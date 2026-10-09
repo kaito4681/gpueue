@@ -25,11 +25,29 @@ use crate::style::Color;
 /// Default number of log lines per job (pueue's default).
 const DEFAULT_LOG_LINES: usize = 15;
 
+/// `println!` that returns the write error instead of panicking, so that a
+/// closed stdout (e.g. `puzuz status | grep -q x`) ends the command quietly.
+macro_rules! outln {
+    ($($arg:tt)*) => {
+        writeln!(io::stdout().lock(), $($arg)*)
+    };
+}
+
+/// Prints a line, ignoring a closed stdout (for `wait`, whose exit status
+/// matters more than its output).
+fn print_best_effort(line: &str) {
+    let _ = writeln!(io::stdout().lock(), "{line}");
+}
+
 /// Why a command failed.
 #[derive(Debug)]
 pub enum CliError {
     Client(ClientError),
     Message(String),
+    /// Whoever read our stdout went away (EPIPE). Not an error worth
+    /// reporting: the command stops and exits successfully, like most
+    /// command line tools.
+    StdoutClosed,
 }
 
 impl From<ClientError> for CliError {
@@ -40,7 +58,11 @@ impl From<ClientError> for CliError {
 
 impl From<io::Error> for CliError {
     fn from(err: io::Error) -> Self {
-        CliError::Message(err.to_string())
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            CliError::StdoutClosed
+        } else {
+            CliError::Message(err.to_string())
+        }
     }
 }
 
@@ -126,7 +148,7 @@ impl App {
                         second: JobId(task_id_2 as u64),
                     })
                     .await?;
-                println!("Jobs have been switched");
+                outln!("Jobs have been switched")?;
                 Ok(ExitCode::SUCCESS)
             }
             SubCommand::Stash {
@@ -280,11 +302,11 @@ impl App {
                     })
                     .await?;
                 if response.removed.is_empty() {
-                    println!("No finished jobs to remove.");
+                    outln!("No finished jobs to remove.")?;
                 } else {
                     let ids: Vec<String> =
                         response.removed.iter().map(ToString::to_string).collect();
-                    println!("Removed finished jobs: {}", ids.join(", "));
+                    outln!("Removed finished jobs: {}", ids.join(", "))?;
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -294,9 +316,9 @@ impl App {
                     .shutdown(&ShutdownRequest { no_checkpoint })
                     .await?;
                 if no_checkpoint {
-                    println!("Daemon is shutting down; running jobs are being killed.");
+                    outln!("Daemon is shutting down; running jobs are being killed.")?;
                 } else {
-                    println!("Daemon is shutting down; running jobs are being checkpointed.");
+                    outln!("Daemon is shutting down; running jobs are being checkpointed.")?;
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -309,7 +331,7 @@ impl App {
                     self.client
                         .set_group_parallel(group, to_u32(parallel)?)
                         .await?;
-                    println!("Parallel jobs setting for group \"{group}\" adjusted");
+                    outln!("Parallel jobs setting for group \"{group}\" adjusted")?;
                     Ok(ExitCode::SUCCESS)
                 }
                 None => self.group(false, None).await,
@@ -359,7 +381,7 @@ impl App {
     ) -> Result<ExitCode> {
         let response = self.client.bulk(&BulkJobRequest { target, action }).await?;
         let report = render::action_report(&response.results, message, headline, &self.ctx.style);
-        report.print();
+        report.print()?;
         Ok(exit(report.ok))
     }
 
@@ -405,7 +427,7 @@ impl App {
             eprintln!("{output}");
             return self.follow(Some(id.0 as usize), None).await;
         }
-        println!("{output}");
+        outln!("{output}")?;
         Ok(ExitCode::SUCCESS)
     }
 
@@ -458,7 +480,7 @@ impl App {
                 .map(|job| job.id)
                 .collect();
             if ids.is_empty() {
-                println!("No failed jobs to restart.");
+                outln!("No failed jobs to restart.")?;
                 return Ok(ExitCode::SUCCESS);
             }
             ids
@@ -517,7 +539,7 @@ impl App {
             format!("Resetting groups {}.", names.join(", "))
         };
         let report = render::action_report(&results, "", Some(headline), &self.ctx.style);
-        report.print();
+        report.print()?;
         Ok(exit(report.ok))
     }
 
@@ -530,9 +552,9 @@ impl App {
             None => {
                 let response = self.client.list_groups().await?;
                 if json {
-                    println!("{}", to_json(&response));
+                    outln!("{}", to_json(&response))?;
                 } else {
-                    println!("{}", render::groups(&response.groups, &self.ctx.style));
+                    outln!("{}", render::groups(&response.groups, &self.ctx.style))?;
                 }
             }
             Some(GroupCommand::Add { name, parallel }) => {
@@ -543,11 +565,11 @@ impl App {
                         parallel,
                     })
                     .await?;
-                println!("New group \"{name}\" has been created");
+                outln!("New group \"{name}\" has been created")?;
             }
             Some(GroupCommand::Remove { name }) => {
                 self.client.delete_group(&name).await?;
-                println!("Group \"{name}\" has been removed");
+                outln!("Group \"{name}\" has been removed")?;
             }
         }
         Ok(ExitCode::SUCCESS)
@@ -558,9 +580,9 @@ impl App {
             None => {
                 let response = self.client.list_gpus().await?;
                 if json {
-                    println!("{}", to_json(&response));
+                    outln!("{}", to_json(&response))?;
                 } else {
-                    println!("{}", render::gpus(&response.gpus, &self.ctx));
+                    outln!("{}", render::gpus(&response.gpus, &self.ctx))?;
                 }
             }
             Some(GpuCommand::Parallel { parallel_jobs, gpu }) => {
@@ -575,12 +597,12 @@ impl App {
                 match gpus {
                     Some(gpus) => {
                         let list: Vec<String> = gpus.iter().map(ToString::to_string).collect();
-                        println!(
+                        outln!(
                             "Parallel jobs setting for GPU {} set to {parallel}",
                             list.join(", ")
-                        );
+                        )?;
                     }
-                    None => println!("Parallel jobs setting for all GPUs set to {parallel}"),
+                    None => outln!("Parallel jobs setting for all GPUs set to {parallel}")?,
                 }
             }
         }
@@ -603,7 +625,7 @@ impl App {
         let jobs = query.apply(jobs, &self.ctx.clock);
 
         if json {
-            println!("{}", to_json(&StatusJson { groups, jobs }));
+            outln!("{}", to_json(&StatusJson { groups, jobs }))?;
             return Ok(ExitCode::SUCCESS);
         }
         let output = render::status(
@@ -616,7 +638,7 @@ impl App {
             },
             &self.ctx,
         )?;
-        println!("{output}");
+        outln!("{output}")?;
         Ok(ExitCode::SUCCESS)
     }
 
@@ -705,7 +727,7 @@ impl App {
                     },
                 );
             }
-            println!("{}", to_json(&out));
+            outln!("{}", to_json(&out))?;
             return Ok(exit(ok));
         }
 
@@ -834,7 +856,9 @@ impl App {
             return Ok(ExitCode::SUCCESS);
         }
         if !quiet {
-            lines.iter().for_each(|line| println!("{line}"));
+            for line in &lines {
+                print_best_effort(line);
+            }
         }
 
         loop {
@@ -849,7 +873,7 @@ impl App {
             };
             for line in waiter.handle(event, &self.ctx)? {
                 if !quiet {
-                    println!("{line}");
+                    print_best_effort(&line);
                 }
             }
         }
@@ -1033,6 +1057,7 @@ fn confirm(action: &str, ids: &[JobId]) -> Result<bool> {
 pub async fn describe_error(err: CliError, client: &Client) -> String {
     let err = match err {
         CliError::Message(message) => return message,
+        CliError::StdoutClosed => return "standard output was closed".to_owned(),
         CliError::Client(err) => err,
     };
     if err.is_daemon_down() {
@@ -1067,6 +1092,14 @@ mod tests {
 
     use super::*;
     use crate::render::tests::{ctx, job};
+
+    #[test]
+    fn broken_pipe_is_not_an_error_message() {
+        let err = CliError::from(io::Error::from(io::ErrorKind::BrokenPipe));
+        assert!(matches!(err, CliError::StdoutClosed));
+        let err = CliError::from(io::Error::other("disk full"));
+        assert!(matches!(err, CliError::Message(m) if m == "disk full"));
+    }
 
     #[test]
     fn wait_targets() {

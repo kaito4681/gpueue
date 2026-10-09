@@ -106,6 +106,8 @@ fn run_remote(cli: &Cli, command: SubCommand) -> ExitCode {
     runtime.block_on(async {
         let code = match app.run(command).await {
             Ok(code) => code,
+            // The reader of our output is gone (e.g. `| grep -q`).
+            Err(commands::CliError::StdoutClosed) => ExitCode::SUCCESS,
             Err(err) => fail(&commands::describe_error(err, &app.client).await),
         };
         // Warnings the daemon keeps for this user (e.g. a failed checkpoint).

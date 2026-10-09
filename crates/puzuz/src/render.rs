@@ -395,13 +395,16 @@ pub struct Report {
 }
 
 impl Report {
-    pub fn print(&self) {
+    pub fn print(&self) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
         for line in &self.stdout {
-            println!("{line}");
+            writeln!(stdout, "{line}")?;
         }
         for line in &self.stderr {
             eprintln!("{line}");
         }
+        Ok(())
     }
 }
 
@@ -564,8 +567,9 @@ pub fn last_lines(log: &[u8], lines: usize) -> (&[u8], bool) {
 // wait
 // ---------------------------------------------------------------------------
 
+/// The time of a `wait` line: when it is printed, not when `wait` started.
 fn wait_prefix(ctx: &RenderCtx) -> String {
-    ctx.clock.now().format("%H:%M:%S").to_string()
+    ctx.clock.current().format("%H:%M:%S").to_string()
 }
 
 /// `wait`: a job that appeared while waiting, or an active job found at the

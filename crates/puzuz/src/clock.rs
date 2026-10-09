@@ -44,8 +44,13 @@ impl Clock {
         }
     }
 
-    pub fn now(&self) -> DateTime<FixedOffset> {
-        self.now
+    /// The actual current time, for long-running commands such as `wait`.
+    /// A fixed (test) clock stays at its instant.
+    pub fn current(&self) -> DateTime<FixedOffset> {
+        match self.zone {
+            Zone::Local => Local::now().fixed_offset(),
+            Zone::Fixed(_) => self.now,
+        }
     }
 
     /// Converts a daemon timestamp to a date in the display time zone.
@@ -111,6 +116,15 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_time_moves_on_unless_fixed() {
+        let now = DateTime::parse_from_rfc3339("2026-10-09T15:00:00+09:00").unwrap();
+        assert_eq!(Clock::fixed(now).current(), now);
+        let system = Clock::system();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(system.current() > system.now);
+    }
 
     #[test]
     fn short_format_hides_todays_date() {
