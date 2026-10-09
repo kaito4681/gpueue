@@ -15,8 +15,12 @@
 #                       already has systemd, criu and python3, e.g.
 #                       puzuz-poc/systemd259:0.1)
 #   PUZUZ_E2E_SKIP_BUILD=1  reuse target/docker/debug binaries
-#   PUZUZ_E2E_ONLY_REBOOT=1 skip the main scenarios and run only the
-#                       reboot scenario (7), e.g. to repeat it many times
+#   PUZUZ_E2E_ONLY=<n...>  run only the listed scenarios (numbers as in
+#                       scenario.sh, separated by spaces or commas, e.g.
+#                       PUZUZ_E2E_ONLY=1 or PUZUZ_E2E_ONLY="3,7"), e.g. to
+#                       repeat one many times. The reboot scenario (7) and
+#                       its container switch are skipped unless listed.
+#   PUZUZ_E2E_ONLY_REBOOT=1 same as PUZUZ_E2E_ONLY=7
 #   PUZUZ_E2E_NAME      prefix of the container and volume names
 #                       (default puzuz-e2e), to tell parallel runs apart
 #   PUZUZ_E2E_GPU=1     also run a CUDA checkpoint/restore scenario on GPU 0
@@ -42,6 +46,12 @@ if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
     gpu_args=(--gpus all)
     gpu_env=(-e PUZUZ_E2E_GPU=1)
 fi
+only="${PUZUZ_E2E_ONLY:-}"
+if [ "${PUZUZ_E2E_ONLY_REBOOT:-}" = 1 ]; then only="${only:+$only }7"; fi
+only="${only//,/ }"
+# selected <n>: whether scenario <n> runs.
+selected() { [ -z "$only" ] || [[ " $only " == *" $1 "* ]]; }
+gpu_env+=(-e "PUZUZ_E2E_ONLY=$only")
 
 if [ "${PUZUZ_E2E_SKIP_BUILD:-}" != 1 ]; then
     "$root/scripts/test-in-docker.sh" build -p puzuz -p puzuz-helper
@@ -98,20 +108,25 @@ warnings() {
 status=0
 boot "$name-a"
 touch "$stage/results"
-if [ "${PUZUZ_E2E_ONLY_REBOOT:-}" != 1 ]; then
+# The main phase runs unless only the reboot scenario is selected.
+if [ -z "$only" ] || [ -n "${only//[ 7]/}" ]; then
     docker exec "${gpu_env[@]}" "$name-a" bash /e2e/scenario.sh main | tee "$stage/results" || status=1
 fi
-docker exec "${gpu_env[@]}" "$name-a" bash /e2e/scenario.sh reboot-prepare | tee -a "$stage/results" || status=1
+if selected 7; then
+    docker exec "${gpu_env[@]}" "$name-a" bash /e2e/scenario.sh reboot-prepare | tee -a "$stage/results" || status=1
+fi
 if [ "$status" -eq 0 ]; then warnings "$name-a"; else journal "$name-a"; fi
 
-# A real systemd shutdown: `docker stop` sends SIGRTMIN+3.
-docker stop -t 120 "$name-a" >/dev/null
-boot "$name-b"
-if docker exec "${gpu_env[@]}" "$name-b" bash /e2e/scenario.sh reboot-verify | tee -a "$stage/results"; then
-    warnings "$name-b"
-else
-    status=1
-    journal "$name-b"
+if selected 7; then
+    # A real systemd shutdown: `docker stop` sends SIGRTMIN+3.
+    docker stop -t 120 "$name-a" >/dev/null
+    boot "$name-b"
+    if docker exec "${gpu_env[@]}" "$name-b" bash /e2e/scenario.sh reboot-verify | tee -a "$stage/results"; then
+        warnings "$name-b"
+    else
+        status=1
+        journal "$name-b"
+    fi
 fi
 
 echo
