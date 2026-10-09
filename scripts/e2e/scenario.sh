@@ -304,6 +304,8 @@ s8_shutdown() {
 s9_gpu() {
     local id before after
     pz carol gpu parallel 1 || fail "gpu parallel"
+    # Created by s3 unless only GPU scenarios run.
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
     id=$(add alice -g free --gpu 0 -- 'exec /opt/venv/bin/python3 -u /e2e/gpu_counter.py')
     wait_state "$id" running
     wait_for 60 "the GPU job to print" bash -c "[ \$(wc -l < $LOGS/1000/$id.log) -ge 5 ]"
@@ -325,6 +327,71 @@ assert [a for a, _ in rows] == list(range(1, len(rows) + 1)), "steps not consecu
 EOF
     pz alice kill "$id" || fail "kill"
     wait_state "$id" 'done/*'
+}
+
+# PUZUZ_E2E_GPU=1 only: PyTorch training whose DataLoader forks its workers
+# (the default start method): the workers inherit the CUDA process's NVIDIA
+# device mappings, which CRIU cannot dump; the helper's fork guard drops
+# them. Each variant is checkpointed and restored <n> times and must log
+# the same losses and parameter checksums as an uninterrupted run, with
+# the workers still producing batches after each restore.
+# gpu_train_variant <steps> <checkpoints> <gpu_train.py args...>
+gpu_train_variant() {
+    local steps=$1 n=$2 ref id k lines last=0 marks=()
+    shift 2
+    local cmd="exec /opt/venv/bin/python3 -u /e2e/gpu_train.py $steps $*"
+    ref=$(add alice -g free --gpu 0 -- "$cmd")
+    wait_state "$ref" 'done/*' 300
+    expect_state "$ref" done/success
+    head -n1 "$LOGS/1000/$ref.log"
+    grep -q 'start_method=fork ' "$LOGS/1000/$ref.log" || fail "the workers are not forked"
+    grep -q 'preload=.*puzuz-forkguard-' "$LOGS/1000/$ref.log" || fail "the fork guard is not preloaded"
+    id=$(add alice -g free --gpu 0 -- "$cmd")
+    wait_state "$id" running
+    for k in $(seq "$n"); do
+        lines=$((last + 12))
+        wait_for 120 "the training job to reach $lines steps" \
+            bash -c "[ \$(grep -c ^step= $LOGS/1000/$id.log) -ge $lines ]"
+        pz alice checkpoint "$id" || fail "checkpoint $k"
+        wait_state "$id" checkpointed 300
+        last=$(grep -c ^step= "$LOGS/1000/$id.log")
+        marks+=("$last")
+        pz alice restore "$id" || fail "restore $k"
+        wait_state "$id" running 300
+    done
+    wait_state "$id" 'done/*' 300
+    expect_state "$id" done/success
+    echo "steps at the checkpoints: ${marks[*]}"
+    python3 - "$LOGS/1000/$ref.log" "$LOGS/1000/$id.log" "$steps" "${marks[@]}" <<'EOF' || fail "the restored training diverged"
+import sys
+ref, got, steps = sys.argv[1], sys.argv[2], int(sys.argv[3])
+marks = [int(m) for m in sys.argv[4:]]
+def rows(path):
+    out = []
+    for line in open(path):
+        if line.startswith("step="):
+            f = dict(kv.split("=", 1) for kv in line.split())
+            out.append((int(f["step"]), f["loss"], f["csum"], f["worker"]))
+    return out
+a, b = rows(ref), rows(got)
+assert [r[:3] for r in b] == [r[:3] for r in a], "losses/checksums differ from the uninterrupted run"
+assert [r[0] for r in b] == list(range(1, steps + 1)), "steps missing or repeated"
+for i, m in enumerate(marks):
+    end = marks[i + 1] if i + 1 < len(marks) else len(b)
+    after = {r[3].split(":")[0] for r in b[m:end]}
+    assert m < end and "-1" not in after and len(after) >= 2, f"workers after restore {i + 1}: {after}"
+print(f"{len(b)} steps identical to the uninterrupted run")
+EOF
+}
+s11_gpu_fork_workers() {
+    pz carol gpu parallel 1 || fail "gpu parallel"
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    say "fork workers"
+    gpu_train_variant 60 1 2
+    say "fork workers, pin_memory, persistent_workers"
+    gpu_train_variant 60 1 3 pin persistent
+    say "fork workers re-forked every epoch, checkpointed twice"
+    gpu_train_variant 80 2 2 pin epochs
 }
 
 # s7 is split across two containers by scripts/e2e-test.sh.
@@ -419,6 +486,7 @@ main)
     run "10 many jobs at once" s10_burst
     if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
+        run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers
     fi
     ;;
 reboot-prepare) run "7 reboot (prepare)" s7_prepare ;;

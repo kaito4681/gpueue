@@ -23,7 +23,9 @@
 #   PUZUZ_E2E_ONLY_REBOOT=1 same as PUZUZ_E2E_ONLY=7
 #   PUZUZ_E2E_NAME      prefix of the container and volume names
 #                       (default puzuz-e2e), to tell parallel runs apart
-#   PUZUZ_E2E_GPU=1     also run a CUDA checkpoint/restore scenario on GPU 0
+#   PUZUZ_E2E_GPU=1     also run the CUDA checkpoint/restore scenarios (9: a
+#                       GPU counter, 11: PyTorch training with forked
+#                       DataLoader workers) on GPU 0
 #                       (`docker run --gpus all`; the base image needs CUDA,
 #                       torch in /opt/venv and cuda-checkpoint, e.g.
 #                       puzuz-poc/criu-cuda-systemd:0.1, with
