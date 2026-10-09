@@ -6,8 +6,8 @@
 //! file for its own settings.
 //!
 //! ```toml
-//! data_dir = "/var/lib/puzuz"          # state.sqlite, logs/, checkpoints/
-//! # state_db = "/var/lib/puzuz/state.sqlite"
+//! data_dir = "/var/lib/puzuz"          # daemon/state.sqlite, logs/, checkpoints/
+//! # state_db = "/var/lib/puzuz/daemon/state.sqlite"
 //! # logs_dir = "/var/lib/puzuz/logs"
 //! # checkpoints_dir = "/var/lib/puzuz/checkpoints"
 //! api_socket = "/run/puzuz/puzuz.sock"
@@ -37,7 +37,9 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/puzuz/config.toml";
 pub struct Config {
     /// Base directory for the state database, logs and checkpoints.
     pub data_dir: PathBuf,
-    /// Overrides `<data_dir>/state.sqlite`.
+    /// Overrides `<data_dir>/daemon/state.sqlite`. The database lives in a
+    /// subdirectory because `<data_dir>` itself must be owned by root (the
+    /// helper refuses to use paths below a directory the daemon can write).
     pub state_db: Option<PathBuf>,
     /// Overrides `<data_dir>/logs`. Logs are `<logs_dir>/<uid>/<id>.log`.
     pub logs_dir: Option<PathBuf>,
@@ -170,7 +172,7 @@ impl Config {
     pub fn state_db_path(&self) -> PathBuf {
         self.state_db
             .clone()
-            .unwrap_or_else(|| self.data_dir.join("state.sqlite"))
+            .unwrap_or_else(|| self.data_dir.join("daemon").join("state.sqlite"))
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -204,7 +206,7 @@ mod tests {
         assert_eq!(config, Config::default());
         assert_eq!(
             config.state_db_path(),
-            PathBuf::from("/var/lib/puzuz/state.sqlite")
+            PathBuf::from("/var/lib/puzuz/daemon/state.sqlite")
         );
         assert_eq!(config.logs_dir(), PathBuf::from("/var/lib/puzuz/logs"));
         assert_eq!(
@@ -246,7 +248,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             config.state_db_path(),
-            PathBuf::from("/srv/puzuz/state.sqlite")
+            PathBuf::from("/srv/puzuz/daemon/state.sqlite")
         );
         assert_eq!(config.logs_dir(), PathBuf::from("/srv/puzuz/logs"));
         assert_eq!(config.checkpoints_dir(), PathBuf::from("/big/ckpt"));
@@ -293,7 +295,10 @@ mod tests {
     #[test]
     fn data_dir_override_moves_derived_paths() {
         let config = Config::default().with_data_dir("/tmp/x");
-        assert_eq!(config.state_db_path(), PathBuf::from("/tmp/x/state.sqlite"));
+        assert_eq!(
+            config.state_db_path(),
+            PathBuf::from("/tmp/x/daemon/state.sqlite")
+        );
         assert_eq!(config.logs_dir(), PathBuf::from("/tmp/x/logs"));
     }
 }

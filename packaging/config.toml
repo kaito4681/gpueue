@@ -1,0 +1,46 @@
+# Configuration of the puzuz daemon (puzuz.service).
+#
+# Created by `puzuz service install`, which never overwrites this file.
+# Every key is optional; the commented values are the defaults. Restart the
+# daemon after changing it: `sudo systemctl restart puzuz.service`.
+# Groups and GPU slot limits are not configured here; they are stored in the
+# daemon's database and changed with `puzuz group` and `puzuz gpu parallel`.
+
+# Base directory of the state database (daemon/state.sqlite), job logs
+# (logs/) and checkpoint images (checkpoints/). Keep the layout created by
+# /etc/tmpfiles.d/puzuz.conf: the helper requires the base directory to be
+# owned by root.
+# data_dir = "/var/lib/puzuz"
+
+# Override single locations below data_dir.
+# state_db = "/var/lib/puzuz/daemon/state.sqlite"
+# logs_dir = "/var/lib/puzuz/logs"
+# checkpoints_dir = "/var/lib/puzuz/checkpoints"
+
+# The socket clients connect to (callers are identified by SO_PEERCRED).
+# api_socket = "/run/puzuz/puzuz.sock"
+
+# The root helper's socket.
+# helper_socket = "/run/puzuz/helper.sock"
+
+# Seconds between SIGTERM and SIGKILL when stopping a job.
+# grace_secs = 30
+
+# Command prefix a job's command line is appended to.
+# shell = ["sh", "-c"]
+
+# Warn when all checkpoint images together exceed this many bytes.
+# checkpoint_size_limit_bytes = 500_000_000_000
+
+# Close TCP connections when checkpointing (`criu --tcp-close`).
+# checkpoint_tcp_close = true
+
+# Paths of criu and cuda-checkpoint.
+# criu_path = "criu"
+# cuda_checkpoint_path = "cuda-checkpoint"
+
+# GPUs, listed statically until automatic detection covers your setup.
+# [[gpus]]
+# index = 0
+# uuid = "GPU-..."
+# name = "NVIDIA GeForce RTX 4090"

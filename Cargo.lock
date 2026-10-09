@@ -1062,6 +1062,7 @@ dependencies = [
  "hyper-util",
  "interim",
  "nix",
+ "puzuz-checkpoint",
  "puzuz-core",
  "puzuz-daemon",
  "puzuz-protocol",
