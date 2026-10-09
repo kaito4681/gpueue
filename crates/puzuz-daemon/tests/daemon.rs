@@ -1023,7 +1023,7 @@ async fn checkpoint_records_gpu_model_driver_and_size() {
     let job = alice.wait_state(id, &JobState::Checkpointed).await;
     assert_eq!(job.checkpoint_size_bytes, Some(4096));
 
-    let store = puzuz_core::storage::Store::open(h.dir.path().join("state.sqlite")).unwrap();
+    let store = puzuz_core::storage::Store::open(h.dir.path().join("daemon/state.sqlite")).unwrap();
     let record = puzuz_core::storage::StoreOps::get_checkpoint(&store, id)
         .unwrap()
         .unwrap();
