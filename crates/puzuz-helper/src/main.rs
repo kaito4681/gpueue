@@ -12,6 +12,7 @@ use puzuz_helper::config::{
     DEFAULT_CHECKPOINT_BASE, DEFAULT_CRIU_ROOT, DEFAULT_LOG_BASE, DEFAULT_STATE_DIR,
 };
 use puzuz_helper::host::SystemHost;
+use puzuz_helper::launcher::Launcher;
 use puzuz_helper::launcher::systemd::SystemdLauncher;
 use puzuz_helper::{Helper, HelperConfig, notify, server, shim};
 use tokio::signal::unix::{SignalKind, signal};
@@ -41,6 +42,14 @@ enum Command {
     /// PID 1 of a job's namespace (internal).
     #[command(hide = true)]
     ShimInit { job_dir: PathBuf },
+    /// `ExecStart` of a restore unit: bind-mount / on ROOT in a private
+    /// mount namespace (unless ROOT is empty), then exec criu (internal).
+    #[command(hide = true)]
+    CriuWrap {
+        root: PathBuf,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        criu: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -65,7 +74,9 @@ struct ServeArgs {
     /// Bind mount of `/` for `criu restore --root`; empty disables it.
     #[arg(long, default_value = DEFAULT_CRIU_ROOT)]
     criu_root: PathBuf,
-    #[arg(long, value_enum, default_value = "plugin")]
+    /// `manual`: the helper calls cuda-checkpoint around criu (works with
+    /// the distribution's criu). `plugin`: CRIU's CUDA plugin does it.
+    #[arg(long, value_enum, default_value = "manual")]
     cuda_mode: ModeArg,
     #[arg(long, default_value = "criu")]
     criu: PathBuf,
@@ -84,6 +95,7 @@ fn main() -> ExitCode {
         // The shim must stay single-threaded: no runtime.
         Command::Shim { job_dir } => shim::run_outer(job_dir),
         Command::ShimInit { job_dir } => shim::run_init(job_dir),
+        Command::CriuWrap { root, criu } => shim::run_criu_wrap(root, criu),
         Command::Serve(args) => match serve(*args) {
             Ok(()) => 0,
             Err(e) => {
@@ -145,7 +157,7 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     )
     .await
     .map_err(|e| format!("connecting to systemd: {e}"))?;
-    let host = SystemHost::new(cfg.nvidia_smi.clone());
+    let host = SystemHost::new(cfg.nvidia_smi.clone(), cfg.checkpoint.cuda.clone());
     let factory: puzuz_helper::ExecutorFactory =
         Arc::new(|| Box::new(SystemExecutor::default()) as Box<dyn Executor + Send>);
     let dump_budget = cfg.checkpoint.timeouts.criu_dump + cfg.checkpoint.timeouts.cuda_checkpoint;
@@ -172,7 +184,29 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
         _ = int.recv() => {}
     }
     let _ = notify::notify("STOPPING=1");
-    eprintln!("puzuz-helper: stopping; checkpointing running jobs (signal again to exit now)");
+    // Only an OS shutdown/reboot dumps the jobs. A restart or stop of the
+    // helper alone (e.g. an upgrade) leaves them running; the next helper
+    // re-discovers them. `puzuz shutdown` dumps through the daemon's
+    // checkpoint requests instead.
+    let stopping = helper
+        .launcher()
+        .system_stopping()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "puzuz-helper: cannot tell whether the system is stopping ({e}); assuming it is"
+            );
+            true
+        });
+    if !stopping {
+        eprintln!("puzuz-helper: stopping without checkpointing (the system is not shutting down)");
+        let _ = stop_tx.send(true);
+        let _ = std::fs::remove_file(&socket_path);
+        return Ok(());
+    }
+    eprintln!(
+        "puzuz-helper: system shutdown; checkpointing running jobs (signal again to exit now)"
+    );
     tokio::spawn(async move {
         tokio::select! {
             _ = term.recv() => {}

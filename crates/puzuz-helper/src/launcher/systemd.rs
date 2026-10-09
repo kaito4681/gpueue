@@ -1,36 +1,41 @@
-//! Jobs as transient systemd services (`puzuz-job-<id>.service`), started
-//! over D-Bus.
+//! Jobs as transient systemd services, started over D-Bus. Follows
+//! `docker-systemd-poc.md` (§3.1, §5, §6).
 //!
-//! Spawned job unit:
-//! - `ExecStart=<helper> shim <job dir>`, `Type=exec`, `RemainAfterExit=yes`
-//!   (so the exit status stays queryable until the helper releases the
-//!   unit), `Before=puzuz-helper.service` (at shutdown the helper stops —
-//!   and dumps — first; the job units are stopped after it).
-//! - `User=`/`Group=`/`SupplementaryGroups=`: systemd drops to the owner.
-//!   The shim keeps only `CAP_SYS_ADMIN` (to create the PID and mount
-//!   namespaces and mount `/proc`) and `CAP_SETPCAP` (to drop its bounding
-//!   set), granted as ambient capabilities; it drops them before running
-//!   the job. `NoNewPrivileges=yes`, `CapabilityBoundingSet=` limited to
-//!   those two.
-//! - `StandardInput=null`; the shim's own output goes to the journal. The
+//! Spawned job unit `puzuz-job-<id>.service`:
+//! - `ExecStart=<helper> shim <job dir>` as root; the shim creates the PID
+//!   and mount namespaces, cleans the mounts and drops to the owner itself
+//!   (no `User=`; `PrivatePIDs=` is not used because it cannot clean the
+//!   mount namespace). `CapabilityBoundingSet=` is limited to what the shim
+//!   needs; `NoNewPrivileges=yes`.
+//! - `Type=exec`, `RemainAfterExit=yes` (the exit status stays queryable
+//!   until the helper releases the unit), `KillMode=mixed` (a stop sends
+//!   SIGTERM to the shim, which forwards it to the job), and
+//!   `Before=puzuz-helper.service` (at OS shutdown the helper stops — and
+//!   dumps — first; the job units are stopped after it).
+//! - `StandardInput=null`; the shim's own messages go to the journal. The
 //!   job's stdout/stderr are *not* connected with `StandardOutput=append:`
-//!   because systemd opens that file as root; the shim opens the log itself
-//!   after dropping its capabilities, i.e. with the owner's permissions.
+//!   because systemd opens that file as root, following symlinks, in a
+//!   directory the job's owner controls; the shim opens the log itself
+//!   after dropping privileges.
 //!
-//! Restored job unit: `ExecStart=criu restore ... --restore-detached
-//! --pidfile <file>`, `Type=forking`, `PIDFile=<file>`: once `criu` exits,
-//! systemd adopts the restored init as the unit's main process.
+//! Restored job unit `puzuz-job-<id>-r<n>.service`: `Type=forking`,
+//! `PIDFile=`, `ExecStart=<helper> criu-wrap <root> criu restore -d
+//! --pidfile ... --root <root> ...`. The wrapper bind-mounts `/` on `<root>`
+//! in a private mount namespace and execs criu; once criu exits, systemd
+//! adopts the restored init as the unit's main process. The CUDA part of a
+//! manual-mode restore is run by the helper afterwards (not in
+//! `ExecStartPost=`) so it shares the executor, timeouts and error
+//! reporting of every other checkpoint step.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use puzuz_protocol::helper::{ExitStatus, HelperErrorCode, JobId};
+use puzuz_protocol::helper::{ExitStatus, HelperErrorCode, signal};
 use zbus::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use super::{
     LaunchError, LaunchResult, LaunchSpec, Launcher, RestoreSpec, UnitState, parse_unit_name,
-    unit_name,
 };
 use crate::host::children_of;
 use crate::jobs::{StartFailure, StartReport, UnitKind};
@@ -46,10 +51,27 @@ const NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
 /// The unit every job unit is ordered before.
 pub const HELPER_UNIT: &str = "puzuz-helper.service";
 
+const CAP_CHOWN: u64 = 0;
+const CAP_DAC_OVERRIDE: u64 = 1;
+const CAP_DAC_READ_SEARCH: u64 = 2;
+const CAP_FOWNER: u64 = 3;
+const CAP_KILL: u64 = 5;
+const CAP_SETGID: u64 = 6;
+const CAP_SETUID: u64 = 7;
 const CAP_SETPCAP: u64 = 8;
 const CAP_SYS_ADMIN: u64 = 21;
-/// Capabilities the shim needs, as a systemd capability mask.
-pub const SHIM_CAPS: u64 = (1 << CAP_SYS_ADMIN) | (1 << CAP_SETPCAP);
+/// What the root shim needs before it drops everything: namespaces and
+/// mounts, changing credentials, dropping the bounding set, and reading its
+/// root-only job files.
+pub const SHIM_CAPS: u64 = (1 << CAP_SYS_ADMIN)
+    | (1 << CAP_SETUID)
+    | (1 << CAP_SETGID)
+    | (1 << CAP_SETPCAP)
+    | (1 << CAP_DAC_OVERRIDE)
+    | (1 << CAP_DAC_READ_SEARCH)
+    | (1 << CAP_FOWNER)
+    | (1 << CAP_CHOWN)
+    | (1 << CAP_KILL);
 
 const POLL: Duration = Duration::from_millis(50);
 
@@ -97,28 +119,17 @@ impl SystemdLauncher {
         reply.body().deserialize()
     }
 
-    async fn property(
-        &self,
-        path: &OwnedObjectPath,
-        iface: &str,
-        name: &str,
-    ) -> zbus::Result<OwnedValue> {
+    async fn property(&self, path: &str, iface: &str, name: &str) -> zbus::Result<OwnedValue> {
         let reply = self
             .conn
-            .call_method(
-                Some(DEST),
-                path.as_ref(),
-                Some(PROPS_IFACE),
-                "Get",
-                &(iface, name),
-            )
+            .call_method(Some(DEST), path, Some(PROPS_IFACE), "Get", &(iface, name))
             .await?;
         reply.body().deserialize()
     }
 
-    async fn unit_path(&self, job: JobId) -> zbus::Result<Option<OwnedObjectPath>> {
+    async fn unit_path(&self, unit: &str) -> zbus::Result<Option<OwnedObjectPath>> {
         match self
-            .manager_call::<_, OwnedObjectPath>("GetUnit", &(unit_name(job),))
+            .manager_call::<_, OwnedObjectPath>("GetUnit", &(unit,))
             .await
         {
             Ok(p) => Ok(Some(p)),
@@ -127,39 +138,63 @@ impl SystemdLauncher {
         }
     }
 
-    async fn main_pid(&self, job: JobId) -> zbus::Result<Option<u32>> {
-        let Some(path) = self.unit_path(job).await? else {
+    async fn string_prop(
+        &self,
+        path: &OwnedObjectPath,
+        iface: &str,
+        name: &str,
+    ) -> LaunchResult<String> {
+        let v = self
+            .property(path.as_str(), iface, name)
+            .await
+            .map_err(dbus)?;
+        String::try_from(v).map_err(|e| dbus(e.into()))
+    }
+
+    async fn int_prop(&self, path: &OwnedObjectPath, name: &str) -> LaunchResult<i32> {
+        let v = self
+            .property(path.as_str(), SERVICE_IFACE, name)
+            .await
+            .map_err(dbus)?;
+        i32::try_from(v).map_err(|e| dbus(e.into()))
+    }
+
+    async fn main_pid(&self, unit: &str) -> LaunchResult<Option<u32>> {
+        let Some(path) = self.unit_path(unit).await.map_err(dbus)? else {
             return Ok(None);
         };
-        let pid: u32 = self
-            .property(&path, SERVICE_IFACE, "MainPID")
-            .await?
-            .try_into()?;
+        let v = self
+            .property(path.as_str(), SERVICE_IFACE, "MainPID")
+            .await
+            .map_err(dbus)?;
+        let pid = u32::try_from(v).map_err(|e| dbus(e.into()))?;
         Ok((pid != 0).then_some(pid))
     }
 
-    async fn start_transient(&self, job: JobId, props: Props<'_>) -> LaunchResult<()> {
+    async fn start_transient(&self, unit: &str, props: Props<'_>) -> LaunchResult<()> {
+        // A failed unit of the same name (e.g. left by a crash) blocks it.
+        let _ = self
+            .manager_call::<_, ()>("ResetFailedUnit", &(unit,))
+            .await;
         let aux: Vec<(&str, Props<'_>)> = Vec::new();
-        self.manager_call::<_, OwnedObjectPath>(
-            "StartTransientUnit",
-            &(unit_name(job), "fail", props, aux),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| {
-            LaunchError::new(
-                HelperErrorCode::SpawnFailed,
-                format!("starting {}: {e}", unit_name(job)),
-            )
-        })
+        self.manager_call::<_, OwnedObjectPath>("StartTransientUnit", &(unit, "fail", props, aux))
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                LaunchError::new(
+                    HelperErrorCode::SpawnFailed,
+                    format!("starting {unit}: {e}"),
+                )
+            })
     }
 
-    fn common_props(&self, job: JobId, description: String) -> Props<'static> {
+    fn common_props(&self, description: String) -> Props<'static> {
         vec![
             ("Description", Value::from(description)),
             ("Before", Value::from(vec![HELPER_UNIT.to_owned()])),
             ("RemainAfterExit", Value::from(true)),
-            ("KillMode", Value::from("control-group")),
+            ("KillMode", Value::from("mixed")),
+            ("NoNewPrivileges", Value::from(true)),
             ("StandardInput", Value::from("null")),
             ("StandardOutput", Value::from("journal")),
             ("StandardError", Value::from("journal")),
@@ -167,28 +202,26 @@ impl SystemdLauncher {
                 "TimeoutStopUSec",
                 Value::from(duration_usec(self.job_stop_timeout)),
             ),
-            (
-                "SyslogIdentifier",
-                Value::from(format!("puzuz-job-{}", job.0)),
-            ),
         ]
     }
 
     async fn wait_for_start(&self, spec: &LaunchSpec) -> LaunchResult<u32> {
         let deadline = Instant::now() + self.spawn_timeout;
-        let unit = unit_name(spec.job);
+        let unit = spec.unit.as_str();
         loop {
             match spec.files.read_start() {
                 Some(StartReport::Started { .. }) => {
-                    // The init is the only child of the shim. It exists
-                    // before the shim reports success.
-                    if let Some(pid) = self.init_pid(spec.job, UnitKind::Spawned).await? {
-                        return Ok(pid);
-                    }
-                    return Err(LaunchError::new(
-                        HelperErrorCode::SpawnFailed,
-                        format!("{unit}: job started but its init is gone"),
-                    ));
+                    // The init is the shim's only child and exists before
+                    // it reports success.
+                    return self
+                        .init_pid(unit, UnitKind::Spawned)
+                        .await?
+                        .ok_or_else(|| {
+                            LaunchError::new(
+                                HelperErrorCode::SpawnFailed,
+                                format!("{unit}: the job started but its init is gone"),
+                            )
+                        });
                 }
                 Some(StartReport::Failed { kind, message }) => {
                     let code = match kind {
@@ -199,7 +232,7 @@ impl SystemdLauncher {
                 }
                 None => {}
             }
-            match self.unit_state(spec.job).await? {
+            match self.unit_state(unit).await? {
                 UnitState::Running => {}
                 state => {
                     // The shim may have reported just before exiting.
@@ -226,32 +259,14 @@ impl SystemdLauncher {
             tokio::time::sleep(POLL).await;
         }
     }
-
-    async fn wait_until_gone(&self, job: JobId, timeout: Duration) -> LaunchResult<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.unit_state(job).await? {
-                UnitState::Gone | UnitState::Exited(_) => return Ok(()),
-                UnitState::Running if Instant::now() >= deadline => {
-                    return Err(LaunchError::internal(format!(
-                        "{} did not stop within {timeout:?}",
-                        unit_name(job)
-                    )));
-                }
-                UnitState::Running => tokio::time::sleep(POLL).await,
-            }
-        }
-    }
 }
 
 impl Launcher for SystemdLauncher {
     async fn spawn(&self, spec: &LaunchSpec) -> LaunchResult<u32> {
         let exe = self.helper_exe.to_string_lossy().into_owned();
         let dir = spec.files.dir().to_string_lossy().into_owned();
-        let mut props = self.common_props(
-            spec.job,
-            format!("puzuz job {}: {}", spec.job.0, spec.argv.join(" ")),
-        );
+        let mut props =
+            self.common_props(format!("puzuz job {}: {}", spec.job.0, spec.argv.join(" ")));
         props.extend([
             ("Type", Value::from("exec")),
             (
@@ -262,91 +277,86 @@ impl Launcher for SystemdLauncher {
                     false,
                 )]),
             ),
-            ("User", Value::from(spec.uid.0.to_string())),
-            ("Group", Value::from(spec.gid.0.to_string())),
-            ("NoNewPrivileges", Value::from(true)),
             ("CapabilityBoundingSet", Value::from(SHIM_CAPS)),
-            ("AmbientCapabilities", Value::from(SHIM_CAPS)),
         ]);
-        if let Some(groups) = &spec.groups {
-            props.push((
-                "SupplementaryGroups",
-                Value::from(groups.iter().map(|g| g.0.to_string()).collect::<Vec<_>>()),
-            ));
-        }
-        self.start_transient(spec.job, props).await?;
+        self.start_transient(&spec.unit, props).await?;
         match self.wait_for_start(spec).await {
             Ok(pid) => Ok(pid),
             Err(e) => {
-                let _ = self.release(spec.job).await;
+                let _ = self.release(&spec.unit).await;
                 Err(e)
             }
         }
     }
 
     async fn restore(&self, spec: &RestoreSpec) -> LaunchResult<u32> {
-        let program = resolve_program(&spec.command.program).ok_or_else(|| {
+        let criu = resolve_program(&spec.command.program).ok_or_else(|| {
             LaunchError::internal(format!(
                 "{} not found in PATH",
                 spec.command.program.display()
             ))
         })?;
-        let program = program.to_string_lossy().into_owned();
-        let mut argv = vec![program.clone()];
+        let mut argv = vec![
+            self.helper_exe.to_string_lossy().into_owned(),
+            "criu-wrap".to_owned(),
+        ];
+        argv.push(
+            spec.criu_root
+                .as_ref()
+                .map_or_else(String::new, |r| r.to_string_lossy().into_owned()),
+        );
+        argv.push(criu.to_string_lossy().into_owned());
         argv.extend(spec.command.args_lossy());
-        let mut props = self.common_props(spec.job, format!("puzuz job {} (restored)", spec.job.0));
+        let mut props = self.common_props(format!("puzuz job {} (restored)", spec.job.0));
         props.extend([
             ("Type", Value::from("forking")),
-            ("ExecStart", Value::from(vec![(program, argv, false)])),
+            (
+                "ExecStart",
+                Value::from(vec![(argv[0].clone(), argv, false)]),
+            ),
             (
                 "PIDFile",
                 Value::from(spec.pidfile.to_string_lossy().into_owned()),
             ),
             ("TimeoutStartUSec", Value::from(duration_usec(spec.timeout))),
         ]);
-        self.start_transient(spec.job, props).await?;
+        self.start_transient(&spec.unit, props).await?;
 
         let deadline = Instant::now() + spec.timeout + Duration::from_secs(10);
         loop {
-            match self.unit_state(spec.job).await? {
-                UnitState::Running => {
-                    let path = self.unit_path(spec.job).await.map_err(dbus)?;
-                    let active = match &path {
-                        Some(p) => String::try_from(
-                            self.property(p, UNIT_IFACE, "ActiveState")
-                                .await
-                                .map_err(dbus)?,
-                        )
-                        .map_err(|e| dbus(e.into()))?,
-                        None => String::new(),
-                    };
-                    if active == "active"
-                        && let Some(pid) = self.main_pid(spec.job).await.map_err(dbus)?
-                    {
+            let path = self.unit_path(&spec.unit).await.map_err(dbus)?;
+            let active = match &path {
+                Some(p) => self.string_prop(p, UNIT_IFACE, "ActiveState").await?,
+                None => "gone".to_owned(),
+            };
+            match active.as_str() {
+                "active" => {
+                    if let Some(pid) = self.main_pid(&spec.unit).await? {
                         return Ok(pid);
                     }
                 }
-                state => {
-                    let _ = self.release(spec.job).await;
-                    return Err(LaunchError::new(
-                        HelperErrorCode::Internal,
-                        format!("criu restore failed ({state:?})"),
-                    ));
+                "activating" | "reloading" => {}
+                other => {
+                    let _ = self.release(&spec.unit).await;
+                    return Err(LaunchError::internal(format!(
+                        "criu restore failed (unit {other}); see journalctl -u {}",
+                        spec.unit
+                    )));
                 }
             }
             if Instant::now() >= deadline {
-                let _ = self.release(spec.job).await;
+                let _ = self.release(&spec.unit).await;
                 return Err(LaunchError::internal("criu restore timed out"));
             }
             tokio::time::sleep(POLL).await;
         }
     }
 
-    async fn init_pid(&self, job: JobId, kind: UnitKind) -> LaunchResult<Option<u32>> {
-        if self.unit_state(job).await? != UnitState::Running {
+    async fn init_pid(&self, unit: &str, kind: UnitKind) -> LaunchResult<Option<u32>> {
+        if self.unit_state(unit).await? != UnitState::Running {
             return Ok(None);
         }
-        let Some(main) = self.main_pid(job).await.map_err(dbus)? else {
+        let Some(main) = self.main_pid(unit).await? else {
             return Ok(None);
         };
         match kind {
@@ -358,19 +368,12 @@ impl Launcher for SystemdLauncher {
         }
     }
 
-    async fn unit_state(&self, job: JobId) -> LaunchResult<UnitState> {
-        let Some(path) = self.unit_path(job).await.map_err(dbus)? else {
+    async fn unit_state(&self, unit: &str) -> LaunchResult<UnitState> {
+        let Some(path) = self.unit_path(unit).await.map_err(dbus)? else {
             return Ok(UnitState::Gone);
         };
-        let get_str = |iface: &'static str, name: &'static str| {
-            let path = path.clone();
-            async move {
-                let v = self.property(&path, iface, name).await?;
-                Ok::<String, zbus::Error>(String::try_from(v)?)
-            }
-        };
-        let active = get_str(UNIT_IFACE, "ActiveState").await.map_err(dbus)?;
-        let sub = get_str(UNIT_IFACE, "SubState").await.map_err(dbus)?;
+        let active = self.string_prop(&path, UNIT_IFACE, "ActiveState").await?;
+        let sub = self.string_prop(&path, UNIT_IFACE, "SubState").await?;
         let running = match active.as_str() {
             "activating" | "reloading" | "deactivating" | "refreshing" => true,
             "active" => sub != "exited",
@@ -379,23 +382,14 @@ impl Launcher for SystemdLauncher {
         if running {
             return Ok(UnitState::Running);
         }
-        let code: i32 = self
-            .property(&path, SERVICE_IFACE, "ExecMainCode")
-            .await
-            .map_err(dbus)?
-            .try_into()
-            .map_err(|e: zbus::zvariant::Error| dbus(e.into()))?;
-        let status: i32 = self
-            .property(&path, SERVICE_IFACE, "ExecMainStatus")
-            .await
-            .map_err(dbus)?
-            .try_into()
-            .map_err(|e: zbus::zvariant::Error| dbus(e.into()))?;
+        let code = self.int_prop(&path, "ExecMainCode").await?;
+        let status = self.int_prop(&path, "ExecMainStatus").await?;
         Ok(UnitState::Exited(exit_status_from_systemd(code, status)))
     }
 
-    async fn signal(&self, job: JobId, signal: i32) -> LaunchResult<()> {
-        self.manager_call::<_, ()>("KillUnit", &(unit_name(job), "all", signal))
+    async fn signal(&self, unit: &str, sig: i32) -> LaunchResult<()> {
+        let whom = signal_target(sig);
+        self.manager_call::<_, ()>("KillUnit", &(unit, whom, sig))
             .await
             .map_err(|e| {
                 if is_no_such_unit(&e) {
@@ -406,25 +400,36 @@ impl Launcher for SystemdLauncher {
             })
     }
 
-    async fn release(&self, job: JobId) -> LaunchResult<()> {
+    async fn release(&self, unit: &str) -> LaunchResult<()> {
         match self
-            .manager_call::<_, OwnedObjectPath>("StopUnit", &(unit_name(job), "replace"))
+            .manager_call::<_, OwnedObjectPath>("StopUnit", &(unit, "replace"))
             .await
         {
             Ok(_) => {}
             Err(e) if is_no_such_unit(&e) => return Ok(()),
             Err(e) => return Err(dbus(e)),
         }
-        self.wait_until_gone(job, self.job_stop_timeout + Duration::from_secs(10))
-            .await?;
-        // A failed unit stays loaded until reset; ignore "not loaded".
+        let deadline = Instant::now() + self.job_stop_timeout + Duration::from_secs(10);
+        loop {
+            match self.unit_state(unit).await? {
+                UnitState::Gone | UnitState::Exited(_) => break,
+                UnitState::Running if Instant::now() >= deadline => {
+                    return Err(LaunchError::internal(format!(
+                        "{unit} did not stop within {:?}",
+                        self.job_stop_timeout
+                    )));
+                }
+                UnitState::Running => tokio::time::sleep(POLL).await,
+            }
+        }
+        // A dumped unit ends `failed` (137); forget it.
         let _ = self
-            .manager_call::<_, ()>("ResetFailedUnit", &(unit_name(job),))
+            .manager_call::<_, ()>("ResetFailedUnit", &(unit,))
             .await;
         Ok(())
     }
 
-    async fn list(&self) -> LaunchResult<Vec<JobId>> {
+    async fn list(&self) -> LaunchResult<Vec<String>> {
         type UnitRow = (
             String,
             String,
@@ -445,10 +450,32 @@ impl Launcher for SystemdLauncher {
             )
             .await
             .map_err(dbus)?;
-        let mut jobs: Vec<JobId> = rows.iter().filter_map(|r| parse_unit_name(&r.0)).collect();
-        jobs.sort();
-        jobs.dedup();
-        Ok(jobs)
+        let mut units: Vec<String> = rows
+            .into_iter()
+            .map(|r| r.0)
+            .filter(|n| parse_unit_name(n).is_some())
+            .collect();
+        units.sort();
+        units.dedup();
+        Ok(units)
+    }
+
+    async fn system_stopping(&self) -> LaunchResult<bool> {
+        let v = self
+            .property(MANAGER_PATH, MANAGER, "SystemState")
+            .await
+            .map_err(dbus)?;
+        let state = String::try_from(v).map_err(|e| dbus(e.into()))?;
+        Ok(state == "stopping")
+    }
+}
+
+/// `KillUnit`'s `whom`: signals the shim can forward go to the main
+/// process only; those it cannot (STOP, CONT, KILL) go to every process.
+pub fn signal_target(sig: i32) -> &'static str {
+    match sig {
+        signal::SIGSTOP | signal::SIGCONT | signal::SIGKILL => "all",
+        _ => "main",
     }
 }
 
@@ -503,6 +530,14 @@ mod tests {
             Some(ExitStatus::Signaled { signal: 9 })
         );
         assert_eq!(exit_status_from_systemd(0, 0), None);
+    }
+
+    #[test]
+    fn routes_signals() {
+        assert_eq!(signal_target(signal::SIGTERM), "main");
+        assert_eq!(signal_target(signal::SIGINT), "main");
+        assert_eq!(signal_target(signal::SIGSTOP), "all");
+        assert_eq!(signal_target(signal::SIGKILL), "all");
     }
 
     #[test]

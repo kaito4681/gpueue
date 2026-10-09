@@ -27,7 +27,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch;
 
-type TestHelper = Helper<Arc<FakeLauncher>, FakeHost>;
+type TestHelper = Helper<Arc<FakeLauncher>, Arc<FakeHost>>;
 
 fn uid() -> u32 {
     let uid = nix::unistd::getuid().as_raw();
@@ -43,6 +43,7 @@ struct Env {
     _tmp: tempfile::TempDir,
     root: PathBuf,
     launcher: Arc<FakeLauncher>,
+    host: Arc<FakeHost>,
     exec: Arc<Mutex<FakeExecState>>,
     helper: Arc<TestHelper>,
     stop: watch::Sender<bool>,
@@ -58,11 +59,22 @@ impl Env {
         let root = tmp.path().to_owned();
         let launcher = Arc::new(FakeLauncher::new());
         let exec = Arc::new(Mutex::new(FakeExecState::default()));
-        let (helper, stop) = start(&root, daemon_uid, launcher.clone(), exec.clone()).await;
+        let host = Arc::new(FakeHost::default());
+        host.add_user(uid(), "tester", gid(), &[gid()]);
+        host.set_mount_points(vec!["/".into(), "/proc".into(), "/tmp".into()]);
+        let (helper, stop) = start(
+            &root,
+            daemon_uid,
+            launcher.clone(),
+            host.clone(),
+            exec.clone(),
+        )
+        .await;
         Self {
             _tmp: tmp,
             root,
             launcher,
+            host,
             exec,
             helper,
             stop,
@@ -72,8 +84,14 @@ impl Env {
     /// Simulate a helper restart on the same state and units.
     async fn restart(&mut self) {
         let _ = self.stop.send(true);
-        let (helper, stop) =
-            start(&self.root, uid(), self.launcher.clone(), self.exec.clone()).await;
+        let (helper, stop) = start(
+            &self.root,
+            uid(),
+            self.launcher.clone(),
+            self.host.clone(),
+            self.exec.clone(),
+        )
+        .await;
         self.helper = helper;
         self.stop = stop;
     }
@@ -129,10 +147,9 @@ async fn start(
     root: &Path,
     daemon_uid: u32,
     launcher: Arc<FakeLauncher>,
+    host: Arc<FakeHost>,
     exec: Arc<Mutex<FakeExecState>>,
 ) -> (Arc<TestHelper>, watch::Sender<bool>) {
-    let host = FakeHost::default();
-    host.add_user(uid(), "tester", gid(), &[gid()]);
     let factory: ExecutorFactory =
         Arc::new(move || Box::new(FakeExecutor(exec.clone())) as Box<dyn Executor + Send>);
     let cfg = config(root, daemon_uid);
@@ -452,6 +469,8 @@ async fn checkpoint_then_restore() {
         HelperErrorCode::InvalidRequest
     );
 
+    // Manual mode: the job's init (host PID 10001, ns PID 1) uses CUDA.
+    env.host.set_cuda_pids(vec![10_001]);
     let image_dir = env.base().join("3");
     let r = c
         .request(Request::Checkpoint {
@@ -474,16 +493,21 @@ async fn checkpoint_then_restore() {
     let DirStatus::Complete(meta) = dir.status() else {
         panic!("{:?}", dir.status())
     };
-    assert_eq!(meta.mode, CudaMode::Plugin);
+    assert_eq!(meta.mode, CudaMode::Manual);
+    assert_eq!(meta.cuda_ns_pids, [1]);
     assert!(c.running().await.is_empty());
-    assert!(env.launcher.unit(job).is_none());
-    assert!(
-        env.exec
-            .lock()
-            .unwrap()
-            .actions
-            .contains(&Some(Action::CriuDump { root_pid: 10_001 }))
+    assert!(env.launcher.unit(job).is_none(), "dumped unit released");
+    assert_eq!(
+        std::mem::take(&mut env.exec.lock().unwrap().actions),
+        [
+            None,
+            Some(Action::CudaLock { pid: 10_001 }),
+            Some(Action::CudaCheckpoint { pid: 10_001 }),
+            Some(Action::CriuDump { root_pid: 10_001 }),
+        ]
     );
+    // No job_exited for a dumped job.
+    c.no_event().await;
 
     // A checkpointed job cannot be spawned again.
     assert_eq!(
@@ -503,6 +527,16 @@ async fn checkpoint_then_restore() {
         err_code(&c.request(restore(uid() + 1)).await),
         HelperErrorCode::PermissionDenied
     );
+    // A mount point of the job's namespace that no longer exists is
+    // reported before criu would fail on it.
+    let mounts = dir.root().join(puzuz_helper::engine::MOUNTS_FILE);
+    let saved = std::fs::read(&mounts).unwrap();
+    std::fs::write(&mounts, br#"["/", "/run/gone-after-reboot"]"#).unwrap();
+    assert_eq!(
+        err_code(&c.request(restore(uid())).await),
+        HelperErrorCode::InvalidRequest
+    );
+    std::fs::write(&mounts, saved).unwrap();
     assert_eq!(c.request(restore(uid())).await, ResponseResult::Accepted);
     let ev = c.event().await;
     let Event::RestoreFinished {
@@ -520,6 +554,17 @@ async fn checkpoint_then_restore() {
         "image removed after restore"
     );
     let restored = env.launcher.restored();
+    assert_eq!(restored[0].unit, "puzuz-job-3-r1.service");
+    assert!(restored[0].command.has_arg("--manage-cgroups=ignore"));
+    // The CUDA state is restored into the new host PID of ns PID 1.
+    assert_eq!(
+        env.exec.lock().unwrap().actions,
+        [
+            None,
+            Some(Action::CudaRestore { pid }),
+            Some(Action::CudaUnlock { pid }),
+        ]
+    );
     assert!(restored[0].command.has_arg("--restore-detached"));
     assert_eq!(restored[0].pidfile, dir.restore_pidfile());
 

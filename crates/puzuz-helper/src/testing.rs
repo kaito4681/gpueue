@@ -19,6 +19,8 @@ pub struct FakeHost {
     users: Mutex<BTreeMap<u32, UserInfo>>,
     gpus: Mutex<GpuSnapshot>,
     available: Mutex<Option<u64>>,
+    cuda: Mutex<Vec<u32>>,
+    mounts: Mutex<Vec<String>>,
 }
 
 impl FakeHost {
@@ -35,6 +37,16 @@ impl FakeHost {
 
     pub fn set_gpus(&self, snap: GpuSnapshot) {
         *self.gpus.lock().unwrap() = snap;
+    }
+
+    /// Host PIDs reported as using CUDA.
+    pub fn set_cuda_pids(&self, pids: Vec<u32>) {
+        *self.cuda.lock().unwrap() = pids;
+    }
+
+    /// Mount points reported for every job.
+    pub fn set_mount_points(&self, mounts: Vec<String>) {
+        *self.mounts.lock().unwrap() = mounts;
     }
 
     pub fn set_available(&self, bytes: u64) {
@@ -71,12 +83,12 @@ impl HostProbe for FakeHost {
         Ok(self.users.lock().unwrap().get(&uid).cloned())
     }
 
-    fn ensure_root_bind(&self, _path: &Path) -> io::Result<()> {
-        Ok(())
+    fn cuda_pids(&self, _host_pids: &[u32]) -> io::Result<Vec<u32>> {
+        Ok(self.cuda.lock().unwrap().clone())
     }
 
-    fn release_root_bind(&self, _path: &Path) -> io::Result<()> {
-        Ok(())
+    fn mount_points(&self, _pid: u32) -> io::Result<Vec<String>> {
+        Ok(self.mounts.lock().unwrap().clone())
     }
 }
 

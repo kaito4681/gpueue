@@ -6,8 +6,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use puzuz_checkpoint::command::{CudaCheckpointOptions, cuda_get_state};
 use puzuz_checkpoint::exec::run_with_timeout;
-use puzuz_checkpoint::{CommandSpec, procfs, space};
+use puzuz_checkpoint::{CommandSpec, probe, procfs, space};
 
 /// One process of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,10 +60,38 @@ pub trait HostProbe: Send + Sync + 'static {
     /// Map inner PIDs of the namespace of `ns_member` to host PIDs.
     fn resolve_ns_pids(&self, ns_member: u32, wanted: &[u32]) -> Result<Vec<u32>, String>;
     fn lookup_user(&self, uid: u32) -> io::Result<Option<UserInfo>>;
-    /// Make sure `path` is a bind mount of `/` (for `criu restore --root`).
-    fn ensure_root_bind(&self, path: &Path) -> io::Result<()>;
-    /// Undo [`HostProbe::ensure_root_bind`] (lazy unmount).
-    fn release_root_bind(&self, path: &Path) -> io::Result<()>;
+    /// Which of `host_pids` use CUDA: every process that answers
+    /// `cuda-checkpoint --get-state` (the job must not be stopped).
+    fn cuda_pids(&self, host_pids: &[u32]) -> io::Result<Vec<u32>>;
+    /// Mount points in the mount namespace of `pid`.
+    fn mount_points(&self, pid: u32) -> io::Result<Vec<String>>;
+}
+
+impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
+    fn job_processes(&self, init_pid: u32) -> io::Result<Vec<ProcInfo>> {
+        (**self).job_processes(init_pid)
+    }
+    fn gpu_snapshot(&self) -> io::Result<GpuSnapshot> {
+        (**self).gpu_snapshot()
+    }
+    fn available_bytes(&self, path: &Path) -> io::Result<u64> {
+        (**self).available_bytes(path)
+    }
+    fn is_tmpfs(&self, path: &Path) -> io::Result<bool> {
+        (**self).is_tmpfs(path)
+    }
+    fn resolve_ns_pids(&self, ns_member: u32, wanted: &[u32]) -> Result<Vec<u32>, String> {
+        (**self).resolve_ns_pids(ns_member, wanted)
+    }
+    fn lookup_user(&self, uid: u32) -> io::Result<Option<UserInfo>> {
+        (**self).lookup_user(uid)
+    }
+    fn cuda_pids(&self, host_pids: &[u32]) -> io::Result<Vec<u32>> {
+        (**self).cuda_pids(host_pids)
+    }
+    fn mount_points(&self, pid: u32) -> io::Result<Vec<String>> {
+        (**self).mount_points(pid)
+    }
 }
 
 /// The real host.
@@ -71,14 +100,19 @@ pub struct SystemHost {
     pub proc_root: PathBuf,
     pub nvidia_smi: PathBuf,
     pub nvidia_smi_timeout: Duration,
+    pub cuda_checkpoint: CudaCheckpointOptions,
+    /// Outer timeout of one `cuda-checkpoint --get-state`.
+    pub get_state_timeout: Duration,
 }
 
 impl SystemHost {
-    pub fn new(nvidia_smi: PathBuf) -> Self {
+    pub fn new(nvidia_smi: PathBuf, cuda_checkpoint: CudaCheckpointOptions) -> Self {
         Self {
             proc_root: PathBuf::from("/proc"),
             nvidia_smi,
             nvidia_smi_timeout: Duration::from_secs(30),
+            cuda_checkpoint,
+            get_state_timeout: Duration::from_secs(10),
         }
     }
 
@@ -167,37 +201,38 @@ impl HostProbe for SystemHost {
         }))
     }
 
-    fn ensure_root_bind(&self, path: &Path) -> io::Result<()> {
-        let mountinfo = fs::read_to_string(self.proc_root.join("self/mountinfo"))?;
-        if is_mount_point(&mountinfo, path) {
-            return Ok(());
+    fn cuda_pids(&self, host_pids: &[u32]) -> io::Result<Vec<u32>> {
+        let mut out = Vec::new();
+        for &pid in host_pids {
+            // cuda-checkpoint hangs on stopped/frozen processes.
+            if procfs::check_runnable(&self.proc_root, Path::new("/sys/fs/cgroup"), pid)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return Err(io::Error::other(format!(
+                    "process {pid} is stopped or frozen"
+                )));
+            }
+            let spec = cuda_get_state(&self.cuda_checkpoint, pid);
+            // Processes without CUDA make cuda-checkpoint fail.
+            if let Ok(o) =
+                run_with_timeout(&spec, self.get_state_timeout, Duration::from_millis(20))
+                && probe::parse_cuda_state(&o.stdout).is_some()
+            {
+                out.push(pid);
+            }
         }
-        fs::create_dir_all(path)?;
-        // Never mount over something a less privileged user could have
-        // swapped in.
-        let meta = fs::symlink_metadata(path)?;
-        if !meta.is_dir() || std::os::unix::fs::MetadataExt::uid(&meta) != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} is not a root-owned directory", path.display()),
-            ));
-        }
-        nix::mount::mount(
-            Some("/"),
-            path,
-            None::<&str>,
-            nix::mount::MsFlags::MS_BIND,
-            None::<&str>,
-        )
-        .map_err(io::Error::from)
+        Ok(out)
     }
 
-    fn release_root_bind(&self, path: &Path) -> io::Result<()> {
-        let mountinfo = fs::read_to_string(self.proc_root.join("self/mountinfo"))?;
-        if !is_mount_point(&mountinfo, path) {
-            return Ok(());
-        }
-        nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH).map_err(io::Error::from)
+    fn mount_points(&self, pid: u32) -> io::Result<Vec<String>> {
+        let mi = fs::read_to_string(self.proc_root.join(pid.to_string()).join("mountinfo"))?;
+        Ok(mi
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(4))
+            .map(crate::shim::unescape_octal)
+            .collect())
     }
 }
 

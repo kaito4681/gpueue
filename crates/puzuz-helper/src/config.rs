@@ -3,7 +3,24 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use puzuz_checkpoint::CheckpointConfig;
+use puzuz_checkpoint::{CheckpointConfig, CudaMode};
+
+use crate::jobs::MountPlan;
+
+/// Manual CUDA mode (the helper calls `cuda-checkpoint` itself) works with
+/// the distribution's criu without the CUDA plugin (docker-systemd-poc.md
+/// §4); `--manage-cgroups=ignore` keeps a restored tree in its restore
+/// unit's cgroup.
+pub fn default_checkpoint_config() -> CheckpointConfig {
+    let mut c = CheckpointConfig {
+        mode: CudaMode::Manual,
+        ..CheckpointConfig::default()
+    };
+    c.criu
+        .extra_restore_args
+        .push("--manage-cgroups=ignore".into());
+    c
+}
 
 /// Default directory for the helper's own state (event queue, job records).
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/puzuz/helper";
@@ -36,6 +53,8 @@ pub struct HelperConfig {
     /// job's mount namespace). `None` disables `--root`.
     pub criu_root: Option<PathBuf>,
     pub checkpoint: CheckpointConfig,
+    /// How the shim cleans each job's mount namespace.
+    pub mounts: MountPlan,
     /// How often running jobs are polled for exit.
     pub poll_interval: Duration,
     /// How long a spawn may take until the job's shim reports back.
@@ -59,7 +78,8 @@ impl Default for HelperConfig {
             checkpoint_base: PathBuf::from(DEFAULT_CHECKPOINT_BASE),
             log_base: PathBuf::from(DEFAULT_LOG_BASE),
             criu_root: Some(PathBuf::from(DEFAULT_CRIU_ROOT)),
-            checkpoint: CheckpointConfig::default(),
+            checkpoint: default_checkpoint_config(),
+            mounts: MountPlan::default(),
             poll_interval: Duration::from_secs(1),
             spawn_timeout: Duration::from_secs(30),
             job_stop_timeout: Duration::from_secs(30),

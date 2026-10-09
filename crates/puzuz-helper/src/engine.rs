@@ -31,12 +31,17 @@ use crate::config::{HelperConfig, SHUTDOWN_MANIFEST};
 use crate::events::EventStore;
 use crate::host::HostProbe;
 use crate::jobs::{self, JobFiles, JobRecord, RecordPhase, ShimSpec, UnitKind};
-use crate::launcher::{LaunchError, LaunchSpec, Launcher, RestoreSpec, UnitState};
+use crate::launcher::{
+    LaunchError, LaunchSpec, Launcher, RestoreSpec, UnitState, restore_unit_name, unit_name,
+};
 use crate::validate::{self, Rejection};
 
 /// File in a checkpoint directory recording the job's owner, so a restore
 /// can check it without trusting the daemon.
 pub const OWNER_FILE: &str = "helper-job.json";
+/// File in a checkpoint directory listing the mount points of the job's
+/// mount namespace at dump time; a restore needs all of them to exist.
+pub const MOUNTS_FILE: &str = "helper-mounts.json";
 
 /// Creates an [`Executor`] for one checkpoint or restore.
 pub type ExecutorFactory = Arc<dyn Fn() -> Box<dyn Executor + Send> + Send + Sync>;
@@ -310,6 +315,8 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             no_checkpoint: req.no_checkpoint,
             phase: RecordPhase::Live,
             unit_kind: UnitKind::Spawned,
+            unit: unit_name(req.job),
+            restores: 0,
         };
         {
             let mut table = self.table();
@@ -363,7 +370,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         let internal =
             |what: &str, e: io::Error| error(HelperErrorCode::Internal, format!("{what}: {e}"));
         files
-            .prepare(req.uid, req.gid, false)
+            .prepare(false)
             .map_err(|e| internal("preparing job files", e))?;
         self.ensure_log_dir(req)
             .map_err(|e| internal("preparing the log directory", e))?;
@@ -381,30 +388,31 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         );
         envs.insert("CUDA_DEVICE_ORDER".into(), "PCI_BUS_ID".into());
         files
-            .write_spec(
-                &ShimSpec {
-                    argv: argv.clone(),
-                    envs: envs.clone(),
-                    cwd: req.cwd.clone(),
-                    log_path: req.log_path.clone(),
-                    log_mode: if self.is_managed_log(req) {
-                        0o660
-                    } else {
-                        0o640
-                    },
+            .write_spec(&ShimSpec {
+                uid: creds.uid.0,
+                gid: creds.gid.0,
+                groups: creds
+                    .groups
+                    .as_ref()
+                    .map(|g| g.iter().map(|g| g.0).collect()),
+                mounts: self.cfg.mounts.clone(),
+                argv: argv.clone(),
+                envs: envs.clone(),
+                cwd: req.cwd.clone(),
+                log_path: req.log_path.clone(),
+                log_mode: if self.is_managed_log(req) {
+                    0o660
+                } else {
+                    0o640
                 },
-                req.uid,
-                req.gid,
-            )
+            })
             .map_err(|e| internal("writing the job spec", e))?;
         files
             .write_record(record)
             .map_err(|e| internal("writing the job record", e))?;
         let spec = LaunchSpec {
             job: req.job,
-            uid: creds.uid,
-            gid: creds.gid,
-            groups: creds.groups.clone(),
+            unit: record.unit.clone(),
             files: files.clone(),
             argv,
             envs,
@@ -463,17 +471,21 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 format!("invalid signal {sig}"),
             );
         }
-        match self.table().get(&job).map(|e| e.phase) {
+        let unit = match self
+            .table()
+            .get(&job)
+            .map(|e| (e.phase, e.record.unit.clone()))
+        {
             None => {
                 return error(
                     HelperErrorCode::JobNotFound,
                     format!("job {} is not running", job.0),
                 );
             }
-            Some(Phase::Running | Phase::Stopped) => {}
+            Some((Phase::Running | Phase::Stopped, unit)) => unit,
             Some(_) => return error(HelperErrorCode::Busy, format!("job {} is busy", job.0)),
-        }
-        if let Err(e) = self.launcher.signal(job, sig).await {
+        };
+        if let Err(e) = self.launcher.signal(&unit, sig).await {
             return e.into();
         }
         if let Some(e) = self.table().get_mut(&job) {
@@ -533,11 +545,11 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
     // -- exit monitoring --------------------------------------------------
 
     /// How a job ended, or `None` while it runs.
-    async fn probe_exit(&self, job: JobId, files: &JobFiles) -> Option<ExitStatus> {
+    async fn probe_exit(&self, unit: &str, files: &JobFiles) -> Option<ExitStatus> {
         if let Some(s) = files.read_exit_status() {
             return Some(s);
         }
-        let unit = match self.launcher.unit_state(job).await {
+        let unit = match self.launcher.unit_state(unit).await {
             Ok(UnitState::Running) | Err(_) => return None,
             Ok(UnitState::Exited(s)) => s,
             Ok(UnitState::Gone) => None,
@@ -553,14 +565,14 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
 
     /// Report jobs that have exited. Called periodically.
     pub async fn poll_exits(&self) {
-        let candidates: Vec<(JobId, JobFiles)> = self
+        let candidates: Vec<(JobId, String, JobFiles)> = self
             .table()
             .iter()
             .filter(|(_, e)| matches!(e.phase, Phase::Running | Phase::Stopped))
-            .map(|(id, e)| (*id, e.files.clone()))
+            .map(|(id, e)| (*id, e.record.unit.clone(), e.files.clone()))
             .collect();
-        for (job, files) in candidates {
-            let Some(status) = self.probe_exit(job, &files).await else {
+        for (job, unit, files) in candidates {
+            let Some(status) = self.probe_exit(&unit, &files).await else {
                 continue;
             };
             {
@@ -574,13 +586,13 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 }
                 table.remove(&job);
             }
-            self.finish_exited(job, &files, status).await;
+            self.finish_exited(job, &unit, &files, status).await;
         }
     }
 
-    async fn finish_exited(&self, job: JobId, files: &JobFiles, status: ExitStatus) {
+    async fn finish_exited(&self, job: JobId, unit: &str, files: &JobFiles, status: ExitStatus) {
         self.emit(Event::JobExited { job, status });
-        if let Err(e) = self.launcher.release(job).await {
+        if let Err(e) = self.launcher.release(unit).await {
             eprintln!("puzuz-helper: releasing job {}: {e}", job.0);
         }
         let _ = files.remove();
@@ -608,24 +620,24 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         let mut known = Vec::new();
         for (files, mut record) in records {
             let job = record.job;
-            known.push(job);
-            let state = match self.launcher.unit_state(job).await {
-                Ok(s) => s,
-                Err(e) => {
-                    return Err(io::Error::other(format!(
-                        "querying the unit of job {}: {e}",
-                        job.0
-                    )));
-                }
-            };
+            known.push(record.unit.clone());
+            let state = self
+                .launcher
+                .unit_state(&record.unit)
+                .await
+                .map_err(|e| io::Error::other(format!("querying {}: {e}", record.unit)))?;
             if record.phase == RecordPhase::Checkpointed {
-                if state == UnitState::Running {
+                if state == UnitState::Running && record.restores > 0 {
                     // A restore finished but the helper died before
                     // recording it.
                     record.phase = RecordPhase::Live;
                     record.unit_kind = UnitKind::Restored;
                     files.write_record(&record)?;
                 } else {
+                    // The dumped (failed) unit or a failed restore unit.
+                    if state != UnitState::Gone {
+                        let _ = self.launcher.release(&record.unit).await;
+                    }
                     let dir = CheckpointDir::for_job(&self.cfg.checkpoint_base, job.0);
                     if !matches!(dir.status(), DirStatus::Complete(_)) {
                         let _ = files.remove();
@@ -637,7 +649,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 UnitState::Running => {
                     let pid = self
                         .launcher
-                        .init_pid(job, record.unit_kind)
+                        .init_pid(&record.unit, record.unit_kind)
                         .await
                         .ok()
                         .flatten();
@@ -653,19 +665,16 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 }
                 UnitState::Exited(_) | UnitState::Gone => {
                     let status = self
-                        .probe_exit(job, &files)
+                        .probe_exit(&record.unit, &files)
                         .await
                         .unwrap_or(ExitStatus::Unknown);
-                    self.finish_exited(job, &files, status).await;
+                    self.finish_exited(job, &record.unit, &files, status).await;
                 }
             }
         }
         if let Ok(units) = self.launcher.list().await {
-            for job in units.into_iter().filter(|j| !known.contains(j)) {
-                eprintln!(
-                    "puzuz-helper: unit of job {} has no helper record; leaving it alone",
-                    job.0
-                );
+            for unit in units.into_iter().filter(|u| !known.contains(u)) {
+                eprintln!("puzuz-helper: {unit} has no helper record; leaving it alone");
             }
         }
         for (id, status) in layout::scan(&self.cfg.checkpoint_base)? {
@@ -743,6 +752,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 reason: "job vanished".into(),
             };
         };
+        let unit = entry.record.unit.clone();
         let restore_phase = |this: &Self| {
             if let Some(e) = this.table().get_mut(&job) {
                 e.phase = if was_stopped {
@@ -753,13 +763,13 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             }
         };
         // cuda-checkpoint hangs on stopped processes.
-        if was_stopped && let Err(e) = self.launcher.signal(job, signal::SIGCONT).await {
+        if was_stopped && let Err(e) = self.launcher.signal(&unit, signal::SIGCONT).await {
             restore_phase(self);
             return CheckpointOutcome::Failed {
                 reason: format!("resuming the stopped job: {e}"),
             };
         }
-        let init_pid = match self.launcher.init_pid(job, entry.record.unit_kind).await {
+        let init_pid = match self.launcher.init_pid(&unit, entry.record.unit_kind).await {
             Ok(Some(pid)) => pid,
             Ok(None) => {
                 restore_phase(self);
@@ -793,15 +803,17 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
 
         match result {
             Ok(meta) => {
-                if let Err(e) = self.launcher.release(job).await {
-                    eprintln!("puzuz-helper: releasing job {} after dump: {e}", job.0);
-                }
+                // Record the dump first: the dumped unit ends `failed`
+                // (137), which must not be mistaken for the job failing.
                 let mut record = entry.record;
                 record.phase = RecordPhase::Checkpointed;
                 if let Err(e) = entry.files.write_record(&record) {
                     eprintln!("puzuz-helper: recording checkpoint of job {}: {e}", job.0);
                 }
                 self.table().remove(&job);
+                if let Err(e) = self.launcher.release(&unit).await {
+                    eprintln!("puzuz-helper: releasing {unit} after dump: {e}");
+                }
                 CheckpointOutcome::Success {
                     image_size_bytes: meta.size_bytes,
                 }
@@ -809,7 +821,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             Err(reason) => {
                 restore_phase(self);
                 if was_stopped {
-                    let _ = self.launcher.signal(job, signal::SIGSTOP).await;
+                    let _ = self.launcher.signal(&unit, signal::SIGSTOP).await;
                 }
                 CheckpointOutcome::Failed { reason }
             }
@@ -885,6 +897,22 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             ));
         }
         validate::check_credentials(&*self.host, record.uid, record.gid, None)?;
+        // CRIU fails with "Can't stat mountpoint" / "Failed to open_tree"
+        // when a mount point of the job's namespace is gone (e.g. under a
+        // /run that was rebuilt at boot); say so up front.
+        if let Ok(bytes) = fs::read(dir.root().join(MOUNTS_FILE)) {
+            let mounts: Vec<String> = serde_json::from_slice(&bytes).unwrap_or_default();
+            let missing: Vec<&String> = mounts
+                .iter()
+                .filter(|m| fs::symlink_metadata(m).is_err())
+                .collect();
+            if !missing.is_empty() {
+                return Err(error(
+                    HelperErrorCode::InvalidRequest,
+                    format!("mount points of the checkpoint are missing on this host: {missing:?}"),
+                ));
+            }
+        }
 
         if !meta.gpus.is_empty() {
             let snap = self
@@ -946,14 +974,18 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             RestoreOutcome::Failed { reason }
         };
         let dir = CheckpointDir::for_job(&self.cfg.checkpoint_base, job.0);
-        if let Err(e) = files.prepare(record.uid, record.gid, true) {
+        if let Err(e) = files.prepare(true) {
             return fail(self, format!("preparing job files: {e}"));
         }
-        if let Some(root) = &self.cfg.criu_root
-            && let Err(e) = self.host.ensure_root_bind(root)
-        {
-            return fail(self, format!("bind-mounting / at {}: {e}", root.display()));
+        // Name the new unit before starting it, so a helper crash during
+        // the restore can find it again.
+        record.restores += 1;
+        record.unit = restore_unit_name(job, record.restores);
+        record.phase = RecordPhase::Checkpointed;
+        if let Err(e) = files.write_record(&record) {
+            return fail(self, format!("writing the job record: {e}"));
         }
+        let unit = record.unit.clone();
         let _ = fs::remove_file(dir.restore_pidfile());
         let ck = self.cfg.checkpoint.clone();
         let target = RestoreTarget {
@@ -976,19 +1008,13 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         };
         let spec = RestoreSpec {
             job,
+            unit: unit.clone(),
             command,
             pidfile: dir.restore_pidfile(),
             timeout,
+            criu_root: self.cfg.criu_root.clone(),
         };
-        let restored = self.launcher.restore(&spec).await;
-        // The restored mount namespace keeps its own copy; the host does not
-        // need the bind mount of / any more.
-        if let Some(root) = &self.cfg.criu_root
-            && let Err(e) = self.host.release_root_bind(root)
-        {
-            eprintln!("puzuz-helper: unmounting {}: {e}", root.display());
-        }
-        let pid = match restored {
+        let pid = match self.launcher.restore(&spec).await {
             Ok(pid) => pid,
             Err(e) => {
                 let summary = fs::read_to_string(dir.restore_log())
@@ -1019,8 +1045,8 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             if let Err(reason) = res {
                 // The tree runs without its GPU state: kill it. The image
                 // is still there.
-                let _ = self.launcher.signal(job, signal::SIGKILL).await;
-                let _ = self.launcher.release(job).await;
+                let _ = self.launcher.signal(&unit, signal::SIGKILL).await;
+                let _ = self.launcher.release(&unit).await;
                 return fail(self, reason);
             }
         }
@@ -1161,6 +1187,19 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     let mut meta = CheckpointMeta::new(record.job.0, now_ms(), ck.mode);
     let mut cuda_pids = Vec::new();
     if !record.gpus.is_empty() {
+        // Every process of the namespace that answers
+        // `cuda-checkpoint --get-state` uses CUDA (PoC: works for spawn
+        // DataLoader workers, which do not).
+        let all: Vec<u32> = procs.iter().map(|p| p.host_pid).collect();
+        for pid in host
+            .cuda_pids(&all)
+            .map_err(|e| format!("finding CUDA processes: {e}"))?
+        {
+            if let Some(p) = procs.iter().find(|p| p.host_pid == pid) {
+                cuda_pids.push(p.host_pid);
+                meta.cuda_ns_pids.push(p.ns_pid);
+            }
+        }
         let snap = host
             .gpu_snapshot()
             .map_err(|e| format!("querying GPUs: {e}"))?;
@@ -1175,16 +1214,16 @@ pub fn dump_job<H: HostProbe + ?Sized>(
                 model: g.model.clone(),
             })
             .collect();
+        // VRAM in use (for the free-space and restore checks).
         for app in &snap.compute_apps {
-            if let Some(p) = procs.iter().find(|p| p.host_pid == app.pid) {
-                if !cuda_pids.contains(&p.host_pid) {
-                    cuda_pids.push(p.host_pid);
-                    meta.cuda_ns_pids.push(p.ns_pid);
-                }
+            if procs.iter().any(|p| p.host_pid == app.pid) {
                 meta.vram_bytes += app.used_bytes;
             }
         }
     }
+    let mounts = host
+        .mount_points(init_pid)
+        .map_err(|e| format!("reading the job's mounts: {e}"))?;
     let available = host.available_bytes(base).map_err(|e| e.to_string())?;
     space::check_free_space(rss, meta.vram_bytes, available).map_err(|e| e.to_string())?;
 
@@ -1216,5 +1255,7 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     owner.phase = RecordPhase::Checkpointed;
     let owner_json = serde_json::to_vec_pretty(&owner).map_err(|e| e.to_string())?;
     write_atomic(&dir.root().join(OWNER_FILE), &owner_json).map_err(|e| e.to_string())?;
+    let mounts_json = serde_json::to_vec_pretty(&mounts).map_err(|e| e.to_string())?;
+    write_atomic(&dir.root().join(MOUNTS_FILE), &mounts_json).map_err(|e| e.to_string())?;
     dir.finalize(meta).map_err(|e| e.to_string())
 }

@@ -1,18 +1,16 @@
 //! Per-job files kept by the helper under `<state dir>/jobs/<id>/`.
 //!
 //! ```text
-//! job.json      JobRecord (root-only): owner, log path, phase
-//! spawn.json    ShimSpec for the shim: argv, env, cwd, log (owner, 0600)
-//! start.json    StartReport written by the shim once the job runs (owner)
-//! exit-status   ExitStatus written by the job's PID-namespace init (owner)
-//! init-status   ExitStatus of the init, written by the outer shim (owner)
+//! job.json      JobRecord: owner, log path, phase, current unit
+//! spawn.json    ShimSpec for the shim: credentials, argv, env, cwd, log
+//! start.json    StartReport written by the shim once the job runs
+//! exit-status   ExitStatus written by the job's PID-namespace init
+//! init-status   ExitStatus of the init, written by the outer shim
 //! ```
 //!
-//! The directory is root-owned (0711) so the owner can open the files the
-//! helper pre-created for them but cannot add or replace any. The owner can
-//! forge `start.json`, `exit-status` and `init-status` of their own job;
-//! nothing the helper does with root privileges trusts their contents
-//! (the job's PIDs are looked up through systemd and `/proc`).
+//! Everything is root-only (directory 0700, files 0600). The shim starts as
+//! root and opens `exit-status` and `start.json` before dropping to the
+//! job's owner, so the owner cannot forge them.
 //!
 //! `exit-status` is opened by the init and therefore part of the dumped
 //! process tree: CRIU reopens it by path on restore, so it must survive
@@ -49,6 +47,13 @@ pub struct JobRecord {
     pub phase: RecordPhase,
     /// How the job's current unit was started; decides where its init is.
     pub unit_kind: UnitKind,
+    /// The job's current unit (`puzuz-job-<id>.service`, or
+    /// `puzuz-job-<id>-r<n>.service` after the n-th restore). While a
+    /// restore is in progress this already names the restore unit.
+    pub unit: String,
+    /// How many times the job has been restored.
+    #[serde(default)]
+    pub restores: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,9 +75,46 @@ pub enum UnitKind {
     Restored,
 }
 
+/// Which mounts the shim removes or replaces in the job's mount namespace,
+/// so that it only contains mounts that also exist after a reboot (CRIU
+/// recreates the namespace on restore and fails on missing mount points or
+/// bind sources). See `docker-systemd-poc.md` §8.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountPlan {
+    /// Detach every mount at or below these paths. A trailing `/` means
+    /// "strictly below" (keep the path itself).
+    pub prune: Vec<String>,
+    /// Exceptions to `prune` (same syntax).
+    pub keep: Vec<String>,
+    /// Mount a private tmpfs here (its contents are saved in the image).
+    pub tmpfs: Vec<String>,
+}
+
+impl Default for MountPlan {
+    fn default() -> Self {
+        Self {
+            prune: vec![
+                "/run/".into(),
+                "/mnt/".into(),
+                "/media/".into(),
+                "/dev/shm".into(),
+            ],
+            keep: vec!["/run/nvidia-persistenced".into()],
+            tmpfs: vec!["/tmp".into(), "/dev/shm".into()],
+        }
+    }
+}
+
 /// Input of the shim, written by the helper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShimSpec {
+    /// The job's owner; the shim refuses 0.
+    pub uid: u32,
+    pub gid: u32,
+    /// Supplementary groups; `None` means `initgroups` for `uid`.
+    pub groups: Option<Vec<u32>>,
+    #[serde(default)]
+    pub mounts: MountPlan,
     pub argv: Vec<String>,
     pub envs: BTreeMap<String, String>,
     pub cwd: PathBuf,
@@ -146,15 +188,16 @@ impl JobFiles {
         self.dir.join(INIT_STATUS_FILE)
     }
 
-    /// Create the directory and the owner-writable files (empty). Existing
-    /// files are truncated, except `exit-status` when `keep_exit_status`
-    /// (a restore must reopen the very file the init had open).
-    pub fn prepare(&self, uid: Uid, gid: Gid, keep_exit_status: bool) -> io::Result<()> {
+    /// Create the directory and the status files (empty, root-only).
+    /// Existing files are truncated, except `exit-status` when
+    /// `keep_exit_status` (a restore must reopen the very file the init had
+    /// open).
+    pub fn prepare(&self, keep_exit_status: bool) -> io::Result<()> {
         fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o711)
+            .mode(0o700)
             .create(&self.dir)?;
-        fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o711))?;
+        fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
         for path in [self.start(), self.init_status(), self.exit_status()] {
             let keep = keep_exit_status && path == self.exit_status();
             let f = OpenOptions::new()
@@ -164,15 +207,13 @@ impl JobFiles {
                 .mode(0o600)
                 .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
                 .open(&path)?;
-            std::os::unix::fs::fchown(&f, Some(uid.0), Some(gid.0))?;
             f.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
         Ok(())
     }
 
-    /// Write the shim's input, readable only by the owner (it holds the
-    /// job's environment).
-    pub fn write_spec(&self, spec: &ShimSpec, uid: Uid, gid: Gid) -> io::Result<()> {
+    /// Write the shim's input (root-only: it holds the job's environment).
+    pub fn write_spec(&self, spec: &ShimSpec) -> io::Result<()> {
         let path = self.spec();
         let _ = fs::remove_file(&path);
         let mut f = OpenOptions::new()
@@ -182,14 +223,13 @@ impl JobFiles {
             .open(&path)?;
         f.write_all(&serde_json::to_vec(spec)?)?;
         f.sync_all()?;
-        std::os::unix::fs::fchown(&f, Some(uid.0), Some(gid.0))?;
         Ok(())
     }
 
     pub fn write_record(&self, record: &JobRecord) -> io::Result<()> {
         fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o711)
+            .mode(0o700)
             .create(&self.dir)?;
         write_atomic(&self.record(), &serde_json::to_vec_pretty(record)?)
     }
@@ -283,7 +323,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (uid, gid) = me();
         let files = JobFiles::new(tmp.path(), JobId(5));
-        files.prepare(uid, gid, false).unwrap();
+        files.prepare(false).unwrap();
         assert_eq!(files.read_exit_status(), None);
         let rec = JobRecord {
             job: JobId(5),
@@ -294,6 +334,8 @@ mod tests {
             no_checkpoint: false,
             phase: RecordPhase::Live,
             unit_kind: UnitKind::Spawned,
+            unit: "puzuz-job-5.service".into(),
+            restores: 0,
         };
         files.write_record(&rec).unwrap();
 
@@ -307,9 +349,9 @@ mod tests {
             Some(ExitStatus::Exited { code: 3 })
         );
         // keep_exit_status leaves it alone; otherwise it is truncated.
-        files.prepare(uid, gid, true).unwrap();
+        files.prepare(true).unwrap();
         assert!(files.read_exit_status().is_some());
-        files.prepare(uid, gid, false).unwrap();
+        files.prepare(false).unwrap();
         assert!(files.read_exit_status().is_none());
 
         let found = scan(tmp.path()).unwrap();

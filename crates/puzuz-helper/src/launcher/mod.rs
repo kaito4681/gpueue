@@ -4,9 +4,12 @@
 //! the service manager so they survive helper and daemon restarts and keep
 //! their exit status where the helper can find it again. [`Launcher`] hides
 //! how that is done; [`systemd::SystemdLauncher`] is the real one and
-//! [`fake::FakeLauncher`] is used in tests. Another mechanism (for example
-//! systemd's own `PrivatePIDs=` once it can be relied on, or a container
-//! runtime) can be added as a further implementation.
+//! [`fake::FakeLauncher`] is used in tests.
+//!
+//! Units are addressed by name: a job starts in `puzuz-job-<id>.service`
+//! and its n-th restore runs in `puzuz-job-<id>-r<n>.service` (a dumped
+//! unit ends `failed` and is reset, but a distinct name keeps the history
+//! unambiguous).
 
 pub mod fake;
 pub mod systemd;
@@ -17,7 +20,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use puzuz_checkpoint::CommandSpec;
-use puzuz_protocol::helper::{ExitStatus, Gid, HelperErrorCode, JobId, Uid};
+use puzuz_protocol::helper::{ExitStatus, HelperErrorCode, JobId};
 
 use crate::jobs::{JobFiles, UnitKind};
 
@@ -25,14 +28,11 @@ use crate::jobs::{JobFiles, UnitKind};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
     pub job: JobId,
-    pub uid: Uid,
-    pub gid: Gid,
-    /// `None`: the service manager looks the groups up for `uid`.
-    pub groups: Option<Vec<Gid>>,
-    /// The job's files; `spawn.json` is already written.
+    pub unit: String,
+    /// The job's files; `spawn.json` (credentials, command, environment)
+    /// is already written.
     pub files: JobFiles,
-    /// Only for logging/description; the shim reads the real input from
-    /// `spawn.json`.
+    /// For the unit description and tests; the shim reads `spawn.json`.
     pub argv: Vec<String>,
     pub envs: BTreeMap<String, String>,
 }
@@ -41,13 +41,17 @@ pub struct LaunchSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreSpec {
     pub job: JobId,
+    pub unit: String,
     /// `criu restore ... --restore-detached --pidfile <pidfile>`.
     pub command: CommandSpec,
     pub pidfile: PathBuf,
     pub timeout: Duration,
+    /// Where `/` is bind-mounted (in a private mount namespace) for
+    /// `criu restore --root`.
+    pub criu_root: Option<PathBuf>,
 }
 
-/// What the service manager knows about a job's unit.
+/// What the service manager knows about a unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitState {
     /// The unit's main process is alive.
@@ -87,27 +91,35 @@ pub trait Launcher: Send + Sync + 'static {
     /// the host PID of the job's PID-namespace init (the dump root).
     fn spawn(&self, spec: &LaunchSpec) -> impl Future<Output = LaunchResult<u32>> + Send;
 
-    /// Run `criu restore` in a new unit for the job and wait until the tree
-    /// runs. Returns the host PID of the restored init.
+    /// Run `criu restore` in a new unit and wait until the tree runs.
+    /// Returns the host PID of the restored init.
     fn restore(&self, spec: &RestoreSpec) -> impl Future<Output = LaunchResult<u32>> + Send;
 
-    /// Host PID of the job's init, if its unit runs.
+    /// Host PID of the job's init, if the unit runs.
     fn init_pid(
         &self,
-        job: JobId,
+        unit: &str,
         kind: UnitKind,
     ) -> impl Future<Output = LaunchResult<Option<u32>>> + Send;
 
-    fn unit_state(&self, job: JobId) -> impl Future<Output = LaunchResult<UnitState>> + Send;
+    fn unit_state(&self, unit: &str) -> impl Future<Output = LaunchResult<UnitState>> + Send;
 
-    /// Send `signal` to every process of the job.
-    fn signal(&self, job: JobId, signal: i32) -> impl Future<Output = LaunchResult<()>> + Send;
+    /// Deliver `signal` to the job. Termination-style signals go to the
+    /// unit's main process, which forwards them to the job's process group;
+    /// SIGSTOP/SIGCONT/SIGKILL (which cannot be forwarded) go to every
+    /// process of the unit.
+    fn signal(&self, unit: &str, signal: i32) -> impl Future<Output = LaunchResult<()>> + Send;
 
-    /// Stop the unit (if still running) and forget it.
-    fn release(&self, job: JobId) -> impl Future<Output = LaunchResult<()>> + Send;
+    /// Stop the unit (if still running) and forget it (`reset-failed`).
+    fn release(&self, unit: &str) -> impl Future<Output = LaunchResult<()>> + Send;
 
-    /// Jobs that currently have a unit.
-    fn list(&self) -> impl Future<Output = LaunchResult<Vec<JobId>>> + Send;
+    /// Names of all existing job units.
+    fn list(&self) -> impl Future<Output = LaunchResult<Vec<String>>> + Send;
+
+    /// Whether the whole system is shutting down (`systemctl
+    /// is-system-running` says `stopping`), as opposed to only the helper
+    /// being stopped or restarted.
+    fn system_stopping(&self) -> impl Future<Output = LaunchResult<bool>> + Send;
 }
 
 impl<T: Launcher> Launcher for std::sync::Arc<T> {
@@ -119,37 +131,47 @@ impl<T: Launcher> Launcher for std::sync::Arc<T> {
     }
     fn init_pid(
         &self,
-        job: JobId,
+        unit: &str,
         kind: UnitKind,
     ) -> impl Future<Output = LaunchResult<Option<u32>>> + Send {
-        (**self).init_pid(job, kind)
+        (**self).init_pid(unit, kind)
     }
-    fn unit_state(&self, job: JobId) -> impl Future<Output = LaunchResult<UnitState>> + Send {
-        (**self).unit_state(job)
+    fn unit_state(&self, unit: &str) -> impl Future<Output = LaunchResult<UnitState>> + Send {
+        (**self).unit_state(unit)
     }
-    fn signal(&self, job: JobId, signal: i32) -> impl Future<Output = LaunchResult<()>> + Send {
-        (**self).signal(job, signal)
+    fn signal(&self, unit: &str, signal: i32) -> impl Future<Output = LaunchResult<()>> + Send {
+        (**self).signal(unit, signal)
     }
-    fn release(&self, job: JobId) -> impl Future<Output = LaunchResult<()>> + Send {
-        (**self).release(job)
+    fn release(&self, unit: &str) -> impl Future<Output = LaunchResult<()>> + Send {
+        (**self).release(unit)
     }
-    fn list(&self) -> impl Future<Output = LaunchResult<Vec<JobId>>> + Send {
+    fn list(&self) -> impl Future<Output = LaunchResult<Vec<String>>> + Send {
         (**self).list()
+    }
+    fn system_stopping(&self) -> impl Future<Output = LaunchResult<bool>> + Send {
+        (**self).system_stopping()
     }
 }
 
-/// The unit name of a job.
+/// The unit a job is spawned in.
 pub fn unit_name(job: JobId) -> String {
     format!("puzuz-job-{}.service", job.0)
 }
 
-/// The job id of a unit name produced by [`unit_name`].
+/// The unit of the n-th restore of a job.
+pub fn restore_unit_name(job: JobId, n: u32) -> String {
+    format!("puzuz-job-{}-r{n}.service", job.0)
+}
+
+/// The job id of a name produced by [`unit_name`] or [`restore_unit_name`].
 pub fn parse_unit_name(name: &str) -> Option<JobId> {
-    name.strip_prefix("puzuz-job-")?
-        .strip_suffix(".service")?
-        .parse()
-        .ok()
-        .map(JobId)
+    let rest = name.strip_prefix("puzuz-job-")?.strip_suffix(".service")?;
+    let id = match rest.split_once("-r") {
+        Some((id, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => id,
+        Some(_) => return None,
+        None => rest,
+    };
+    id.parse().ok().map(JobId)
 }
 
 #[cfg(test)]
@@ -159,7 +181,10 @@ mod tests {
     #[test]
     fn unit_names_round_trip() {
         assert_eq!(unit_name(JobId(42)), "puzuz-job-42.service");
+        assert_eq!(restore_unit_name(JobId(42), 3), "puzuz-job-42-r3.service");
         assert_eq!(parse_unit_name("puzuz-job-42.service"), Some(JobId(42)));
+        assert_eq!(parse_unit_name("puzuz-job-42-r3.service"), Some(JobId(42)));
+        assert_eq!(parse_unit_name("puzuz-job-42-rx.service"), None);
         assert_eq!(parse_unit_name("puzuz-job-x.service"), None);
         assert_eq!(parse_unit_name("puzuz.service"), None);
     }

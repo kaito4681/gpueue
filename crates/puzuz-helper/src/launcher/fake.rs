@@ -5,11 +5,14 @@ use std::sync::Mutex;
 
 use puzuz_protocol::helper::{ExitStatus, HelperErrorCode, JobId, signal};
 
-use super::{LaunchError, LaunchResult, LaunchSpec, Launcher, RestoreSpec, UnitState};
+use super::{
+    LaunchError, LaunchResult, LaunchSpec, Launcher, RestoreSpec, UnitState, parse_unit_name,
+};
 use crate::jobs::UnitKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeUnit {
+    pub name: String,
     pub state: UnitState,
     pub pid: u32,
     pub signals: Vec<i32>,
@@ -18,12 +21,13 @@ pub struct FakeUnit {
 
 #[derive(Debug, Default)]
 struct Inner {
-    units: BTreeMap<JobId, FakeUnit>,
+    units: BTreeMap<String, FakeUnit>,
     next_pid: u32,
     fail_next_spawn: Option<LaunchError>,
     fail_next_restore: Option<LaunchError>,
     spawned: Vec<LaunchSpec>,
     restored: Vec<RestoreSpec>,
+    system_stopping: bool,
 }
 
 /// Units live in a map; tests drive exits with [`FakeLauncher::exit`].
@@ -41,28 +45,21 @@ impl FakeLauncher {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The most recent unit of `job`.
+    pub fn unit(&self, job: JobId) -> Option<FakeUnit> {
+        self.lock()
+            .units
+            .values()
+            .filter(|u| parse_unit_name(&u.name) == Some(job))
+            .max_by_key(|u| u.pid)
+            .cloned()
+    }
+
     /// Make the job's main process exit with `status`.
     pub fn exit(&self, job: JobId, status: ExitStatus) {
-        if let Some(u) = self.lock().units.get_mut(&job) {
-            u.state = UnitState::Exited(Some(status));
+        if let Some(u) = self.unit(job) {
+            self.lock().units.get_mut(&u.name).unwrap().state = UnitState::Exited(Some(status));
         }
-    }
-
-    /// Pretend a unit exists (e.g. left over from before a helper restart).
-    pub fn insert_unit(&self, job: JobId, pid: u32, state: UnitState) {
-        self.lock().units.insert(
-            job,
-            FakeUnit {
-                state,
-                pid,
-                signals: Vec::new(),
-                kind: UnitKind::Spawned,
-            },
-        );
-    }
-
-    pub fn unit(&self, job: JobId) -> Option<FakeUnit> {
-        self.lock().units.get(&job).cloned()
     }
 
     pub fn fail_next_spawn(&self, err: LaunchError) {
@@ -73,6 +70,10 @@ impl FakeLauncher {
         self.lock().fail_next_restore = Some(err);
     }
 
+    pub fn set_system_stopping(&self, stopping: bool) {
+        self.lock().system_stopping = stopping;
+    }
+
     pub fn spawned(&self) -> Vec<LaunchSpec> {
         self.lock().spawned.clone()
     }
@@ -81,19 +82,17 @@ impl FakeLauncher {
         self.lock().restored.clone()
     }
 
-    fn start(&self, job: JobId, kind: UnitKind) -> LaunchResult<u32> {
+    fn start(&self, unit: &str, kind: UnitKind) -> LaunchResult<u32> {
         let mut g = self.lock();
-        if g.units
-            .get(&job)
-            .is_some_and(|u| u.state == UnitState::Running)
-        {
+        if g.units.contains_key(unit) {
             return Err(LaunchError::new(HelperErrorCode::Busy, "unit exists"));
         }
         g.next_pid = g.next_pid.max(10_000) + 1;
         let pid = g.next_pid;
         g.units.insert(
-            job,
+            unit.to_owned(),
             FakeUnit {
+                name: unit.to_owned(),
                 state: UnitState::Running,
                 pid,
                 signals: Vec::new(),
@@ -110,7 +109,7 @@ impl Launcher for FakeLauncher {
             return Err(err);
         }
         self.lock().spawned.push(spec.clone());
-        self.start(spec.job, UnitKind::Spawned)
+        self.start(&spec.unit, UnitKind::Spawned)
     }
 
     async fn restore(&self, spec: &RestoreSpec) -> LaunchResult<u32> {
@@ -118,31 +117,31 @@ impl Launcher for FakeLauncher {
             return Err(err);
         }
         self.lock().restored.push(spec.clone());
-        self.start(spec.job, UnitKind::Restored)
+        self.start(&spec.unit, UnitKind::Restored)
     }
 
-    async fn init_pid(&self, job: JobId, _kind: UnitKind) -> LaunchResult<Option<u32>> {
+    async fn init_pid(&self, unit: &str, _kind: UnitKind) -> LaunchResult<Option<u32>> {
         Ok(self
             .lock()
             .units
-            .get(&job)
+            .get(unit)
             .filter(|u| u.state == UnitState::Running)
             .map(|u| u.pid))
     }
 
-    async fn unit_state(&self, job: JobId) -> LaunchResult<UnitState> {
+    async fn unit_state(&self, unit: &str) -> LaunchResult<UnitState> {
         Ok(self
             .lock()
             .units
-            .get(&job)
+            .get(unit)
             .map_or(UnitState::Gone, |u| u.state))
     }
 
-    async fn signal(&self, job: JobId, sig: i32) -> LaunchResult<()> {
+    async fn signal(&self, unit: &str, sig: i32) -> LaunchResult<()> {
         let mut g = self.lock();
         let u = g
             .units
-            .get_mut(&job)
+            .get_mut(unit)
             .ok_or_else(|| LaunchError::new(HelperErrorCode::JobNotFound, "no unit"))?;
         u.signals.push(sig);
         if sig == signal::SIGKILL && u.state == UnitState::Running {
@@ -151,12 +150,16 @@ impl Launcher for FakeLauncher {
         Ok(())
     }
 
-    async fn release(&self, job: JobId) -> LaunchResult<()> {
-        self.lock().units.remove(&job);
+    async fn release(&self, unit: &str) -> LaunchResult<()> {
+        self.lock().units.remove(unit);
         Ok(())
     }
 
-    async fn list(&self) -> LaunchResult<Vec<JobId>> {
-        Ok(self.lock().units.keys().copied().collect())
+    async fn list(&self) -> LaunchResult<Vec<String>> {
+        Ok(self.lock().units.keys().cloned().collect())
+    }
+
+    async fn system_stopping(&self) -> LaunchResult<bool> {
+        Ok(self.lock().system_stopping)
     }
 }
