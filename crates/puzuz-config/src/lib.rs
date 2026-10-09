@@ -30,6 +30,7 @@
 //! cuda_checkpoint_mode = "manual"
 //! criu_dump_timeout_secs = 1800
 //! criu_restore_timeout_secs = 1800
+//! fork_guard = true
 //!
 //! # GPUs are detected with NVML ("auto"). Without NVML (no driver, no
 //! # libnvidia-ml.so.1) the [[gpus]] list below is used instead; "static"
@@ -97,6 +98,12 @@ pub struct Config {
     pub criu_dump_timeout_secs: u64,
     /// Seconds a `criu restore` may take before it is killed (helper only).
     pub criu_restore_timeout_secs: u64,
+    /// Preload the fork guard into jobs (helper only): children that a
+    /// CUDA process forks without exec, such as PyTorch DataLoader workers
+    /// with the default `fork` start method, drop the inherited NVIDIA
+    /// device mappings, which CRIU cannot dump. Installed into
+    /// `<data_dir>/lib`.
+    pub fork_guard: bool,
     /// How GPUs are found at start-up.
     pub gpu_detection: GpuDetection,
     /// Path (or name) of the NVML library; by default `libnvidia-ml.so.1`
@@ -172,6 +179,7 @@ impl Default for Config {
             cuda_checkpoint_mode: CudaCheckpointMode::Manual,
             criu_dump_timeout_secs: 1800,
             criu_restore_timeout_secs: 1800,
+            fork_guard: true,
             gpu_detection: GpuDetection::Auto,
             nvml_library: None,
             gpus: Vec::new(),
@@ -327,6 +335,7 @@ mod tests {
         assert_eq!(config.daemon_user, "puzuz");
         assert_eq!(config.cuda_checkpoint_mode, CudaCheckpointMode::Manual);
         assert_eq!(config.criu_dump_timeout_secs, 1800);
+        assert!(config.fork_guard);
     }
 
     #[test]

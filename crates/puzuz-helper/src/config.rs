@@ -33,6 +33,9 @@ pub const DEFAULT_LOG_BASE: &str = "/var/lib/puzuz/logs";
 /// `/run/puzuz`, which the daemon can write to: the helper must never mount
 /// onto a path a less privileged user controls.
 pub const DEFAULT_CRIU_ROOT: &str = "/run/puzuz-helper/criu-root";
+/// Default directory of the fork guard library: `<data_dir>/lib`, readable
+/// by every user and persistent (restored jobs map it again).
+pub const DEFAULT_FORK_GUARD_DIR: &str = "/var/lib/puzuz/lib";
 /// Name of the shutdown manifest written into the checkpoint base.
 pub const SHUTDOWN_MANIFEST: &str = "shutdown-manifest.json";
 
@@ -67,6 +70,12 @@ pub struct HelperConfig {
     pub helper_exe: PathBuf,
     /// `nvidia-smi`, used to find CUDA processes and GPU memory.
     pub nvidia_smi: PathBuf,
+    /// Where the fork guard is installed at start-up (see
+    /// [`crate::forkguard`]); `None` disables it.
+    pub fork_guard_dir: Option<PathBuf>,
+    /// The installed fork guard, put into every job's `LD_PRELOAD`. Set at
+    /// start-up when the installation succeeded.
+    pub job_preload: Option<PathBuf>,
 }
 
 impl Default for HelperConfig {
@@ -86,6 +95,8 @@ impl Default for HelperConfig {
             job_stop_timeout: Duration::from_secs(30),
             helper_exe: PathBuf::from("/usr/bin/puzuz-helper"),
             nvidia_smi: PathBuf::from("nvidia-smi"),
+            fork_guard_dir: Some(PathBuf::from(DEFAULT_FORK_GUARD_DIR)),
+            job_preload: None,
         }
     }
 }
@@ -136,6 +147,7 @@ impl HelperConfig {
             job_stop_timeout: o
                 .job_stop_timeout
                 .unwrap_or(Duration::from_secs(file.grace_secs)),
+            fork_guard_dir: file.fork_guard.then(|| file.data_dir.join("lib")),
             ..HelperConfig::default()
         };
         let ck = &mut cfg.checkpoint;
@@ -213,6 +225,7 @@ mod tests {
         assert_eq!(c.nvidia_smi, d.nvidia_smi);
         assert_eq!(c.job_stop_timeout, d.job_stop_timeout);
         assert_eq!(c.checkpoint, d.checkpoint);
+        assert_eq!(c.fork_guard_dir, d.fork_guard_dir);
     }
 
     #[test]
@@ -239,6 +252,7 @@ mod tests {
         assert_eq!(r.daemon_user, "svc");
         assert_eq!(c.socket_path, PathBuf::from("/run/x/helper.sock"));
         assert_eq!(c.state_dir, PathBuf::from("/srv/pz/helper"));
+        assert_eq!(c.fork_guard_dir, Some(PathBuf::from("/srv/pz/lib")));
         assert_eq!(c.checkpoint_base, PathBuf::from("/srv/pz/checkpoints"));
         assert_eq!(c.log_base, PathBuf::from("/logs"));
         assert_eq!(c.job_stop_timeout, Duration::from_secs(7));
@@ -306,6 +320,12 @@ mod tests {
         assert_eq!(c.checkpoint.cuda.path, PathBuf::from("/flag/cc"));
         assert_eq!(c.nvidia_smi, PathBuf::from("/flag/smi"));
         assert_eq!(c.job_stop_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn fork_guard_can_be_disabled() {
+        let r = HelperConfig::resolve(&file("fork_guard = false\n"), Overrides::default());
+        assert_eq!(r.config.fork_guard_dir, None);
     }
 
     #[test]

@@ -426,6 +426,9 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 .join(","),
         );
         envs.insert("CUDA_DEVICE_ORDER".into(), "PCI_BUS_ID".into());
+        if let Some(lib) = &self.cfg.job_preload {
+            crate::forkguard::add_to_preload(&mut envs, lib);
+        }
         files
             .write_spec(&ShimSpec {
                 uid: creds.uid.0,

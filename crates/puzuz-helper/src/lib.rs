@@ -12,10 +12,13 @@
 //! - [`shim`]: the job unit's main process (PID/mount namespace init).
 //! - [`host`]: `/proc`, `nvidia-smi`, users and mounts.
 //! - [`mounts`]: mountinfo analysis (hidden mounts, CRIU's external binds).
+//! - [`forkguard`]: the preload library that makes forked children of CUDA
+//!   processes checkpointable.
 
 pub mod config;
 pub mod engine;
 pub mod events;
+pub mod forkguard;
 pub mod host;
 pub mod jobs;
 pub mod launcher;

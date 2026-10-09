@@ -27,6 +27,9 @@ zbus.workspace = true
 nix.workspace = true
 rustix = { workspace = true, features = ["thread", "process", "mount"] }
 
+[build-dependencies]
+cc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

@@ -176,9 +176,29 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     if !nix::unistd::geteuid().is_root() {
         return Err("must run as root".into());
     }
-    let cfg = config(args)?;
+    let mut cfg = config(args)?;
     for path in cfg.paths_to_check() {
         puzuz_helper::validate::check_root_owned_path(path)?;
+    }
+    if let Some(dir) = &cfg.fork_guard_dir {
+        // Without it jobs still run; only forked children of CUDA
+        // processes keep their dumps from succeeding.
+        match puzuz_helper::forkguard::install(dir)
+            .map_err(|e| e.to_string())
+            .and_then(|lib| {
+                puzuz_helper::validate::check_root_owned_path(&lib)?;
+                Ok(lib)
+            }) {
+            Ok(lib) => {
+                eprintln!("puzuz-helper: fork guard {}", lib.display());
+                cfg.job_preload = Some(lib);
+            }
+            Err(e) => eprintln!(
+                "puzuz-helper: WARN cannot install the fork guard in {}: {e}; \
+                 jobs that fork CUDA processes cannot be checkpointed",
+                dir.display()
+            ),
+        }
     }
     if cfg.checkpoint.mode == CudaMode::Manual {
         std::fs::create_dir_all(&cfg.checkpoint.criu.empty_plugin_dir)

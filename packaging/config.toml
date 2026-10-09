@@ -63,6 +63,14 @@
 # criu_dump_timeout_secs = 1800
 # criu_restore_timeout_secs = 1800
 
+# [helper] Preload the fork guard (<data_dir>/lib/puzuz-forkguard-*.so) into
+# jobs. Children that a CUDA process forks without exec, such as PyTorch
+# DataLoader workers with the default "fork" start method, inherit NVIDIA
+# device mappings that CRIU cannot dump; the guard drops them in the child,
+# so such jobs can be checkpointed without changes. It does not apply to
+# statically linked programs.
+# fork_guard = true
+
 # How GPUs are found at start-up: "auto" uses NVML and falls back to the
 # [[gpus]] list below when NVML is unavailable; "static" always uses the list.
 # gpu_detection = "auto"
