@@ -14,7 +14,7 @@ use puzuz_protocol::api::{
 };
 
 use crate::error::{ApiResult, Failure};
-use crate::state::{Core, JobInfo, needs_helper, now_ms};
+use crate::state::{Core, JobInfo, needs_helper, now_ms, targets_live_process};
 
 fn lifecycle_action(action: &JobAction) -> Action {
     match action {
@@ -180,6 +180,11 @@ impl Core {
     /// Applies `action` to one job. `removed_together` lists jobs removed in
     /// the same request (they do not block each other's removal). Returns
     /// the id of a job created by `restart`.
+    ///
+    /// An action on the live process (pause, kill, checkpoint, ...) of a job
+    /// whose spawn or restore request has not been answered yet waits for
+    /// that answer, then re-evaluates the action against the job's state at
+    /// that point (so it fails cleanly if the spawn failed).
     pub async fn job_action(
         self: &Arc<Self>,
         caller: Caller,
@@ -188,17 +193,51 @@ impl Core {
         removed_together: Vec<JobId>,
     ) -> ApiResult<Option<JobId>> {
         self.reject_if_shutting_down()?;
+        type Launch = (Job, Vec<Effect>);
+        let (job, effects, copy): (Job, Vec<Effect>, Option<Launch>) = loop {
+            let step = self
+                .job_action_tx(caller, id, action.clone(), removed_together.clone())
+                .await?;
+            match step {
+                Some(step) => break step,
+                // Invalid actions were rejected above without waiting.
+                None => self.wait_for_launch(id).await?,
+            }
+        };
+        let result = self.run_effects(&job, &effects).await;
+        if let Some((copy, effects)) = &copy {
+            // Run even if the first effects failed: the copy may be launching.
+            self.run_effects(copy, effects).await?;
+        }
+        result?;
+        Ok(copy.map(|(copy, _)| copy.id))
+    }
+
+    /// The transaction of [`Core::job_action`]. Returns `None`, changing
+    /// nothing, when the action targets the live process and the job's
+    /// launch is still in flight.
+    #[allow(clippy::type_complexity)]
+    async fn job_action_tx(
+        self: &Arc<Self>,
+        caller: Caller,
+        id: JobId,
+        action: JobAction,
+        removed_together: Vec<JobId>,
+    ) -> ApiResult<Option<(Job, Vec<Effect>, Option<(Job, Vec<Effect>)>)>> {
         let helper_ready = self.helper_ready();
         let now = now_ms();
         let core = self.clone();
-        type Launch = (Job, Vec<Effect>);
-        let (job, effects, copy): (Job, Vec<Effect>, Option<Launch>) = self
-            .write(move |tx, ch| {
+        self.write(move |tx, ch| {
                 let mut job = tx.get_job(id)?.ok_or_else(|| job_not_found(id))?;
                 authz::require_mutate(&caller, &job)?;
                 let transition = transition_for(&action, &job, now).map_err(|e| {
                     Failure::invalid_transition(e, lifecycle_action(&action), &job.state)
                 })?;
+                if transition.effects.iter().any(targets_live_process)
+                    && core.launch_in_flight(id)
+                {
+                    return Ok(None);
+                }
                 let immediate_copy = matches!(&action, JobAction::Restart(o) if o.immediate && !o.in_place && !o.stashed);
                 if !helper_ready
                     && (transition.effects.iter().any(needs_helper) || immediate_copy)
@@ -242,16 +281,11 @@ impl Core {
                 if action == JobAction::Remove {
                     tx.remove_job(id)?;
                     ch.removed(id);
-                    return Ok((snapshot, transition.effects, copy));
+                    return Ok(Some((snapshot, transition.effects, copy)));
                 }
-                Ok((job, transition.effects, copy))
+                Ok(Some((job, transition.effects, copy)))
             })
-            .await?;
-        self.run_effects(&job, &effects).await?;
-        if let Some((copy, effects)) = &copy {
-            self.run_effects(copy, effects).await?;
-        }
-        Ok(copy.map(|(copy, _)| copy.id))
+            .await
     }
 
     /// `POST /v1/jobs/bulk`.

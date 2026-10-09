@@ -32,6 +32,23 @@ use extract::{JsonBody, OptionalJson};
 
 pub type AppState = Arc<Core>;
 
+/// Runs a job operation to completion even if the client goes away: the
+/// handler future is dropped when the connection closes, and an operation
+/// cut off between its commit and its helper requests would leave a job
+/// marked `Running` that was never spawned (and its launch unsettled, see
+/// [`crate::launch`]).
+async fn detached<T, F>(operation: F) -> ApiResult<T>
+where
+    F: Future<Output = ApiResult<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::spawn(operation).await {
+        Ok(result) => result,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(_) => Err(Failure::internal("the operation was cancelled")),
+    }
+}
+
 pub fn router(core: Arc<Core>) -> Router {
     Router::new()
         .route(routes::JOBS, get(list_jobs).post(add_job))
@@ -170,7 +187,7 @@ async fn add_job(
     Auth(caller): Auth,
     JsonBody(request): JsonBody<AddJobRequest>,
 ) -> ApiResult<(StatusCode, Json<AddJobResponse>)> {
-    let id = core.add_job(caller, request).await?;
+    let id = detached(async move { core.add_job(caller, request).await }).await?;
     Ok((StatusCode::CREATED, Json(AddJobResponse { id })))
 }
 
@@ -190,8 +207,11 @@ async fn remove_job(
     Path(id): Path<String>,
 ) -> ApiResult<Json<JobActionResult>> {
     let id = parse_job_id(&id)?;
-    core.job_action(caller, id, JobAction::Remove, Vec::new())
-        .await?;
+    detached(async move {
+        core.job_action(caller, id, JobAction::Remove, Vec::new())
+            .await
+    })
+    .await?;
     Ok(Json(JobActionResult::ok(id)))
 }
 
@@ -219,7 +239,8 @@ async fn job_action(
         JobActionKind::Enqueue => JobAction::Enqueue(opts::<EnqueueOptions>(&body)?),
         JobActionKind::Remove => unreachable!("filtered above"),
     };
-    let new_id = core.job_action(caller, id, action, Vec::new()).await?;
+    let new_id =
+        detached(async move { core.job_action(caller, id, action, Vec::new()).await }).await?;
     Ok(Json(JobActionResult {
         id,
         outcome: puzuz_protocol::api::ActionOutcome::Ok { new_id },
@@ -231,7 +252,8 @@ async fn bulk(
     Auth(caller): Auth,
     JsonBody(request): JsonBody<BulkJobRequest>,
 ) -> ApiResult<Response> {
-    Ok(Json(core.bulk(caller, request).await?).into_response())
+    let response = detached(async move { core.bulk(caller, request).await }).await?;
+    Ok(Json(response).into_response())
 }
 
 async fn clean(
@@ -239,7 +261,8 @@ async fn clean(
     Auth(caller): Auth,
     OptionalJson(request): OptionalJson<CleanRequest>,
 ) -> ApiResult<Response> {
-    Ok(Json(core.clean(caller, request).await?).into_response())
+    let response = detached(async move { core.clean(caller, request).await }).await?;
+    Ok(Json(response).into_response())
 }
 
 async fn reset(
@@ -247,7 +270,8 @@ async fn reset(
     Auth(caller): Auth,
     OptionalJson(request): OptionalJson<ResetRequest>,
 ) -> ApiResult<Response> {
-    Ok(Json(core.reset(caller, request).await?).into_response())
+    let response = detached(async move { core.reset(caller, request).await }).await?;
+    Ok(Json(response).into_response())
 }
 
 async fn switch(
