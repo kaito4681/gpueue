@@ -1,0 +1,882 @@
+//! End-to-end tests: the daemon runs in-process on a temporary socket and
+//! database, with the in-memory `FakeHelper`, and is driven over HTTP on the
+//! Unix socket with a minimal hyper client.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::{Method, Request, StatusCode};
+use hyper_util::rt::TokioIo;
+use puzuz_core::model::{GpuIndex, JobId, JobResult, JobSpec, JobState};
+use puzuz_daemon::api::TEST_UID_HEADER;
+use puzuz_daemon::helper::FakeOutcome;
+use puzuz_daemon::{Config, Daemon, DaemonOptions, FakeHelper, StaticGpuDetector, StaticUserDb};
+use puzuz_protocol::BINARY_VERSION;
+use puzuz_protocol::api::{
+    AddJobRequest, AddJobResponse, ApiError, BulkJobResponse, CleanResponse, ErrorCode, JobView,
+    ListGpusResponse, ListJobsResponse, VERSION_HEADER, VersionResponse,
+};
+use puzuz_protocol::helper::signal;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+
+const ALICE: u32 = 1000;
+const BOB: u32 = 1001;
+const ADMIN: u32 = 500;
+
+// ---------------------------------------------------------------------------
+// Test client
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct Client {
+    socket: PathBuf,
+    uid: u32,
+    version: String,
+}
+
+struct Reply {
+    status: StatusCode,
+    body: Bytes,
+}
+
+impl Reply {
+    fn json<T: DeserializeOwned>(&self) -> T {
+        serde_json::from_slice(&self.body).unwrap_or_else(|e| {
+            panic!(
+                "bad JSON ({e}) in {} reply: {}",
+                self.status,
+                String::from_utf8_lossy(&self.body)
+            )
+        })
+    }
+
+    fn error(&self) -> ApiError {
+        assert!(
+            !self.status.is_success(),
+            "expected an error, got {}",
+            self.status
+        );
+        self.json()
+    }
+}
+
+impl Client {
+    fn new(socket: &Path, uid: u32) -> Self {
+        Self {
+            socket: socket.to_owned(),
+            uid,
+            version: BINARY_VERSION.to_owned(),
+        }
+    }
+
+    async fn open(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> hyper::Response<hyper::body::Incoming> {
+        let stream = tokio::net::UnixStream::connect(&self.socket).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let body = body.map(|v| v.to_string()).unwrap_or_default();
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header(VERSION_HEADER, &self.version)
+            .header(TEST_UID_HEADER, self.uid.to_string())
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+        sender.send_request(request).await.unwrap()
+    }
+
+    async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Reply {
+        let response = self.open(method, path, body).await;
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        Reply { status, body }
+    }
+
+    async fn get(&self, path: &str) -> Reply {
+        self.call(Method::GET, path, None).await
+    }
+
+    async fn post(&self, path: &str, body: Value) -> Reply {
+        self.call(Method::POST, path, Some(body)).await
+    }
+
+    async fn add(&self, request: &AddJobRequest) -> JobId {
+        let reply = self
+            .post("/v1/jobs", serde_json::to_value(request).unwrap())
+            .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        reply.json::<AddJobResponse>().id
+    }
+
+    async fn job(&self, id: JobId) -> JobView {
+        let reply = self.get(&format!("/v1/jobs/{id}")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        reply.json()
+    }
+
+    async fn action(&self, id: JobId, action: &str, body: Value) -> Reply {
+        self.post(&format!("/v1/jobs/{id}/{action}"), body).await
+    }
+
+    /// Polls until `pred` holds for the job (5 s at most).
+    async fn wait_for(&self, id: JobId, what: &str, pred: impl Fn(&JobView) -> bool) -> JobView {
+        for _ in 0..250 {
+            let job = self.job(id).await;
+            if pred(&job) {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "job {id} never became {what}: {:?}",
+            self.job(id).await.state
+        );
+    }
+
+    async fn wait_state(&self, id: JobId, state: &JobState) -> JobView {
+        self.wait_for(id, state.name(), |j| j.state == *state).await
+    }
+}
+
+fn job_request(command: &str, gpus: &[u32]) -> AddJobRequest {
+    AddJobRequest {
+        spec: JobSpec {
+            command: command.to_owned(),
+            cwd: PathBuf::from("/tmp"),
+            envs: BTreeMap::from([("SECRET".to_owned(), "hunter2".to_owned())]),
+            group: "default".to_owned(),
+            gpus: gpus.iter().copied().map(GpuIndex).collect(),
+            dependencies: Vec::new(),
+            priority: 0,
+            label: Some("experiment".to_owned()),
+            no_checkpoint: false,
+        },
+        stashed: false,
+        enqueue_at: None,
+        immediate: false,
+    }
+}
+
+fn done(result: JobResult) -> JobState {
+    JobState::Done { result }
+}
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+struct Harness {
+    dir: tempfile::TempDir,
+    helper: FakeHelper,
+    daemon: Option<Daemon>,
+}
+
+impl Harness {
+    async fn new(gpus: u32) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = FakeHelper::new();
+        let mut harness = Self {
+            dir,
+            helper,
+            daemon: None,
+        };
+        harness.start(gpus).await;
+        harness
+    }
+
+    fn config(&self) -> Config {
+        Config {
+            api_socket: self.dir.path().join("puzuz.sock"),
+            grace_secs: 1,
+            ..Config::default()
+        }
+        .with_data_dir(self.dir.path())
+    }
+
+    async fn start(&mut self, gpus: u32) {
+        let daemon = Daemon::start(DaemonOptions {
+            config: self.config(),
+            helper: Arc::new(self.helper.clone()),
+            users: Arc::new(StaticUserDb::with_admins([ADMIN])),
+            gpus: Arc::new(StaticGpuDetector::anonymous(gpus)),
+            trust_uid_header: true,
+        })
+        .await
+        .unwrap();
+        self.daemon = Some(daemon);
+    }
+
+    async fn stop(&mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            daemon.stop().await;
+        }
+    }
+
+    fn client(&self, uid: u32) -> Client {
+        Client::new(&self.dir.path().join("puzuz.sock"), uid)
+    }
+
+    async fn set_default_parallel(&self, parallel: u32) {
+        let reply = self
+            .client(ADMIN)
+            .call(
+                Method::PUT,
+                "/v1/groups/default/parallel",
+                Some(json!({ "parallel": parallel })),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_start_exit_status_and_log() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+
+    let id = alice.add(&job_request("echo hi", &[0])).await;
+    let job = alice.wait_state(id, &JobState::Running).await;
+    assert!(job.started_at.is_some());
+    let spawned = h.helper.spawned();
+    assert_eq!(spawned.len(), 1);
+    assert_eq!(spawned[0].job, id);
+    assert_eq!(spawned[0].uid.0, ALICE);
+    assert_eq!(spawned[0].command, "echo hi");
+    assert_eq!(spawned[0].shell, ["sh", "-c"]);
+    assert_eq!(spawned[0].envs["SECRET"], "hunter2");
+    assert_eq!(
+        spawned[0].log_path,
+        h.dir.path().join(format!("logs/{ALICE}/{id}.log"))
+    );
+
+    h.helper.exit(id, 0);
+    let job = alice.wait_state(id, &done(JobResult::Success)).await;
+    assert!(job.finished_at.is_some());
+    let details = job.details.expect("the owner sees details");
+    assert_eq!(details.command, "echo hi");
+
+    let failing = alice.add(&job_request("false", &[])).await;
+    alice.wait_state(failing, &JobState::Running).await;
+    h.helper.exit(failing, 3);
+    alice
+        .wait_state(failing, &done(JobResult::Failed { exit_code: 3 }))
+        .await;
+
+    // The list shows both.
+    let list: ListJobsResponse = alice.get("/v1/jobs").await.json();
+    assert_eq!(list.jobs.len(), 2);
+
+    // Logs: raw bytes, tail, and only for the owner.
+    let log = h.dir.path().join(format!("logs/{ALICE}/{id}.log"));
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "one\ntwo\nthree\n").unwrap();
+    let reply = alice.get(&format!("/v1/jobs/{id}/log")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(&reply.body[..], b"one\ntwo\nthree\n");
+    let reply = alice.get(&format!("/v1/jobs/{id}/log?tail=2")).await;
+    assert_eq!(&reply.body[..], b"two\nthree\n");
+    let reply = alice.get(&format!("/v1/jobs/{id}/log?follow=true")).await;
+    assert_eq!(
+        &reply.body[..],
+        b"one\ntwo\nthree\n",
+        "follow ends with the job"
+    );
+    let reply = h.client(BOB).get(&format!("/v1/jobs/{id}/log")).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(reply.error().code, ErrorCode::PermissionDenied);
+    let reply = h
+        .client(ADMIN)
+        .get(&format!("/v1/jobs/{id}/log?tail=1"))
+        .await;
+    assert_eq!(&reply.body[..], b"three\n");
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_follow_streams_appended_output() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let id = alice.add(&job_request("train", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    let log = h.dir.path().join(format!("logs/{ALICE}/{id}.log"));
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "start\n").unwrap();
+
+    let response = alice
+        .open(Method::GET, &format!("/v1/jobs/{id}/log?follow=true"), None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    received.extend_from_slice(&first);
+    assert_eq!(received, b"start\n");
+
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    file.write_all(b"epoch 1\n").unwrap();
+    let next = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(&next[..], b"epoch 1\n");
+
+    file.write_all(b"bye\n").unwrap();
+    h.helper.exit(id, 0);
+    while let Some(frame) = body.frame().await {
+        received.extend_from_slice(&frame.unwrap().into_data().unwrap());
+    }
+    assert!(
+        received.ends_with(b"bye\n"),
+        "{:?}",
+        String::from_utf8_lossy(&received)
+    );
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gpu_slots_are_shared_across_users() {
+    let mut h = Harness::new(2).await;
+    h.set_default_parallel(4).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+
+    let a0 = alice.add(&job_request("a", &[0])).await;
+    alice.wait_state(a0, &JobState::Running).await;
+    let b0 = bob.add(&job_request("b", &[0])).await;
+    let b1 = bob.add(&job_request("c", &[1])).await;
+    bob.wait_state(b1, &JobState::Running).await;
+    // GPU 0 has one slot, taken by alice.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(bob.job(b0).await.state, JobState::Queued { .. }));
+
+    let gpus: ListGpusResponse = bob.get("/v1/gpus").await.json();
+    assert_eq!(gpus.gpus.len(), 2);
+    assert_eq!(gpus.gpus[0].used, 1);
+    assert_eq!(gpus.gpus[0].jobs[0].id, a0);
+    assert_eq!(gpus.gpus[0].jobs[0].owner.0, ALICE);
+    assert_eq!(gpus.gpus[1].jobs[0].owner.0, BOB);
+
+    // A job on both GPUs waits for both.
+    let both = alice.add(&job_request("d", &[0, 1])).await;
+
+    h.helper.exit(a0, 0);
+    bob.wait_state(b0, &JobState::Running).await;
+    assert!(matches!(
+        alice.job(both).await.state,
+        JobState::Queued { .. }
+    ));
+
+    // Raising the GPU limit lets it start.
+    let reply = bob
+        .call(
+            Method::PUT,
+            "/v1/gpus/parallel",
+            Some(json!({ "parallel": 2 })),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let reply = h
+        .client(ADMIN)
+        .call(
+            Method::PUT,
+            "/v1/gpus/parallel",
+            Some(json!({ "parallel": 2 })),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    alice.wait_state(both, &JobState::Running).await;
+    let request = &h.helper.spawned()[3];
+    assert_eq!(request.gpus, [GpuIndex(0), GpuIndex(1)]);
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn other_users_see_redacted_jobs_and_cannot_touch_them() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let admin = h.client(ADMIN);
+
+    // Bob watches the event stream.
+    let response = bob.open(Method::GET, "/v1/events", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut events = response.into_body();
+
+    let id = alice.add(&job_request("secret-command", &[0])).await;
+    alice.wait_state(id, &JobState::Running).await;
+
+    let seen = bob.job(id).await;
+    assert!(seen.is_redacted());
+    assert_eq!(seen.label, None);
+    assert_eq!(seen.owner.0, ALICE);
+    assert_eq!(seen.gpus, [GpuIndex(0)]);
+    let list = String::from_utf8(bob.get("/v1/jobs").await.body.to_vec()).unwrap();
+    assert!(
+        !list.contains("secret-command") && !list.contains("hunter2"),
+        "{list}"
+    );
+    assert!(!admin.job(id).await.is_redacted());
+
+    for (action, body) in [
+        ("kill", json!({})),
+        ("pause", json!({})),
+        ("checkpoint", json!({})),
+    ] {
+        let reply = bob.action(id, action, body).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{action}");
+    }
+    let reply = bob
+        .call(Method::DELETE, &format!("/v1/jobs/{id}"), None)
+        .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    // Bulk requests report per job.
+    let reply: BulkJobResponse = bob
+        .post(
+            "/v1/jobs/bulk",
+            json!({"target": {"kind": "ids", "ids": [id]}, "action": "kill"}),
+        )
+        .await
+        .json();
+    assert!(!reply.all_ok());
+    // `-a` for bob does not include alice's job.
+    let reply: BulkJobResponse = bob
+        .post(
+            "/v1/jobs/bulk",
+            json!({"target": {"kind": "all"}, "action": "kill"}),
+        )
+        .await
+        .json();
+    assert!(reply.results.is_empty());
+    // Admin-only operations.
+    let reply = bob
+        .post("/v1/groups", json!({"name": "gpu", "parallel": 2}))
+        .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let reply = bob.post("/v1/daemon/shutdown", json!({})).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+
+    // The admin may kill it.
+    let reply = admin.action(id, "kill", json!({})).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    alice.wait_state(id, &done(JobResult::Killed)).await;
+    assert_eq!(h.helper.signals(), [(id, signal::SIGTERM)]);
+
+    // Bob's events carry only redacted views.
+    let mut text = String::new();
+    while !text.contains("event: job_added") || !text.contains("\"result\":\"killed\"") {
+        let frame = tokio::time::timeout(Duration::from_secs(5), events.frame())
+            .await
+            .expect("an event")
+            .unwrap()
+            .unwrap();
+        if let Ok(data) = frame.into_data() {
+            text.push_str(&String::from_utf8_lossy(&data));
+        }
+    }
+    assert!(!text.contains("secret-command"), "{text}");
+    assert!(!text.contains("\"details\""), "{text}");
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_and_restore() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+
+    let id = alice.add(&job_request("train", &[0])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    let reply = alice.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let job = alice.wait_state(id, &JobState::Checkpointed).await;
+    assert_eq!(job.checkpoint_size_bytes, Some(4096));
+    assert!(h.helper.has_image(id));
+    assert!(!h.helper.is_running(id));
+
+    // `start` and `kill` point to restore/remove.
+    let reply = alice.action(id, "start", json!(null)).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert!(reply.error().message.contains("restore"));
+
+    // The GPU is free again: another job may take it.
+    let other = alice.add(&job_request("other", &[0])).await;
+    alice.wait_state(other, &JobState::Running).await;
+
+    // Restore waits for the slot.
+    let reply = alice.action(id, "restore", json!({})).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(
+        alice.job(id).await.state,
+        JobState::RestoreQueued { .. }
+    ));
+    h.helper.exit(other, 0);
+    alice.wait_state(id, &JobState::Running).await;
+    assert!(h.helper.is_running(id));
+    assert!(!h.helper.has_image(id));
+    assert_eq!(alice.job(id).await.checkpoint_size_bytes, None);
+
+    // A failed restore keeps the job checkpointed with the reason.
+    alice.action(id, "checkpoint", json!(null)).await;
+    alice.wait_state(id, &JobState::Checkpointed).await;
+    h.helper
+        .set_restore_outcome(FakeOutcome::Fail("GPU model changed".to_owned()));
+    let reply = alice
+        .action(id, "restore", json!({"immediate": true}))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let job = alice
+        .wait_for(id, "checkpointed with an error", |j| {
+            j.state == JobState::Checkpointed
+                && j.details.as_ref().and_then(|d| d.last_error.as_deref())
+                    == Some("GPU model changed")
+        })
+        .await;
+    assert_eq!(job.checkpoint_size_bytes, Some(4096));
+    assert!(h.helper.has_image(id));
+    // Other users do not see the reason.
+    assert!(h.client(BOB).job(id).await.details.is_none());
+
+    // Removing the job deletes the image.
+    let reply = alice
+        .call(Method::DELETE, &format!("/v1/jobs/{id}"), None)
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(!h.helper.has_image(id));
+    assert_eq!(
+        alice.get(&format!("/v1/jobs/{id}")).await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_checkpoint_terminates_the_job_while_holding_its_gpu() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    h.helper
+        .set_checkpoint_outcome(FakeOutcome::Fail("criu: tcp connection".to_owned()));
+    h.helper.set_ignore_sigterm(true);
+
+    let id = alice.add(&job_request("train", &[0])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    let waiting = alice.add(&job_request("next", &[0])).await;
+
+    alice.action(id, "checkpoint", json!(null)).await;
+    let reason = JobResult::CheckpointFailed {
+        reason: "criu: tcp connection".to_owned(),
+    };
+    alice
+        .wait_state(
+            id,
+            &JobState::Terminating {
+                result: reason.clone(),
+            },
+        )
+        .await;
+    // Still holding the GPU while it shuts down.
+    assert!(matches!(
+        alice.job(waiting).await.state,
+        JobState::Queued { .. }
+    ));
+    let redacted = h.client(BOB).job(id).await;
+    assert_eq!(
+        redacted.state,
+        JobState::Terminating {
+            result: JobResult::CheckpointFailed {
+                reason: puzuz_core::authz::REDACTED.to_owned()
+            }
+        }
+    );
+
+    // SIGTERM is ignored; SIGKILL follows after the 1 s grace period.
+    let job = alice.wait_state(id, &done(reason)).await;
+    assert_eq!(
+        job.details.unwrap().last_error.as_deref(),
+        Some("criu: tcp connection")
+    );
+    assert_eq!(
+        h.helper.signals(),
+        [(id, signal::SIGTERM), (id, signal::SIGKILL)]
+    );
+    alice.wait_state(waiting, &JobState::Running).await;
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_checkpoints_running_jobs_then_stops() {
+    let mut h = Harness::new(2).await;
+    h.set_default_parallel(4).await;
+    let alice = h.client(ALICE);
+
+    let saved = alice.add(&job_request("train", &[0])).await;
+    let mut request = job_request("preprocess", &[]);
+    request.spec.no_checkpoint = true;
+    let killed = alice.add(&request).await;
+    alice.wait_state(saved, &JobState::Running).await;
+    alice.wait_state(killed, &JobState::Running).await;
+    let reply = alice.action(saved, "pause", json!({})).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    alice.wait_state(saved, &JobState::Paused).await;
+    let mut stashed = job_request("later", &[]);
+    stashed.stashed = true;
+    let untouched = alice.add(&stashed).await;
+
+    let reply = h.client(ADMIN).post("/v1/daemon/shutdown", json!({})).await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED);
+    let daemon = h.daemon.take().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), daemon.shutdown_requested())
+        .await
+        .expect("shutdown finishes");
+
+    assert_eq!(alice.job(saved).await.state, JobState::Checkpointed);
+    assert_eq!(alice.job(killed).await.state, done(JobResult::Killed));
+    assert!(matches!(
+        alice.job(untouched).await.state,
+        JobState::Stashed { .. }
+    ));
+    // The paused job was resumed before the dump.
+    assert!(h.helper.signals().contains(&(saved, signal::SIGCONT)));
+    // No new work is accepted.
+    let reply = alice
+        .post(
+            "/v1/jobs",
+            serde_json::to_value(job_request("x", &[])).unwrap(),
+        )
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::ShuttingDown);
+
+    daemon.stop().await;
+    assert!(!h.dir.path().join("puzuz.sock").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_restart_reconciles_with_the_helper() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(3).await;
+    let alice = h.client(ALICE);
+    let finished = alice.add(&job_request("a", &[])).await;
+    let lost = alice.add(&job_request("b", &[])).await;
+    let survivor = alice.add(&job_request("c", &[])).await;
+    let queued = alice.add(&job_request("d", &[])).await;
+    for id in [finished, lost, survivor] {
+        alice.wait_state(id, &JobState::Running).await;
+    }
+
+    // Stopping the daemon leaves the jobs alone.
+    h.stop().await;
+    assert_eq!(h.helper.jobs().len(), 3);
+    assert!(h.helper.signals().is_empty());
+
+    // Meanwhile: one job exits (the helper queues the event), one vanishes,
+    // and the helper runs a job the daemon never heard of.
+    h.helper.exit(finished, 0);
+    h.helper.vanish(lost);
+    h.helper.insert_running(JobId(99));
+
+    h.start(0).await;
+    let alice = h.client(ALICE);
+    alice.wait_state(finished, &done(JobResult::Success)).await;
+    alice.wait_state(lost, &done(JobResult::Lost)).await;
+    assert_eq!(alice.job(survivor).await.state, JobState::Running);
+    // Freed slots are used again.
+    alice.wait_state(queued, &JobState::Running).await;
+    // The replayed exit event was acknowledged.
+    for _ in 0..100 {
+        if h.helper.unacked().iter().all(|e| {
+            !matches!(e.event, puzuz_protocol::helper::Event::JobExited { job, .. } if job == finished)
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(h.helper.unacked().is_empty(), "{:?}", h.helper.unacked());
+    // The orphan is left running.
+    assert!(h.helper.is_running(JobId(99)));
+
+    // Helper reconnects are reconciled too.
+    h.helper.disconnect();
+    h.helper.vanish(survivor);
+    h.helper.reconnect();
+    alice.wait_state(survivor, &done(JobResult::Lost)).await;
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validation_versions_groups_and_bulk_operations() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    let admin = h.client(ADMIN);
+
+    // Unknown dependency, GPU, group; relative cwd; root.
+    let mut request = job_request("x", &[]);
+    request.spec.dependencies = vec![JobId(42)];
+    let reply = alice
+        .post("/v1/jobs", serde_json::to_value(&request).unwrap())
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::BadRequest);
+    assert!(reply.error().message.contains("42"));
+    let reply = alice
+        .post(
+            "/v1/jobs",
+            serde_json::to_value(job_request("x", &[7])).unwrap(),
+        )
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::BadRequest);
+    let mut request = job_request("x", &[]);
+    request.spec.group = "nope".to_owned();
+    let reply = alice
+        .post("/v1/jobs", serde_json::to_value(&request).unwrap())
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::GroupNotFound);
+    let mut request = job_request("x", &[]);
+    request.spec.cwd = PathBuf::from("relative");
+    let reply = alice
+        .post("/v1/jobs", serde_json::to_value(&request).unwrap())
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    let reply = h
+        .client(0)
+        .post(
+            "/v1/jobs",
+            serde_json::to_value(job_request("x", &[])).unwrap(),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    let reply = alice.post("/v1/jobs", json!({"garbage": true})).await;
+    assert_eq!(reply.error().code, ErrorCode::BadRequest);
+
+    // Version check (but /v1/version always answers).
+    let mut old = alice.clone();
+    old.version = "0.0.1".to_owned();
+    let reply = old.get("/v1/jobs").await;
+    assert_eq!(reply.error().code, ErrorCode::VersionMismatch);
+    let version: VersionResponse = old.get("/v1/version").await.json();
+    assert_eq!(version.daemon_version, BINARY_VERSION);
+    assert!(version.helper.connected);
+
+    // Groups.
+    let reply = admin
+        .post("/v1/groups", json!({"name": "gpu", "parallel": 2}))
+        .await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    let reply = admin.post("/v1/groups", json!({"name": "gpu"})).await;
+    assert_eq!(reply.error().code, ErrorCode::AlreadyExists);
+
+    // Dependencies, stash, enqueue, switch.
+    let first = alice.add(&job_request("first", &[])).await;
+    alice.wait_state(first, &JobState::Running).await;
+    let mut request = job_request("after", &[]);
+    request.spec.dependencies = vec![first];
+    let dependant = alice.add(&request).await;
+    let mut request = job_request("stashed", &[]);
+    request.stashed = true;
+    let stashed = alice.add(&request).await;
+    let reply = alice
+        .post(
+            "/v1/jobs/switch",
+            json!({"first": dependant, "second": stashed}),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        alice.job(dependant).await.details.unwrap().command,
+        "stashed"
+    );
+    assert_eq!(alice.job(stashed).await.details.unwrap().command, "after");
+    let (dependant, stashed) = (stashed, dependant);
+    let reply = alice.action(stashed, "enqueue", json!({})).await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    // A failed dependency fails its dependants.
+    h.helper.exit(first, 1);
+    alice
+        .wait_state(dependant, &done(JobResult::DependencyFailed))
+        .await;
+    alice.wait_state(stashed, &JobState::Running).await;
+
+    // Pause and resume.
+    assert_eq!(
+        alice.action(stashed, "pause", json!({})).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(stashed, &JobState::Paused).await;
+    assert_eq!(
+        alice.action(stashed, "start", json!(null)).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(stashed, &JobState::Running).await;
+    // Removing a running job is refused with a hint.
+    let reply = alice
+        .call(Method::DELETE, &format!("/v1/jobs/{stashed}"), None)
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::InvalidState);
+    assert!(reply.error().message.contains("kill"));
+
+    // Restart creates a new job.
+    let reply = alice.action(first, "restart", json!({})).await;
+    let result: puzuz_protocol::api::JobActionResult = reply.json();
+    let puzuz_protocol::api::ActionOutcome::Ok { new_id: Some(copy) } = result.outcome else {
+        panic!("{result:?}");
+    };
+    alice
+        .wait_for(copy, "queued or running", |j| {
+            matches!(j.state, JobState::Queued { .. } | JobState::Running)
+        })
+        .await;
+
+    // Clean removes finished jobs (only the caller's).
+    let bob = h.client(BOB);
+    let bobs = bob.add(&job_request("bob", &[])).await;
+    let cleaned: CleanResponse = alice.post("/v1/jobs/clean", json!({})).await.json();
+    assert_eq!(cleaned.removed, vec![first, dependant]);
+    assert_eq!(
+        alice.get(&format!("/v1/jobs/{first}")).await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    // Reset kills and removes everything of alice's, but not bob's job.
+    let reset: BulkJobResponse = alice.post("/v1/jobs/reset", json!({})).await.json();
+    assert!(reset.all_ok(), "{reset:?}");
+    for _ in 0..250 {
+        let list: ListJobsResponse = alice.get("/v1/jobs").await.json();
+        if list.jobs.iter().all(|j| j.owner.0 != ALICE) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let list: ListJobsResponse = alice.get("/v1/jobs").await.json();
+    assert_eq!(list.jobs.iter().map(|j| j.id).collect::<Vec<_>>(), [bobs]);
+
+    // Deleting a group.
+    let reply = admin.call(Method::DELETE, "/v1/groups/gpu", None).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+
+    h.stop().await;
+}

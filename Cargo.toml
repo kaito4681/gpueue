@@ -33,6 +33,12 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 comfy-table = "7"
 nix = { version = "0.30", features = ["user"] }
+axum = "0.8"
+futures = "0.3"
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
