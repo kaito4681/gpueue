@@ -40,10 +40,6 @@ struct Client {
     socket: PathBuf,
     uid: u32,
     version: String,
-    /// The daemon records `Running` before its spawn request reaches the
-    /// helper; waiting for `Running` also waits for the fake helper to know
-    /// the job, so tests can make it exit or checkpoint right away.
-    helper: Option<FakeHelper>,
 }
 
 struct Reply {
@@ -87,7 +83,6 @@ impl Client {
             socket: socket.to_owned(),
             uid,
             version: BINARY_VERSION.to_owned(),
-            helper: None,
         }
     }
 
@@ -174,19 +169,7 @@ impl Client {
     }
 
     async fn wait_state(&self, id: JobId, state: &JobState) -> JobView {
-        let job = self.wait_for(id, state.name(), |j| j.state == *state).await;
-        if *state == JobState::Running
-            && let Some(helper) = &self.helper
-        {
-            for _ in 0..250 {
-                if helper.is_running(id) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert!(helper.is_running(id), "job {id} never reached the helper");
-        }
-        job
+        self.wait_for(id, state.name(), |j| j.state == *state).await
     }
 }
 
@@ -273,10 +256,27 @@ impl Harness {
     }
 
     fn client(&self, uid: u32) -> Client {
-        Client {
-            helper: Some(self.helper.clone()),
-            ..Client::new(&self.dir.path().join("puzuz.sock"), uid)
+        Client::new(&self.dir.path().join("puzuz.sock"), uid)
+    }
+
+    /// Waits until the fake helper runs the job. A job is `Running` in the
+    /// daemon before its spawn request has reached the helper; API actions
+    /// wait for that by themselves, but simulated process events (exit,
+    /// vanish) need the fake to know the job.
+    async fn wait_spawned(&self, id: JobId) {
+        for _ in 0..250 {
+            if self.helper.is_running(id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        panic!("job {id} never reached the helper");
+    }
+
+    /// The job's process exits with `code` (once it has been spawned).
+    async fn exit(&self, id: JobId, code: i32) {
+        self.wait_spawned(id).await;
+        self.helper.exit(id, code);
     }
 
     async fn set_default_parallel(&self, parallel: u32) {
@@ -304,6 +304,7 @@ async fn add_start_exit_status_and_log() {
     let id = alice.add(&job_request("echo hi", &[0])).await;
     let job = alice.wait_state(id, &JobState::Running).await;
     assert!(job.started_at.is_some());
+    h.wait_spawned(id).await;
     let spawned = h.helper.spawned();
     assert_eq!(spawned.len(), 1);
     assert_eq!(spawned[0].job, id);
@@ -316,7 +317,7 @@ async fn add_start_exit_status_and_log() {
         h.dir.path().join(format!("logs/{ALICE}/{id}.log"))
     );
 
-    h.helper.exit(id, 0);
+    h.exit(id, 0).await;
     let job = alice.wait_state(id, &done(JobResult::Success)).await;
     assert!(job.finished_at.is_some());
     let details = job.details.expect("the owner sees details");
@@ -324,7 +325,7 @@ async fn add_start_exit_status_and_log() {
 
     let failing = alice.add(&job_request("false", &[])).await;
     alice.wait_state(failing, &JobState::Running).await;
-    h.helper.exit(failing, 3);
+    h.exit(failing, 3).await;
     alice
         .wait_state(failing, &done(JobResult::Failed { exit_code: 3 }))
         .await;
@@ -387,7 +388,7 @@ async fn log_follow_streams_appended_output() {
     assert_eq!(&next[..], b"epoch 1\n");
 
     file.write_all(b"bye\n").unwrap();
-    h.helper.exit(id, 0);
+    h.exit(id, 0).await;
     while let Some(frame) = body.frame().await {
         received.extend_from_slice(&frame.unwrap().into_data().unwrap());
     }
@@ -426,7 +427,7 @@ async fn gpu_slots_are_shared_across_users() {
     // A job on both GPUs waits for both.
     let both = alice.add(&job_request("d", &[0, 1])).await;
 
-    h.helper.exit(a0, 0);
+    h.exit(a0, 0).await;
     bob.wait_state(b0, &JobState::Running).await;
     assert!(matches!(
         alice.job(both).await.state,
@@ -452,6 +453,7 @@ async fn gpu_slots_are_shared_across_users() {
         .await;
     assert_eq!(reply.status, StatusCode::OK);
     alice.wait_state(both, &JobState::Running).await;
+    h.wait_spawned(both).await;
     let request = &h.helper.spawned()[3];
     assert_eq!(request.gpus, [GpuIndex(0), GpuIndex(1)]);
 
@@ -578,7 +580,7 @@ async fn checkpoint_and_restore() {
         alice.job(id).await.state,
         JobState::RestoreQueued { .. }
     ));
-    h.helper.exit(other, 0);
+    h.exit(other, 0).await;
     alice.wait_state(id, &JobState::Running).await;
     assert!(h.helper.is_running(id));
     assert!(!h.helper.has_image(id));
@@ -731,6 +733,7 @@ async fn daemon_restart_reconciles_with_the_helper() {
     let queued = alice.add(&job_request("d", &[])).await;
     for id in [finished, lost, survivor] {
         alice.wait_state(id, &JobState::Running).await;
+        h.wait_spawned(id).await;
     }
 
     // Stopping the daemon leaves the jobs alone.
@@ -740,7 +743,7 @@ async fn daemon_restart_reconciles_with_the_helper() {
 
     // Meanwhile: one job exits (the helper queues the event), one vanishes,
     // and the helper runs a job the daemon never heard of.
-    h.helper.exit(finished, 0);
+    h.exit(finished, 0).await;
     h.helper.vanish(lost);
     h.helper.insert_running(JobId(99));
 
@@ -860,7 +863,7 @@ async fn validation_versions_groups_and_bulk_operations() {
     assert_eq!(reply.status, StatusCode::OK);
 
     // A failed dependency fails its dependants.
-    h.helper.exit(first, 1);
+    h.exit(first, 1).await;
     alice
         .wait_state(dependant, &done(JobResult::DependencyFailed))
         .await;
@@ -1098,6 +1101,194 @@ async fn owner_is_warned_once_about_a_failed_checkpoint() {
         alice.get("/v1/jobs").await.warnings(),
         [Warning::CheckpointFailed { job: second }]
     );
+
+    h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The launch window: the daemon records a job as Running (or Restoring)
+// before the helper has answered its spawn (or restore) request. The fake
+// holds those requests to make the window deterministic.
+// ---------------------------------------------------------------------------
+
+/// Sends `action` for `id` in the background.
+fn send_action(
+    client: &Client,
+    id: JobId,
+    action: &'static str,
+    body: Value,
+) -> tokio::task::JoinHandle<Reply> {
+    let client = client.clone();
+    tokio::spawn(async move { client.action(id, action, body).await })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actions_in_the_spawn_window_wait_for_the_helper() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(3).await;
+    let alice = h.client(ALICE);
+
+    let mut ids = Vec::new();
+    for (action, body) in [
+        ("checkpoint", json!(null)),
+        ("pause", json!({})),
+        ("kill", json!({})),
+    ] {
+        h.helper.hold_launches();
+        let id = alice.add(&job_request(action, &[])).await;
+        alice.wait_state(id, &JobState::Running).await;
+        h.helper.wait_held(1).await;
+        let reply = send_action(&alice, id, action, body);
+        // Nothing reaches the helper (or the database) before the spawn is
+        // answered.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!reply.is_finished(), "{action}");
+        assert_eq!(alice.job(id).await.state, JobState::Running, "{action}");
+        assert!(h.helper.signals().iter().all(|(job, _)| *job != id));
+
+        h.helper.release_launches();
+        let reply = reply.await.unwrap();
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "{action}: {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        ids.push(id);
+    }
+    let [checkpointed, paused, killed] = ids[..] else {
+        unreachable!()
+    };
+    let job = alice
+        .wait_state(checkpointed, &JobState::Checkpointed)
+        .await;
+    assert_eq!(job.checkpoint_size_bytes, Some(4096));
+    assert!(h.helper.has_image(checkpointed));
+    alice.wait_state(paused, &JobState::Paused).await;
+    assert_eq!(
+        h.helper.jobs()[&paused].phase,
+        puzuz_protocol::helper::RunningPhase::Stopped
+    );
+    alice.wait_state(killed, &done(JobResult::Killed)).await;
+    assert!(!h.helper.is_running(killed));
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_spawn_fails_the_waiting_action_cleanly() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    h.helper.hold_launches();
+    h.helper.set_spawn_failure(Some("no such directory"));
+
+    let id = alice.add(&job_request("train", &[0])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.helper.wait_held(1).await;
+    let checkpoint = send_action(&alice, id, "checkpoint", json!(null));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!checkpoint.is_finished());
+
+    h.helper.release_launches();
+    let reply = checkpoint.await.unwrap();
+    assert_eq!(reply.error().code, ErrorCode::InvalidState);
+    let job = alice
+        .wait_state(
+            id,
+            &done(JobResult::FailedToSpawn {
+                reason: "no such directory".to_owned(),
+            }),
+        )
+        .await;
+    assert_eq!(job.checkpoint_size_bytes, None);
+    assert!(h.helper.signals().is_empty());
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_in_flight_rejects_checkpoint_and_kill_then_completes() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+
+    let id = alice.add(&job_request("train", &[0])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    let reply = alice.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    alice.wait_state(id, &JobState::Checkpointed).await;
+
+    h.helper.hold_launches();
+    let restore = send_action(&alice, id, "restore", json!({"immediate": true}));
+    h.helper.wait_held(1).await;
+    alice.wait_state(id, &JobState::Restoring).await;
+    // Rejected right away (nothing to signal or dump yet), not queued.
+    for (action, body) in [
+        ("checkpoint", json!(null)),
+        ("kill", json!({})),
+        ("pause", json!({})),
+    ] {
+        let reply = alice.action(id, action, body).await;
+        assert_eq!(reply.error().code, ErrorCode::InvalidState, "{action}");
+    }
+    assert!(h.helper.signals().is_empty());
+
+    h.helper.release_launches();
+    assert_eq!(restore.await.unwrap().status, StatusCode::OK);
+    alice.wait_state(id, &JobState::Running).await;
+    assert!(h.helper.is_running(id));
+    // Restored: checkpointing works again.
+    let reply = alice.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    alice.wait_state(id, &JobState::Checkpointed).await;
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_helper_reconnect_during_a_spawn_does_not_lose_the_job() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    h.helper.hold_launches();
+
+    let id = alice.add(&job_request("train", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.helper.wait_held(1).await;
+    // The live-job list sent on reconnect predates the spawn.
+    h.helper.disconnect();
+    h.helper.reconnect();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    h.helper.release_launches();
+    h.wait_spawned(id).await;
+    // Past the one-second re-check, the job is still running.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(alice.job(id).await.state, JobState::Running);
+    let reply = alice.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    alice.wait_state(id, &JobState::Checkpointed).await;
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_restart_during_a_spawn_marks_the_job_lost() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    h.helper.hold_launches();
+
+    let id = alice.add(&job_request("train", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.helper.wait_held(1).await;
+    // The daemon stops before the helper has answered; the request is
+    // dropped unanswered, so the helper never starts the job.
+    h.stop().await;
+    h.helper.wait_held(0).await;
+    h.helper.release_launches();
+    assert!(h.helper.spawned().is_empty());
+
+    h.start(0).await;
+    let alice = h.client(ALICE);
+    alice.wait_state(id, &done(JobResult::Lost)).await;
+    assert!(!h.helper.is_running(id));
 
     h.stop().await;
 }

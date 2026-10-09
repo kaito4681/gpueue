@@ -5,6 +5,11 @@
 //! acknowledged, so tests can simulate exits, checkpoint failures, helper
 //! disconnects and daemon restarts. Clones share the same state, so one
 //! instance can outlive a daemon and be handed to the next one.
+//!
+//! [`FakeHelper::hold_launches`] makes spawn and restore requests wait
+//! (unanswered and without effect) until [`FakeHelper::release_launches`],
+//! to reproduce the window in which the daemon has recorded a launch the
+//! helper does not know about yet.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -18,7 +23,7 @@ use puzuz_protocol::helper::{
     HelperErrorCode, RestoreOutcome, RestoreRequest, RunningJob, RunningPhase, SpawnRequest,
     signal,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::{Helper, HelperError, HelperNotice, HelperResult, HelperState};
 
@@ -52,6 +57,9 @@ struct State {
     ignore_sigterm: bool,
     spawned: Vec<SpawnRequest>,
     signals: Vec<(JobId, i32)>,
+    hold_launches: bool,
+    /// Spawn/restore requests currently held.
+    held: usize,
 }
 
 impl State {
@@ -114,14 +122,57 @@ fn not_found(job: JobId) -> HelperError {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FakeHelper {
     state: Arc<Mutex<State>>,
+    /// Bumped whenever held requests may proceed or the held count changes.
+    wake: Arc<watch::Sender<u64>>,
+}
+
+impl Default for FakeHelper {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            wake: Arc::new(watch::channel(0).0),
+        }
+    }
+}
+
+/// Decrements the held count when a held request stops waiting (also when
+/// its future is dropped).
+struct Held<'a>(&'a FakeHelper);
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.0.with(|s| s.held -= 1);
+        self.0.bump();
+    }
 }
 
 impl FakeHelper {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn bump(&self) {
+        self.wake.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Waits while launches are held. A request dropped while waiting has
+    /// no effect.
+    async fn launch_gate(&self) {
+        let mut rx = self.wake.subscribe();
+        if !self.with(|s| s.hold_launches) {
+            return;
+        }
+        self.with(|s| s.held += 1);
+        self.bump();
+        let _held = Held(self);
+        while self.with(|s| s.hold_launches) {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
@@ -164,6 +215,29 @@ impl FakeHelper {
     /// Make the next spawns fail with `reason` (`None` to succeed again).
     pub fn set_spawn_failure(&self, reason: Option<&str>) {
         self.with(|s| s.spawn_failure = reason.map(str::to_owned));
+    }
+
+    /// Holds spawn and restore requests until [`release_launches`].
+    ///
+    /// [`release_launches`]: FakeHelper::release_launches
+    pub fn hold_launches(&self) {
+        self.with(|s| s.hold_launches = true);
+    }
+
+    /// Lets held (and later) spawn and restore requests proceed.
+    pub fn release_launches(&self) {
+        self.with(|s| s.hold_launches = false);
+        self.bump();
+    }
+
+    /// Resolves once `count` spawn/restore requests are being held.
+    pub async fn wait_held(&self, count: usize) {
+        let mut rx = self.wake.subscribe();
+        while self.with(|s| s.held) < count {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     pub fn set_checkpoint_outcome(&self, outcome: FakeOutcome) {
@@ -370,8 +444,11 @@ impl Helper for FakeHelper {
     }
 
     fn spawn(&self, request: SpawnRequest) -> BoxFuture<'_, HelperResult<u32>> {
-        let result = self.do_spawn(request);
-        async move { result }.boxed()
+        async move {
+            self.launch_gate().await;
+            self.do_spawn(request)
+        }
+        .boxed()
     }
 
     fn signal(&self, job: JobId, signal: i32) -> BoxFuture<'_, HelperResult<()>> {
@@ -390,8 +467,11 @@ impl Helper for FakeHelper {
     }
 
     fn restore(&self, request: RestoreRequest) -> BoxFuture<'_, HelperResult<()>> {
-        let result = self.do_restore(request);
-        async move { result }.boxed()
+        async move {
+            self.launch_gate().await;
+            self.do_restore(request)
+        }
+        .boxed()
     }
 
     fn delete_checkpoint(

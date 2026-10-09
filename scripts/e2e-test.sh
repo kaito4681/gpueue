@@ -15,6 +15,10 @@
 #                       already has systemd, criu and python3, e.g.
 #                       puzuz-poc/systemd259:0.1)
 #   PUZUZ_E2E_SKIP_BUILD=1  reuse target/docker/debug binaries
+#   PUZUZ_E2E_ONLY_REBOOT=1 skip the main scenarios and run only the
+#                       reboot scenario (7), e.g. to repeat it many times
+#   PUZUZ_E2E_NAME      prefix of the container and volume names
+#                       (default puzuz-e2e), to tell parallel runs apart
 #   PUZUZ_E2E_GPU=1     also run a CUDA checkpoint/restore scenario on GPU 0
 #                       (`docker run --gpus all`; the base image needs CUDA,
 #                       torch in /opt/venv and cuda-checkpoint, e.g.
@@ -29,8 +33,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 image="${PUZUZ_SYSTEMD_IMAGE:-puzuz-helper-systemd:test}"
-name="puzuz-e2e-$$"
-volume="puzuz-e2e-state-$$"
+name="${PUZUZ_E2E_NAME:-puzuz-e2e}-$$"
+volume="${PUZUZ_E2E_NAME:-puzuz-e2e}-state-$$"
 keep="${1:-}"
 gpu_args=()
 gpu_env=()
@@ -93,7 +97,10 @@ warnings() {
 
 status=0
 boot "$name-a"
-docker exec "${gpu_env[@]}" "$name-a" bash /e2e/scenario.sh main | tee "$stage/results" || status=1
+touch "$stage/results"
+if [ "${PUZUZ_E2E_ONLY_REBOOT:-}" != 1 ]; then
+    docker exec "${gpu_env[@]}" "$name-a" bash /e2e/scenario.sh main | tee "$stage/results" || status=1
+fi
 docker exec "${gpu_env[@]}" "$name-a" bash /e2e/scenario.sh reboot-prepare | tee -a "$stage/results" || status=1
 if [ "$status" -eq 0 ]; then warnings "$name-a"; else journal "$name-a"; fi
 

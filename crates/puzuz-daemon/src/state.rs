@@ -7,9 +7,15 @@
 //!    and persists it with [`Core::apply_in_tx`] (which also performs the
 //!    effects that only touch the database).
 //! 2. Still under the database lock, the changed jobs are published to
-//!    `/v1/events` subscribers, so events are delivered in commit order.
+//!    `/v1/events` subscribers, so events are delivered in commit order, and
+//!    launches (spawn/restore) are registered in [`Launches`].
 //! 3. The remaining effects (helper calls, log files) run afterwards with
 //!    [`Core::run_effects`]; their failures may lead to further transitions.
+//!
+//! Effects that act on a live process (signals, checkpoints) must not reach
+//! the helper before the spawn or restore request that started the process
+//! has been answered (see [`crate::launch`]); [`Core::wait_for_launch`] and
+//! [`Core::launch_in_flight`] enforce that ordering per job.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -36,6 +42,7 @@ use crate::config::Config;
 use crate::error::{ApiResult, Failure};
 use crate::gpu::DetectedGpu;
 use crate::helper::{Helper, HelperError, HelperNotice};
+use crate::launch::Launches;
 use crate::users::UserDb;
 
 /// Current time in Unix epoch milliseconds.
@@ -141,6 +148,8 @@ pub struct Changes {
     groups: Vec<String>,
     groups_removed: Vec<String>,
     other: bool,
+    /// Jobs whose spawn or restore request is sent after the commit.
+    launching: Vec<JobId>,
 }
 
 impl Changes {
@@ -162,6 +171,9 @@ impl Changes {
     /// Something else that may affect scheduling changed (e.g. GPU limits).
     pub fn touch(&mut self) {
         self.other = true;
+    }
+    fn launching(&mut self, id: JobId) {
+        self.launching.push(id);
     }
     fn is_empty(&self) -> bool {
         self.added.is_empty()
@@ -188,6 +200,20 @@ pub fn needs_helper(effect: &Effect) -> bool {
             | Effect::DeleteCheckpointImage
     )
 }
+
+/// Whether an effect acts on the job's live process, which the helper only
+/// knows once the spawn or restore request that started it was answered.
+pub fn targets_live_process(effect: &Effect) -> bool {
+    needs_helper(effect)
+        && !matches!(
+            effect,
+            Effect::Spawn | Effect::Restore | Effect::DeleteCheckpointImage
+        )
+}
+
+/// How long an operation waits for the helper to answer a job's spawn or
+/// restore request (the helper client gives up on a request after 60 s).
+const LAUNCH_WAIT: Duration = Duration::from_secs(75);
 
 /// A pre-transition hook for [`Core::handle_event`] that does nothing.
 pub fn no_pre(_: &dyn StoreOps, _: &Job) -> Result<(), StorageError> {
@@ -219,6 +245,8 @@ pub struct Core {
     pending_removal: Mutex<BTreeSet<JobId>>,
     /// Live helper jobs the database does not account for.
     orphans: Mutex<BTreeSet<JobId>>,
+    /// Spawn and restore requests the helper has not answered yet.
+    launches: Launches,
 }
 
 impl Core {
@@ -248,6 +276,7 @@ impl Core {
             shutdown_complete: CancellationToken::new(),
             pending_removal: Mutex::new(BTreeSet::new()),
             orphans: Mutex::new(BTreeSet::new()),
+            launches: Launches::default(),
         })
     }
 
@@ -280,6 +309,36 @@ impl Core {
             ErrorCode::HelperUnavailable,
             "the puzuz helper is not connected; check `systemctl status puzuz-helper`",
         )
+    }
+
+    /// Whether a spawn or restore request for `id` is waiting for the
+    /// helper's answer. Consistent with the database when called inside
+    /// [`Core::write`], since launches are registered under its lock.
+    pub fn launch_in_flight(&self, id: JobId) -> bool {
+        self.launches.in_flight(id)
+    }
+
+    /// Waits until the helper has answered a pending spawn or restore
+    /// request for `id`, so that requests for the live process do not
+    /// overtake it. Fails (retryably) when the daemon stops or the helper
+    /// takes too long.
+    pub async fn wait_for_launch(&self, id: JobId) -> ApiResult<()> {
+        if !self.launches.in_flight(id) {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = self.launches.wait(id) => Ok(()),
+            _ = self.cancel.cancelled() => Err(Failure::new(
+                ErrorCode::ShuttingDown,
+                "the daemon is stopping",
+            )),
+            _ = tokio::time::sleep(LAUNCH_WAIT) => Err(Failure::new(
+                ErrorCode::HelperUnavailable,
+                format!(
+                    "the puzuz helper has not confirmed that job {id} started; try again later"
+                ),
+            )),
+        }
     }
 
     pub fn orphans(&self) -> Vec<JobId> {
@@ -416,6 +475,9 @@ impl Core {
                 let result = store.transaction(|tx| f(tx, &mut changes));
                 let changed = result.is_ok() && !changes.is_empty();
                 if changed {
+                    for &id in &changes.launching {
+                        core.launches.begin(id);
+                    }
                     core.publish(store, &changes);
                 }
                 (result, changed)
@@ -498,6 +560,7 @@ impl Core {
         let mut copy = None;
         for effect in &transition.effects {
             match effect {
+                Effect::Spawn | Effect::Restore => changes.launching(job.id),
                 Effect::Checkpoint => {
                     tx.put_checkpoint(&self.new_checkpoint_record(job, now))?;
                     changes.updated(job.id);
@@ -563,13 +626,19 @@ impl Core {
 
     async fn run_effect(self: &Arc<Self>, job: &Job, effect: &Effect) -> ApiResult<()> {
         match effect {
-            Effect::Spawn => self.spawn_job(job).await,
+            Effect::Spawn => {
+                let _settle = self.launches.settle_on_drop(job.id);
+                self.spawn_job(job).await
+            }
             Effect::SignalStop => self.signal(job, signal::SIGSTOP).await,
             Effect::SignalContinue => self.signal(job, signal::SIGCONT).await,
             Effect::SendSignal(sig) => self.signal(job, *sig).await,
             Effect::Kill | Effect::Terminate => self.terminate(job).await,
             Effect::Checkpoint => self.start_checkpoint(job).await,
-            Effect::Restore => self.start_restore(job).await,
+            Effect::Restore => {
+                let _settle = self.launches.settle_on_drop(job.id);
+                self.start_restore(job).await
+            }
             // After a successful restore the helper has already removed the
             // image (and refuses to touch the directory of a live job).
             Effect::DeleteCheckpointImage if job.state == JobState::Running => Ok(()),
@@ -963,8 +1032,14 @@ impl Core {
     /// - known to the helper but not live in the database → orphan, logged
     ///   and left alone;
     /// - `Terminating` jobs get their SIGTERM/SIGKILL sequence re-armed.
+    ///
+    /// A job whose spawn or restore request is in flight, or was answered
+    /// since the previous reconciliation, may be missing from `running`
+    /// only because that list was taken before the request reached the
+    /// helper; it is checked again once the request has settled.
     pub async fn reconcile(self: &Arc<Self>, running: Vec<RunningJob>) {
         let live: HashSet<JobId> = running.iter().map(|r| r.job).collect();
+        let recently_launched = self.launches.take_settled();
         let jobs = match self.read(|s| s.list_jobs(&JobFilter::all())).await {
             Ok(jobs) => jobs,
             Err(e) => {
@@ -975,7 +1050,12 @@ impl Core {
         let mut accounted = HashSet::new();
         for job in jobs.iter().filter(|j| j.state.occupies_slot()) {
             accounted.insert(job.id);
-            if !live.contains(&job.id) {
+            if !live.contains(&job.id)
+                && (self.launches.in_flight(job.id) || recently_launched.contains(&job.id))
+            {
+                tracing::debug!(job = %job.id, "job was launched around the reconnect; checking again");
+                self.recheck_after_launch(job.id, job.started_at);
+            } else if !live.contains(&job.id) {
                 tracing::warn!(job = %job.id, state = job.state.name(), "job is gone; marking it lost");
                 self.handle_event(job.id, lifecycle::Event::Lost, no_pre)
                     .await;
@@ -995,6 +1075,19 @@ impl Core {
         *self.orphans.lock().unwrap() = orphans;
         self.reconciled.store(true, Ordering::SeqCst);
         self.wake_scheduler();
+    }
+
+    /// Once the launch of `id` has settled, marks the job lost unless the
+    /// helper knows it (see [`Core::reconcile`]).
+    fn recheck_after_launch(self: &Arc<Self>, id: JobId, started_at: Option<Timestamp>) {
+        let core = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = core.cancel.cancelled() => return,
+                _ = core.launches.wait(id) => {}
+            }
+            core.spawn_lost_check(id, started_at);
+        });
     }
 
     /// Consumes helper notices until the daemon stops.
@@ -1092,6 +1185,8 @@ impl Core {
                 Ok(launched)
             })
             .await?;
+        // One at a time: concurrent spawns make the real helper fail or
+        // stall them (seen in scripts/e2e-test.sh).
         for (job, effects) in launched {
             let _ = self.run_effects(&job, &effects).await;
         }
@@ -1171,6 +1266,15 @@ impl Core {
         let checkpoint_wait = Duration::from_secs(30 * 60);
         let settle_wait = Duration::from_secs(self.config.grace_secs + 10);
         for _pass in 0..3 {
+            // New launches are refused from now on; let the ones in flight
+            // be answered so the jobs can be signalled or checkpointed.
+            tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                _ = self.launches.wait_idle() => {}
+                _ = tokio::time::sleep(LAUNCH_WAIT) => {
+                    tracing::warn!("the helper has not answered every spawn or restore request");
+                }
+            }
             let jobs = match self.read(|s| s.list_jobs(&JobFilter::all())).await {
                 Ok(jobs) => jobs,
                 Err(_) => break,
