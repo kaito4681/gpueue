@@ -1,0 +1,21 @@
+[package]
+name = "puzuz"
+description = "GPU-aware job queue with transparent checkpointing (CLI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "puzuz"
+path = "src/main.rs"
+
+[dependencies]
+puzuz-core.workspace = true
+puzuz-protocol.workspace = true
+puzuz-daemon.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

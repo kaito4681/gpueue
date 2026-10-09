@@ -1,0 +1,19 @@
+[package]
+name = "puzuz-helper"
+description = "Privileged helper that runs, signals and checkpoints puzuz jobs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "puzuz-helper"
+path = "src/main.rs"
+
+[dependencies]
+puzuz-protocol.workspace = true
+puzuz-checkpoint.workspace = true
+
+[lints]
+workspace = true

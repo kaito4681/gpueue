@@ -1,6 +1,29 @@
-[package]
-name = "puzuz"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/puzuz"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/kaito4681/puzuz"
 
-[dependencies]
+[workspace.dependencies]
+puzuz-core = { path = "crates/puzuz-core" }
+puzuz-protocol = { path = "crates/puzuz-protocol" }
+puzuz-daemon = { path = "crates/puzuz-daemon" }
+puzuz-checkpoint = { path = "crates/puzuz-checkpoint" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

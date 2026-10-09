@@ -1,0 +1,15 @@
+[package]
+name = "puzuz-daemon"
+description = "The puzuz daemon: API, scheduler and state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+puzuz-core.workspace = true
+puzuz-protocol.workspace = true
+
+[lints]
+workspace = true
