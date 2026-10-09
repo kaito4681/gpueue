@@ -25,6 +25,7 @@ clap_complete_nushell = "4.5"
 chrono = "0.4"
 interim = { version = "0.2", features = ["chrono_0_4"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

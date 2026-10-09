@@ -8,5 +8,6 @@ pub mod error;
 pub mod lifecycle;
 pub mod model;
 pub mod scheduler;
+pub mod storage;
 
 pub use error::Error;
