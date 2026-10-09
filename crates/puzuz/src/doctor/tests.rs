@@ -201,6 +201,22 @@ fn cuda_checkpoint_problems_fail_with_a_driver() {
 }
 
 #[test]
+fn cuda_checkpoint_that_cannot_start_is_explained() {
+    let (sys, _sockets) = healthy();
+    sys.respond(
+        "cuda-checkpoint --help",
+        CmdOutput::failed(
+            "",
+            "cuda-checkpoint: error while loading shared libraries: libcuda.so.1: cannot open \
+             shared object file\n",
+        ),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "cuda-checkpoint"), Level::Fail);
+    assert!(message(&report, "cuda-checkpoint").contains("libcuda.so.1"));
+}
+
+#[test]
 fn unconfigured_gpus_warn() {
     let (sys, _sockets) = healthy();
     sys.write("/etc/puzuz/config.toml", "");

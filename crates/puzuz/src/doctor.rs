@@ -295,6 +295,12 @@ fn check_cuda_checkpoint(sys: &dyn System, configured: &Path, driver: Option<&Ve
     };
     // Older binaries print the help on stderr.
     let features = parse_cuda_checkpoint_help(&format!("{}\n{}", output.stdout, output.stderr));
+    if !output.success && features.version.is_none() && !features.actions {
+        // E.g. "error while loading shared libraries: libcuda.so.1".
+        let reason = output.stderr.lines().next().unwrap_or("no output").trim();
+        return Check::new(missing, NAME, format!("`{shown} --help` failed: {reason}"))
+            .hint("check that the NVIDIA driver (libcuda.so.1) is installed and matches it");
+    }
     let version = features
         .version
         .as_ref()
