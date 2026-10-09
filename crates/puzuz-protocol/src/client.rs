@@ -10,6 +10,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -29,7 +30,7 @@ use crate::api::{
     ErrorCode, Event, GpuView, JobAction, JobActionResult, JobView, ListGpusResponse,
     ListGroupsResponse, ListJobsQuery, ListJobsResponse, LogQuery, Method, ResetRequest,
     SetGpusParallelRequest, SetParallelRequest, ShutdownRequest, SseDecoder, SwitchRequest,
-    VERSION_HEADER, VersionResponse,
+    VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
 };
 
 /// Error bodies longer than this are cut when they are not valid JSON.
@@ -88,11 +89,13 @@ impl ClientError {
 
 pub type Result<T, E = ClientError> = std::result::Result<T, E>;
 
-/// Client of one daemon socket. Cheap to clone.
+/// Client of one daemon socket. Cheap to clone (clones share the collected
+/// [`Warning`]s).
 #[derive(Debug, Clone)]
 pub struct Client {
     socket: PathBuf,
     version: String,
+    warnings: Arc<Mutex<Vec<Warning>>>,
 }
 
 impl Client {
@@ -101,6 +104,7 @@ impl Client {
         Self {
             socket: socket.into(),
             version: BINARY_VERSION.to_owned(),
+            warnings: Arc::default(),
         }
     }
 
@@ -117,6 +121,13 @@ impl Client {
     /// The version sent in [`VERSION_HEADER`].
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Takes the warnings the daemon attached to responses so far (see
+    /// [`WARNINGS_HEADER`]). The daemon sends each warning once, so the
+    /// caller should show them to the user.
+    pub fn take_warnings(&self) -> Vec<Warning> {
+        std::mem::take(&mut *self.warnings.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     // -----------------------------------------------------------------------
@@ -335,6 +346,16 @@ impl Client {
 
         let response = sender.send_request(request).await?;
         if response.status().is_success() {
+            if let Some(value) = response.headers().get(WARNINGS_HEADER)
+                && let Ok(value) = value.to_str()
+            {
+                let mut warnings = self.warnings.lock().unwrap_or_else(|e| e.into_inner());
+                for warning in Warning::parse_header(value) {
+                    if !warnings.contains(&warning) {
+                        warnings.push(warning);
+                    }
+                }
+            }
             Ok(response)
         } else {
             Err(error_from_response(response).await)

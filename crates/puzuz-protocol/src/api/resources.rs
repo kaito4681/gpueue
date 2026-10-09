@@ -48,12 +48,28 @@ pub struct GpuView {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_total_bytes: Option<u64>,
+    /// NVIDIA driver version reported by detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_version: Option<String>,
+    /// Whether the GPU was detected when the daemon started. A GPU that was
+    /// known before but is missing now stays listed (with its slot limit)
+    /// but starts no jobs; jobs that need it stay queued. Omitted when true.
+    #[serde(default = "available_default", skip_serializing_if = "is_available")]
+    pub available: bool,
     /// Maximum number of jobs at once.
     pub parallel: u32,
     /// Slots currently taken.
     pub used: u32,
     /// Jobs holding a slot on this GPU.
     pub jobs: Vec<GpuJob>,
+}
+
+fn available_default() -> bool {
+    true
+}
+
+fn is_available(available: &bool) -> bool {
+    *available
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
