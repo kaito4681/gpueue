@@ -141,6 +141,7 @@ impl Core {
                         )));
                     }
                 }
+                core.require_gpus_available(&spec.gpus)?;
                 for dep in &spec.dependencies {
                     if tx.get_job(*dep)?.is_none() {
                         return Err(Failure::bad_request(format!(
@@ -203,6 +204,14 @@ impl Core {
                     && (transition.effects.iter().any(needs_helper) || immediate_copy)
                 {
                     return Err(Core::helper_unavailable());
+                }
+                let launches = immediate_copy
+                    || transition
+                        .effects
+                        .iter()
+                        .any(|e| matches!(e, Effect::Spawn | Effect::Restore));
+                if launches {
+                    core.require_gpus_available(&job.spec.gpus)?;
                 }
                 if action == JobAction::Remove {
                     let all = tx.list_jobs(&JobFilter::all())?;
@@ -519,6 +528,21 @@ impl Core {
     // GPUs
     // -----------------------------------------------------------------
 
+    /// Rejects launching on (or submitting for) a GPU that was not detected
+    /// at start-up. Jobs already queued for one simply wait.
+    fn require_gpus_available(&self, gpus: &[GpuIndex]) -> ApiResult<()> {
+        match gpus.iter().find(|gpu| !self.gpu_available(**gpu)) {
+            Some(gpu) => Err(Failure::new(
+                ErrorCode::InvalidState,
+                format!(
+                    "GPU {gpu} is not available: it was not detected when the daemon started \
+                     (see `puzuz gpu`)"
+                ),
+            )),
+            None => Ok(()),
+        }
+    }
+
     fn gpu_views(&self, gpus: Vec<Gpu>, jobs: &[Job]) -> Vec<GpuView> {
         gpus.into_iter()
             .map(|gpu| {
@@ -530,9 +554,12 @@ impl Core {
                         owner: j.owner,
                     })
                     .collect();
+                let detected = self.detected_gpus.get(&gpu.index);
                 GpuView {
                     index: gpu.index,
-                    memory_total_bytes: self.gpu_memory.get(&gpu.index).copied(),
+                    memory_total_bytes: detected.and_then(|d| d.memory_total_bytes),
+                    driver_version: detected.and_then(|d| d.driver_version.clone()),
+                    available: detected.is_some(),
                     uuid: gpu.uuid,
                     name: gpu.name,
                     parallel: gpu.parallel,

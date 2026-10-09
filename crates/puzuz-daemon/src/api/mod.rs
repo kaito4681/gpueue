@@ -9,11 +9,11 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
-use puzuz_core::model::{GpuIndex, JobId};
+use puzuz_core::model::{GpuIndex, JobId, Uid};
 use puzuz_protocol::BINARY_VERSION;
 use puzuz_protocol::api::routes::{self, JobActionKind};
 use puzuz_protocol::api::{
@@ -21,7 +21,8 @@ use puzuz_protocol::api::{
     EnqueueOptions, ErrorCode, HelperStatus, JobAction, JobActionResult, KillOptions,
     ListGpusResponse, ListGroupsResponse, ListJobsQuery, ListJobsResponse, PauseOptions,
     ResetRequest, RestartOptions, RestoreOptions, SetGpusParallelRequest, SetParallelRequest,
-    ShutdownRequest, StashOptions, SwitchRequest, VERSION_HEADER, VersionResponse,
+    ShutdownRequest, StashOptions, SwitchRequest, VERSION_HEADER, VersionResponse, WARNINGS_HEADER,
+    Warning,
 };
 
 use crate::error::{ApiResult, Failure};
@@ -51,8 +52,56 @@ pub fn router(core: Arc<Core>) -> Router {
         .route(routes::VERSION, get(version))
         .route(routes::EVENTS, get(sse::events))
         .fallback(not_found)
+        .layer(middleware::from_fn_with_state(
+            core.clone(),
+            attach_warnings,
+        ))
         .layer(middleware::from_fn(check_version))
         .with_state(core)
+}
+
+/// Hands the caller's pending warnings (a failed checkpoint of one of their
+/// jobs) to the CLI in the [`WARNINGS_HEADER`] of a successful response,
+/// once. Only requests from the puzuz CLI (with the [`VERSION_HEADER`]) get
+/// them, and `/v1/version` never does.
+async fn attach_warnings(State(core): State<AppState>, request: Request, next: Next) -> Response {
+    let uid = if request.headers().contains_key(VERSION_HEADER)
+        && request.uri().path() != routes::VERSION
+    {
+        extract::peer_uid(
+            request.headers(),
+            request.extensions(),
+            core.trust_uid_header,
+        )
+        .ok()
+    } else {
+        None
+    };
+    // Looked up before the handler runs so the reply is not delayed; a
+    // failure caused by this very request is reported on the next one.
+    let pending = match uid {
+        Some(uid) => core.pending_warnings(Uid(uid)).await.unwrap_or_else(|e| {
+            tracing::warn!("cannot read pending warnings: {}", e.0.message);
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+    let mut response = next.run(request).await;
+    if pending.is_empty() || !response.status().is_success() {
+        return response;
+    }
+    let value = match HeaderValue::from_str(&Warning::encode_header(&pending)) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!("cannot encode warnings: {e}");
+            return response;
+        }
+    };
+    if let Err(e) = core.acknowledge_warnings(&pending).await {
+        tracing::warn!("cannot record delivered warnings: {}", e.0.message);
+    }
+    response.headers_mut().insert(WARNINGS_HEADER, value);
+    response
 }
 
 async fn not_found() -> Failure {

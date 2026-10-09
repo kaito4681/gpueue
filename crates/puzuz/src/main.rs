@@ -1,10 +1,13 @@
 mod cli;
 mod clock;
 mod commands;
+mod doctor;
 mod query;
 mod render;
 mod requests;
+mod service;
 mod style;
+mod system;
 mod users;
 
 use std::{io, path::Path, process::ExitCode};
@@ -14,7 +17,7 @@ use clap::{CommandFactory, FromArgMatches};
 use clap_complete::{Generator, generate, generate_to, shells};
 use puzuz_protocol::client::Client;
 
-use crate::cli::{Cli, Shell, SubCommand};
+use crate::cli::{Cli, ServiceCommand, Shell, SubCommand};
 use crate::clock::Clock;
 use crate::commands::App;
 use crate::render::RenderCtx;
@@ -60,10 +63,24 @@ fn main() -> ExitCode {
             helper_socket,
             socket: socket_is_explicit.then(|| cli.socket.clone()),
         }),
-        other @ (SubCommand::Service { .. }
-        | SubCommand::Doctor
-        | SubCommand::Edit { .. }
-        | SubCommand::Env { .. }) => fail(&format!("`{}` is not implemented yet", other.name())),
+        SubCommand::Service { cmd } => {
+            run_service(cmd, socket_is_explicit.then_some(cli.socket.as_path()))
+        }
+        SubCommand::Doctor => {
+            let report = doctor::run(
+                &system::RealSystem,
+                socket_is_explicit.then_some(cli.socket.as_path()),
+            );
+            let _ = report.print(&mut io::stdout());
+            if report.has_failures() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        other @ (SubCommand::Edit { .. } | SubCommand::Env { .. }) => {
+            fail(&format!("`{}` is not implemented yet", other.name()))
+        }
         other => run_remote(&cli, other),
     }
 }
@@ -87,11 +104,42 @@ fn run_remote(cli: &Cli, command: SubCommand) -> ExitCode {
         },
     };
     runtime.block_on(async {
-        match app.run(command).await {
+        let code = match app.run(command).await {
             Ok(code) => code,
             Err(err) => fail(&commands::describe_error(err, &app.client).await),
+        };
+        // Warnings the daemon keeps for this user (e.g. a failed checkpoint).
+        for warning in app.client.take_warnings() {
+            eprintln!("{BIN_NAME}: warning: {warning}");
         }
+        code
     })
+}
+
+/// `puzuz service ...`.
+fn run_service(cmd: ServiceCommand, socket: Option<&Path>) -> ExitCode {
+    let sys = system::RealSystem;
+    let mut out = io::stdout();
+    let result = match cmd {
+        ServiceCommand::Install { no_start, bin_dir } => service::install(
+            &sys,
+            &service::InstallOptions { no_start, bin_dir },
+            &mut out,
+        )
+        .map(|_| true),
+        ServiceCommand::Uninstall { purge, yes } => {
+            service::uninstall(&sys, &service::UninstallOptions { purge, yes }, &mut out)
+                .map(|()| true)
+        }
+        ServiceCommand::Status => {
+            service::status(&sys, socket, &mut out).map_err(|e| format!("writing output: {e}"))
+        }
+    };
+    match result {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(err) => fail(&err),
+    }
 }
 
 struct DaemonArgs {

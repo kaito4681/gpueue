@@ -17,6 +17,7 @@ mod events;
 mod jobs;
 mod resources;
 pub mod routes;
+mod warnings;
 
 pub use error::{ApiError, ErrorCode};
 pub use events::{Event, SseDecoder, SseMessage};
@@ -31,6 +32,7 @@ pub use resources::{
     SetGpusParallelRequest, SetParallelRequest, ShutdownRequest, VersionResponse,
 };
 pub use routes::{Method, Route};
+pub use warnings::{WARNINGS_HEADER, Warning};
 
 /// Major API version; matches the path prefix.
 pub const API_VERSION: u32 = 1;

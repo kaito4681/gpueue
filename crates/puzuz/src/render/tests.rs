@@ -276,6 +276,8 @@ fn gpu_table() {
             uuid: "GPU-0".into(),
             name: "NVIDIA A100".into(),
             memory_total_bytes: Some(80 * 1024 * 1024 * 1024),
+            driver_version: None,
+            available: true,
             parallel: 1,
             used: 1,
             jobs: vec![GpuJob {
@@ -288,6 +290,8 @@ fn gpu_table() {
             uuid: "GPU-1".into(),
             name: "NVIDIA A100".into(),
             memory_total_bytes: None,
+            driver_version: None,
+            available: true,
             parallel: 0,
             used: 2,
             jobs: vec![

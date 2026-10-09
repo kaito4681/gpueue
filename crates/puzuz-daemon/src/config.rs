@@ -6,8 +6,8 @@
 //! file for its own settings.
 //!
 //! ```toml
-//! data_dir = "/var/lib/puzuz"          # state.sqlite, logs/, checkpoints/
-//! # state_db = "/var/lib/puzuz/state.sqlite"
+//! data_dir = "/var/lib/puzuz"          # daemon/state.sqlite, logs/, checkpoints/
+//! # state_db = "/var/lib/puzuz/daemon/state.sqlite"
 //! # logs_dir = "/var/lib/puzuz/logs"
 //! # checkpoints_dir = "/var/lib/puzuz/checkpoints"
 //! api_socket = "/run/puzuz/puzuz.sock"
@@ -17,7 +17,11 @@
 //! # checkpoint_size_limit_bytes = 500_000_000_000
 //! checkpoint_tcp_close = true
 //!
-//! # Until NVML detection exists, GPUs are listed here.
+//! # GPUs are detected with NVML ("auto"). Without NVML (no driver, no
+//! # libnvidia-ml.so.1) the [[gpus]] list below is used instead; "static"
+//! # always uses the list.
+//! gpu_detection = "auto"
+//! # nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
 //! [[gpus]]
 //! index = 0
 //! uuid = "GPU-..."
@@ -37,7 +41,9 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/puzuz/config.toml";
 pub struct Config {
     /// Base directory for the state database, logs and checkpoints.
     pub data_dir: PathBuf,
-    /// Overrides `<data_dir>/state.sqlite`.
+    /// Overrides `<data_dir>/daemon/state.sqlite`. The database lives in a
+    /// subdirectory because `<data_dir>` itself must be owned by root (the
+    /// helper refuses to use paths below a directory the daemon can write).
     pub state_db: Option<PathBuf>,
     /// Overrides `<data_dir>/logs`. Logs are `<logs_dir>/<uid>/<id>.log`.
     pub logs_dir: Option<PathBuf>,
@@ -60,8 +66,25 @@ pub struct Config {
     pub criu_path: PathBuf,
     /// Path of `cuda-checkpoint` (used by the helper).
     pub cuda_checkpoint_path: PathBuf,
-    /// Statically configured GPUs, used until NVML detection is implemented.
+    /// How GPUs are found at start-up.
+    pub gpu_detection: GpuDetection,
+    /// Path (or name) of the NVML library; by default `libnvidia-ml.so.1`
+    /// and then `libnvidia-ml.so` are tried.
+    pub nvml_library: Option<PathBuf>,
+    /// Statically configured GPUs: used when NVML is unavailable, or always
+    /// with `gpu_detection = "static"`.
     pub gpus: Vec<GpuConfig>,
+}
+
+/// [`Config::gpu_detection`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuDetection {
+    /// NVML, falling back to [`Config::gpus`] when NVML cannot be loaded.
+    #[default]
+    Auto,
+    /// Only [`Config::gpus`].
+    Static,
 }
 
 /// One GPU in [`Config::gpus`].
@@ -91,6 +114,8 @@ impl Default for Config {
             checkpoint_tcp_close: true,
             criu_path: PathBuf::from("criu"),
             cuda_checkpoint_path: PathBuf::from("cuda-checkpoint"),
+            gpu_detection: GpuDetection::Auto,
+            nvml_library: None,
             gpus: Vec::new(),
         }
     }
@@ -170,7 +195,7 @@ impl Config {
     pub fn state_db_path(&self) -> PathBuf {
         self.state_db
             .clone()
-            .unwrap_or_else(|| self.data_dir.join("state.sqlite"))
+            .unwrap_or_else(|| self.data_dir.join("daemon").join("state.sqlite"))
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -204,7 +229,7 @@ mod tests {
         assert_eq!(config, Config::default());
         assert_eq!(
             config.state_db_path(),
-            PathBuf::from("/var/lib/puzuz/state.sqlite")
+            PathBuf::from("/var/lib/puzuz/daemon/state.sqlite")
         );
         assert_eq!(config.logs_dir(), PathBuf::from("/var/lib/puzuz/logs"));
         assert_eq!(
@@ -232,6 +257,8 @@ mod tests {
             shell = ["bash", "-lc"]
             checkpoint_size_limit_bytes = 1000
             checkpoint_tcp_close = false
+            gpu_detection = "static"
+            nvml_library = "/opt/nvml.so"
             helper_only_setting = "x"
 
             [[gpus]]
@@ -246,7 +273,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             config.state_db_path(),
-            PathBuf::from("/srv/puzuz/state.sqlite")
+            PathBuf::from("/srv/puzuz/daemon/state.sqlite")
         );
         assert_eq!(config.logs_dir(), PathBuf::from("/srv/puzuz/logs"));
         assert_eq!(config.checkpoints_dir(), PathBuf::from("/big/ckpt"));
@@ -254,6 +281,8 @@ mod tests {
         assert_eq!(config.shell, ["bash", "-lc"]);
         assert_eq!(config.checkpoint_size_limit_bytes, Some(1000));
         assert!(!config.checkpoint_tcp_close);
+        assert_eq!(config.gpu_detection, GpuDetection::Static);
+        assert_eq!(config.nvml_library, Some(PathBuf::from("/opt/nvml.so")));
         assert_eq!(config.gpus.len(), 2);
         assert_eq!(config.gpus[0].name, "A100");
         assert_eq!(config.gpus[1].uuid, "");
@@ -293,7 +322,10 @@ mod tests {
     #[test]
     fn data_dir_override_moves_derived_paths() {
         let config = Config::default().with_data_dir("/tmp/x");
-        assert_eq!(config.state_db_path(), PathBuf::from("/tmp/x/state.sqlite"));
+        assert_eq!(
+            config.state_db_path(),
+            PathBuf::from("/tmp/x/daemon/state.sqlite")
+        );
         assert_eq!(config.logs_dir(), PathBuf::from("/tmp/x/logs"));
     }
 }

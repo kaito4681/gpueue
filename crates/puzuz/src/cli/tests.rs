@@ -1015,19 +1015,43 @@ fn service_subcommands() {
     assert_eq!(
         cmd(&["service", "install"]),
         SubCommand::Service {
-            cmd: ServiceCommand::Install
+            cmd: ServiceCommand::Install {
+                no_start: false,
+                bin_dir: None
+            }
+        }
+    );
+    assert_eq!(
+        cmd(&[
+            "service",
+            "install",
+            "--no-start",
+            "--bin-dir",
+            "/usr/local/bin"
+        ]),
+        SubCommand::Service {
+            cmd: ServiceCommand::Install {
+                no_start: true,
+                bin_dir: Some(PathBuf::from("/usr/local/bin"))
+            }
         }
     );
     assert_eq!(
         cmd(&["service", "uninstall"]),
         SubCommand::Service {
-            cmd: ServiceCommand::Uninstall { purge: false }
+            cmd: ServiceCommand::Uninstall {
+                purge: false,
+                yes: false
+            }
         }
     );
     assert_eq!(
-        cmd(&["service", "uninstall", "--purge"]),
+        cmd(&["service", "uninstall", "--purge", "-y"]),
         SubCommand::Service {
-            cmd: ServiceCommand::Uninstall { purge: true }
+            cmd: ServiceCommand::Uninstall {
+                purge: true,
+                yes: true
+            }
         }
     );
     assert_eq!(

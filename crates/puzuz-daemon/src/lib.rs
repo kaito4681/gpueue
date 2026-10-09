@@ -14,12 +14,21 @@
 //! reconciles with the helper. `puzuz shutdown` (`POST /v1/daemon/shutdown`)
 //! is the way to checkpoint or stop every job first.
 //!
+//! GPUs are detected once at start-up (NVML, see [`gpu`]); restart the
+//! daemon after adding or removing GPUs.
+//!
+//! Checkpoint bookkeeping: each record gets the GPU model and driver version
+//! of the job's GPUs, and the image size the helper reports. When all
+//! complete images together exceed `checkpoint_size_limit_bytes`, the daemon
+//! logs a warning (at start-up and after each dump); images are never
+//! deleted automatically and dumps are not refused. The owner of a job whose
+//! dump failed is told on their next command (see
+//! [`puzuz_protocol::api::WARNINGS_HEADER`]).
+//!
 //! Known gaps, for integration:
-//! - GPU detection is static (configuration file); NVML is not used yet.
 //! - Removing or truncating a log file (`remove`, `clean`, `restart
 //!   --in-place`) needs write access to `<logs_dir>/<uid>/`, which the
 //!   helper creates; the daemon only tries and logs failures.
-//! - The checkpoint size limit is parsed but not enforced or reported.
 
 mod actions;
 pub mod api;
@@ -30,19 +39,22 @@ pub mod helper;
 mod state;
 pub mod users;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use puzuz_core::model::GpuIndex;
 use puzuz_core::storage::{Store, StoreOps};
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
 pub use crate::config::Config;
-pub use crate::gpu::{DetectedGpu, GpuDetector, StaticGpuDetector};
+pub use crate::gpu::{
+    DetectedGpu, FallbackGpuDetector, GpuDetector, NvmlGpuDetector, StaticGpuDetector,
+};
 pub use crate::helper::{FakeHelper, Helper, HelperClient};
 use crate::state::Core;
 pub use crate::users::{StaticUserDb, SystemUserDb, UserDb};
@@ -60,12 +72,12 @@ pub struct DaemonOptions {
 
 impl DaemonOptions {
     /// The production setup: the real helper connection, NSS user lookups
-    /// and GPUs from the configuration.
+    /// and NVML GPU detection (falling back to the configuration).
     pub fn new(config: Config) -> Self {
         Self {
             helper: Arc::new(HelperClient::new(&config.helper_socket)),
             users: Arc::new(SystemUserDb),
-            gpus: Arc::new(StaticGpuDetector::from_config(&config.gpus)),
+            gpus: Arc::from(gpu::detector_for(&config)),
             config,
             trust_uid_header: false,
         }
@@ -117,18 +129,18 @@ impl Daemon {
         }
         let store = Store::open(&db_path)?;
 
-        let mut gpu_memory = HashMap::new();
-        match gpus.detect() {
-            Ok(detected) => {
-                for gpu in detected {
-                    store.upsert_gpu(gpu.index, &gpu.uuid, &gpu.name)?;
-                    if let Some(bytes) = gpu.memory_total_bytes {
-                        gpu_memory.insert(gpu.index, bytes);
-                    }
-                }
+        let detected = match tokio::task::spawn_blocking(move || gpus.detect()).await {
+            Ok(Ok(detected)) => detected,
+            Ok(Err(e)) => {
+                tracing::warn!("GPU detection failed: {e}");
+                Vec::new()
             }
-            Err(e) => tracing::warn!("GPU detection failed: {e}"),
-        }
+            Err(e) => {
+                tracing::warn!("GPU detection panicked: {e}");
+                Vec::new()
+            }
+        };
+        let detected = record_gpus(&store, detected)?;
 
         let listener = bind(&config.api_socket).map_err(|source| StartError::Listen {
             path: config.api_socket.clone(),
@@ -136,7 +148,8 @@ impl Daemon {
         })?;
         let socket = config.api_socket.clone();
 
-        let core = Core::new(config, store, helper, users, gpu_memory, trust_uid_header);
+        let core = Core::new(config, store, helper, users, detected, trust_uid_header);
+        core.check_checkpoint_usage().await;
         let notices = core.helper.connect();
         let tasks = vec![
             tokio::spawn(core.clone().notice_loop(notices)),
@@ -187,6 +200,58 @@ impl Daemon {
         }
         let _ = std::fs::remove_file(&self.socket);
     }
+}
+
+/// Records the detected GPUs in the store and reports changes against the
+/// GPUs it knew before. Returns the detected GPUs by index (the available
+/// ones; see [`gpu`] for what happens to the others).
+fn record_gpus(
+    store: &Store,
+    detected: Vec<DetectedGpu>,
+) -> Result<HashMap<GpuIndex, DetectedGpu>, StartError> {
+    let known: BTreeMap<GpuIndex, _> = store
+        .list_gpus()?
+        .into_iter()
+        .map(|gpu| (gpu.index, gpu))
+        .collect();
+    let mut by_index = HashMap::new();
+    for gpu in detected {
+        if by_index.contains_key(&gpu.index) {
+            tracing::warn!(index = %gpu.index, "GPU detected twice; ignoring the second one");
+            continue;
+        }
+        if let Some(old) = known.get(&gpu.index)
+            && !old.uuid.is_empty()
+            && old.uuid != gpu.uuid
+        {
+            tracing::warn!(
+                index = %gpu.index,
+                old = %old.uuid,
+                new = %gpu.uuid,
+                "a different GPU is now at this index; it keeps the index's slot limit"
+            );
+        }
+        store.upsert_gpu(gpu.index, &gpu.uuid, &gpu.name)?;
+        tracing::info!(
+            index = %gpu.index,
+            uuid = %gpu.uuid,
+            name = %gpu.name,
+            memory = ?gpu.memory_total_bytes,
+            driver = ?gpu.driver_version,
+            "GPU detected"
+        );
+        by_index.insert(gpu.index, gpu);
+    }
+    for (index, gpu) in &known {
+        if !by_index.contains_key(index) {
+            tracing::warn!(
+                %index,
+                uuid = %gpu.uuid,
+                "GPU was not detected; it starts no jobs, and jobs that need it stay queued"
+            );
+        }
+    }
+    Ok(by_index)
 }
 
 /// Binds the API socket, replacing a stale socket file, and makes it

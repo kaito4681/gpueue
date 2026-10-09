@@ -14,11 +14,14 @@ use hyper_util::rt::TokioIo;
 use puzuz_core::model::{GpuIndex, JobId, JobResult, JobSpec, JobState};
 use puzuz_daemon::api::TEST_UID_HEADER;
 use puzuz_daemon::helper::FakeOutcome;
-use puzuz_daemon::{Config, Daemon, DaemonOptions, FakeHelper, StaticGpuDetector, StaticUserDb};
+use puzuz_daemon::{
+    Config, Daemon, DaemonOptions, DetectedGpu, FakeHelper, GpuDetector, StaticGpuDetector,
+    StaticUserDb,
+};
 use puzuz_protocol::BINARY_VERSION;
 use puzuz_protocol::api::{
     AddJobRequest, AddJobResponse, ApiError, BulkJobResponse, CleanResponse, ErrorCode, JobView,
-    ListGpusResponse, ListJobsResponse, VERSION_HEADER, VersionResponse,
+    ListGpusResponse, ListJobsResponse, VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
 };
 use puzuz_protocol::helper::signal;
 use serde::de::DeserializeOwned;
@@ -37,10 +40,15 @@ struct Client {
     socket: PathBuf,
     uid: u32,
     version: String,
+    /// The daemon records `Running` before its spawn request reaches the
+    /// helper; waiting for `Running` also waits for the fake helper to know
+    /// the job, so tests can make it exit or checkpoint right away.
+    helper: Option<FakeHelper>,
 }
 
 struct Reply {
     status: StatusCode,
+    headers: hyper::HeaderMap,
     body: Bytes,
 }
 
@@ -53,6 +61,14 @@ impl Reply {
                 String::from_utf8_lossy(&self.body)
             )
         })
+    }
+
+    /// The warnings the daemon attached for the caller.
+    fn warnings(&self) -> Vec<Warning> {
+        self.headers
+            .get(WARNINGS_HEADER)
+            .map(|v| Warning::parse_header(v.to_str().unwrap()))
+            .unwrap_or_default()
     }
 
     fn error(&self) -> ApiError {
@@ -71,6 +87,7 @@ impl Client {
             socket: socket.to_owned(),
             uid,
             version: BINARY_VERSION.to_owned(),
+            helper: None,
         }
     }
 
@@ -101,8 +118,13 @@ impl Client {
     async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Reply {
         let response = self.open(method, path, body).await;
         let status = response.status();
+        let headers = response.headers().clone();
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        Reply { status, body }
+        Reply {
+            status,
+            headers,
+            body,
+        }
     }
 
     async fn get(&self, path: &str) -> Reply {
@@ -152,7 +174,19 @@ impl Client {
     }
 
     async fn wait_state(&self, id: JobId, state: &JobState) -> JobView {
-        self.wait_for(id, state.name(), |j| j.state == *state).await
+        let job = self.wait_for(id, state.name(), |j| j.state == *state).await;
+        if *state == JobState::Running
+            && let Some(helper) = &self.helper
+        {
+            for _ in 0..250 {
+                if helper.is_running(id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(helper.is_running(id), "job {id} never reached the helper");
+        }
+        job
     }
 }
 
@@ -191,6 +225,10 @@ struct Harness {
 
 impl Harness {
     async fn new(gpus: u32) -> Self {
+        Self::with_gpus(StaticGpuDetector::anonymous(gpus)).await
+    }
+
+    async fn with_gpus(detector: impl GpuDetector) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let helper = FakeHelper::new();
         let mut harness = Self {
@@ -198,7 +236,7 @@ impl Harness {
             helper,
             daemon: None,
         };
-        harness.start(gpus).await;
+        harness.start_with(detector).await;
         harness
     }
 
@@ -212,11 +250,15 @@ impl Harness {
     }
 
     async fn start(&mut self, gpus: u32) {
+        self.start_with(StaticGpuDetector::anonymous(gpus)).await;
+    }
+
+    async fn start_with(&mut self, detector: impl GpuDetector) {
         let daemon = Daemon::start(DaemonOptions {
             config: self.config(),
             helper: Arc::new(self.helper.clone()),
             users: Arc::new(StaticUserDb::with_admins([ADMIN])),
-            gpus: Arc::new(StaticGpuDetector::anonymous(gpus)),
+            gpus: Arc::new(detector),
             trust_uid_header: true,
         })
         .await
@@ -231,7 +273,10 @@ impl Harness {
     }
 
     fn client(&self, uid: u32) -> Client {
-        Client::new(&self.dir.path().join("puzuz.sock"), uid)
+        Client {
+            helper: Some(self.helper.clone()),
+            ..Client::new(&self.dir.path().join("puzuz.sock"), uid)
+        }
     }
 
     async fn set_default_parallel(&self, parallel: u32) {
@@ -877,6 +922,182 @@ async fn validation_versions_groups_and_bulk_operations() {
     // Deleting a group.
     let reply = admin.call(Method::DELETE, "/v1/groups/gpu", None).await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
+
+    h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// GPU detection, checkpoint bookkeeping and warnings
+// ---------------------------------------------------------------------------
+
+fn a100(index: u32) -> DetectedGpu {
+    DetectedGpu {
+        index: GpuIndex(index),
+        uuid: format!("GPU-a100-{index}"),
+        name: "NVIDIA A100".to_owned(),
+        memory_total_bytes: Some(80 << 30),
+        driver_version: Some("570.86.10".to_owned()),
+    }
+}
+
+async fn gpus(client: &Client) -> ListGpusResponse {
+    let reply = client.get("/v1/gpus").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    reply.json()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undetected_gpus_are_kept_but_start_nothing() {
+    let mut h = Harness::with_gpus(StaticGpuDetector(vec![a100(0), a100(1)])).await;
+    h.set_default_parallel(4).await;
+    let alice = h.client(ALICE);
+    let admin = h.client(ADMIN);
+
+    let listed = gpus(&alice).await.gpus;
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|g| g.available));
+    assert_eq!(listed[1].memory_total_bytes, Some(80 << 30));
+    assert_eq!(listed[1].driver_version.as_deref(), Some("570.86.10"));
+    let reply = admin
+        .call(
+            Method::PUT,
+            "/v1/gpus/1/parallel",
+            Some(json!({ "parallel": 2 })),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let mut stashed = job_request("needs gpu 1", &[1]);
+    stashed.stashed = true;
+    let waiting = alice.add(&stashed).await;
+
+    // GPU 1 disappears.
+    h.stop().await;
+    h.start_with(StaticGpuDetector(vec![a100(0)])).await;
+    let alice = h.client(ALICE);
+    let listed = gpus(&alice).await.gpus;
+    assert_eq!(listed.len(), 2, "the missing GPU stays listed");
+    assert!(listed[0].available);
+    assert!(!listed[1].available);
+    assert_eq!(listed[1].parallel, 2, "its limit is kept");
+    assert_eq!(listed[1].memory_total_bytes, None);
+
+    // Queued jobs that need it wait; new ones and forced starts are refused.
+    let reply = alice.action(waiting, "enqueue", json!({})).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let state = alice.job(waiting).await.state;
+    assert!(matches!(state, JobState::Queued { .. }), "{state:?}");
+    let reply = alice.action(waiting, "start", json!(null)).await;
+    assert_eq!(reply.error().code, ErrorCode::InvalidState);
+    assert!(reply.error().message.contains("not detected"));
+    let reply = alice
+        .post(
+            "/v1/jobs",
+            serde_json::to_value(job_request("x", &[1])).unwrap(),
+        )
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::InvalidState);
+    // Other GPUs work as usual.
+    let other = alice.add(&job_request("on gpu 0", &[0])).await;
+    alice.wait_state(other, &JobState::Running).await;
+
+    // It comes back: the waiting job starts.
+    h.stop().await;
+    h.start_with(StaticGpuDetector(vec![a100(0), a100(1)]))
+        .await;
+    let alice = h.client(ALICE);
+    assert!(gpus(&alice).await.gpus.iter().all(|g| g.available));
+    alice.wait_state(waiting, &JobState::Running).await;
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_records_gpu_model_driver_and_size() {
+    let mut h = Harness::with_gpus(StaticGpuDetector(vec![a100(0)])).await;
+    let alice = h.client(ALICE);
+
+    let id = alice.add(&job_request("train", &[0])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    alice.action(id, "checkpoint", json!(null)).await;
+    let job = alice.wait_state(id, &JobState::Checkpointed).await;
+    assert_eq!(job.checkpoint_size_bytes, Some(4096));
+
+    let store = puzuz_core::storage::Store::open(h.dir.path().join("daemon/state.sqlite")).unwrap();
+    let record = puzuz_core::storage::StoreOps::get_checkpoint(&store, id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.gpu_model.as_deref(), Some("NVIDIA A100"));
+    assert_eq!(record.driver_version.as_deref(), Some("570.86.10"));
+    assert_eq!(record.size_bytes, Some(4096));
+    assert_eq!(
+        record.status,
+        puzuz_core::storage::CheckpointStatus::Complete
+    );
+
+    // CPU-only jobs record no GPU.
+    let cpu = alice.add(&job_request("cpu", &[])).await;
+    alice.wait_state(cpu, &JobState::Running).await;
+    alice.action(cpu, "checkpoint", json!(null)).await;
+    alice.wait_state(cpu, &JobState::Checkpointed).await;
+    let record = puzuz_core::storage::StoreOps::get_checkpoint(&store, cpu)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.gpu_model, None);
+    assert_eq!(record.driver_version, None);
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_is_warned_once_about_a_failed_checkpoint() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let admin = h.client(ADMIN);
+    h.helper
+        .set_checkpoint_outcome(FakeOutcome::Fail("criu: tcp connection".to_owned()));
+
+    let id = alice.add(&job_request("train", &[0])).await;
+    // Poll as the admin: the owner's requests would take the warning.
+    admin.wait_state(id, &JobState::Running).await;
+    // Asked by the admin, so the failure cannot ride on the owner's reply.
+    let reply = admin.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    admin
+        .wait_for(id, "done", |j| matches!(j.state, JobState::Done { .. }))
+        .await;
+
+    // Only the owner gets it, on their next command, once.
+    assert!(bob.get("/v1/jobs").await.warnings().is_empty());
+    assert!(admin.get("/v1/jobs").await.warnings().is_empty());
+    // Not on /v1/version, which every client may call first.
+    assert!(alice.get("/v1/version").await.warnings().is_empty());
+    let reply = alice.get("/v1/groups").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.warnings(), [Warning::CheckpointFailed { job: id }]);
+    assert!(alice.get("/v1/jobs").await.warnings().is_empty());
+
+    // The reason stays visible in the job view.
+    assert_eq!(
+        alice.job(id).await.details.unwrap().last_error.as_deref(),
+        Some("criu: tcp connection")
+    );
+
+    // A warning survives a daemon restart until it is delivered.
+    let second = alice.add(&job_request("again", &[0])).await;
+    admin.wait_state(second, &JobState::Running).await;
+    admin.action(second, "checkpoint", json!(null)).await;
+    admin
+        .wait_for(second, "done", |j| matches!(j.state, JobState::Done { .. }))
+        .await;
+    h.stop().await;
+    h.start(1).await;
+    let alice = h.client(ALICE);
+    assert_eq!(
+        alice.get("/v1/jobs").await.warnings(),
+        [Warning::CheckpointFailed { job: second }]
+    );
 
     h.stop().await;
 }

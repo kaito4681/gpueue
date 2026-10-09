@@ -424,6 +424,25 @@ pub trait StoreOps: sealed::Sealed {
     fn delete_checkpoint(&self, job_id: JobId) -> Result<bool> {
         checkpoints::delete(self.conn(), job_id)
     }
+
+    /// Jobs of `owner` whose last dump failed and whose owner has not been
+    /// told yet, ordered by id. A new record ([`put_checkpoint`]) or a
+    /// status change ([`set_checkpoint_status`]) makes a failure
+    /// unacknowledged again.
+    ///
+    /// [`put_checkpoint`]: StoreOps::put_checkpoint
+    /// [`set_checkpoint_status`]: StoreOps::set_checkpoint_status
+    fn unacknowledged_checkpoint_failures(&self, owner: Uid) -> Result<Vec<JobId>> {
+        checkpoints::unacknowledged_failures(self.conn(), owner)
+    }
+
+    /// Marks the failed dumps of `job_ids` as reported to their owner.
+    /// Records that are not failed (or do not exist) are left alone.
+    fn acknowledge_checkpoint_failures(&self, job_ids: &[JobId]) -> Result<()> {
+        atomic(self.conn(), |c| {
+            checkpoints::acknowledge_failures(c, job_ids)
+        })
+    }
 }
 
 impl StoreOps for Store {}

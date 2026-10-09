@@ -315,6 +315,8 @@ fn resource_bodies_golden() {
             uuid: "GPU-1".into(),
             name: "RTX".into(),
             memory_total_bytes: None,
+            driver_version: None,
+            available: true,
             parallel: 1,
             used: 1,
             jobs: vec![GpuJob {

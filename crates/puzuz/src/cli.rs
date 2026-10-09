@@ -628,8 +628,9 @@ pub enum SubCommand {
 
     /// (puzuz) Check the installation and print how to fix problems.
     ///
-    /// Checks criu, cuda-checkpoint, the daemon and helper services, the socket, the checkpoint
-    /// storage, the GPUs and the driver.
+    /// Checks criu, cuda-checkpoint, the NVIDIA driver, the kernel, systemd, the daemon and
+    /// helper services and sockets, the checkpoint storage and the configuration. Exits with a
+    /// non-zero status if any check fails.
     Doctor,
 }
 
@@ -737,15 +738,35 @@ pub enum GpuCommand {
 /// Subcommands of `service`.
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub enum ServiceCommand {
-    /// Create the system user, directories and systemd units, then enable and start them
-    /// (requires root).
-    Install,
+    /// Install the systemd units, the system user and group, the directories and a default
+    /// configuration, then enable and start the services (requires root). Safe to re-run, e.g.
+    /// after upgrading the binaries.
+    ///
+    /// The units run `puzuz` and `puzuz-helper` from the directory this `puzuz` binary is in
+    /// when that is /usr/bin or /usr/local/bin. Otherwise pass --bin-dir to install copies of
+    /// both binaries (`puzuz-helper` must be next to `puzuz`) into a system directory.
+    Install {
+        /// Enable the services but do not start (or restart) them now.
+        #[arg(long)]
+        no_start: bool,
 
-    /// Disable and remove the systemd units (requires root). Data is kept unless --purge is given.
+        /// Copy `puzuz` and `puzuz-helper` into this directory (e.g. /usr/local/bin) and run
+        /// them from there.
+        #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
+        bin_dir: Option<PathBuf>,
+    },
+
+    /// Stop, disable and remove the systemd units (requires root). Configuration, state, logs
+    /// and checkpoint images are kept unless --purge is given.
     Uninstall {
-        /// Also delete configuration, state, logs and checkpoint images.
+        /// Also delete /etc/puzuz, /var/lib/puzuz (state, logs, checkpoint images) and the
+        /// runtime directories.
         #[arg(long)]
         purge: bool,
+
+        /// Do not ask for confirmation before purging.
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Show the state of both services and whether daemon and helper are connected.
