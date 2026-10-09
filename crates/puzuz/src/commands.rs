@@ -821,12 +821,15 @@ impl App {
 
         let mut waiter = Waiter::new(target, target_status);
         let mut lines = Vec::new();
+        let mut selected = false;
         for job in &jobs {
             if waiter.selects(job) {
+                selected = true;
                 lines.extend(waiter.add(job, true, &self.ctx));
             }
         }
-        if waiter.watched.is_empty() {
+        // Jobs that already reached the target are not "not found".
+        if !selected {
             eprintln!("No jobs found for {}", describe_selection(&waiter.target));
             return Ok(ExitCode::SUCCESS);
         }
