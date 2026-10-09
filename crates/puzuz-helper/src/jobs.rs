@@ -1,0 +1,311 @@
+//! Per-job files kept by the helper under `<state dir>/jobs/<id>/`.
+//!
+//! ```text
+//! job.json      JobRecord (root-only): owner, log path, phase
+//! spawn.json    ShimSpec for the shim: argv, env, cwd, log (owner, 0600)
+//! start.json    StartReport written by the shim once the job runs (owner)
+//! exit-status   ExitStatus written by the job's PID-namespace init (owner)
+//! init-status   ExitStatus of the init, written by the outer shim (owner)
+//! ```
+//!
+//! The directory is root-owned (0711) so the owner can open the files the
+//! helper pre-created for them but cannot add or replace any. The owner can
+//! forge `start.json`, `exit-status` and `init-status` of their own job;
+//! nothing the helper does with root privileges trusts their contents
+//! (the job's PIDs are looked up through systemd and `/proc`).
+//!
+//! `exit-status` is opened by the init and therefore part of the dumped
+//! process tree: CRIU reopens it by path on restore, so it must survive
+//! reboots (the state dir is under `/var/lib`) and must exist before a
+//! restore.
+
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+use puzuz_checkpoint::layout::write_atomic;
+use puzuz_protocol::helper::{ExitStatus, Gid, GpuIndex, JobId, Uid};
+use serde::{Deserialize, Serialize};
+
+pub const RECORD_FILE: &str = "job.json";
+pub const SPEC_FILE: &str = "spawn.json";
+pub const START_FILE: &str = "start.json";
+pub const EXIT_STATUS_FILE: &str = "exit-status";
+pub const INIT_STATUS_FILE: &str = "init-status";
+
+/// What the helper remembers about a job across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRecord {
+    pub job: JobId,
+    pub uid: Uid,
+    pub gid: Gid,
+    pub log_path: PathBuf,
+    #[serde(default)]
+    pub gpus: Vec<GpuIndex>,
+    #[serde(default)]
+    pub no_checkpoint: bool,
+    pub phase: RecordPhase,
+    /// How the job's current unit was started; decides where its init is.
+    pub unit_kind: UnitKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordPhase {
+    /// A unit exists (or existed) for the job.
+    Live,
+    /// Dumped; the image is in the checkpoint directory and no unit exists.
+    Checkpointed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitKind {
+    /// Started by `spawn`: the unit's main process is the outer shim and
+    /// the job's init is its only child.
+    Spawned,
+    /// Started by `restore`: the unit's main process is the restored init.
+    Restored,
+}
+
+/// Input of the shim, written by the helper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShimSpec {
+    pub argv: Vec<String>,
+    pub envs: BTreeMap<String, String>,
+    pub cwd: PathBuf,
+    pub log_path: PathBuf,
+}
+
+/// Written by the shim once the job has been started (or failed to).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum StartReport {
+    Started {
+        /// The job's PID inside its namespace.
+        ns_pid: u32,
+    },
+    Failed {
+        kind: StartFailure,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartFailure {
+    /// The owner may not use the cwd or log file.
+    PermissionDenied,
+    /// Anything else (namespace setup, exec, ...).
+    Other,
+}
+
+/// The files of one job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobFiles {
+    dir: PathBuf,
+}
+
+impl JobFiles {
+    pub fn new(jobs_dir: &Path, job: JobId) -> Self {
+        Self {
+            dir: jobs_dir.join(job.0.to_string()),
+        }
+    }
+
+    pub fn from_dir(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+    pub fn record(&self) -> PathBuf {
+        self.dir.join(RECORD_FILE)
+    }
+    pub fn spec(&self) -> PathBuf {
+        self.dir.join(SPEC_FILE)
+    }
+    pub fn start(&self) -> PathBuf {
+        self.dir.join(START_FILE)
+    }
+    pub fn exit_status(&self) -> PathBuf {
+        self.dir.join(EXIT_STATUS_FILE)
+    }
+    pub fn init_status(&self) -> PathBuf {
+        self.dir.join(INIT_STATUS_FILE)
+    }
+
+    /// Create the directory and the owner-writable files (empty). Existing
+    /// files are truncated, except `exit-status` when `keep_exit_status`
+    /// (a restore must reopen the very file the init had open).
+    pub fn prepare(&self, uid: Uid, gid: Gid, keep_exit_status: bool) -> io::Result<()> {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o711)
+            .create(&self.dir)?;
+        fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o711))?;
+        for path in [self.start(), self.init_status(), self.exit_status()] {
+            let keep = keep_exit_status && path == self.exit_status();
+            let f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(!keep)
+                .mode(0o600)
+                .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+                .open(&path)?;
+            std::os::unix::fs::fchown(&f, Some(uid.0), Some(gid.0))?;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    /// Write the shim's input, readable only by the owner (it holds the
+    /// job's environment).
+    pub fn write_spec(&self, spec: &ShimSpec, uid: Uid, gid: Gid) -> io::Result<()> {
+        let path = self.spec();
+        let _ = fs::remove_file(&path);
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(&serde_json::to_vec(spec)?)?;
+        f.sync_all()?;
+        std::os::unix::fs::fchown(&f, Some(uid.0), Some(gid.0))?;
+        Ok(())
+    }
+
+    pub fn write_record(&self, record: &JobRecord) -> io::Result<()> {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o711)
+            .create(&self.dir)?;
+        write_atomic(&self.record(), &serde_json::to_vec_pretty(record)?)
+    }
+
+    pub fn read_record(&self) -> io::Result<JobRecord> {
+        let bytes = fs::read(self.record())?;
+        serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// The init's report of the job's exit, if written.
+    pub fn read_exit_status(&self) -> Option<ExitStatus> {
+        read_json(&self.exit_status())
+    }
+
+    /// The outer shim's report of how the init ended, if written.
+    pub fn read_init_status(&self) -> Option<ExitStatus> {
+        read_json(&self.init_status())
+    }
+
+    pub fn read_start(&self) -> Option<StartReport> {
+        read_json(&self.start())
+    }
+
+    pub fn remove(&self) -> io::Result<()> {
+        match fs::remove_dir_all(&self.dir) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Parse a small JSON file; `None` when missing, empty or partial.
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Every job directory under `jobs_dir` with a readable record.
+pub fn scan(jobs_dir: &Path) -> io::Result<Vec<(JobFiles, JobRecord)>> {
+    let entries = match fs::read_dir(jobs_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let files = JobFiles::new(jobs_dir, JobId(id));
+        match files.read_record() {
+            Ok(rec) if rec.job == JobId(id) => out.push((files, rec)),
+            // A directory without a record is a spawn that never completed.
+            _ => {
+                let _ = files.remove();
+            }
+        }
+    }
+    out.sort_by_key(|(_, r)| r.job);
+    Ok(out)
+}
+
+/// Write `status` as the content of an already-open status file
+/// (truncating it first).
+pub fn write_status_to(file: &mut fs::File, status: &ExitStatus) -> io::Result<()> {
+    use std::io::Seek;
+    file.set_len(0)?;
+    file.seek(io::SeekFrom::Start(0))?;
+    file.write_all(&serde_json::to_vec(status)?)?;
+    file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn me() -> (Uid, Gid) {
+        (
+            Uid(nix::unistd::getuid().as_raw()),
+            Gid(nix::unistd::getgid().as_raw()),
+        )
+    }
+
+    #[test]
+    fn prepare_record_and_status_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (uid, gid) = me();
+        let files = JobFiles::new(tmp.path(), JobId(5));
+        files.prepare(uid, gid, false).unwrap();
+        assert_eq!(files.read_exit_status(), None);
+        let rec = JobRecord {
+            job: JobId(5),
+            uid,
+            gid,
+            log_path: "/tmp/x.log".into(),
+            gpus: vec![GpuIndex(0)],
+            no_checkpoint: false,
+            phase: RecordPhase::Live,
+            unit_kind: UnitKind::Spawned,
+        };
+        files.write_record(&rec).unwrap();
+
+        let mut f = OpenOptions::new()
+            .write(true)
+            .open(files.exit_status())
+            .unwrap();
+        write_status_to(&mut f, &ExitStatus::Exited { code: 3 }).unwrap();
+        assert_eq!(
+            files.read_exit_status(),
+            Some(ExitStatus::Exited { code: 3 })
+        );
+        // keep_exit_status leaves it alone; otherwise it is truncated.
+        files.prepare(uid, gid, true).unwrap();
+        assert!(files.read_exit_status().is_some());
+        files.prepare(uid, gid, false).unwrap();
+        assert!(files.read_exit_status().is_none());
+
+        let found = scan(tmp.path()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, rec);
+    }
+}

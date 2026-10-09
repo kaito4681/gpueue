@@ -1,0 +1,666 @@
+//! The helper over its real socket, with a fake launcher, host and
+//! checkpoint executor. Runs unprivileged: the "daemon" is this process's
+//! own uid, and jobs are owned by it too.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use puzuz_checkpoint::layout::{CheckpointDir, DirStatus};
+use puzuz_checkpoint::plan::Action;
+use puzuz_checkpoint::{CudaMode, Executor};
+use puzuz_helper::config::SHUTDOWN_MANIFEST;
+use puzuz_helper::engine::{ManifestEntry, ManifestResult};
+use puzuz_helper::launcher::UnitState;
+use puzuz_helper::launcher::fake::FakeLauncher;
+use puzuz_helper::testing::{FakeExecState, FakeExecutor, FakeHost};
+use puzuz_helper::{ExecutorFactory, Helper, HelperConfig, ShutdownManifest, server};
+use puzuz_protocol::helper::{
+    CheckpointOutcome, DaemonMessage, Event, EventEnvelope, EventSeq, ExitStatus, Gid, GpuIndex,
+    Hello, HelperErrorCode, HelperMessage, JobId, PROTOCOL_VERSION, Request, RequestEnvelope,
+    RequestId, ResponseResult, RestoreOutcome, RestoreRequest, RunningPhase, SpawnRequest, Uid,
+    decode_line, encode_line, signal,
+};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::watch;
+
+type TestHelper = Helper<Arc<FakeLauncher>, FakeHost>;
+
+fn uid() -> u32 {
+    let uid = nix::unistd::getuid().as_raw();
+    assert_ne!(uid, 0, "run these tests as an unprivileged user");
+    uid
+}
+
+fn gid() -> u32 {
+    nix::unistd::getgid().as_raw()
+}
+
+struct Env {
+    _tmp: tempfile::TempDir,
+    root: PathBuf,
+    launcher: Arc<FakeLauncher>,
+    exec: Arc<Mutex<FakeExecState>>,
+    helper: Arc<TestHelper>,
+    stop: watch::Sender<bool>,
+}
+
+impl Env {
+    async fn new() -> Self {
+        Self::with_daemon_uid(uid()).await
+    }
+
+    async fn with_daemon_uid(daemon_uid: u32) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_owned();
+        let launcher = Arc::new(FakeLauncher::new());
+        let exec = Arc::new(Mutex::new(FakeExecState::default()));
+        let (helper, stop) = start(&root, daemon_uid, launcher.clone(), exec.clone()).await;
+        Self {
+            _tmp: tmp,
+            root,
+            launcher,
+            exec,
+            helper,
+            stop,
+        }
+    }
+
+    /// Simulate a helper restart on the same state and units.
+    async fn restart(&mut self) {
+        let _ = self.stop.send(true);
+        let (helper, stop) =
+            start(&self.root, uid(), self.launcher.clone(), self.exec.clone()).await;
+        self.helper = helper;
+        self.stop = stop;
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.root.join("helper.sock")
+    }
+
+    fn base(&self) -> PathBuf {
+        self.root.join("checkpoints")
+    }
+
+    async fn client(&self) -> Client {
+        Client::connect(&self.socket(), Hello::current()).await
+    }
+
+    fn spawn_req(&self, job: u64) -> SpawnRequest {
+        SpawnRequest {
+            job: JobId(job),
+            uid: Uid(uid()),
+            gid: Gid(gid()),
+            groups: None,
+            cwd: self.root.clone(),
+            command: "python train.py".into(),
+            shell: vec!["sh".into(), "-c".into()],
+            envs: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            gpus: vec![GpuIndex(0)],
+            log_path: self
+                .root
+                .join("logs")
+                .join(uid().to_string())
+                .join(format!("{job}.log")),
+            no_checkpoint: false,
+        }
+    }
+}
+
+fn config(root: &Path, daemon_uid: u32) -> HelperConfig {
+    HelperConfig {
+        socket_path: root.join("helper.sock"),
+        daemon_uid,
+        daemon_gid: gid(),
+        state_dir: root.join("state"),
+        checkpoint_base: root.join("checkpoints"),
+        log_base: root.join("logs"),
+        criu_root: None,
+        poll_interval: Duration::from_millis(20),
+        ..HelperConfig::default()
+    }
+}
+
+async fn start(
+    root: &Path,
+    daemon_uid: u32,
+    launcher: Arc<FakeLauncher>,
+    exec: Arc<Mutex<FakeExecState>>,
+) -> (Arc<TestHelper>, watch::Sender<bool>) {
+    let host = FakeHost::default();
+    host.add_user(uid(), "tester", gid(), &[gid()]);
+    let factory: ExecutorFactory =
+        Arc::new(move || Box::new(FakeExecutor(exec.clone())) as Box<dyn Executor + Send>);
+    let cfg = config(root, daemon_uid);
+    let socket = cfg.socket_path.clone();
+    let helper = Helper::new(cfg, launcher, host, factory).unwrap();
+    helper.recover().await.unwrap();
+    // Owned by us so that a test can connect as a "wrong" uid; the helper
+    // still checks the peer against `daemon_uid`.
+    let listener = server::bind(&socket, uid()).unwrap();
+    let (stop, stop_rx) = watch::channel(false);
+    tokio::spawn(server::serve(helper.clone(), listener, stop_rx.clone()));
+    tokio::spawn(helper.clone().monitor(stop_rx));
+    (helper, stop)
+}
+
+struct Client {
+    rd: BufReader<OwnedReadHalf>,
+    wr: OwnedWriteHalf,
+    next_id: u64,
+    events: Vec<EventEnvelope>,
+}
+
+const WAIT: Duration = Duration::from_secs(5);
+
+impl Client {
+    async fn connect(path: &Path, hello: Hello) -> Self {
+        let (rd, wr) = UnixStream::connect(path).await.unwrap().into_split();
+        let mut c = Self {
+            rd: BufReader::new(rd),
+            wr,
+            next_id: 1,
+            events: Vec::new(),
+        };
+        c.send(&DaemonMessage::Hello(hello)).await;
+        match c.read().await {
+            Some(HelperMessage::Hello(h)) => assert_eq!(h.protocol_version, PROTOCOL_VERSION),
+            other => panic!("expected hello, got {other:?}"),
+        }
+        c
+    }
+
+    async fn send(&mut self, msg: &DaemonMessage) {
+        self.wr.write_all(&encode_line(msg).unwrap()).await.unwrap();
+    }
+
+    /// The next message, or `None` at EOF.
+    async fn read(&mut self) -> Option<HelperMessage> {
+        let mut line = String::new();
+        let n = tokio::time::timeout(WAIT, self.rd.read_line(&mut line))
+            .await
+            .expect("timed out waiting for the helper")
+            .unwrap_or(0);
+        (n > 0).then(|| decode_line(line.as_bytes()).unwrap())
+    }
+
+    async fn request(&mut self, request: Request) -> ResponseResult {
+        let id = RequestId(self.next_id);
+        self.next_id += 1;
+        self.send(&DaemonMessage::Request(RequestEnvelope { id, request }))
+            .await;
+        loop {
+            match self.read().await.expect("connection closed") {
+                HelperMessage::Response(r) if r.id == id => return r.result,
+                HelperMessage::Event(e) => self.events.push(e),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    async fn event(&mut self) -> EventEnvelope {
+        if !self.events.is_empty() {
+            return self.events.remove(0);
+        }
+        match self.read().await.expect("connection closed") {
+            HelperMessage::Event(e) => e,
+            other => panic!("expected an event, got {other:?}"),
+        }
+    }
+
+    /// Asserts that no event arrives within a short time.
+    async fn no_event(&mut self) {
+        assert!(self.events.is_empty(), "unexpected {:?}", self.events);
+        let mut line = String::new();
+        let r =
+            tokio::time::timeout(Duration::from_millis(200), self.rd.read_line(&mut line)).await;
+        assert!(r.is_err(), "unexpected message {line}");
+    }
+
+    async fn running(&mut self) -> Vec<(JobId, RunningPhase)> {
+        match self.request(Request::ListRunning).await {
+            ResponseResult::Running { jobs } => {
+                jobs.into_iter().map(|j| (j.job, j.phase)).collect()
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+fn err_code(r: &ResponseResult) -> HelperErrorCode {
+    match r {
+        ResponseResult::Error { code, .. } => *code,
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejects_other_uids_without_a_word() {
+    let env = Env::with_daemon_uid(uid() + 1).await;
+    let stream = UnixStream::connect(env.socket()).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let _ = wr
+        .write_all(&encode_line(&DaemonMessage::Hello(Hello::current())).unwrap())
+        .await;
+    let mut line = String::new();
+    let n = tokio::time::timeout(WAIT, BufReader::new(rd).read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(n, 0, "got {line}");
+}
+
+#[tokio::test]
+async fn version_mismatch_gets_our_hello_then_eof() {
+    let env = Env::new().await;
+    let stream = UnixStream::connect(env.socket()).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let theirs = Hello {
+        protocol_version: PROTOCOL_VERSION + 1,
+        binary_version: "9.9.9".into(),
+    };
+    wr.write_all(&encode_line(&DaemonMessage::Hello(theirs)).unwrap())
+        .await
+        .unwrap();
+    let mut rd = BufReader::new(rd);
+    let mut line = String::new();
+    rd.read_line(&mut line).await.unwrap();
+    let msg: HelperMessage = decode_line(line.as_bytes()).unwrap();
+    assert!(matches!(msg, HelperMessage::Hello(h) if h.protocol_version == PROTOCOL_VERSION));
+    line.clear();
+    let n = tokio::time::timeout(WAIT, rd.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn spawn_validates_and_sets_cuda_env() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+
+    let mut root = env.spawn_req(1);
+    root.uid = Uid(0);
+    assert_eq!(
+        err_code(&c.request(Request::Spawn(root)).await),
+        HelperErrorCode::InvalidRequest
+    );
+    let mut foreign = env.spawn_req(1);
+    foreign.groups = Some(vec![Gid(gid() + 12345)]);
+    assert_eq!(
+        err_code(&c.request(Request::Spawn(foreign)).await),
+        HelperErrorCode::PermissionDenied
+    );
+
+    let r = c.request(Request::Spawn(env.spawn_req(1))).await;
+    assert!(matches!(r, ResponseResult::Spawned { .. }), "{r:?}");
+    assert_eq!(
+        err_code(&c.request(Request::Spawn(env.spawn_req(1))).await),
+        HelperErrorCode::Busy
+    );
+    let spawned = env.launcher.spawned();
+    assert_eq!(spawned.len(), 1);
+    assert_eq!(spawned[0].envs["CUDA_VISIBLE_DEVICES"], "0");
+    assert_eq!(spawned[0].envs["CUDA_DEVICE_ORDER"], "PCI_BUS_ID");
+    assert_eq!(spawned[0].argv, ["sh", "-c", "python train.py"]);
+    // The shim input (with the environment) is gone once the job runs.
+    assert!(!spawned[0].files.spec().exists());
+    // The per-user log directory was created.
+    assert!(env.root.join("logs").join(uid().to_string()).is_dir());
+    assert_eq!(c.running().await, [(JobId(1), RunningPhase::Running)]);
+
+    // Signals are forwarded and STOP/CONT tracked.
+    assert_eq!(
+        c.request(Request::Signal {
+            job: JobId(1),
+            signal: signal::SIGSTOP
+        })
+        .await,
+        ResponseResult::Ok
+    );
+    assert_eq!(c.running().await, [(JobId(1), RunningPhase::Stopped)]);
+    assert_eq!(
+        err_code(
+            &c.request(Request::Signal {
+                job: JobId(2),
+                signal: signal::SIGTERM
+            })
+            .await
+        ),
+        HelperErrorCode::JobNotFound
+    );
+    assert_eq!(
+        env.launcher.unit(JobId(1)).unwrap().signals,
+        [signal::SIGSTOP]
+    );
+}
+
+#[tokio::test]
+async fn exit_events_are_persisted_replayed_and_acked() {
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(1))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    env.launcher.exit(JobId(1), ExitStatus::Exited { code: 3 });
+    let ev = c.event().await;
+    assert_eq!(ev.seq, EventSeq(1));
+    assert_eq!(
+        ev.event,
+        Event::JobExited {
+            job: JobId(1),
+            status: ExitStatus::Exited { code: 3 }
+        }
+    );
+    assert!(c.running().await.is_empty());
+    assert!(env.launcher.unit(JobId(1)).is_none(), "unit released");
+    drop(c);
+
+    // Not acknowledged: replayed on the next connection.
+    let mut c = env.client().await;
+    assert_eq!(c.event().await.seq, EventSeq(1));
+    assert_eq!(
+        c.request(Request::AckEvents { up_to: EventSeq(1) }).await,
+        ResponseResult::Ok
+    );
+    drop(c);
+    let mut c = env.client().await;
+    c.no_event().await;
+    drop(c);
+
+    // Sequence numbers keep increasing across a helper restart, and the
+    // exit status file written by the job's init wins over systemd's view.
+    env.restart().await;
+    let mut c = env.client().await;
+    let spawned = c.request(Request::Spawn(env.spawn_req(2))).await;
+    assert!(matches!(spawned, ResponseResult::Spawned { .. }));
+    let files = env.launcher.spawned().last().unwrap().files.clone();
+    std::fs::write(files.exit_status(), br#"{"kind":"signaled","signal":15}"#).unwrap();
+    let ev = c.event().await;
+    assert_eq!(ev.seq, EventSeq(2));
+    assert_eq!(
+        ev.event,
+        Event::JobExited {
+            job: JobId(2),
+            status: ExitStatus::Signaled { signal: 15 }
+        }
+    );
+}
+
+#[tokio::test]
+async fn recovery_readopts_running_jobs_and_reports_exits() {
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    for job in [7, 8] {
+        assert!(matches!(
+            c.request(Request::Spawn(env.spawn_req(job))).await,
+            ResponseResult::Spawned { .. }
+        ));
+    }
+    drop(c);
+    // The helper goes away; job 8 exits while it is gone.
+    let _ = env.stop.send(true);
+    env.launcher.exit(JobId(8), ExitStatus::Exited { code: 0 });
+    env.restart().await;
+
+    let mut c = env.client().await;
+    let ev = c.event().await;
+    assert_eq!(
+        ev.event,
+        Event::JobExited {
+            job: JobId(8),
+            status: ExitStatus::Exited { code: 0 }
+        }
+    );
+    assert_eq!(c.running().await, [(JobId(7), RunningPhase::Running)]);
+}
+
+#[tokio::test]
+async fn checkpoint_then_restore() {
+    let env = Env::new().await;
+    env.helper.config();
+    let mut c = env.client().await;
+    let job = JobId(3);
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(3))).await,
+        ResponseResult::Spawned { .. }
+    ));
+
+    // The image directory is fixed by the helper.
+    assert_eq!(
+        err_code(
+            &c.request(Request::Checkpoint {
+                job,
+                image_dir: "/tmp/elsewhere".into(),
+                options: Default::default(),
+            })
+            .await
+        ),
+        HelperErrorCode::InvalidRequest
+    );
+
+    let image_dir = env.base().join("3");
+    let r = c
+        .request(Request::Checkpoint {
+            job,
+            image_dir: image_dir.clone(),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    let Event::CheckpointFinished {
+        outcome: CheckpointOutcome::Success { image_size_bytes },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert!(image_size_bytes > 0);
+    let dir = CheckpointDir::for_job(&env.base(), 3);
+    let DirStatus::Complete(meta) = dir.status() else {
+        panic!("{:?}", dir.status())
+    };
+    assert_eq!(meta.mode, CudaMode::Plugin);
+    assert!(c.running().await.is_empty());
+    assert!(env.launcher.unit(job).is_none());
+    assert!(
+        env.exec
+            .lock()
+            .unwrap()
+            .actions
+            .contains(&Some(Action::CriuDump { root_pid: 10_001 }))
+    );
+
+    // A checkpointed job cannot be spawned again.
+    assert_eq!(
+        err_code(&c.request(Request::Spawn(env.spawn_req(3))).await),
+        HelperErrorCode::Busy
+    );
+
+    let restore = |uid: u32| {
+        Request::Restore(RestoreRequest {
+            job,
+            uid: Uid(uid),
+            image_dir: image_dir.clone(),
+            gpus: vec![GpuIndex(0)],
+        })
+    };
+    assert_eq!(
+        err_code(&c.request(restore(uid() + 1)).await),
+        HelperErrorCode::PermissionDenied
+    );
+    assert_eq!(c.request(restore(uid())).await, ResponseResult::Accepted);
+    let ev = c.event().await;
+    let Event::RestoreFinished {
+        outcome: RestoreOutcome::Success { pid },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert_eq!(c.running().await, [(job, RunningPhase::Running)]);
+    assert_eq!(env.launcher.unit(job).unwrap().pid, pid);
+    assert_eq!(
+        dir.status(),
+        DirStatus::Missing,
+        "image removed after restore"
+    );
+    let restored = env.launcher.restored();
+    assert!(restored[0].command.has_arg("--restore-detached"));
+    assert_eq!(restored[0].pidfile, dir.restore_pidfile());
+
+    // Once it exits, it is reported like any other job.
+    env.launcher.exit(job, ExitStatus::Exited { code: 0 });
+    assert!(matches!(c.event().await.event, Event::JobExited { .. }));
+}
+
+#[tokio::test]
+async fn failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let job = JobId(4);
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(4))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    c.request(Request::Signal {
+        job,
+        signal: signal::SIGSTOP,
+    })
+    .await;
+    env.exec.lock().unwrap().fail_on = Some(|a| matches!(a, Action::CriuDump { .. }));
+    let r = c
+        .request(Request::Checkpoint {
+            job,
+            image_dir: env.base().join("4"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    let Event::CheckpointFinished {
+        outcome: CheckpointOutcome::Failed { reason },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert!(reason.contains("injected"), "{reason}");
+    // SIGCONT before the dump, SIGSTOP again after the failure.
+    assert_eq!(
+        env.launcher.unit(job).unwrap().signals,
+        [signal::SIGSTOP, signal::SIGCONT, signal::SIGSTOP]
+    );
+    assert_eq!(c.running().await, [(job, RunningPhase::Stopped)]);
+    assert!(!CheckpointDir::for_job(&env.base(), 4).images_dir().exists());
+}
+
+#[tokio::test]
+async fn delete_checkpoint_refuses_live_jobs() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(6))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    let del = Request::DeleteCheckpoint {
+        job: JobId(6),
+        image_dir: env.base().join("6"),
+    };
+    assert_eq!(
+        err_code(&c.request(del.clone()).await),
+        HelperErrorCode::Busy
+    );
+    c.request(Request::Checkpoint {
+        job: JobId(6),
+        image_dir: env.base().join("6"),
+        options: Default::default(),
+    })
+    .await;
+    c.event().await;
+    assert_eq!(c.request(del).await, ResponseResult::Ok);
+    assert!(!env.base().join("6").exists());
+    // ... after which the id may be spawned again.
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(6))).await,
+        ResponseResult::Spawned { .. }
+    ));
+}
+
+#[tokio::test]
+async fn shutdown_checkpoints_everything_except_no_checkpoint_jobs() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let mut skip = env.spawn_req(11);
+    skip.no_checkpoint = true;
+    for req in [env.spawn_req(10), skip] {
+        assert!(matches!(
+            c.request(Request::Spawn(req)).await,
+            ResponseResult::Spawned { .. }
+        ));
+    }
+
+    let dumped = Arc::new(Mutex::new(Vec::new()));
+    let d = dumped.clone();
+    let manifest = env
+        .helper
+        .shutdown(move |job| d.lock().unwrap().push(job))
+        .await;
+    assert_eq!(*dumped.lock().unwrap(), [JobId(10)]);
+    assert_eq!(manifest.jobs.len(), 2);
+    assert!(matches!(
+        manifest.jobs[0],
+        ManifestEntry {
+            job: JobId(10),
+            result: ManifestResult::Checkpointed { .. }
+        }
+    ));
+    assert_eq!(
+        manifest.jobs[1],
+        ManifestEntry {
+            job: JobId(11),
+            result: ManifestResult::Skipped
+        }
+    );
+    let on_disk: ShutdownManifest =
+        serde_json::from_slice(&std::fs::read(env.base().join(SHUTDOWN_MANIFEST)).unwrap())
+            .unwrap();
+    assert_eq!(on_disk, manifest);
+
+    // The daemon still hears about it, and new work is refused.
+    assert!(matches!(
+        c.event().await.event,
+        Event::CheckpointFinished {
+            job: JobId(10),
+            outcome: CheckpointOutcome::Success { .. }
+        }
+    ));
+    assert_eq!(
+        err_code(&c.request(Request::Spawn(env.spawn_req(12))).await),
+        HelperErrorCode::ShuttingDown
+    );
+    assert_eq!(
+        err_code(
+            &c.request(Request::Restore(RestoreRequest {
+                job: JobId(10),
+                uid: Uid(uid()),
+                image_dir: env.base().join("10"),
+                gpus: vec![],
+            }))
+            .await
+        ),
+        HelperErrorCode::ShuttingDown
+    );
+    // The no_checkpoint job is left to systemd.
+    assert_eq!(
+        env.launcher.unit(JobId(11)).unwrap().state,
+        UnitState::Running
+    );
+}
