@@ -7,6 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Reserved for the HTTP-over-Unix-socket client used by the CLI (hyper,
+# hyper-util, ...). The helper depends on this crate without it, so it only
+# pulls in the plain wire types.
+client = []
+
 [dependencies]
 puzuz-core.workspace = true
 serde.workspace = true

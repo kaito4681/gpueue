@@ -1,0 +1,425 @@
+//! Job-related request and response bodies.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use puzuz_core::model::{Caller, GpuIndex, Job, JobId, JobSpec, JobState, Timestamp, Uid};
+use serde::{Deserialize, Serialize};
+
+use super::ApiError;
+
+// ---------------------------------------------------------------------------
+// Views
+// ---------------------------------------------------------------------------
+
+/// A job as seen by a particular caller.
+///
+/// Everybody may see every job (so users can tell who occupies a GPU), but
+/// only the owner and administrators receive [`JobDetails`]. For everyone
+/// else `details` is absent: the daemon must build views with
+/// [`JobView::for_caller`] so the command, cwd and environment never leave it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobView {
+    pub id: JobId,
+    pub owner: Uid,
+    pub group: String,
+    pub gpus: Vec<GpuIndex>,
+    pub dependencies: Vec<JobId>,
+    pub priority: i32,
+    pub label: Option<String>,
+    pub no_checkpoint: bool,
+    pub state: JobState,
+    pub created_at: Timestamp,
+    pub started_at: Option<Timestamp>,
+    pub finished_at: Option<Timestamp>,
+    /// Size of the stored checkpoint image, if any. Filled in by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_size_bytes: Option<u64>,
+    /// Owner/admin-only fields; `None` in the redacted view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<JobDetails>,
+}
+
+/// Fields only the owner and administrators may see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobDetails {
+    pub command: String,
+    pub cwd: PathBuf,
+    pub envs: BTreeMap<String, String>,
+    /// The last checkpoint/restore error (e.g. a CRIU log summary). Kept
+    /// private because it can mention paths and command lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl JobView {
+    /// The view with every field, for the owner or an administrator.
+    pub fn full(job: &Job) -> Self {
+        let mut view = Self::redacted(job);
+        view.details = Some(JobDetails {
+            command: job.spec.command.clone(),
+            cwd: job.spec.cwd.clone(),
+            envs: job.spec.envs.clone(),
+            last_error: None,
+        });
+        view
+    }
+
+    /// The view for users other than the owner: no command, cwd or envs.
+    pub fn redacted(job: &Job) -> Self {
+        Self {
+            id: job.id,
+            owner: job.owner,
+            group: job.spec.group.clone(),
+            gpus: job.spec.gpus.clone(),
+            dependencies: job.spec.dependencies.clone(),
+            priority: job.spec.priority,
+            label: job.spec.label.clone(),
+            no_checkpoint: job.spec.no_checkpoint,
+            state: job.state.clone(),
+            created_at: job.created_at,
+            started_at: job.started_at,
+            finished_at: job.finished_at,
+            checkpoint_size_bytes: None,
+            details: None,
+        }
+    }
+
+    /// The full view for the owner and administrators, the redacted one for
+    /// everybody else.
+    pub fn for_caller(job: &Job, caller: &Caller) -> Self {
+        if caller.is_admin || caller.uid == job.owner {
+            Self::full(job)
+        } else {
+            Self::redacted(job)
+        }
+    }
+
+    pub fn is_redacted(&self) -> bool {
+        self.details.is_none()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/jobs, POST /v1/jobs
+// ---------------------------------------------------------------------------
+
+/// Query of `GET /v1/jobs`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListJobsQuery {
+    /// Only jobs in this group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+impl ListJobsQuery {
+    /// Renders the query string (without `?`), empty if there is none.
+    pub fn to_query_string(&self) -> String {
+        let mut q = QueryBuilder::default();
+        if let Some(group) = &self.group {
+            q.push("group", group);
+        }
+        q.finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListJobsResponse {
+    pub jobs: Vec<JobView>,
+}
+
+/// Body of `POST /v1/jobs` (`puzuz add`). The owner is taken from the
+/// connection's peer credentials, never from the body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddJobRequest {
+    #[serde(flatten)]
+    pub spec: JobSpec,
+    /// Add as stashed instead of queued (`--stashed`).
+    #[serde(default)]
+    pub stashed: bool,
+    /// With `stashed`, enqueue automatically at this time (`--delay`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enqueue_at: Option<Timestamp>,
+    /// Start right away, ignoring group and GPU slots (`--immediate`).
+    #[serde(default)]
+    pub immediate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddJobResponse {
+    pub id: JobId,
+}
+
+// ---------------------------------------------------------------------------
+// Job actions
+// ---------------------------------------------------------------------------
+
+/// An operation on existing jobs.
+///
+/// Single-job form: `POST /v1/jobs/{id}/{action}` (`DELETE /v1/jobs/{id}` for
+/// remove) with the variant's options as the body. Bulk form:
+/// `POST /v1/jobs/bulk` with a [`BulkJobRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum JobAction {
+    Pause(PauseOptions),
+    /// Resume a paused job (not a checkpointed one; that is `restore`).
+    Start,
+    Kill(KillOptions),
+    /// Checkpoint a running job and stop it.
+    Checkpoint,
+    Restore(RestoreOptions),
+    /// Run the job again as a new job; the checkpoint image is kept.
+    Restart(RestartOptions),
+    Stash(StashOptions),
+    Enqueue(EnqueueOptions),
+    /// Delete the job, its log and its checkpoint image.
+    Remove,
+}
+
+impl JobAction {
+    /// The path segment of the single-job endpoint, and the wire name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            JobAction::Pause(_) => "pause",
+            JobAction::Start => "start",
+            JobAction::Kill(_) => "kill",
+            JobAction::Checkpoint => "checkpoint",
+            JobAction::Restore(_) => "restore",
+            JobAction::Restart(_) => "restart",
+            JobAction::Stash(_) => "stash",
+            JobAction::Enqueue(_) => "enqueue",
+            JobAction::Remove => "remove",
+        }
+    }
+
+    /// The JSON body of the single-job endpoint, or `None` if it takes none.
+    pub fn options_json(&self) -> Option<serde_json::Value> {
+        let value = match self {
+            JobAction::Pause(o) => serde_json::to_value(o),
+            JobAction::Kill(o) => serde_json::to_value(o),
+            JobAction::Restore(o) => serde_json::to_value(o),
+            JobAction::Restart(o) => serde_json::to_value(o),
+            JobAction::Stash(o) => serde_json::to_value(o),
+            JobAction::Enqueue(o) => serde_json::to_value(o),
+            JobAction::Start | JobAction::Checkpoint | JobAction::Remove => return None,
+        };
+        // Plain structs of primitives always serialize.
+        Some(value.expect("action options serialize"))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseOptions {
+    /// With a group selector: pause the group but let running jobs finish
+    /// (`pause --wait`).
+    #[serde(default)]
+    pub wait: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KillOptions {
+    /// Signal number to send; `None` means the default (SIGTERM, then SIGKILL
+    /// after the grace period).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreOptions {
+    /// Restore now without waiting for free group/GPU slots (`-i`).
+    #[serde(default)]
+    pub immediate: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartOptions {
+    /// Start the new job right away (`-k/--start-immediately`).
+    #[serde(default)]
+    pub immediate: bool,
+    /// Add the new job as stashed (`-s/--stashed`).
+    #[serde(default)]
+    pub stashed: bool,
+    /// Reuse the job instead of creating a new one (`-i/--in-place`).
+    #[serde(default)]
+    pub in_place: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StashOptions {
+    /// Enqueue automatically at this time (`--delay`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enqueue_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnqueueOptions {
+    /// Enqueue at this time instead of now (`--delay`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<Timestamp>,
+}
+
+/// Which jobs a bulk request applies to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JobSelector {
+    Ids {
+        ids: Vec<JobId>,
+    },
+    /// Every job of the group the caller may modify (`-g`). For `pause` and
+    /// `start` this also pauses/resumes the group itself, as in pueue.
+    Group {
+        group: String,
+    },
+    /// The caller's own jobs, or every job for administrators (`-a`).
+    All,
+}
+
+/// Body of `POST /v1/jobs/bulk`, e.g.
+/// `{"target":{"kind":"ids","ids":[1,2]},"action":"kill","signal":9}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BulkJobRequest {
+    pub target: JobSelector,
+    #[serde(flatten)]
+    pub action: JobAction,
+}
+
+/// Body of `200 OK` from `POST /v1/jobs/bulk`. Failures are reported per
+/// job; the request as a whole only fails for malformed input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BulkJobResponse {
+    pub results: Vec<JobActionResult>,
+}
+
+impl BulkJobResponse {
+    pub fn all_ok(&self) -> bool {
+        self.results.iter().all(JobActionResult::is_ok)
+    }
+}
+
+/// Result of an action on one job. Also the success body of the single-job
+/// endpoints (where failures are reported as an HTTP error instead).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobActionResult {
+    pub id: JobId,
+    #[serde(flatten)]
+    pub outcome: ActionOutcome,
+}
+
+impl JobActionResult {
+    pub fn ok(id: JobId) -> Self {
+        Self {
+            id,
+            outcome: ActionOutcome::Ok { new_id: None },
+        }
+    }
+
+    pub fn error(id: JobId, error: ApiError) -> Self {
+        Self {
+            id,
+            outcome: ActionOutcome::Error { error },
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        matches!(self.outcome, ActionOutcome::Ok { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ActionOutcome {
+    Ok {
+        /// The id of the job created by `restart` (unless in place).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_id: Option<JobId>,
+    },
+    Error {
+        error: ApiError,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// clean, reset, switch
+// ---------------------------------------------------------------------------
+
+/// Body of `POST /v1/jobs/clean`: remove finished jobs the caller may modify.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanRequest {
+    /// Only remove successfully finished jobs (`-s`).
+    #[serde(default)]
+    pub successful_only: bool,
+    /// Only this group (`-g`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanResponse {
+    pub removed: Vec<JobId>,
+}
+
+/// Body of `POST /v1/jobs/reset`: kill and remove every job the caller may
+/// modify (own jobs, or all jobs for administrators). Answered with a
+/// [`BulkJobResponse`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetRequest {
+    /// Only this group (`-g`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// Body of `POST /v1/jobs/switch`: swap the queue positions of two jobs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchRequest {
+    pub first: JobId,
+    pub second: JobId,
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/jobs/{id}/log
+// ---------------------------------------------------------------------------
+
+/// Query of `GET /v1/jobs/{id}/log`. The response is the raw log bytes
+/// (`application/octet-stream`); with `follow`, appended output keeps being
+/// streamed (chunked) until the job finishes or the client disconnects.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogQuery {
+    /// Only the last N lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<u64>,
+    #[serde(default)]
+    pub follow: bool,
+}
+
+impl LogQuery {
+    /// Renders the query string (without `?`), empty if there is none.
+    pub fn to_query_string(&self) -> String {
+        let mut q = QueryBuilder::default();
+        if let Some(tail) = self.tail {
+            q.push("tail", &tail.to_string());
+        }
+        if self.follow {
+            q.push("follow", "true");
+        }
+        q.finish()
+    }
+}
+
+#[derive(Default)]
+struct QueryBuilder(String);
+
+impl QueryBuilder {
+    fn push(&mut self, key: &str, value: &str) {
+        if !self.0.is_empty() {
+            self.0.push('&');
+        }
+        self.0.push_str(key);
+        self.0.push('=');
+        self.0.push_str(&super::routes::percent_encode(value));
+    }
+
+    fn finish(self) -> String {
+        self.0
+    }
+}
