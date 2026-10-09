@@ -38,7 +38,11 @@ fn full(status: StatusCode, content_type: &str, body: impl Into<Bytes>) -> Respo
 }
 
 fn json(status: StatusCode, value: impl serde::Serialize) -> Response<Body> {
-    full(status, CONTENT_TYPE_JSON, serde_json::to_vec(&value).unwrap())
+    full(
+        status,
+        CONTENT_TYPE_JSON,
+        serde_json::to_vec(&value).unwrap(),
+    )
 }
 
 /// A body that yields `chunks` with a short pause in between, to exercise
@@ -105,7 +109,10 @@ async fn route(req: Request<Incoming>, log: Arc<Mutex<Vec<Recorded>>>) -> Respon
     if version.as_deref() == Some("0.0.0-old") && uri != "/v1/version" {
         return json(
             StatusCode::BAD_REQUEST,
-            ApiError::new(ErrorCode::VersionMismatch, "client 0.0.0-old != daemon 9.9.9"),
+            ApiError::new(
+                ErrorCode::VersionMismatch,
+                "client 0.0.0-old != daemon 9.9.9",
+            ),
         );
     }
 
@@ -164,7 +171,10 @@ async fn route(req: Request<Incoming>, log: Arc<Mutex<Vec<Recorded>>>) -> Respon
             ];
             let mut wire: String = events.iter().map(Event::to_sse).collect();
             // An unknown event type and a keep-alive comment are skipped.
-            wire.insert_str(0, ": ping\n\nevent: future\ndata: {\"type\":\"future\"}\n\n");
+            wire.insert_str(
+                0,
+                ": ping\n\nevent: future\ndata: {\"type\":\"future\"}\n\n",
+            );
             // Split in awkward places.
             let (a, b) = wire.split_at(wire.len() / 3);
             let (b, c) = b.split_at(b.len() / 2);

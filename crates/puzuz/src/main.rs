@@ -1,11 +1,24 @@
 mod cli;
+mod clock;
+mod commands;
+mod query;
+mod render;
+mod requests;
+mod style;
+mod users;
 
 use std::{io, path::Path, process::ExitCode};
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{Generator, generate, generate_to, shells};
+use puzuz_protocol::client::Client;
 
 use crate::cli::{Cli, Shell, SubCommand};
+use crate::clock::Clock;
+use crate::commands::App;
+use crate::render::RenderCtx;
+use crate::style::Style;
+use crate::users::UserNames;
 
 const BIN_NAME: &str = "puzuz";
 
@@ -27,8 +40,39 @@ fn main() -> ExitCode {
              so there is nothing to send input to. Make the command non-interactive instead \
              (e.g. `yes | cmd` or a `--yes` flag).",
         ),
-        other => fail(&format!("`{}` is not implemented yet", other.name())),
+        other @ (SubCommand::Daemon { .. }
+        | SubCommand::Service { .. }
+        | SubCommand::Doctor
+        | SubCommand::Edit { .. }
+        | SubCommand::Env { .. }) => fail(&format!("`{}` is not implemented yet", other.name())),
+        other => run_remote(&cli, other),
     }
+}
+
+/// Runs a command that talks to the daemon.
+fn run_remote(cli: &Cli, command: SubCommand) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => return fail(&format!("failed to start the async runtime: {err}")),
+    };
+    let app = App {
+        client: Client::new(&cli.socket),
+        ctx: RenderCtx {
+            style: Style::for_stdout(cli.color),
+            clock: Clock::system(),
+            users: UserNames::system(),
+            detect_width: true,
+        },
+    };
+    runtime.block_on(async {
+        match app.run(command).await {
+            Ok(code) => code,
+            Err(err) => fail(&commands::describe_error(err, &app.client).await),
+        }
+    })
 }
 
 fn fail(message: &str) -> ExitCode {
