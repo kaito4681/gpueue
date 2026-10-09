@@ -334,6 +334,14 @@ pub trait StoreOps: sealed::Sealed {
         jobs::remove(self.conn(), id)
     }
 
+    /// Swaps the ids of two jobs (`switch`): each job keeps its spec, state
+    /// and checkpoint record but takes the other's id, and dependencies on
+    /// either job are swapped too. Fails with
+    /// [`Error::JobNotFound`](crate::Error::JobNotFound) if either is missing.
+    fn swap_job_ids(&self, a: JobId, b: JobId) -> Result<()> {
+        atomic(self.conn(), |c| jobs::swap_ids(c, a, b))
+    }
+
     // ----- groups -----
 
     fn list_groups(&self) -> Result<Vec<Group>> {

@@ -228,3 +228,37 @@ pub(super) fn remove(conn: &Connection, id: JobId) -> Result<()> {
     }
     Ok(())
 }
+
+/// Swaps the ids of two jobs (pueue's `switch`): every row keyed by one job
+/// id moves to the other, and dependency references follow. Must run inside
+/// a savepoint or transaction.
+pub(super) fn swap_ids(conn: &Connection, a: JobId, b: JobId) -> Result<()> {
+    for id in [a, b] {
+        if get(conn, id)?.is_none() {
+            return Err(Error::JobNotFound(id).into());
+        }
+    }
+    if a == b {
+        return Ok(());
+    }
+    // The id counter has not been handed out yet, so it is free to use as a
+    // temporary. Rows briefly point at it; foreign keys are checked when the
+    // surrounding transaction commits (the pragma resets itself then).
+    let tmp = next_id(conn)?;
+    conn.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+    for (table, column) in [
+        ("jobs", "id"),
+        ("job_env", "job_id"),
+        ("job_gpus", "job_id"),
+        ("job_deps", "job_id"),
+        ("job_deps", "depends_on"),
+        ("checkpoints", "job_id"),
+    ] {
+        let sql = format!("UPDATE {table} SET {column} = ?2 WHERE {column} = ?1");
+        let mut stmt = conn.prepare_cached(&sql)?;
+        stmt.execute(params![a.0, tmp.0])?;
+        stmt.execute(params![b.0, a.0])?;
+        stmt.execute(params![tmp.0, b.0])?;
+    }
+    Ok(())
+}
