@@ -147,7 +147,7 @@ pub fn load_config(sys: &dyn System) -> LoadedConfig {
     match Config::load(&path) {
         Ok(config) => LoadedConfig {
             config,
-            check: Check::ok("config", DEFAULT_CONFIG_PATH),
+            check: check_config_trust(sys),
         },
         Err(err) => LoadedConfig {
             config: Config::default(),
@@ -156,6 +156,79 @@ pub fn load_config(sys: &dyn System) -> LoadedConfig {
             )),
         },
     }
+}
+
+/// The helper (root) reads the same file and refuses it unless only root can change it.
+fn check_config_trust(sys: &dyn System) -> Check {
+    let file = Path::new(DEFAULT_CONFIG_PATH);
+    for path in [file, file.parent().unwrap_or(file)] {
+        match is_root_owned_and_protected(sys, path) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Check::fail(
+                    "config",
+                    format!(
+                        "{} is not owned by root or is group/world-writable; \
+                         the helper refuses to start with it",
+                        path.display()
+                    ),
+                )
+                .hint(format!(
+                    "sudo chown root:root {0}; sudo chmod go-w {0}",
+                    path.display()
+                ));
+            }
+            Err(err) => return Check::fail("config", format!("{}: {err}", path.display())),
+        }
+    }
+    Check::ok("config", DEFAULT_CONFIG_PATH)
+}
+
+/// What the helper uses: `config.toml`, unless its unit passes flags that override it.
+fn check_helper_settings(sys: &dyn System, config: &Config) -> Check {
+    const NAME: &str = "helper settings";
+    let summary = format!(
+        "cuda mode {}, criu {}, cuda-checkpoint {}, checkpoints {}, logs {}",
+        config.cuda_checkpoint_mode.as_str(),
+        config.criu_path.display(),
+        config.cuda_checkpoint_path.display(),
+        config.checkpoints_dir().display(),
+        config.logs_dir().display(),
+    );
+    let unit = unit_file(sys, HELPER_UNIT);
+    let flags = std::fs::read_to_string(sys.path(&unit))
+        .ok()
+        .map(|text| exec_start_flags(&text))
+        .unwrap_or_default();
+    if flags.is_empty() {
+        return Check::info(NAME, format!("from {DEFAULT_CONFIG_PATH}: {summary}"));
+    }
+    Check::warn(
+        NAME,
+        format!(
+            "ExecStart= of {} passes {}, which override {DEFAULT_CONFIG_PATH} \
+             (this report shows the file's values: {summary})",
+            unit.display(),
+            flags.join(" ")
+        ),
+    )
+    .hint(format!(
+        "set the keys in {DEFAULT_CONFIG_PATH} and remove the flags \
+         (`sudo systemctl edit {HELPER_UNIT}` or `sudo puzuz service install`)"
+    ))
+}
+
+/// The `--flags` of the first `ExecStart=` line of a unit file.
+pub fn exec_start_flags(unit: &str) -> Vec<String> {
+    unit.lines()
+        .find_map(|line| line.trim().strip_prefix("ExecStart="))
+        .map(|cmd| {
+            cmd.split_whitespace()
+                .filter(|arg| arg.starts_with("--"))
+                .map(|arg| arg.split('=').next().unwrap_or(arg).to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Runs every check. `socket` overrides the daemon socket from the configuration.
@@ -180,6 +253,7 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
         checks.push(check_unit(sys, unit));
     }
     checks.push(check_helper_binary(sys));
+    checks.push(check_helper_settings(sys, &config));
     let api_socket = socket.map_or_else(|| config.api_socket.clone(), Path::to_owned);
     checks.push(check_socket(sys, "daemon socket", &api_socket, DAEMON_UNIT));
     checks.push(check_socket(
@@ -327,7 +401,7 @@ fn check_cuda_checkpoint(sys: &dyn System, configured: &Path, driver: Option<&Ve
 
 fn check_gpus(sys: &dyn System, config: &Config) -> Check {
     const NAME: &str = "gpus";
-    let Some(smi) = find_program(sys, Path::new("nvidia-smi")) else {
+    let Some(smi) = find_program(sys, &config.nvidia_smi_path) else {
         return Check::warn(
             NAME,
             "nvidia-smi not found; the helper needs it to find CUDA processes",

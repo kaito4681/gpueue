@@ -32,7 +32,9 @@
 
 mod actions;
 pub mod api;
-pub mod config;
+/// The configuration file's schema lives in `puzuz-config`, which the root
+/// helper shares.
+pub use puzuz_config as config;
 mod error;
 pub mod gpu;
 pub mod helper;

@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 puzuz-core = { workspace = true, features = ["storage"] }
 puzuz-protocol.workspace = true
+puzuz-config.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -17,7 +18,6 @@ tokio.workspace = true
 axum.workspace = true
 futures.workspace = true
 tokio-util.workspace = true
-toml.workspace = true
 nix.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

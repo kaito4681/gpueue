@@ -1,21 +1,35 @@
-//! Daemon configuration (`/etc/puzuz/config.toml`).
+//! The configuration file `/etc/puzuz/config.toml`, shared by the daemon,
+//! the root helper and `puzuz doctor`.
 //!
 //! Only settings that are fixed at start-up live here; groups and GPU slot
-//! limits are stored in SQLite and changed with commands. Every key is
-//! optional. Unknown keys are ignored because the root helper reads the same
-//! file for its own settings.
+//! limits are stored in the daemon's SQLite database and changed with
+//! commands. Every key is optional. Unknown keys are ignored, so a newer
+//! file still works with an older binary.
+//!
+//! The daemon reads the file with [`Config::load`]. The helper, which runs
+//! as root, reads it with [`Config::load_trusted`]: the file and every
+//! parent directory must be owned by root and not group/world-writable
+//! (see [`trust`]). Command-line flags of the helper override the file.
 //!
 //! ```toml
-//! data_dir = "/var/lib/puzuz"          # daemon/state.sqlite, logs/, checkpoints/
+//! data_dir = "/var/lib/puzuz"          # daemon/, helper/, logs/, checkpoints/
 //! # state_db = "/var/lib/puzuz/daemon/state.sqlite"
+//! # helper_state_dir = "/var/lib/puzuz/helper"
 //! # logs_dir = "/var/lib/puzuz/logs"
 //! # checkpoints_dir = "/var/lib/puzuz/checkpoints"
 //! api_socket = "/run/puzuz/puzuz.sock"
 //! helper_socket = "/run/puzuz/helper.sock"
+//! daemon_user = "puzuz"
 //! grace_secs = 30
 //! shell = ["sh", "-c"]
 //! # checkpoint_size_limit_bytes = 500_000_000_000
 //! checkpoint_tcp_close = true
+//! criu_path = "criu"
+//! cuda_checkpoint_path = "cuda-checkpoint"
+//! nvidia_smi_path = "nvidia-smi"
+//! cuda_checkpoint_mode = "manual"
+//! criu_dump_timeout_secs = 1800
+//! criu_restore_timeout_secs = 1800
 //!
 //! # GPUs are detected with NVML ("auto"). Without NVML (no driver, no
 //! # libnvidia-ml.so.1) the [[gpus]] list below is used instead; "static"
@@ -27,6 +41,8 @@
 //! uuid = "GPU-..."
 //! name = "NVIDIA GeForce RTX 4090"
 //! ```
+
+pub mod trust;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -45,6 +61,9 @@ pub struct Config {
     /// subdirectory because `<data_dir>` itself must be owned by root (the
     /// helper refuses to use paths below a directory the daemon can write).
     pub state_db: Option<PathBuf>,
+    /// Overrides `<data_dir>/helper`: the helper's event queue and job
+    /// records. Must be owned by root (used by the helper only).
+    pub helper_state_dir: Option<PathBuf>,
     /// Overrides `<data_dir>/logs`. Logs are `<logs_dir>/<uid>/<id>.log`.
     pub logs_dir: Option<PathBuf>,
     /// Overrides `<data_dir>/checkpoints`. Images are `<dir>/<id>/`.
@@ -54,7 +73,11 @@ pub struct Config {
     pub api_socket: PathBuf,
     /// The root helper's socket.
     pub helper_socket: PathBuf,
-    /// Seconds between SIGTERM and SIGKILL when stopping a job.
+    /// The system user the daemon runs as (`User=` of `puzuz.service`).
+    /// The helper accepts connections only from this user.
+    pub daemon_user: String,
+    /// Seconds between SIGTERM and SIGKILL when stopping a job (the daemon's
+    /// `kill`/`stop`, and `TimeoutStopSec=` of the helper's job units).
     pub grace_secs: u64,
     /// Command prefix a job's command line is appended to.
     pub shell: Vec<String>,
@@ -66,6 +89,14 @@ pub struct Config {
     pub criu_path: PathBuf,
     /// Path of `cuda-checkpoint` (used by the helper).
     pub cuda_checkpoint_path: PathBuf,
+    /// Path of `nvidia-smi` (used by the helper to find CUDA processes).
+    pub nvidia_smi_path: PathBuf,
+    /// Who drives `cuda-checkpoint` during a dump/restore (helper only).
+    pub cuda_checkpoint_mode: CudaCheckpointMode,
+    /// Seconds a `criu dump` may take before it is killed (helper only).
+    pub criu_dump_timeout_secs: u64,
+    /// Seconds a `criu restore` may take before it is killed (helper only).
+    pub criu_restore_timeout_secs: u64,
     /// How GPUs are found at start-up.
     pub gpu_detection: GpuDetection,
     /// Path (or name) of the NVML library; by default `libnvidia-ml.so.1`
@@ -87,6 +118,27 @@ pub enum GpuDetection {
     Static,
 }
 
+/// [`Config::cuda_checkpoint_mode`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaCheckpointMode {
+    /// The helper calls `cuda-checkpoint` around `criu` itself; works with
+    /// the distribution's criu (no CUDA plugin needed).
+    #[default]
+    Manual,
+    /// CRIU's CUDA plugin calls `cuda-checkpoint`.
+    Plugin,
+}
+
+impl CudaCheckpointMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Plugin => "plugin",
+        }
+    }
+}
+
 /// One GPU in [`Config::gpus`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuConfig {
@@ -104,16 +156,22 @@ impl Default for Config {
         Self {
             data_dir: PathBuf::from("/var/lib/puzuz"),
             state_db: None,
+            helper_state_dir: None,
             logs_dir: None,
             checkpoints_dir: None,
             api_socket: PathBuf::from(puzuz_protocol::api::DEFAULT_SOCKET_PATH),
             helper_socket: PathBuf::from(puzuz_protocol::helper::DEFAULT_SOCKET_PATH),
+            daemon_user: "puzuz".to_owned(),
             grace_secs: 30,
             shell: vec!["sh".to_owned(), "-c".to_owned()],
             checkpoint_size_limit_bytes: None,
             checkpoint_tcp_close: true,
             criu_path: PathBuf::from("criu"),
             cuda_checkpoint_path: PathBuf::from("cuda-checkpoint"),
+            nvidia_smi_path: PathBuf::from("nvidia-smi"),
+            cuda_checkpoint_mode: CudaCheckpointMode::Manual,
+            criu_dump_timeout_secs: 1800,
+            criu_restore_timeout_secs: 1800,
             gpu_detection: GpuDetection::Auto,
             nvml_library: None,
             gpus: Vec::new(),
@@ -137,6 +195,8 @@ pub enum ConfigError {
     },
     #[error("invalid configuration in {}: {message}", path.display())]
     Invalid { path: PathBuf, message: String },
+    #[error("refusing to use {}: {message}", path.display())]
+    Untrusted { path: PathBuf, message: String },
 }
 
 impl Config {
@@ -153,7 +213,12 @@ impl Config {
                 });
             }
         };
-        Self::parse(&text).map_err(|e| match e {
+        Self::parse_file(path, &text)
+    }
+
+    /// [`Config::parse`] with errors that name `path`.
+    pub(crate) fn parse_file(path: &Path, text: &str) -> Result<Self, ConfigError> {
+        Self::parse(text).map_err(|e| match e {
             ParseError::Toml(source) => ConfigError::Parse {
                 path: path.to_owned(),
                 source: Box::new(source),
@@ -176,6 +241,12 @@ impl Config {
         if self.shell.is_empty() {
             return Err("`shell` must not be empty".to_owned());
         }
+        if self.daemon_user.is_empty() {
+            return Err("`daemon_user` must not be empty".to_owned());
+        }
+        if self.criu_dump_timeout_secs == 0 || self.criu_restore_timeout_secs == 0 {
+            return Err("criu timeouts must be positive".to_owned());
+        }
         let mut seen = std::collections::HashSet::new();
         for gpu in &self.gpus {
             if !seen.insert(gpu.index) {
@@ -196,6 +267,12 @@ impl Config {
         self.state_db
             .clone()
             .unwrap_or_else(|| self.data_dir.join("daemon").join("state.sqlite"))
+    }
+
+    pub fn helper_state_dir(&self) -> PathBuf {
+        self.helper_state_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("helper"))
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -243,6 +320,13 @@ mod tests {
         );
         assert_eq!(config.shell, ["sh", "-c"]);
         assert_eq!(config.grace_secs, 30);
+        assert_eq!(
+            config.helper_state_dir(),
+            PathBuf::from("/var/lib/puzuz/helper")
+        );
+        assert_eq!(config.daemon_user, "puzuz");
+        assert_eq!(config.cuda_checkpoint_mode, CudaCheckpointMode::Manual);
+        assert_eq!(config.criu_dump_timeout_secs, 1800);
     }
 
     #[test]
@@ -259,7 +343,15 @@ mod tests {
             checkpoint_tcp_close = false
             gpu_detection = "static"
             nvml_library = "/opt/nvml.so"
-            helper_only_setting = "x"
+            daemon_user = "svc-puzuz"
+            nvidia_smi_path = "/opt/nvidia-smi"
+            cuda_checkpoint_mode = "plugin"
+            criu_dump_timeout_secs = 60
+            criu_restore_timeout_secs = 90
+            some_future_setting = "x"
+
+            [some_future_table]
+            key = 1
 
             [[gpus]]
             index = 0
@@ -286,6 +378,15 @@ mod tests {
         assert_eq!(config.gpus.len(), 2);
         assert_eq!(config.gpus[0].name, "A100");
         assert_eq!(config.gpus[1].uuid, "");
+        assert_eq!(
+            config.helper_state_dir(),
+            PathBuf::from("/srv/puzuz/helper")
+        );
+        assert_eq!(config.daemon_user, "svc-puzuz");
+        assert_eq!(config.nvidia_smi_path, PathBuf::from("/opt/nvidia-smi"));
+        assert_eq!(config.cuda_checkpoint_mode, CudaCheckpointMode::Plugin);
+        assert_eq!(config.criu_dump_timeout_secs, 60);
+        assert_eq!(config.criu_restore_timeout_secs, 90);
     }
 
     #[test]
@@ -296,6 +397,18 @@ mod tests {
         ));
         assert!(matches!(
             Config::parse("shell = []"),
+            Err(ParseError::Invalid(_))
+        ));
+        assert!(matches!(
+            Config::parse("cuda_checkpoint_mode = \"auto\""),
+            Err(ParseError::Toml(_))
+        ));
+        assert!(matches!(
+            Config::parse("daemon_user = \"\""),
+            Err(ParseError::Invalid(_))
+        ));
+        assert!(matches!(
+            Config::parse("criu_dump_timeout_secs = 0"),
             Err(ParseError::Invalid(_))
         ));
         assert!(matches!(

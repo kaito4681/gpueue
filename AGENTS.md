@@ -12,6 +12,8 @@
   - `crates/puzuz-core` — domain model, scheduling decisions, authorization, SQLite storage
   - `crates/puzuz-protocol` — wire types: CLI ⇄ daemon (HTTP over a Unix socket),
     daemon ⇄ helper (newline-delimited JSON)
+  - `crates/puzuz-config` — schema of `/etc/puzuz/config.toml`, shared by the daemon, the
+    helper (which loads it with root-ownership checks) and `puzuz doctor`
   - `crates/puzuz-daemon` — the daemon (runs as the unprivileged `puzuz` system user)
   - `crates/puzuz-checkpoint` — CRIU and cuda-checkpoint integration
   - `crates/puzuz-helper` — the root helper binary (spawns jobs as their owner, checkpoints)

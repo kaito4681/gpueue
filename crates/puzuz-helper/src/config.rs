@@ -1,9 +1,10 @@
 //! Runtime configuration of the helper.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use puzuz_checkpoint::{CheckpointConfig, CudaMode};
+use puzuz_config::CudaCheckpointMode;
 
 use crate::jobs::MountPlan;
 
@@ -89,12 +90,230 @@ impl Default for HelperConfig {
     }
 }
 
+/// Settings given on the command line. Each one that is set overrides the
+/// configuration file.
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    pub socket: Option<PathBuf>,
+    pub daemon_user: Option<String>,
+    pub state_dir: Option<PathBuf>,
+    pub checkpoint_dir: Option<PathBuf>,
+    pub log_dir: Option<PathBuf>,
+    /// An empty path disables `criu restore --root`.
+    pub criu_root: Option<PathBuf>,
+    pub cuda_mode: Option<CudaMode>,
+    pub criu: Option<PathBuf>,
+    pub cuda_checkpoint: Option<PathBuf>,
+    pub nvidia_smi: Option<PathBuf>,
+    pub job_stop_timeout: Option<Duration>,
+}
+
+/// The helper's effective settings: [`HelperConfig`] plus the daemon's user
+/// name (looked up by the caller).
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    pub config: HelperConfig,
+    pub daemon_user: String,
+}
+
 impl HelperConfig {
+    /// Combines the shared configuration file with command-line overrides:
+    /// flag > file > built-in default (the file's defaults are the
+    /// built-in ones). `daemon_uid`/`daemon_gid` and `helper_exe` are left
+    /// at their defaults for the caller to fill in.
+    pub fn resolve(file: &puzuz_config::Config, o: Overrides) -> Resolved {
+        let mut cfg = HelperConfig {
+            socket_path: o.socket.unwrap_or_else(|| file.helper_socket.clone()),
+            state_dir: o.state_dir.unwrap_or_else(|| file.helper_state_dir()),
+            checkpoint_base: o.checkpoint_dir.unwrap_or_else(|| file.checkpoints_dir()),
+            log_base: o.log_dir.unwrap_or_else(|| file.logs_dir()),
+            criu_root: match o.criu_root {
+                Some(root) if root.as_os_str().is_empty() => None,
+                Some(root) => Some(root),
+                None => Some(PathBuf::from(DEFAULT_CRIU_ROOT)),
+            },
+            nvidia_smi: o.nvidia_smi.unwrap_or_else(|| file.nvidia_smi_path.clone()),
+            job_stop_timeout: o
+                .job_stop_timeout
+                .unwrap_or(Duration::from_secs(file.grace_secs)),
+            ..HelperConfig::default()
+        };
+        let ck = &mut cfg.checkpoint;
+        ck.mode = o.cuda_mode.unwrap_or(match file.cuda_checkpoint_mode {
+            CudaCheckpointMode::Manual => CudaMode::Manual,
+            CudaCheckpointMode::Plugin => CudaMode::Plugin,
+        });
+        ck.criu.criu_path = o.criu.unwrap_or_else(|| file.criu_path.clone());
+        ck.criu.empty_plugin_dir = file.data_dir.join("criu-no-plugins");
+        // The daemon also asks for `--tcp-close` per checkpoint; this is the
+        // helper's own default for dumps it starts (e.g. at shutdown).
+        ck.criu.tcp_close = file.checkpoint_tcp_close;
+        ck.cuda.path = o
+            .cuda_checkpoint
+            .unwrap_or_else(|| file.cuda_checkpoint_path.clone());
+        ck.timeouts.criu_dump = Duration::from_secs(file.criu_dump_timeout_secs);
+        ck.timeouts.criu_restore = Duration::from_secs(file.criu_restore_timeout_secs);
+        Resolved {
+            config: cfg,
+            daemon_user: o.daemon_user.unwrap_or_else(|| file.daemon_user.clone()),
+        }
+    }
+
+    /// Paths root writes to or executes: they must not be changeable by
+    /// anyone but root (programs given by name are looked up in `PATH`).
+    pub fn paths_to_check(&self) -> Vec<&Path> {
+        let mut paths = vec![
+            self.state_dir.as_path(),
+            &self.checkpoint_base,
+            &self.log_base,
+        ];
+        if let Some(root) = &self.criu_root {
+            paths.push(root);
+        }
+        for program in [
+            &self.checkpoint.criu.criu_path,
+            &self.checkpoint.cuda.path,
+            &self.nvidia_smi,
+        ] {
+            if program.is_absolute() {
+                paths.push(program);
+            }
+        }
+        paths
+    }
+
     pub fn jobs_dir(&self) -> PathBuf {
         self.state_dir.join("jobs")
     }
 
     pub fn events_dir(&self) -> PathBuf {
         self.state_dir.join("events")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(text: &str) -> puzuz_config::Config {
+        puzuz_config::Config::parse(text).unwrap()
+    }
+
+    #[test]
+    fn built_in_defaults_without_file_or_flags() {
+        let r = HelperConfig::resolve(&puzuz_config::Config::default(), Overrides::default());
+        let c = &r.config;
+        let d = HelperConfig::default();
+        assert_eq!(r.daemon_user, "puzuz");
+        assert_eq!(c.socket_path, d.socket_path);
+        assert_eq!(c.state_dir, d.state_dir);
+        assert_eq!(c.checkpoint_base, d.checkpoint_base);
+        assert_eq!(c.log_base, d.log_base);
+        assert_eq!(c.criu_root, d.criu_root);
+        assert_eq!(c.nvidia_smi, d.nvidia_smi);
+        assert_eq!(c.job_stop_timeout, d.job_stop_timeout);
+        assert_eq!(c.checkpoint, d.checkpoint);
+    }
+
+    #[test]
+    fn file_overrides_defaults() {
+        let f = file(
+            r#"
+            data_dir = "/srv/pz"
+            logs_dir = "/logs"
+            helper_socket = "/run/x/helper.sock"
+            daemon_user = "svc"
+            grace_secs = 7
+            checkpoint_tcp_close = false
+            criu_path = "/opt/criu"
+            cuda_checkpoint_path = "/opt/cuda-checkpoint"
+            nvidia_smi_path = "/opt/nvidia-smi"
+            cuda_checkpoint_mode = "plugin"
+            criu_dump_timeout_secs = 11
+            criu_restore_timeout_secs = 12
+            daemon_only_key = "ignored"
+            "#,
+        );
+        let r = HelperConfig::resolve(&f, Overrides::default());
+        let c = &r.config;
+        assert_eq!(r.daemon_user, "svc");
+        assert_eq!(c.socket_path, PathBuf::from("/run/x/helper.sock"));
+        assert_eq!(c.state_dir, PathBuf::from("/srv/pz/helper"));
+        assert_eq!(c.checkpoint_base, PathBuf::from("/srv/pz/checkpoints"));
+        assert_eq!(c.log_base, PathBuf::from("/logs"));
+        assert_eq!(c.job_stop_timeout, Duration::from_secs(7));
+        assert_eq!(c.nvidia_smi, PathBuf::from("/opt/nvidia-smi"));
+        assert_eq!(c.checkpoint.mode, CudaMode::Plugin);
+        assert_eq!(c.checkpoint.criu.criu_path, PathBuf::from("/opt/criu"));
+        assert!(!c.checkpoint.criu.tcp_close);
+        assert_eq!(
+            c.checkpoint.criu.empty_plugin_dir,
+            PathBuf::from("/srv/pz/criu-no-plugins")
+        );
+        assert_eq!(
+            c.checkpoint.cuda.path,
+            PathBuf::from("/opt/cuda-checkpoint")
+        );
+        assert_eq!(c.checkpoint.timeouts.criu_dump, Duration::from_secs(11));
+        assert_eq!(c.checkpoint.timeouts.criu_restore, Duration::from_secs(12));
+        // Settings the file does not have keep their defaults.
+        assert!(
+            c.checkpoint
+                .criu
+                .extra_restore_args
+                .contains(&"--manage-cgroups=ignore".into())
+        );
+        assert_eq!(c.criu_root, Some(PathBuf::from(DEFAULT_CRIU_ROOT)));
+    }
+
+    #[test]
+    fn flags_override_the_file() {
+        let f = file(
+            r#"
+            helper_socket = "/run/x/helper.sock"
+            daemon_user = "svc"
+            grace_secs = 7
+            criu_path = "/opt/criu"
+            cuda_checkpoint_path = "/opt/cuda-checkpoint"
+            nvidia_smi_path = "/opt/nvidia-smi"
+            cuda_checkpoint_mode = "plugin"
+            checkpoints_dir = "/ckpt"
+            "#,
+        );
+        let o = Overrides {
+            socket: Some("/flag/helper.sock".into()),
+            daemon_user: Some("flaguser".into()),
+            state_dir: Some("/flag/state".into()),
+            checkpoint_dir: Some("/flag/ckpt".into()),
+            log_dir: Some("/flag/logs".into()),
+            criu_root: Some(PathBuf::new()),
+            cuda_mode: Some(CudaMode::Manual),
+            criu: Some("/flag/criu".into()),
+            cuda_checkpoint: Some("/flag/cc".into()),
+            nvidia_smi: Some("/flag/smi".into()),
+            job_stop_timeout: Some(Duration::from_secs(3)),
+        };
+        let r = HelperConfig::resolve(&f, o);
+        let c = &r.config;
+        assert_eq!(r.daemon_user, "flaguser");
+        assert_eq!(c.socket_path, PathBuf::from("/flag/helper.sock"));
+        assert_eq!(c.state_dir, PathBuf::from("/flag/state"));
+        assert_eq!(c.checkpoint_base, PathBuf::from("/flag/ckpt"));
+        assert_eq!(c.log_base, PathBuf::from("/flag/logs"));
+        assert_eq!(c.criu_root, None);
+        assert_eq!(c.checkpoint.mode, CudaMode::Manual);
+        assert_eq!(c.checkpoint.criu.criu_path, PathBuf::from("/flag/criu"));
+        assert_eq!(c.checkpoint.cuda.path, PathBuf::from("/flag/cc"));
+        assert_eq!(c.nvidia_smi, PathBuf::from("/flag/smi"));
+        assert_eq!(c.job_stop_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn absolute_programs_are_checked_but_path_lookups_are_not() {
+        let r = HelperConfig::resolve(&file("criu_path = \"/opt/criu\"\n"), Overrides::default());
+        let paths = r.config.paths_to_check();
+        assert!(paths.contains(&Path::new("/opt/criu")));
+        assert!(paths.contains(&Path::new(DEFAULT_CHECKPOINT_BASE)));
+        assert!(!paths.contains(&Path::new("cuda-checkpoint")));
     }
 }
