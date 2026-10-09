@@ -609,13 +609,15 @@ pub enum SubCommand {
         #[arg(long, value_hint = ValueHint::FilePath, default_value = "/etc/puzuz/config.toml")]
         config: PathBuf,
 
-        /// Directory for the state database and job logs.
-        #[arg(long, value_hint = ValueHint::DirPath, default_value = "/var/lib/puzuz")]
-        data_dir: PathBuf,
+        /// Directory for the state database and job logs [default: from the config file,
+        /// /var/lib/puzuz].
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        data_dir: Option<PathBuf>,
 
-        /// Socket of the root helper.
-        #[arg(long, value_hint = ValueHint::FilePath, default_value = "/run/puzuz/helper.sock")]
-        helper_socket: PathBuf,
+        /// Socket of the root helper [default: from the config file,
+        /// /run/puzuz/helper.sock].
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        helper_socket: Option<PathBuf>,
     },
 
     /// (puzuz) Install, uninstall or inspect the systemd services.
