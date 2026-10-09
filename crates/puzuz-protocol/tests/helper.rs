@@ -69,6 +69,7 @@ fn spawn_golden() {
             envs: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
             gpus: vec![GpuIndex(0)],
             log_path: "/var/lib/puzuz/logs/7.log".into(),
+            no_checkpoint: false,
         }),
     );
     // The newline in the command is escaped, so the message stays one line.

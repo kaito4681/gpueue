@@ -26,8 +26,11 @@ mod framing;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use puzuz_core::model::{GpuIndex, JobId, Uid};
 use serde::{Deserialize, Serialize};
+
+/// Re-exported so that the helper can use the ids without depending on
+/// `puzuz-core` itself.
+pub use puzuz_core::model::{GpuIndex, JobId, Uid};
 
 pub use framing::{FrameError, LineBuffer, MAX_LINE_LEN, decode_line, encode_line};
 
@@ -185,6 +188,10 @@ pub struct SpawnRequest {
     pub gpus: Vec<GpuIndex>,
     /// stdout and stderr are appended to this file, opened as the owner.
     pub log_path: PathBuf,
+    /// `add --no-checkpoint`: when the helper shuts down, leave this job to
+    /// be stopped by systemd (SIGTERM, then SIGKILL) instead of dumping it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_checkpoint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
