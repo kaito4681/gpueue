@@ -234,6 +234,14 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
         });
     if !stopping {
         eprintln!("puzuz-helper: stopping without checkpointing (the system is not shutting down)");
+        // Let spawns, restores and checkpoints in flight finish or be
+        // abandoned (a second signal exits at once); the connections stay
+        // open so their answers and events still reach the daemon.
+        tokio::select! {
+            _ = helper.drain() => {}
+            _ = term.recv() => eprintln!("puzuz-helper: second signal, exiting now"),
+            _ = int.recv() => eprintln!("puzuz-helper: second signal, exiting now"),
+        }
         let _ = stop_tx.send(true);
         let _ = std::fs::remove_file(&socket_path);
         return Ok(());

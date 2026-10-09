@@ -120,6 +120,13 @@ pub trait Launcher: Send + Sync + 'static {
     /// is-system-running` says `stopping`), as opposed to only the helper
     /// being stopped or restarted.
     fn system_stopping(&self) -> impl Future<Output = LaunchResult<bool>> + Send;
+
+    /// The helper is being stopped: from now on, a spawn or restore whose
+    /// unit systemd has not begun to start is abandoned (its start job is
+    /// cancelled) and fails with `shutting_down`. Job units are ordered
+    /// before the helper, so their start jobs wait for the helper's stop
+    /// job, which in turn waits for the operations in flight.
+    fn stop_waiting(&self) {}
 }
 
 impl<T: Launcher> Launcher for std::sync::Arc<T> {
@@ -150,6 +157,9 @@ impl<T: Launcher> Launcher for std::sync::Arc<T> {
     }
     fn system_stopping(&self) -> impl Future<Output = LaunchResult<bool>> + Send {
         (**self).system_stopping()
+    }
+    fn stop_waiting(&self) {
+        (**self).stop_waiting();
     }
 }
 

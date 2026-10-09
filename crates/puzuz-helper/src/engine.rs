@@ -335,6 +335,9 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
     // -- spawn ------------------------------------------------------------
 
     async fn spawn(self: &Arc<Self>, req: SpawnRequest) -> ResponseResult {
+        // Counted before the check, so a stop that saw no operation in
+        // flight is seen here (see `Self::drain`).
+        let _busy = self.inflight.enter();
         if self.is_shutting_down() {
             return error(HelperErrorCode::ShuttingDown, "the helper is shutting down");
         }
@@ -379,7 +382,6 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 },
             );
         }
-        let _busy = self.inflight.enter();
         match self.do_spawn(&req, &creds, &files, &record).await {
             Ok(pid) => {
                 let _ = fs::remove_file(files.spec());
@@ -488,11 +490,21 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 ));
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                fs::DirBuilder::new().mode(0o750).create(&user_dir)?;
+                // A concurrent spawn of the same user may create it first.
+                match fs::DirBuilder::new().mode(0o750).create(&user_dir) {
+                    Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+                    _ => {}
+                }
             }
             Err(e) => return Err(e),
         }
         let m = fs::symlink_metadata(&user_dir)?;
+        if !m.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} is not a directory", user_dir.display()),
+            ));
+        }
         if m.uid() != req.uid.0 || m.gid() != self.cfg.daemon_gid {
             std::os::unix::fs::lchown(&user_dir, Some(req.uid.0), Some(self.cfg.daemon_gid))?;
         }
@@ -868,6 +880,8 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
     // -- restore ----------------------------------------------------------
 
     fn restore(self: &Arc<Self>, req: RestoreRequest) -> ResponseResult {
+        // Counted before the check (see `Self::spawn`).
+        let guard = self.inflight.enter();
         if self.is_shutting_down() {
             return error(HelperErrorCode::ShuttingDown, "the helper is shutting down");
         }
@@ -892,7 +906,6 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 },
             );
         }
-        let guard = self.inflight.enter();
         let this = self.clone();
         tokio::spawn(async move {
             let _guard = guard;
@@ -1110,6 +1123,19 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
     }
 
     // -- shutdown ---------------------------------------------------------
+
+    /// Stop of the helper alone (not of the OS): refuse new spawns and
+    /// restores, then wait for the spawns, restores and checkpoints in
+    /// flight to finish, so that none is cut off half-way (their answers
+    /// and events still reach the daemon). Spawns and restores whose units
+    /// systemd has not begun to start are abandoned instead (see
+    /// [`Launcher::stop_waiting`]): they would wait for this very stop.
+    /// The jobs keep running.
+    pub async fn drain(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        self.launcher.stop_waiting();
+        self.inflight.wait_idle().await;
+    }
 
     /// First SIGTERM: refuse new spawns/restores, wait for running
     /// operations, then dump every live job one by one (`no_checkpoint`

@@ -12,8 +12,8 @@ use puzuz_checkpoint::plan::Action;
 use puzuz_checkpoint::{CudaMode, Executor};
 use puzuz_helper::config::SHUTDOWN_MANIFEST;
 use puzuz_helper::engine::{ManifestEntry, ManifestResult};
-use puzuz_helper::launcher::UnitState;
 use puzuz_helper::launcher::fake::FakeLauncher;
+use puzuz_helper::launcher::{Launcher, UnitState};
 use puzuz_helper::testing::{FakeExecState, FakeExecutor, FakeHost};
 use puzuz_helper::{ExecutorFactory, Helper, HelperConfig, ShutdownManifest, server};
 use puzuz_protocol::helper::{
@@ -170,6 +170,8 @@ struct Client {
     wr: OwnedWriteHalf,
     next_id: u64,
     events: Vec<EventEnvelope>,
+    /// Responses read while waiting for another one.
+    responses: BTreeMap<RequestId, ResponseResult>,
 }
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -182,6 +184,7 @@ impl Client {
             wr,
             next_id: 1,
             events: Vec::new(),
+            responses: BTreeMap::new(),
         };
         c.send(&DaemonMessage::Hello(hello)).await;
         match c.read().await {
@@ -206,17 +209,48 @@ impl Client {
     }
 
     async fn request(&mut self, request: Request) -> ResponseResult {
+        let id = self.send_request(request).await;
+        self.response(id).await
+    }
+
+    /// Sends a request without waiting for its response.
+    async fn send_request(&mut self, request: Request) -> RequestId {
         let id = RequestId(self.next_id);
         self.next_id += 1;
         self.send(&DaemonMessage::Request(RequestEnvelope { id, request }))
             .await;
+        id
+    }
+
+    /// The response to request `id`.
+    async fn response(&mut self, id: RequestId) -> ResponseResult {
+        if let Some(r) = self.responses.remove(&id) {
+            return r;
+        }
         loop {
             match self.read().await.expect("connection closed") {
                 HelperMessage::Response(r) if r.id == id => return r.result,
+                HelperMessage::Response(r) => {
+                    self.responses.insert(r.id, r.result);
+                }
                 HelperMessage::Event(e) => self.events.push(e),
                 other => panic!("unexpected {other:?}"),
             }
         }
+    }
+
+    /// Sends every request before reading any response; the responses in
+    /// request order.
+    async fn request_all(&mut self, requests: Vec<Request>) -> Vec<ResponseResult> {
+        let mut ids = Vec::new();
+        for r in requests {
+            ids.push(self.send_request(r).await);
+        }
+        let mut out = Vec::new();
+        for id in ids {
+            out.push(self.response(id).await);
+        }
+        out
     }
 
     async fn event(&mut self) -> EventEnvelope {
@@ -764,4 +798,185 @@ async fn shutdown_checkpoints_everything_except_no_checkpoint_jobs() {
         env.launcher.unit(JobId(11)).unwrap().state,
         UnitState::Running
     );
+}
+
+/// Collects `n` events, panicking on any that `pick` rejects.
+async fn events<T>(c: &mut Client, n: usize, pick: impl Fn(Event) -> Option<T>) -> Vec<T> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        let ev = c.event().await;
+        match pick(ev.event.clone()) {
+            Some(v) => out.push(v),
+            None => panic!("unexpected {ev:?}"),
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_spawns_and_restores() {
+    let env = Env::new().await;
+    env.launcher.set_delay(Some(Duration::from_millis(30)));
+    let mut c = env.client().await;
+
+    // Many spawns at once, into a log directory that does not exist yet.
+    let first: Vec<u64> = (100..124).collect();
+    let results = c
+        .request_all(
+            first
+                .iter()
+                .map(|&j| Request::Spawn(env.spawn_req(j)))
+                .collect(),
+        )
+        .await;
+    let mut pids = std::collections::BTreeSet::new();
+    for (job, r) in first.iter().zip(results) {
+        let ResponseResult::Spawned { pid } = r else {
+            panic!("job {job}: {r:?}")
+        };
+        assert!(pids.insert(pid), "pid {pid} reused");
+    }
+    assert!(
+        env.launcher.max_concurrent() > 1,
+        "the spawns did not overlap"
+    );
+    assert_eq!(c.running().await.len(), first.len());
+
+    // Checkpoint some of them (the helper dumps one at a time).
+    let dumped: Vec<u64> = first[..8].to_vec();
+    let results = c
+        .request_all(
+            dumped
+                .iter()
+                .map(|&j| Request::Checkpoint {
+                    job: JobId(j),
+                    image_dir: env.base().join(j.to_string()),
+                    options: Default::default(),
+                })
+                .collect(),
+        )
+        .await;
+    assert!(
+        results.iter().all(|r| *r == ResponseResult::Accepted),
+        "{results:?}"
+    );
+    let mut done = events(&mut c, dumped.len(), |e| match e {
+        Event::CheckpointFinished {
+            job,
+            outcome: CheckpointOutcome::Success { .. },
+        } => Some(job.0),
+        _ => None,
+    })
+    .await;
+    done.sort_unstable();
+    assert_eq!(done, dumped);
+
+    // Restore them while new jobs are spawned and the job list is read.
+    let second: Vec<u64> = (200..208).collect();
+    let mut requests = Vec::new();
+    for (&r, &s) in dumped.iter().zip(&second) {
+        requests.push(Request::Restore(RestoreRequest {
+            job: JobId(r),
+            uid: Uid(uid()),
+            image_dir: env.base().join(r.to_string()),
+            gpus: vec![GpuIndex(0)],
+        }));
+        requests.push(Request::Spawn(env.spawn_req(s)));
+        requests.push(Request::ListRunning);
+    }
+    for (i, r) in c.request_all(requests).await.into_iter().enumerate() {
+        match i % 3 {
+            0 => assert_eq!(r, ResponseResult::Accepted),
+            1 => assert!(matches!(r, ResponseResult::Spawned { .. }), "{r:?}"),
+            _ => assert!(matches!(r, ResponseResult::Running { .. }), "{r:?}"),
+        }
+    }
+    let mut restored = events(&mut c, dumped.len(), |e| match e {
+        Event::RestoreFinished {
+            job,
+            outcome: RestoreOutcome::Success { .. },
+        } => Some(job.0),
+        _ => None,
+    })
+    .await;
+    restored.sort_unstable();
+    assert_eq!(restored, dumped);
+
+    let all: Vec<u64> = first.iter().chain(&second).copied().collect();
+    let running = c.running().await;
+    assert_eq!(running.len(), all.len());
+    assert!(running.iter().all(|(_, p)| *p == RunningPhase::Running));
+    // One live unit per job: the restored ones under new, distinct names.
+    let units = env.launcher.list().await.unwrap();
+    assert_eq!(units.len(), all.len(), "{units:?}");
+
+    // Each job's exit is reported exactly once.
+    for &j in &all {
+        env.launcher.exit(JobId(j), ExitStatus::Exited { code: 0 });
+    }
+    let mut exited = events(&mut c, all.len(), |e| match e {
+        Event::JobExited { job, .. } => Some(job.0),
+        _ => None,
+    })
+    .await;
+    exited.sort_unstable();
+    let mut expected = all.clone();
+    expected.sort_unstable();
+    assert_eq!(exited, expected);
+    c.no_event().await;
+    assert!(c.running().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopping_helper_abandons_queued_launches_and_refuses_new_ones() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(1))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    // Spawns whose units systemd has not started yet (the fake's delay).
+    env.launcher.set_delay(Some(Duration::from_secs(30)));
+    let mut queued = Vec::new();
+    for j in 2..=5 {
+        queued.push(c.send_request(Request::Spawn(env.spawn_req(j))).await);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let drain = tokio::spawn({
+        let helper = env.helper.clone();
+        async move { helper.drain().await }
+    });
+
+    // They are abandoned and refused with `shutting_down` (the daemon
+    // offers them again), leaving nothing behind...
+    for id in queued {
+        assert_eq!(
+            err_code(&c.response(id).await),
+            HelperErrorCode::ShuttingDown
+        );
+    }
+    tokio::time::timeout(WAIT, drain).await.unwrap().unwrap();
+    for j in 2..=5 {
+        assert!(env.launcher.unit(JobId(j)).is_none());
+        assert!(!env.root.join("state/jobs").join(j.to_string()).exists());
+    }
+    // ...new launches are refused...
+    assert_eq!(
+        err_code(&c.request(Request::Spawn(env.spawn_req(6))).await),
+        HelperErrorCode::ShuttingDown
+    );
+    assert_eq!(
+        err_code(
+            &c.request(Request::Restore(RestoreRequest {
+                job: JobId(7),
+                uid: Uid(uid()),
+                image_dir: env.base().join("7"),
+                gpus: vec![],
+            }))
+            .await
+        ),
+        HelperErrorCode::ShuttingDown
+    );
+    // ...and the running job is left alone.
+    assert_eq!(c.running().await, [(JobId(1), RunningPhase::Running)]);
 }

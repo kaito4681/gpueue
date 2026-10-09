@@ -24,8 +24,10 @@ ExecStart=/usr/bin/puzuz-helper serve
 # every running job one by one (except --no-checkpoint jobs, which systemd
 # stops after the helper) and write <checkpoint dir>/shutdown-manifest.json.
 # A plain `systemctl stop/restart puzuz-helper` (e.g. an upgrade) leaves the
-# jobs running; the next helper re-discovers them. A second SIGTERM makes
-# the helper exit at once.
+# jobs running; the next helper re-discovers them. It refuses new
+# spawns/restores and first lets the operations in flight finish (a dump
+# in progress may take a while). A second SIGTERM makes the helper exit at
+# once.
 # KillMode=mixed: only the helper itself gets SIGTERM; criu and
 # cuda-checkpoint children in the middle of a dump are not interrupted.
 KillMode=mixed

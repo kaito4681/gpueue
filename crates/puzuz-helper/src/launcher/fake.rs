@@ -28,6 +28,13 @@ struct Inner {
     spawned: Vec<LaunchSpec>,
     restored: Vec<RestoreSpec>,
     system_stopping: bool,
+    /// How long `spawn` and `restore` take.
+    delay: Option<std::time::Duration>,
+    /// Set by `stop_waiting`: launches still in their delay are abandoned.
+    stopping: bool,
+    /// Spawns and restores in progress, and the most seen at once.
+    active: usize,
+    max_active: usize,
 }
 
 /// Units live in a map; tests drive exits with [`FakeLauncher::exit`].
@@ -74,6 +81,42 @@ impl FakeLauncher {
         self.lock().system_stopping = stopping;
     }
 
+    /// Make `spawn` and `restore` take `delay` (and yield), so that
+    /// concurrent requests overlap.
+    pub fn set_delay(&self, delay: Option<std::time::Duration>) {
+        self.lock().delay = delay;
+    }
+
+    /// The launch's delay; fails like the real launcher if the helper
+    /// starts stopping meanwhile.
+    async fn pause(&self) -> LaunchResult<()> {
+        let delay = {
+            let mut g = self.lock();
+            g.active += 1;
+            g.max_active = g.max_active.max(g.active);
+            g.delay
+        };
+        let end = tokio::time::Instant::now() + delay.unwrap_or_default();
+        let mut result = Ok(());
+        while tokio::time::Instant::now() < end {
+            if self.lock().stopping {
+                result = Err(LaunchError::new(
+                    HelperErrorCode::ShuttingDown,
+                    "the helper is stopping",
+                ));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        self.lock().active -= 1;
+        result
+    }
+
+    /// The most spawns and restores that were in progress at once.
+    pub fn max_concurrent(&self) -> usize {
+        self.lock().max_active
+    }
+
     pub fn spawned(&self) -> Vec<LaunchSpec> {
         self.lock().spawned.clone()
     }
@@ -105,6 +148,7 @@ impl FakeLauncher {
 
 impl Launcher for FakeLauncher {
     async fn spawn(&self, spec: &LaunchSpec) -> LaunchResult<u32> {
+        self.pause().await?;
         if let Some(err) = self.lock().fail_next_spawn.take() {
             return Err(err);
         }
@@ -113,6 +157,7 @@ impl Launcher for FakeLauncher {
     }
 
     async fn restore(&self, spec: &RestoreSpec) -> LaunchResult<u32> {
+        self.pause().await?;
         if let Some(err) = self.lock().fail_next_restore.take() {
             return Err(err);
         }
@@ -161,5 +206,9 @@ impl Launcher for FakeLauncher {
 
     async fn system_stopping(&self) -> LaunchResult<bool> {
         Ok(self.lock().system_stopping)
+    }
+
+    fn stop_waiting(&self) {
+        self.lock().stopping = true;
     }
 }

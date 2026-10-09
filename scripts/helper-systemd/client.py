@@ -7,6 +7,12 @@ The script is a JSON list of steps:
   {"send": <request object without id>, "expect": {"result": "..."}}
   {"event": {"event": "...", ...}, "timeout": 30}   wait for a matching event
   {"sleep": 1.5}
+  {"batch": [<request>, ...], "expect": {...}, "save": "<file>"}
+      send every request before reading any response; each response must
+      match "expect" (if given); "save" writes the responses as a JSON list
+      (a connection that breaks leaves null for the unanswered ones)
+  {"events": {"event": "...", ...}, "count": N, "timeout": 30, "ack": true}
+      wait for N matching events
 Matching is by subset: every key in the expectation must equal the
 received value (recursively). Events received while waiting for responses
 are kept for later "event" steps. Exits 1 on the first mismatch.
@@ -31,6 +37,7 @@ class Conn:
         self.s.connect(path)
         self.buf = b""
         self.events = []
+        self.responses = {}
         self.next_id = 1
         self.send({"type": "hello", "protocol_version": 1, "binary_version": "test"})
         hello = self.read(10)
@@ -53,20 +60,33 @@ class Conn:
         line, self.buf = self.buf.split(b"\n", 1)
         return json.loads(line)
 
-    def request(self, req, timeout=60):
+    def send_request(self, req):
         rid = self.next_id
         self.next_id += 1
         self.send({"type": "request", "id": rid, **req})
+        return rid
+
+    def response(self, rid, timeout=60):
+        """The response to request rid, or None if the connection ends."""
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = self.read(max(0.1, deadline - time.time()))
+        while rid not in self.responses:
+            left = deadline - time.time()
+            if left <= 0:
+                raise SystemExit(f"timeout waiting for response {rid}")
+            msg = self.read(left)
             if msg is None:
-                raise SystemExit(f"no response to {req}")
+                return None
             if msg["type"] == "event":
                 self.events.append(msg)
-            elif msg["type"] == "response" and msg["id"] == rid:
-                return msg
-        raise SystemExit(f"timeout waiting for response to {req}")
+            elif msg["type"] == "response":
+                self.responses[msg["id"]] = msg
+        return self.responses.pop(rid)
+
+    def request(self, req, timeout=60):
+        resp = self.response(self.send_request(req), timeout)
+        if resp is None:
+            raise SystemExit(f"no response to {req}")
+        return resp
 
     def wait_event(self, want, timeout):
         deadline = time.time() + timeout
@@ -97,6 +117,27 @@ def main():
             print("event", json.dumps(ev))
             if "ack" in step:
                 conn.request({"op": "ack_events", "up_to": ev["seq"]})
+        elif "batch" in step:
+            ids = [conn.send_request(r) for r in step["batch"]]
+            resps = [conn.response(rid, step.get("timeout", 60)) for rid in ids]
+            for req, resp in zip(step["batch"], resps):
+                print("->", json.dumps(req)[:120], "\n<-", json.dumps(resp))
+            if "save" in step:
+                with open(step["save"], "w") as f:
+                    json.dump(resps, f)
+            if "expect" in step and not all(r is not None and subset(step["expect"], r) for r in resps):
+                raise SystemExit(f"unexpected response, wanted {step['expect']}")
+        elif "events" in step:
+            seen = set()
+            for _ in range(step["count"]):
+                ev = conn.wait_event(step["events"], step.get("timeout", 30))
+                print("event", json.dumps(ev))
+                key = json.dumps({k: v for k, v in ev.items() if k != "seq"}, sort_keys=True)
+                if key in seen:
+                    raise SystemExit(f"event reported twice: {ev}")
+                seen.add(key)
+                if step.get("ack"):
+                    conn.request({"op": "ack_events", "up_to": ev["seq"]})
         elif "sleep" in step:
             time.sleep(step["sleep"])
     print("OK")

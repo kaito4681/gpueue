@@ -28,6 +28,8 @@
 //! reporting of every other checkpoint step.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use puzuz_protocol::helper::{ExitStatus, HelperErrorCode, signal};
@@ -96,6 +98,8 @@ pub struct SystemdLauncher {
     spawn_timeout: Duration,
     job_stop_timeout: Duration,
     proc_root: PathBuf,
+    /// Set by [`Launcher::stop_waiting`].
+    stopping: Arc<AtomicBool>,
 }
 
 type Props<'a> = Vec<(&'a str, Value<'a>)>;
@@ -113,6 +117,7 @@ impl SystemdLauncher {
             spawn_timeout,
             job_stop_timeout,
             proc_root: PathBuf::from("/proc"),
+            stopping: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -207,6 +212,15 @@ impl SystemdLauncher {
     /// "already ended" (and they would then stop the unit just as it
     /// starts). Once the job is `running`, the unit is `activating` or past
     /// it.
+    ///
+    /// While the helper is being stopped or restarted, the start job of a
+    /// job unit stays `waiting` until the helper's stop job is done (job
+    /// units are ordered `Before=` the helper, and systemd runs a stop
+    /// before a start whatever the direction of the ordering). Waiting for
+    /// it would stall the stop until the spawn timeout, so once
+    /// [`Launcher::stop_waiting`] was called a start job that is still
+    /// queued is cancelled and the launch refused with `shutting_down`
+    /// (nothing ran; the daemon offers the job again).
     async fn wait_job_dispatched(&self, unit: &str, job: &OwnedObjectPath) -> LaunchResult<()> {
         const JOB_POLL: Duration = Duration::from_millis(5);
         let deadline = Instant::now() + self.spawn_timeout;
@@ -220,6 +234,9 @@ impl SystemdLauncher {
                 Err(e) if is_job_gone(&e) => return Ok(()),
                 Err(e) => return Err(dbus(e)),
             }
+            if self.stopping.load(Ordering::SeqCst) {
+                return self.cancel_start(unit, job).await;
+            }
             if Instant::now() >= deadline {
                 let _ = self.release(unit).await;
                 return Err(LaunchError::new(
@@ -232,6 +249,27 @@ impl SystemdLauncher {
             }
             tokio::time::sleep(JOB_POLL).await;
         }
+    }
+
+    /// Cancels the queued start job `job` of `unit` (see
+    /// [`Self::wait_job_dispatched`]).
+    async fn cancel_start(&self, unit: &str, job: &OwnedObjectPath) -> LaunchResult<()> {
+        if let Err(e) = self
+            .conn
+            .call_method(Some(DEST), job.as_str(), Some(JOB_IFACE), "Cancel", &())
+            .await
+            && !is_job_gone(&e)
+        {
+            return Err(dbus(e));
+        }
+        // It may have been dispatched just before the cancel.
+        if self.unit_state(unit).await? == UnitState::Running {
+            return Ok(());
+        }
+        Err(LaunchError::new(
+            HelperErrorCode::ShuttingDown,
+            format!("the helper is stopping; {unit} was not started"),
+        ))
     }
 
     fn common_props(&self, description: String) -> Props<'static> {
@@ -515,6 +553,10 @@ impl Launcher for SystemdLauncher {
             .map_err(dbus)?;
         let state = String::try_from(v).map_err(|e| dbus(e.into()))?;
         Ok(state == "stopping")
+    }
+
+    fn stop_waiting(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
     }
 }
 
