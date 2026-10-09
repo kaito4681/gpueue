@@ -1127,40 +1127,38 @@ async fn actions_in_the_spawn_window_wait_for_the_helper() {
     let mut h = Harness::new(0).await;
     h.set_default_parallel(3).await;
     let alice = h.client(ALICE);
-    h.helper.hold_launches();
 
-    let checkpointed = alice.add(&job_request("a", &[])).await;
-    let paused = alice.add(&job_request("b", &[])).await;
-    let killed = alice.add(&job_request("c", &[])).await;
-    for id in [checkpointed, paused, killed] {
+    let mut ids = Vec::new();
+    for (action, body) in [
+        ("checkpoint", json!(null)),
+        ("pause", json!({})),
+        ("kill", json!({})),
+    ] {
+        h.helper.hold_launches();
+        let id = alice.add(&job_request(action, &[])).await;
         alice.wait_state(id, &JobState::Running).await;
-    }
-    h.helper.wait_held(3).await;
+        h.helper.wait_held(1).await;
+        let reply = send_action(&alice, id, action, body);
+        // Nothing reaches the helper (or the database) before the spawn is
+        // answered.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!reply.is_finished(), "{action}");
+        assert_eq!(alice.job(id).await.state, JobState::Running, "{action}");
+        assert!(h.helper.signals().iter().all(|(job, _)| *job != id));
 
-    let checkpoint = send_action(&alice, checkpointed, "checkpoint", json!(null));
-    let pause = send_action(&alice, paused, "pause", json!({}));
-    let kill = send_action(&alice, killed, "kill", json!({}));
-    // Nothing reaches the helper (or the database) before the spawns are
-    // answered.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!checkpoint.is_finished());
-    assert!(!pause.is_finished());
-    assert!(!kill.is_finished());
-    for id in [checkpointed, paused, killed] {
-        assert_eq!(alice.job(id).await.state, JobState::Running);
-    }
-    assert!(h.helper.signals().is_empty());
-
-    h.helper.release_launches();
-    for (reply, what) in [(checkpoint, "checkpoint"), (pause, "pause"), (kill, "kill")] {
+        h.helper.release_launches();
         let reply = reply.await.unwrap();
         assert_eq!(
             reply.status,
             StatusCode::OK,
-            "{what}: {}",
+            "{action}: {}",
             String::from_utf8_lossy(&reply.body)
         );
+        ids.push(id);
     }
+    let [checkpointed, paused, killed] = ids[..] else {
+        unreachable!()
+    };
     let job = alice
         .wait_state(checkpointed, &JobState::Checkpointed)
         .await;

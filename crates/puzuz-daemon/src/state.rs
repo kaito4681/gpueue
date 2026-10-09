@@ -1185,18 +1185,10 @@ impl Core {
                 Ok(launched)
             })
             .await?;
-        // Each launch runs on its own, so one slow helper answer does not
-        // hold up the other launches or the next scheduling round. They
-        // stop with the daemon; a request dropped unanswered is settled
-        // by the next reconciliation.
+        // One at a time: concurrent spawns make the real helper fail or
+        // stall them (seen in scripts/e2e-test.sh).
         for (job, effects) in launched {
-            let core = self.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = core.cancel.cancelled() => {}
-                    _ = core.run_effects(&job, &effects) => {}
-                }
-            });
+            let _ = self.run_effects(&job, &effects).await;
         }
         Ok(())
     }
