@@ -15,7 +15,11 @@ path = "src/main.rs"
 puzuz-core.workspace = true
 puzuz-protocol.workspace = true
 puzuz-daemon.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env", "wrap_help"] }
+clap_complete.workspace = true
+clap_complete_nushell.workspace = true
+chrono.workspace = true
+interim.workspace = true
 
 [lints]
 workspace = true
