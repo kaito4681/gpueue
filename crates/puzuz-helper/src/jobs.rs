@@ -136,6 +136,11 @@ pub enum StartReport {
     Started {
         /// The job's PID inside its namespace.
         ns_pid: u32,
+        /// The init's PID in the host namespace (read before `/proc` is
+        /// remounted). Only used when the job is already over by the time
+        /// the helper looks for the init.
+        #[serde(default)]
+        init_host_pid: u32,
     },
     Failed {
         kind: StartFailure,

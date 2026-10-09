@@ -1,0 +1,44 @@
+[Unit]
+Description=puzuz root helper (runs, checkpoints and restores puzuz jobs)
+Documentation=https://github.com/kaito4681/puzuz
+# Units are stopped in the reverse order of starting. Being After= the
+# filesystems, D-Bus and the NVIDIA services means the helper is stopped -
+# and dumps every running job - while they are still available.
+# Job units (puzuz-job-<id>.service) are created with
+# Before=puzuz-helper.service, so they are stopped only after the helper
+# has finished its dumps.
+After=local-fs.target remote-fs.target dbus.service systemd-tmpfiles-setup.service
+After=nvidia-persistenced.service nvidia-fabricmanager.service
+Requires=dbus.service
+RequiresMountsFor=/var/lib/puzuz
+
+[Service]
+# READY=1 is sent once jobs are re-discovered and the socket is bound.
+Type=notify
+ExecStart=/usr/bin/puzuz-helper serve
+# On SIGTERM the helper asks systemd whether the whole system is stopping
+# (SystemState=stopping). Only then does it refuse new spawns/restores, dump
+# every running job one by one (except --no-checkpoint jobs, which systemd
+# stops after the helper) and write <checkpoint dir>/shutdown-manifest.json.
+# A plain `systemctl stop/restart puzuz-helper` (e.g. an upgrade) leaves the
+# jobs running; the next helper re-discovers them. A second SIGTERM makes
+# the helper exit at once.
+# KillMode=mixed: only the helper itself gets SIGTERM; criu and
+# cuda-checkpoint children in the middle of a dump are not interrupted.
+KillMode=mixed
+# Upper bound for dumping everything. The helper additionally extends the
+# timeout with EXTEND_TIMEOUT_USEC before each job, so this mostly matters
+# for systemd versions without that. Size it for your jobs: a dump writes
+# roughly RSS + VRAM per job (PoC: 7 GB of VRAM in ~11 s; a 16 GB job takes
+# 20-30 s on an NVMe disk) and jobs are dumped sequentially.
+TimeoutStopSec=30min
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+# Jobs run in their own units, so restarting the helper does not touch
+# them; it re-discovers them on start.
+# No mount sandboxing (ProtectSystem=, PrivateTmp=, ...): the helper
+# bind-mounts / for `criu restore --root` and must see the host's mounts.
+
+[Install]
+WantedBy=multi-user.target

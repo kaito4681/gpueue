@@ -1,0 +1,40 @@
+[Unit]
+Description=puzuz job queue daemon
+Documentation=https://github.com/kaito4681/puzuz
+# The daemon talks to the helper; it is started after it and therefore
+# stopped before it. Stopping the daemon never stops jobs.
+After=network.target puzuz-helper.service systemd-tmpfiles-setup.service
+Wants=puzuz-helper.service
+
+[Service]
+Type=exec
+User=puzuz
+Group=puzuz
+ExecStart=/usr/bin/puzuz daemon
+KillMode=mixed
+TimeoutStopSec=60s
+Restart=on-failure
+RestartSec=2s
+UMask=0007
+
+# The daemon is unprivileged and needs no privileges at all.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# Its own state, the job logs (group puzuz, see tmpfiles.d/puzuz.conf) and
+# the sockets.
+ReadWritePaths=/var/lib/puzuz/daemon /var/lib/puzuz/logs /run/puzuz
+
+[Install]
+WantedBy=multi-user.target

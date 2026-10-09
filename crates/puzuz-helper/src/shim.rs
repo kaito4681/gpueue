@@ -198,7 +198,7 @@ fn outer(files: &JobFiles) -> Result<i32, Failure> {
 pub fn run_init(job_dir: PathBuf) -> i32 {
     let files = JobFiles::from_dir(job_dir);
     let mut start = match OpenOptions::new().write(true).open(files.start()) {
-        Ok(f) => f,
+        Ok(f) => Some(f),
         Err(e) => {
             return fail(
                 &files,
@@ -209,13 +209,21 @@ pub fn run_init(job_dir: PathBuf) -> i32 {
     };
     match init(&files, &mut start) {
         Ok(code) => code,
-        Err(f) => fail(&files, Some(&mut start), f),
+        Err(f) => fail(&files, start.as_mut(), f),
     }
 }
 
-fn init(files: &JobFiles, start: &mut File) -> Result<i32, Failure> {
+/// `start` is closed once the job runs: only `exit-status` may stay open in
+/// the dumped tree (CRIU reopens open files by path on restore and checks
+/// their size).
+fn init(files: &JobFiles, start: &mut Option<File>) -> Result<i32, Failure> {
     let sfd = signal_fd().map_err(|e| Failure::other(format!("signalfd: {e}")))?;
     nix::unistd::setsid().map_err(|e| Failure::other(format!("setsid: {e}")))?;
+    // Still the host's /proc: its `self` link names our host PID.
+    let init_host_pid = std::fs::read_link("/proc/self")
+        .ok()
+        .and_then(|p| p.to_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
     let spec: ShimSpec = std::fs::read(files.spec())
         .and_then(|b| serde_json::from_slice(&b).map_err(io::Error::from))
         .map_err(|e| Failure::other(format!("reading {}: {e}", files.spec().display())))?;
@@ -252,8 +260,21 @@ fn init(files: &JobFiles, start: &mut File) -> Result<i32, Failure> {
         .spawn()
         .map_err(|e| Failure::other(format!("running {program}: {e}")))?;
     let job = Pid::from_raw(child.id() as i32);
-    if let Err(e) = write_report(start, &StartReport::Started { ns_pid: child.id() }) {
+    let report = StartReport::Started {
+        ns_pid: child.id(),
+        init_host_pid,
+    };
+    if let Some(mut file) = start.take()
+        && let Err(e) = write_report(&mut file, &report)
+    {
         eprintln!("puzuz shim: writing the start report: {e}");
+    }
+    // Our stdout/stderr are the unit's journal socket, which CRIU cannot
+    // dump ("External socket is used"); the init is part of the dumped
+    // tree, so let go of it. Later problems surface through the files.
+    if let Ok(null) = OpenOptions::new().write(true).open("/dev/null") {
+        let _ = nix::unistd::dup2_stdout(&null);
+        let _ = nix::unistd::dup2_stderr(&null);
     }
 
     let mut status = None;

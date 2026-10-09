@@ -210,18 +210,20 @@ impl SystemdLauncher {
         let unit = spec.unit.as_str();
         loop {
             match spec.files.read_start() {
-                Some(StartReport::Started { .. }) => {
-                    // The init is the shim's only child and exists before
-                    // it reports success.
-                    return self
-                        .init_pid(unit, UnitKind::Spawned)
-                        .await?
-                        .ok_or_else(|| {
-                            LaunchError::new(
-                                HelperErrorCode::SpawnFailed,
-                                format!("{unit}: the job started but its init is gone"),
-                            )
-                        });
+                Some(StartReport::Started { init_host_pid, .. }) => {
+                    // The init is the shim's only child. A very short job
+                    // may already be over; its exit status is in the files
+                    // and the monitor reports it.
+                    if let Some(pid) = self.init_pid(unit, UnitKind::Spawned).await? {
+                        return Ok(pid);
+                    }
+                    if init_host_pid != 0 {
+                        return Ok(init_host_pid);
+                    }
+                    return Err(LaunchError::new(
+                        HelperErrorCode::SpawnFailed,
+                        format!("{unit}: the job started but its init is gone"),
+                    ));
                 }
                 Some(StartReport::Failed { kind, message }) => {
                     let code = match kind {
