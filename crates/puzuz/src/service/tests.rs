@@ -501,9 +501,11 @@ fn config_template_documents_every_key_and_parses_to_the_defaults() {
     let mut parsed = Config::parse(&uncommented).unwrap();
     let default = Config::default();
     assert_eq!(parsed.state_db_path(), default.state_db_path());
+    assert_eq!(parsed.helper_state_dir(), default.helper_state_dir());
     assert_eq!(parsed.logs_dir(), default.logs_dir());
     assert_eq!(parsed.checkpoints_dir(), default.checkpoints_dir());
     parsed.state_db = None;
+    parsed.helper_state_dir = None;
     parsed.logs_dir = None;
     parsed.checkpoints_dir = None;
     assert_eq!(parsed, default);

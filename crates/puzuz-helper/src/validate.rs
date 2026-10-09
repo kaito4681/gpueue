@@ -122,29 +122,9 @@ pub fn check_spawn<H: HostProbe + ?Sized>(
     Ok(creds)
 }
 
-/// Every existing ancestor of `path` (and `path` itself, if it exists) must
-/// be owned by root and not writable by group or others, otherwise a less
-/// privileged user could redirect what root writes there.
-pub fn check_root_owned_path(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    for p in path.ancestors() {
-        let meta = match std::fs::symlink_metadata(p) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("{}: {e}", p.display())),
-        };
-        if meta.file_type().is_symlink() {
-            return Err(format!("{} is a symlink", p.display()));
-        }
-        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
-            return Err(format!(
-                "{} must be owned by root and not group/world-writable",
-                p.display()
-            ));
-        }
-    }
-    Ok(())
-}
+/// Every existing ancestor of a path must be owned by root and not writable
+/// by group or others (shared with the configuration loader).
+pub use puzuz_config::trust::check_root_owned_path;
 
 /// The image directory must be exactly `<base>/<job id>`; the daemon cannot
 /// point the helper anywhere else.

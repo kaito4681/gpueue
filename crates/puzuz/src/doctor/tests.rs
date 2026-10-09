@@ -239,6 +239,46 @@ fn config_problems() {
 }
 
 #[test]
+fn config_the_helper_would_refuse_fails() {
+    let (sys, _sockets) = healthy();
+    let file = sys.path(Path::new("/etc/puzuz/config.toml"));
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o664)).unwrap();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "config"), Level::Fail);
+    assert!(message(&report, "config").contains("helper refuses"));
+    assert!(hint(&report, "config").contains("chmod go-w /etc/puzuz/config.toml"));
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let dir = sys.path(Path::new("/etc/puzuz"));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "config"), Level::Fail);
+    assert!(message(&report, "config").starts_with("/etc/puzuz is"));
+}
+
+#[test]
+fn helper_settings_come_from_the_config_unless_flags_override_them() {
+    let (sys, _sockets) = healthy();
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!("cuda_checkpoint_mode = \"plugin\"\ncheckpoints_dir = \"/ckpt\"\n{CONFIG}"),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "helper settings"), Level::Info);
+    let shown = message(&report, "helper settings");
+    assert!(shown.contains("cuda mode plugin"), "{shown}");
+    assert!(shown.contains("checkpoints /ckpt"), "{shown}");
+
+    sys.write(
+        "/etc/systemd/system/puzuz-helper.service",
+        "[Service]\nExecStart=/usr/bin/puzuz-helper serve --criu /opt/criu --cuda-mode=manual\n",
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "helper settings"), Level::Warn);
+    assert!(message(&report, "helper settings").contains("--criu --cuda-mode"));
+}
+
+#[test]
 fn kernel_checks() {
     let (sys, _sockets) = healthy();
     sys.write("/proc/sys/kernel/osrelease", "5.4.0\n");

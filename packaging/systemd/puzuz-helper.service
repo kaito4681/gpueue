@@ -15,6 +15,9 @@ RequiresMountsFor=/var/lib/puzuz
 [Service]
 # READY=1 is sent once jobs are re-discovered and the socket is bound.
 Type=notify
+# Settings come from /etc/puzuz/config.toml (shared with the daemon), which
+# must be owned by root. Flags (`puzuz-helper serve --help`) override it;
+# prefer the file so that `puzuz doctor` reports what the helper uses.
 ExecStart=/usr/bin/puzuz-helper serve
 # On SIGTERM the helper asks systemd whether the whole system is stopping
 # (SystemState=stopping). Only then does it refuse new spawns/restores, dump

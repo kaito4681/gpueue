@@ -1157,6 +1157,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "puzuz-config"
+version = "0.1.0"
+dependencies = [
+ "puzuz-protocol",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+]
+
+[[package]]
 name = "puzuz-core"
 version = "0.1.0"
 dependencies = [
@@ -1178,6 +1189,7 @@ dependencies = [
  "hyper-util",
  "nix",
  "nvml-wrapper",
+ "puzuz-config",
  "puzuz-core",
  "puzuz-protocol",
  "serde",
@@ -1186,7 +1198,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
- "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1198,6 +1209,7 @@ dependencies = [
  "clap",
  "nix",
  "puzuz-checkpoint",
+ "puzuz-config",
  "puzuz-protocol",
  "rustix",
  "serde",

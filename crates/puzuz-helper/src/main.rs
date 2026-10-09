@@ -8,9 +8,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use puzuz_checkpoint::{CudaMode, Executor, SystemExecutor};
-use puzuz_helper::config::{
-    DEFAULT_CHECKPOINT_BASE, DEFAULT_CRIU_ROOT, DEFAULT_LOG_BASE, DEFAULT_STATE_DIR,
-};
+use puzuz_config::DEFAULT_CONFIG_PATH;
+use puzuz_helper::config::{Overrides, Resolved};
 use puzuz_helper::host::SystemHost;
 use puzuz_helper::launcher::Launcher;
 use puzuz_helper::launcher::systemd::SystemdLauncher;
@@ -58,35 +57,51 @@ enum ModeArg {
     Manual,
 }
 
+/// Flags of `serve`. Every setting except `--config` defaults to the
+/// shared configuration file, whose missing keys take the built-in defaults.
 #[derive(Debug, clap::Args)]
 struct ServeArgs {
-    #[arg(long, default_value = puzuz_protocol::helper::DEFAULT_SOCKET_PATH)]
-    socket: PathBuf,
-    /// The only user allowed to connect (the daemon's system user).
-    #[arg(long, default_value = "puzuz")]
-    daemon_user: String,
-    #[arg(long, default_value = DEFAULT_STATE_DIR)]
-    state_dir: PathBuf,
-    #[arg(long, default_value = DEFAULT_CHECKPOINT_BASE)]
-    checkpoint_dir: PathBuf,
-    #[arg(long, default_value = DEFAULT_LOG_BASE)]
-    log_dir: PathBuf,
+    /// The configuration file shared with the daemon. It must be owned by
+    /// root and not group/world-writable (and so must its directories).
+    #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
+    /// [config: helper_socket]
+    #[arg(long)]
+    socket: Option<PathBuf>,
+    /// The only user allowed to connect. [config: daemon_user]
+    #[arg(long)]
+    daemon_user: Option<String>,
+    /// [config: helper_state_dir, default <data_dir>/helper]
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// [config: checkpoints_dir, default <data_dir>/checkpoints]
+    #[arg(long)]
+    checkpoint_dir: Option<PathBuf>,
+    /// [config: logs_dir, default <data_dir>/logs]
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
     /// Bind mount of `/` for `criu restore --root`; empty disables it.
-    #[arg(long, default_value = DEFAULT_CRIU_ROOT)]
-    criu_root: PathBuf,
+    /// [default: /run/puzuz-helper/criu-root]
+    #[arg(long)]
+    criu_root: Option<PathBuf>,
     /// `manual`: the helper calls cuda-checkpoint around criu (works with
     /// the distribution's criu). `plugin`: CRIU's CUDA plugin does it.
-    #[arg(long, value_enum, default_value = "manual")]
-    cuda_mode: ModeArg,
-    #[arg(long, default_value = "criu")]
-    criu: PathBuf,
-    #[arg(long, default_value = "cuda-checkpoint")]
-    cuda_checkpoint: PathBuf,
-    #[arg(long, default_value = "nvidia-smi")]
-    nvidia_smi: PathBuf,
+    /// [config: cuda_checkpoint_mode]
+    #[arg(long, value_enum)]
+    cuda_mode: Option<ModeArg>,
+    /// [config: criu_path]
+    #[arg(long)]
+    criu: Option<PathBuf>,
+    /// [config: cuda_checkpoint_path]
+    #[arg(long)]
+    cuda_checkpoint: Option<PathBuf>,
+    /// [config: nvidia_smi_path]
+    #[arg(long)]
+    nvidia_smi: Option<PathBuf>,
     /// Seconds systemd waits between SIGTERM and SIGKILL when stopping a job.
-    #[arg(long, default_value_t = 30)]
-    job_stop_timeout: u64,
+    /// [config: grace_secs]
+    #[arg(long)]
+    job_stop_timeout: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -107,29 +122,52 @@ fn main() -> ExitCode {
     ExitCode::from(u8::try_from(code & 0xff).unwrap_or(1))
 }
 
+/// Flag > `config.toml` > built-in default.
 fn config(args: ServeArgs) -> Result<HelperConfig, String> {
-    let user = nix::unistd::User::from_name(&args.daemon_user)
-        .map_err(|e| format!("looking up {}: {e}", args.daemon_user))?
-        .ok_or_else(|| format!("user {} does not exist", args.daemon_user))?;
-    let mut cfg = HelperConfig {
-        socket_path: args.socket,
-        daemon_uid: user.uid.as_raw(),
-        daemon_gid: user.gid.as_raw(),
+    let file = puzuz_config::Config::load_trusted(&args.config).map_err(|e| e.to_string())?;
+    let overrides = Overrides {
+        socket: args.socket,
+        daemon_user: args.daemon_user,
         state_dir: args.state_dir,
-        checkpoint_base: args.checkpoint_dir,
-        log_base: args.log_dir,
-        criu_root: (!args.criu_root.as_os_str().is_empty()).then_some(args.criu_root),
+        checkpoint_dir: args.checkpoint_dir,
+        log_dir: args.log_dir,
+        criu_root: args.criu_root,
+        cuda_mode: args.cuda_mode.map(|mode| match mode {
+            ModeArg::Plugin => CudaMode::Plugin,
+            ModeArg::Manual => CudaMode::Manual,
+        }),
+        criu: args.criu,
+        cuda_checkpoint: args.cuda_checkpoint,
         nvidia_smi: args.nvidia_smi,
-        job_stop_timeout: Duration::from_secs(args.job_stop_timeout),
-        helper_exe: std::env::current_exe().map_err(|e| format!("locating myself: {e}"))?,
-        ..HelperConfig::default()
+        job_stop_timeout: args.job_stop_timeout.map(Duration::from_secs),
     };
-    cfg.checkpoint.mode = match args.cuda_mode {
-        ModeArg::Plugin => CudaMode::Plugin,
-        ModeArg::Manual => CudaMode::Manual,
-    };
-    cfg.checkpoint.criu.criu_path = args.criu;
-    cfg.checkpoint.cuda.path = args.cuda_checkpoint;
+    let Resolved {
+        config: mut cfg,
+        daemon_user,
+    } = HelperConfig::resolve(&file, overrides);
+    let user = nix::unistd::User::from_name(&daemon_user)
+        .map_err(|e| format!("looking up {daemon_user}: {e}"))?
+        .ok_or_else(|| format!("user {daemon_user} does not exist"))?;
+    if user.uid.is_root() {
+        return Err(format!("the daemon user {daemon_user} must not be root"));
+    }
+    cfg.daemon_uid = user.uid.as_raw();
+    cfg.daemon_gid = user.gid.as_raw();
+    cfg.helper_exe = std::env::current_exe().map_err(|e| format!("locating myself: {e}"))?;
+    eprintln!(
+        "puzuz-helper: config {}; daemon user {daemon_user}; socket {}; checkpoints {}; \
+         logs {}; cuda mode {}; criu {}; cuda-checkpoint {}",
+        args.config.display(),
+        cfg.socket_path.display(),
+        cfg.checkpoint_base.display(),
+        cfg.log_base.display(),
+        match cfg.checkpoint.mode {
+            CudaMode::Plugin => "plugin",
+            CudaMode::Manual => "manual",
+        },
+        cfg.checkpoint.criu.criu_path.display(),
+        cfg.checkpoint.cuda.path.display(),
+    );
     Ok(cfg)
 }
 
@@ -139,12 +177,8 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
         return Err("must run as root".into());
     }
     let cfg = config(args)?;
-    let mut must_be_root_owned = vec![&cfg.state_dir, &cfg.checkpoint_base, &cfg.log_base];
-    if let Some(root) = &cfg.criu_root {
-        must_be_root_owned.push(root);
-    }
-    for dir in must_be_root_owned {
-        puzuz_helper::validate::check_root_owned_path(dir)?;
+    for path in cfg.paths_to_check() {
+        puzuz_helper::validate::check_root_owned_path(path)?;
     }
     if cfg.checkpoint.mode == CudaMode::Manual {
         std::fs::create_dir_all(&cfg.checkpoint.criu.empty_plugin_dir)
