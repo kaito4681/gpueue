@@ -2,7 +2,8 @@
 
 - Code, comments, docs and commit messages are written in English.
 - Run tests inside Docker: `scripts/test-in-docker.sh` (defaults to `cargo test --workspace`;
-  pass other cargo arguments to run e.g. `clippy --workspace --all-targets`).
+  pass other cargo arguments, e.g. `clippy --workspace --all-targets` or `fmt --all`;
+  the toolchain image is built from `docker/test.Dockerfile`).
 - Workspace layout:
   - `crates/puzuz` — the `puzuz` binary (pueue-compatible CLI, `puzuz daemon` entry point)
   - `crates/puzuz-core` — domain model, scheduling decisions, authorization, SQLite storage

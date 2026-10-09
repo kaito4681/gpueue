@@ -93,9 +93,13 @@ pub struct Job {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum JobState {
     /// Waiting for a free slot (group parallelism and GPUs).
-    Queued { enqueued_at: Timestamp },
+    Queued {
+        enqueued_at: Timestamp,
+    },
     /// Held back until explicitly enqueued, optionally at a given time.
-    Stashed { enqueue_at: Option<Timestamp> },
+    Stashed {
+        enqueue_at: Option<Timestamp>,
+    },
     Running,
     Paused,
     /// A checkpoint is being written.
@@ -103,10 +107,14 @@ pub enum JobState {
     /// Saved to disk and stopped; resumed with `restore`.
     Checkpointed,
     /// Waiting for a free slot to be restored from its checkpoint.
-    RestoreQueued { enqueued_at: Timestamp },
+    RestoreQueued {
+        enqueued_at: Timestamp,
+    },
     /// A checkpoint is being restored.
     Restoring,
-    Done { result: JobResult },
+    Done {
+        result: JobResult,
+    },
 }
 
 impl JobState {
@@ -138,13 +146,19 @@ impl JobState {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum JobResult {
     Success,
-    Failed { exit_code: i32 },
-    FailedToSpawn { reason: String },
+    Failed {
+        exit_code: i32,
+    },
+    FailedToSpawn {
+        reason: String,
+    },
     Killed,
     /// A dependency did not finish successfully.
     DependencyFailed,
     /// Checkpointing failed, so the job was terminated instead.
-    CheckpointFailed { reason: String },
+    CheckpointFailed {
+        reason: String,
+    },
     /// The job disappeared while the daemon was not watching it.
     Lost,
 }

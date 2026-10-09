@@ -3,8 +3,13 @@
 # Usage: scripts/test-in-docker.sh [cargo args...]   (default: test --workspace)
 set -euo pipefail
 
-image="${PUZUZ_TEST_IMAGE:-rust:1.98.1-bookworm}"
+image="${PUZUZ_TEST_IMAGE:-puzuz-test:1.98.1}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Build the toolchain image (rust + clippy + rustfmt) on first use.
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+    docker build -q -t "$image" -f "$root/docker/test.Dockerfile" "$root/docker" >/dev/null
+fi
 
 if [ "$#" -eq 0 ]; then
     set -- test --workspace
