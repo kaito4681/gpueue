@@ -568,6 +568,16 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
         (Event::CheckpointSucceeded, JobState::Checkpointing) => {
             Transition::to(JobState::Checkpointed)
         }
+        // On an OS shutdown the helper dumps running jobs on its own after
+        // the daemon has stopped; the next daemon gets the replayed event.
+        (Event::CheckpointSucceeded, JobState::Running | JobState::Paused) => {
+            Transition::to(JobState::Checkpointed)
+        }
+        // A failed shutdown dump leaves the job running until systemd stops
+        // it; its exit (or `Lost`) follows.
+        (Event::CheckpointFailed { .. }, JobState::Running | JobState::Paused) => {
+            Transition::unchanged()
+        }
         // CRIU leaves the process running when a dump fails; stop it, giving
         // it a chance to save its own checkpoint on SIGTERM.
         (Event::CheckpointFailed { reason }, JobState::Checkpointing) => {
@@ -1166,7 +1176,26 @@ mod tests {
             t.effects,
             vec![Effect::Terminate, Effect::DeleteCheckpointImage]
         );
-        assert!(on_event(&job(1, JobState::Running), &Event::CheckpointSucceeded).is_err());
+        assert!(on_event(&job(1, JobState::Checkpointed), &Event::CheckpointSucceeded).is_err());
+    }
+
+    #[test]
+    fn shutdown_dump_by_the_helper() {
+        // The helper dumped a running job while the daemon was down.
+        for state in [JobState::Running, JobState::Paused] {
+            let t = on_event(&job(1, state.clone()), &Event::CheckpointSucceeded).unwrap();
+            assert_eq!(t.next, Some(JobState::Checkpointed));
+            assert!(t.effects.is_empty());
+            let t = on_event(
+                &job(1, state),
+                &Event::CheckpointFailed {
+                    reason: "x".to_owned(),
+                },
+            )
+            .unwrap();
+            assert_eq!(t.next, None);
+            assert!(t.effects.is_empty());
+        }
     }
 
     #[test]
