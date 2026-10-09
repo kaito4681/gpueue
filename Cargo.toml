@@ -27,9 +27,19 @@ interim = { version = "0.2", features = ["chrono_0_4"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
 rustix = { version = "1", features = ["fs"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+comfy-table = "7"
+nix = { version = "0.30", features = ["user", "sched", "mount", "signal", "process", "fs"] }
+axum = "0.8"
+futures = "0.3"
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
-nix = { version = "0.30", features = ["sched", "mount", "user", "signal", "process", "fs"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

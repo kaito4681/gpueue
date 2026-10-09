@@ -10,8 +10,9 @@
 //! - `send` is parsed but always fails: jobs run with stdin connected to `/dev/null`.
 //! - `edit` and `env` are parsed but not implemented yet.
 //! - `shutdown` checkpoints all jobs before stopping (`--no-checkpoint` kills them instead).
-//! - `status` query arguments are accepted verbatim; the query language is evaluated later by
-//!   the status command (see [`SubCommand::Status`]).
+//! - `status` accepts pueue's query language plus the puzuz columns `owner` and `gpu` and the
+//!   checkpoint states (see `crate::query`). `status --json` prints puzuz's own schema
+//!   (`{"groups": [...], "jobs": [...]}`), not pueue's state dump.
 //! - puzuz extensions: `add --gpu/--no-checkpoint`, `checkpoint`, `restore`, `gpu`, `daemon`,
 //!   `service` and `doctor`.
 
@@ -54,7 +55,8 @@ Syntax:
 
 where:
   - column_selection := `columns=[column]([column],)*`
-  - column := `id | status | command | label | path | enqueue_at | dependencies | start | end`
+  - column := `id | status | priority | command | label | path | enqueue_at | dependencies |
+    owner | gpu | start | end`
   - filter := `[filter_column] [filter_op] [filter_value]`
   - filter_column := `status | command | label | start | end | enqueue_at`
   - filter_op := `= | != | < | > | %=`   (`%=` means \"contains\")
@@ -62,11 +64,12 @@ where:
   - limit := `[first | last]? [count]`
 
 Filter columns:
-  - `status` supports `=` and `!=` with values like `queued`, `stashed`, `paused`, `running`,
-    `success`, `failed`
-  - `command` and `label` support `=`, `!=` and `%=` with arbitrary text
+  - `status` supports `=` and `!=` with `queued`, `stashed`, `paused`, `running`, `success`,
+    `failed`, `done`, `checkpointing`, `checkpointed`, `restore_queued`, `restoring` and
+    `terminating`
+  - `command` and `label` support `=`, `!=` and `%=`; the value is the rest of the query
   - `start`, `end` and `enqueue_at` support `=`, `!=`, `<` and `>` with `YYYY-MM-DD`,
-    `HH:mm[:ss]` or `YYYY-MM-DDHH:mm:ss` (no separator between date and time)
+    `HH:mm[:ss]` or `YYYY-MM-DD[ |T]HH:mm[:ss]`
 
 Examples:
   - `status=running`
@@ -606,13 +609,15 @@ pub enum SubCommand {
         #[arg(long, value_hint = ValueHint::FilePath, default_value = "/etc/puzuz/config.toml")]
         config: PathBuf,
 
-        /// Directory for the state database and job logs.
-        #[arg(long, value_hint = ValueHint::DirPath, default_value = "/var/lib/puzuz")]
-        data_dir: PathBuf,
+        /// Directory for the state database and job logs [default: from the config file,
+        /// /var/lib/puzuz].
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        data_dir: Option<PathBuf>,
 
-        /// Socket of the root helper.
-        #[arg(long, value_hint = ValueHint::FilePath, default_value = "/run/puzuz/helper.sock")]
-        helper_socket: PathBuf,
+        /// Socket of the root helper [default: from the config file,
+        /// /run/puzuz/helper.sock].
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        helper_socket: Option<PathBuf>,
     },
 
     /// (puzuz) Install, uninstall or inspect the systemd services.

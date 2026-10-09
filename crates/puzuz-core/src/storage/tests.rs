@@ -818,3 +818,62 @@ fn corrupt_state_data_is_reported() {
         StorageError::Corrupt(_)
     ));
 }
+
+// ----- switch -----
+
+#[test]
+fn swap_job_ids_moves_every_row_and_dependency() {
+    let mut store = Store::open_in_memory().unwrap();
+    let a = store
+        .insert_job(Uid(1000), &full_spec(), &queued(1), 1)
+        .unwrap();
+    let b = store
+        .insert_job(Uid(1001), &spec("b"), &queued(2), 2)
+        .unwrap();
+    let mut dependant_spec = spec("c");
+    dependant_spec.dependencies = vec![a.id];
+    let c = store
+        .insert_job(Uid(1000), &dependant_spec, &queued(3), 3)
+        .unwrap();
+    store
+        .put_checkpoint(&CheckpointRecord {
+            job_id: a.id,
+            path: PathBuf::from("/ckpt/a"),
+            size_bytes: None,
+            gpu_model: None,
+            driver_version: None,
+            created_at: 5,
+            status: CheckpointStatus::Complete,
+            failure_reason: None,
+        })
+        .unwrap();
+
+    store.transaction(|tx| tx.swap_job_ids(a.id, b.id)).unwrap();
+
+    let new_a = store.get_job(b.id).unwrap().unwrap();
+    assert_eq!(new_a.owner, a.owner);
+    assert_eq!(new_a.spec, a.spec);
+    assert_eq!(new_a.created_at, a.created_at);
+    let new_b = store.get_job(a.id).unwrap().unwrap();
+    assert_eq!(new_b.spec, b.spec);
+    assert_eq!(
+        store.get_job(c.id).unwrap().unwrap().spec.dependencies,
+        vec![b.id]
+    );
+    assert_eq!(
+        store.get_checkpoint(b.id).unwrap().unwrap().path,
+        PathBuf::from("/ckpt/a")
+    );
+    assert!(store.get_checkpoint(a.id).unwrap().is_none());
+    // The counter was only borrowed.
+    assert_eq!(store.next_job_id().unwrap(), JobId(3));
+
+    // Outside an explicit transaction, too.
+    store.swap_job_ids(a.id, b.id).unwrap();
+    assert_eq!(store.get_job(a.id).unwrap().unwrap().spec, a.spec);
+
+    assert_domain(
+        store.swap_job_ids(a.id, JobId(99)).unwrap_err(),
+        Error::JobNotFound(JobId(99)),
+    );
+}

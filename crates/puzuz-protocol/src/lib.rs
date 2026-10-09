@@ -4,11 +4,16 @@
 //! - [`helper`]: daemon ⇄ helper, newline-delimited JSON over one persistent
 //!   Unix socket connection.
 //!
-//! This crate only defines types and pure encoding helpers; it performs no
-//! I/O. Networking code (the HTTP client) will live behind the `client`
-//! feature so that the root helper can depend on the types alone.
+//! - [`client`] (feature `client`): async HTTP client of the daemon API, used
+//!   by the CLI.
+//!
+//! Without the `client` feature this crate only defines types and pure
+//! encoding helpers and performs no I/O, so the root helper can depend on the
+//! types alone.
 
 pub mod api;
+#[cfg(feature = "client")]
+pub mod client;
 pub mod helper;
 
 /// Version of the puzuz binaries this crate was built with.

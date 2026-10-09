@@ -982,8 +982,8 @@ fn daemon_defaults_and_overrides() {
         cmd(&["daemon"]),
         SubCommand::Daemon {
             config: PathBuf::from("/etc/puzuz/config.toml"),
-            data_dir: PathBuf::from("/var/lib/puzuz"),
-            helper_socket: PathBuf::from("/run/puzuz/helper.sock"),
+            data_dir: None,
+            helper_socket: None,
         }
     );
     let cli = parse(&[
@@ -1002,8 +1002,8 @@ fn daemon_defaults_and_overrides() {
         cli.subcommand(),
         SubCommand::Daemon {
             config: PathBuf::from("/tmp/t/config.toml"),
-            data_dir: PathBuf::from("/tmp/t/data"),
-            helper_socket: PathBuf::from("/tmp/t/helper.sock"),
+            data_dir: Some(PathBuf::from("/tmp/t/data")),
+            helper_socket: Some(PathBuf::from("/tmp/t/helper.sock")),
         }
     );
     // puzuz never daemonizes itself.

@@ -13,13 +13,24 @@ path = "src/main.rs"
 
 [dependencies]
 puzuz-core.workspace = true
-puzuz-protocol.workspace = true
+puzuz-protocol = { workspace = true, features = ["client"] }
 puzuz-daemon.workspace = true
 clap = { workspace = true, features = ["env", "wrap_help"] }
 clap_complete.workspace = true
 clap_complete_nushell.workspace = true
 chrono.workspace = true
 interim.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+comfy-table.workspace = true
+nix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
 
 [lints]
 workspace = true
