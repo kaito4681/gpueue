@@ -37,7 +37,7 @@ use puzuz_protocol::helper::{
     self as hp, CheckpointOptions, CheckpointOutcome, HelperErrorCode, RestoreOutcome,
     RestoreRequest, RunningJob, SpawnRequest, signal,
 };
-use tokio::sync::{Notify, broadcast, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
@@ -235,6 +235,9 @@ pub fn targets_live_process(effect: &Effect) -> bool {
 /// restore request (the helper client gives up on a request after 60 s).
 const LAUNCH_WAIT: Duration = Duration::from_secs(75);
 
+/// Spawn/restore requests the scheduler has outstanding at most.
+const MAX_CONCURRENT_LAUNCHES: usize = 8;
+
 /// A pre-transition hook for [`Core::handle_event`] that does nothing.
 pub fn no_pre(_: &dyn StoreOps, _: &Job) -> Result<(), StorageError> {
     Ok(())
@@ -267,6 +270,11 @@ pub struct Core {
     orphans: Mutex<BTreeSet<JobId>>,
     /// Spawn and restore requests the helper has not answered yet.
     launches: Launches,
+    /// Bounds the scheduler's concurrent spawn/restore requests.
+    launch_slots: Semaphore,
+    /// Jobs whose spawn request went unanswered (connection lost or
+    /// timed out); see [`Core::spawn_lost_check`].
+    unconfirmed_spawns: Mutex<HashSet<JobId>>,
 }
 
 impl Core {
@@ -297,6 +305,8 @@ impl Core {
             pending_removal: Mutex::new(BTreeSet::new()),
             orphans: Mutex::new(BTreeSet::new()),
             launches: Launches::default(),
+            launch_slots: Semaphore::new(MAX_CONCURRENT_LAUNCHES),
+            unconfirmed_spawns: Mutex::new(HashSet::new()),
         })
     }
 
@@ -589,7 +599,9 @@ impl Core {
         changes: &mut Changes,
     ) -> ApiResult<Option<Job>> {
         if transition.next.is_some() {
-            let restored = job.state == JobState::Restoring
+            // From `Checkpointed`: a late success of a restore that was
+            // given up as interrupted.
+            let restored = matches!(job.state, JobState::Restoring | JobState::Checkpointed)
                 && transition.next.as_ref() == Some(&JobState::Running);
             transition.apply(job, now);
             tx.update_job_state(job.id, &job.state, job.started_at, job.finished_at)?;
@@ -746,6 +758,25 @@ impl Core {
                 tracing::info!(job = %job.id, pid, "job started");
                 Ok(())
             }
+            Err(
+                e @ HelperError::Rejected {
+                    code: HelperErrorCode::ShuttingDown,
+                    ..
+                },
+            ) => {
+                // The helper is stopping: nothing was started (it refuses
+                // new spawns, and abandons those systemd had not begun to
+                // start). Not the job's fault; put it back in line once
+                // that helper is likely gone, rather than offering it
+                // again in a tight loop.
+                tracing::info!(job = %job.id, "the helper is stopping; requeueing the job");
+                tokio::select! {
+                    _ = self.cancel.cancelled() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                self.requeue_unstarted(job.id, job.started_at).await?;
+                Err(e.into())
+            }
             Err(HelperError::Rejected { message, .. }) => {
                 self.handle_event(
                     job.id,
@@ -757,29 +788,48 @@ impl Core {
             }
             Err(HelperError::NotConnected) => {
                 // Never reached the helper: put the job back in line.
-                let id = job.id;
-                self.write(move |tx, ch| {
-                    if let Some(job) = tx.get_job(id)?
-                        && job.state == JobState::Running
-                    {
-                        tx.update_job_state(
-                            id,
-                            &JobState::Queued {
-                                enqueued_at: now_ms(),
-                            },
-                            None,
-                            None,
-                        )?;
-                        ch.updated(id);
-                    }
-                    Ok(())
-                })
-                .await?;
+                self.requeue_unstarted(job.id, job.started_at).await?;
                 Err(HelperError::NotConnected.into())
             }
-            // Unknown whether it started; reconciliation will tell.
-            Err(e) => Err(e.into()),
+            // Unknown whether it started (the connection broke or the
+            // answer is late). Reconciliation (after a reconnect) or the
+            // check below tells: a job the helper does not know was never
+            // started and goes back in line, see `Core::spawn_lost_check`.
+            Err(e) => {
+                self.unconfirmed_spawns.lock().unwrap().insert(job.id);
+                if matches!(e, HelperError::Timeout) {
+                    self.spawn_lost_check(job.id, job.started_at);
+                }
+                Err(e.into())
+            }
         }
+    }
+
+    /// Puts a job whose spawn request did not start it back in line (unless
+    /// it has moved on since the launch that `started_at` identifies).
+    async fn requeue_unstarted(
+        self: &Arc<Self>,
+        id: JobId,
+        started_at: Option<Timestamp>,
+    ) -> ApiResult<()> {
+        self.write(move |tx, ch| {
+            if let Some(job) = tx.get_job(id)?
+                && job.state == JobState::Running
+                && job.started_at == started_at
+            {
+                tx.update_job_state(
+                    id,
+                    &JobState::Queued {
+                        enqueued_at: now_ms(),
+                    },
+                    None,
+                    None,
+                )?;
+                ch.updated(id);
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn signal(self: &Arc<Self>, job: &Job, sig: i32) -> ApiResult<()> {
@@ -848,6 +898,13 @@ impl Core {
 
     /// The helper does not know the job: unless its exit event shows up
     /// shortly, record it as lost.
+    ///
+    /// A job whose spawn request went unanswered (see
+    /// [`Core::spawn_job`]) is put back in line instead: the helper
+    /// records a spawn before it starts the unit and re-discovers the
+    /// unit, or reports how the job ended, after a restart (its replayed
+    /// events precede its list of live jobs). So a job it neither lists
+    /// nor reported was never started.
     fn spawn_lost_check(self: &Arc<Self>, id: JobId, started_at: Option<Timestamp>) {
         let core = self.clone();
         tokio::spawn(async move {
@@ -856,14 +913,33 @@ impl Core {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
             if !core.still_live(id, started_at).await {
+                core.unconfirmed_spawns.lock().unwrap().remove(&id);
                 return;
             }
-            if let Ok(running) = core.helper.list_running().await
-                && !running.iter().any(|r| r.job == id)
-            {
-                tracing::warn!(job = %id, "the helper no longer knows the job; marking it lost");
-                core.handle_event(id, lifecycle::Event::Lost, no_pre).await;
+            let Ok(running) = core.helper.list_running().await else {
+                return;
+            };
+            if running.iter().any(|r| r.job == id) {
+                core.unconfirmed_spawns.lock().unwrap().remove(&id);
+                return;
             }
+            if core.unconfirmed_spawns.lock().unwrap().remove(&id) {
+                // An exit reported just before the list was taken arrives
+                // shortly; give it time before starting the job again.
+                tokio::select! {
+                    _ = core.cancel.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                if core.still_live(id, started_at).await {
+                    tracing::warn!(job = %id, "the helper never started the job; requeueing it");
+                    if let Err(e) = core.requeue_unstarted(id, started_at).await {
+                        tracing::warn!(job = %id, "cannot requeue the job: {}", e.0.message);
+                    }
+                }
+                return;
+            }
+            tracing::warn!(job = %id, "the helper no longer knows the job; marking it lost");
+            core.handle_event(id, lifecycle::Event::Lost, no_pre).await;
         });
     }
 
@@ -1231,10 +1307,26 @@ impl Core {
                 Ok(launched)
             })
             .await?;
-        // One at a time: concurrent spawns make the real helper fail or
-        // stall them (seen in scripts/e2e-test.sh).
+        // Each launch runs on its own task, so one slow helper answer does
+        // not hold up the next scheduling round; at most
+        // `MAX_CONCURRENT_LAUNCHES` are sent at a time. They stop with the
+        // daemon; a request dropped unanswered is settled by the next
+        // reconciliation (the launch tracker settles it on drop).
         for (job, effects) in launched {
-            let _ = self.run_effects(&job, &effects).await;
+            let core = self.clone();
+            tokio::spawn(async move {
+                // Biased: once the daemon is stopped, a launch that has not
+                // been answered yet is dropped at its next wake-up instead
+                // of acting on the outcome.
+                tokio::select! {
+                    biased;
+                    _ = core.cancel.cancelled() => {}
+                    _ = async {
+                        let _permit = core.launch_slots.acquire().await;
+                        let _ = core.run_effects(&job, &effects).await;
+                    } => {}
+                }
+            });
         }
         Ok(())
     }

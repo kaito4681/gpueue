@@ -593,6 +593,13 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
         (Event::RestoreSucceeded, JobState::Restoring) => {
             Transition::to(JobState::Running).with(Effect::DeleteCheckpointImage)
         }
+        // The restore was given up as interrupted (`Lost` below, e.g. after
+        // a helper or daemon restart) but did finish: the helper runs the
+        // job, so follow it. The helper only restores on request, so a
+        // checkpointed job never gets this otherwise.
+        (Event::RestoreSucceeded, JobState::Checkpointed) => {
+            Transition::to(JobState::Running).with(Effect::DeleteCheckpointImage)
+        }
         (Event::RestoreFailed { reason }, JobState::Restoring) => {
             Transition::to(JobState::Checkpointed).with(Effect::RecordRestoreError(reason.clone()))
         }
@@ -1223,7 +1230,11 @@ mod tests {
             vec![Effect::RecordRestoreError("driver mismatch".to_owned())]
         );
         assert!(!t.effects.contains(&Effect::DeleteCheckpointImage));
-        assert!(on_event(&job(1, JobState::Checkpointed), &Event::RestoreSucceeded).is_err());
+        // A success reported after the restore was given up as interrupted
+        // brings the job back to running.
+        let t = on_event(&job(1, JobState::Checkpointed), &Event::RestoreSucceeded).unwrap();
+        assert_eq!(t.next, Some(JobState::Running));
+        assert_eq!(t.effects, vec![Effect::DeleteCheckpointImage]);
 
         // A failure reported after the restore was given up as interrupted
         // only replaces the recorded reason.

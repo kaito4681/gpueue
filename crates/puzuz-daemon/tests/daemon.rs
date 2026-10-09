@@ -1317,38 +1317,40 @@ async fn actions_in_the_spawn_window_wait_for_the_helper() {
     let mut h = Harness::new(0).await;
     h.set_default_parallel(3).await;
     let alice = h.client(ALICE);
+    h.helper.hold_launches();
 
-    let mut ids = Vec::new();
-    for (action, body) in [
-        ("checkpoint", json!(null)),
-        ("pause", json!({})),
-        ("kill", json!({})),
-    ] {
-        h.helper.hold_launches();
-        let id = alice.add(&job_request(action, &[])).await;
+    let checkpointed = alice.add(&job_request("a", &[])).await;
+    let paused = alice.add(&job_request("b", &[])).await;
+    let killed = alice.add(&job_request("c", &[])).await;
+    for id in [checkpointed, paused, killed] {
         alice.wait_state(id, &JobState::Running).await;
-        h.helper.wait_held(1).await;
-        let reply = send_action(&alice, id, action, body);
-        // Nothing reaches the helper (or the database) before the spawn is
-        // answered.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!reply.is_finished(), "{action}");
-        assert_eq!(alice.job(id).await.state, JobState::Running, "{action}");
-        assert!(h.helper.signals().iter().all(|(job, _)| *job != id));
+    }
+    h.helper.wait_held(3).await;
 
-        h.helper.release_launches();
+    let checkpoint = send_action(&alice, checkpointed, "checkpoint", json!(null));
+    let pause = send_action(&alice, paused, "pause", json!({}));
+    let kill = send_action(&alice, killed, "kill", json!({}));
+    // Nothing reaches the helper (or the database) before the spawns are
+    // answered.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!checkpoint.is_finished());
+    assert!(!pause.is_finished());
+    assert!(!kill.is_finished());
+    for id in [checkpointed, paused, killed] {
+        assert_eq!(alice.job(id).await.state, JobState::Running);
+    }
+    assert!(h.helper.signals().is_empty());
+
+    h.helper.release_launches();
+    for (reply, what) in [(checkpoint, "checkpoint"), (pause, "pause"), (kill, "kill")] {
         let reply = reply.await.unwrap();
         assert_eq!(
             reply.status,
             StatusCode::OK,
-            "{action}: {}",
+            "{what}: {}",
             String::from_utf8_lossy(&reply.body)
         );
-        ids.push(id);
     }
-    let [checkpointed, paused, killed] = ids[..] else {
-        unreachable!()
-    };
     let job = alice
         .wait_state(checkpointed, &JobState::Checkpointed)
         .await;
@@ -1362,6 +1364,87 @@ async fn actions_in_the_spawn_window_wait_for_the_helper() {
     alice.wait_state(killed, &done(JobResult::Killed)).await;
     assert!(!h.helper.is_running(killed));
 
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawns_refused_by_a_stopping_helper_are_requeued() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(4).await;
+    let alice = h.client(ALICE);
+    h.helper.set_stopping(true);
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        ids.push(alice.add(&job_request(&format!("j{i}"), &[])).await);
+    }
+    // Refused and put back in line, not failed...
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    for &id in &ids {
+        let state = alice.job(id).await.state;
+        assert!(
+            matches!(state, JobState::Queued { .. } | JobState::Running),
+            "job {id}: {state:?}"
+        );
+    }
+    // ...and offered again once the (next) helper accepts spawns.
+    h.helper.set_stopping(false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !ids.iter().all(|&id| h.helper.is_running(id)) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "jobs were not respawned"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for &id in &ids {
+        alice.wait_state(id, &JobState::Running).await;
+    }
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawns_cut_off_by_a_helper_restart_are_resolved_not_lost() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(2).await;
+    let alice = h.client(ALICE);
+    h.helper.hold_launches();
+    let started = alice.add(&job_request("started", &[])).await;
+    let never = alice.add(&job_request("never", &[])).await;
+    h.helper.wait_held(2).await;
+
+    // The helper restarts while both requests are in flight: the answers
+    // are lost. It had started one job (and re-discovers its unit); the
+    // other request never reached it.
+    h.helper.disconnect();
+    h.helper.lose_held_launches();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.helper.insert_running(started);
+    h.helper.reconnect();
+
+    // The job it never started goes back in line and is started again.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !h.helper.is_running(never) {
+        assert!(tokio::time::Instant::now() < deadline, "not respawned");
+        let state = alice.job(never).await.state;
+        assert!(
+            matches!(state, JobState::Running | JobState::Queued { .. }),
+            "{state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        h.helper
+            .spawned()
+            .iter()
+            .filter(|r| r.job == started)
+            .count(),
+        0,
+        "the re-discovered job was spawned again"
+    );
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    for id in [started, never] {
+        assert_eq!(alice.job(id).await.state, JobState::Running, "job {id}");
+    }
     h.stop().await;
 }
 

@@ -52,6 +52,8 @@ struct State {
     next_seq: u64,
     unacked: Vec<EventEnvelope>,
     spawn_failure: Option<String>,
+    /// Refuse spawns as a stopping helper does.
+    stopping: bool,
     checkpoint_outcome: FakeOutcome,
     restore_outcome: FakeOutcome,
     restore_rejection: Option<String>,
@@ -59,6 +61,8 @@ struct State {
     spawned: Vec<SpawnRequest>,
     signals: Vec<(JobId, i32)>,
     hold_launches: bool,
+    /// Held requests fail with `ConnectionLost` when released.
+    lose_held: bool,
     /// Spawn/restore requests currently held.
     held: usize,
 }
@@ -161,19 +165,23 @@ impl FakeHelper {
 
     /// Waits while launches are held. A request dropped while waiting has
     /// no effect.
-    async fn launch_gate(&self) {
+    async fn launch_gate(&self) -> HelperResult<()> {
         let mut rx = self.wake.subscribe();
         if !self.with(|s| s.hold_launches) {
-            return;
+            return Ok(());
         }
         self.with(|s| s.held += 1);
         self.bump();
         let _held = Held(self);
         while self.with(|s| s.hold_launches) {
             if rx.changed().await.is_err() {
-                return;
+                return Ok(());
             }
         }
+        if self.with(|s| s.lose_held) {
+            return Err(HelperError::ConnectionLost);
+        }
+        Ok(())
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
@@ -218,6 +226,12 @@ impl FakeHelper {
         self.with(|s| s.spawn_failure = reason.map(str::to_owned));
     }
 
+    /// Refuse spawns with `shutting_down`, as a helper that is stopping
+    /// does (`false` to accept them again).
+    pub fn set_stopping(&self, stopping: bool) {
+        self.with(|s| s.stopping = stopping);
+    }
+
     /// Holds spawn and restore requests until [`release_launches`].
     ///
     /// [`release_launches`]: FakeHelper::release_launches
@@ -231,10 +245,30 @@ impl FakeHelper {
         self.bump();
     }
 
-    /// Resolves once `count` spawn/restore requests are being held.
+    /// Fails the held spawn and restore requests with `ConnectionLost`, as
+    /// if the connection broke before the helper read them (until
+    /// [`reconnect`]).
+    ///
+    /// [`reconnect`]: FakeHelper::reconnect
+    pub fn lose_held_launches(&self) {
+        self.with(|s| {
+            s.lose_held = true;
+            s.hold_launches = false;
+        });
+        self.bump();
+    }
+
+    /// Resolves once `count` spawn/restore requests (or more) are being
+    /// held; `0` waits until none is.
     pub async fn wait_held(&self, count: usize) {
         let mut rx = self.wake.subscribe();
-        while self.with(|s| s.held) < count {
+        while self.with(|s| {
+            if count == 0 {
+                s.held > 0
+            } else {
+                s.held < count
+            }
+        }) {
             if rx.changed().await.is_err() {
                 return;
             }
@@ -282,6 +316,7 @@ impl FakeHelper {
     pub fn reconnect(&self) {
         self.with(|s| {
             s.connected = true;
+            s.lose_held = false;
             s.announce();
         });
     }
@@ -327,6 +362,12 @@ impl FakeHelper {
                 return Err(HelperError::Rejected {
                     code: HelperErrorCode::Busy,
                     message: format!("job {} is already running", request.job),
+                });
+            }
+            if s.stopping {
+                return Err(HelperError::Rejected {
+                    code: HelperErrorCode::ShuttingDown,
+                    message: "the helper is shutting down".to_owned(),
                 });
             }
             if let Some(reason) = &s.spawn_failure {
@@ -464,7 +505,7 @@ impl Helper for FakeHelper {
 
     fn spawn(&self, request: SpawnRequest) -> BoxFuture<'_, HelperResult<u32>> {
         async move {
-            self.launch_gate().await;
+            self.launch_gate().await?;
             self.do_spawn(request)
         }
         .boxed()
@@ -487,7 +528,7 @@ impl Helper for FakeHelper {
 
     fn restore(&self, request: RestoreRequest) -> BoxFuture<'_, HelperResult<()>> {
         async move {
-            self.launch_gate().await;
+            self.launch_gate().await?;
             self.do_restore(request)
         }
         .boxed()
