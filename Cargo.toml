@@ -26,6 +26,7 @@ chrono = "0.4"
 interim = { version = "0.2", features = ["chrono_0_4"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
+rustix = { version = "1", features = ["fs"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
