@@ -39,7 +39,15 @@
 # criu_path = "criu"
 # cuda_checkpoint_path = "cuda-checkpoint"
 
-# GPUs, listed statically until automatic detection covers your setup.
+# How GPUs are found at start-up: "auto" uses NVML and falls back to the
+# [[gpus]] list below when NVML is unavailable; "static" always uses the list.
+# gpu_detection = "auto"
+
+# Path (or name) of the NVML library. By default libnvidia-ml.so.1 and then
+# libnvidia-ml.so are tried.
+# nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
+
+# GPUs used when NVML is unavailable (or with gpu_detection = "static").
 # [[gpus]]
 # index = 0
 # uuid = "GPU-..."

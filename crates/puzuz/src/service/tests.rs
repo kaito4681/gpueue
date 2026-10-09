@@ -492,7 +492,9 @@ fn config_template_documents_every_key_and_parses_to_the_defaults() {
         .filter(|line| {
             line.split_once(" = ")
                 .is_some_and(|(key, _)| defaults.get(key).is_some())
+                // Optional keys whose commented values are examples, not defaults.
                 && !line.starts_with("checkpoint_size_limit_bytes")
+                && !line.starts_with("nvml_library")
         })
         .collect::<Vec<_>>()
         .join("\n");
