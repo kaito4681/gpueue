@@ -88,7 +88,12 @@ diagnose() {
 }
 
 FAILED=()
+# PUZUZ_E2E_ONLY: space-separated scenario numbers to run (all if empty).
+ONLY="${PUZUZ_E2E_ONLY:-}"
 run() { # run <name> <function>
+    if [ -n "$ONLY" ] && [[ " $ONLY " != *" ${1%% *} "* ]]; then
+        return 0
+    fi
     say "$1"
     if (set -e; "$2"); then
         echo "PASS $1"
@@ -104,7 +109,9 @@ run() { # run <name> <function>
 s1_lifecycle() {
     local id ok out log
     id=$(add alice -- 'echo start; echo pid=$$; echo uid=$(id -u) caps=$(grep CapEff /proc/self/status | cut -f2); echo nproc=$(ls /proc | grep -c "^[0-9]"); for i in 1 2 3 4 5; do echo tick $i; sleep 0.4; done; exit 3')
-    wait_state "$id" running
+    # The job runs for about 2 s; on a loaded host the polling may miss
+    # that window, and follow also works (prints the log) once it is done.
+    wait_state "$id" '@(running|done/*)'
     out=$(PZ_TIMEOUT=30 pz alice follow "$id") || fail "follow failed"
     grep -q '^tick 5$' <<<"$out" || fail "follow did not stream the whole output: $out"
     PZ_TIMEOUT=30 pz alice wait "$id" >/dev/null || true
@@ -116,6 +123,10 @@ s1_lifecycle() {
     grep -qx 'pid=2' <<<"$log" || fail "the job is not in its own PID namespace"
     [ "$(sed -n 's/^nproc=//p' <<<"$log")" -lt 10 ] || fail "/proc shows processes outside the job"
     [ "$(stat -c %U "$LOGS/1000/$id.log")" = alice ] || fail "the log is not owned by alice"
+    # A reader that stops early (`| grep -q`, `| head`) is not an error,
+    # even with pipefail (the CLI used to panic on EPIPE).
+    pz alice log --full "$id" | true || fail "log fails when its reader goes away"
+    pz alice status | true || fail "status fails when its reader goes away"
 
     ok=$(add alice -- 'echo fine')
     PZ_TIMEOUT=30 pz alice wait "$ok" || fail "wait failed for a successful job"
