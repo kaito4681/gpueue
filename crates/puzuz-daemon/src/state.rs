@@ -24,7 +24,7 @@ use puzuz_core::model::{Caller, GpuIndex, Group, Job, JobId, JobResult, JobState
 use puzuz_core::scheduler;
 use puzuz_core::storage::StorageError;
 use puzuz_core::storage::{CheckpointRecord, CheckpointStatus, JobFilter, Store, StoreOps, Tx};
-use puzuz_protocol::api::{self, ErrorCode, JobView};
+use puzuz_protocol::api::{self, ErrorCode, JobView, Warning};
 use puzuz_protocol::helper::{
     self as hp, CheckpointOptions, CheckpointOutcome, HelperErrorCode, RestoreOutcome,
     RestoreRequest, RunningJob, SpawnRequest, signal,
@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::error::{ApiResult, Failure};
+use crate::gpu::DetectedGpu;
 use crate::helper::{Helper, HelperError, HelperNotice};
 use crate::users::UserDb;
 
@@ -198,8 +199,9 @@ pub struct Core {
     pub db: Db,
     pub helper: Arc<dyn Helper>,
     pub users: Arc<dyn UserDb>,
-    /// Memory sizes reported by GPU detection.
-    pub gpu_memory: HashMap<GpuIndex, u64>,
+    /// The GPUs detected at start-up. GPUs in the store but not here are
+    /// unavailable (see [`crate::gpu`]).
+    pub detected_gpus: HashMap<GpuIndex, DetectedGpu>,
     /// Testing only: let the `x-puzuz-test-uid` header override the peer
     /// uid. Never settable from the configuration file.
     pub trust_uid_header: bool,
@@ -225,7 +227,7 @@ impl Core {
         store: Store,
         helper: Arc<dyn Helper>,
         users: Arc<dyn UserDb>,
-        gpu_memory: HashMap<GpuIndex, u64>,
+        detected_gpus: HashMap<GpuIndex, DetectedGpu>,
         trust_uid_header: bool,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
@@ -235,7 +237,7 @@ impl Core {
             db: Db::new(store),
             helper,
             users,
-            gpu_memory,
+            detected_gpus,
             trust_uid_header,
             events,
             changes,
@@ -297,6 +299,103 @@ impl Core {
 
     pub fn wake_scheduler(&self) {
         self.schedule.notify_one();
+    }
+
+    /// Whether `index` was detected at start-up (and so may start jobs).
+    pub fn gpu_available(&self, index: GpuIndex) -> bool {
+        self.detected_gpus.contains_key(&index)
+    }
+
+    /// The GPU model(s) and driver version to record with a checkpoint of a
+    /// job using `gpus`; `(None, None)` for CPU-only jobs.
+    fn gpu_identity(&self, gpus: &[GpuIndex]) -> (Option<String>, Option<String>) {
+        let detected: Vec<&DetectedGpu> = gpus
+            .iter()
+            .filter_map(|index| self.detected_gpus.get(index))
+            .collect();
+        let mut models: Vec<&str> = Vec::new();
+        for gpu in &detected {
+            if !models.contains(&gpu.name.as_str()) {
+                models.push(&gpu.name);
+            }
+        }
+        let model = (!models.is_empty()).then(|| models.join(", "));
+        let driver = detected.iter().find_map(|gpu| gpu.driver_version.clone());
+        (model, driver)
+    }
+
+    /// A new in-progress checkpoint record for `job`.
+    fn new_checkpoint_record(&self, job: &Job, now: Timestamp) -> CheckpointRecord {
+        let (gpu_model, driver_version) = self.gpu_identity(&job.spec.gpus);
+        CheckpointRecord {
+            job_id: job.id,
+            path: self.image_dir(job.id),
+            size_bytes: None,
+            gpu_model,
+            driver_version,
+            created_at: now,
+            status: CheckpointStatus::InProgress,
+            failure_reason: None,
+        }
+    }
+
+    /// Total size of the complete checkpoint images.
+    pub async fn checkpoint_usage(&self) -> ApiResult<u64> {
+        let records = self.read(|s| s.list_checkpoints()).await?;
+        Ok(records
+            .iter()
+            .filter(|r| r.status == CheckpointStatus::Complete)
+            .filter_map(|r| r.size_bytes)
+            .fold(0u64, u64::saturating_add))
+    }
+
+    /// Warns (in the log) when the complete images exceed
+    /// `checkpoint_size_limit_bytes`. Per the spec nothing is deleted and
+    /// new dumps are not refused. Returns whether the limit is exceeded.
+    pub async fn check_checkpoint_usage(&self) -> bool {
+        let Some(limit) = self.config.checkpoint_size_limit_bytes else {
+            return false;
+        };
+        match self.checkpoint_usage().await {
+            Ok(total) if total > limit => {
+                tracing::warn!(
+                    total_bytes = total,
+                    limit_bytes = limit,
+                    dir = %self.config.checkpoints_dir().display(),
+                    "checkpoint images exceed checkpoint_size_limit_bytes; they are not deleted \
+                     automatically (restore or remove checkpointed jobs to free space)"
+                );
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                tracing::warn!("cannot sum up checkpoint sizes: {}", e.0.message);
+                false
+            }
+        }
+    }
+
+    /// The warnings `owner` has not been shown yet (one indexed read).
+    pub async fn pending_warnings(&self, owner: Uid) -> ApiResult<Vec<Warning>> {
+        let ids = self
+            .read(move |s| s.unacknowledged_checkpoint_failures(owner))
+            .await?;
+        Ok(ids
+            .into_iter()
+            .map(|job| Warning::CheckpointFailed { job })
+            .collect())
+    }
+
+    /// Records that `warnings` have been shown to their owner.
+    pub async fn acknowledge_warnings(&self, warnings: &[Warning]) -> ApiResult<()> {
+        let ids: Vec<JobId> = warnings
+            .iter()
+            .map(|w| match w {
+                Warning::CheckpointFailed { job } => *job,
+            })
+            .collect();
+        self.read(move |s| s.acknowledge_checkpoint_failures(&ids))
+            .await
     }
 
     // -----------------------------------------------------------------
@@ -400,16 +499,7 @@ impl Core {
         for effect in &transition.effects {
             match effect {
                 Effect::Checkpoint => {
-                    tx.put_checkpoint(&CheckpointRecord {
-                        job_id: job.id,
-                        path: self.image_dir(job.id),
-                        size_bytes: None,
-                        gpu_model: None,
-                        driver_version: None,
-                        created_at: now,
-                        status: CheckpointStatus::InProgress,
-                        failure_reason: None,
-                    })?;
+                    tx.put_checkpoint(&self.new_checkpoint_record(job, now))?;
                     changes.updated(job.id);
                 }
                 Effect::RecordRestoreError(reason) => {
@@ -711,6 +801,7 @@ impl Core {
     }
 
     async fn start_restore(self: &Arc<Self>, job: &Job) -> ApiResult<()> {
+        self.warn_if_gpus_changed(job).await;
         let request = RestoreRequest {
             job: job.id,
             uid: job.owner,
@@ -735,6 +826,30 @@ impl Core {
                 Err(e.into())
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Logs when a checkpoint is restored on a different GPU model or
+    /// driver than it was dumped with (cuda-checkpoint may then fail; the
+    /// helper reports that as a restore failure).
+    async fn warn_if_gpus_changed(&self, job: &Job) {
+        let id = job.id;
+        let Ok(Some(record)) = self.read(move |s| s.get_checkpoint(id)).await else {
+            return;
+        };
+        let (model, driver) = self.gpu_identity(&job.spec.gpus);
+        let differs = |then: &Option<String>, now: &Option<String>| {
+            then.is_some() && now.is_some() && then != now
+        };
+        if differs(&record.gpu_model, &model) || differs(&record.driver_version, &driver) {
+            tracing::warn!(
+                job = %id,
+                dumped_on = ?record.gpu_model,
+                dumped_driver = ?record.driver_version,
+                now = ?model,
+                driver = ?driver,
+                "restoring a checkpoint on a different GPU model or driver"
+            );
         }
     }
 
@@ -791,8 +906,8 @@ impl Core {
                 self.handle_event(job, event, no_pre).await;
             }
             hp::Event::CheckpointFinished { job, outcome } => {
-                let path = self.image_dir(job);
                 let now = now_ms();
+                let succeeded = matches!(outcome, CheckpointOutcome::Success { .. });
                 let (event, status, size, reason) = match outcome {
                     CheckpointOutcome::Success { image_size_bytes } => (
                         E::CheckpointSucceeded,
@@ -809,23 +924,23 @@ impl Core {
                         Some(reason),
                     ),
                 };
-                self.handle_event(job, event, move |tx, _| {
+                let core = self.clone();
+                self.handle_event(job, event, move |tx, current| {
                     if tx.get_checkpoint(job)?.is_some() {
                         tx.set_checkpoint_status(job, status, size, reason.as_deref())
                     } else {
                         tx.put_checkpoint(&CheckpointRecord {
-                            job_id: job,
-                            path,
                             size_bytes: size,
-                            gpu_model: None,
-                            driver_version: None,
-                            created_at: now,
                             status,
                             failure_reason: reason,
+                            ..core.new_checkpoint_record(current, now)
                         })
                     }
                 })
                 .await;
+                if succeeded {
+                    self.check_checkpoint_usage().await;
+                }
             }
             hp::Event::RestoreFinished { job, outcome } => {
                 let event = match outcome {
@@ -932,7 +1047,12 @@ impl Core {
             .write(move |tx, ch| {
                 let jobs = tx.list_jobs(&JobFilter::all())?;
                 let groups = tx.list_groups()?;
-                let gpus = tx.list_gpus()?;
+                // Undetected GPUs are left out, so jobs that need them wait.
+                let gpus: Vec<_> = tx
+                    .list_gpus()?
+                    .into_iter()
+                    .filter(|gpu| core.gpu_available(gpu.index))
+                    .collect();
                 let plan = scheduler::plan(now, &jobs, &groups, &gpus);
                 let mut by_id: HashMap<JobId, Job> = jobs.into_iter().map(|j| (j.id, j)).collect();
                 let mut launched = Vec::new();
@@ -1109,5 +1229,103 @@ impl Core {
             self.run_effects(&job, &effects).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use puzuz_core::model::JobSpec;
+
+    use super::*;
+    use crate::helper::FakeHelper;
+    use crate::users::StaticUserDb;
+
+    fn core(limit: Option<u64>, gpus: Vec<DetectedGpu>) -> Arc<Core> {
+        let config = Config {
+            checkpoint_size_limit_bytes: limit,
+            ..Config::default()
+        };
+        Core::new(
+            config,
+            Store::open_in_memory().unwrap(),
+            Arc::new(FakeHelper::new()),
+            Arc::new(StaticUserDb::with_admins([])),
+            gpus.into_iter().map(|g| (g.index, g)).collect(),
+            false,
+        )
+    }
+
+    fn spec() -> JobSpec {
+        JobSpec {
+            command: "x".to_owned(),
+            cwd: PathBuf::from("/"),
+            envs: Default::default(),
+            group: "default".to_owned(),
+            gpus: Vec::new(),
+            dependencies: Vec::new(),
+            priority: 0,
+            label: None,
+            no_checkpoint: false,
+        }
+    }
+
+    async fn add_image(core: &Core, size: u64, status: CheckpointStatus) {
+        core.db
+            .call(move |store| {
+                let job = store
+                    .insert_job(Uid(1), &spec(), &JobState::Checkpointed, 0)
+                    .unwrap();
+                store
+                    .put_checkpoint(&CheckpointRecord {
+                        job_id: job.id,
+                        path: PathBuf::from("/x"),
+                        size_bytes: Some(size),
+                        gpu_model: None,
+                        driver_version: None,
+                        created_at: 0,
+                        status,
+                        failure_reason: None,
+                    })
+                    .unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn size_limit_counts_complete_images_only() {
+        let over = core(Some(1000), Vec::new());
+        add_image(&over, 600, CheckpointStatus::Complete).await;
+        assert!(!over.check_checkpoint_usage().await);
+        add_image(&over, 5000, CheckpointStatus::Failed).await;
+        add_image(&over, 5000, CheckpointStatus::InProgress).await;
+        assert!(!over.check_checkpoint_usage().await);
+        add_image(&over, 500, CheckpointStatus::Complete).await;
+        assert_eq!(over.checkpoint_usage().await.unwrap(), 1100);
+        assert!(over.check_checkpoint_usage().await);
+
+        let unlimited = core(None, Vec::new());
+        add_image(&unlimited, i64::MAX as u64, CheckpointStatus::Complete).await;
+        assert!(!unlimited.check_checkpoint_usage().await);
+    }
+
+    #[test]
+    fn gpu_identity_lists_distinct_models_of_detected_gpus() {
+        let gpu = |index: u32, name: &str| DetectedGpu {
+            index: GpuIndex(index),
+            uuid: format!("GPU-{index}"),
+            name: name.to_owned(),
+            memory_total_bytes: None,
+            driver_version: Some("570.86.10".to_owned()),
+        };
+        let core = core(None, vec![gpu(0, "A100"), gpu(1, "A100"), gpu(2, "H100")]);
+        assert_eq!(core.gpu_identity(&[]), (None, None));
+        assert_eq!(
+            core.gpu_identity(&[GpuIndex(2), GpuIndex(0), GpuIndex(1)]),
+            (Some("H100, A100".to_owned()), Some("570.86.10".to_owned()))
+        );
+        // Undetected GPUs contribute nothing.
+        assert_eq!(core.gpu_identity(&[GpuIndex(9)]), (None, None));
+        assert!(core.gpu_available(GpuIndex(1)));
+        assert!(!core.gpu_available(GpuIndex(9)));
     }
 }

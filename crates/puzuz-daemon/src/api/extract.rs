@@ -5,6 +5,7 @@ use axum::body::Bytes;
 use axum::extract::connect_info::{ConnectInfo, Connected};
 use axum::extract::{FromRequest, FromRequestParts, Request};
 use axum::http::request::Parts;
+use axum::http::{Extensions, HeaderMap};
 use axum::serve::IncomingStream;
 use puzuz_core::model::{Caller, Uid};
 use puzuz_protocol::api::ErrorCode;
@@ -45,25 +46,7 @@ impl FromRequestParts<AppState> for Auth {
     type Rejection = Failure;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Failure> {
-        let peer = parts
-            .extensions
-            .get::<ConnectInfo<PeerCred>>()
-            .and_then(|info| info.0.uid);
-        let mut uid = peer.ok_or_else(|| {
-            Failure::new(
-                ErrorCode::PermissionDenied,
-                "cannot determine who is connecting",
-            )
-        })?;
-        if state.trust_uid_header
-            && let Some(value) = parts.headers.get(TEST_UID_HEADER)
-        {
-            uid = value
-                .to_str()
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .ok_or_else(|| Failure::bad_request("invalid test uid header"))?;
-        }
+        let uid = peer_uid(&parts.headers, &parts.extensions, state.trust_uid_header)?;
         let users = state.users.clone();
         let is_admin = tokio::task::spawn_blocking(move || users.is_admin(Uid(uid)))
             .await
@@ -73,6 +56,31 @@ impl FromRequestParts<AppState> for Auth {
             is_admin,
         }))
     }
+}
+
+/// The caller's uid: `SO_PEERCRED`, or the test header when trusted.
+pub fn peer_uid(
+    headers: &HeaderMap,
+    extensions: &Extensions,
+    trust_uid_header: bool,
+) -> Result<u32, Failure> {
+    let peer = extensions
+        .get::<ConnectInfo<PeerCred>>()
+        .and_then(|info| info.0.uid);
+    let mut uid = peer.ok_or_else(|| {
+        Failure::new(
+            ErrorCode::PermissionDenied,
+            "cannot determine who is connecting",
+        )
+    })?;
+    if trust_uid_header && let Some(value) = headers.get(TEST_UID_HEADER) {
+        uid = value
+            .to_str()
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| Failure::bad_request("invalid test uid header"))?;
+    }
+    Ok(uid)
 }
 
 /// Parses a body that may be empty (then `T::default()`).

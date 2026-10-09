@@ -101,9 +101,20 @@ CREATE TABLE checkpoints (
 ) STRICT;
 "#;
 
+/// Version 2: `checkpoints.failure_acknowledged`.
+///
+/// Set once the owner has been told about a failed dump (on their next
+/// command). Replacing a record (a new dump) resets it, and so does a status
+/// change; see `checkpoints::set_status`.
+const V2: &str = r#"
+ALTER TABLE checkpoints
+    ADD COLUMN failure_acknowledged INTEGER NOT NULL DEFAULT 0
+    CHECK (failure_acknowledged IN (0, 1));
+"#;
+
 /// All migrations, in order. The schema version after migrating is
 /// `MIGRATIONS.len()`.
-pub(crate) const MIGRATIONS: &[&str] = &[V1];
+pub(crate) const MIGRATIONS: &[&str] = &[V1, V2];
 
 /// The schema version this build of puzuz writes.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

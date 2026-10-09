@@ -17,7 +17,11 @@
 //! # checkpoint_size_limit_bytes = 500_000_000_000
 //! checkpoint_tcp_close = true
 //!
-//! # Until NVML detection exists, GPUs are listed here.
+//! # GPUs are detected with NVML ("auto"). Without NVML (no driver, no
+//! # libnvidia-ml.so.1) the [[gpus]] list below is used instead; "static"
+//! # always uses the list.
+//! gpu_detection = "auto"
+//! # nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
 //! [[gpus]]
 //! index = 0
 //! uuid = "GPU-..."
@@ -62,8 +66,25 @@ pub struct Config {
     pub criu_path: PathBuf,
     /// Path of `cuda-checkpoint` (used by the helper).
     pub cuda_checkpoint_path: PathBuf,
-    /// Statically configured GPUs, used until NVML detection is implemented.
+    /// How GPUs are found at start-up.
+    pub gpu_detection: GpuDetection,
+    /// Path (or name) of the NVML library; by default `libnvidia-ml.so.1`
+    /// and then `libnvidia-ml.so` are tried.
+    pub nvml_library: Option<PathBuf>,
+    /// Statically configured GPUs: used when NVML is unavailable, or always
+    /// with `gpu_detection = "static"`.
     pub gpus: Vec<GpuConfig>,
+}
+
+/// [`Config::gpu_detection`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuDetection {
+    /// NVML, falling back to [`Config::gpus`] when NVML cannot be loaded.
+    #[default]
+    Auto,
+    /// Only [`Config::gpus`].
+    Static,
 }
 
 /// One GPU in [`Config::gpus`].
@@ -93,6 +114,8 @@ impl Default for Config {
             checkpoint_tcp_close: true,
             criu_path: PathBuf::from("criu"),
             cuda_checkpoint_path: PathBuf::from("cuda-checkpoint"),
+            gpu_detection: GpuDetection::Auto,
+            nvml_library: None,
             gpus: Vec::new(),
         }
     }
@@ -234,6 +257,8 @@ mod tests {
             shell = ["bash", "-lc"]
             checkpoint_size_limit_bytes = 1000
             checkpoint_tcp_close = false
+            gpu_detection = "static"
+            nvml_library = "/opt/nvml.so"
             helper_only_setting = "x"
 
             [[gpus]]
@@ -256,6 +281,8 @@ mod tests {
         assert_eq!(config.shell, ["bash", "-lc"]);
         assert_eq!(config.checkpoint_size_limit_bytes, Some(1000));
         assert!(!config.checkpoint_tcp_close);
+        assert_eq!(config.gpu_detection, GpuDetection::Static);
+        assert_eq!(config.nvml_library, Some(PathBuf::from("/opt/nvml.so")));
         assert_eq!(config.gpus.len(), 2);
         assert_eq!(config.gpus[0].name, "A100");
         assert_eq!(config.gpus[1].uuid, "");

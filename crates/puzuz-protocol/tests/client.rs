@@ -159,6 +159,14 @@ async fn route(req: Request<Incoming>, log: Arc<Mutex<Vec<Recorded>>>) -> Respon
         ("POST", "/v1/jobs/switch") => full(StatusCode::NO_CONTENT, CONTENT_TYPE_JSON, ""),
         ("POST", "/v1/daemon/shutdown") => full(StatusCode::ACCEPTED, CONTENT_TYPE_JSON, ""),
         ("PUT", "/v1/gpus/parallel") => json(StatusCode::OK, ListGpusResponse { gpus: vec![] }),
+        ("GET", "/v1/gpus") => {
+            let mut response = json(StatusCode::OK, ListGpusResponse { gpus: vec![] });
+            response.headers_mut().insert(
+                WARNINGS_HEADER,
+                "checkpoint-failed=4, from-the-future=1".parse().unwrap(),
+            );
+            response
+        }
         ("GET", "/v1/jobs/1/log?tail=2&follow=true") => chunked(
             CONTENT_TYPE_LOG,
             vec!["line 1\n".into(), "line 2\n".into(), "line 3\n".into()],
@@ -249,6 +257,23 @@ async fn sends_version_header_and_decodes_json() {
         Some(puzuz_protocol::BINARY_VERSION)
     );
     assert_eq!(recorded.body, "");
+}
+
+#[tokio::test]
+async fn collects_warnings_from_responses() {
+    let daemon = FakeDaemon::start();
+    let client = daemon.client();
+    assert!(client.take_warnings().is_empty());
+
+    client.list_gpus().await.unwrap();
+    // Clones share the collected warnings; repeats are kept once.
+    client.clone().list_gpus().await.unwrap();
+    client.list_groups().await.unwrap();
+    assert_eq!(
+        client.take_warnings(),
+        [Warning::CheckpointFailed { job: JobId(4) }]
+    );
+    assert!(client.take_warnings().is_empty());
 }
 
 #[tokio::test]
