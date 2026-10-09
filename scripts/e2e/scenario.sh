@@ -317,6 +317,8 @@ EOF
 # s7 is split across two containers by scripts/e2e-test.sh.
 s7_prepare() {
     local a b
+    # Created by s3 unless only the reboot scenario runs.
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
     a=$(add alice -g free -- "$COUNTER")
     b=$(add bob -g free --no-checkpoint -- 'trap "echo got TERM; exit 0" TERM; while :; do sleep 0.1; done')
     wait_state "$a" running

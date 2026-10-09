@@ -46,7 +46,16 @@ const MANAGER: &str = "org.freedesktop.systemd1.Manager";
 const UNIT_IFACE: &str = "org.freedesktop.systemd1.Unit";
 const SERVICE_IFACE: &str = "org.freedesktop.systemd1.Service";
 const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
+const JOB_IFACE: &str = "org.freedesktop.systemd1.Job";
 const NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
+/// Errors of a `Get` on a job object that no longer exists.
+const JOB_GONE_ERRORS: &[&str] = &[
+    "org.freedesktop.systemd1.NoSuchJob",
+    "org.freedesktop.DBus.Error.UnknownObject",
+    "org.freedesktop.DBus.Error.UnknownInterface",
+    "org.freedesktop.DBus.Error.UnknownMethod",
+    "org.freedesktop.DBus.Error.UnknownProperty",
+];
 
 /// The unit every job unit is ordered before.
 pub const HELPER_UNIT: &str = "puzuz-helper.service";
@@ -177,15 +186,52 @@ impl SystemdLauncher {
             .manager_call::<_, ()>("ResetFailedUnit", &(unit,))
             .await;
         let aux: Vec<(&str, Props<'_>)> = Vec::new();
-        self.manager_call::<_, OwnedObjectPath>("StartTransientUnit", &(unit, "fail", props, aux))
+        let job = self
+            .manager_call::<_, OwnedObjectPath>("StartTransientUnit", &(unit, "fail", props, aux))
             .await
-            .map(|_| ())
             .map_err(|e| {
                 LaunchError::new(
                     HelperErrorCode::SpawnFailed,
                     format!("starting {unit}: {e}"),
                 )
-            })
+            })?;
+        self.wait_job_dispatched(unit, &job).await
+    }
+
+    /// Waits until systemd has begun running the start job `job` of `unit`
+    /// (or has already finished it).
+    ///
+    /// `StartTransientUnit` returns as soon as the job is queued; systemd
+    /// dispatches it in a later iteration of its event loop. Until then the
+    /// unit is still `inactive`, which the callers' polling would take for
+    /// "already ended" (and they would then stop the unit just as it
+    /// starts). Once the job is `running`, the unit is `activating` or past
+    /// it.
+    async fn wait_job_dispatched(&self, unit: &str, job: &OwnedObjectPath) -> LaunchResult<()> {
+        const JOB_POLL: Duration = Duration::from_millis(5);
+        let deadline = Instant::now() + self.spawn_timeout;
+        loop {
+            match self.property(job.as_str(), JOB_IFACE, "State").await {
+                Ok(v) => {
+                    if String::try_from(v).map_err(|e| dbus(e.into()))? == "running" {
+                        return Ok(());
+                    }
+                }
+                Err(e) if is_job_gone(&e) => return Ok(()),
+                Err(e) => return Err(dbus(e)),
+            }
+            if Instant::now() >= deadline {
+                let _ = self.release(unit).await;
+                return Err(LaunchError::new(
+                    HelperErrorCode::SpawnFailed,
+                    format!(
+                        "systemd did not start {unit} within {:?}",
+                        self.spawn_timeout
+                    ),
+                ));
+            }
+            tokio::time::sleep(JOB_POLL).await;
+        }
     }
 
     fn common_props(&self, description: String) -> Props<'static> {
@@ -483,6 +529,10 @@ pub fn signal_target(sig: i32) -> &'static str {
 
 fn is_no_such_unit(e: &zbus::Error) -> bool {
     matches!(e, zbus::Error::MethodError(name, _, _) if name.as_str() == NO_SUCH_UNIT)
+}
+
+fn is_job_gone(e: &zbus::Error) -> bool {
+    matches!(e, zbus::Error::MethodError(name, _, _) if JOB_GONE_ERRORS.contains(&name.as_str()))
 }
 
 fn dbus(e: zbus::Error) -> LaunchError {
