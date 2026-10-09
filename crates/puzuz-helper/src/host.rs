@@ -65,6 +65,12 @@ pub trait HostProbe: Send + Sync + 'static {
     fn cuda_pids(&self, host_pids: &[u32]) -> io::Result<Vec<u32>>;
     /// Mount points in the mount namespace of `pid`.
     fn mount_points(&self, pid: u32) -> io::Result<Vec<String>>;
+    /// Mounts of the namespace of `pid` that CRIU could only restore from a
+    /// path that is hidden in the helper's own namespace (see
+    /// [`crate::mounts::unreachable_sources`]).
+    fn unreachable_mounts(&self, _pid: u32) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
@@ -91,6 +97,9 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     }
     fn mount_points(&self, pid: u32) -> io::Result<Vec<String>> {
         (**self).mount_points(pid)
+    }
+    fn unreachable_mounts(&self, pid: u32) -> io::Result<Vec<String>> {
+        (**self).unreachable_mounts(pid)
     }
 }
 
@@ -231,8 +240,18 @@ impl HostProbe for SystemHost {
         Ok(mi
             .lines()
             .filter_map(|l| l.split_whitespace().nth(4))
-            .map(crate::shim::unescape_octal)
+            .map(crate::mounts::unescape_octal)
             .collect())
+    }
+
+    fn unreachable_mounts(&self, pid: u32) -> io::Result<Vec<String>> {
+        use crate::mounts::{MountTree, unreachable_sources};
+        let job = fs::read_to_string(self.proc_root.join(pid.to_string()).join("mountinfo"))?;
+        let own = fs::read_to_string(self.proc_root.join("self/mountinfo"))?;
+        Ok(unreachable_sources(
+            &MountTree::parse(&job),
+            &MountTree::parse(&own),
+        ))
     }
 }
 
@@ -249,27 +268,7 @@ pub fn is_mount_point(mountinfo: &str, path: &Path) -> bool {
     mountinfo
         .lines()
         .filter_map(|l| l.split_whitespace().nth(4))
-        .any(|mp| unescape_mountinfo(mp) == want)
-}
-
-fn unescape_mountinfo(s: &str) -> String {
-    // Spaces, tabs, newlines and backslashes are written as \ooo.
-    let mut out = String::with_capacity(s.len());
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\'
-            && i + 3 < b.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 4], 8)
-        {
-            out.push(v as char);
-            i += 4;
-            continue;
-        }
-        out.push(b[i] as char);
-        i += 1;
-    }
-    out
+        .any(|mp| crate::mounts::unescape_octal(mp) == want)
 }
 
 /// Parse the two `nvidia-smi --format=csv,noheader,nounits` queries (memory

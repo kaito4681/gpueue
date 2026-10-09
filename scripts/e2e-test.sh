@@ -24,10 +24,11 @@
 #                       torch in /opt/venv and cuda-checkpoint, e.g.
 #                       puzuz-poc/criu-cuda-systemd:0.1, with
 #                       PUZUZ_SYSTEMD_IMAGE set to a different tag).
-#                       Known failure: every restore in that mode fails
-#                       because the NVIDIA runtime's bind mount of
+#                       The NVIDIA runtime's bind mount of
 #                       /run/nvidia-persistenced/socket is hidden under the
-#                       container's /run tmpfs, so CRIU cannot recreate it.
+#                       container's /run tmpfs there; the shim removes such
+#                       hidden mounts from each job's namespace (see
+#                       crates/puzuz-helper/src/mounts.rs).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

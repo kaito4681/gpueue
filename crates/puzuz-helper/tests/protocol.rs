@@ -536,6 +536,17 @@ async fn checkpoint_then_restore() {
         err_code(&c.request(restore(uid())).await),
         HelperErrorCode::InvalidRequest
     );
+    // So is the host path of an external bind mount (e.g. one that was
+    // hidden under another mount at dump time).
+    std::fs::write(
+        &mounts,
+        br#"{"mount_points": ["/"], "external_sources": ["/run/nvidia-persistenced/socket-gone"]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        err_code(&c.request(restore(uid())).await),
+        HelperErrorCode::InvalidRequest
+    );
     std::fs::write(&mounts, saved).unwrap();
     assert_eq!(c.request(restore(uid())).await, ResponseResult::Accepted);
     let ev = c.event().await;
@@ -612,6 +623,44 @@ async fn failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first()
     );
     assert_eq!(c.running().await, [(job, RunningPhase::Stopped)]);
     assert!(!CheckpointDir::for_job(&env.base(), 4).images_dir().exists());
+}
+
+#[tokio::test]
+async fn dump_refuses_a_job_that_depends_on_a_hidden_mount() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let job = JobId(5);
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(5))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    env.host
+        .set_unreachable_mounts(vec!["/run/nvidia-persistenced/socket".into()]);
+    let r = c
+        .request(Request::Checkpoint {
+            job,
+            image_dir: env.base().join("5"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    let Event::CheckpointFinished {
+        outcome: CheckpointOutcome::Failed { reason },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert!(
+        reason.contains("/run/nvidia-persistenced/socket"),
+        "{reason}"
+    );
+    assert!(
+        env.exec.lock().unwrap().actions.is_empty(),
+        "nothing was run against the job"
+    );
+    assert_eq!(c.running().await, [(job, RunningPhase::Running)]);
 }
 
 #[tokio::test]
