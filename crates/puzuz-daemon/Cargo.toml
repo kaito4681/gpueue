@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-puzuz-core.workspace = true
+puzuz-core = { workspace = true, features = ["storage"] }
 puzuz-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true

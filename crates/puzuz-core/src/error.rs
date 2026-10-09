@@ -23,6 +23,7 @@ pub enum Error {
     },
 }
 
+#[cfg(feature = "storage")]
 /// Errors produced by the `storage` module.
 ///
 /// Kept separate from [`Error`] because the underlying SQLite and I/O errors

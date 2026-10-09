@@ -11,7 +11,12 @@ repository.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, optional = true }
+
+[features]
+# SQLite-backed persistence, used by the daemon. Off by default so the root
+# helper (through puzuz-protocol) does not link SQLite.
+storage = ["dep:rusqlite"]
 
 [dev-dependencies]
 tempfile.workspace = true
