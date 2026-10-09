@@ -205,7 +205,9 @@ s3_limits() {
     wait_state "$c" running
     expect_state "$b" queued
     wait_state "$b" 'done/*' 30
-    for i in "$a" "$b" "$c"; do expect_state "$i" done/success; done
+    # Not just expect_state: launches are serialized, so on a loaded host
+    # job c may start late enough to still run when b is done.
+    for i in "$a" "$b" "$c"; do wait_state "$i" 'done/*' 30 && expect_state "$i" done/success; done
     [ "$(started_at "$b")" -ge "$(finished_at "$a")" ] || fail "job $b shared GPU 0 with job $a"
     grep -qx 'CVD=0' "$LOGS/1000/$a.log" || fail "CUDA_VISIBLE_DEVICES of job $a"
     grep -qx 'CVD=0' "$LOGS/1001/$b.log" || fail "CUDA_VISIBLE_DEVICES of job $b"
