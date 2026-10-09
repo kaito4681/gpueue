@@ -19,7 +19,7 @@ mod resources;
 pub mod routes;
 
 pub use error::{ApiError, ErrorCode};
-pub use events::Event;
+pub use events::{Event, SseDecoder, SseMessage};
 pub use jobs::{
     ActionOutcome, AddJobRequest, AddJobResponse, BulkJobRequest, BulkJobResponse, CleanRequest,
     CleanResponse, EnqueueOptions, JobAction, JobActionResult, JobDetails, JobSelector, JobView,

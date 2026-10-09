@@ -9,15 +9,36 @@ repository.workspace = true
 
 [features]
 default = []
-# Reserved for the HTTP-over-Unix-socket client used by the CLI (hyper,
-# hyper-util, ...). The helper depends on this crate without it, so it only
-# pulls in the plain wire types.
-client = []
+# The async HTTP-over-Unix-socket client used by the CLI. The helper depends
+# on this crate without it, so it only pulls in the plain wire types.
+client = [
+    "dep:tokio",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:thiserror",
+]
 
 [dependencies]
 puzuz-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+tempfile.workspace = true
+
+[[test]]
+name = "client"
+required-features = ["client"]
 
 [lints]
 workspace = true
