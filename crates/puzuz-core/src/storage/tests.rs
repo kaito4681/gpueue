@@ -774,6 +774,114 @@ fn checkpoint_record_lifecycle() {
 }
 
 #[test]
+fn checkpoint_failures_are_reported_once_per_failure() {
+    let store = Store::open_in_memory().unwrap();
+    let a = store
+        .insert_job(Uid(1), &spec("a"), &JobState::Checkpointing, 0)
+        .unwrap();
+    let b = store
+        .insert_job(Uid(1), &spec("b"), &JobState::Checkpointing, 0)
+        .unwrap();
+    let other = store
+        .insert_job(Uid(2), &spec("c"), &JobState::Checkpointing, 0)
+        .unwrap();
+    for id in [a.id, b.id, other.id] {
+        store.put_checkpoint(&checkpoint(id)).unwrap();
+    }
+    // In-progress and complete dumps are not warnings.
+    store
+        .set_checkpoint_status(b.id, CheckpointStatus::Complete, Some(1), None)
+        .unwrap();
+    assert!(
+        store
+            .unacknowledged_checkpoint_failures(Uid(1))
+            .unwrap()
+            .is_empty()
+    );
+
+    for id in [a.id, other.id] {
+        store
+            .set_checkpoint_status(id, CheckpointStatus::Failed, None, Some("boom"))
+            .unwrap();
+    }
+    assert_eq!(
+        store.unacknowledged_checkpoint_failures(Uid(1)).unwrap(),
+        [a.id]
+    );
+    assert_eq!(
+        store.unacknowledged_checkpoint_failures(Uid(2)).unwrap(),
+        [other.id]
+    );
+
+    // Acknowledging ignores records that did not fail.
+    store
+        .acknowledge_checkpoint_failures(&[a.id, b.id, JobId(99)])
+        .unwrap();
+    assert!(
+        store
+            .unacknowledged_checkpoint_failures(Uid(1))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.get_checkpoint(b.id).unwrap().unwrap().status,
+        CheckpointStatus::Complete
+    );
+
+    // Recording a restore error keeps the status and the acknowledgement.
+    store
+        .set_checkpoint_status(a.id, CheckpointStatus::Failed, None, Some("again"))
+        .unwrap();
+    assert!(
+        store
+            .unacknowledged_checkpoint_failures(Uid(1))
+            .unwrap()
+            .is_empty()
+    );
+
+    // A new dump that fails is a new warning.
+    store.put_checkpoint(&checkpoint(a.id)).unwrap();
+    store
+        .set_checkpoint_status(a.id, CheckpointStatus::Failed, None, Some("boom"))
+        .unwrap();
+    assert_eq!(
+        store.unacknowledged_checkpoint_failures(Uid(1)).unwrap(),
+        [a.id]
+    );
+}
+
+#[test]
+fn version_one_database_is_upgraded_keeping_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(migrations::MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, owner_uid, command, cwd, group_name, state, state_data,
+                               created_at)
+             VALUES (0, 1, 'x', x'2f', 'default', 'checkpointing', ?1, 0)",
+            [serde_json::to_string(&JobState::Checkpointing).unwrap()],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO checkpoints (job_id, path, created_at, status, failure_reason)
+             VALUES (0, x'2f', 0, 'failed', 'boom');",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let record = store.get_checkpoint(JobId(0)).unwrap().unwrap();
+    assert_eq!(record.failure_reason.as_deref(), Some("boom"));
+    assert_eq!(
+        store.unacknowledged_checkpoint_failures(Uid(1)).unwrap(),
+        [JobId(0)]
+    );
+}
+
+#[test]
 fn checkpoint_for_unknown_job_is_rejected() {
     let store = Store::open_in_memory().unwrap();
     assert_domain(
