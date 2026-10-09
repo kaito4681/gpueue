@@ -362,6 +362,51 @@ s7_verify() {
     wait_state "$a" 'done/*'
 }
 
+# Many jobs at once: `add --immediate` from several CLIs in parallel races
+# the scheduler, so the helper gets concurrent spawns; then again while the
+# helper restarts. No job may fail to spawn or get lost.
+s10_burst() {
+    local ids=() i id u pids=()
+    burst() { # burst <tag> <count> <command>: add jobs in parallel, ids in $STATE/burst-<tag>
+        local tag=$1 n=$2 cmd=$3 k
+        mkdir -p "$STATE"
+        rm -f "$STATE"/burst-"$tag"-*
+        for k in $(seq "$n"); do
+            if [ $((k % 2)) -eq 0 ]; then u=alice; else u=bob; fi
+            if [ $((k % 3)) -eq 0 ]; then
+                add "$u" -g free -- "$cmd" >"$STATE/burst-$tag-$k" &
+            else
+                add "$u" -g free -i -- "$cmd" >"$STATE/burst-$tag-$k" &
+            fi
+        done
+        wait
+        cat "$STATE"/burst-"$tag"-*
+    }
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+
+    mapfile -t ids < <(burst a 24 'echo ok; sleep 1')
+    [ "${#ids[@]}" = 24 ] || fail "only ${#ids[@]} of 24 jobs were added"
+    for id in "${ids[@]}"; do wait_state "$id" 'done/*' 60; done
+    for id in "${ids[@]}"; do expect_state "$id" done/success; done
+
+    # Again, with a helper restart while the spawns are in flight. An
+    # `add --immediate` that finds the helper away is refused (no job).
+    burst b 16 'echo ok; sleep 3' >/dev/null 2>&1 &
+    sleep 0.15
+    systemctl restart puzuz-helper.service
+    wait
+    mapfile -t ids < <(cat "$STATE"/burst-b-*)
+    echo "${#ids[@]} of 16 jobs added around the helper restart"
+    [ "${#ids[@]}" -ge 8 ] || fail "only ${#ids[@]} of 16 jobs were added"
+    wait_socket
+    for id in "${ids[@]}"; do wait_state "$id" 'done/*' 90; done
+    for id in "${ids[@]}"; do expect_state "$id" done/success; done
+    for id in "${ids[@]}"; do
+        u=$(q carol "job($id)['owner']")
+        grep -qx ok "$LOGS/$u/$id.log" || fail "job $id has no output"
+    done
+}
+
 case "${1:-main}" in
 main)
     run "1 add/status/log/follow/wait" s1_lifecycle
@@ -371,6 +416,7 @@ main)
     run "5 daemon restart" s5_daemon_restart
     run "6 helper restart" s6_helper_restart
     run "8 puzuz shutdown" s8_shutdown
+    run "10 many jobs at once" s10_burst
     if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
     fi
