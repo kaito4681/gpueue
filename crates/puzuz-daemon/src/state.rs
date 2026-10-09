@@ -480,6 +480,9 @@ impl Core {
             Effect::Kill | Effect::Terminate => self.terminate(job).await,
             Effect::Checkpoint => self.start_checkpoint(job).await,
             Effect::Restore => self.start_restore(job).await,
+            // After a successful restore the helper has already removed the
+            // image (and refuses to touch the directory of a live job).
+            Effect::DeleteCheckpointImage if job.state == JobState::Running => Ok(()),
             Effect::DeleteCheckpointImage => Ok(self
                 .helper
                 .delete_checkpoint(job.id, self.image_dir(job.id))

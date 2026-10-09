@@ -236,6 +236,8 @@ pub async fn run(config: Config) -> Result<(), StartError> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(io::stderr)
+        // No color codes in the journal.
+        .with_ansi(io::IsTerminal::is_terminal(&io::stderr()))
         .try_init();
 
     let daemon = Daemon::start(DaemonOptions::new(config)).await?;
