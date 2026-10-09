@@ -61,6 +61,8 @@ pub trait HostProbe: Send + Sync + 'static {
     fn lookup_user(&self, uid: u32) -> io::Result<Option<UserInfo>>;
     /// Make sure `path` is a bind mount of `/` (for `criu restore --root`).
     fn ensure_root_bind(&self, path: &Path) -> io::Result<()>;
+    /// Undo [`HostProbe::ensure_root_bind`] (lazy unmount).
+    fn release_root_bind(&self, path: &Path) -> io::Result<()>;
 }
 
 /// The real host.
@@ -171,6 +173,15 @@ impl HostProbe for SystemHost {
             return Ok(());
         }
         fs::create_dir_all(path)?;
+        // Never mount over something a less privileged user could have
+        // swapped in.
+        let meta = fs::symlink_metadata(path)?;
+        if !meta.is_dir() || std::os::unix::fs::MetadataExt::uid(&meta) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is not a root-owned directory", path.display()),
+            ));
+        }
         nix::mount::mount(
             Some("/"),
             path,
@@ -179,6 +190,14 @@ impl HostProbe for SystemHost {
             None::<&str>,
         )
         .map_err(io::Error::from)
+    }
+
+    fn release_root_bind(&self, path: &Path) -> io::Result<()> {
+        let mountinfo = fs::read_to_string(self.proc_root.join("self/mountinfo"))?;
+        if !is_mount_point(&mountinfo, path) {
+            return Ok(());
+        }
+        nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH).map_err(io::Error::from)
     }
 }
 

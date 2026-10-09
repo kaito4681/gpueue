@@ -11,8 +11,10 @@ pub const DEFAULT_STATE_DIR: &str = "/var/lib/puzuz/helper";
 pub const DEFAULT_CHECKPOINT_BASE: &str = "/var/lib/puzuz/checkpoints";
 /// Default base directory of job logs (`<base>/<uid>/<id>.log`).
 pub const DEFAULT_LOG_BASE: &str = "/var/lib/puzuz/logs";
-/// Default bind mount of `/` passed to `criu restore --root`.
-pub const DEFAULT_CRIU_ROOT: &str = "/run/puzuz/criu-root";
+/// Default bind mount of `/` passed to `criu restore --root`. Not under
+/// `/run/puzuz`, which the daemon can write to: the helper must never mount
+/// onto a path a less privileged user controls.
+pub const DEFAULT_CRIU_ROOT: &str = "/run/puzuz-helper/criu-root";
 /// Name of the shutdown manifest written into the checkpoint base.
 pub const SHUTDOWN_MANIFEST: &str = "shutdown-manifest.json";
 

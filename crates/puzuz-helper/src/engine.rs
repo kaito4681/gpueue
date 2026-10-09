@@ -965,7 +965,15 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             pidfile: dir.restore_pidfile(),
             timeout,
         };
-        let pid = match self.launcher.restore(&spec).await {
+        let restored = self.launcher.restore(&spec).await;
+        // The restored mount namespace keeps its own copy; the host does not
+        // need the bind mount of / any more.
+        if let Some(root) = &self.cfg.criu_root
+            && let Err(e) = self.host.release_root_bind(root)
+        {
+            eprintln!("puzuz-helper: unmounting {}: {e}", root.display());
+        }
+        let pid = match restored {
             Ok(pid) => pid,
             Err(e) => {
                 let summary = fs::read_to_string(dir.restore_log())

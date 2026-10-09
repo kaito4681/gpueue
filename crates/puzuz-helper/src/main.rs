@@ -127,6 +127,13 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
         return Err("must run as root".into());
     }
     let cfg = config(args)?;
+    let mut must_be_root_owned = vec![&cfg.state_dir, &cfg.checkpoint_base, &cfg.log_base];
+    if let Some(root) = &cfg.criu_root {
+        must_be_root_owned.push(root);
+    }
+    for dir in must_be_root_owned {
+        puzuz_helper::validate::check_root_owned_path(dir)?;
+    }
     if cfg.checkpoint.mode == CudaMode::Manual {
         std::fs::create_dir_all(&cfg.checkpoint.criu.empty_plugin_dir)
             .map_err(|e| format!("creating the empty CRIU plugin dir: {e}"))?;

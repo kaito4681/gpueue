@@ -74,6 +74,10 @@ impl HostProbe for FakeHost {
     fn ensure_root_bind(&self, _path: &Path) -> io::Result<()> {
         Ok(())
     }
+
+    fn release_root_bind(&self, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Shared log and failure switches of [`FakeExecutor`]s.

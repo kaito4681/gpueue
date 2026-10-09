@@ -2,7 +2,6 @@
 //! and event delivery with replay.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,23 +21,34 @@ use crate::launcher::Launcher;
 /// How long a client may take to send its Hello.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bind the socket: replace a stale one, then restrict it to its owner and
-/// hand it to the daemon's uid (the peer uid is checked again per
-/// connection).
+/// Bind the socket: replace a stale one, create it mode 0600 and hand it to
+/// the daemon's uid (the peer uid is checked again per connection).
+///
+/// The socket's directory (`/run/puzuz`) is writable by the daemon, so the
+/// path is never followed with root privileges: the socket is created and
+/// set up inside a private (0700) sibling directory and then renamed into
+/// place (`rename` replaces whatever is at `path` without following it).
 pub fn bind(path: &Path, daemon_uid: u32) -> io::Result<UnixListener> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    if nix::unistd::geteuid().as_raw() != daemon_uid {
-        std::os::unix::fs::chown(path, Some(daemon_uid), None)?;
-    }
-    Ok(listener)
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let private = parent.join(format!(".helper-sock.{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&private);
+    std::fs::DirBuilder::new().mode(0o700).create(&private)?;
+    let staged = private.join("sock");
+    let result = (|| {
+        let listener = UnixListener::bind(&staged)?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
+        if nix::unistd::geteuid().as_raw() != daemon_uid {
+            std::os::unix::fs::lchown(&staged, Some(daemon_uid), None)?;
+        }
+        std::fs::rename(&staged, path)?;
+        Ok(listener)
+    })();
+    let _ = std::fs::remove_dir_all(&private);
+    result
 }
 
 /// Accept connections until `stop` fires.
