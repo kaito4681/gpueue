@@ -17,7 +17,8 @@
 //!    - cleans the mount namespace so that it only holds mounts that also
 //!      exist after a reboot: makes everything private, detaches the
 //!      inherited `/proc` tree and mounts a fresh `/proc` (CUDA fails with
-//!      error 304 without it), detaches volatile mounts (`/run/*`, `/mnt/*`,
+//!      error 304 without it), removes mounts hidden under later mounts
+//!      (see [`crate::mounts`]), detaches volatile mounts (`/run/*`, `/mnt/*`,
 //!      ...) and mounts private tmpfs on `/tmp` and `/dev/shm` (CRIU saves
 //!      their contents in the image),
 //!    - drops privileges: supplementary groups → gid → bounding set → uid →
@@ -53,6 +54,8 @@ use nix::unistd::{Gid, Pid, Uid};
 use puzuz_protocol::helper::ExitStatus;
 
 use crate::jobs::{JobFiles, MountPlan, ShimSpec, StartFailure, StartReport, write_status_to};
+use crate::mounts::MountTree;
+pub use crate::mounts::{path_under, unescape_octal};
 
 /// Exit code of the shim when it could not start the job.
 pub const SHIM_FAILURE: i32 = 125;
@@ -317,16 +320,6 @@ fn init(files: &JobFiles, start: &mut Option<File>) -> Result<i32, Failure> {
     }
 }
 
-/// Whether `path` is `prefix` or below it; a trailing `/` on `prefix` means
-/// strictly below.
-pub fn path_under(path: &str, prefix: &str) -> bool {
-    if prefix.len() > 1 && prefix.ends_with('/') {
-        return path.starts_with(prefix);
-    }
-    path.strip_prefix(prefix)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-}
-
 /// Mount points from `/proc/self/mountinfo` matching `plan`, in mountinfo
 /// order (parents first).
 pub fn mounts_to_prune(mountinfo: &str, plan: &MountPlan) -> Vec<String> {
@@ -341,24 +334,97 @@ pub fn mounts_to_prune(mountinfo: &str, plan: &MountPlan) -> Vec<String> {
         .collect()
 }
 
-/// Undo mountinfo's `\ooo` escapes.
-pub fn unescape_octal(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\'
-            && i + 3 < b.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 4], 8)
-        {
-            out.push(v);
-            i += 4;
-            continue;
+fn read_mount_tree() -> Result<MountTree, String> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|mi| MountTree::parse(&mi))
+        .map_err(|e| format!("reading mountinfo: {e}"))
+}
+
+/// Remove every mount that is hidden under a later mount (see
+/// [`crate::mounts`]). The job cannot reach such a mount, but CRIU dumps it
+/// as an external bind of a path that does not lead to it, and the restore
+/// fails. It cannot be unmounted by path while it is covered, so the
+/// covering mount `C` is set aside first:
+///
+/// 1. `open_tree(C, OPEN_TREE_CLONE | AT_RECURSIVE)`: a detached copy of
+///    `C` with its submounts (same superblocks, so the same contents),
+/// 2. detach `C`, which makes the mounts it hid reachable,
+/// 3. unmount those,
+/// 4. `move_mount` the copy back onto `C`'s mount point.
+///
+/// Everything happens in the job's private namespace before the job runs,
+/// so nothing else observes the gap. Loops because a mount can be hidden
+/// under several layers.
+fn remove_hidden_mounts() -> Result<(), String> {
+    use rustix::fs::CWD;
+    use rustix::mount::{MoveMountFlags, OpenTreeFlags, move_mount, open_tree};
+
+    for _ in 0..16 {
+        let tree = read_mount_tree()?;
+        let hidden = tree.hidden();
+        let Some(first) = hidden.first() else {
+            return Ok(());
+        };
+        let cover = first.covered_by_path.clone();
+        if cover == "/" {
+            eprintln!(
+                "puzuz shim: cannot remove {} (hidden under the root mount); \
+                 the job will not be restorable",
+                first.mount_point
+            );
+            return Ok(());
         }
-        out.push(b[i]);
-        i += 1;
+        let ids: Vec<u64> = hidden
+            .iter()
+            .filter(|h| h.covered_by == first.covered_by)
+            .map(|h| h.id)
+            .collect();
+        let copy = match open_tree(
+            CWD,
+            cover.as_str(),
+            OpenTreeFlags::OPEN_TREE_CLONE
+                | OpenTreeFlags::AT_RECURSIVE
+                | OpenTreeFlags::OPEN_TREE_CLOEXEC,
+        ) {
+            Ok(fd) => fd,
+            Err(e) => {
+                // Old kernel (< 5.2): keep going, the dump will refuse.
+                eprintln!(
+                    "puzuz shim: cannot copy {cover} to uncover {}: {e}; \
+                     the job will not be restorable",
+                    first.mount_point
+                );
+                return Ok(());
+            }
+        };
+        umount2(cover.as_str(), MntFlags::MNT_DETACH)
+            .map_err(|e| format!("detaching {cover} to uncover hidden mounts: {e}"))?;
+        // Unmount what is reachable now; anything still covered (several
+        // layers) is handled in the next round.
+        let res = read_mount_tree().map(|now| {
+            for id in ids {
+                if let Some(m) = now.get(id)
+                    && now.resolve(&m.mount_point).last() == Some(&id)
+                {
+                    let _ = umount2(m.mount_point.as_str(), MntFlags::MNT_DETACH);
+                }
+            }
+        });
+        move_mount(
+            &copy,
+            "",
+            CWD,
+            cover.as_str(),
+            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+        )
+        .map_err(|e| format!("re-attaching {cover}: {e}"))?;
+        res?;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    let left = read_mount_tree()?.hidden();
+    if !left.is_empty() {
+        eprintln!("puzuz shim: hidden mounts left: {left:?}; the job will not be restorable");
+    }
+    Ok(())
 }
 
 fn setup_mounts(plan: &MountPlan) -> Result<(), String> {
@@ -381,6 +447,7 @@ fn setup_mounts(plan: &MountPlan) -> Result<(), String> {
         None::<&str>,
     )
     .map_err(|e| format!("mounting /proc: {e}"))?;
+    remove_hidden_mounts()?;
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
         .map_err(|e| format!("reading mountinfo: {e}"))?;
     // Deepest first; mounts already gone with a parent fail harmlessly.

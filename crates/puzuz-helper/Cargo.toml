@@ -24,7 +24,7 @@ clap.workspace = true
 tokio.workspace = true
 zbus.workspace = true
 nix.workspace = true
-rustix = { workspace = true, features = ["thread", "process"] }
+rustix = { workspace = true, features = ["thread", "process", "mount"] }
 
 [dev-dependencies]
 tempfile.workspace = true

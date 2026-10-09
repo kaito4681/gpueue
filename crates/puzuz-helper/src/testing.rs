@@ -21,6 +21,7 @@ pub struct FakeHost {
     available: Mutex<Option<u64>>,
     cuda: Mutex<Vec<u32>>,
     mounts: Mutex<Vec<String>>,
+    unreachable: Mutex<Vec<String>>,
 }
 
 impl FakeHost {
@@ -47,6 +48,11 @@ impl FakeHost {
     /// Mount points reported for every job.
     pub fn set_mount_points(&self, mounts: Vec<String>) {
         *self.mounts.lock().unwrap() = mounts;
+    }
+
+    /// Mounts reported as depending on a hidden mount, for every job.
+    pub fn set_unreachable_mounts(&self, mounts: Vec<String>) {
+        *self.unreachable.lock().unwrap() = mounts;
     }
 
     pub fn set_available(&self, bytes: u64) {
@@ -89,6 +95,10 @@ impl HostProbe for FakeHost {
 
     fn mount_points(&self, _pid: u32) -> io::Result<Vec<String>> {
         Ok(self.mounts.lock().unwrap().clone())
+    }
+
+    fn unreachable_mounts(&self, _pid: u32) -> io::Result<Vec<String>> {
+        Ok(self.unreachable.lock().unwrap().clone())
     }
 }
 

@@ -240,9 +240,45 @@ pub fn summarize_criu_log(log: &str, max_lines: usize) -> Vec<String> {
         .collect()
 }
 
+/// Paths that CRIU's dump log (`-v4`) names as auto-detected external
+/// mounts (`--external mnt[]`): `mnt: autodetected external mount <path>
+/// for ./<mount point>(<id>)`. A restore bind-mounts each `<path>` from
+/// under `--root`, so all of them must exist on the restoring host.
+pub fn criu_external_mounts(log: &str) -> Vec<String> {
+    const MARK: &str = "autodetected external mount ";
+    let mut out: Vec<String> = Vec::new();
+    for l in log.lines() {
+        let Some((_, rest)) = l.split_once(MARK) else {
+            continue;
+        };
+        let Some((path, _)) = rest.rsplit_once(" for ./") else {
+            continue;
+        };
+        if !out.iter().any(|p| p == path) {
+            out.push(path.to_owned());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_mounts_from_a_dump_log() {
+        let log = "\
+(00.069149) mnt: autodetected external mount /run for ./run(9393)
+(00.069297) mnt: autodetected external mount /run/nvidia-persistenced/socket for ./run/nvidia-persistenced/socket(9319)
+(00.069300) mnt: autodetected external mount /data a for b for ./data a for b(9318)
+(00.069301) mnt: autodetected external mount /run for ./x(9300)
+(00.069302) mnt: something else
+";
+        assert_eq!(
+            criu_external_mounts(log),
+            ["/run", "/run/nvidia-persistenced/socket", "/data a for b"]
+        );
+    }
 
     const HELP_595: &str = "\
 CUDA checkpoint and restore utility.

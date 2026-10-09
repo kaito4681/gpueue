@@ -11,6 +11,7 @@
 //! - [`launcher`]: how job units are started (systemd over D-Bus, or a fake).
 //! - [`shim`]: the job unit's main process (PID/mount namespace init).
 //! - [`host`]: `/proc`, `nvidia-smi`, users and mounts.
+//! - [`mounts`]: mountinfo analysis (hidden mounts, CRIU's external binds).
 
 pub mod config;
 pub mod engine;
@@ -18,6 +19,7 @@ pub mod events;
 pub mod host;
 pub mod jobs;
 pub mod launcher;
+pub mod mounts;
 pub mod notify;
 pub mod server;
 pub mod shim;

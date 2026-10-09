@@ -39,9 +39,46 @@ use crate::validate::{self, Rejection};
 /// File in a checkpoint directory recording the job's owner, so a restore
 /// can check it without trusting the daemon.
 pub const OWNER_FILE: &str = "helper-job.json";
-/// File in a checkpoint directory listing the mount points of the job's
-/// mount namespace at dump time; a restore needs all of them to exist.
+/// File in a checkpoint directory recording what the job's mount namespace
+/// depends on ([`SavedMounts`]); a restore needs all of it to exist.
 pub const MOUNTS_FILE: &str = "helper-mounts.json";
+
+/// Contents of [`MOUNTS_FILE`]. Older helpers wrote only the list of mount
+/// points.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SavedMounts {
+    Full {
+        /// Mount points of the job's namespace at dump time.
+        mount_points: Vec<String>,
+        /// Paths CRIU bind-mounts from the host on restore (its
+        /// auto-detected external mounts, from the dump log).
+        #[serde(default)]
+        external_sources: Vec<String>,
+    },
+    MountPoints(Vec<String>),
+}
+
+impl SavedMounts {
+    /// Every path that must exist on the restoring host, without
+    /// duplicates.
+    pub fn required_paths(&self) -> Vec<&str> {
+        let (a, b): (&[String], &[String]) = match self {
+            SavedMounts::Full {
+                mount_points,
+                external_sources,
+            } => (mount_points, external_sources),
+            SavedMounts::MountPoints(m) => (m, &[]),
+        };
+        let mut out: Vec<&str> = Vec::new();
+        for p in a.iter().chain(b) {
+            if !out.contains(&p.as_str()) {
+                out.push(p);
+            }
+        }
+        out
+    }
+}
 
 /// Creates an [`Executor`] for one checkpoint or restore.
 pub type ExecutorFactory = Arc<dyn Fn() -> Box<dyn Executor + Send> + Send + Sync>;
@@ -898,18 +935,23 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         }
         validate::check_credentials(&*self.host, record.uid, record.gid, None)?;
         // CRIU fails with "Can't stat mountpoint" / "Failed to open_tree"
-        // when a mount point of the job's namespace is gone (e.g. under a
-        // /run that was rebuilt at boot); say so up front.
-        if let Ok(bytes) = fs::read(dir.root().join(MOUNTS_FILE)) {
-            let mounts: Vec<String> = serde_json::from_slice(&bytes).unwrap_or_default();
-            let missing: Vec<&String> = mounts
-                .iter()
+        // when a mount point of the job's namespace or the host path of an
+        // external bind mount is gone (e.g. under a /run that was rebuilt
+        // at boot, or hidden under another mount); say so up front.
+        if let Ok(bytes) = fs::read(dir.root().join(MOUNTS_FILE))
+            && let Ok(mounts) = serde_json::from_slice::<SavedMounts>(&bytes)
+        {
+            let missing: Vec<&str> = mounts
+                .required_paths()
+                .into_iter()
                 .filter(|m| fs::symlink_metadata(m).is_err())
                 .collect();
             if !missing.is_empty() {
                 return Err(error(
                     HelperErrorCode::InvalidRequest,
-                    format!("mount points of the checkpoint are missing on this host: {missing:?}"),
+                    format!(
+                        "paths the checkpoint's mounts depend on are missing on this host: {missing:?}"
+                    ),
                 ));
             }
         }
@@ -1224,6 +1266,18 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     let mounts = host
         .mount_points(init_pid)
         .map_err(|e| format!("reading the job's mounts: {e}"))?;
+    // An image that depends on a hidden mount can never be restored, not
+    // even on this host; refuse before touching the job (it keeps running).
+    let unreachable = host
+        .unreachable_mounts(init_pid)
+        .map_err(|e| format!("reading the job's mounts: {e}"))?;
+    if !unreachable.is_empty() {
+        return Err(format!(
+            "the job's mounts {unreachable:?} are only reachable through mounts hidden under \
+             other mounts, so CRIU could not restore them; restart the job to get a clean \
+             mount namespace"
+        ));
+    }
     let available = host.available_bytes(base).map_err(|e| e.to_string())?;
     space::check_free_space(rss, meta.vram_bytes, available).map_err(|e| e.to_string())?;
 
@@ -1255,7 +1309,13 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     owner.phase = RecordPhase::Checkpointed;
     let owner_json = serde_json::to_vec_pretty(&owner).map_err(|e| e.to_string())?;
     write_atomic(&dir.root().join(OWNER_FILE), &owner_json).map_err(|e| e.to_string())?;
-    let mounts_json = serde_json::to_vec_pretty(&mounts).map_err(|e| e.to_string())?;
+    let saved = SavedMounts::Full {
+        mount_points: mounts,
+        external_sources: fs::read_to_string(dir.dump_log())
+            .map(|log| probe::criu_external_mounts(&log))
+            .unwrap_or_default(),
+    };
+    let mounts_json = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
     write_atomic(&dir.root().join(MOUNTS_FILE), &mounts_json).map_err(|e| e.to_string())?;
     dir.finalize(meta).map_err(|e| e.to_string())
 }
