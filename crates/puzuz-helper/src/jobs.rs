@@ -77,6 +77,14 @@ pub struct ShimSpec {
     pub envs: BTreeMap<String, String>,
     pub cwd: PathBuf,
     pub log_path: PathBuf,
+    /// Mode of the log file (0660 in the helper-managed log directory so
+    /// the daemon can truncate it; 0640 elsewhere).
+    #[serde(default = "default_log_mode")]
+    pub log_mode: u32,
+}
+
+fn default_log_mode() -> u32 {
+    0o640
 }
 
 /// Written by the shim once the job has been started (or failed to).

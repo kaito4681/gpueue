@@ -185,7 +185,7 @@ fn init(files: &JobFiles) -> Result<i32, Failure> {
         .open(files.exit_status())
         .map_err(|e| Failure::other(format!("opening {}: {e}", files.exit_status().display())))?;
 
-    let log = open_log(&spec.log_path)?;
+    let log = open_log(&spec.log_path, spec.log_mode)?;
     std::env::set_current_dir(&spec.cwd).map_err(|e| Failure {
         kind: StartFailure::PermissionDenied,
         message: format!("cannot enter {}: {e}", spec.cwd.display()),
@@ -218,7 +218,7 @@ fn init(files: &JobFiles) -> Result<i32, Failure> {
 
 /// Open (creating) the log for appending, as the owner, refusing symlinks
 /// and anything that is not a regular file owned by the owner.
-fn open_log(path: &Path) -> Result<File, Failure> {
+fn open_log(path: &Path, mode: u32) -> Result<File, Failure> {
     let denied = |e: io::Error| Failure {
         kind: StartFailure::PermissionDenied,
         message: format!("cannot open log {}: {e}", path.display()),
@@ -226,7 +226,7 @@ fn open_log(path: &Path) -> Result<File, Failure> {
     let f = OpenOptions::new()
         .append(true)
         .create(true)
-        .mode(0o640)
+        .mode(mode & 0o660)
         .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
         .open(path)
         .map_err(denied)?;
@@ -237,6 +237,10 @@ fn open_log(path: &Path) -> Result<File, Failure> {
             "not a regular file owned by the job's owner",
         )));
     }
+    // The unit's umask would strip group write; set the mode explicitly.
+    use std::os::unix::fs::PermissionsExt;
+    f.set_permissions(std::fs::Permissions::from_mode(mode & 0o660))
+        .map_err(denied)?;
     Ok(f)
 }
 

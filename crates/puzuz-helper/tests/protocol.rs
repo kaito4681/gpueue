@@ -310,8 +310,12 @@ async fn spawn_validates_and_sets_cuda_env() {
     assert_eq!(spawned[0].argv, ["sh", "-c", "python train.py"]);
     // The shim input (with the environment) is gone once the job runs.
     assert!(!spawned[0].files.spec().exists());
-    // The per-user log directory was created.
-    assert!(env.root.join("logs").join(uid().to_string()).is_dir());
+    // The per-user log directory was created, group-writable for the daemon.
+    let log_dir = env.root.join("logs").join(uid().to_string());
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(&log_dir).unwrap().permissions(),
+    );
+    assert_eq!(mode & 0o7777, 0o2770);
     assert_eq!(c.running().await, [(JobId(1), RunningPhase::Running)]);
 
     // Signals are forwarded and STOP/CONT tracked.
@@ -362,8 +366,11 @@ async fn exit_events_are_persisted_replayed_and_acked() {
     assert!(env.launcher.unit(JobId(1)).is_none(), "unit released");
     drop(c);
 
-    // Not acknowledged: replayed on the next connection.
+    // Not acknowledged: replayed on the next connection, before the answer
+    // to the first request (the daemon reconciles with list_running).
     let mut c = env.client().await;
+    assert!(c.running().await.is_empty());
+    assert_eq!(c.events.len(), 1, "replay must precede the response");
     assert_eq!(c.event().await.seq, EventSeq(1));
     assert_eq!(
         c.request(Request::AckEvents { up_to: EventSeq(1) }).await,

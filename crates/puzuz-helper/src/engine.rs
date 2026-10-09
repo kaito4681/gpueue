@@ -387,6 +387,11 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     envs: envs.clone(),
                     cwd: req.cwd.clone(),
                     log_path: req.log_path.clone(),
+                    log_mode: if self.is_managed_log(req) {
+                        0o660
+                    } else {
+                        0o640
+                    },
                 },
                 req.uid,
                 req.gid,
@@ -407,12 +412,22 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         self.launcher.spawn(&spec).await.map_err(Into::into)
     }
 
+    fn is_managed_log(&self, req: &SpawnRequest) -> bool {
+        let user_dir = self.cfg.log_base.join(req.uid.0.to_string());
+        req.log_path.parent() == Some(user_dir.as_path())
+    }
+
     /// `<log base>/<uid>/` is created by the helper: owned by the user,
-    /// group `puzuz` (setgid, so logs inherit it and the daemon can read
-    /// them), mode 2750. Logs elsewhere are the owner's business.
+    /// group `puzuz`, mode 2770. The setgid bit makes logs inherit the
+    /// group, and group write lets the unprivileged daemon delete and
+    /// truncate logs (remove, clean, reset, restart in place) without a
+    /// helper round trip; logs there are created 0660. The daemon can thus
+    /// also create files there, but the shim only ever appends to a regular
+    /// file owned by the job's owner. Logs elsewhere are the owner's
+    /// business.
     fn ensure_log_dir(&self, req: &SpawnRequest) -> io::Result<()> {
         let user_dir = self.cfg.log_base.join(req.uid.0.to_string());
-        if req.log_path.parent() != Some(user_dir.as_path()) {
+        if !self.is_managed_log(req) {
             return Ok(());
         }
         fs::DirBuilder::new()
@@ -436,7 +451,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         if m.uid() != req.uid.0 || m.gid() != self.cfg.daemon_gid {
             std::os::unix::fs::lchown(&user_dir, Some(req.uid.0), Some(self.cfg.daemon_gid))?;
         }
-        fs::set_permissions(&user_dir, fs::Permissions::from_mode(0o2750))
+        fs::set_permissions(&user_dir, fs::Permissions::from_mode(0o2770))
     }
 
     // -- signal -----------------------------------------------------------

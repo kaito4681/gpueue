@@ -140,7 +140,7 @@ pub async fn handle_connection<L: Launcher, H: HostProbe>(
     }
 
     // Writer task: everything sent to the daemon goes through `out`.
-    let (out, mut out_rx) = mpsc::channel::<HelperMessage>(256);
+    let (out, mut out_rx) = mpsc::unbounded_channel::<HelperMessage>();
     let writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             let line = match encode_line(&msg) {
@@ -157,9 +157,19 @@ pub async fn handle_connection<L: Launcher, H: HostProbe>(
         let _ = wr.shutdown().await;
     });
 
-    // Events: replay the unacknowledged ones, then follow live ones.
+    // Events: queue every unacknowledged one *before* reading the first
+    // request, so the replay always precedes any response (the daemon
+    // reconciles with `list_running` and relies on having seen them).
+    // Then follow live ones.
     let (pending, rx) = helper.events().subscribe();
-    let events_task = tokio::spawn(forward_events(helper.clone(), pending, rx, out.clone()));
+    let mut last = EventSeq(0);
+    for env in pending {
+        last = env.seq;
+        if out.send(HelperMessage::Event(env)).is_err() {
+            return Ok(());
+        }
+    }
+    let events_task = tokio::spawn(forward_events(helper.clone(), last, rx, out.clone()));
 
     let result = loop {
         let msg = tokio::select! {
@@ -180,9 +190,7 @@ pub async fn handle_connection<L: Launcher, H: HostProbe>(
                 let out = out.clone();
                 tokio::spawn(async move {
                     let result = helper.handle(env.request).await;
-                    let _ = out
-                        .send(HelperMessage::Response(Response { id: env.id, result }))
-                        .await;
+                    let _ = out.send(HelperMessage::Response(Response { id: env.id, result }));
                 });
             }
         }
@@ -197,17 +205,10 @@ pub async fn handle_connection<L: Launcher, H: HostProbe>(
 
 async fn forward_events<L: Launcher, H: HostProbe>(
     helper: Arc<Helper<L, H>>,
-    pending: Vec<EventEnvelope>,
+    mut last: EventSeq,
     mut rx: broadcast::Receiver<EventEnvelope>,
-    out: mpsc::Sender<HelperMessage>,
+    out: mpsc::UnboundedSender<HelperMessage>,
 ) {
-    let mut last = EventSeq(0);
-    for env in pending {
-        last = env.seq;
-        if out.send(HelperMessage::Event(env)).await.is_err() {
-            return;
-        }
-    }
     loop {
         let batch = match rx.recv().await {
             Ok(env) => vec![env],
@@ -220,7 +221,7 @@ async fn forward_events<L: Launcher, H: HostProbe>(
                 continue;
             }
             last = env.seq;
-            if out.send(HelperMessage::Event(env)).await.is_err() {
+            if out.send(HelperMessage::Event(env)).is_err() {
                 return;
             }
         }
