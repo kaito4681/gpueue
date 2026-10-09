@@ -596,6 +596,11 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
         (Event::RestoreFailed { reason }, JobState::Restoring) => {
             Transition::to(JobState::Checkpointed).with(Effect::RecordRestoreError(reason.clone()))
         }
+        // The restore was already given up as interrupted (`Lost` below)
+        // when the helper's own answer arrived: keep its more precise reason.
+        (Event::RestoreFailed { reason }, JobState::Checkpointed) => {
+            Transition::unchanged().with(Effect::RecordRestoreError(reason.clone()))
+        }
 
         (Event::Lost, JobState::Running | JobState::Paused) => done(JobResult::Lost),
         // An unfinished dump is useless.
@@ -1219,6 +1224,26 @@ mod tests {
         );
         assert!(!t.effects.contains(&Effect::DeleteCheckpointImage));
         assert!(on_event(&job(1, JobState::Checkpointed), &Event::RestoreSucceeded).is_err());
+
+        // A failure reported after the restore was given up as interrupted
+        // only replaces the recorded reason.
+        let t = on_event(
+            &job(1, JobState::Checkpointed),
+            &Event::RestoreFailed {
+                reason: "criu restore failed".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(t.next, None);
+        assert_eq!(
+            t.effects,
+            vec![Effect::RecordRestoreError("criu restore failed".to_owned())]
+        );
+        let failed = Event::RestoreFailed {
+            reason: "x".to_owned(),
+        };
+        assert!(on_event(&job(1, JobState::Running), &failed).is_err());
+        assert!(on_event(&job(1, JobState::RestoreQueued { enqueued_at: 0 }), &failed).is_err());
     }
 
     #[test]

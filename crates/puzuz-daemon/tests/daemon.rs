@@ -1106,6 +1106,196 @@ async fn owner_is_warned_once_about_a_failed_checkpoint() {
 }
 
 // ---------------------------------------------------------------------------
+// Restore failures: every reason ends up in the owner's view, survives a
+// daemon restart and is reported to the owner once.
+// ---------------------------------------------------------------------------
+
+impl Harness {
+    /// The daemon's database, opened next to the running daemon.
+    fn store(&self) -> puzuz_core::storage::Store {
+        puzuz_core::storage::Store::open(self.dir.path().join("daemon/state.sqlite")).unwrap()
+    }
+
+    /// Runs a job of alice and checkpoints it.
+    async fn checkpointed_job(&self) -> JobId {
+        let admin = self.client(ADMIN);
+        let id = self.client(ALICE).add(&job_request("train", &[])).await;
+        admin.wait_state(id, &JobState::Running).await;
+        admin.action(id, "checkpoint", json!(null)).await;
+        admin.wait_state(id, &JobState::Checkpointed).await;
+        id
+    }
+}
+
+fn last_error(job: &JobView) -> Option<&str> {
+    job.details.as_ref()?.last_error.as_deref()
+}
+
+/// Waits (polling as the admin, so the owner's warning stays pending) until
+/// the job is checkpointed again with `reason`.
+async fn wait_restore_error(h: &Harness, id: JobId, reason: &str) -> JobView {
+    h.client(ADMIN)
+        .wait_for(id, "checkpointed with the reason", |j| {
+            j.state == JobState::Checkpointed && last_error(j) == Some(reason)
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_failure_without_a_checkpoint_record_is_kept() {
+    use puzuz_core::storage::{JobErrorKind, StoreOps};
+
+    let mut h = Harness::new(0).await;
+    let id = h.checkpointed_job().await;
+    // The job has an image but the daemon lost its record of it.
+    h.stop().await;
+    assert!(h.store().delete_checkpoint(id).unwrap());
+    h.start(0).await;
+    let admin = h.client(ADMIN);
+
+    let reason = "criu restore failed (unit inactive)";
+    h.helper
+        .set_restore_outcome(FakeOutcome::Fail(reason.to_owned()));
+    let reply = admin
+        .action(id, "restore", json!({"immediate": true}))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    wait_restore_error(&h, id, reason).await;
+    assert!(h.helper.has_image(id));
+
+    // Stored durably with the job, visible to its owner only.
+    let error = h.store().get_job_error(id).unwrap().unwrap();
+    assert_eq!(
+        (error.kind, error.message.as_str()),
+        (JobErrorKind::Restore, reason)
+    );
+    assert!(h.client(BOB).job(id).await.details.is_none());
+    let body = String::from_utf8(h.client(BOB).get("/v1/jobs").await.body.to_vec()).unwrap();
+    assert!(!body.contains("unit inactive"), "leaked: {body}");
+
+    // It survives a restart; the owner is warned once.
+    h.stop().await;
+    h.start(0).await;
+    let alice = h.client(ALICE);
+    assert!(h.client(BOB).get("/v1/jobs").await.warnings().is_empty());
+    assert_eq!(
+        alice.get("/v1/jobs").await.warnings(),
+        [Warning::RestoreFailed { job: id }]
+    );
+    assert!(alice.get("/v1/jobs").await.warnings().is_empty());
+    assert_eq!(last_error(&alice.job(id).await), Some(reason));
+
+    // A successful restore clears it.
+    h.helper.set_restore_outcome(FakeOutcome::Succeed);
+    alice
+        .action(id, "restore", json!({"immediate": true}))
+        .await;
+    let job = alice.wait_state(id, &JobState::Running).await;
+    assert_eq!(last_error(&job), None);
+    assert_eq!(h.store().get_job_error(id).unwrap(), None);
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_refused_by_the_helper_keeps_the_reason() {
+    let mut h = Harness::new(0).await;
+    let id = h.checkpointed_job().await;
+    let admin = h.client(ADMIN);
+
+    // The helper's up-front checks (GPU compatibility, missing mounts, ...)
+    // refuse the request itself.
+    let reason = "checkpoint is not compatible with this host: [\"driver 570 != 580\"]";
+    h.helper.set_restore_rejection(Some(reason));
+    admin
+        .action(id, "restore", json!({"immediate": true}))
+        .await;
+    let job = wait_restore_error(&h, id, reason).await;
+    assert_eq!(job.checkpoint_size_bytes, Some(4096));
+    assert_eq!(
+        h.client(ALICE).get("/v1/groups").await.warnings(),
+        [Warning::RestoreFailed { job: id }]
+    );
+
+    // The same failure again is not a new warning; a different one is.
+    admin
+        .action(id, "restore", json!({"immediate": true}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_restore_error(&h, id, reason).await;
+    assert!(
+        h.client(ALICE)
+            .get("/v1/groups")
+            .await
+            .warnings()
+            .is_empty()
+    );
+
+    h.helper.set_restore_rejection(None);
+    h.helper
+        .set_restore_outcome(FakeOutcome::Fail("criu: Can't stat mountpoint".to_owned()));
+    admin
+        .action(id, "restore", json!({"immediate": true}))
+        .await;
+    wait_restore_error(&h, id, "criu: Can't stat mountpoint").await;
+    assert_eq!(
+        h.client(ALICE).get("/v1/groups").await.warnings(),
+        [Warning::RestoreFailed { job: id }]
+    );
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_restore_is_recorded_and_refined_by_a_late_answer() {
+    use puzuz_core::storage::StoreOps;
+
+    let mut h = Harness::new(0).await;
+    let id = h.checkpointed_job().await;
+    // The daemon went away while restoring and the helper forgot the job.
+    h.stop().await;
+    h.store()
+        .update_job_state(id, &JobState::Restoring, None, None)
+        .unwrap();
+    h.start(0).await;
+    wait_restore_error(&h, id, "the restore was interrupted").await;
+
+    // The helper's own reason, arriving late, replaces the guess.
+    h.helper
+        .emit_event(puzuz_protocol::helper::Event::RestoreFinished {
+            job: id,
+            outcome: puzuz_protocol::helper::RestoreOutcome::Failed {
+                reason: "criu restore failed (unit inactive)".to_owned(),
+            },
+        });
+    wait_restore_error(&h, id, "criu restore failed (unit inactive)").await;
+    assert_eq!(
+        h.client(ALICE).get("/v1/jobs").await.warnings(),
+        [Warning::RestoreFailed { job: id }]
+    );
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_failure_reason_is_the_owners_last_error() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    h.helper
+        .set_spawn_failure(Some("cwd /tmp/gone does not exist"));
+    let id = alice.add(&job_request("x", &[])).await;
+    let job = alice
+        .wait_for(id, "failed to spawn", |j| {
+            matches!(j.state, JobState::Done { .. })
+        })
+        .await;
+    assert_eq!(last_error(&job), Some("cwd /tmp/gone does not exist"));
+    assert!(h.client(BOB).job(id).await.details.is_none());
+
+    h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
 // The launch window: the daemon records a job as Running (or Restoring)
 // before the helper has answered its spawn (or restore) request. The fake
 // holds those requests to make the window deterministic.

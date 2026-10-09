@@ -1,17 +1,18 @@
 //! Warnings the daemon hands to a user on their next command.
 //!
 //! The spec asks that the owner of a job whose checkpoint failed is told
-//! about it the next time they run a command. The daemon attaches pending
-//! warnings for the caller to any successful response in the
-//! [`WARNINGS_HEADER`] header (only for requests that carry the
-//! [`VERSION_HEADER`](super::VERSION_HEADER), i.e. from the puzuz CLI) and
-//! then considers them delivered. The CLI prints them on stderr.
+//! about it the next time they run a command; a failed restore is reported
+//! the same way. The daemon attaches pending warnings for the caller to any
+//! successful response in the [`WARNINGS_HEADER`] header (only for requests
+//! that carry the [`VERSION_HEADER`](super::VERSION_HEADER), i.e. from the
+//! puzuz CLI) and then considers them delivered. The CLI prints them on
+//! stderr.
 //!
 //! The header value is a comma-separated list of `kind=argument` items, e.g.
-//! `checkpoint-failed=3, checkpoint-failed=5`. Clients skip kinds they do
-//! not know, so new kinds can be added without a new API version. Details
-//! (such as the failure reason) are not in the header; they stay in the job
-//! view.
+//! `checkpoint-failed=3, restore-failed=5`. Clients skip kinds they do not
+//! know, so new kinds can be added without a new API version. Details (such
+//! as the failure reason) are not in the header; they stay in the job view
+//! (`JobDetails::last_error`).
 
 use std::fmt;
 
@@ -24,17 +25,29 @@ pub const WARNINGS_HEADER: &str = "x-puzuz-warnings";
 pub enum Warning {
     /// The last checkpoint of this job (owned by the caller) failed.
     CheckpointFailed { job: JobId },
+    /// Restoring this job (owned by the caller) failed; it is still
+    /// checkpointed.
+    RestoreFailed { job: JobId },
 }
 
 const CHECKPOINT_FAILED: &str = "checkpoint-failed";
+const RESTORE_FAILED: &str = "restore-failed";
 
 impl Warning {
+    /// The job the warning is about.
+    pub fn job(&self) -> JobId {
+        match self {
+            Warning::CheckpointFailed { job } | Warning::RestoreFailed { job } => *job,
+        }
+    }
+
     /// Renders warnings as a [`WARNINGS_HEADER`] value.
     pub fn encode_header(warnings: &[Warning]) -> String {
         warnings
             .iter()
             .map(|warning| match warning {
                 Warning::CheckpointFailed { job } => format!("{CHECKPOINT_FAILED}={job}"),
+                Warning::RestoreFailed { job } => format!("{RESTORE_FAILED}={job}"),
             })
             .collect::<Vec<_>>()
             .join(", ")
@@ -47,10 +60,10 @@ impl Warning {
             .split(',')
             .filter_map(|item| {
                 let (kind, argument) = item.trim().split_once('=')?;
+                let job = || argument.parse().ok().map(JobId);
                 match kind {
-                    CHECKPOINT_FAILED => Some(Warning::CheckpointFailed {
-                        job: JobId(argument.parse().ok()?),
-                    }),
+                    CHECKPOINT_FAILED => Some(Warning::CheckpointFailed { job: job()? }),
+                    RESTORE_FAILED => Some(Warning::RestoreFailed { job: job()? }),
                     _ => None,
                 }
             })
@@ -65,6 +78,11 @@ impl fmt::Display for Warning {
                 f,
                 "the checkpoint of job {job} failed; it was not saved (see `puzuz status`)"
             ),
+            Warning::RestoreFailed { job } => write!(
+                f,
+                "restoring job {job} failed; it is still checkpointed \
+                 (see `puzuz log {job}` for the reason)"
+            ),
         }
     }
 }
@@ -77,15 +95,29 @@ mod tests {
     fn header_round_trips_and_skips_unknown_items() {
         let warnings = [
             Warning::CheckpointFailed { job: JobId(3) },
+            Warning::RestoreFailed { job: JobId(4) },
             Warning::CheckpointFailed { job: JobId(5) },
         ];
         let header = Warning::encode_header(&warnings);
-        assert_eq!(header, "checkpoint-failed=3, checkpoint-failed=5");
+        assert_eq!(
+            header,
+            "checkpoint-failed=3, restore-failed=4, checkpoint-failed=5"
+        );
         assert_eq!(Warning::parse_header(&header), warnings);
         assert_eq!(
-            Warning::parse_header("future-kind=x,checkpoint-failed=7,checkpoint-failed=no, junk"),
+            Warning::parse_header(
+                "future-kind=x,checkpoint-failed=7,checkpoint-failed=no, restore-failed=, junk"
+            ),
             [Warning::CheckpointFailed { job: JobId(7) }]
         );
         assert!(Warning::parse_header("").is_empty());
+    }
+
+    #[test]
+    fn warnings_name_their_job() {
+        let restore = Warning::RestoreFailed { job: JobId(9) };
+        assert_eq!(restore.job(), JobId(9));
+        assert!(restore.to_string().contains("restoring job 9 failed"));
+        assert_eq!(Warning::CheckpointFailed { job: JobId(2) }.job(), JobId(2));
     }
 }

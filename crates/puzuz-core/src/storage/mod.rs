@@ -26,6 +26,7 @@
 mod checkpoints;
 mod gpus;
 mod groups;
+mod job_errors;
 mod jobs;
 pub mod migrations;
 
@@ -198,8 +199,45 @@ pub struct CheckpointRecord {
     pub driver_version: Option<String>,
     pub created_at: Timestamp,
     pub status: CheckpointStatus,
-    /// Why the dump failed (a summary of the CRIU log).
+    /// Why the dump failed (a summary of the CRIU log). Restore errors are
+    /// kept as a [`JobError`] instead.
     pub failure_reason: Option<String>,
+}
+
+/// What a [`JobError`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobErrorKind {
+    /// Restoring the job's checkpoint failed; the job stays checkpointed.
+    Restore,
+}
+
+impl JobErrorKind {
+    /// The value stored in `job_errors.kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobErrorKind::Restore => "restore",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "restore" => JobErrorKind::Restore,
+            _ => return None,
+        })
+    }
+}
+
+/// The last error recorded for a job that its state does not carry by
+/// itself (a failed spawn or dump is part of the job's result and of its
+/// checkpoint record). A job has at most one; it is removed with the job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobError {
+    pub job_id: JobId,
+    pub kind: JobErrorKind,
+    /// The reason, as reported by the helper or found by the daemon.
+    pub message: String,
+    pub recorded_at: Timestamp,
 }
 
 /// Criteria for [`StoreOps::list_jobs`]. Unset fields match everything;
@@ -328,14 +366,14 @@ pub trait StoreOps: sealed::Sealed {
         jobs::update_state(self.conn(), id, state, started_at, finished_at)
     }
 
-    /// Removes a job together with its env, GPUs, dependencies and
-    /// checkpoint record. Its id is never handed out again.
+    /// Removes a job together with its env, GPUs, dependencies, checkpoint
+    /// record and recorded error. Its id is never handed out again.
     fn remove_job(&self, id: JobId) -> Result<()> {
         jobs::remove(self.conn(), id)
     }
 
-    /// Swaps the ids of two jobs (`switch`): each job keeps its spec, state
-    /// and checkpoint record but takes the other's id, and dependencies on
+    /// Swaps the ids of two jobs (`switch`): each job keeps its spec, state,
+    /// checkpoint record and recorded error but takes the other's id, and dependencies on
     /// either job are swapped too. Fails with
     /// [`Error::JobNotFound`](crate::Error::JobNotFound) if either is missing.
     fn swap_job_ids(&self, a: JobId, b: JobId) -> Result<()> {
@@ -442,6 +480,47 @@ pub trait StoreOps: sealed::Sealed {
         atomic(self.conn(), |c| {
             checkpoints::acknowledge_failures(c, job_ids)
         })
+    }
+
+    // ----- job errors -----
+
+    /// Records `message` as the last error of `job_id`, replacing any
+    /// previous one. A different error is reported to the owner again (see
+    /// [`unacknowledged_job_errors`]); recording the same error twice (e.g.
+    /// from a replayed helper event) is not. Fails with
+    /// [`Error::JobNotFound`](crate::Error::JobNotFound) if the job does not
+    /// exist.
+    ///
+    /// [`unacknowledged_job_errors`]: StoreOps::unacknowledged_job_errors
+    fn set_job_error(
+        &self,
+        job_id: JobId,
+        kind: JobErrorKind,
+        message: &str,
+        at: Timestamp,
+    ) -> Result<()> {
+        job_errors::set(self.conn(), job_id, kind, message, at)
+    }
+
+    fn get_job_error(&self, job_id: JobId) -> Result<Option<JobError>> {
+        job_errors::get(self.conn(), job_id)
+    }
+
+    /// Forgets the job's error; returns whether there was one.
+    fn clear_job_error(&self, job_id: JobId) -> Result<bool> {
+        job_errors::clear(self.conn(), job_id)
+    }
+
+    /// Jobs of `owner` with an error the owner has not been told about yet,
+    /// ordered by id.
+    fn unacknowledged_job_errors(&self, owner: Uid) -> Result<Vec<(JobId, JobErrorKind)>> {
+        job_errors::unacknowledged(self.conn(), owner)
+    }
+
+    /// Marks the errors of `job_ids` as reported to their owner. Jobs
+    /// without an error are ignored.
+    fn acknowledge_job_errors(&self, job_ids: &[JobId]) -> Result<()> {
+        atomic(self.conn(), |c| job_errors::acknowledge(c, job_ids))
     }
 }
 

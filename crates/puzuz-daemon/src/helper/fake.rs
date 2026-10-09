@@ -54,6 +54,7 @@ struct State {
     spawn_failure: Option<String>,
     checkpoint_outcome: FakeOutcome,
     restore_outcome: FakeOutcome,
+    restore_rejection: Option<String>,
     ignore_sigterm: bool,
     spawned: Vec<SpawnRequest>,
     signals: Vec<(JobId, i32)>,
@@ -248,6 +249,18 @@ impl FakeHelper {
         self.with(|s| s.restore_outcome = outcome);
     }
 
+    /// Make the next restore requests be refused up front with `reason`, as
+    /// the real helper's synchronous checks do (e.g. an incompatible GPU);
+    /// `None` to accept them again.
+    pub fn set_restore_rejection(&self, reason: Option<&str>) {
+        self.with(|s| s.restore_rejection = reason.map(str::to_owned));
+    }
+
+    /// Emits `event` as if the helper had produced it (e.g. a late answer).
+    pub fn emit_event(&self, event: Event) {
+        self.with(|s| s.emit(event));
+    }
+
     /// Jobs survive SIGTERM (so only the SIGKILL after the grace period
     /// stops them).
     pub fn set_ignore_sigterm(&self, ignore: bool) {
@@ -388,6 +401,12 @@ impl FakeHelper {
                 return Err(HelperError::Rejected {
                     code: HelperErrorCode::Busy,
                     message: format!("job {job} is already running"),
+                });
+            }
+            if let Some(reason) = &s.restore_rejection {
+                return Err(HelperError::Rejected {
+                    code: HelperErrorCode::InvalidRequest,
+                    message: reason.clone(),
                 });
             }
             let outcome = if !s.images.contains(&job) {

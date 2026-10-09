@@ -112,9 +112,33 @@ ALTER TABLE checkpoints
     CHECK (failure_acknowledged IN (0, 1));
 "#;
 
+/// Version 3: `job_errors`, the last error recorded for a job (currently
+/// a failed restore), independent of its checkpoint record.
+///
+/// Restore errors used to be written into `checkpoints.failure_reason` of
+/// the (complete) record, so they were lost for a job without one. They are
+/// moved here; `checkpoints.failure_reason` now only explains failed dumps.
+/// `acknowledged` is set once the owner has been told (like
+/// `checkpoints.failure_acknowledged`); moved errors were never reported.
+/// `kind` is checked by the code, not by SQL, so new kinds need no table
+/// rebuild.
+const V3: &str = r#"
+CREATE TABLE job_errors (
+    job_id       INTEGER PRIMARY KEY NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL,
+    message      TEXT NOT NULL,
+    recorded_at  INTEGER NOT NULL,
+    acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0, 1))
+) STRICT;
+INSERT INTO job_errors (job_id, kind, message, recorded_at, acknowledged)
+    SELECT job_id, 'restore', failure_reason, created_at, 0 FROM checkpoints
+    WHERE status = 'complete' AND failure_reason IS NOT NULL;
+UPDATE checkpoints SET failure_reason = NULL WHERE status = 'complete';
+"#;
+
 /// All migrations, in order. The schema version after migrating is
 /// `MIGRATIONS.len()`.
-pub(crate) const MIGRATIONS: &[&str] = &[V1, V2];
+pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 /// The schema version this build of puzuz writes.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

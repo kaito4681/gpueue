@@ -115,6 +115,57 @@ fn full_view_for_owner_and_admin() {
 }
 
 #[test]
+fn result_reasons_are_the_owners_last_error_only() {
+    let stranger = Caller {
+        uid: Uid(1001),
+        is_admin: false,
+    };
+    for result in [
+        JobResult::FailedToSpawn {
+            reason: "no such directory /home/alice/proj".into(),
+        },
+        JobResult::CheckpointFailed {
+            reason: "criu: /home/alice/proj busy".into(),
+        },
+    ] {
+        let reason = match &result {
+            JobResult::FailedToSpawn { reason } | JobResult::CheckpointFailed { reason } => {
+                reason.clone()
+            }
+            _ => unreachable!(),
+        };
+        for state in [
+            JobState::Done {
+                result: result.clone(),
+            },
+            JobState::Terminating {
+                result: result.clone(),
+            },
+        ] {
+            let job = Job {
+                state,
+                ..sample_job()
+            };
+            let full = JobView::full(&job);
+            assert_eq!(
+                full.details.unwrap().last_error.as_deref(),
+                Some(reason.as_str())
+            );
+            let json = serde_json::to_string(&JobView::for_caller(&job, &stranger)).unwrap();
+            assert!(!json.contains("/home/alice"), "leaked: {json}");
+            assert!(!json.contains("last_error"), "leaked: {json}");
+        }
+    }
+    let killed = Job {
+        state: JobState::Done {
+            result: JobResult::Killed,
+        },
+        ..sample_job()
+    };
+    assert_eq!(JobView::full(&killed).details.unwrap().last_error, None);
+}
+
+#[test]
 fn add_job_request_golden() {
     let req = AddJobRequest {
         spec: JobSpec {

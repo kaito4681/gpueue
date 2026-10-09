@@ -253,6 +253,7 @@ pub(super) fn swap_ids(conn: &Connection, a: JobId, b: JobId) -> Result<()> {
         ("job_deps", "job_id"),
         ("job_deps", "depends_on"),
         ("checkpoints", "job_id"),
+        ("job_errors", "job_id"),
     ] {
         let sql = format!("UPDATE {table} SET {column} = ?2 WHERE {column} = ?1");
         let mut stmt = conn.prepare_cached(&sql)?;

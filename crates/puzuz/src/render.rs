@@ -54,11 +54,29 @@ pub fn state_text(job: &JobView) -> (String, Color) {
         JobState::Paused => ("Paused".into(), Color::White),
         JobState::Checkpointing => ("Checkpointing".into(), Color::Yellow),
         JobState::Checkpointed => {
-            let text = match job.checkpoint_size_bytes {
-                Some(size) => format!("Checkpointed ({})", human_bytes(size)),
-                None => "Checkpointed".into(),
+            // The last error of a checkpointed job is a failed restore (only
+            // in the owner's view; `puzuz log` shows the reason).
+            let mut notes = Vec::new();
+            if let Some(size) = job.checkpoint_size_bytes {
+                notes.push(human_bytes(size));
+            }
+            let restore_failed = last_error(job).is_some();
+            if restore_failed {
+                notes.push("restore failed".into());
+            }
+            let text = if notes.is_empty() {
+                "Checkpointed".into()
+            } else {
+                format!("Checkpointed ({})", notes.join(", "))
             };
-            (text, Color::Cyan)
+            (
+                text,
+                if restore_failed {
+                    Color::Red
+                } else {
+                    Color::Cyan
+                },
+            )
         }
         JobState::RestoreQueued { .. } => ("Restore queued".into(), Color::Yellow),
         JobState::Restoring => ("Restoring".into(), Color::Yellow),
@@ -73,6 +91,11 @@ pub fn state_text(job: &JobView) -> (String, Color) {
             JobResult::Lost => ("Lost".into(), Color::Red),
         },
     }
+}
+
+/// The last error the daemon recorded for the job (owner's view only).
+fn last_error(job: &JobView) -> Option<&str> {
+    job.details.as_ref()?.last_error.as_deref()
 }
 
 /// Short state name for `wait` messages (`Queued`, `Running`, ...).
@@ -500,7 +523,7 @@ pub fn log_header(job: &JobView, ctx: &RenderCtx) -> String {
     title.load_preset("││─ └──┘     ─ ┌┐  ");
     title.set_header(vec![
         ctx.style.cell(format!("Job {}: ", job.id), None, true),
-        ctx.style.cell(state, Some(color), false),
+        ctx.style.cell(&state, Some(color), false),
     ]);
 
     let mut info = ctx.table();
@@ -524,6 +547,18 @@ pub fn log_header(job: &JobView, ctx: &RenderCtx) -> String {
     }
     if let Some(end) = job.finished_at {
         add("End:", ctx.clock.format_long(end));
+    }
+    // Unless the title already says it (a failed spawn or dump).
+    if let Some(error) = last_error(job)
+        && !state.contains(error)
+    {
+        let label = match job.state {
+            JobState::Checkpointed | JobState::RestoreQueued { .. } | JobState::Restoring => {
+                "Restore failed:"
+            }
+            _ => "Last error:",
+        };
+        add(label, error.to_owned());
     }
     if let Some(column) = info.column_mut(0) {
         column.set_cell_alignment(CellAlignment::Right);

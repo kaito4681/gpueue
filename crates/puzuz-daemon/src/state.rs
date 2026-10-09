@@ -29,7 +29,9 @@ use puzuz_core::lifecycle::{self, Effect, ShutdownAction, Transition};
 use puzuz_core::model::{Caller, GpuIndex, Group, Job, JobId, JobResult, JobState, Timestamp, Uid};
 use puzuz_core::scheduler;
 use puzuz_core::storage::StorageError;
-use puzuz_core::storage::{CheckpointRecord, CheckpointStatus, JobFilter, Store, StoreOps, Tx};
+use puzuz_core::storage::{
+    CheckpointRecord, CheckpointStatus, JobError, JobErrorKind, JobFilter, Store, StoreOps, Tx,
+};
 use puzuz_protocol::api::{self, ErrorCode, JobView, Warning};
 use puzuz_protocol::helper::{
     self as hp, CheckpointOptions, CheckpointOutcome, HelperErrorCode, RestoreOutcome,
@@ -85,23 +87,41 @@ impl Db {
 pub struct JobInfo {
     pub job: Job,
     pub checkpoint: Option<CheckpointRecord>,
+    /// The last error recorded for the job (a failed restore).
+    pub error: Option<JobError>,
 }
 
 impl JobInfo {
     pub fn load(store: &impl StoreOps, job: Job) -> Result<Self, StorageError> {
         let checkpoint = store.get_checkpoint(job.id)?;
-        Ok(Self { job, checkpoint })
+        let error = store.get_job_error(job.id)?;
+        Ok(Self {
+            job,
+            checkpoint,
+            error,
+        })
     }
 
-    /// The view `caller` may see, with checkpoint information filled in.
+    /// The view `caller` may see, with checkpoint information and the last
+    /// error (owner and administrators only) filled in.
     pub fn view(&self, caller: &Caller) -> JobView {
         let mut view = JobView::for_caller(&self.job, caller);
-        if let Some(record) = &self.checkpoint {
-            if record.status == CheckpointStatus::Complete {
-                view.checkpoint_size_bytes = record.size_bytes;
-            }
-            if let Some(details) = view.details.as_mut() {
-                details.last_error = record.failure_reason.clone();
+        if let Some(record) = &self.checkpoint
+            && record.status == CheckpointStatus::Complete
+        {
+            view.checkpoint_size_bytes = record.size_bytes;
+        }
+        if let Some(details) = view.details.as_mut() {
+            // A recorded error is the most recent one: it is cleared by the
+            // next successful restore, and a dump can only follow that.
+            let dump_failure = self
+                .checkpoint
+                .as_ref()
+                .and_then(|record| record.failure_reason.clone());
+            if let Some(error) = &self.error {
+                details.last_error = Some(error.message.clone());
+            } else if dump_failure.is_some() {
+                details.last_error = dump_failure;
             }
         }
         view
@@ -434,27 +454,43 @@ impl Core {
         }
     }
 
-    /// The warnings `owner` has not been shown yet (one indexed read).
+    /// The warnings `owner` has not been shown yet (failed dumps and failed
+    /// restores), ordered by job.
     pub async fn pending_warnings(&self, owner: Uid) -> ApiResult<Vec<Warning>> {
-        let ids = self
-            .read(move |s| s.unacknowledged_checkpoint_failures(owner))
+        let (dumps, errors) = self
+            .read(move |s| {
+                Ok((
+                    s.unacknowledged_checkpoint_failures(owner)?,
+                    s.unacknowledged_job_errors(owner)?,
+                ))
+            })
             .await?;
-        Ok(ids
+        let mut warnings: Vec<Warning> = dumps
             .into_iter()
             .map(|job| Warning::CheckpointFailed { job })
-            .collect())
+            .chain(errors.into_iter().map(|(job, kind)| match kind {
+                JobErrorKind::Restore => Warning::RestoreFailed { job },
+            }))
+            .collect();
+        warnings.sort_by_key(Warning::job);
+        Ok(warnings)
     }
 
     /// Records that `warnings` have been shown to their owner.
     pub async fn acknowledge_warnings(&self, warnings: &[Warning]) -> ApiResult<()> {
-        let ids: Vec<JobId> = warnings
-            .iter()
-            .map(|w| match w {
-                Warning::CheckpointFailed { job } => *job,
-            })
-            .collect();
-        self.read(move |s| s.acknowledge_checkpoint_failures(&ids))
-            .await
+        let mut dumps = Vec::new();
+        let mut errors = Vec::new();
+        for warning in warnings {
+            match warning {
+                Warning::CheckpointFailed { job } => dumps.push(*job),
+                Warning::RestoreFailed { job } => errors.push(*job),
+            }
+        }
+        self.read(move |s| {
+            s.acknowledge_checkpoint_failures(&dumps)?;
+            s.acknowledge_job_errors(&errors)
+        })
+        .await
     }
 
     // -----------------------------------------------------------------
@@ -553,8 +589,14 @@ impl Core {
         changes: &mut Changes,
     ) -> ApiResult<Option<Job>> {
         if transition.next.is_some() {
+            let restored = job.state == JobState::Restoring
+                && transition.next.as_ref() == Some(&JobState::Running);
             transition.apply(job, now);
             tx.update_job_state(job.id, &job.state, job.started_at, job.finished_at)?;
+            if restored {
+                // The job runs again; an earlier failed attempt is history.
+                tx.clear_job_error(job.id)?;
+            }
             changes.updated(job.id);
         }
         let mut copy = None;
@@ -566,14 +608,10 @@ impl Core {
                     changes.updated(job.id);
                 }
                 Effect::RecordRestoreError(reason) => {
-                    if let Some(record) = tx.get_checkpoint(job.id)? {
-                        tx.set_checkpoint_status(
-                            job.id,
-                            record.status,
-                            record.size_bytes,
-                            Some(reason),
-                        )?;
-                    }
+                    // Kept with the job rather than with its checkpoint
+                    // record, so the reason survives without a record.
+                    tracing::warn!(job = %job.id, "restore failed: {reason}");
+                    tx.set_job_error(job.id, JobErrorKind::Restore, reason, now)?;
                     changes.updated(job.id);
                 }
                 Effect::DeleteCheckpointImage => {
@@ -848,6 +886,8 @@ impl Core {
                 // The dump never started; the job keeps running.
                 let id = job.id;
                 let reason = e.to_string();
+                let core = self.clone();
+                let now = now_ms();
                 self.write(move |tx, ch| {
                     if let Some(job) = tx.get_job(id)?
                         && job.state == JobState::Checkpointing
@@ -860,6 +900,12 @@ impl Core {
                                 None,
                                 Some(&reason),
                             )?;
+                        } else {
+                            tx.put_checkpoint(&CheckpointRecord {
+                                status: CheckpointStatus::Failed,
+                                failure_reason: Some(reason),
+                                ..core.new_checkpoint_record(&job, now)
+                            })?;
                         }
                         ch.updated(id);
                     }

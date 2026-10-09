@@ -985,3 +985,185 @@ fn swap_job_ids_moves_every_row_and_dependency() {
         Error::JobNotFound(JobId(99)),
     );
 }
+
+// ----- job errors -----
+
+#[test]
+fn job_errors_are_kept_without_a_checkpoint_record_and_reported_once() {
+    let mut store = Store::open_in_memory().unwrap();
+    let a = store
+        .insert_job(Uid(1), &spec("a"), &JobState::Checkpointed, 0)
+        .unwrap();
+    let b = store
+        .insert_job(Uid(1), &spec("b"), &JobState::Checkpointed, 0)
+        .unwrap();
+    let other = store
+        .insert_job(Uid(2), &spec("c"), &JobState::Checkpointed, 0)
+        .unwrap();
+    assert_eq!(store.get_job_error(a.id).unwrap(), None);
+
+    // No checkpoint record is needed.
+    store
+        .set_job_error(a.id, JobErrorKind::Restore, "criu restore failed", 10)
+        .unwrap();
+    store
+        .set_job_error(other.id, JobErrorKind::Restore, "x", 11)
+        .unwrap();
+    assert_eq!(
+        store.get_job_error(a.id).unwrap(),
+        Some(JobError {
+            job_id: a.id,
+            kind: JobErrorKind::Restore,
+            message: "criu restore failed".to_owned(),
+            recorded_at: 10,
+        })
+    );
+    assert_eq!(
+        store.unacknowledged_job_errors(Uid(1)).unwrap(),
+        [(a.id, JobErrorKind::Restore)]
+    );
+    assert_eq!(
+        store.unacknowledged_job_errors(Uid(2)).unwrap(),
+        [(other.id, JobErrorKind::Restore)]
+    );
+
+    store
+        .acknowledge_job_errors(&[a.id, b.id, JobId(99)])
+        .unwrap();
+    assert!(store.unacknowledged_job_errors(Uid(1)).unwrap().is_empty());
+
+    // The same error again (a replayed event) is not reported again ...
+    store
+        .set_job_error(a.id, JobErrorKind::Restore, "criu restore failed", 12)
+        .unwrap();
+    assert!(store.unacknowledged_job_errors(Uid(1)).unwrap().is_empty());
+    assert_eq!(store.get_job_error(a.id).unwrap().unwrap().recorded_at, 12);
+    // ... a different one is.
+    store
+        .set_job_error(a.id, JobErrorKind::Restore, "driver mismatch", 13)
+        .unwrap();
+    assert_eq!(
+        store.unacknowledged_job_errors(Uid(1)).unwrap(),
+        [(a.id, JobErrorKind::Restore)]
+    );
+
+    assert!(store.clear_job_error(a.id).unwrap());
+    assert!(!store.clear_job_error(a.id).unwrap());
+    assert_eq!(store.get_job_error(a.id).unwrap(), None);
+
+    // Unknown jobs are rejected; removal and switch take the error along.
+    assert_domain(
+        store
+            .set_job_error(JobId(99), JobErrorKind::Restore, "x", 0)
+            .unwrap_err(),
+        Error::JobNotFound(JobId(99)),
+    );
+    store.remove_job(other.id).unwrap();
+    assert_eq!(count(&store, "job_errors"), 0);
+
+    let q1 = store
+        .insert_job(Uid(1), &spec("q1"), &queued(1), 1)
+        .unwrap();
+    let q2 = store
+        .insert_job(Uid(1), &spec("q2"), &queued(1), 1)
+        .unwrap();
+    store
+        .set_job_error(q1.id, JobErrorKind::Restore, "moved", 0)
+        .unwrap();
+    store
+        .transaction(|tx| tx.swap_job_ids(q1.id, q2.id))
+        .unwrap();
+    assert_eq!(store.get_job_error(q1.id).unwrap(), None);
+    assert_eq!(
+        store.get_job_error(q2.id).unwrap().unwrap().message,
+        "moved"
+    );
+}
+
+#[test]
+fn unknown_job_error_kind_is_reported_as_an_error() {
+    let store = Store::open_in_memory().unwrap();
+    let job = store.insert_job(Uid(1), &spec("a"), &queued(0), 0).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO job_errors (job_id, kind, message, recorded_at)
+             VALUES (?1, 'bogus', 'x', 0)",
+            [job.id.0],
+        )
+        .unwrap();
+    assert!(store.get_job_error(job.id).is_err());
+}
+
+#[test]
+fn version_two_database_moves_restore_errors_out_of_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(migrations::MIGRATIONS[0]).unwrap();
+        conn.execute_batch(migrations::MIGRATIONS[1]).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO jobs (id, owner_uid, command, cwd, group_name, state, state_data,
+                                   created_at)
+                 VALUES (?1, 1, 'x', x'2f', 'default', ?2, ?3, 0)",
+            )
+            .unwrap();
+        for (id, state) in [
+            (0, JobState::Checkpointed),
+            (1, JobState::Checkpointing),
+            (2, JobState::Checkpointed),
+        ] {
+            insert
+                .execute(rusqlite::params![
+                    id,
+                    state.name(),
+                    serde_json::to_string(&state).unwrap()
+                ])
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO checkpoints (job_id, path, created_at, status, failure_reason,
+                                      failure_acknowledged)
+             VALUES (0, x'2f', 7, 'complete', 'criu restore failed', 0),
+                    (1, x'2f', 8, 'failed', 'dump failed', 1),
+                    (2, x'2f', 9, 'complete', NULL, 0);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+
+    // The restore error moved to the job ...
+    assert_eq!(
+        store.get_job_error(JobId(0)).unwrap(),
+        Some(JobError {
+            job_id: JobId(0),
+            kind: JobErrorKind::Restore,
+            message: "criu restore failed".to_owned(),
+            recorded_at: 7,
+        })
+    );
+    let record = store.get_checkpoint(JobId(0)).unwrap().unwrap();
+    assert_eq!(record.status, CheckpointStatus::Complete);
+    assert_eq!(record.failure_reason, None);
+    // ... and is reported once, as it never was before.
+    assert_eq!(
+        store.unacknowledged_job_errors(Uid(1)).unwrap(),
+        [(JobId(0), JobErrorKind::Restore)]
+    );
+
+    // Failed dumps keep their reason and acknowledgement.
+    let failed = store.get_checkpoint(JobId(1)).unwrap().unwrap();
+    assert_eq!(failed.failure_reason.as_deref(), Some("dump failed"));
+    assert!(
+        store
+            .unacknowledged_checkpoint_failures(Uid(1))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.get_job_error(JobId(1)).unwrap(), None);
+    assert_eq!(store.get_job_error(JobId(2)).unwrap(), None);
+}

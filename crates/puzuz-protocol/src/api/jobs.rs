@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use puzuz_core::authz;
-use puzuz_core::model::{Caller, GpuIndex, Job, JobId, JobSpec, JobState, Timestamp, Uid};
+use puzuz_core::model::{
+    Caller, GpuIndex, Job, JobId, JobResult, JobSpec, JobState, Timestamp, Uid,
+};
 use serde::{Deserialize, Serialize};
 
 use super::ApiError;
@@ -47,23 +49,35 @@ pub struct JobDetails {
     pub command: String,
     pub cwd: PathBuf,
     pub envs: BTreeMap<String, String>,
-    /// The last checkpoint/restore error (e.g. a CRIU log summary). Kept
-    /// private because it can mention paths and command lines.
+    /// The last error recorded for the job: why its last restore, dump or
+    /// spawn failed (e.g. a CRIU log summary). Kept private because it can
+    /// mention paths and command lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
 
 impl JobView {
     /// The view with every field, for the owner or an administrator.
+    /// `last_error` holds the reason carried by the job's result, if any;
+    /// the daemon fills in errors kept elsewhere (failed restores and dumps).
     pub fn full(job: &Job) -> Self {
         let mut view = Self::redacted(job);
         view.label = job.spec.label.clone();
         view.state = job.state.clone();
+        let reason = match &job.state {
+            JobState::Done { result } | JobState::Terminating { result } => match result {
+                JobResult::FailedToSpawn { reason } | JobResult::CheckpointFailed { reason } => {
+                    Some(reason.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
         view.details = Some(JobDetails {
             command: job.spec.command.clone(),
             cwd: job.spec.cwd.clone(),
             envs: job.spec.envs.clone(),
-            last_error: None,
+            last_error: reason,
         });
         view
     }

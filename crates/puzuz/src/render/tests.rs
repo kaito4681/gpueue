@@ -388,6 +388,74 @@ fn log_header_shows_job_details() {
     );
 }
 
+fn with_error(mut job: JobView, error: &str) -> JobView {
+    job.details.as_mut().unwrap().last_error = Some(error.into());
+    job
+}
+
+#[test]
+fn failed_restore_is_shown_in_status_and_log_header() {
+    let mut checkpointed = with_error(
+        job(6, JobState::Checkpointed),
+        "criu restore failed (unit inactive)",
+    );
+    checkpointed.checkpoint_size_bytes = Some(4096);
+    assert_eq!(
+        state_text(&checkpointed),
+        (
+            "Checkpointed (4.0 KiB, restore failed)".to_owned(),
+            Color::Red
+        )
+    );
+    let mut no_size = checkpointed.clone();
+    no_size.checkpoint_size_bytes = None;
+    assert_eq!(state_text(&no_size).0, "Checkpointed (restore failed)");
+
+    let output = log_header(&checkpointed, &ctx());
+    let expected = lines(&[
+        "┌────────────────────────┐",
+        "│ Job 6:    checkpointed │",
+        "└────────────────────────┘",
+        "       Command: sleep 60                            ",
+        "          Path: /tmp                                ",
+        "         Owner: alice                               ",
+        "Restore failed: criu restore failed (unit inactive) ",
+    ]);
+    assert_eq!(output, expected, "\n{output}");
+
+    // A redacted view has no error to show.
+    let mut foreign = checkpointed.clone();
+    foreign.details = None;
+    assert_eq!(state_text(&foreign).0, "Checkpointed (4.0 KiB)");
+    assert!(!log_header(&foreign, &ctx()).contains("criu"));
+}
+
+#[test]
+fn log_header_does_not_repeat_the_reason_of_the_result() {
+    let spawn = with_error(
+        job(
+            7,
+            JobState::Done {
+                result: JobResult::FailedToSpawn {
+                    reason: "no such directory".into(),
+                },
+            },
+        ),
+        "no such directory",
+    );
+    let output = log_header(&spawn, &ctx());
+    assert_eq!(output.matches("no such directory").count(), 1, "\n{output}");
+    assert!(!output.contains("Last error:"), "\n{output}");
+
+    // A failed dump of a job that kept running.
+    let running = with_error(job(8, JobState::Running), "criu: tcp connection");
+    let output = log_header(&running, &ctx());
+    assert!(
+        output.contains("Last error: criu: tcp connection"),
+        "\n{output}"
+    );
+}
+
 #[test]
 fn last_lines_keeps_the_tail() {
     assert_eq!(last_lines(b"a\nb\nc\n", 2), (&b"b\nc\n"[..], true));
