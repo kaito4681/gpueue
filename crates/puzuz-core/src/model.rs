@@ -112,6 +112,12 @@ pub enum JobState {
     },
     /// A checkpoint is being restored.
     Restoring,
+    /// Being stopped (SIGTERM, then SIGKILL) after a failed checkpoint. The
+    /// process may still hold its GPUs, so the job keeps its slots until the
+    /// exit is observed; it then becomes `Done` with `result`.
+    Terminating {
+        result: JobResult,
+    },
     Done {
         result: JobResult,
     },
@@ -129,6 +135,7 @@ impl JobState {
             JobState::Checkpointed => "checkpointed",
             JobState::RestoreQueued { .. } => "restore_queued",
             JobState::Restoring => "restoring",
+            JobState::Terminating { .. } => "terminating",
             JobState::Done { .. } => "done",
         }
     }
@@ -137,7 +144,11 @@ impl JobState {
     pub fn occupies_slot(&self) -> bool {
         matches!(
             self,
-            JobState::Running | JobState::Paused | JobState::Checkpointing | JobState::Restoring
+            JobState::Running
+                | JobState::Paused
+                | JobState::Checkpointing
+                | JobState::Restoring
+                | JobState::Terminating { .. }
         )
     }
 }

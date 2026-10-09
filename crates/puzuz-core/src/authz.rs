@@ -185,20 +185,27 @@ pub fn view(caller: &Caller, job: &Job) -> JobView {
 
 /// Strip free-text failure reasons from a state; everything else is public.
 pub fn redact_state(state: &JobState) -> JobState {
-    let result = match state {
-        JobState::Done {
-            result: JobResult::FailedToSpawn { .. },
-        } => JobResult::FailedToSpawn {
+    match state {
+        JobState::Done { result } => JobState::Done {
+            result: redact_result(result),
+        },
+        JobState::Terminating { result } => JobState::Terminating {
+            result: redact_result(result),
+        },
+        other => other.clone(),
+    }
+}
+
+fn redact_result(result: &JobResult) -> JobResult {
+    match result {
+        JobResult::FailedToSpawn { .. } => JobResult::FailedToSpawn {
             reason: REDACTED.to_owned(),
         },
-        JobState::Done {
-            result: JobResult::CheckpointFailed { .. },
-        } => JobResult::CheckpointFailed {
+        JobResult::CheckpointFailed { .. } => JobResult::CheckpointFailed {
             reason: REDACTED.to_owned(),
         },
-        other => return other.clone(),
-    };
-    JobState::Done { result }
+        other => other.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -402,5 +409,14 @@ mod tests {
             redact_state(&JobState::Checkpointed),
             JobState::Checkpointed
         );
+
+        let terminating = JobState::Terminating {
+            result: JobResult::CheckpointFailed {
+                reason: "criu: /home/alice/secret".to_owned(),
+            },
+        };
+        let redacted = format!("{:?}", redact_state(&terminating));
+        assert!(!redacted.contains("alice"));
+        assert!(redacted.contains(REDACTED));
     }
 }

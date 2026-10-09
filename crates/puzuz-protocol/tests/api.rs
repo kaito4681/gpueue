@@ -73,9 +73,10 @@ fn redacted_view_hides_private_fields() {
     let json = serde_json::to_string(&view).unwrap();
     assert_eq!(
         json,
-        r#"{"id":7,"owner":1000,"group":"default","gpus":[0,1],"dependencies":[],"priority":0,"label":"run1","no_checkpoint":false,"state":{"state":"running"},"created_at":1000,"started_at":2000,"finished_at":null}"#
+        r#"{"id":7,"owner":1000,"group":"default","gpus":[0,1],"dependencies":[],"priority":0,"label":null,"no_checkpoint":false,"state":{"state":"running"},"created_at":1000,"started_at":2000,"finished_at":null}"#
     );
     for secret in [
+        "run1",
         "train.py",
         "/home/alice",
         "WANDB_API_KEY",

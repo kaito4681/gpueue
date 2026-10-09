@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use puzuz_core::authz;
 use puzuz_core::model::{Caller, GpuIndex, Job, JobId, JobSpec, JobState, Timestamp, Uid};
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,8 @@ impl JobView {
     /// The view with every field, for the owner or an administrator.
     pub fn full(job: &Job) -> Self {
         let mut view = Self::redacted(job);
+        view.label = job.spec.label.clone();
+        view.state = job.state.clone();
         view.details = Some(JobDetails {
             command: job.spec.command.clone(),
             cwd: job.spec.cwd.clone(),
@@ -65,7 +68,9 @@ impl JobView {
         view
     }
 
-    /// The view for users other than the owner: no command, cwd or envs.
+    /// The view for users other than the owner: no command, cwd, envs or
+    /// label, and free-text failure reasons are replaced by
+    /// [`authz::REDACTED`].
     pub fn redacted(job: &Job) -> Self {
         Self {
             id: job.id,
@@ -74,9 +79,9 @@ impl JobView {
             gpus: job.spec.gpus.clone(),
             dependencies: job.spec.dependencies.clone(),
             priority: job.spec.priority,
-            label: job.spec.label.clone(),
+            label: None,
             no_checkpoint: job.spec.no_checkpoint,
-            state: job.state.clone(),
+            state: authz::redact_state(&job.state),
             created_at: job.created_at,
             started_at: job.started_at,
             finished_at: job.finished_at,
@@ -88,7 +93,7 @@ impl JobView {
     /// The full view for the owner and administrators, the redacted one for
     /// everybody else.
     pub fn for_caller(job: &Job, caller: &Caller) -> Self {
-        if caller.is_admin || caller.uid == job.owner {
+        if authz::can_view_details(caller, job) {
             Self::full(job)
         } else {
             Self::redacted(job)

@@ -548,8 +548,9 @@ fn done(result: JobResult) -> Transition {
 /// - CRIU stops the process after a successful dump; that must be reported as
 ///   `CheckpointSucceeded`, not `Exited`. An `Exited` while `Checkpointing`
 ///   means the job ended on its own before the dump completed.
-/// - After a checkpoint failure the job is already `Done{CheckpointFailed}`
-///   while it is being terminated; its later `Exited` is accepted and ignored.
+/// - After a checkpoint failure the job is `Terminating{CheckpointFailed}`
+///   and keeps its slots until its `Exited` (or `Lost`) arrives; it then
+///   becomes `Done` with the checkpoint-failure result.
 pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
     let state = &job.state;
     let transition = match (event, state) {
@@ -562,12 +563,7 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
         (Event::Exited(status), JobState::Running | JobState::Paused | JobState::Checkpointing) => {
             done(status.result())
         }
-        (
-            Event::Exited(_),
-            JobState::Done {
-                result: JobResult::CheckpointFailed { .. },
-            },
-        ) => Transition::unchanged(),
+        (Event::Exited(_) | Event::Lost, JobState::Terminating { result }) => done(result.clone()),
 
         (Event::CheckpointSucceeded, JobState::Checkpointing) => {
             Transition::to(JobState::Checkpointed)
@@ -575,8 +571,10 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
         // CRIU leaves the process running when a dump fails; stop it, giving
         // it a chance to save its own checkpoint on SIGTERM.
         (Event::CheckpointFailed { reason }, JobState::Checkpointing) => {
-            done(JobResult::CheckpointFailed {
-                reason: reason.clone(),
+            Transition::to(JobState::Terminating {
+                result: JobResult::CheckpointFailed {
+                    reason: reason.clone(),
+                },
             })
             .with(Effect::Terminate)
             .with(Effect::DeleteCheckpointImage)
@@ -650,6 +648,11 @@ mod tests {
             JobState::Checkpointed,
             JobState::RestoreQueued { enqueued_at: 1 },
             JobState::Restoring,
+            JobState::Terminating {
+                result: JobResult::CheckpointFailed {
+                    reason: "x".to_owned(),
+                },
+            },
             JobState::Done {
                 result: JobResult::Success,
             },
@@ -1100,19 +1103,26 @@ mod tests {
                 result: JobResult::Killed
             })
         );
-        // Exit after checkpoint failure keeps the CheckpointFailed result.
-        let failed = job(
+        // Exit after checkpoint failure finishes with the CheckpointFailed result.
+        let failed = JobResult::CheckpointFailed {
+            reason: "r".to_owned(),
+        };
+        let terminating = job(
             1,
-            JobState::Done {
-                result: JobResult::CheckpointFailed {
-                    reason: "r".to_owned(),
-                },
+            JobState::Terminating {
+                result: failed.clone(),
             },
         );
-        assert_eq!(
-            on_event(&failed, &Event::Exited(ExitStatus::Signal(15))),
-            Ok(Transition::unchanged())
-        );
+        for event in [Event::Exited(ExitStatus::Signal(15)), Event::Lost] {
+            assert_eq!(
+                on_event(&terminating, &event).unwrap().next,
+                Some(JobState::Done {
+                    result: failed.clone()
+                })
+            );
+        }
+        let already_done = job(1, JobState::Done { result: failed });
+        assert!(on_event(&already_done, &Event::Exited(ExitStatus::Signal(15))).is_err());
         let success = job(
             1,
             JobState::Done {
@@ -1145,12 +1155,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             t.next,
-            Some(JobState::Done {
+            Some(JobState::Terminating {
                 result: JobResult::CheckpointFailed {
                     reason: "criu: dump failed".to_owned()
                 }
             })
         );
+        assert!(t.next.as_ref().unwrap().occupies_slot());
         assert_eq!(
             t.effects,
             vec![Effect::Terminate, Effect::DeleteCheckpointImage]
