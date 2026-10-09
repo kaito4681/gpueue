@@ -359,7 +359,15 @@ pub fn gpus(gpus: &[GpuView], ctx: &RenderCtx) -> String {
             .join(", ");
         table.add_row(vec![
             Cell::new(gpu.index),
-            Cell::new(&gpu.name),
+            if gpu.available {
+                Cell::new(&gpu.name)
+            } else {
+                ctx.style.cell(
+                    format!("{} (not detected)", gpu.name),
+                    Some(Color::Red),
+                    false,
+                )
+            },
             Cell::new(
                 gpu.memory_total_bytes
                     .map(human_bytes)
