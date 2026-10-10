@@ -251,6 +251,28 @@ fn events_golden() {
         ),
         r#"{"type":"event","seq":44,"event":"restore_finished","job":7,"outcome":{"result":"failed","reason":"the helper is stopping","code":"shutting_down"}}"#,
     );
+    assert_golden_line(
+        &event(
+            45,
+            Event::CheckpointFinished {
+                job: JobId(7),
+                outcome: CheckpointOutcome::failed("criu dump failed"),
+            },
+        ),
+        r#"{"type":"event","seq":45,"event":"checkpoint_finished","job":7,"outcome":{"result":"failed","reason":"criu dump failed"}}"#,
+    );
+    assert_golden_line(
+        &event(
+            46,
+            Event::CheckpointFinished {
+                job: JobId(7),
+                outcome: CheckpointOutcome::refused("not enough free space"),
+            },
+        ),
+        r#"{"type":"event","seq":46,"event":"checkpoint_finished","job":7,"outcome":{"result":"failed","reason":"not enough free space","code":"checkpoint_refused"}}"#,
+    );
+    assert!(CheckpointOutcome::refused("x").is_refused());
+    assert!(!CheckpointOutcome::failed("x").is_refused());
     assert!(ExitStatus::Exited { code: 0 }.success());
     assert!(!ExitStatus::Signaled { signal: 9 }.success());
 }

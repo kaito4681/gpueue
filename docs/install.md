@@ -260,8 +260,11 @@ unlimited).
   The helper also writes `shutdown-manifest.json` there after the dumps at system shutdown.
 - Each job has at most one image. It is deleted when the restore succeeds, when the job is removed
   (`remove`, `clean`, `reset`), or when the dump fails. A failed restore keeps the image.
+- After a failed dump the helper moves its `dump.log` to `failed-logs/<job id>-<unix ms>.log` in
+  the same directory (root only) and keeps the newest 20 of them. The job's last error names the
+  file.
 - Space: before each dump the helper requires free space of at least (RSS + VRAM of the job) × 1.2.
-  Otherwise the checkpoint fails. Images are not compressed. A job with 7 GB of VRAM produced an
+  Otherwise the checkpoint is refused and the job keeps running. Images are not compressed. A job with 7 GB of VRAM produced an
   8.1 GB image in tests. Do not use tmpfs (`puzuz doctor` fails on it). It also warns below 20 GiB
   free, or below the space left under `checkpoint_size_limit_bytes`.
 - Limit: with `checkpoint_size_limit_bytes`, the owner of a checkpoint that takes the total over
@@ -336,11 +339,13 @@ journalctl -u puzuz -u puzuz-helper          # daemon and helper
 journalctl -u 'puzuz-job-*'                  # job units (start/stop, OOM kills)
 puzuz status; puzuz log <id>                 # job state, last error, output
 sudo ls /var/lib/puzuz/checkpoints/<id>/     # dump.log, restore.log (CRIU logs, root only)
+sudo ls /var/lib/puzuz/checkpoints/failed-logs/   # dump.log of failed dumps (newest 20)
 ```
 
 Job output is written to `/var/lib/puzuz/logs/<uid>/<id>.log`. When a checkpoint or restore fails,
 the job's last error (shown by `puzuz status` and in the `puzuz log` header to the owner and
-administrators) contains a short summary of the CRIU log. The daemon logs at `info` level. For
+administrators) contains a short summary of the CRIU log. After a failed dump it also names the
+full log, e.g. `(CRIU log: /var/lib/puzuz/checkpoints/failed-logs/12-1760000000000.log)`. The daemon logs at `info` level. For
 more detail, set `Environment=RUST_LOG=debug` in a drop-in for `puzuz.service`.
 
 If the daemon is not running, every command fails with "cannot connect to the daemon socket". Check
@@ -367,23 +372,36 @@ stopped until `sudo systemctl start puzuz` or the next boot.
 
 ### Checkpoint failures
 
-A failed `puzuz checkpoint` stops the job (SIGTERM, then SIGKILL after `grace_secs`) and marks it
-`Checkpoint failed` with the reason. Common reasons:
+The helper checks the job before dumping it. If a check fails, the dump is **refused**: the job is
+not touched and keeps running, `puzuz checkpoint` fails with `checkpoint refused: <reason>; the job
+keeps running`, and the reason becomes the job's last error. When the refusal only comes when the
+dump is due (for example during `puzuz shutdown`, which then leaves the job running), the owner is
+warned on their next command. Refusals:
 
 - `not enough free space for the checkpoint: need N bytes, M available`: free space or move
-  `checkpoints_dir`.
+  `checkpoints_dir`, then checkpoint again.
+- `the job's mounts [...] are only reachable through mounts hidden under other mounts`: the job's
+  mount namespace depends on a mount that is hidden under another one, so it could never be
+  restored. Run the job again (`puzuz restart`). New jobs get a cleaned-up namespace.
+- Mounts covering `/` itself cannot be handled. puzuz refuses such dumps.
+- `<dir> is on tmpfs`: move `checkpoints_dir` to a disk.
+
+A dump that is attempted and **fails** stops the job (SIGTERM, then SIGKILL after `grace_secs`),
+because CRIU and cuda-checkpoint have already frozen it. The job is marked `Checkpoint failed`
+with a summary of the CRIU log and the path of the full log. Common reasons:
+
 - `Can't handle non-regular mapping` or `handle_device_vma plugin failed` in the CRIU summary: a
   process that a CUDA process forked without `exec` still maps `/dev/nvidia*`. The fork guard
   normally prevents this. Check that `fork_guard` is not `false`, that the program is not
   statically linked, and that the job was started after the guard was installed. Otherwise use
   the `spawn` or `forkserver` start method (`multiprocessing_context="forkserver"` for a PyTorch
   DataLoader).
-- `the job's mounts [...] are only reachable through mounts hidden under other mounts`: the job's
-  mount namespace depends on a mount that is hidden under another one, so it could never be
-  restored. Run the job again (`puzuz restart`). New jobs get a cleaned-up namespace.
-- Mounts covering `/` itself cannot be handled. puzuz refuses such dumps.
 - With `checkpoint_tcp_close = false`, CRIU refuses to dump jobs that have established TCP
   connections.
+
+During an OS shutdown or reboot, a job whose dump fails or is refused is stopped by systemd. After
+the boot it is shown as `Checkpoint failed` with the reason (refusals start with `checkpoint
+refused:`), and its owner is warned.
 
 ### Restore failures
 

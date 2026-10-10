@@ -33,6 +33,11 @@ pub enum FakeOutcome {
     #[default]
     Succeed,
     Fail(String),
+    /// Checkpoints only: accept the request, then report the dump refused
+    /// before the job was touched (`code: checkpoint_refused`), as the
+    /// helper does when its pre-checks fail at dump time. The job keeps
+    /// running.
+    Refuse(String),
 }
 
 /// A simulated live job.
@@ -59,6 +64,7 @@ struct State {
     checkpoint_outcome: FakeOutcome,
     restore_outcome: FakeOutcome,
     restore_rejection: Option<String>,
+    checkpoint_rejection: Option<String>,
     ignore_sigterm: bool,
     spawned: Vec<SpawnRequest>,
     signals: Vec<(JobId, i32)>,
@@ -290,6 +296,14 @@ impl FakeHelper {
         self.with(|s| s.checkpoint_outcome = outcome);
     }
 
+    /// Make the next checkpoint requests be refused up front with `reason`
+    /// (`checkpoint_refused`), as the helper's synchronous pre-checks do
+    /// (hidden mounts, not enough free space, ...); `None` to accept them
+    /// again.
+    pub fn set_checkpoint_rejection(&self, reason: Option<&str>) {
+        self.with(|s| s.checkpoint_rejection = reason.map(str::to_owned));
+    }
+
     pub fn set_restore_outcome(&self, outcome: FakeOutcome) {
         self.with(|s| s.restore_outcome = outcome);
     }
@@ -430,6 +444,12 @@ impl FakeHelper {
             if !s.jobs.contains_key(&job) {
                 return Err(not_found(job));
             }
+            if let Some(reason) = &s.checkpoint_rejection {
+                return Err(HelperError::Rejected {
+                    code: HelperErrorCode::CheckpointRefused,
+                    message: reason.clone(),
+                });
+            }
             let outcome = match s.checkpoint_outcome.clone() {
                 FakeOutcome::Succeed => {
                     s.jobs.remove(&job);
@@ -438,7 +458,8 @@ impl FakeHelper {
                         image_size_bytes: 4096,
                     }
                 }
-                FakeOutcome::Fail(reason) => CheckpointOutcome::Failed { reason },
+                FakeOutcome::Fail(reason) => CheckpointOutcome::failed(reason),
+                FakeOutcome::Refuse(reason) => CheckpointOutcome::refused(reason),
             };
             s.emit(Event::CheckpointFinished { job, outcome });
             Ok(())
@@ -491,7 +512,9 @@ impl FakeHelper {
                         );
                         RestoreOutcome::Success { pid }
                     }
-                    FakeOutcome::Fail(reason) => RestoreOutcome::failed(reason),
+                    FakeOutcome::Fail(reason) | FakeOutcome::Refuse(reason) => {
+                        RestoreOutcome::failed(reason)
+                    }
                 }
             };
             s.emit(Event::RestoreFinished { job, outcome });

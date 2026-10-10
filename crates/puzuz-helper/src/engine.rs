@@ -29,7 +29,7 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::config::{HelperConfig, SHUTDOWN_MANIFEST};
 use crate::events::EventStore;
-use crate::host::HostProbe;
+use crate::host::{HostProbe, ProcInfo};
 use crate::jobs::{self, JobFiles, JobRecord, RecordPhase, ShimSpec, UnitKind};
 use crate::launcher::{
     LaunchError, LaunchSpec, Launcher, RestoreSpec, UnitState, restore_unit_name, unit_name,
@@ -110,6 +110,10 @@ pub enum ManifestResult {
     },
     Failed {
         reason: String,
+        /// The dump was refused before the job was touched (see
+        /// [`CheckpointOutcome::is_refused`]); systemd stops it either way.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        refused: bool,
     },
     /// `no_checkpoint` job, left for systemd to stop.
     Skipped,
@@ -319,7 +323,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 job,
                 image_dir,
                 options,
-            } => self.checkpoint(job, &image_dir, options),
+            } => self.checkpoint(job, &image_dir, options).await,
             Request::Restore(r) => self.restore(r),
             Request::DeleteCheckpoint { job, image_dir } => {
                 self.delete_checkpoint(job, &image_dir).await
@@ -740,7 +744,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
 
     // -- checkpoint -------------------------------------------------------
 
-    fn checkpoint(
+    async fn checkpoint(
         self: &Arc<Self>,
         job: JobId,
         image_dir: &Path,
@@ -760,6 +764,17 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             Err(res) => return res,
         };
         let guard = self.inflight.enter();
+        // Refuse up front what the dump would refuse anyway, so the caller
+        // gets the reason as the answer. The dump checks again (things may
+        // change while it waits for an earlier one).
+        if let Err(reason) = self.precheck(job).await {
+            self.unclaim(job, was_stopped);
+            eprintln!(
+                "puzuz-helper: refusing to checkpoint job {}: {reason}",
+                job.0
+            );
+            return error(HelperErrorCode::CheckpointRefused, reason);
+        }
         let this = self.clone();
         tokio::spawn(async move {
             let _guard = guard;
@@ -767,6 +782,32 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             this.emit(Event::CheckpointFinished { job, outcome });
         });
         ResponseResult::Accepted
+    }
+
+    /// The dump's pre-checks ([`precheck_dump`]) for a claimed job, without
+    /// touching it.
+    async fn precheck(&self, job: JobId) -> Result<(), String> {
+        let Some(entry) = self.table().get(&job).cloned() else {
+            return Err("job vanished".into());
+        };
+        let init_pid = match self
+            .launcher
+            .init_pid(&entry.record.unit, entry.record.unit_kind)
+            .await
+        {
+            Ok(Some(pid)) => pid,
+            Ok(None) => return Err("the job is not running".into()),
+            Err(e) => return Err(e.to_string()),
+        };
+        let host = self.host.clone();
+        let base = self.cfg.checkpoint_base.clone();
+        let mode = self.cfg.checkpoint.mode;
+        let record = entry.record;
+        tokio::task::spawn_blocking(move || {
+            precheck_dump(&*host, mode, &base, &record, init_pid).map(|_| ())
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("checkpoint pre-check panicked: {e}")))
     }
 
     /// Mark a job as checkpointing; returns whether it was stopped.
@@ -792,6 +833,17 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         Ok(was_stopped)
     }
 
+    /// Undo [`Self::claim_for_checkpoint`] after a dump that did not happen.
+    fn unclaim(&self, job: JobId, was_stopped: bool) {
+        if let Some(e) = self.table().get_mut(&job) {
+            e.phase = if was_stopped {
+                Phase::Stopped
+            } else {
+                Phase::Running
+            };
+        }
+    }
+
     async fn checkpoint_job(
         &self,
         job: JobId,
@@ -800,58 +852,42 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
     ) -> CheckpointOutcome {
         let _heavy = self.heavy.lock().await;
         let Some(entry) = self.table().get(&job).cloned() else {
-            return CheckpointOutcome::Failed {
-                reason: "job vanished".into(),
-            };
+            return CheckpointOutcome::refused("job vanished");
         };
         let unit = entry.record.unit.clone();
-        let restore_phase = |this: &Self| {
-            if let Some(e) = this.table().get_mut(&job) {
-                e.phase = if was_stopped {
-                    Phase::Stopped
-                } else {
-                    Phase::Running
-                };
-            }
-        };
         // cuda-checkpoint hangs on stopped processes.
         if was_stopped && let Err(e) = self.launcher.signal(&unit, signal::SIGCONT).await {
-            restore_phase(self);
-            return CheckpointOutcome::Failed {
-                reason: format!("resuming the stopped job: {e}"),
-            };
+            self.unclaim(job, was_stopped);
+            return CheckpointOutcome::refused(format!("resuming the stopped job: {e}"));
         }
         let init_pid = match self.launcher.init_pid(&unit, entry.record.unit_kind).await {
-            Ok(Some(pid)) => pid,
-            Ok(None) => {
-                restore_phase(self);
-                return CheckpointOutcome::Failed {
-                    reason: "the job is not running".into(),
-                };
-            }
-            Err(e) => {
-                restore_phase(self);
-                return CheckpointOutcome::Failed {
-                    reason: e.to_string(),
-                };
-            }
+            Ok(Some(pid)) => Ok(pid),
+            Ok(None) => Err("the job is not running".to_owned()),
+            Err(e) => Err(e.to_string()),
         };
 
-        let mut ck = self.cfg.checkpoint.clone();
-        ck.criu.tcp_close |= options.tcp_close;
-        if let Some(secs) = options.timeout_secs {
-            ck.timeouts.criu_dump = ck.timeouts.criu_dump.min(Duration::from_secs(secs));
-        }
-        let host = self.host.clone();
-        let factory = self.executor.clone();
-        let base = self.cfg.checkpoint_base.clone();
-        let record = entry.record.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let mut exec = factory();
-            dump_job(&*host, &mut *exec, &ck, &base, &record, init_pid)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("checkpoint task panicked: {e}")));
+        let result = match init_pid {
+            Err(reason) => Err(DumpError::Refused(reason)),
+            Ok(init_pid) => {
+                let mut ck = self.cfg.checkpoint.clone();
+                ck.criu.tcp_close |= options.tcp_close;
+                if let Some(secs) = options.timeout_secs {
+                    ck.timeouts.criu_dump = ck.timeouts.criu_dump.min(Duration::from_secs(secs));
+                }
+                let host = self.host.clone();
+                let factory = self.executor.clone();
+                let base = self.cfg.checkpoint_base.clone();
+                let record = entry.record.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut exec = factory();
+                    dump_job(&*host, &mut *exec, &ck, &base, &record, init_pid)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    Err(DumpError::Failed(format!("checkpoint task panicked: {e}")))
+                })
+            }
+        };
 
         match result {
             Ok(meta) => {
@@ -870,12 +906,24 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     image_size_bytes: meta.size_bytes,
                 }
             }
-            Err(reason) => {
-                restore_phase(self);
+            Err(e) => {
+                self.unclaim(job, was_stopped);
                 if was_stopped {
                     let _ = self.launcher.signal(&unit, signal::SIGSTOP).await;
                 }
-                CheckpointOutcome::Failed { reason }
+                match e {
+                    DumpError::Refused(reason) => {
+                        eprintln!(
+                            "puzuz-helper: refusing to checkpoint job {}: {reason}",
+                            job.0
+                        );
+                        CheckpointOutcome::refused(reason)
+                    }
+                    DumpError::Failed(reason) => {
+                        eprintln!("puzuz-helper: checkpoint of job {} failed: {reason}", job.0);
+                        CheckpointOutcome::failed(reason)
+                    }
+                }
             }
         }
     }
@@ -1183,11 +1231,14 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                         job,
                         outcome: outcome.clone(),
                     });
+                    let refused = outcome.is_refused();
                     match outcome {
                         CheckpointOutcome::Success { image_size_bytes } => {
                             ManifestResult::Checkpointed { image_size_bytes }
                         }
-                        CheckpointOutcome::Failed { reason } => ManifestResult::Failed { reason },
+                        CheckpointOutcome::Failed { reason, .. } => {
+                            ManifestResult::Failed { reason, refused }
+                        }
                     }
                 }
             };
@@ -1242,16 +1293,37 @@ fn device_map<H: HostProbe + ?Sized>(
     DeviceMap::new(pairs).map(Some).map_err(|e| e.to_string())
 }
 
-/// The blocking part of a checkpoint: prechecks, the dump plan with
-/// rollback, `meta.json`, owner record and the `COMPLETE` marker.
-pub fn dump_job<H: HostProbe + ?Sized>(
+/// Why [`dump_job`] produced no image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DumpError {
+    /// The pre-checks failed before anything ran against the job; it keeps
+    /// running as it was.
+    Refused(String),
+    /// The dump was attempted and failed (CRIU rolled back). The reason
+    /// names the preserved CRIU log, if any.
+    Failed(String),
+}
+
+/// What [`precheck_dump`] learned, for the dump that follows.
+#[derive(Debug, Clone)]
+pub struct DumpPrecheck {
+    procs: Vec<ProcInfo>,
+    /// Without the CUDA PIDs yet.
+    meta: CheckpointMeta,
+    mounts: Vec<String>,
+}
+
+/// The checks before a dump, which only read the job's state: the image
+/// base, the job's mounts (an image that depends on a hidden mount could
+/// never be restored, not even on this host) and the free space for its
+/// memory. An error means the dump is refused and the job is left alone.
+pub fn precheck_dump<H: HostProbe + ?Sized>(
     host: &H,
-    exec: &mut dyn Executor,
-    ck: &CheckpointConfig,
+    mode: CudaMode,
     base: &Path,
     record: &JobRecord,
     init_pid: u32,
-) -> Result<CheckpointMeta, String> {
+) -> Result<DumpPrecheck, String> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -1265,22 +1337,8 @@ pub fn dump_job<H: HostProbe + ?Sized>(
         .map_err(|e| format!("listing the job's processes: {e}"))?;
     let rss: u64 = procs.iter().map(|p| p.rss_bytes).sum();
 
-    let mut meta = CheckpointMeta::new(record.job.0, now_ms(), ck.mode);
-    let mut cuda_pids = Vec::new();
+    let mut meta = CheckpointMeta::new(record.job.0, now_ms(), mode);
     if !record.gpus.is_empty() {
-        // Every process of the namespace that answers
-        // `cuda-checkpoint --get-state` uses CUDA (PoC: works for spawn
-        // DataLoader workers, which do not).
-        let all: Vec<u32> = procs.iter().map(|p| p.host_pid).collect();
-        for pid in host
-            .cuda_pids(&all)
-            .map_err(|e| format!("finding CUDA processes: {e}"))?
-        {
-            if let Some(p) = procs.iter().find(|p| p.host_pid == pid) {
-                cuda_pids.push(p.host_pid);
-                meta.cuda_ns_pids.push(p.ns_pid);
-            }
-        }
         let snap = host
             .gpu_snapshot()
             .map_err(|e| format!("querying GPUs: {e}"))?;
@@ -1305,8 +1363,6 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     let mounts = host
         .mount_points(init_pid)
         .map_err(|e| format!("reading the job's mounts: {e}"))?;
-    // An image that depends on a hidden mount can never be restored, not
-    // even on this host; refuse before touching the job (it keeps running).
     let unreachable = host
         .unreachable_mounts(init_pid)
         .map_err(|e| format!("reading the job's mounts: {e}"))?;
@@ -1319,9 +1375,48 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     }
     let available = host.available_bytes(base).map_err(|e| e.to_string())?;
     space::check_free_space(rss, meta.vram_bytes, available).map_err(|e| e.to_string())?;
+    Ok(DumpPrecheck {
+        procs,
+        meta,
+        mounts,
+    })
+}
+
+/// The blocking part of a checkpoint: [`precheck_dump`], the dump plan with
+/// rollback, `meta.json`, owner record and the `COMPLETE` marker.
+pub fn dump_job<H: HostProbe + ?Sized>(
+    host: &H,
+    exec: &mut dyn Executor,
+    ck: &CheckpointConfig,
+    base: &Path,
+    record: &JobRecord,
+    init_pid: u32,
+) -> Result<CheckpointMeta, DumpError> {
+    let DumpPrecheck {
+        procs,
+        mut meta,
+        mounts,
+    } = precheck_dump(host, ck.mode, base, record, init_pid).map_err(DumpError::Refused)?;
+    let mut cuda_pids = Vec::new();
+    if !record.gpus.is_empty() {
+        // Every process of the namespace that answers
+        // `cuda-checkpoint --get-state` uses CUDA (PoC: works for spawn
+        // DataLoader workers, which do not).
+        let all: Vec<u32> = procs.iter().map(|p| p.host_pid).collect();
+        for pid in host
+            .cuda_pids(&all)
+            .map_err(|e| DumpError::Refused(format!("finding CUDA processes: {e}")))?
+        {
+            if let Some(p) = procs.iter().find(|p| p.host_pid == pid) {
+                cuda_pids.push(p.host_pid);
+                meta.cuda_ns_pids.push(p.ns_pid);
+            }
+        }
+    }
 
     let dir = CheckpointDir::for_job(base, record.job.0);
-    dir.prepare().map_err(|e| e.to_string())?;
+    dir.prepare()
+        .map_err(|e| DumpError::Refused(format!("preparing {}: {e}", dir.root().display())))?;
     let target = DumpTarget {
         tree_root_pid: init_pid,
         images_dir: dir.images_dir(),
@@ -1340,21 +1435,53 @@ pub fn dump_job<H: HostProbe + ?Sized>(
                 reason = format!("{reason}: {}", lines.join("; "));
             }
         }
-        // Free the space; keep dump.log for the administrator.
-        let _ = fs::remove_dir_all(dir.images_dir());
-        return Err(reason);
+        return Err(DumpError::Failed(discard_failed_dump(base, &dir, reason)));
     }
-    let mut owner = record.clone();
-    owner.phase = RecordPhase::Checkpointed;
-    let owner_json = serde_json::to_vec_pretty(&owner).map_err(|e| e.to_string())?;
-    write_atomic(&dir.root().join(OWNER_FILE), &owner_json).map_err(|e| e.to_string())?;
-    let saved = SavedMounts::Full {
-        mount_points: mounts,
-        external_sources: fs::read_to_string(dir.dump_log())
-            .map(|log| probe::criu_external_mounts(&log))
-            .unwrap_or_default(),
+    let finish = || -> Result<CheckpointMeta, String> {
+        let mut owner = record.clone();
+        owner.phase = RecordPhase::Checkpointed;
+        let owner_json = serde_json::to_vec_pretty(&owner).map_err(|e| e.to_string())?;
+        write_atomic(&dir.root().join(OWNER_FILE), &owner_json).map_err(|e| e.to_string())?;
+        let saved = SavedMounts::Full {
+            mount_points: mounts,
+            external_sources: fs::read_to_string(dir.dump_log())
+                .map(|log| probe::criu_external_mounts(&log))
+                .unwrap_or_default(),
+        };
+        let mounts_json = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
+        write_atomic(&dir.root().join(MOUNTS_FILE), &mounts_json).map_err(|e| e.to_string())?;
+        dir.finalize(meta).map_err(|e| e.to_string())
     };
-    let mounts_json = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
-    write_atomic(&dir.root().join(MOUNTS_FILE), &mounts_json).map_err(|e| e.to_string())?;
-    dir.finalize(meta).map_err(|e| e.to_string())
+    finish().map_err(|reason| DumpError::Failed(discard_failed_dump(base, &dir, reason)))
+}
+
+/// After a failed dump: keep CRIU's log for administrators under
+/// `<base>/failed-logs/` (see [`layout::preserve_failed_log`]) and remove
+/// the checkpoint directory. Returns `reason` with the log's path.
+fn discard_failed_dump(base: &Path, dir: &CheckpointDir, reason: String) -> String {
+    match layout::preserve_failed_log(base, dir, now_ms(), layout::FAILED_LOGS_KEEP) {
+        Ok(kept) => {
+            if let Err(e) = dir.remove() {
+                eprintln!(
+                    "puzuz-helper: removing the failed checkpoint {}: {e}",
+                    dir.root().display()
+                );
+            }
+            match kept {
+                Some(log) => format!("{reason} (CRIU log: {})", log.display()),
+                None => reason,
+            }
+        }
+        Err(e) => {
+            // Free the space at least; dump.log stays where it is until
+            // the checkpoint directory is deleted.
+            eprintln!(
+                "puzuz-helper: moving {} to {}: {e}",
+                dir.dump_log().display(),
+                base.join(layout::FAILED_LOGS_SUBDIR).display()
+            );
+            let _ = fs::remove_dir_all(dir.images_dir());
+            reason
+        }
+    }
 }

@@ -119,6 +119,16 @@ impl Executor for FakeExecutor {
     fn execute(&mut self, step: &Step) -> Result<StepOutput, StepError> {
         let mut st = self.0.lock().unwrap();
         st.actions.push(step.action());
+        // CRIU writes its log whether or not the dump succeeds.
+        if let Step::Run {
+            action: Action::CriuDump { .. },
+            command,
+            ..
+        } = step
+            && let Some(log) = command.value_of("-o")
+        {
+            fs::write(log, b"(00.000001) Error (criu/fake.c:1): fake criu log\n")?;
+        }
         if let (Some(action), Some(fail)) = (step.action(), st.fail_on)
             && fail(&action)
         {

@@ -741,6 +741,210 @@ async fn failed_checkpoint_terminates_the_job_while_holding_its_gpu() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_checkpoint_fails_the_command_and_leaves_the_job_running() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    let admin = h.client(ADMIN);
+    let id = alice.add(&job_request("train", &[0])).await;
+    admin.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+
+    // Refused by the helper's synchronous pre-checks: the command fails
+    // with the reason, and nothing is done to the job.
+    h.helper
+        .set_checkpoint_rejection(Some("not enough free space for the image"));
+    let reply = admin.action(id, "checkpoint", json!(null)).await;
+    let error = reply.error();
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert_eq!(error.code, ErrorCode::InvalidState);
+    assert_eq!(
+        error.message,
+        "checkpoint refused: not enough free space for the image; the job keeps running"
+    );
+    let job = admin.job(id).await;
+    assert_eq!(job.state, JobState::Running);
+    assert_eq!(
+        last_error(&job),
+        Some("checkpoint refused: not enough free space for the image")
+    );
+    assert!(h.helper.is_running(id));
+    assert!(h.helper.signals().is_empty());
+    // The owner hears about it (the admin asked).
+    assert_eq!(
+        alice.get("/v1/groups").await.warnings(),
+        [Warning::CheckpointFailed { job: id }]
+    );
+
+    // Refused only when the dump was due (the request was accepted): the
+    // job is back to running, its owner warned.
+    h.helper.set_checkpoint_rejection(None);
+    h.helper
+        .set_checkpoint_outcome(FakeOutcome::Refuse("hidden mount /run/x".to_owned()));
+    let reply = admin.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    admin
+        .wait_for(id, "running with the refusal", |j| {
+            j.state == JobState::Running
+                && last_error(j) == Some("checkpoint refused: hidden mount /run/x")
+        })
+        .await;
+    assert!(h.helper.is_running(id));
+    assert!(h.helper.signals().is_empty());
+    assert_eq!(
+        alice.get("/v1/groups").await.warnings(),
+        [Warning::CheckpointFailed { job: id }]
+    );
+
+    // A paused job was resumed for the dump and runs on.
+    assert_eq!(
+        alice.action(id, "pause", json!({})).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Paused).await;
+    alice.action(id, "checkpoint", json!(null)).await;
+    alice
+        .wait_for(id, "running", |j| j.state == JobState::Running)
+        .await;
+    assert_eq!(
+        h.helper.signals(),
+        [(id, signal::SIGSTOP), (id, signal::SIGCONT)]
+    );
+
+    // Once the problem is gone it can be checkpointed.
+    h.helper.set_checkpoint_outcome(FakeOutcome::Succeed);
+    alice.action(id, "checkpoint", json!(null)).await;
+    alice.wait_state(id, &JobState::Checkpointed).await;
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_leaves_jobs_whose_checkpoint_is_refused_running() {
+    // Refused up front, or only when the dump was due.
+    for up_front in [true, false] {
+        let mut h = Harness::new(0).await;
+        h.set_default_parallel(2).await;
+        let alice = h.client(ALICE);
+        let refused = alice.add(&job_request("a", &[])).await;
+        let mut request = job_request("b", &[]);
+        request.spec.no_checkpoint = true;
+        let stopped = alice.add(&request).await;
+        for id in [refused, stopped] {
+            alice.wait_state(id, &JobState::Running).await;
+            h.wait_spawned(id).await;
+        }
+        if up_front {
+            h.helper
+                .set_checkpoint_rejection(Some("hidden mount /run/x"));
+        } else {
+            h.helper
+                .set_checkpoint_outcome(FakeOutcome::Refuse("hidden mount /run/x".to_owned()));
+        }
+
+        let reply = h.client(ADMIN).post("/v1/daemon/shutdown", json!({})).await;
+        assert_eq!(reply.status, StatusCode::ACCEPTED);
+        let daemon = h.daemon.take().unwrap();
+        // Without retrying the refused job until the settle wait (11 s)
+        // runs out.
+        tokio::time::timeout(Duration::from_secs(5), daemon.shutdown_requested())
+            .await
+            .expect("shutdown finishes");
+
+        let job = alice.job(refused).await;
+        assert_eq!(job.state, JobState::Running, "up front: {up_front}");
+        assert_eq!(
+            last_error(&job),
+            Some("checkpoint refused: hidden mount /run/x")
+        );
+        assert!(h.helper.is_running(refused));
+        // The other job was handled as usual.
+        assert_eq!(alice.job(stopped).await.state, done(JobResult::Killed));
+        assert_eq!(h.helper.signals(), [(stopped, signal::SIGTERM)]);
+        daemon.stop().await;
+
+        // The next daemon finds it running.
+        h.start(0).await;
+        let alice = h.client(ALICE);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(alice.job(refused).await.state, JobState::Running);
+        h.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_os_shutdown_dumps_end_as_checkpoint_failed_after_the_reboot() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(3).await;
+    let alice = h.client(ALICE);
+    let failed = alice.add(&job_request("a", &[])).await;
+    let refused = alice.add(&job_request("b", &[])).await;
+    let paused = alice.add(&job_request("c", &[])).await;
+    for id in [failed, refused, paused] {
+        alice.wait_state(id, &JobState::Running).await;
+        h.wait_spawned(id).await;
+    }
+    alice.action(paused, "pause", json!({})).await;
+    alice.wait_state(paused, &JobState::Paused).await;
+    h.stop().await;
+
+    // OS shutdown: the helper dumps the jobs on its own; every dump fails
+    // or is refused, and systemd stops the jobs. One exit is recorded, the
+    // others are not (the helper had already exited).
+    use puzuz_protocol::helper::{CheckpointOutcome, Event, ExitStatus};
+    for (id, outcome) in [
+        (
+            failed,
+            CheckpointOutcome::failed("criu: tcp connection (CRIU log: /x.log)"),
+        ),
+        (refused, CheckpointOutcome::refused("hidden mount /run/x")),
+        (
+            paused,
+            CheckpointOutcome::failed("cuda-checkpoint timed out"),
+        ),
+    ] {
+        h.helper
+            .emit_event(Event::CheckpointFinished { job: id, outcome });
+    }
+    h.helper.emit_event(Event::JobExited {
+        job: failed,
+        status: ExitStatus::Signaled { signal: 15 },
+    });
+    for id in [failed, refused, paused] {
+        h.helper.vanish(id);
+    }
+
+    // After the reboot the replayed events and the reconciliation agree.
+    h.start(0).await;
+    let alice = h.client(ALICE);
+    // Polled as the admin: the owner's requests would take the warnings.
+    let admin = h.client(ADMIN);
+    for (id, reason) in [
+        (failed, "criu: tcp connection (CRIU log: /x.log)"),
+        (refused, "checkpoint refused: hidden mount /run/x"),
+        (paused, "cuda-checkpoint timed out"),
+    ] {
+        let job = admin
+            .wait_state(
+                id,
+                &done(JobResult::CheckpointFailed {
+                    reason: reason.to_owned(),
+                }),
+            )
+            .await;
+        assert_eq!(last_error(&job), Some(reason));
+    }
+    assert_eq!(
+        alice.get("/v1/groups").await.warnings(),
+        [
+            Warning::CheckpointFailed { job: failed },
+            Warning::CheckpointFailed { job: refused },
+            Warning::CheckpointFailed { job: paused },
+        ]
+    );
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_checkpoints_running_jobs_then_stops() {
     let mut h = Harness::new(2).await;
     h.set_default_parallel(4).await;
