@@ -157,8 +157,10 @@ puzuz restore -i 0 && puzuz follow 0
 
 The daemon and the helper read `/etc/puzuz/config.toml`. Every key is optional. Unknown keys are
 ignored. A missing file means all defaults. The installed file
-([packaging/config.toml](../packaging/config.toml)) lists every key with comments. After a change,
-restart whatever uses the key. Restarting the helper does not affect running jobs:
+([packaging/config.toml](../packaging/config.toml)) lists every key with comments: a commented
+line `# key = value` shows the default, and lines indented below `# Example:` are examples for
+keys that are unset by default (such as `checkpoint_size_limit_bytes`) and for `[[gpus]]`. After a
+change, restart whatever uses the key. Restarting the helper does not affect running jobs:
 
 ```sh
 sudo systemctl restart puzuz-helper.service puzuz.service
@@ -198,10 +200,7 @@ changed with `puzuz group`, `puzuz parallel` and `puzuz gpu parallel`.
 | `fork_guard` | `true` | helper | preload the fork guard into jobs (see the README's limitations) |
 | `gpu_detection` | `"auto"` | daemon | `"auto"`: NVML, falling back to `[[gpus]]`. `"static"`: only `[[gpus]]`. |
 | `nvml_library` | unset | daemon | NVML library path or name; by default `libnvidia-ml.so.1`, then `libnvidia-ml.so` |
-| `[[gpus]]` | empty | daemon | static GPU list: `index` (required), `uuid`, `name`, `memory_total_bytes` |
-
-> In the installed file, `checkpoint_size_limit_bytes = 500_000_000_000` is only an example in a
-> comment. The actual default is no limit.
+| `[[gpus]]` | empty | daemon | static GPU list: `index` (required), `uuid`, `name`, `memory_total_bytes` (see [GPU detection](#gpu-detection)) |
 
 `puzuz-helper serve` also accepts command-line flags (`puzuz-helper serve --help`). They override
 the file. Prefer the file: `puzuz doctor` reports the file's values and warns when the unit's
@@ -240,6 +239,13 @@ uuid = "GPU-..."          # nvidia-smi --query-gpu=index,uuid,name,memory.total 
 name = "NVIDIA GeForce RTX 4090"
 memory_total_bytes = 25757220864
 ```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `index` | required | the GPU's index in PCI bus order, as nvidia-smi numbers it. Unique. `puzuz add --gpu` takes it, and jobs see it in `CUDA_VISIBLE_DEVICES` (with `CUDA_DEVICE_ORDER=PCI_BUS_ID`). |
+| `uuid` | `""` | the GPU's UUID. The daemon warns at start-up when a GPU with a different UUID than before is found at an index. |
+| `name` | `""` | the model, shown by `puzuz gpu` and recorded with each checkpoint. Restoring requires the same model. |
+| `memory_total_bytes` | unset | the GPU's memory in bytes, shown by `puzuz gpu` |
 
 > The packaged `puzuz.service` runs the daemon with `PrivateDevices=yes`, which hides
 > `/dev/nvidia*`. NVML detection inside this sandbox has not been tested, and the end-to-end

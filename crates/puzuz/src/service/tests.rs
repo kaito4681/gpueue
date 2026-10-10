@@ -470,36 +470,126 @@ fn packaged_units_start_the_expected_binaries() {
     assert!(DAEMON_UNIT_TEMPLATE.contains("\nExecStart=/usr/bin/puzuz daemon\n"));
 }
 
+/// The key (or table name) of a commented TOML line of the configuration
+/// template: `key = value` or a table header such as `[[gpus]]`.
+fn template_toml_key(text: &str) -> Option<&str> {
+    let is_name = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+    if let Some((key, _)) = text.split_once(" = ")
+        && is_name(key)
+    {
+        return Some(key);
+    }
+    let table = text.trim_start_matches('[').trim_end_matches(']');
+    (text.starts_with('[') && is_name(table)).then_some(table)
+}
+
+/// Splits the commented TOML of the configuration template by its
+/// convention: a `# key = value` line shows a default, and lines indented by
+/// `#   ` right below a `# Example:` line form an example. Returns the
+/// default lines and the example blocks. Panics on commented TOML that
+/// follows neither form (such as a table header outside an example).
+fn template_defaults_and_examples(template: &str) -> (String, Vec<String>) {
+    let mut defaults = String::new();
+    let mut examples: Vec<String> = Vec::new();
+    let mut in_example = false;
+    for line in template.lines() {
+        if line == "# Example:" {
+            examples.push(String::new());
+            in_example = true;
+            continue;
+        }
+        if in_example && let Some(example) = line.strip_prefix("#   ") {
+            let block = examples.last_mut().unwrap();
+            block.push_str(example);
+            block.push('\n');
+            continue;
+        }
+        in_example = false;
+        let Some(comment) = line.strip_prefix('#') else {
+            continue;
+        };
+        if let Some(text) = comment.strip_prefix(' ')
+            && !text.starts_with([' ', '['])
+            && template_toml_key(text).is_some()
+        {
+            defaults.push_str(text);
+            defaults.push('\n');
+            continue;
+        }
+        assert!(
+            template_toml_key(comment.trim_start()).is_none(),
+            "commented TOML that is neither `# key = default` nor below `# Example:`: {line}"
+        );
+    }
+    (defaults, examples)
+}
+
+#[test]
+fn config_template_convention() {
+    let (defaults, examples) = template_defaults_and_examples(
+        "# a = 1\n# Example:\n#   b = 2\n#   [[c]]\n# prose, then\n#   indented prose\n",
+    );
+    assert_eq!(defaults, "a = 1\n");
+    assert_eq!(examples, ["b = 2\n[[c]]\n"]);
+    for unmarked in [
+        "#   b = 2\n",
+        "# [[gpus]]\n",
+        "#  index = 0\n",
+        "# Example:\n\n#   x = 1\n",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| template_defaults_and_examples(unmarked)).is_err(),
+            "{unmarked:?} was accepted"
+        );
+    }
+}
+
 #[test]
 fn config_template_documents_every_key_and_parses_to_the_defaults() {
+    use puzuz_daemon::config::GpuConfig;
+
     assert_eq!(Config::parse(CONFIG_TEMPLATE).unwrap(), Config::default());
-    let defaults = serde_json::to_value(Config::default()).unwrap();
+    let (defaults_toml, examples) = template_defaults_and_examples(CONFIG_TEMPLATE);
+    let default = Config::default();
+    let defaults = serde_json::to_value(&default).unwrap();
+    let default_keys: Vec<&str> = defaults_toml
+        .lines()
+        .filter_map(template_toml_key)
+        .collect();
+    let example_keys: Vec<&str> = examples
+        .iter()
+        .flat_map(|example| example.lines().filter_map(template_toml_key))
+        .collect();
+
+    // Every key is shown, with its default or in an example.
     for key in defaults.as_object().unwrap().keys() {
-        let documented = if key == "gpus" {
-            "# [[gpus]]".to_owned()
-        } else {
-            format!("# {key} = ")
-        };
         assert!(
-            CONFIG_TEMPLATE.contains(&documented),
+            default_keys.contains(&key.as_str()) || example_keys.contains(&key.as_str()),
             "{key} is not documented"
         );
     }
-    // The commented values are the defaults.
-    let uncommented: String = CONFIG_TEMPLATE
-        .lines()
-        .filter_map(|line| line.strip_prefix("# "))
-        .filter(|line| {
-            line.split_once(" = ")
-                .is_some_and(|(key, _)| defaults.get(key).is_some())
-                // Optional keys whose commented values are examples, not defaults.
-                && !line.starts_with("checkpoint_size_limit_bytes")
-                && !line.starts_with("nvml_library")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut parsed = Config::parse(&uncommented).unwrap();
-    let default = Config::default();
+    // Every field of a [[gpus]] entry is described and in the example.
+    let gpu = serde_json::to_value(GpuConfig {
+        index: 0,
+        uuid: String::new(),
+        name: String::new(),
+        memory_total_bytes: None,
+    })
+    .unwrap();
+    for field in gpu.as_object().unwrap().keys() {
+        assert!(
+            example_keys.contains(&field.as_str()),
+            "[[gpus]] field {field} is not in the example"
+        );
+        assert!(
+            CONFIG_TEMPLATE.contains(&format!("\n# - {field} (")),
+            "[[gpus]] field {field} is not described"
+        );
+    }
+
+    // The lines shown as defaults are the defaults. The paths below data_dir
+    // are unset by default and resolve to the paths shown.
+    let mut parsed = Config::parse(&defaults_toml).unwrap();
     assert_eq!(parsed.state_db_path(), default.state_db_path());
     assert_eq!(parsed.helper_state_dir(), default.helper_state_dir());
     assert_eq!(parsed.logs_dir(), default.logs_dir());
@@ -509,6 +599,27 @@ fn config_template_documents_every_key_and_parses_to_the_defaults() {
     parsed.logs_dir = None;
     parsed.checkpoints_dir = None;
     assert_eq!(parsed, default);
+
+    // Examples are valid and are not defaults.
+    for example in &examples {
+        let parsed =
+            Config::parse(example).unwrap_or_else(|e| panic!("invalid example {example:?}: {e}"));
+        let parsed = serde_json::to_value(parsed).unwrap();
+        for key in example.lines().filter_map(template_toml_key) {
+            let Some(default_value) = defaults.get(key) else {
+                continue; // a field of a [[gpus]] entry
+            };
+            assert!(
+                !default_keys.contains(&key),
+                "{key} is shown both as a default and in an example"
+            );
+            assert_ne!(
+                parsed.get(key),
+                Some(default_value),
+                "the example of {key} is its default; show it as `# {key} = ...`"
+            );
+        }
+    }
 }
 
 #[test]

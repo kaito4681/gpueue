@@ -3,8 +3,10 @@
 # [both] by both; unmarked keys are the daemon's.
 #
 # Created by `puzuz service install`, which never overwrites this file.
-# Every key is optional; the commented values are the defaults. Unknown keys
-# are ignored. Restart what uses a changed key:
+# Every key is optional and unknown keys are ignored. A commented line
+# `# key = value` shows the key's default. Lines indented below `# Example:`
+# are examples, not defaults: keys that are unset by default, and the [[gpus]]
+# list. Restart what uses a changed key:
 # `sudo systemctl restart puzuz-helper.service puzuz.service`.
 # (Restarting the helper leaves running jobs alone.)
 #
@@ -46,8 +48,10 @@
 # Warn when all checkpoint images together exceed this many bytes. Images are
 # never deleted automatically: the owner of a job whose checkpoint crosses the
 # limit is told once, administrators (root, puzuz-admin) on their commands
-# while it is exceeded, and `puzuz doctor` reports it.
-# checkpoint_size_limit_bytes = 500_000_000_000
+# while it is exceeded, and `puzuz doctor` reports it. Unset by default (no
+# limit).
+# Example:
+#   checkpoint_size_limit_bytes = 500_000_000_000
 
 # Remind each administrator of exceeded checkpoint_size_limit_bytes at most
 # this often (seconds); going back under the limit resets the reminder.
@@ -82,12 +86,28 @@
 # [[gpus]] list below when NVML is unavailable; "static" always uses the list.
 # gpu_detection = "auto"
 
-# Path (or name) of the NVML library. By default libnvidia-ml.so.1 and then
-# libnvidia-ml.so are tried.
-# nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
+# Path (or name) of the NVML library. Unset by default: libnvidia-ml.so.1 and
+# then libnvidia-ml.so are tried.
+# Example:
+#   nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
 
-# GPUs used when NVML is unavailable (or with gpu_detection = "static").
-# [[gpus]]
-# index = 0
-# uuid = "GPU-..."
-# name = "NVIDIA GeForce RTX 4090"
+# GPUs used when NVML is unavailable (or with gpu_detection = "static"). Empty
+# by default; `puzuz service install` appends an entry for each GPU that
+# `nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv` lists.
+# Keep the list in sync with the hardware (`puzuz doctor` compares the two).
+# Fields of an entry:
+# - index (required, unique): the GPU's index in PCI bus order, as nvidia-smi
+#   numbers it. `puzuz add --gpu` takes it, and jobs see it in
+#   CUDA_VISIBLE_DEVICES (with CUDA_DEVICE_ORDER=PCI_BUS_ID).
+# - uuid (default ""): the GPU's UUID. The daemon warns at start-up when a GPU
+#   with a different UUID than before is found at an index.
+# - name (default ""): the model, shown by `puzuz gpu` and recorded with each
+#   checkpoint; restoring requires the same model.
+# - memory_total_bytes (unset by default): the GPU's memory in bytes, shown by
+#   `puzuz gpu`.
+# Example:
+#   [[gpus]]
+#   index = 0
+#   uuid = "GPU-..."
+#   name = "NVIDIA GeForce RTX 4090"
+#   memory_total_bytes = 25_757_220_864

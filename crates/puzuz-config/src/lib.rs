@@ -11,8 +11,12 @@
 //! parent directory must be owned by root and not group/world-writable
 //! (see [`trust`]). Command-line flags of the helper override the file.
 //!
+//! A file that spells out every default, followed by examples of the keys
+//! that are unset by default (`packaging/config.toml` documents each key):
+//!
 //! ```toml
 //! data_dir = "/var/lib/puzuz"          # daemon/, helper/, logs/, checkpoints/
+//! # Unset by default; they follow data_dir.
 //! # state_db = "/var/lib/puzuz/daemon/state.sqlite"
 //! # helper_state_dir = "/var/lib/puzuz/helper"
 //! # logs_dir = "/var/lib/puzuz/logs"
@@ -22,7 +26,6 @@
 //! daemon_user = "puzuz"
 //! grace_secs = 30
 //! shell = ["sh", "-c"]
-//! # checkpoint_size_limit_bytes = 500_000_000_000
 //! checkpoint_size_warning_interval_secs = 3600
 //! checkpoint_tcp_close = true
 //! criu_path = "criu"
@@ -32,16 +35,21 @@
 //! criu_dump_timeout_secs = 1800
 //! criu_restore_timeout_secs = 1800
 //! fork_guard = true
-//!
 //! # GPUs are detected with NVML ("auto"). Without NVML (no driver, no
-//! # libnvidia-ml.so.1) the [[gpus]] list below is used instead; "static"
-//! # always uses the list.
+//! # libnvidia-ml.so.1) the [[gpus]] list is used instead; "static" always
+//! # uses the list.
 //! gpu_detection = "auto"
-//! # nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
+//!
+//! # Examples; unset by default.
+//! checkpoint_size_limit_bytes = 500_000_000_000   # default: no limit
+//! nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
+//!
+//! # The [[gpus]] list is empty by default. See [`GpuConfig`] for the fields.
 //! [[gpus]]
-//! index = 0
-//! uuid = "GPU-..."
-//! name = "NVIDIA GeForce RTX 4090"
+//! index = 0                          # required
+//! uuid = "GPU-..."                   # default ""
+//! name = "NVIDIA GeForce RTX 4090"   # default ""
+//! memory_total_bytes = 25_757_220_864  # default unset
 //! ```
 
 pub mod trust;
@@ -151,14 +159,25 @@ impl CudaCheckpointMode {
     }
 }
 
-/// One GPU in [`Config::gpus`].
+/// One `[[gpus]]` entry of [`Config::gpus`]. `puzuz service install` writes
+/// one per GPU that `nvidia-smi --query-gpu=index,uuid,name,memory.total`
+/// lists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuConfig {
+    /// Required and unique: the GPU's index in PCI bus order, as nvidia-smi
+    /// numbers it. `puzuz add --gpu` takes it, and jobs see it in
+    /// `CUDA_VISIBLE_DEVICES` (with `CUDA_DEVICE_ORDER=PCI_BUS_ID`).
     pub index: u32,
+    /// The GPU's UUID (`GPU-...`; default empty). The daemon warns at
+    /// start-up when a GPU with a different UUID than before is found at an
+    /// index.
     #[serde(default)]
     pub uuid: String,
+    /// The model (default empty), shown by `puzuz gpu` and recorded with
+    /// each checkpoint; restoring requires the same model.
     #[serde(default)]
     pub name: String,
+    /// The GPU's memory in bytes (default unset), shown by `puzuz gpu`.
     #[serde(default)]
     pub memory_total_bytes: Option<u64>,
 }
@@ -404,6 +423,36 @@ mod tests {
         assert_eq!(config.cuda_checkpoint_mode, CudaCheckpointMode::Plugin);
         assert_eq!(config.criu_dump_timeout_secs, 60);
         assert_eq!(config.criu_restore_timeout_secs, 90);
+    }
+
+    #[test]
+    fn crate_doc_example_shows_the_defaults_and_examples() {
+        let doc: String = include_str!("lib.rs")
+            .lines()
+            .filter_map(|line| line.strip_prefix("//!"))
+            .map(|line| line.strip_prefix(' ').unwrap_or(line))
+            .skip_while(|line| *line != "```toml")
+            .skip(1)
+            .take_while(|line| *line != "```")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut config = Config::parse(&doc).unwrap();
+        assert_eq!(config.checkpoint_size_limit_bytes, Some(500_000_000_000));
+        assert!(config.nvml_library.is_some());
+        assert_eq!(
+            config.gpus,
+            [GpuConfig {
+                index: 0,
+                uuid: "GPU-...".into(),
+                name: "NVIDIA GeForce RTX 4090".into(),
+                memory_total_bytes: Some(25_757_220_864),
+            }]
+        );
+        // Everything else is the default.
+        config.checkpoint_size_limit_bytes = None;
+        config.nvml_library = None;
+        config.gpus.clear();
+        assert_eq!(config, Config::default());
     }
 
     #[test]
