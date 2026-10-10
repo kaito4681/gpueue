@@ -34,8 +34,8 @@ const DELAY_FORMAT_HELP: &str = "DELAY FORMAT:
     2020-4-1 18:2:30      // Optional leading zeros
     2020-4-1 5:30pm       // Informal am/pm time
     2020-4-1 5pm          // Optional minutes and seconds
-    April 1 2020 18:30:00 // English months
-    1 Apr 8:30pm          // Implies current year
+    April 1, 2020 18:30   // English months
+    Apr 1 8:30pm          // Implies current year
     4/1                   // American form date
     wednesday 10:30pm     // The closest wednesday in the future at 22:30
     wednesday             // The closest wednesday in the future
@@ -55,14 +55,14 @@ Syntax:
    [column_selection]? [filter]* [order_by]? [limit]?
 
 where:
-  - column_selection := `columns=[column]([column],)*`
+  - column_selection := `columns=[column](,[column])*`
   - column := `id | status | priority | command | label | path | enqueue_at | dependencies |
     owner | gpu | start | end`
   - filter := `[filter_column] [filter_op] [filter_value]`
   - filter_column := `status | command | label | start | end | enqueue_at`
   - filter_op := `= | != | < | > | %=`   (`%=` means \"contains\")
   - order_by := `order_by [column] [asc | desc]`
-  - limit := `[first | last]? [count]`
+  - limit := `(first | last) [count]`
 
 Filter columns:
   - `status` supports `=` and `!=` with `queued`, `stashed`, `paused`, `running`, `success`,
@@ -75,8 +75,8 @@ Filter columns:
 Examples:
   - `status=running`
   - `command%=echo`
-  - `label=mytask`
-  - `columns=id,status,command status=running start > 2023-05-2112:03:17 order_by command first 5`";
+  - `label=nightly`
+  - `columns=id,status,command status=running start > 2023-05-21 12:03:17 order_by command first 5`";
 
 /// Top-level command line arguments.
 #[derive(Parser, Debug, Clone, PartialEq)]
@@ -133,7 +133,7 @@ pub enum SubCommand {
     /// puzuz add 'ls $HOME && echo "Some string"'
     ///
     /// Use `--` to separate puzuz's options from options of the command itself.
-    #[command(trailing_var_arg = true)]
+    #[command(trailing_var_arg = true, after_help = DELAY_FORMAT_HELP)]
     Add {
         /// The command to be added.
         #[arg(required = true, num_args(1..), value_hint = ValueHint::CommandWithArguments)]
@@ -160,7 +160,7 @@ pub enum SubCommand {
         #[arg(short, long, conflicts_with = "immediate")]
         stashed: bool,
 
-        /// Don't enqueue the job before 'delay' has elapsed. See "enqueue --help" for the format.
+        /// Don't enqueue the job before 'delay' has elapsed. See DELAY FORMAT below.
         #[arg(short, long, conflicts_with = "immediate", value_parser = parse_delay_until)]
         delay: Option<DateTime<Local>>,
 
@@ -209,7 +209,7 @@ pub enum SubCommand {
     #[command(alias("rm"))]
     Remove {
         /// The ids of the jobs to remove.
-        #[arg(required = true)]
+        #[arg(required = true, value_name = "IDS")]
         task_ids: Vec<usize>,
     },
 
@@ -218,8 +218,10 @@ pub enum SubCommand {
     /// Only works on queued and stashed jobs.
     Switch {
         /// The first job id.
+        #[arg(value_name = "ID_1")]
         task_id_1: usize,
         /// The second job id.
+        #[arg(value_name = "ID_2")]
         task_id_2: usize,
     },
 
@@ -229,6 +231,7 @@ pub enum SubCommand {
     #[command(after_help = DELAY_FORMAT_HELP)]
     Stash {
         /// Stash these jobs.
+        #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
         /// Stash all queued jobs of a group.
@@ -250,6 +253,7 @@ pub enum SubCommand {
     #[command(after_help = DELAY_FORMAT_HELP)]
     Enqueue {
         /// Enqueue these jobs.
+        #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
         /// Enqueue all stashed jobs of a group.
@@ -267,11 +271,13 @@ pub enum SubCommand {
 
     /// Resume paused jobs or groups, or force-start queued jobs.
     ///
-    /// Without arguments, resumes the default group and its paused jobs.
+    /// Without arguments, resumes the default group and its paused jobs. Only administrators
+    /// resume a group; other users resume their own paused jobs in it.
     /// Starting specific queued/stashed jobs ignores group limits and dependencies.
     /// Checkpointed jobs are resumed with `puzuz restore`, not with `start`.
     Start {
         /// Start these jobs: paused jobs are resumed, queued/stashed jobs are force-started.
+        #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
         /// Resume a group and all paused jobs in it.
@@ -291,6 +297,7 @@ pub enum SubCommand {
     #[command(alias("re"))]
     Restart {
         /// Restart these jobs.
+        #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
         /// Restart all failed jobs in all groups.
@@ -325,9 +332,11 @@ pub enum SubCommand {
     /// Pause running jobs or whole groups.
     ///
     /// Without arguments, pauses the default group and its jobs.
-    /// A paused group does not start new jobs.
+    /// A paused group does not start new jobs. Only administrators pause a group; other users
+    /// pause their own jobs in it.
     Pause {
         /// Pause these jobs.
+        #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
         /// Pause a group.
@@ -346,12 +355,14 @@ pub enum SubCommand {
     /// Kill running jobs or all jobs of a group.
     ///
     /// Without ids, kills the jobs of the default group. Checkpointed jobs are not running;
-    /// use `puzuz remove` to discard them.
+    /// use `puzuz remove` to discard them. Only administrators pause a group; other users kill
+    /// their own jobs in it.
     Kill {
         /// Kill these jobs.
+        #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
-        /// Kill all running jobs of a group and pause the group.
+        /// Kill all running jobs of a group and pause the group (administrators).
         #[arg(short, long, conflicts_with = "all")]
         group: Option<String>,
 
@@ -373,6 +384,7 @@ pub enum SubCommand {
     /// non-interactive instead (e.g. `yes | cmd` or a `--yes` flag).
     Send {
         /// The id of the job.
+        #[arg(value_name = "ID")]
         task_id: usize,
 
         /// The input to send.
@@ -382,6 +394,7 @@ pub enum SubCommand {
     /// Edit properties of stashed or queued jobs in $EDITOR (not implemented yet).
     Edit {
         /// The ids of the jobs to edit.
+        #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
     },
 
@@ -426,6 +439,7 @@ pub enum SubCommand {
     /// Use "follow" to stream the output of a running job.
     Log {
         /// Show the output of these jobs.
+        #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
         /// Show the output of this group's jobs.
@@ -443,9 +457,7 @@ pub enum SubCommand {
         #[arg(short, long)]
         json: bool,
 
-        /// Only print the last N lines of each job's output.
-        ///
-        /// This is the default when looking at multiple jobs.
+        /// Only print the last N lines of each job's output (default: 15, unless --full).
         #[arg(short, long, conflicts_with = "full")]
         lines: Option<usize>,
 
@@ -460,6 +472,7 @@ pub enum SubCommand {
         /// The job to follow.
         ///
         /// May be omitted if exactly one job is running.
+        #[arg(value_name = "ID")]
         task_id: Option<usize>,
 
         /// Only print the last N lines before following.
@@ -473,6 +486,7 @@ pub enum SubCommand {
     /// Jobs in any non-finished state (queued, stashed, paused, ...) are waited for as well.
     Wait {
         /// Wait for these jobs.
+        #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
         /// Wait for all jobs of a group.
@@ -535,6 +549,7 @@ pub enum SubCommand {
     /// running jobs; it only affects scheduling.
     Parallel {
         /// The number of parallel jobs; 0 means unlimited.
+        #[arg(value_name = "PARALLEL_JOBS")]
         parallel_tasks: Option<usize>,
 
         /// Set the limit of this group.
@@ -559,6 +574,7 @@ pub enum SubCommand {
     /// cuda-checkpoint. The job becomes Checkpointed and can be resumed with `puzuz restore`.
     Checkpoint {
         /// Checkpoint these jobs.
+        #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
         /// Checkpoint all running jobs of a group.
@@ -577,6 +593,7 @@ pub enum SubCommand {
     /// the time the checkpoint was taken.
     Restore {
         /// Restore these jobs.
+        #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
         /// Restore all Checkpointed jobs of a group.
@@ -686,6 +703,7 @@ pub enum EnvCommand {
     /// Set an environment variable of a job.
     Set {
         /// The id of the job.
+        #[arg(value_name = "ID")]
         task_id: usize,
         /// The name of the variable.
         key: String,
@@ -696,6 +714,7 @@ pub enum EnvCommand {
     /// Remove an environment variable from a job.
     Unset {
         /// The id of the job.
+        #[arg(value_name = "ID")]
         task_id: usize,
         /// The name of the variable.
         key: String,

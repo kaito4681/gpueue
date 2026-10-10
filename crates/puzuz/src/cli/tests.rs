@@ -1111,3 +1111,270 @@ fn subcommand_names_match_clap() {
         assert!(command.find_subcommand(name).is_some());
     }
 }
+
+// --- Examples in help texts -----------------------------------------------------------------
+
+/// The subcommand at `path` (e.g. `["gpu", "parallel"]`).
+fn subcommand_at(path: &[impl AsRef<str>]) -> clap::Command {
+    let mut command = Cli::command();
+    for name in path {
+        command = command
+            .find_subcommand(name.as_ref())
+            .unwrap_or_else(|| panic!("no subcommand {}", name.as_ref()))
+            .clone();
+    }
+    command
+}
+
+/// Every help text of `command` and its subcommands, with the subcommand path.
+fn collect_help_texts(
+    command: &clap::Command,
+    path: &[String],
+    out: &mut Vec<(Vec<String>, String)>,
+) {
+    let texts = [
+        command.get_about(),
+        command.get_long_about(),
+        command.get_after_help(),
+        command.get_after_long_help(),
+    ];
+    let arg_texts = command
+        .get_arguments()
+        .flat_map(|arg| [arg.get_help(), arg.get_long_help()]);
+    for text in texts.into_iter().chain(arg_texts).flatten() {
+        out.push((path.to_vec(), text.to_string()));
+    }
+    for sub in command.get_subcommands() {
+        let mut sub_path = path.to_vec();
+        sub_path.push(sub.get_name().to_owned());
+        collect_help_texts(sub, &sub_path, out);
+    }
+}
+
+fn all_help_texts() -> Vec<(Vec<String>, String)> {
+    let mut out = Vec::new();
+    collect_help_texts(&Cli::command(), &[], &mut out);
+    out
+}
+
+/// The `quoted` snippets of a text.
+fn backticked(text: &str) -> Vec<&str> {
+    text.split('`').skip(1).step_by(2).collect()
+}
+
+/// The quoted snippets after "e.g." in a help text, up to the end of the line.
+fn examples_after_eg(text: &str) -> Vec<&str> {
+    text.split("e.g. ")
+        .skip(1)
+        .flat_map(|rest| {
+            let line = rest.split('\n').next().unwrap();
+            backticked(line.split(". ").next().unwrap())
+        })
+        .collect()
+}
+
+/// The short and long help of one argument of the subcommand at `path`.
+fn arg_help(path: &[&str], arg: &str) -> String {
+    let command = subcommand_at(path);
+    let arg = command
+        .get_arguments()
+        .find(|a| a.get_id() == arg)
+        .unwrap_or_else(|| panic!("no argument {arg} in {path:?}"));
+    let help = arg.get_help().map(ToString::to_string).unwrap_or_default();
+    let long = arg
+        .get_long_help()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    format!("{help}\n{long}")
+}
+
+/// Splits a shell command line with simple single/double quoting.
+fn shell_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote = None;
+    for c in line.chars() {
+        match (quote, c) {
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                word.get_or_insert_default();
+            }
+            (Some(q), c) if c == q => quote = None,
+            (None, ' ') => words.extend(word.take()),
+            (_, c) => word.get_or_insert_default().push(c),
+        }
+    }
+    assert_eq!(quote, None, "unbalanced quotes in {line}");
+    words.extend(word);
+    words
+}
+
+#[test]
+fn shell_words_handles_quotes() {
+    assert_eq!(
+        shell_words(r#"puzuz add 'ls $HOME && echo "Some string"'"#),
+        ["puzuz", "add", r#"ls $HOME && echo "Some string""#]
+    );
+    assert_eq!(shell_words("a  \"b c\" ''"), ["a", "b c", ""]);
+}
+
+#[test]
+fn status_help_examples_parse() {
+    let help = arg_help(&["status"], "query");
+    let mut examples: Vec<&str> = help
+        .split_once("Examples:")
+        .expect("status --help has examples")
+        .1
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- `")?.strip_suffix('`'))
+        .collect();
+    assert!(examples.len() >= 4, "{examples:?}");
+    // The short help's example (`status -h`).
+    let short = examples_after_eg(&help);
+    assert_eq!(short, ["status=running first 5"]);
+    examples.extend(short);
+    for example in examples {
+        crate::query::Query::parse(example)
+            .unwrap_or_else(|e| panic!("`{example}` from `status --help`: {e}"));
+        // Typed on the command line, the words are joined again.
+        let mut args = vec!["status"];
+        args.extend(example.split(' '));
+        let SubCommand::Status { query, .. } = cmd(&args) else {
+            panic!("expected status");
+        };
+        assert_eq!(query.join(" "), example);
+    }
+}
+
+#[test]
+fn delay_help_examples_parse() {
+    let now = Local.with_ymd_and_hms(2024, 1, 10, 12, 0, 0).unwrap();
+    let examples: Vec<&str> = DELAY_FORMAT_HELP
+        .lines()
+        .filter_map(|line| Some(line.split_once("//")?.0.trim()))
+        .collect();
+    assert!(examples.len() >= 15, "{examples:?}");
+    let failed: Vec<&str> = examples
+        .into_iter()
+        .filter(|example| parse_delay_until_from(example, now).is_err())
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "delay examples that do not parse: {failed:?}"
+    );
+    // Every subcommand that takes --delay shows the format.
+    let paths: std::collections::BTreeSet<Vec<String>> =
+        all_help_texts().into_iter().map(|(path, _)| path).collect();
+    let mut with_delay = 0;
+    for path in paths {
+        let command = subcommand_at(&path[..]);
+        if command.get_arguments().any(|a| a.get_id() == "delay") {
+            assert_eq!(
+                command.get_after_help().map(ToString::to_string).as_deref(),
+                Some(DELAY_FORMAT_HELP),
+                "{path:?} takes --delay but does not show DELAY FORMAT"
+            );
+            with_delay += 1;
+        }
+    }
+    assert_eq!(with_delay, 3); // add, stash, enqueue
+}
+
+#[test]
+fn value_examples_in_help_parse() {
+    let signal_help = arg_help(&["kill"], "signal");
+    let signals = examples_after_eg(&signal_help);
+    assert!(!signals.is_empty());
+    for signal in signals {
+        assert_eq!(
+            cmd(&["kill", "--signal", signal, "1"]),
+            cmd(&["kill", "--signal", "SIGINT", "1"]),
+            "{signal}"
+        );
+    }
+    let add_help = arg_help(&["add"], "gpu");
+    let parallel_help = arg_help(&["gpu", "parallel"], "gpu");
+    let add_gpus = examples_after_eg(&add_help);
+    let parallel_gpus = examples_after_eg(&parallel_help);
+    assert!(!add_gpus.is_empty() && !parallel_gpus.is_empty());
+    for gpus in add_gpus {
+        parse(&["add", "--gpu", gpus, "x"]);
+    }
+    for gpus in parallel_gpus {
+        parse(&["gpu", "parallel", "1", "--gpu", gpus]);
+    }
+}
+
+#[test]
+fn commands_and_options_in_help_texts_exist() {
+    // Options of other programs that help texts mention on purpose.
+    let foreign_options: [(&[&str], &str); 3] = [
+        (&[], "config"),    // pueue's, which puzuz replaces with --socket
+        (&[], "profile"),   // likewise
+        (&["send"], "yes"), // a job command's own flag
+    ];
+    let root = Cli::command();
+    let mut commands = 0;
+    for (path, text) in all_help_texts() {
+        // References such as `puzuz group add` or `puzuz start <id>` name
+        // existing subcommands.
+        for snippet in backticked(&text) {
+            let Some(rest) = snippet.strip_prefix("puzuz ") else {
+                continue;
+            };
+            let mut words = rest.split(' ');
+            let first = words.next().unwrap();
+            let mut command = root
+                .find_subcommand(first)
+                .unwrap_or_else(|| panic!("{path:?}: `{snippet}` names no subcommand"));
+            for word in words {
+                if word.starts_with(['-', '<']) || command.get_subcommands().next().is_none() {
+                    break;
+                }
+                command = command
+                    .find_subcommand(word)
+                    .unwrap_or_else(|| panic!("{path:?}: `{snippet}`: no subcommand `{word}`"));
+            }
+            commands += 1;
+        }
+        // Example command lines parse completely.
+        for line in text.lines().map(str::trim) {
+            let is_example = line
+                .strip_prefix("puzuz ")
+                .and_then(|rest| rest.split(' ').next())
+                .is_some_and(|word| root.find_subcommand(word).is_some());
+            if is_example {
+                Cli::try_parse_from(shell_words(line))
+                    .unwrap_or_else(|e| panic!("{path:?}: example `{line}` does not parse: {e}"));
+                commands += 1;
+            }
+        }
+        // Options mentioned as --name exist on this command or are global.
+        let command = subcommand_at(&path[..]);
+        for word in text.split(|c: char| c.is_whitespace() || "`(),.;:/\"'[]".contains(c)) {
+            let Some(long) = word.strip_prefix("--") else {
+                continue;
+            };
+            if !long.starts_with(|c: char| c.is_ascii_lowercase()) {
+                continue;
+            }
+            let long = long.split('=').next().unwrap();
+            let known = long == "help"
+                || command
+                    .get_arguments()
+                    .chain(root.get_arguments())
+                    .any(|arg| arg.get_long() == Some(long))
+                || foreign_options
+                    .iter()
+                    .any(|(p, option)| *p == path.as_slice() && *option == long);
+            assert!(
+                known,
+                "{path:?}: help mentions --{long}, which does not exist there"
+            );
+        }
+    }
+    assert!(
+        commands >= 5,
+        "only {commands} commands found in help texts"
+    );
+}
