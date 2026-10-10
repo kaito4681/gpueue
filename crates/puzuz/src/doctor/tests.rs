@@ -2,6 +2,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 
+use puzuz_protocol::api::CheckpointStorage;
+
 use super::*;
 use crate::system::fake::FakeSystem;
 use crate::system::{CmdOutput, FsUsage};
@@ -427,6 +429,134 @@ fn checkpoint_size_limit_raises_the_space_threshold() {
     );
     sys.fs_usage.available_bytes = 500 << 30;
     assert_eq!(level(&run(&sys, None), "checkpoint dir"), Level::Warn);
+}
+
+fn with_storage(sys: &mut FakeSystem, storage: CheckpointStorage) {
+    let mut version = FakeSystem::daemon_ok(true).unwrap();
+    version.checkpoints = Some(storage);
+    sys.daemon = Ok(version);
+}
+
+#[test]
+fn checkpoint_usage_comes_from_the_daemon() {
+    let (mut sys, _sockets) = healthy();
+    // Daemons that do not report it: no usage check.
+    assert!(run(&sys, None).find("checkpoint usage").is_none());
+
+    // No limit.
+    with_storage(
+        &mut sys,
+        CheckpointStorage {
+            images: 2,
+            total_bytes: 3 << 30,
+            limit_bytes: None,
+            available_bytes: Some(400 << 30),
+        },
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "checkpoint usage"), Level::Info);
+    assert_eq!(
+        message(&report, "checkpoint usage"),
+        "2 image(s) take 3.0 GiB; no checkpoint_size_limit_bytes set"
+    );
+    // The daemon's free space wins over what this process sees.
+    assert!(message(&report, "checkpoint dir").contains("400.0 GiB free"));
+    assert!(!report.has_failures());
+
+    // Within the limit.
+    with_storage(
+        &mut sys,
+        CheckpointStorage {
+            images: 2,
+            total_bytes: 3 << 30,
+            limit_bytes: Some(100 << 30),
+            available_bytes: Some(400 << 30),
+        },
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "checkpoint usage"), Level::Ok);
+    assert!(
+        message(&report, "checkpoint usage").contains("of checkpoint_size_limit_bytes (100.0 GiB)")
+    );
+
+    // Over the limit: a warning with what to do, not a failure.
+    with_storage(
+        &mut sys,
+        CheckpointStorage {
+            images: 3,
+            total_bytes: 120 << 30,
+            limit_bytes: Some(100 << 30),
+            available_bytes: Some(400 << 30),
+        },
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "checkpoint usage"), Level::Warn);
+    assert!(message(&report, "checkpoint usage").contains("120.0 GiB, over"));
+    assert!(hint(&report, "checkpoint usage").contains("puzuz status"));
+    assert!(hint(&report, "checkpoint usage").contains("puzuz remove"));
+    assert_eq!(level(&report, "checkpoint dir"), Level::Ok);
+    assert!(!report.has_failures());
+    let mut out = Vec::new();
+    report.print(&mut out).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("WARN  checkpoint usage: 3 image(s) take 120.0 GiB"),
+        "{out}"
+    );
+    assert!(out.contains("      fix: find large checkpoints"), "{out}");
+}
+
+#[test]
+fn low_free_space_reported_by_the_daemon_warns() {
+    let (mut sys, _sockets) = healthy();
+    // Plenty of space locally, but the daemon sees little.
+    sys.fs_usage.available_bytes = 500 << 30;
+    with_storage(
+        &mut sys,
+        CheckpointStorage {
+            images: 0,
+            total_bytes: 0,
+            limit_bytes: None,
+            available_bytes: Some(5 << 30),
+        },
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "checkpoint dir"), Level::Warn);
+    assert!(message(&report, "checkpoint dir").contains("5.0 GiB"));
+
+    // With a limit, only the room still allowed under it is needed.
+    with_storage(
+        &mut sys,
+        CheckpointStorage {
+            images: 1,
+            total_bytes: 550 << 30,
+            limit_bytes: Some(600 << 30),
+            available_bytes: Some(100 << 30),
+        },
+    );
+    assert_eq!(level(&run(&sys, None), "checkpoint dir"), Level::Ok);
+    with_storage(
+        &mut sys,
+        CheckpointStorage {
+            images: 1,
+            total_bytes: 100 << 30,
+            limit_bytes: Some(600 << 30),
+            available_bytes: Some(100 << 30),
+        },
+    );
+    assert_eq!(level(&run(&sys, None), "checkpoint dir"), Level::Warn);
+
+    // Without the daemon's figure, the local one is used.
+    with_storage(
+        &mut sys,
+        CheckpointStorage {
+            images: 0,
+            total_bytes: 0,
+            limit_bytes: None,
+            available_bytes: None,
+        },
+    );
+    assert_eq!(level(&run(&sys, None), "checkpoint dir"), Level::Ok);
 }
 
 #[test]

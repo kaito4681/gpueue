@@ -24,12 +24,13 @@ pub use events::{Event, SseDecoder, SseMessage};
 pub use jobs::{
     ActionOutcome, AddJobRequest, AddJobResponse, BulkJobRequest, BulkJobResponse, CleanRequest,
     CleanResponse, EnqueueOptions, JobAction, JobActionResult, JobDetails, JobSelector, JobView,
-    KillOptions, ListJobsQuery, ListJobsResponse, LogQuery, PauseOptions, ResetRequest,
-    RestartOptions, RestoreOptions, StashOptions, SwitchRequest,
+    KillOptions, ListDetails, ListJobsQuery, ListJobsResponse, LogQuery, PauseOptions,
+    ResetRequest, RestartOptions, RestoreOptions, StashOptions, SwitchRequest,
 };
 pub use resources::{
-    CreateGroupRequest, GpuJob, GpuView, HelperStatus, ListGpusResponse, ListGroupsResponse,
-    SetGpusParallelRequest, SetParallelRequest, ShutdownRequest, VersionResponse,
+    CheckpointStorage, CreateGroupRequest, GpuJob, GpuView, HelperStatus, ListGpusResponse,
+    ListGroupsResponse, SetGpusParallelRequest, SetParallelRequest, ShutdownRequest,
+    VersionResponse,
 };
 pub use routes::{Method, Route};
 pub use warnings::{WARNINGS_HEADER, Warning};

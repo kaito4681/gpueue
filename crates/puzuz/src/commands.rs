@@ -690,7 +690,9 @@ impl App {
                 let mut jobs = Vec::new();
                 for id in ids {
                     match self.client.get_job(*id).await {
-                        Ok(job) => jobs.push(job),
+                        // Like the group and all selections (which list jobs),
+                        // `log --json` leaves out the environment.
+                        Ok(job) => jobs.push(job.without_envs()),
                         Err(err @ ClientError::Api { .. }) => {
                             ok = false;
                             eprintln!(
@@ -1016,7 +1018,8 @@ fn describe_selection(target: &JobSelector) -> String {
 
 /// The JSON printed by `status --json`:
 /// `{"groups": [Group, ...], "jobs": [JobView, ...]}`, where `jobs` is
-/// filtered by `--group` and the query.
+/// filtered by `--group` and the query. The views are those of
+/// `GET /v1/jobs`, so they carry no `envs`.
 #[derive(Serialize)]
 pub struct StatusJson {
     pub groups: Vec<Group>,
@@ -1024,7 +1027,8 @@ pub struct StatusJson {
 }
 
 /// One entry of `log --json`, keyed by job id:
-/// `{"<id>": {"job": JobView, "output": "..."}}`.
+/// `{"<id>": {"job": JobView, "output": "..."}}`. The views carry no
+/// `envs`, whichever way the jobs were selected.
 #[derive(Serialize)]
 struct LogJson {
     job: JobView,

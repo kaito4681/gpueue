@@ -1,7 +1,6 @@
 //! Snapshot-style tests of the rendered output (colors disabled, no
 //! terminal width, fixed clock and user names).
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::DateTime;
@@ -47,7 +46,7 @@ pub(crate) fn job(id: u64, state: JobState) -> JobView {
         details: Some(JobDetails {
             command: "sleep 60".into(),
             cwd: PathBuf::from("/tmp"),
-            envs: BTreeMap::new(),
+            envs: None,
             last_error: None,
         }),
     }

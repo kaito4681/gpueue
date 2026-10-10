@@ -45,6 +45,7 @@ use crate::error::{ApiResult, Failure};
 use crate::gpu::DetectedGpu;
 use crate::helper::{Helper, HelperError, HelperNotice};
 use crate::launch::Launches;
+use crate::usage::SizeWarnings;
 use crate::users::UserDb;
 
 /// Current time in Unix epoch milliseconds.
@@ -141,13 +142,15 @@ pub enum DaemonEvent {
 }
 
 impl DaemonEvent {
+    /// The event as `caller` may see it. Job views leave out the
+    /// environment, like `GET /v1/jobs`.
     pub fn to_api(&self, caller: &Caller) -> api::Event {
         match self {
             DaemonEvent::JobAdded(info) => api::Event::JobAdded {
-                job: info.view(caller),
+                job: info.view(caller).without_envs(),
             },
             DaemonEvent::JobUpdated(info) => api::Event::JobUpdated {
-                job: info.view(caller),
+                job: info.view(caller).without_envs(),
             },
             DaemonEvent::JobRemoved(id) => api::Event::JobRemoved { id: *id },
             DaemonEvent::GroupUpdated(group) => api::Event::GroupUpdated {
@@ -295,6 +298,8 @@ pub struct Core {
     /// the scheduler launches it as soon as it can, ignoring slots. Kept in
     /// memory only: after a daemon restart such a job waits for a slot.
     forced: Mutex<HashSet<JobId>>,
+    /// Checkpoint size warnings (see [`crate::usage`]).
+    pub(crate) size_warnings: Mutex<SizeWarnings>,
 }
 
 impl Core {
@@ -328,6 +333,7 @@ impl Core {
             launch_slots: Semaphore::new(MAX_CONCURRENT_LAUNCHES),
             unconfirmed_launches: Mutex::new(HashMap::new()),
             forced: Mutex::new(HashSet::new()),
+            size_warnings: Mutex::default(),
         })
     }
 
@@ -476,44 +482,9 @@ impl Core {
         }
     }
 
-    /// Total size of the complete checkpoint images.
-    pub async fn checkpoint_usage(&self) -> ApiResult<u64> {
-        let records = self.read(|s| s.list_checkpoints()).await?;
-        Ok(records
-            .iter()
-            .filter(|r| r.status == CheckpointStatus::Complete)
-            .filter_map(|r| r.size_bytes)
-            .fold(0u64, u64::saturating_add))
-    }
-
-    /// Warns (in the log) when the complete images exceed
-    /// `checkpoint_size_limit_bytes`. Per the spec nothing is deleted and
-    /// new dumps are not refused. Returns whether the limit is exceeded.
-    pub async fn check_checkpoint_usage(&self) -> bool {
-        let Some(limit) = self.config.checkpoint_size_limit_bytes else {
-            return false;
-        };
-        match self.checkpoint_usage().await {
-            Ok(total) if total > limit => {
-                tracing::warn!(
-                    total_bytes = total,
-                    limit_bytes = limit,
-                    dir = %self.config.checkpoints_dir().display(),
-                    "checkpoint images exceed checkpoint_size_limit_bytes; they are not deleted \
-                     automatically (restore or remove checkpointed jobs to free space)"
-                );
-                true
-            }
-            Ok(_) => false,
-            Err(e) => {
-                tracing::warn!("cannot sum up checkpoint sizes: {}", e.0.message);
-                false
-            }
-        }
-    }
-
     /// The warnings `owner` has not been shown yet (failed dumps and failed
-    /// restores), ordered by job.
+    /// restores, ordered by job), followed by checkpoint size warnings (see
+    /// [`crate::usage`]).
     pub async fn pending_warnings(&self, owner: Uid) -> ApiResult<Vec<Warning>> {
         let (dumps, errors) = self
             .read(move |s| {
@@ -531,17 +502,20 @@ impl Core {
             }))
             .collect();
         warnings.sort_by_key(Warning::job);
+        warnings.extend(self.pending_size_warnings(owner).await);
         Ok(warnings)
     }
 
-    /// Records that `warnings` have been shown to their owner.
-    pub async fn acknowledge_warnings(&self, warnings: &[Warning]) -> ApiResult<()> {
+    /// Records that `warnings` have been shown to `owner`.
+    pub async fn acknowledge_warnings(&self, owner: Uid, warnings: &[Warning]) -> ApiResult<()> {
+        self.acknowledge_size_warnings(owner, warnings);
         let mut dumps = Vec::new();
         let mut errors = Vec::new();
         for warning in warnings {
             match warning {
                 Warning::CheckpointFailed { job } => dumps.push(*job),
                 Warning::RestoreFailed { job } => errors.push(*job),
+                Warning::CheckpointOverLimit { .. } | Warning::CheckpointUsageOverLimit { .. } => {}
             }
         }
         self.read(move |s| {
@@ -1227,7 +1201,7 @@ impl Core {
                 })
                 .await;
                 if succeeded {
-                    self.check_checkpoint_usage().await;
+                    self.note_new_checkpoint(job).await;
                 }
             }
             hp::Event::RestoreFinished { job, outcome } => {
@@ -1677,17 +1651,29 @@ mod tests {
     async fn size_limit_counts_complete_images_only() {
         let over = core(Some(1000), Vec::new());
         add_image(&over, 600, CheckpointStatus::Complete).await;
-        assert!(!over.check_checkpoint_usage().await);
+        assert_eq!(over.check_checkpoint_usage().await, None);
         add_image(&over, 5000, CheckpointStatus::Failed).await;
         add_image(&over, 5000, CheckpointStatus::InProgress).await;
-        assert!(!over.check_checkpoint_usage().await);
+        assert_eq!(over.check_checkpoint_usage().await, None);
         add_image(&over, 500, CheckpointStatus::Complete).await;
-        assert_eq!(over.checkpoint_usage().await.unwrap(), 1100);
-        assert!(over.check_checkpoint_usage().await);
+        assert_eq!(over.checkpoint_usage().await.unwrap(), (2, 1100));
+        assert_eq!(
+            over.check_checkpoint_usage().await,
+            Some(crate::usage::OverLimit {
+                total_bytes: 1100,
+                limit_bytes: 1000
+            })
+        );
+        let storage = over.checkpoint_storage().await.unwrap();
+        assert_eq!(storage.images, 2);
+        assert_eq!(storage.total_bytes, 1100);
+        assert_eq!(storage.limit_bytes, Some(1000));
+        assert!(storage.over_limit());
 
         let unlimited = core(None, Vec::new());
         add_image(&unlimited, i64::MAX as u64, CheckpointStatus::Complete).await;
-        assert!(!unlimited.check_checkpoint_usage().await);
+        assert_eq!(unlimited.check_checkpoint_usage().await, None);
+        assert!(!unlimited.checkpoint_storage().await.unwrap().over_limit());
     }
 
     #[test]

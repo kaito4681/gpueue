@@ -69,6 +69,7 @@ fn delayed(content_type: &str, delay: Duration, chunks: Vec<String>) -> Response
         .unwrap()
 }
 
+/// A job as `GET /v1/jobs` lists it: without its environment.
 fn job(id: u64, state: JobState) -> JobView {
     JobView {
         id: JobId(id),
@@ -87,7 +88,7 @@ fn job(id: u64, state: JobState) -> JobView {
         details: Some(JobDetails {
             command: "python train.py".into(),
             cwd: PathBuf::from("/work"),
-            envs: BTreeMap::new(),
+            envs: None,
             last_error: None,
         }),
     }
@@ -109,6 +110,8 @@ fn jobs() -> Vec<JobView> {
 enum Mode {
     Normal,
     VersionMismatch,
+    /// Like `Normal`, with checkpoint size warnings on every response.
+    SizeWarnings,
 }
 
 async fn route(
@@ -136,6 +139,7 @@ async fn route(
                         connected: true,
                         version: None,
                     },
+                    checkpoints: None,
                 },
             );
         }
@@ -157,7 +161,15 @@ async fn route(
             },
         ),
         ("GET", "/v1/jobs") => json(StatusCode::OK, ListJobsResponse { jobs: jobs() }),
-        ("GET", "/v1/jobs/2") => json(StatusCode::OK, jobs().remove(1)),
+        ("GET", "/v1/jobs/2") => {
+            // A single job comes with its environment.
+            let mut job = jobs().remove(1);
+            job.details.as_mut().unwrap().envs = Some(BTreeMap::from([(
+                "SECRET".to_owned(),
+                "hunter2".to_owned(),
+            )]));
+            json(StatusCode::OK, job)
+        }
         ("POST", "/v1/jobs") => json(StatusCode::CREATED, AddJobResponse::new(JobId(5))),
         ("POST", "/v1/jobs/bulk") => json(
             StatusCode::OK,
@@ -219,7 +231,26 @@ impl FakeDaemon {
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
                         let log = log.clone();
-                        async move { Ok::<_, Infallible>(route(req, mode, log).await) }
+                        async move {
+                            let mut response = route(req, mode, log).await;
+                            if mode == Mode::SizeWarnings {
+                                let warnings = Warning::encode_header(&[
+                                    Warning::CheckpointOverLimit {
+                                        job: JobId(7),
+                                        total_bytes: 3 << 30,
+                                        limit_bytes: 2 << 30,
+                                    },
+                                    Warning::CheckpointUsageOverLimit {
+                                        total_bytes: 3 << 30,
+                                        limit_bytes: 2 << 30,
+                                    },
+                                ]);
+                                response
+                                    .headers_mut()
+                                    .insert(WARNINGS_HEADER, warnings.parse().unwrap());
+                            }
+                            Ok::<_, Infallible>(response)
+                        }
                     });
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
@@ -277,6 +308,28 @@ fn status_prints_a_table() {
 }
 
 #[test]
+fn checkpoint_size_warnings_go_to_stderr() {
+    let daemon = FakeDaemon::start(Mode::SizeWarnings);
+    let output = puzuz(&daemon.socket, &["group"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("default"), "{}", stdout(&output));
+    assert!(!stdout(&output).contains("warning"));
+    let text = stderr(&output);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(
+        lines[0].starts_with("puzuz: warning: the checkpoint of job 7 brought checkpoint images to 3.0 GiB, over the limit of 2.0 GiB"),
+        "{text}"
+    );
+    assert!(lines[0].contains("`puzuz remove 7`"), "{text}");
+    assert!(
+        lines[1].starts_with("puzuz: warning: checkpoint images take 3.0 GiB, over checkpoint_size_limit_bytes (2.0 GiB)"),
+        "{text}"
+    );
+    assert!(lines[1].contains("`puzuz status`"), "{text}");
+}
+
+#[test]
 fn status_query_and_json() {
     let daemon = FakeDaemon::start(Mode::Normal);
     let output = puzuz(&daemon.socket, &["status", "--json", "status=running"]);
@@ -286,6 +339,20 @@ fn status_query_and_json() {
     let jobs = value["jobs"].as_array().unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0]["id"], 1);
+    assert_eq!(jobs[0]["state"], serde_json::json!({"state": "running"}));
+
+    // Finished jobs carry their result flat inside `state`.
+    let output = puzuz(&daemon.socket, &["status", "--json", "status=success"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["jobs"][0]["state"],
+        serde_json::json!({"state": "done", "result": "success"})
+    );
+    assert_eq!(
+        value["jobs"][0]["details"],
+        serde_json::json!({"command": "python train.py", "cwd": "/work"})
+    );
 
     let output = puzuz(&daemon.socket, &["status", "status=bogus"]);
     assert!(!output.status.success());
@@ -356,6 +423,26 @@ fn log_writes_raw_bytes_to_stdout() {
     assert!(header.contains("completed successfully"), "{header}");
     assert!(header.contains("output:"), "{header}");
     assert!(!header.contains("last 15 lines"), "{header}");
+}
+
+#[test]
+fn log_json_has_a_flat_state_and_no_environment() {
+    let daemon = FakeDaemon::start(Mode::Normal);
+    let output = puzuz(&daemon.socket, &["log", "--json", "2"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let job = &value["2"]["job"];
+    assert_eq!(
+        job["state"],
+        serde_json::json!({"state": "done", "result": "success"})
+    );
+    // Fetched with `GET /v1/jobs/2`, which includes the environment, but
+    // `log --json` leaves it out like for listed jobs.
+    assert_eq!(
+        job["details"],
+        serde_json::json!({"command": "python train.py", "cwd": "/work"})
+    );
+    assert_eq!(value["2"]["output"], "epoch 1\nepoch 2\n\u{fffd} raw\n");
 }
 
 #[test]

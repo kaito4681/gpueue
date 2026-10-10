@@ -89,6 +89,27 @@ pub struct Job {
 /// Lifecycle state of a job.
 ///
 /// Mirrors pueue's task states and adds checkpoint-related ones.
+///
+/// # JSON representation
+///
+/// This is the representation used on the wire (`GET /v1/jobs`, events,
+/// `status --json`) and in storage (`jobs.state_data`). It is a flat object:
+///
+/// - `state` names the variant ([`JobState::name`]), and the variant's
+///   fields sit next to it:
+///   `{"state":"queued","enqueued_at":1700000000000}`, `{"state":"running"}`.
+/// - `done` and `terminating` carry a [`JobResult`] whose fields are
+///   flattened into the same object: `result` names the result variant and
+///   its fields sit alongside, e.g.
+///   `{"state":"done","result":"success"}`,
+///   `{"state":"done","result":"failed","exit_code":1}`,
+///   `{"state":"terminating","result":"checkpoint_failed","reason":"..."}`.
+///
+/// Every key is unique across a state and its result (`state`,
+/// `enqueued_at`, `enqueue_at`, `result`, `exit_code`, `reason`), so each
+/// variant is unambiguous. Schema versions up to 3 stored the result nested
+/// (`{"state":"done","result":{"result":"failed","exit_code":1}}`); migration
+/// 4 rewrites those rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum JobState {
@@ -116,9 +137,11 @@ pub enum JobState {
     /// process may still hold its GPUs, so the job keeps its slots until the
     /// exit is observed; it then becomes `Done` with `result`.
     Terminating {
+        #[serde(flatten)]
         result: JobResult,
     },
     Done {
+        #[serde(flatten)]
         result: JobResult,
     },
 }
@@ -153,6 +176,9 @@ impl JobState {
     }
 }
 
+/// How a job ended. Serialized as a flat object tagged by `result`, e.g.
+/// `{"result":"failed","exit_code":1}`; inside a [`JobState`] these keys are
+/// flattened into the state object (see there).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum JobResult {
@@ -188,4 +214,142 @@ pub struct Gpu {
     pub name: String,
     /// Maximum number of jobs allowed on this GPU at once.
     pub parallel: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every state with its exact JSON. This is the wire and storage format;
+    /// changing it needs a storage migration.
+    fn golden() -> Vec<(JobState, &'static str)> {
+        vec![
+            (
+                JobState::Queued { enqueued_at: 5 },
+                r#"{"state":"queued","enqueued_at":5}"#,
+            ),
+            (
+                JobState::Stashed { enqueue_at: None },
+                r#"{"state":"stashed","enqueue_at":null}"#,
+            ),
+            (
+                JobState::Stashed {
+                    enqueue_at: Some(9),
+                },
+                r#"{"state":"stashed","enqueue_at":9}"#,
+            ),
+            (JobState::Running, r#"{"state":"running"}"#),
+            (JobState::Paused, r#"{"state":"paused"}"#),
+            (JobState::Checkpointing, r#"{"state":"checkpointing"}"#),
+            (JobState::Checkpointed, r#"{"state":"checkpointed"}"#),
+            (
+                JobState::RestoreQueued { enqueued_at: 7 },
+                r#"{"state":"restore_queued","enqueued_at":7}"#,
+            ),
+            (JobState::Restoring, r#"{"state":"restoring"}"#),
+            (
+                JobState::Terminating {
+                    result: JobResult::CheckpointFailed {
+                        reason: "criu".into(),
+                    },
+                },
+                r#"{"state":"terminating","result":"checkpoint_failed","reason":"criu"}"#,
+            ),
+            (
+                JobState::Done {
+                    result: JobResult::Success,
+                },
+                r#"{"state":"done","result":"success"}"#,
+            ),
+            (
+                JobState::Done {
+                    result: JobResult::Failed { exit_code: -3 },
+                },
+                r#"{"state":"done","result":"failed","exit_code":-3}"#,
+            ),
+            (
+                JobState::Done {
+                    result: JobResult::FailedToSpawn {
+                        reason: "no such file".into(),
+                    },
+                },
+                r#"{"state":"done","result":"failed_to_spawn","reason":"no such file"}"#,
+            ),
+            (
+                JobState::Done {
+                    result: JobResult::Killed,
+                },
+                r#"{"state":"done","result":"killed"}"#,
+            ),
+            (
+                JobState::Done {
+                    result: JobResult::DependencyFailed,
+                },
+                r#"{"state":"done","result":"dependency_failed"}"#,
+            ),
+            (
+                JobState::Done {
+                    result: JobResult::CheckpointFailed {
+                        reason: "dump".into(),
+                    },
+                },
+                r#"{"state":"done","result":"checkpoint_failed","reason":"dump"}"#,
+            ),
+            (
+                JobState::Done {
+                    result: JobResult::Lost,
+                },
+                r#"{"state":"done","result":"lost"}"#,
+            ),
+        ]
+    }
+
+    #[test]
+    fn job_state_json_is_flat_and_round_trips() {
+        for (state, json) in golden() {
+            assert_eq!(serde_json::to_string(&state).unwrap(), json);
+            assert_eq!(serde_json::from_str::<JobState>(json).unwrap(), state);
+        }
+    }
+
+    #[test]
+    fn job_state_json_key_order_does_not_matter() {
+        let state: JobState =
+            serde_json::from_str(r#"{"exit_code":1,"result":"failed","state":"done"}"#).unwrap();
+        assert_eq!(
+            state,
+            JobState::Done {
+                result: JobResult::Failed { exit_code: 1 }
+            }
+        );
+    }
+
+    #[test]
+    fn incomplete_or_old_job_state_json_is_rejected() {
+        for json in [
+            // A finished job needs a result ...
+            r#"{"state":"done"}"#,
+            // ... with its fields.
+            r#"{"state":"done","result":"failed"}"#,
+            r#"{"state":"terminating","result":"checkpoint_failed"}"#,
+            r#"{"state":"done","result":"exploded"}"#,
+            // The nested shape of schema versions <= 3.
+            r#"{"state":"done","result":{"result":"failed","exit_code":1}}"#,
+            r#"{"state":"queued"}"#,
+            r#"{"state":"unknown"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<JobState>(json).is_err(),
+                "{json} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn job_result_json_is_tagged_by_result() {
+        let result = JobResult::Failed { exit_code: 2 };
+        let json = serde_json::to_string(&result).unwrap();
+        assert_eq!(json, r#"{"result":"failed","exit_code":2}"#);
+        assert_eq!(serde_json::from_str::<JobResult>(&json).unwrap(), result);
+    }
 }

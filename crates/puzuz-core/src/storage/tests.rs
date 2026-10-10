@@ -1167,3 +1167,131 @@ fn version_two_database_moves_restore_errors_out_of_checkpoints() {
     assert_eq!(store.get_job_error(JobId(1)).unwrap(), None);
     assert_eq!(store.get_job_error(JobId(2)).unwrap(), None);
 }
+
+#[test]
+fn version_three_database_flattens_job_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    // `state_data` exactly as schema version 3 wrote it.
+    let old_rows: &[(&str, &str)] = &[
+        ("queued", r#"{"state":"queued","enqueued_at":5}"#),
+        ("stashed", r#"{"state":"stashed","enqueue_at":null}"#),
+        ("running", r#"{"state":"running"}"#),
+        (
+            "restore_queued",
+            r#"{"state":"restore_queued","enqueued_at":7}"#,
+        ),
+        ("done", r#"{"state":"done","result":{"result":"success"}}"#),
+        (
+            "done",
+            r#"{"state":"done","result":{"result":"failed","exit_code":-3}}"#,
+        ),
+        (
+            "done",
+            r#"{"state":"done","result":{"result":"failed_to_spawn","reason":"no \"such\" file"}}"#,
+        ),
+        ("done", r#"{"state":"done","result":{"result":"killed"}}"#),
+        (
+            "done",
+            r#"{"state":"done","result":{"result":"dependency_failed"}}"#,
+        ),
+        (
+            "done",
+            r#"{"state":"done","result":{"result":"checkpoint_failed","reason":"criu: dump failed"}}"#,
+        ),
+        ("done", r#"{"state":"done","result":{"result":"lost"}}"#),
+        (
+            "terminating",
+            r#"{"state":"terminating","result":{"result":"checkpoint_failed","reason":"x"}}"#,
+        ),
+    ];
+    {
+        let conn = Connection::open(&path).unwrap();
+        for sql in &migrations::MIGRATIONS[..3] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO jobs (id, owner_uid, command, cwd, group_name, state, state_data,
+                                   created_at)
+                 VALUES (?1, 1, 'x', x'2f', 'default', ?2, ?3, 0)",
+            )
+            .unwrap();
+        for (id, (name, data)) in old_rows.iter().enumerate() {
+            insert.execute(rusqlite::params![id, name, data]).unwrap();
+        }
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'next_job_id'",
+            [old_rows.len()],
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let expected = [
+        queued(5),
+        JobState::Stashed { enqueue_at: None },
+        JobState::Running,
+        JobState::RestoreQueued { enqueued_at: 7 },
+        JobState::Done {
+            result: JobResult::Success,
+        },
+        JobState::Done {
+            result: JobResult::Failed { exit_code: -3 },
+        },
+        JobState::Done {
+            result: JobResult::FailedToSpawn {
+                reason: "no \"such\" file".to_owned(),
+            },
+        },
+        JobState::Done {
+            result: JobResult::Killed,
+        },
+        JobState::Done {
+            result: JobResult::DependencyFailed,
+        },
+        JobState::Done {
+            result: JobResult::CheckpointFailed {
+                reason: "criu: dump failed".to_owned(),
+            },
+        },
+        JobState::Done {
+            result: JobResult::Lost,
+        },
+        JobState::Terminating {
+            result: JobResult::CheckpointFailed {
+                reason: "x".to_owned(),
+            },
+        },
+    ];
+    let jobs = store.list_jobs(&JobFilter::all()).unwrap();
+    assert_eq!(jobs.len(), expected.len());
+    for (job, state) in jobs.iter().zip(&expected) {
+        assert_eq!(&job.state, state, "job {}", job.id);
+        // The stored JSON is now exactly what this version writes.
+        let stored: String = store
+            .conn
+            .query_row(
+                "SELECT state_data FROM jobs WHERE id = ?1",
+                [job.id.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(
+            stored,
+            serde_json::to_value(state).unwrap(),
+            "job {}",
+            job.id
+        );
+    }
+    // Rows without a nested result are untouched, byte for byte.
+    let running: String = store
+        .conn
+        .query_row("SELECT state_data FROM jobs WHERE id = 2", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(running, r#"{"state":"running"}"#);
+    assert_eq!(store.next_job_id().unwrap(), JobId(old_rows.len() as u64));
+}

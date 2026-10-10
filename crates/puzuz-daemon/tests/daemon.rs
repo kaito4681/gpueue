@@ -204,6 +204,10 @@ struct Harness {
     dir: tempfile::TempDir,
     helper: FakeHelper,
     daemon: Option<Daemon>,
+    /// `checkpoint_size_limit_bytes` and
+    /// `checkpoint_size_warning_interval_secs` of the next start.
+    checkpoint_limit: Option<u64>,
+    warning_interval_secs: u64,
 }
 
 impl Harness {
@@ -218,6 +222,8 @@ impl Harness {
             dir,
             helper,
             daemon: None,
+            checkpoint_limit: None,
+            warning_interval_secs: Config::default().checkpoint_size_warning_interval_secs,
         };
         harness.start_with(detector).await;
         harness
@@ -227,6 +233,8 @@ impl Harness {
         Config {
             api_socket: self.dir.path().join("puzuz.sock"),
             grace_secs: 1,
+            checkpoint_size_limit_bytes: self.checkpoint_limit,
+            checkpoint_size_warning_interval_secs: self.warning_interval_secs,
             ..Config::default()
         }
         .with_data_dir(self.dir.path())
@@ -333,6 +341,45 @@ async fn add_start_exit_status_and_log() {
     // The list shows both.
     let list: ListJobsResponse = alice.get("/v1/jobs").await.json();
     assert_eq!(list.jobs.len(), 2);
+    // Without the environments, which only the single-job view carries.
+    for job in &list.jobs {
+        let details = job.details.as_ref().expect("the owner sees details");
+        assert_eq!(details.envs, None, "job {}", job.id);
+    }
+    let raw = String::from_utf8(alice.get("/v1/jobs").await.body.to_vec()).unwrap();
+    assert!(!raw.contains("envs") && !raw.contains("hunter2"), "{raw}");
+    // Finished jobs carry their result flat inside `state`.
+    assert!(
+        raw.contains(r#""state":{"state":"done","result":"failed","exit_code":3}"#),
+        "{raw}"
+    );
+    let secret = BTreeMap::from([("SECRET".to_owned(), "hunter2".to_owned())]);
+    for caller in [ALICE, ADMIN] {
+        let view = h.client(caller).job(id).await;
+        assert_eq!(view.details.unwrap().envs.as_ref(), Some(&secret));
+    }
+    // The environments are listed on request, still only to the owner.
+    let list: ListJobsResponse = alice.get("/v1/jobs?details=envs").await.json();
+    assert!(
+        list.jobs
+            .iter()
+            .all(|job| job.details.as_ref().unwrap().envs.as_ref() == Some(&secret))
+    );
+    let list = String::from_utf8(
+        h.client(BOB)
+            .get("/v1/jobs?details=envs")
+            .await
+            .body
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        !list.contains("envs") && !list.contains("hunter2"),
+        "{list}"
+    );
+    assert!(h.client(BOB).job(id).await.details.is_none());
+    let reply = alice.get("/v1/jobs?details=bogus").await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
 
     // Logs: raw bytes, tail, and only for the owner.
     let log = h.dir.path().join(format!("logs/{ALICE}/{id}.log"));
@@ -467,10 +514,13 @@ async fn other_users_see_redacted_jobs_and_cannot_touch_them() {
     let bob = h.client(BOB);
     let admin = h.client(ADMIN);
 
-    // Bob watches the event stream.
+    // Bob watches the event stream, and so does alice.
     let response = bob.open(Method::GET, "/v1/events", None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut events = response.into_body();
+    let response = alice.open(Method::GET, "/v1/events", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut own_events = response.into_body();
 
     let id = alice.add(&job_request("secret-command", &[0])).await;
     alice.wait_state(id, &JobState::Running).await;
@@ -531,20 +581,35 @@ async fn other_users_see_redacted_jobs_and_cannot_touch_them() {
     alice.wait_state(id, &done(JobResult::Killed)).await;
     assert_eq!(h.helper.signals(), [(id, signal::SIGTERM)]);
 
-    // Bob's events carry only redacted views.
-    let mut text = String::new();
-    while !text.contains("event: job_added") || !text.contains("\"result\":\"killed\"") {
-        let frame = tokio::time::timeout(Duration::from_secs(5), events.frame())
-            .await
-            .expect("an event")
-            .unwrap()
-            .unwrap();
-        if let Ok(data) = frame.into_data() {
-            text.push_str(&String::from_utf8_lossy(&data));
+    // Reads an event stream until the job was added and killed.
+    async fn until_killed(events: &mut hyper::body::Incoming) -> String {
+        let mut text = String::new();
+        while !text.contains("event: job_added")
+            || !text.contains(r#""state":{"state":"done","result":"killed"}"#)
+        {
+            let frame = tokio::time::timeout(Duration::from_secs(5), events.frame())
+                .await
+                .expect("an event")
+                .unwrap()
+                .unwrap();
+            if let Ok(data) = frame.into_data() {
+                text.push_str(&String::from_utf8_lossy(&data));
+            }
         }
+        text
     }
+
+    // Bob's events carry only redacted views.
+    let text = until_killed(&mut events).await;
     assert!(!text.contains("secret-command"), "{text}");
     assert!(!text.contains("\"details\""), "{text}");
+    // Alice's carry details, but no environment (like the job list).
+    let text = until_killed(&mut own_events).await;
+    assert!(text.contains("secret-command"), "{text}");
+    assert!(
+        !text.contains("envs") && !text.contains("hunter2"),
+        "{text}"
+    );
 
     h.stop().await;
 }
@@ -1104,6 +1169,162 @@ async fn owner_is_warned_once_about_a_failed_checkpoint() {
         alice.get("/v1/jobs").await.warnings(),
         [Warning::CheckpointFailed { job: second }]
     );
+
+    h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint images over `checkpoint_size_limit_bytes` (the fake helper's
+// images are 4096 bytes each).
+// ---------------------------------------------------------------------------
+
+const LIMIT: u64 = 5000;
+const CAROL: u32 = 1002;
+
+impl Harness {
+    /// A daemon with a checkpoint size limit of [`LIMIT`].
+    async fn with_limit(warning_interval_secs: u64) -> Self {
+        let mut h = Harness::new(1).await;
+        h.stop().await;
+        h.checkpoint_limit = Some(LIMIT);
+        h.warning_interval_secs = warning_interval_secs;
+        h.start(1).await;
+        h.set_default_parallel(8).await;
+        h
+    }
+
+    /// Runs a job of `owner` and has the owner checkpoint it, polling as
+    /// carol, who owns no jobs and is not an administrator (so the polls
+    /// cannot swallow anybody's warnings).
+    async fn checkpoint_as(&self, owner: u32) -> JobId {
+        let client = self.client(owner);
+        let carol = self.client(CAROL);
+        let id = client.add(&job_request("train", &[])).await;
+        carol.wait_state(id, &JobState::Running).await;
+        let reply = client.action(id, "checkpoint", json!(null)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        carol.wait_state(id, &JobState::Checkpointed).await;
+        id
+    }
+}
+
+/// Polls `/v1/groups` until the daemon attaches warnings (5 s at most).
+async fn next_warnings(client: &Client) -> Vec<Warning> {
+    for _ in 0..250 {
+        let warnings = client.get("/v1/groups").await.warnings();
+        if !warnings.is_empty() {
+            return warnings;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no warnings arrived for uid {}", client.uid);
+}
+
+fn usage(total_bytes: u64) -> Warning {
+    Warning::CheckpointUsageOverLimit {
+        total_bytes,
+        limit_bytes: LIMIT,
+    }
+}
+
+fn over_limit(job: JobId, total_bytes: u64) -> Warning {
+    Warning::CheckpointOverLimit {
+        job,
+        total_bytes,
+        limit_bytes: LIMIT,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoints_over_the_size_limit_warn_owners_and_admins() {
+    let mut h = Harness::with_limit(3600).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let admin = h.client(ADMIN);
+
+    // Under the limit: nobody is warned.
+    let first = h.checkpoint_as(ALICE).await;
+    assert!(alice.get("/v1/groups").await.warnings().is_empty());
+    assert!(admin.get("/v1/groups").await.warnings().is_empty());
+    let version: VersionResponse = admin.get("/v1/version").await.json();
+    let storage = version.checkpoints.expect("the daemon reports its usage");
+    assert_eq!((storage.images, storage.total_bytes), (1, 4096));
+    assert_eq!(storage.limit_bytes, Some(LIMIT));
+    assert!(!storage.over_limit());
+
+    // The second image crosses it.
+    let second = h.checkpoint_as(ALICE).await;
+    // The owner is told once, about the checkpoint that crossed it.
+    assert_eq!(next_warnings(&alice).await, [over_limit(second, 8192)]);
+    assert!(alice.get("/v1/jobs").await.warnings().is_empty());
+    // Administrators are reminded, rate-limited.
+    assert_eq!(admin.get("/v1/jobs").await.warnings(), [usage(8192)]);
+    assert!(admin.get("/v1/jobs").await.warnings().is_empty());
+    assert!(admin.get("/v1/groups").await.warnings().is_empty());
+    // Others are not, and /v1/version never carries warnings.
+    assert!(bob.get("/v1/jobs").await.warnings().is_empty());
+    let reply = admin.get("/v1/version").await;
+    assert!(reply.warnings().is_empty());
+    let storage = reply.json::<VersionResponse>().checkpoints.unwrap();
+    assert_eq!((storage.images, storage.total_bytes), (2, 8192));
+    assert!(storage.over_limit());
+
+    // Back under the limit (images are only removed by people)...
+    let reply = alice
+        .call(Method::DELETE, &format!("/v1/jobs/{second}"), None)
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(admin.get("/v1/jobs").await.warnings().is_empty());
+    // ...and over it again: administrators hear about it right away.
+    let third = h.checkpoint_as(BOB).await;
+    assert_eq!(next_warnings(&admin).await, [usage(8192)]);
+    assert!(admin.get("/v1/jobs").await.warnings().is_empty());
+    assert_eq!(next_warnings(&bob).await, [over_limit(third, 8192)]);
+    assert!(alice.get("/v1/jobs").await.warnings().is_empty());
+    assert_eq!(alice.job(first).await.checkpoint_size_bytes, Some(4096));
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admins_are_reminded_once_per_interval() {
+    let mut h = Harness::with_limit(1).await;
+    let admin = h.client(ADMIN);
+
+    h.checkpoint_as(ALICE).await;
+    h.checkpoint_as(ALICE).await;
+    assert_eq!(next_warnings(&admin).await, [usage(8192)]);
+    assert!(admin.get("/v1/jobs").await.warnings().is_empty());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(admin.get("/v1/jobs").await.warnings(), [usage(8192)]);
+    assert!(admin.get("/v1/jobs").await.warnings().is_empty());
+
+    // An administrator's own checkpoint: the owner warning carries the same
+    // numbers, so no separate reminder comes with it.
+    let own = h.checkpoint_as(ADMIN).await;
+    // The admin's own requests above may have taken a reminder; wait until
+    // another one would be due (which also lets the daemon queue the owner
+    // warning after recording the image).
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(next_warnings(&admin).await, [over_limit(own, 12288)]);
+    assert!(admin.get("/v1/jobs").await.warnings().is_empty());
+
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_size_warnings_without_a_limit() {
+    let mut h = Harness::new(1).await;
+    h.set_default_parallel(8).await;
+    let admin = h.client(ADMIN);
+    h.checkpoint_as(ALICE).await;
+    h.checkpoint_as(ALICE).await;
+    assert!(admin.get("/v1/jobs").await.warnings().is_empty());
+    assert!(h.client(ALICE).get("/v1/jobs").await.warnings().is_empty());
+    let version: VersionResponse = admin.get("/v1/version").await.json();
+    let storage = version.checkpoints.unwrap();
+    assert_eq!((storage.images, storage.total_bytes), (2, 8192));
+    assert_eq!(storage.limit_bytes, None);
 
     h.stop().await;
 }

@@ -43,8 +43,15 @@
 # Command prefix a job's command line is appended to.
 # shell = ["sh", "-c"]
 
-# Warn when all checkpoint images together exceed this many bytes.
+# Warn when all checkpoint images together exceed this many bytes. Images are
+# never deleted automatically: the owner of a job whose checkpoint crosses the
+# limit is told once, administrators (root, puzuz-admin) on their commands
+# while it is exceeded, and `puzuz doctor` reports it.
 # checkpoint_size_limit_bytes = 500_000_000_000
+
+# Remind each administrator of exceeded checkpoint_size_limit_bytes at most
+# this often (seconds); going back under the limit resets the reminder.
+# checkpoint_size_warning_interval_secs = 3600
 
 # [both] Close TCP connections when checkpointing (`criu --tcp-close`).
 # checkpoint_tcp_close = true

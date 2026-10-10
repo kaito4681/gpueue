@@ -21,6 +21,11 @@ use super::ApiError;
 /// only the owner and administrators receive [`JobDetails`]. For everyone
 /// else `details` is absent: the daemon must build views with
 /// [`JobView::for_caller`] so the command, cwd and environment never leave it.
+///
+/// The environment is large (a full login environment per job), so only
+/// `GET /v1/jobs/{id}` includes it; `GET /v1/jobs` (unless asked with
+/// `?details=envs`) and events send views without it (see
+/// [`JobDetails::envs`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobView {
     pub id: JobId,
@@ -48,7 +53,13 @@ pub struct JobView {
 pub struct JobDetails {
     pub command: String,
     pub cwd: PathBuf,
-    pub envs: BTreeMap<String, String>,
+    /// The submitting client's environment. Present in single-job views
+    /// (`GET /v1/jobs/{id}`, and `GET /v1/jobs?details=envs`); absent from
+    /// job lists and events, which would otherwise repeat every job's whole
+    /// environment. Absent never means "empty environment": an empty one is
+    /// sent as `{}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envs: Option<BTreeMap<String, String>>,
     /// The last error recorded for the job: why its last restore, dump or
     /// spawn failed (e.g. a CRIU log summary). Kept private because it can
     /// mention paths and command lines.
@@ -76,7 +87,7 @@ impl JobView {
         view.details = Some(JobDetails {
             command: job.spec.command.clone(),
             cwd: job.spec.cwd.clone(),
-            envs: job.spec.envs.clone(),
+            envs: Some(job.spec.envs.clone()),
             last_error: reason,
         });
         view
@@ -117,6 +128,15 @@ impl JobView {
     pub fn is_redacted(&self) -> bool {
         self.details.is_none()
     }
+
+    /// Drops the environment (see [`JobDetails::envs`]); for job lists and
+    /// events.
+    pub fn without_envs(mut self) -> Self {
+        if let Some(details) = self.details.as_mut() {
+            details.envs = None;
+        }
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +149,27 @@ pub struct ListJobsQuery {
     /// Only jobs in this group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Extra fields to include in every view (`details=envs`). By default
+    /// the list leaves out each job's environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<ListDetails>,
+}
+
+/// Opt-in extras of `GET /v1/jobs` (`?details=...`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListDetails {
+    /// Include [`JobDetails::envs`] (still only in views the caller may see
+    /// in full).
+    Envs,
+}
+
+impl ListDetails {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ListDetails::Envs => "envs",
+        }
+    }
 }
 
 impl ListJobsQuery {
@@ -138,7 +179,15 @@ impl ListJobsQuery {
         if let Some(group) = &self.group {
             q.push("group", group);
         }
+        if let Some(details) = self.details {
+            q.push("details", details.as_str());
+        }
         q.finish()
+    }
+
+    /// Whether the views should include [`JobDetails::envs`].
+    pub fn include_envs(&self) -> bool {
+        self.details == Some(ListDetails::Envs)
     }
 }
 
