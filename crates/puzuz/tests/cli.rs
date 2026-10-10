@@ -112,6 +112,27 @@ enum Mode {
     VersionMismatch,
     /// Like `Normal`, with checkpoint size warnings on every response.
     SizeWarnings,
+    /// Like `Normal`, but bulk `pause`/`start`/`kill` on a group or on all
+    /// jobs report the groups they paused or resumed, as for an
+    /// administrator.
+    Admin,
+}
+
+/// The groups the fake daemon reports as paused/resumed for a bulk request.
+fn changed_groups(mode: Mode, body: &[u8]) -> Vec<String> {
+    let request: BulkJobRequest = serde_json::from_slice(body).unwrap();
+    let group_action = matches!(
+        request.action,
+        JobAction::Pause(_) | JobAction::Start | JobAction::Kill(_)
+    );
+    if mode != Mode::Admin || !group_action {
+        return Vec::new();
+    }
+    match request.target {
+        JobSelector::Ids { .. } => Vec::new(),
+        JobSelector::Group { group } => vec![group],
+        JobSelector::All => vec!["default".into(), "gpu".into()],
+    }
 }
 
 async fn route(
@@ -182,6 +203,7 @@ async fn route(
                         ApiError::new(ErrorCode::InvalidState, "job 2 is not running"),
                     ),
                 ],
+                groups: changed_groups(mode, &body),
             },
         ),
         ("GET", "/v1/jobs/2/log?tail=16") => Response::builder()
@@ -377,7 +399,7 @@ fn partial_failure_reports_each_job_and_exits_non_zero() {
 
 #[test]
 fn group_selection_uses_the_bulk_endpoint() {
-    let daemon = FakeDaemon::start(Mode::Normal);
+    let daemon = FakeDaemon::start(Mode::Admin);
     let output = puzuz(&daemon.socket, &["pause", "-g", "gpu"]);
     // The fake answers with one failure.
     assert_eq!(output.status.code(), Some(1));
@@ -477,4 +499,79 @@ fn version_mismatch_explains_how_to_fix_it() {
     let text = stderr(&output);
     assert!(text.contains("daemon 9.9.9"), "{text}");
     assert!(text.contains("sudo systemctl restart puzuz"), "{text}");
+}
+
+/// Runs `args` against a fake daemon in `mode`; returns (exit code, stdout).
+fn run_bulk(mode: Mode, args: &[&str]) -> (Option<i32>, String) {
+    let daemon = FakeDaemon::start(mode);
+    let output = puzuz(&daemon.socket, args);
+    // The fake answers every bulk request with job 1 done and job 2 failed.
+    assert_eq!(stderr(&output), "Job 2: job 2 is not running\n");
+    (output.status.code(), stdout(&output))
+}
+
+#[test]
+fn all_selection_reports_groups_for_admins() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["pause", "-a"], "All groups are being paused.\n"),
+        (
+            &["pause", "-a", "--wait"],
+            "All groups are being paused. Running jobs keep running.\n",
+        ),
+        (&["start", "-a"], "All groups are being resumed.\n"),
+        (
+            &["kill", "-a"],
+            "Jobs are being killed: 1\nAll groups have been paused.\n",
+        ),
+        (
+            &["kill", "-a", "-s", "INT"],
+            "Sending signal SIGINT to jobs: 1\nAll groups have been paused.\n",
+        ),
+        (&["start", "-g", "gpu"], "Group \"gpu\" is being resumed.\n"),
+        (
+            &["kill", "-g", "gpu"],
+            "Jobs are being killed: 1\nGroup \"gpu\" has been paused.\n",
+        ),
+        // Explicit ids never touch groups.
+        (&["pause", "1", "2"], "Jobs are being paused: 1\n"),
+    ];
+    for (args, expected) in cases {
+        let (code, out) = run_bulk(Mode::Admin, args);
+        assert_eq!(code, Some(1), "{args:?}");
+        assert_eq!(out, *expected, "{args:?}");
+    }
+}
+
+#[test]
+fn all_selection_reports_own_jobs_for_normal_users() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["pause", "-a"], "Your jobs are being paused: 1\n"),
+        (
+            &["pause", "-a", "--wait"],
+            "Only administrators pause groups; no jobs were paused.\n",
+        ),
+        (&["start", "-a"], "Your paused jobs are being resumed: 1\n"),
+        (&["kill", "-a"], "Your jobs are being killed: 1\n"),
+        (
+            &["kill", "-a", "-s", "INT"],
+            "Sending signal SIGINT to your jobs: 1\n",
+        ),
+        (
+            &["pause", "-g", "gpu"],
+            "Your jobs in group \"gpu\" are being paused: 1\n",
+        ),
+        (
+            &["start"],
+            "Your paused jobs in group \"default\" are being resumed: 1\n",
+        ),
+        (
+            &["kill", "-g", "gpu"],
+            "Your jobs in group \"gpu\" are being killed: 1\n",
+        ),
+    ];
+    for (args, expected) in cases {
+        let (code, out) = run_bulk(Mode::Normal, args);
+        assert_eq!(code, Some(1), "{args:?}");
+        assert_eq!(out, *expected, "{args:?}");
+    }
 }

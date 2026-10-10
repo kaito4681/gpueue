@@ -272,7 +272,7 @@ pub enum SubCommand {
     /// Resume paused jobs or groups, or force-start queued jobs.
     ///
     /// Without arguments, resumes the default group and its paused jobs. Only administrators
-    /// resume a group; other users resume their own paused jobs in it.
+    /// resume groups; other users resume their own paused jobs in them (`-g`, `-a`).
     /// Starting specific queued/stashed jobs ignores group limits and dependencies.
     /// Checkpointed jobs are resumed with `puzuz restore`, not with `start`.
     Start {
@@ -280,11 +280,11 @@ pub enum SubCommand {
         #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
-        /// Resume a group and all paused jobs in it.
+        /// Resume a group and all paused jobs in it (other users: your paused jobs in it).
         #[arg(short, long, conflicts_with = "all")]
         group: Option<String>,
 
-        /// Resume all groups and their paused jobs.
+        /// Resume all groups and all paused jobs (other users: all your paused jobs).
         #[arg(short, long)]
         all: bool,
     },
@@ -332,22 +332,22 @@ pub enum SubCommand {
     /// Pause running jobs or whole groups.
     ///
     /// Without arguments, pauses the default group and its jobs.
-    /// A paused group does not start new jobs. Only administrators pause a group; other users
-    /// pause their own jobs in it.
+    /// A paused group does not start new jobs. Only administrators pause groups; other users
+    /// pause their own jobs in them (`-g`, `-a`).
     Pause {
         /// Pause these jobs.
         #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
-        /// Pause a group.
+        /// Pause a group and its jobs (other users: your jobs in it).
         #[arg(short, long, conflicts_with = "all")]
         group: Option<String>,
 
-        /// Pause all groups.
+        /// Pause all groups and all jobs (other users: all your jobs).
         #[arg(short, long)]
         all: bool,
 
-        /// Only pause the groups; let their running jobs finish.
+        /// Only pause the groups; let their running jobs finish (administrators).
         #[arg(short, long)]
         wait: bool,
     },
@@ -355,18 +355,18 @@ pub enum SubCommand {
     /// Kill running jobs or all jobs of a group.
     ///
     /// Without ids, kills the jobs of the default group. Checkpointed jobs are not running;
-    /// use `puzuz remove` to discard them. Only administrators pause a group; other users kill
-    /// their own jobs in it.
+    /// use `puzuz remove` to discard them. With `-g`/`-a`, administrators also pause the
+    /// groups (as pueue does); other users kill their own jobs and leave the groups alone.
     Kill {
         /// Kill these jobs.
         #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
-        /// Kill all running jobs of a group and pause the group (administrators).
+        /// Kill all running jobs of a group and pause it (other users: your jobs in it).
         #[arg(short, long, conflicts_with = "all")]
         group: Option<String>,
 
-        /// Kill all running jobs in all groups and pause all groups.
+        /// Kill all running jobs and pause all groups (other users: all your jobs).
         #[arg(short, long)]
         all: bool,
 

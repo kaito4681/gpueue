@@ -189,14 +189,7 @@ impl App {
                 all,
             } => {
                 let target = requests::selection(&task_ids, group.as_deref(), all);
-                let headline = match &target {
-                    JobSelector::Group { group } => {
-                        Some(format!("Group \"{group}\" is being resumed."))
-                    }
-                    JobSelector::All => Some("All groups are being resumed.".to_owned()),
-                    JobSelector::Ids { .. } => None,
-                };
-                self.bulk(target, JobAction::Start, "Jobs are being started", headline)
+                self.group_bulk(target, JobAction::Start, GroupVerb::Start)
                     .await
             }
             SubCommand::Pause {
@@ -206,20 +199,8 @@ impl App {
                 wait,
             } => {
                 let target = requests::selection(&task_ids, group.as_deref(), all);
-                let suffix = if wait {
-                    " Running jobs keep running."
-                } else {
-                    ""
-                };
-                let headline = match &target {
-                    JobSelector::Group { group } => {
-                        Some(format!("Group \"{group}\" is being paused.{suffix}"))
-                    }
-                    JobSelector::All => Some(format!("All groups are being paused.{suffix}")),
-                    JobSelector::Ids { .. } => None,
-                };
                 let action = JobAction::Pause(PauseOptions { wait });
-                self.bulk(target, action, "Jobs are being paused", headline)
+                self.group_bulk(target, action, GroupVerb::Pause { wait })
                     .await
             }
             SubCommand::Kill {
@@ -229,14 +210,13 @@ impl App {
                 signal,
             } => {
                 let target = requests::selection(&task_ids, group.as_deref(), all);
-                let message = match signal {
-                    Some(signal) => format!("Sending signal {signal} to jobs"),
-                    None => "Jobs are being killed".to_owned(),
-                };
                 let action = JobAction::Kill(KillOptions {
                     signal: signal.map(|signal| signal.number()),
                 });
-                self.bulk(target, action, &message, None).await
+                let verb = GroupVerb::Kill {
+                    signal: signal.map(|signal| signal.to_string()),
+                };
+                self.group_bulk(target, action, verb).await
             }
             SubCommand::Restart {
                 task_ids,
@@ -381,6 +361,33 @@ impl App {
     ) -> Result<ExitCode> {
         let response = self.client.bulk(&BulkJobRequest { target, action }).await?;
         let report = render::action_report(&response.results, message, headline, &self.ctx.style);
+        report.print()?;
+        Ok(exit(report.ok))
+    }
+
+    /// `pause`, `start` and `kill`: the report says whether whole groups
+    /// were paused/resumed (administrators) or only the caller's own jobs.
+    async fn group_bulk(
+        &self,
+        target: JobSelector,
+        action: JobAction,
+        verb: GroupVerb,
+    ) -> Result<ExitCode> {
+        let response = self
+            .client
+            .bulk(&BulkJobRequest {
+                target: target.clone(),
+                action,
+            })
+            .await?;
+        let messages = group_messages(&verb, &target, &response.groups);
+        let mut report = render::action_report(
+            &response.results,
+            &messages.message,
+            messages.headline,
+            &self.ctx.style,
+        );
+        report.stdout.extend(messages.note);
         report.print()?;
         Ok(exit(report.ok))
     }
@@ -540,7 +547,7 @@ impl App {
         };
         let mut results = Vec::new();
         for request in &requests {
-            let BulkJobResponse { results: more } = self.client.reset(request).await?;
+            let BulkJobResponse { results: more, .. } = self.client.reset(request).await?;
             results.extend(more);
         }
         let headline = if groups.is_empty() {
@@ -983,6 +990,109 @@ impl Waiter {
 fn state_kind_changed(previous: &JobState, next: &JobState) -> bool {
     std::mem::discriminant(previous) != std::mem::discriminant(next)
         || matches!(next, JobState::Done { .. }) && previous != next
+}
+
+/// A bulk action that may also pause or resume whole groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupVerb {
+    Pause {
+        wait: bool,
+    },
+    Start,
+    /// The signal's name, if one is sent instead of killing.
+    Kill {
+        signal: Option<String>,
+    },
+}
+
+/// What [`App::group_bulk`] prints: `message` prefixes the list of
+/// affected jobs unless there is a `headline`; `note` follows the report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMessages {
+    pub message: String,
+    pub headline: Option<String>,
+    pub note: Option<String>,
+}
+
+/// The messages for `verb` on `target`, given the groups whose paused flag
+/// the daemon set (`BulkJobResponse::groups`). Only administrators change a
+/// group; for everyone else `-g`/`-a` only act on their own jobs, which the
+/// wording reflects.
+pub fn group_messages(verb: &GroupVerb, target: &JobSelector, groups: &[String]) -> GroupMessages {
+    let changed = match target {
+        JobSelector::Ids { .. } => false,
+        JobSelector::Group { group } => groups.contains(group),
+        JobSelector::All => !groups.is_empty(),
+    };
+    let jobs_of = match target {
+        JobSelector::Group { group } => format!(" in group \"{group}\""),
+        _ => String::new(),
+    };
+    let own = !changed && !matches!(target, JobSelector::Ids { .. });
+    let (message, headline, note) = match verb {
+        GroupVerb::Pause { wait } => {
+            let suffix = if *wait {
+                " Running jobs keep running."
+            } else {
+                ""
+            };
+            let headline = match target {
+                JobSelector::Group { group } if changed => {
+                    Some(format!("Group \"{group}\" is being paused.{suffix}"))
+                }
+                JobSelector::All if changed => {
+                    Some(format!("All groups are being paused.{suffix}"))
+                }
+                // `--wait` only pauses groups, which is up to administrators.
+                _ if own && *wait => {
+                    Some("Only administrators pause groups; no jobs were paused.".to_owned())
+                }
+                _ => None,
+            };
+            let message = if own {
+                format!("Your jobs{jobs_of} are being paused")
+            } else {
+                "Jobs are being paused".to_owned()
+            };
+            (message, headline, None)
+        }
+        GroupVerb::Start => {
+            let headline = match target {
+                JobSelector::Group { group } if changed => {
+                    Some(format!("Group \"{group}\" is being resumed."))
+                }
+                JobSelector::All if changed => Some("All groups are being resumed.".to_owned()),
+                _ => None,
+            };
+            let message = if own {
+                format!("Your paused jobs{jobs_of} are being resumed")
+            } else {
+                "Jobs are being started".to_owned()
+            };
+            (message, headline, None)
+        }
+        GroupVerb::Kill { signal } => {
+            let message = match (signal, own) {
+                (Some(signal), true) => format!("Sending signal {signal} to your jobs{jobs_of}"),
+                (Some(signal), false) => format!("Sending signal {signal} to jobs"),
+                (None, true) => format!("Your jobs{jobs_of} are being killed"),
+                (None, false) => "Jobs are being killed".to_owned(),
+            };
+            let note = match target {
+                JobSelector::Group { group } if changed => {
+                    Some(format!("Group \"{group}\" has been paused."))
+                }
+                JobSelector::All if changed => Some("All groups have been paused.".to_owned()),
+                _ => None,
+            };
+            (message, None, note)
+        }
+    };
+    GroupMessages {
+        message,
+        headline,
+        note,
+    }
 }
 
 /// Whether a job in `state` satisfies `wait --status target`.

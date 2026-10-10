@@ -130,6 +130,7 @@ and does not read pueue's files. These are the differences:
 | `shutdown` | kills all tasks and stops the daemon | administrators only. Checkpoints all running jobs, then stops the daemon. A job whose checkpoint is refused keeps running. `--no-checkpoint` kills them instead. |
 | `restart` | finished tasks | also works on `Checkpointed` jobs: they start over as a new job, and the image is kept |
 | `reset`, `-a/--all`, `-g/--group` | all tasks | your own jobs. Administrators act on everyone's. |
+| `pause/start/kill -a`, `-g` | also pause/resume the groups | only administrators pause/resume groups; for others, groups are left as they are |
 | Wording | "task" | "job". Option names such as `--print-task-id` are kept for compatibility. |
 | `--json` | pueue's internal state | puzuz's own schema, described below |
 | `edit`, `env`, `restart --edit` | supported | accepted but not implemented yet |
@@ -197,9 +198,14 @@ columns, and `Checkpointed` jobs show the image size.
   working directory, environment, label, failure reasons and log.
 - **Everyone:** seeing that a job exists, its owner, group, GPUs, state, priority, dependencies and
   times (`status`, `gpu`). This shows who is using which GPU.
-- **Administrators only:** `group add/remove`, `parallel`, `gpu parallel`, pausing or resuming a
-  whole group (`pause -g`, `start -g`, `kill -g`), `shutdown`, and `reset` of other users' jobs.
-  When a regular user runs `pause/start/kill -g`, only their own jobs in the group are affected.
+- **Administrators only:** `group add/remove`, `parallel`, `gpu parallel`, pausing or resuming
+  whole groups (`pause/start/kill -g` for one group, `pause/start/kill -a` for all groups),
+  `shutdown`, and `reset` of other users' jobs. As in pueue, `pause` and `kill` pause the selected
+  groups, `start` resumes them, and `pause --wait` pauses only the groups and lets running jobs
+  finish. Unlike pueue, `kill -g/-a` pauses the groups even when nothing is queued in them.
+  When a regular user runs `pause/start/kill -g` or `-a`, only their own jobs are affected and no
+  group's paused state changes (`pause --wait` then does nothing). The output says which happened
+  (`All groups are being paused.` versus `Your jobs are being paused: 3, 4`).
 - Administrators are root and members of the `puzuz-admin` group (primary or supplementary). The
   check is made on every request, so `usermod -aG puzuz-admin <user>` takes effect immediately.
 

@@ -296,8 +296,9 @@ impl JobAction {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PauseOptions {
-    /// With a group selector: pause the group but let running jobs finish
-    /// (`pause --wait`).
+    /// With a group or all selector: pause the group(s) but let running
+    /// jobs finish (`pause --wait`). Pausing groups is admin-only, so this
+    /// does nothing for other users.
     #[serde(default)]
     pub wait: bool,
 }
@@ -351,12 +352,15 @@ pub enum JobSelector {
     Ids {
         ids: Vec<JobId>,
     },
-    /// Every job of the group the caller may modify (`-g`). For `pause` and
-    /// `start` this also pauses/resumes the group itself, as in pueue.
+    /// Every job of the group the caller may modify (`-g`). For an
+    /// administrator, `pause` and `kill` also pause the group itself and
+    /// `start` resumes it, as in pueue.
     Group {
         group: String,
     },
-    /// The caller's own jobs, or every job for administrators (`-a`).
+    /// The caller's own jobs, or every job for administrators (`-a`). For
+    /// an administrator, `pause` and `kill` also pause every group and
+    /// `start` resumes every group, as in pueue.
     All,
 }
 
@@ -374,9 +378,22 @@ pub struct BulkJobRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BulkJobResponse {
     pub results: Vec<JobActionResult>,
+    /// Groups whose paused flag this request set: paused by `pause` and
+    /// `kill`, resumed by `start`. Only administrators change it, with a
+    /// `group` or `all` target; empty otherwise (omitted from the JSON).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
 }
 
 impl BulkJobResponse {
+    /// A response that changed no group.
+    pub fn new(results: Vec<JobActionResult>) -> Self {
+        Self {
+            results,
+            groups: Vec::new(),
+        }
+    }
+
     pub fn all_ok(&self) -> bool {
         self.results.iter().all(JobActionResult::is_ok)
     }

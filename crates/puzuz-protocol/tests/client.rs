@@ -146,15 +146,13 @@ async fn route(req: Request<Incoming>, log: Arc<Mutex<Vec<Recorded>>>) -> Respon
         ),
         ("POST", "/v1/jobs/bulk") => json(
             StatusCode::OK,
-            BulkJobResponse {
-                results: vec![
-                    JobActionResult::ok(JobId(1)),
-                    JobActionResult::error(
-                        JobId(2),
-                        ApiError::new(ErrorCode::InvalidState, "job 2 is not running"),
-                    ),
-                ],
-            },
+            BulkJobResponse::new(vec![
+                JobActionResult::ok(JobId(1)),
+                JobActionResult::error(
+                    JobId(2),
+                    ApiError::new(ErrorCode::InvalidState, "job 2 is not running"),
+                ),
+            ]),
         ),
         ("DELETE", "/v1/jobs/3") => json(StatusCode::OK, JobActionResult::ok(JobId(3))),
         ("POST", "/v1/jobs/3/kill") => json(StatusCode::OK, JobActionResult::ok(JobId(3))),

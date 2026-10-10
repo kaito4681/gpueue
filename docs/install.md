@@ -213,7 +213,8 @@ the file. Prefer the file: `puzuz doctor` reports the file's values and warns wh
 
 Administrators are root and the members of `puzuz-admin` (primary or supplementary group). They
 can act on every user's jobs and run the admin-only commands (`group add/remove`, `parallel`,
-`gpu parallel`, group-wide `pause/start/kill -g`, `shutdown`, `reset` of all jobs).
+`gpu parallel`, pausing/resuming groups with `pause/start/kill -g` or `-a`, `shutdown`, `reset`
+of all jobs).
 
 ```sh
 sudo usermod -aG puzuz-admin alice

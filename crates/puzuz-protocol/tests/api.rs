@@ -317,12 +317,21 @@ fn bulk_response_golden() {
                 },
             },
         ],
+        groups: Vec::new(),
     };
     assert!(!resp.all_ok());
     assert_golden(
         &resp,
         r#"{"results":[{"id":1,"status":"ok"},{"id":2,"status":"ok","new_id":9},{"id":3,"status":"error","error":{"code":"invalid_state","message":"job 3 is not running"}},{"id":4,"status":"ok","launch_pending":true}]}"#,
     );
+    // Groups whose paused flag was set are listed; the field is optional.
+    let paused = BulkJobResponse {
+        results: Vec::new(),
+        groups: vec!["default".into(), "gpu".into()],
+    };
+    assert_golden(&paused, r#"{"results":[],"groups":["default","gpu"]}"#);
+    let plain: BulkJobResponse = serde_json::from_str(r#"{"results":[]}"#).unwrap();
+    assert_eq!(plain, BulkJobResponse::new(Vec::new()));
     // The field is optional for older daemons.
     let add: AddJobResponse = serde_json::from_str(r#"{"id":5}"#).unwrap();
     assert_eq!(add, AddJobResponse::new(JobId(5)));

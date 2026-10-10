@@ -86,6 +86,25 @@ fn list_ids(ids: &[JobId]) -> String {
         .join(", ")
 }
 
+/// The jobs a `group` or `all` selection acts on: those in `scope`; for
+/// `start` only paused ones (queued jobs wait for their slot); none for
+/// `pause --wait`.
+fn bulk_targets(
+    jobs: &[Job],
+    action: &JobAction,
+    scope: &authz::Scope,
+    waiting_pause: bool,
+) -> Vec<JobId> {
+    if waiting_pause {
+        return Vec::new();
+    }
+    jobs.iter()
+        .filter(|j| scope.includes(j))
+        .filter(|j| *action != JobAction::Start || j.state == JobState::Paused)
+        .map(|j| j.id)
+        .collect()
+}
+
 impl Core {
     // -----------------------------------------------------------------
     // Jobs: reading
@@ -384,52 +403,59 @@ impl Core {
         self.reject_if_shutting_down()?;
         let action = request.action;
         let scope = authz::selection_scope(&caller);
-        let (ids, explicit) = match request.target {
-            JobSelector::Ids { ids } => (ids, true),
+        // Pausing/resuming whole groups (`-g`, or `-a` for all groups) is
+        // admin-only; others only act on their own jobs in them. As in
+        // pueue, `kill` pauses the groups too.
+        let paused = match &action {
+            JobAction::Pause(_) | JobAction::Kill(_) => Some(true),
+            JobAction::Start => Some(false),
+            _ => None,
+        };
+        let set_paused = paused.filter(|_| caller.is_admin);
+        // `pause --wait`: only the groups are paused; running jobs may finish.
+        let waiting_pause = matches!(&action, JobAction::Pause(o) if o.wait);
+        let (ids, explicit, groups) = match request.target {
+            JobSelector::Ids { ids } => (ids, true, Vec::new()),
             JobSelector::Group { group } => {
-                // Pausing/resuming a whole group is admin-only; others only
-                // act on their own jobs in it.
-                let paused = match &action {
-                    JobAction::Pause(_) | JobAction::Kill(_) => Some(true),
-                    JobAction::Start => Some(false),
-                    _ => None,
-                };
-                let set_status = caller.is_admin && paused.is_some();
-                let name = group.clone();
-                let jobs = self
+                let (jobs, groups) = self
                     .write(move |tx, ch| {
-                        if tx.get_group(&name)?.is_none() {
-                            return Err(puzuz_core::Error::GroupNotFound(name).into());
+                        if tx.get_group(&group)?.is_none() {
+                            return Err(puzuz_core::Error::GroupNotFound(group).into());
                         }
-                        if set_status && let Some(paused) = paused {
-                            tx.set_group_paused(&name, paused)?;
-                            ch.group(&name);
+                        let mut groups = Vec::new();
+                        if let Some(paused) = set_paused {
+                            tx.set_group_paused(&group, paused)?;
+                            ch.group(&group);
+                            groups.push(group.clone());
                         }
-                        Ok(tx.list_jobs(&JobFilter::all().group(&name))?)
+                        Ok((tx.list_jobs(&JobFilter::all().group(&group))?, groups))
                     })
                     .await?;
-                let waiting_pause = matches!(&action, JobAction::Pause(o) if o.wait);
-                let ids = if waiting_pause {
-                    // `pause --wait`: running jobs may finish.
-                    Vec::new()
-                } else {
-                    jobs.iter()
-                        .filter(|j| scope.includes(j))
-                        .filter(|j| action != JobAction::Start || j.state == JobState::Paused)
-                        .map(|j| j.id)
-                        .collect()
-                };
-                (ids, false)
+                (
+                    bulk_targets(&jobs, &action, &scope, waiting_pause),
+                    false,
+                    groups,
+                )
             }
             JobSelector::All => {
-                let jobs = self.read(|s| s.list_jobs(&JobFilter::all())).await?;
-                let ids = jobs
-                    .iter()
-                    .filter(|j| scope.includes(j))
-                    .filter(|j| action != JobAction::Start || j.state == JobState::Paused)
-                    .map(|j| j.id)
-                    .collect();
-                (ids, false)
+                let (jobs, groups) = self
+                    .write(move |tx, ch| {
+                        let mut groups = Vec::new();
+                        if let Some(paused) = set_paused {
+                            for group in tx.list_groups()? {
+                                tx.set_group_paused(&group.name, paused)?;
+                                ch.group(&group.name);
+                                groups.push(group.name);
+                            }
+                        }
+                        Ok((tx.list_jobs(&JobFilter::all())?, groups))
+                    })
+                    .await?;
+                (
+                    bulk_targets(&jobs, &action, &scope, waiting_pause),
+                    false,
+                    groups,
+                )
             }
         };
         let together = if action == JobAction::Remove {
@@ -452,7 +478,7 @@ impl Core {
                 Err(e) => results.push(JobActionResult::error(id, e.0)),
             }
         }
-        Ok(BulkJobResponse { results })
+        Ok(BulkJobResponse { results, groups })
     }
 
     /// `POST /v1/jobs/clean`.
@@ -571,7 +597,7 @@ impl Core {
             self.reap_pending(job.id).await;
         }
         results.sort_by_key(|r| r.id);
-        Ok(BulkJobResponse { results })
+        Ok(BulkJobResponse::new(results))
     }
 
     /// `POST /v1/jobs/switch`.
