@@ -23,7 +23,22 @@ CapabilityBoundingSet=
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
-PrivateDevices=yes
+# Devices: only the pseudo devices (/dev/null, /dev/urandom, ...) and the
+# NVIDIA control and GPU nodes (/dev/nvidiactl, /dev/nvidia<N>; character
+# major 195, named "nvidiactl"/"nvidia" - "nvidia-frontend" on older drivers
+# - in /proc/devices), which NVML opens read-write to detect the GPUs at
+# start-up. The nodes are mode 0666, so no extra group is needed. Not
+# PrivateDevices=yes: its private /dev has no /dev/nvidia* (NVML then fails
+# with "driver is not loaded"), and BindPaths= cannot follow GPU nodes by
+# pattern. The device cgroup still denies everything else (e.g.
+# /dev/nvidia-uvm: the daemon never runs CUDA). Device groups are looked up
+# in /proc/devices when the unit starts; like GPU detection itself, they
+# need a restart of the daemon after the NVIDIA driver is loaded later.
+DevicePolicy=closed
+DeviceAllow=char-nvidiactl rw
+DeviceAllow=char-nvidia rw
+DeviceAllow=char-nvidia-frontend rw
+SystemCallFilter=~@raw-io
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

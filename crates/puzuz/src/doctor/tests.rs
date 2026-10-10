@@ -2,7 +2,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 
-use puzuz_protocol::api::CheckpointStorage;
+use puzuz_core::model::GpuIndex;
+use puzuz_protocol::api::{CheckpointStorage, DetectedGpuSummary};
 
 use super::*;
 use crate::system::fake::FakeSystem;
@@ -43,8 +44,8 @@ fn healthy() -> (FakeSystem, Vec<UnixListener>) {
     sys.respond("cuda-checkpoint --help", CmdOutput::ok(CUDA_HELP));
     sys.write_exe("/usr/bin/nvidia-smi", "");
     sys.respond(
-        "nvidia-smi --query-gpu=index,name",
-        CmdOutput::ok("0, NVIDIA GeForce RTX 4090\n"),
+        "nvidia-smi --query-gpu=index,uuid,name",
+        CmdOutput::ok("0, GPU-a, NVIDIA GeForce RTX 4090\n"),
     );
     sys.write("/proc/sys/kernel/osrelease", "6.8.0-generic\n");
     sys.write("/proc/sys/kernel/ns_last_pid", "1234\n");
@@ -218,13 +219,182 @@ fn cuda_checkpoint_that_cannot_start_is_explained() {
     assert!(message(&report, "cuda-checkpoint").contains("libcuda.so.1"));
 }
 
+fn detection(
+    mode: GpuDetection,
+    source: GpuSource,
+    nvml_error: Option<&str>,
+    uuids: &[&str],
+) -> GpuDetectionStatus {
+    GpuDetectionStatus {
+        mode,
+        source,
+        nvml_error: nvml_error.map(str::to_owned),
+        gpus: uuids
+            .iter()
+            .enumerate()
+            .map(|(i, uuid)| DetectedGpuSummary {
+                index: GpuIndex(i as u32),
+                uuid: (*uuid).to_owned(),
+                name: "NVIDIA GeForce RTX 4090".to_owned(),
+            })
+            .collect(),
+    }
+}
+
+fn with_detection(sys: &mut FakeSystem, detection: GpuDetectionStatus) {
+    let mut version = FakeSystem::daemon_ok(true).unwrap();
+    version.gpu_detection = Some(detection);
+    sys.daemon = Ok(version);
+}
+
 #[test]
-fn unconfigured_gpus_warn() {
-    let (sys, _sockets) = healthy();
+fn nvml_detection_needs_no_gpus_list() {
+    let (mut sys, _sockets) = healthy();
     sys.write("/etc/puzuz/config.toml", "");
+    with_detection(
+        &mut sys,
+        detection(GpuDetection::Auto, GpuSource::Nvml, None, &["GPU-a"]),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpus"), Level::Ok, "{report:#?}");
+    assert_eq!(message(&report, "gpus"), "1 GPU(s), detected with NVML");
+    assert!(!report.has_failures());
+
+    // A fallback list that matches nvidia-smi is fine too.
+    sys.write("/etc/puzuz/config.toml", CONFIG);
+    assert_eq!(level(&run(&sys, None), "gpus"), Level::Ok);
+}
+
+#[test]
+fn nvml_failing_in_auto_mode_warns_with_the_reason() {
+    let (mut sys, _sockets) = healthy();
+    let error = "cannot initialize NVML: libnvidia-ml.so.1: NVIDIA driver is not loaded \
+                 (/dev/nvidiactl does not exist)";
+    // Even when the fallback list matches nvidia-smi.
+    with_detection(
+        &mut sys,
+        detection(
+            GpuDetection::Auto,
+            GpuSource::Config,
+            Some(error),
+            &["GPU-a"],
+        ),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpus"), Level::Warn);
+    assert!(message(&report, "gpus").contains(error));
+    assert!(message(&report, "gpus").contains("uses the 1 GPU(s) of [[gpus]]"));
+    assert!(hint(&report, "gpus").contains("DeviceAllow="));
+
+    sys.write("/etc/puzuz/config.toml", "");
+    with_detection(
+        &mut sys,
+        detection(GpuDetection::Auto, GpuSource::Config, Some(error), &[]),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpus"), Level::Warn);
+    assert!(message(&report, "gpus").contains("runs without GPUs"));
+}
+
+#[test]
+fn no_detected_gpus_while_nvidia_smi_sees_some_warn() {
+    let (mut sys, _sockets) = healthy();
+    sys.write("/etc/puzuz/config.toml", "gpu_detection = \"static\"\n");
+    with_detection(
+        &mut sys,
+        detection(GpuDetection::Static, GpuSource::Config, None, &[]),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpus"), Level::Warn);
+    assert!(message(&report, "gpus").contains("the daemon has none"));
+    assert!(hint(&report, "gpus").contains("[[gpus]]"));
+
+    // NVML found none (e.g. a GPU added since the daemon started).
+    with_detection(
+        &mut sys,
+        detection(GpuDetection::Auto, GpuSource::Nvml, None, &[]),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpus"), Level::Warn);
+    assert!(hint(&report, "gpus").contains("systemctl restart puzuz.service"));
+}
+
+#[test]
+fn static_list_disagreeing_with_nvidia_smi_warns() {
+    let (mut sys, _sockets) = healthy();
+    with_detection(
+        &mut sys,
+        detection(GpuDetection::Static, GpuSource::Config, None, &["GPU-x"]),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpus"), Level::Warn);
+    assert!(
+        message(&report, "gpus").contains("GPU 0 is GPU-x but nvidia-smi shows GPU-a"),
+        "{}",
+        message(&report, "gpus")
+    );
+
+    with_detection(
+        &mut sys,
+        detection(
+            GpuDetection::Static,
+            GpuSource::Config,
+            None,
+            &["GPU-a", "GPU-b"],
+        ),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpus"), Level::Warn);
+    assert!(message(&report, "gpus").contains("GPU 1 is not in nvidia-smi"));
+
+    with_detection(
+        &mut sys,
+        detection(GpuDetection::Static, GpuSource::Config, None, &["GPU-a"]),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpus"), Level::Ok);
+    assert_eq!(
+        message(&report, "gpus"),
+        "1 GPU(s), from [[gpus]] (gpu_detection = \"static\")"
+    );
+}
+
+#[test]
+fn stale_fallback_list_warns_even_when_nvml_works() {
+    let (mut sys, _sockets) = healthy();
+    sys.write(
+        "/etc/puzuz/config.toml",
+        "[[gpus]]\nindex = 0\nuuid = \"GPU-old\"\n",
+    );
+    with_detection(
+        &mut sys,
+        detection(GpuDetection::Auto, GpuSource::Nvml, None, &["GPU-a"]),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpus"), Level::Warn);
+    assert!(message(&report, "gpus").contains("would be used if NVML failed"));
+}
+
+#[test]
+fn without_the_daemons_report_only_static_mode_is_checked() {
+    let (mut sys, _sockets) = healthy();
+    // Auto mode: what the daemon detected is unknown.
+    sys.write("/etc/puzuz/config.toml", "");
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpus"), Level::Info);
+    sys.daemon = Err("connection refused".to_owned());
+    assert_eq!(level(&run(&sys, None), "gpus"), Level::Info);
+
+    // Static mode: the configuration is what the daemon uses.
+    sys.write("/etc/puzuz/config.toml", "gpu_detection = \"static\"\n");
     let report = run(&sys, None);
     assert_eq!(level(&report, "gpus"), Level::Warn);
     assert!(hint(&report, "gpus").contains("[[gpus]]"));
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!("gpu_detection = \"static\"\n{CONFIG}"),
+    );
+    assert_eq!(level(&run(&sys, None), "gpus"), Level::Ok);
 }
 
 #[test]

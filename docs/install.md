@@ -94,7 +94,8 @@ following:
    - `/etc/systemd/system/puzuz-helper.service`, the root helper (from
      [packaging/systemd/puzuz-helper.service](../packaging/systemd/puzuz-helper.service)),
    - `/etc/systemd/system/puzuz.service`, the daemon, which runs as user `puzuz` with a strict
-     sandbox (from [packaging/systemd/puzuz.service](../packaging/systemd/puzuz.service)),
+     sandbox that allows only the NVIDIA devices NVML needs (from
+     [packaging/systemd/puzuz.service](../packaging/systemd/puzuz.service)),
    - `/etc/sysusers.d/puzuz.conf`, which defines the system user `puzuz` and the group
      `puzuz-admin`,
    - `/etc/tmpfiles.d/puzuz.conf`, the directories listed below.
@@ -115,7 +116,8 @@ following:
 
 5. Creates `/etc/puzuz/config.toml` from
    [packaging/config.toml](../packaging/config.toml) **only if it does not exist yet**. If
-   `nvidia-smi` works, it appends a `[[gpus]]` entry for each GPU it lists.
+   `nvidia-smi` works, it appends a `[[gpus]]` entry for each GPU it lists (a fallback for when
+   NVML fails; see [GPU detection](#gpu-detection)).
 6. Runs `systemctl daemon-reload`. If the units or the binaries changed, it runs
    `systemctl try-restart` on both services. Then it runs
    `systemctl enable --now puzuz-helper.service puzuz.service`, waits up to 10 seconds for the
@@ -138,8 +140,9 @@ puzuz service status   # both units, and whether the daemon is reachable and con
 ```
 
 `puzuz doctor` checks the configuration file and its ownership, `criu` (version 4.2 or newer), the
-NVIDIA driver, `cuda-checkpoint` (manual mode support, version matching the driver), `nvidia-smi`
-against the configured GPUs, the kernel, the systemd version, both units, the helper binary's
+NVIDIA driver, `cuda-checkpoint` (manual mode support, version matching the driver), the GPUs the
+daemon detected (with NVML or from `[[gpus]]`) against `nvidia-smi` (see
+[GPU detection](#gpu-detection)), the kernel, the systemd version, both units, the helper binary's
 ownership, both sockets, the daemon and helper versions and their connection, the checkpoint
 directory (exists, not tmpfs, free space) and the total checkpoint size, and whether you are an
 administrator. It does not run `criu check`. Run `sudo criu check` yourself to see what CRIU
@@ -225,13 +228,26 @@ without logging in again.
 The daemon detects GPUs once, when it starts. Restart `puzuz.service` after adding, removing or
 replacing a GPU.
 
-- With `gpu_detection = "auto"` (the default) it loads NVML (`libnvidia-ml.so.1`) at run time. If
-  NVML cannot be loaded or initialized, it uses the `[[gpus]]` list from the configuration.
+- With `gpu_detection = "auto"` (the default) it loads NVML (`libnvidia-ml.so.1`) at run time and
+  ignores `[[gpus]]`. If NVML cannot be loaded or initialized, it logs why (`journalctl -u
+  puzuz.service`, a warning starting with "GPU detection with NVML failed") and uses the
+  `[[gpus]]` list from the configuration instead, or runs without GPUs if there is none.
 - With `gpu_detection = "static"` it always uses the `[[gpus]]` list.
 
-`puzuz service install` writes the `[[gpus]]` list from `nvidia-smi` when it creates the
-configuration file. Keep the list in sync with the hardware (`puzuz doctor` compares it with
-`nvidia-smi`):
+NVML needs read-write access to `/dev/nvidiactl` and `/dev/nvidia<N>`. These nodes are normally
+mode 0666, so the `puzuz` user needs no extra group. The packaged `puzuz.service` therefore does
+not use `PrivateDevices=yes` (its private `/dev` has no NVIDIA nodes). It uses
+`DevicePolicy=closed` with `DeviceAllow=` for the NVIDIA control and GPU devices instead, so the
+daemon can open only those and the standard pseudo devices. If you customize the unit, keep these
+lines, or NVML fails with "NVIDIA driver is not loaded" (node hidden) or "internal driver error"
+(node not allowed). The log message says which one.
+
+`puzuz service install` also writes the `[[gpus]]` list from `nvidia-smi` when it creates the
+configuration file, as the fallback. `puzuz doctor` asks the daemon which GPUs it detected and
+how, and compares them with `nvidia-smi`. It warns when NVML failed in auto mode, when the daemon
+has no GPUs while `nvidia-smi` lists some, when the daemon's GPUs (or the `[[gpus]]` fallback
+list) differ from `nvidia-smi`, and when `gpu_detection = "static"` and `[[gpus]]` is empty. An
+empty `[[gpus]]` is fine while NVML works. The list looks like this:
 
 ```toml
 [[gpus]]
@@ -241,10 +257,8 @@ name = "NVIDIA GeForce RTX 4090"
 memory_total_bytes = 25757220864
 ```
 
-> The packaged `puzuz.service` runs the daemon with `PrivateDevices=yes`, which hides
-> `/dev/nvidia*`. NVML detection inside this sandbox has not been tested, and the end-to-end
-> tests use `gpu_detection = "static"`. Until it is, rely on the `[[gpus]]` list. If `puzuz gpu`
-> shows the right GPUs, detection works.
+`puzuz gpu` shows what the daemon uses: with NVML, each GPU's name, memory and driver version.
+The GPU end-to-end test checks NVML detection inside the packaged unit.
 
 A GPU that the daemon knew before but no longer finds stays listed as unavailable, and keeps its
 slot limit. Jobs that need it stay queued, and new jobs that ask for it are rejected. Each GPU

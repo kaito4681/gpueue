@@ -15,13 +15,14 @@ use puzuz_core::model::{GpuIndex, JobId, JobResult, JobSpec, JobState};
 use puzuz_daemon::api::TEST_UID_HEADER;
 use puzuz_daemon::helper::FakeOutcome;
 use puzuz_daemon::{
-    Config, Daemon, DaemonOptions, DetectedGpu, FakeHelper, GpuDetector, StaticGpuDetector,
-    StaticUserDb,
+    Config, Daemon, DaemonOptions, DetectedGpu, FakeHelper, FallbackGpuDetector, GpuDetector,
+    StaticGpuDetector, StaticUserDb,
 };
 use puzuz_protocol::BINARY_VERSION;
 use puzuz_protocol::api::{
-    AddJobRequest, AddJobResponse, ApiError, BulkJobResponse, CleanResponse, ErrorCode, JobView,
-    ListGpusResponse, ListJobsResponse, VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
+    AddJobRequest, AddJobResponse, ApiError, BulkJobResponse, CleanResponse, ErrorCode,
+    GpuDetection, GpuSource, JobView, ListGpusResponse, ListJobsResponse, VERSION_HEADER,
+    VersionResponse, WARNINGS_HEADER, Warning,
 };
 use puzuz_protocol::helper::signal;
 use serde::de::DeserializeOwned;
@@ -1080,6 +1081,45 @@ async fn undetected_gpus_are_kept_but_start_nothing() {
     assert!(gpus(&alice).await.gpus.iter().all(|g| g.available));
     alice.wait_state(waiting, &JobState::Running).await;
 
+    h.stop().await;
+}
+
+struct BrokenNvml;
+impl GpuDetector for BrokenNvml {
+    fn detect(&self) -> Result<Vec<DetectedGpu>, String> {
+        Err("cannot initialize NVML: NVIDIA driver is not loaded".to_owned())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn version_reports_how_gpus_were_detected() {
+    let mut h = Harness::with_gpus(StaticGpuDetector(vec![a100(0)])).await;
+    let version: VersionResponse = h.client(ALICE).get("/v1/version").await.json();
+    let detection = version.gpu_detection.expect("reported");
+    assert_eq!(detection.mode, GpuDetection::Auto);
+    assert_eq!(detection.source, GpuSource::Config);
+    assert_eq!(detection.nvml_error, None);
+    assert_eq!(detection.gpus.len(), 1);
+    assert_eq!(detection.gpus[0].uuid, "GPU-a100-0");
+
+    // NVML fails: the configured list is used, and the reason is reported.
+    h.stop().await;
+    h.start_with(FallbackGpuDetector {
+        primary: Box::new(BrokenNvml),
+        fallback: StaticGpuDetector(vec![a100(0), a100(1)]),
+    })
+    .await;
+    let version: VersionResponse = h.client(ALICE).get("/v1/version").await.json();
+    let detection = version.gpu_detection.expect("reported");
+    assert_eq!(detection.source, GpuSource::Config);
+    assert!(
+        detection
+            .nvml_error
+            .as_deref()
+            .is_some_and(|e| e.contains("driver is not loaded")),
+        "{detection:?}"
+    );
+    assert_eq!(detection.gpus.len(), 2);
     h.stop().await;
 }
 

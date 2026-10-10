@@ -119,16 +119,10 @@ pub struct Config {
     pub gpus: Vec<GpuConfig>,
 }
 
-/// [`Config::gpu_detection`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GpuDetection {
-    /// NVML, falling back to [`Config::gpus`] when NVML cannot be loaded.
-    #[default]
-    Auto,
-    /// Only [`Config::gpus`].
-    Static,
-}
+/// [`Config::gpu_detection`]: NVML falling back to [`Config::gpus`]
+/// (`auto`), or only [`Config::gpus`] (`static`). Defined in
+/// `puzuz-protocol` because `GET /v1/version` reports it.
+pub use puzuz_protocol::api::GpuDetection;
 
 /// [`Config::cuda_checkpoint_mode`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

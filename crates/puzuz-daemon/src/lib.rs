@@ -68,12 +68,13 @@ use std::time::Duration;
 
 use puzuz_core::model::GpuIndex;
 use puzuz_core::storage::{Store, StoreOps};
+use puzuz_protocol::api::GpuSource;
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
 pub use crate::config::Config;
 pub use crate::gpu::{
-    DetectedGpu, FallbackGpuDetector, GpuDetector, NvmlGpuDetector, StaticGpuDetector,
+    DetectedGpu, Detection, FallbackGpuDetector, GpuDetector, NvmlGpuDetector, StaticGpuDetector,
 };
 pub use crate::helper::{FakeHelper, Helper, HelperClient};
 use crate::state::Core;
@@ -149,18 +150,30 @@ impl Daemon {
         }
         let store = Store::open(&db_path)?;
 
-        let detected = match tokio::task::spawn_blocking(move || gpus.detect()).await {
-            Ok(Ok(detected)) => detected,
+        let failed = |error: String| Detection {
+            gpus: Vec::new(),
+            source: GpuSource::Config,
+            nvml_error: Some(error),
+        };
+        let detection = match tokio::task::spawn_blocking(move || gpus.detection()).await {
+            Ok(Ok(detection)) => detection,
             Ok(Err(e)) => {
-                tracing::warn!("GPU detection failed: {e}");
-                Vec::new()
+                tracing::warn!("GPU detection failed: {e}; running without GPUs");
+                failed(e)
             }
             Err(e) => {
-                tracing::warn!("GPU detection panicked: {e}");
-                Vec::new()
+                tracing::warn!("GPU detection panicked: {e}; running without GPUs");
+                failed(format!("GPU detection panicked: {e}"))
             }
         };
-        let detected = record_gpus(&store, detected)?;
+        if config.gpu_detection == config::GpuDetection::Static {
+            tracing::info!(
+                "gpu_detection = \"static\": using the {} GPU(s) of the [[gpus]] list",
+                detection.gpus.len()
+            );
+        }
+        let gpu_detection = detection.status(config.gpu_detection);
+        let detected = record_gpus(&store, detection.gpus)?;
 
         let listener = bind(&config.api_socket).map_err(|source| StartError::Listen {
             path: config.api_socket.clone(),
@@ -168,7 +181,15 @@ impl Daemon {
         })?;
         let socket = config.api_socket.clone();
 
-        let core = Core::new(config, store, helper, users, detected, trust_uid_header);
+        let core = Core::new(
+            config,
+            store,
+            helper,
+            users,
+            detected,
+            gpu_detection,
+            trust_uid_header,
+        );
         core.check_checkpoint_usage().await;
         let notices = core.helper.connect();
         let tasks = vec![

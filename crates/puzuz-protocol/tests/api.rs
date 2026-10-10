@@ -425,6 +425,7 @@ fn resource_bodies_golden() {
                 version: Some("0.1.0".into()),
             },
             checkpoints: None,
+            gpu_detection: None,
         },
         r#"{"api_version":1,"daemon_version":"0.1.0","helper":{"connected":true,"version":"0.1.0"}}"#,
     );
@@ -441,6 +442,7 @@ fn resource_bodies_golden() {
             limit_bytes: Some(1000),
             available_bytes: Some(1 << 40),
         }),
+        gpu_detection: None,
     };
     assert_golden(
         &with_usage,
@@ -464,6 +466,31 @@ fn resource_bodies_golden() {
     let unlimited: CheckpointStorage =
         serde_json::from_str(r#"{"images":1,"total_bytes":5}"#).unwrap();
     assert!(!unlimited.over_limit());
+    assert_golden(
+        &GpuDetectionStatus {
+            mode: GpuDetection::Auto,
+            source: GpuSource::Config,
+            nvml_error: Some("NVIDIA driver is not loaded".into()),
+            gpus: vec![DetectedGpuSummary {
+                index: GpuIndex(0),
+                uuid: "GPU-a".into(),
+                name: "A100".into(),
+            }],
+        },
+        concat!(
+            r#"{"mode":"auto","source":"config","nvml_error":"NVIDIA driver is not loaded","#,
+            r#""gpus":[{"index":0,"uuid":"GPU-a","name":"A100"}]}"#
+        ),
+    );
+    assert_golden(
+        &GpuDetectionStatus {
+            mode: GpuDetection::Static,
+            source: GpuSource::Nvml,
+            nvml_error: None,
+            gpus: vec![],
+        },
+        r#"{"mode":"static","source":"nvml","gpus":[]}"#,
+    );
     assert_golden(
         &GpuView {
             index: GpuIndex(0),

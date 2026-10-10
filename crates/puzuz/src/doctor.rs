@@ -1,13 +1,14 @@
 //! `puzuz doctor`: checks the installation and prints how to fix what is missing.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 use puzuz_checkpoint::probe::{Version, parse_criu_version, parse_cuda_checkpoint_help};
-use puzuz_daemon::config::{Config, DEFAULT_CONFIG_PATH};
-use puzuz_protocol::api::{CheckpointStorage, VersionResponse};
+use puzuz_daemon::config::{Config, DEFAULT_CONFIG_PATH, GpuDetection};
+use puzuz_protocol::api::{CheckpointStorage, GpuDetectionStatus, GpuSource, VersionResponse};
 
 use crate::service::{ADMIN_GROUP, DAEMON_UNIT, HELPER_UNIT, TMPFILES_PATH, UNIT_DIR};
 use crate::system::{System, find_program, is_root_owned_and_protected};
@@ -236,6 +237,8 @@ pub fn exec_start_flags(unit: &str) -> Vec<String> {
 pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     let LoadedConfig { config, check } = load_config(sys);
     let mut checks = vec![check];
+    let api_socket = socket.map_or_else(|| config.api_socket.clone(), Path::to_owned);
+    let daemon = sys.daemon_version(&api_socket);
 
     checks.push(check_criu(sys, &config.criu_path));
     let driver = driver_version(sys);
@@ -246,7 +249,8 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
         driver.as_ref().ok(),
     ));
     if driver.is_ok() {
-        checks.push(check_gpus(sys, &config));
+        let detection = daemon.as_ref().ok().and_then(|v| v.gpu_detection.as_ref());
+        checks.push(check_gpus(sys, &config, detection));
     }
     checks.push(check_kernel(sys));
     checks.push(check_systemd(sys));
@@ -255,7 +259,6 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     }
     checks.push(check_helper_binary(sys));
     checks.push(check_helper_settings(sys, &config));
-    let api_socket = socket.map_or_else(|| config.api_socket.clone(), Path::to_owned);
     checks.push(check_socket(sys, "daemon socket", &api_socket, DAEMON_UNIT));
     checks.push(check_socket(
         sys,
@@ -263,7 +266,6 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
         &config.helper_socket,
         HELPER_UNIT,
     ));
-    let daemon = sys.daemon_version(&api_socket);
     checks.extend(check_daemon(&daemon));
     let storage = daemon.as_ref().ok().and_then(|v| v.checkpoints.as_ref());
     checks.push(check_checkpoint_dir(sys, &config, storage));
@@ -405,7 +407,39 @@ fn check_cuda_checkpoint(sys: &dyn System, configured: &Path, driver: Option<&Ve
     Check::ok(NAME, format!("{version} ({shown})"))
 }
 
-fn check_gpus(sys: &dyn System, config: &Config) -> Check {
+/// A GPU's index and UUID, as nvidia-smi, the daemon or `[[gpus]]` have it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GpuId {
+    index: u32,
+    uuid: String,
+}
+
+/// How `ours` (what the daemon uses) differs from what nvidia-smi lists. An
+/// empty UUID (allowed in `[[gpus]]`) only has to exist at that index.
+fn gpu_differences(ours: &[GpuId], listed: &[GpuId]) -> Vec<String> {
+    let indices: BTreeSet<u32> = ours.iter().chain(listed).map(|gpu| gpu.index).collect();
+    let find = |gpus: &[GpuId], index: u32| gpus.iter().find(|gpu| gpu.index == index).cloned();
+    indices
+        .into_iter()
+        .filter_map(|index| match (find(ours, index), find(listed, index)) {
+            (Some(a), Some(b)) if a.uuid.is_empty() || a.uuid == b.uuid => None,
+            (Some(a), Some(b)) => Some(format!(
+                "GPU {index} is {} but nvidia-smi shows {}",
+                a.uuid, b.uuid
+            )),
+            (Some(_), None) => Some(format!("GPU {index} is not in nvidia-smi")),
+            (None, Some(b)) => Some(format!("GPU {index} ({}) is missing", b.uuid)),
+            (None, None) => None,
+        })
+        .collect()
+}
+
+/// Compares the GPUs the daemon detected (`detection`, from `GET
+/// /v1/version`) with nvidia-smi, and only warns about real problems: NVML
+/// failing in auto mode, no GPUs while nvidia-smi sees some, or a list that
+/// disagrees with nvidia-smi. Without the daemon's report, `[[gpus]]` stands
+/// in for it in static mode.
+fn check_gpus(sys: &dyn System, config: &Config, detection: Option<&GpuDetectionStatus>) -> Check {
     const NAME: &str = "gpus";
     let Some(smi) = find_program(sys, &config.nvidia_smi_path) else {
         return Check::warn(
@@ -414,39 +448,152 @@ fn check_gpus(sys: &dyn System, config: &Config) -> Check {
         )
         .hint("install nvidia-smi (part of the NVIDIA driver utilities)");
     };
-    let listed = match sys.run(
+    let listed: Vec<GpuId> = match sys.run(
         &smi.to_string_lossy(),
-        &["--query-gpu=index,name", "--format=csv,noheader"],
+        &["--query-gpu=index,uuid,name", "--format=csv,noheader"],
     ) {
         Ok(output) if output.success => output
             .stdout
             .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count(),
+            .filter_map(|line| {
+                let mut fields = line.splitn(3, ',').map(str::trim);
+                let index = fields.next()?.parse().ok()?;
+                let uuid = fields.next().unwrap_or_default().to_owned();
+                Some(GpuId { index, uuid })
+            })
+            .collect(),
         Ok(output) => {
             return Check::warn(NAME, format!("nvidia-smi failed: {}", output.stdout.trim()));
         }
         Err(err) => return Check::warn(NAME, format!("cannot run nvidia-smi: {err}")),
     };
-    let configured = config.gpus.len();
-    if configured == 0 && listed > 0 {
+    let configured: Vec<GpuId> = config
+        .gpus
+        .iter()
+        .map(|gpu| GpuId {
+            index: gpu.index,
+            uuid: gpu.uuid.clone(),
+        })
+        .collect();
+    let update_list = format!(
+        "update [[gpus]] in {DEFAULT_CONFIG_PATH} \
+         (`nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv`), then \
+         `sudo systemctl restart {DAEMON_UNIT}`"
+    );
+
+    let Some(detection) = detection else {
+        // The daemon is not reachable (reported below) or predates the report.
+        if config.gpu_detection == GpuDetection::Auto {
+            return Check::info(
+                NAME,
+                format!(
+                    "nvidia-smi lists {} GPU(s); the daemon did not report which GPUs it \
+                     detected",
+                    listed.len()
+                ),
+            );
+        }
+        if configured.is_empty() && !listed.is_empty() {
+            return Check::warn(
+                NAME,
+                format!(
+                    "nvidia-smi lists {} GPU(s) but gpu_detection = \"static\" and [[gpus]] is \
+                     empty; GPU jobs cannot run",
+                    listed.len()
+                ),
+            )
+            .hint(update_list);
+        }
+        let differences = gpu_differences(&configured, &listed);
+        if !differences.is_empty() {
+            return Check::warn(
+                NAME,
+                format!(
+                    "[[gpus]] differs from nvidia-smi: {}",
+                    differences.join("; ")
+                ),
+            )
+            .hint(update_list);
+        }
+        return Check::ok(NAME, format!("{} GPU(s) in [[gpus]]", configured.len()));
+    };
+
+    let detected: Vec<GpuId> = detection
+        .gpus
+        .iter()
+        .map(|gpu| GpuId {
+            index: gpu.index.0,
+            uuid: gpu.uuid.clone(),
+        })
+        .collect();
+    if let Some(error) = &detection.nvml_error {
+        let fallback = if detected.is_empty() {
+            "it runs without GPUs".to_owned()
+        } else {
+            format!("it uses the {} GPU(s) of [[gpus]] instead", detected.len())
+        };
         return Check::warn(
             NAME,
-            format!("nvidia-smi lists {listed} GPU(s) but none is configured; GPU jobs cannot run"),
+            format!("the daemon could not detect GPUs with NVML ({error}); {fallback}"),
         )
         .hint(format!(
-            "add [[gpus]] entries to {DEFAULT_CONFIG_PATH} \
-             (see `nvidia-smi --query-gpu=index,uuid,name --format=csv`)"
+            "the daemon (user puzuz) must be able to open /dev/nvidiactl and /dev/nvidia<N>: keep \
+             the DevicePolicy=/DeviceAllow= lines of the packaged {DAEMON_UNIT} \
+             (`sudo puzuz service install` rewrites it) and do not add PrivateDevices=yes; \
+             then `sudo systemctl restart {DAEMON_UNIT}` and see `journalctl -u {DAEMON_UNIT}`"
         ));
     }
-    if configured != listed {
+    let from_nvml = detection.source == GpuSource::Nvml;
+    let fix = if from_nvml {
+        format!("GPUs are detected when the daemon starts: `sudo systemctl restart {DAEMON_UNIT}`")
+    } else {
+        update_list
+    };
+    if detected.is_empty() && !listed.is_empty() {
         return Check::warn(
             NAME,
-            format!("nvidia-smi lists {listed} GPU(s), the configuration {configured}"),
+            format!(
+                "nvidia-smi lists {} GPU(s) but the daemon has none; GPU jobs cannot run",
+                listed.len()
+            ),
         )
-        .hint(format!("update [[gpus]] in {DEFAULT_CONFIG_PATH}"));
+        .hint(fix);
     }
-    Check::ok(NAME, format!("{listed} GPU(s)"))
+    let differences = gpu_differences(&detected, &listed);
+    if !differences.is_empty() {
+        let what = if from_nvml {
+            "the GPUs the daemon detected with NVML differ from nvidia-smi"
+        } else {
+            "the daemon's [[gpus]] list differs from nvidia-smi"
+        };
+        return Check::warn(NAME, format!("{what}: {}", differences.join("; "))).hint(fix);
+    }
+    if from_nvml && !configured.is_empty() {
+        let stale = gpu_differences(&configured, &listed);
+        if !stale.is_empty() {
+            return Check::warn(
+                NAME,
+                format!(
+                    "{} GPU(s) detected with NVML, but the fallback [[gpus]] list differs from \
+                     nvidia-smi ({}); it would be used if NVML failed",
+                    detected.len(),
+                    stale.join("; ")
+                ),
+            )
+            .hint(format!(
+                "update or remove [[gpus]] in {DEFAULT_CONFIG_PATH}"
+            ));
+        }
+    }
+    let how = if from_nvml {
+        "detected with NVML".to_owned()
+    } else {
+        format!(
+            "from [[gpus]] (gpu_detection = \"{}\")",
+            detection.mode.as_str()
+        )
+    };
+    Check::ok(NAME, format!("{} GPU(s), {how}", detected.len()))
 }
 
 fn check_kernel(sys: &dyn System) -> Check {

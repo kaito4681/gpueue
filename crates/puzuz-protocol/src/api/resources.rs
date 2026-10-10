@@ -113,6 +113,63 @@ pub struct VersionResponse {
     /// so every caller may see it. Absent from daemons that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoints: Option<CheckpointStorage>,
+    /// How the daemon found its GPUs at start-up (for `puzuz doctor`).
+    /// Absent from daemons that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_detection: Option<GpuDetectionStatus>,
+}
+
+/// `gpu_detection` in the configuration file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuDetection {
+    /// NVML, falling back to the configured `[[gpus]]` list when NVML
+    /// cannot be used.
+    #[default]
+    Auto,
+    /// Only the configured `[[gpus]]` list.
+    Static,
+}
+
+impl GpuDetection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GpuDetection::Auto => "auto",
+            GpuDetection::Static => "static",
+        }
+    }
+}
+
+/// Where the daemon's GPU list came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuSource {
+    /// Detected with NVML.
+    Nvml,
+    /// The `[[gpus]]` list of the configuration file: `gpu_detection =
+    /// "static"`, or NVML failed (then `nvml_error` says why).
+    Config,
+}
+
+/// The result of GPU detection at daemon start-up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuDetectionStatus {
+    pub mode: GpuDetection,
+    pub source: GpuSource,
+    /// Why NVML could not be used (`gpu_detection = "auto"` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvml_error: Option<String>,
+    /// The GPUs detected, by index. GPUs the daemon knew before but did not
+    /// detect are not listed (`GET /v1/gpus` shows them as unavailable).
+    pub gpus: Vec<DetectedGpuSummary>,
+}
+
+/// One detected GPU, as [`GpuDetectionStatus`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectedGpuSummary {
+    pub index: GpuIndex,
+    pub uuid: String,
+    pub name: String,
 }
 
 /// Checkpoint image usage, as the daemon accounts for it.

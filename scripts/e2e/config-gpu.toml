@@ -1,6 +1,7 @@
 # /etc/puzuz/config.toml of the e2e test with PUZUZ_E2E_GPU=1: GPU 0 is
 # the real GPU passed with `docker run --gpus all`; GPU 1 is fake (only
-# used by CPU-only jobs that get CUDA_VISIBLE_DEVICES).
+# used by CPU-only jobs that get CUDA_VISIBLE_DEVICES). Scenario 12 replaces
+# it for a while with gpu_detection = "auto" and no [[gpus]] (NVML).
 grace_secs = 5
 gpu_detection = "static"
 

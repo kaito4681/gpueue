@@ -5,7 +5,11 @@
 //! `dlopen`, so the daemon also runs on machines without the NVIDIA driver),
 //! wrapped in a [`FallbackGpuDetector`] that falls back to the `[[gpus]]`
 //! list of the configuration file ([`StaticGpuDetector`]) when NVML cannot be
-//! used. `gpu_detection = "static"` skips NVML altogether.
+//! used. `gpu_detection = "static"` skips NVML altogether. A failure of NVML
+//! is logged with its reason (including whether `/dev/nvidiactl` is missing
+//! or cannot be opened, the usual cause under a sandboxing systemd unit),
+//! and `GET /v1/version` reports where the list came from
+//! ([`GpuDetectionStatus`]) so that `puzuz doctor` can tell.
 //!
 //! Indices follow `CUDA_DEVICE_ORDER=PCI_BUS_ID`: GPUs are sorted by PCI
 //! domain, bus, device and function, which is the order CUDA uses with that
@@ -22,9 +26,10 @@
 //!   because users address GPUs by index.
 
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use puzuz_core::model::GpuIndex;
+use puzuz_protocol::api::{DetectedGpuSummary, GpuDetectionStatus, GpuSource};
 
 use crate::config::{Config, GpuConfig, GpuDetection};
 
@@ -39,9 +44,49 @@ pub struct DetectedGpu {
     pub driver_version: Option<String>,
 }
 
+/// What a detection found, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detection {
+    pub gpus: Vec<DetectedGpu>,
+    pub source: GpuSource,
+    /// Why NVML could not be used, when the list came from the
+    /// configuration instead.
+    pub nvml_error: Option<String>,
+}
+
+impl Detection {
+    /// What `GET /v1/version` reports about it.
+    pub fn status(&self, mode: GpuDetection) -> GpuDetectionStatus {
+        GpuDetectionStatus {
+            mode,
+            source: self.source,
+            nvml_error: self.nvml_error.clone(),
+            gpus: self
+                .gpus
+                .iter()
+                .map(|gpu| DetectedGpuSummary {
+                    index: gpu.index,
+                    uuid: gpu.uuid.clone(),
+                    name: gpu.name.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 pub trait GpuDetector: Send + Sync + 'static {
     /// The GPUs present now, in `CUDA_DEVICE_ORDER=PCI_BUS_ID` order.
     fn detect(&self) -> Result<Vec<DetectedGpu>, String>;
+
+    /// [`detect`](GpuDetector::detect) and where the list came from. By
+    /// default the list counts as configured (fixed lists, tests).
+    fn detection(&self) -> Result<Detection, String> {
+        self.detect().map(|gpus| Detection {
+            gpus,
+            source: GpuSource::Config,
+            nvml_error: None,
+        })
+    }
 }
 
 /// The detector `puzuz daemon` uses for `config`.
@@ -108,25 +153,46 @@ pub struct FallbackGpuDetector {
 
 impl GpuDetector for FallbackGpuDetector {
     fn detect(&self) -> Result<Vec<DetectedGpu>, String> {
-        match self.primary.detect() {
-            Ok(gpus) => {
-                if !self.fallback.0.is_empty() {
+        self.detection().map(|detection| detection.gpus)
+    }
+
+    fn detection(&self) -> Result<Detection, String> {
+        let configured = &self.fallback.0;
+        match self.primary.detection() {
+            Ok(detection) => {
+                tracing::info!(
+                    "detected {} GPU(s) with NVML (gpu_detection = \"auto\")",
+                    detection.gpus.len()
+                );
+                let uuids = |gpus: &[DetectedGpu]| -> Vec<(GpuIndex, String)> {
+                    gpus.iter().map(|g| (g.index, g.uuid.clone())).collect()
+                };
+                if !configured.is_empty() && uuids(configured) != uuids(&detection.gpus) {
                     tracing::warn!(
-                        "GPUs were detected with NVML; the [[gpus]] list in the configuration \
-                         is ignored (set gpu_detection = \"static\" to use it instead)"
+                        "the [[gpus]] list in the configuration does not match the GPUs NVML \
+                         detected; it is only used when NVML fails, so update or remove it"
                     );
                 }
-                Ok(gpus)
-            }
-            Err(e) if self.fallback.0.is_empty() => {
-                tracing::warn!("GPU detection failed ({e}); running without GPUs");
-                Ok(Vec::new())
+                Ok(detection)
             }
             Err(e) => {
-                tracing::warn!(
-                    "GPU detection failed ({e}); using the [[gpus]] list from the configuration"
-                );
-                Ok(self.fallback.0.clone())
+                if configured.is_empty() {
+                    tracing::warn!(
+                        "GPU detection with NVML failed: {e}; running WITHOUT GPUs (there is no \
+                         [[gpus]] list in the configuration to fall back to)"
+                    );
+                } else {
+                    tracing::warn!(
+                        "GPU detection with NVML failed: {e}; using the {} GPU(s) of the \
+                         [[gpus]] list in the configuration instead",
+                        configured.len()
+                    );
+                }
+                Ok(Detection {
+                    gpus: configured.clone(),
+                    source: GpuSource::Config,
+                    nvml_error: Some(e),
+                })
             }
         }
     }
@@ -156,11 +222,47 @@ impl NvmlGpuDetector {
                 Err(e) => errors.push(format!("{}: {e}", library.to_string_lossy())),
             }
         }
-        Err(format!("cannot initialize NVML: {}", errors.join("; ")))
+        let mut message = format!("cannot initialize NVML: {}", errors.join("; "));
+        if let Some(reason) = device_node_problem(Path::new("/dev")) {
+            message.push_str(&format!(" ({reason})"));
+        }
+        Err(message)
+    }
+}
+
+/// Why NVML probably cannot talk to the driver: `/dev/nvidiactl` is missing
+/// or cannot be opened by this process. `None` if it can be opened (or
+/// there is no NVIDIA hardware to speak of).
+pub fn device_node_problem(dev: &Path) -> Option<String> {
+    let ctl = dev.join("nvidiactl");
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&ctl)
+    {
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!(
+            "{} does not exist: the NVIDIA kernel module is not loaded, or the device nodes are \
+             hidden from the daemon, e.g. by PrivateDevices=yes in its systemd unit",
+            ctl.display()
+        )),
+        Err(e) => Some(format!(
+            "{} cannot be opened: {e}; check DevicePolicy=/DeviceAllow= of the daemon's systemd \
+             unit and the permissions of /dev/nvidia*",
+            ctl.display()
+        )),
     }
 }
 
 impl GpuDetector for NvmlGpuDetector {
+    fn detection(&self) -> Result<Detection, String> {
+        self.detect().map(|gpus| Detection {
+            gpus,
+            source: GpuSource::Nvml,
+            nvml_error: None,
+        })
+    }
+
     fn detect(&self) -> Result<Vec<DetectedGpu>, String> {
         let nvml = self.init()?;
         let driver_version = nvml.sys_driver_version().ok();
@@ -311,9 +413,79 @@ mod tests {
         let nvml = StaticGpuDetector::anonymous(1);
         let working = FallbackGpuDetector {
             primary: Box::new(nvml.clone()),
-            fallback: configured,
+            fallback: configured.clone(),
         };
         assert_eq!(working.detect().unwrap(), nvml.0);
+    }
+
+    struct FakeNvml(Vec<DetectedGpu>);
+    impl GpuDetector for FakeNvml {
+        fn detect(&self) -> Result<Vec<DetectedGpu>, String> {
+            Ok(self.0.clone())
+        }
+        fn detection(&self) -> Result<Detection, String> {
+            Ok(Detection {
+                gpus: self.0.clone(),
+                source: GpuSource::Nvml,
+                nvml_error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn detection_reports_the_source_and_why_nvml_failed() {
+        let configured = StaticGpuDetector::anonymous(2);
+        let failed = FallbackGpuDetector {
+            primary: Box::new(Failing),
+            fallback: configured.clone(),
+        }
+        .detection()
+        .unwrap();
+        assert_eq!(failed.source, GpuSource::Config);
+        assert_eq!(
+            failed.nvml_error.as_deref(),
+            Some("libnvidia-ml.so.1: not found")
+        );
+        let status = failed.status(GpuDetection::Auto);
+        assert_eq!(status.mode, GpuDetection::Auto);
+        assert_eq!(status.gpus.len(), 2);
+        assert_eq!(status.gpus[1].uuid, "GPU-test-1");
+
+        let nvml = FallbackGpuDetector {
+            primary: Box::new(FakeNvml(StaticGpuDetector::anonymous(1).0)),
+            fallback: configured.clone(),
+        }
+        .detection()
+        .unwrap();
+        assert_eq!(nvml.source, GpuSource::Nvml);
+        assert_eq!(nvml.nvml_error, None);
+        assert_eq!(nvml.gpus.len(), 1);
+
+        let fixed = configured.detection().unwrap();
+        assert_eq!(fixed.source, GpuSource::Config);
+        assert_eq!(fixed.nvml_error, None);
+    }
+
+    #[test]
+    fn device_node_problems_are_explained() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dev = tempfile::tempdir().unwrap();
+        let missing = device_node_problem(dev.path()).unwrap();
+        assert!(missing.contains("does not exist"), "{missing}");
+        assert!(missing.contains("PrivateDevices"), "{missing}");
+
+        let ctl = dev.path().join("nvidiactl");
+        std::fs::write(&ctl, "").unwrap();
+        assert_eq!(device_node_problem(dev.path()), None);
+
+        // Root opens anything; the permission case only shows otherwise.
+        if !nix::unistd::geteuid().is_root() {
+            std::fs::set_permissions(&ctl, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let denied = device_node_problem(dev.path()).unwrap();
+            assert!(denied.contains("cannot be opened"), "{denied}");
+            assert!(denied.contains("DeviceAllow"), "{denied}");
+        }
     }
 
     #[test]
