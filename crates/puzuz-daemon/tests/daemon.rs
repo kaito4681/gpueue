@@ -333,6 +333,45 @@ async fn add_start_exit_status_and_log() {
     // The list shows both.
     let list: ListJobsResponse = alice.get("/v1/jobs").await.json();
     assert_eq!(list.jobs.len(), 2);
+    // Without the environments, which only the single-job view carries.
+    for job in &list.jobs {
+        let details = job.details.as_ref().expect("the owner sees details");
+        assert_eq!(details.envs, None, "job {}", job.id);
+    }
+    let raw = String::from_utf8(alice.get("/v1/jobs").await.body.to_vec()).unwrap();
+    assert!(!raw.contains("envs") && !raw.contains("hunter2"), "{raw}");
+    // Finished jobs carry their result flat inside `state`.
+    assert!(
+        raw.contains(r#""state":{"state":"done","result":"failed","exit_code":3}"#),
+        "{raw}"
+    );
+    let secret = BTreeMap::from([("SECRET".to_owned(), "hunter2".to_owned())]);
+    for caller in [ALICE, ADMIN] {
+        let view = h.client(caller).job(id).await;
+        assert_eq!(view.details.unwrap().envs.as_ref(), Some(&secret));
+    }
+    // The environments are listed on request, still only to the owner.
+    let list: ListJobsResponse = alice.get("/v1/jobs?details=envs").await.json();
+    assert!(
+        list.jobs
+            .iter()
+            .all(|job| job.details.as_ref().unwrap().envs.as_ref() == Some(&secret))
+    );
+    let list = String::from_utf8(
+        h.client(BOB)
+            .get("/v1/jobs?details=envs")
+            .await
+            .body
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        !list.contains("envs") && !list.contains("hunter2"),
+        "{list}"
+    );
+    assert!(h.client(BOB).job(id).await.details.is_none());
+    let reply = alice.get("/v1/jobs?details=bogus").await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
 
     // Logs: raw bytes, tail, and only for the owner.
     let log = h.dir.path().join(format!("logs/{ALICE}/{id}.log"));
@@ -467,10 +506,13 @@ async fn other_users_see_redacted_jobs_and_cannot_touch_them() {
     let bob = h.client(BOB);
     let admin = h.client(ADMIN);
 
-    // Bob watches the event stream.
+    // Bob watches the event stream, and so does alice.
     let response = bob.open(Method::GET, "/v1/events", None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut events = response.into_body();
+    let response = alice.open(Method::GET, "/v1/events", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut own_events = response.into_body();
 
     let id = alice.add(&job_request("secret-command", &[0])).await;
     alice.wait_state(id, &JobState::Running).await;
@@ -531,20 +573,35 @@ async fn other_users_see_redacted_jobs_and_cannot_touch_them() {
     alice.wait_state(id, &done(JobResult::Killed)).await;
     assert_eq!(h.helper.signals(), [(id, signal::SIGTERM)]);
 
-    // Bob's events carry only redacted views.
-    let mut text = String::new();
-    while !text.contains("event: job_added") || !text.contains("\"result\":\"killed\"") {
-        let frame = tokio::time::timeout(Duration::from_secs(5), events.frame())
-            .await
-            .expect("an event")
-            .unwrap()
-            .unwrap();
-        if let Ok(data) = frame.into_data() {
-            text.push_str(&String::from_utf8_lossy(&data));
+    // Reads an event stream until the job was added and killed.
+    async fn until_killed(events: &mut hyper::body::Incoming) -> String {
+        let mut text = String::new();
+        while !text.contains("event: job_added")
+            || !text.contains(r#""state":{"state":"done","result":"killed"}"#)
+        {
+            let frame = tokio::time::timeout(Duration::from_secs(5), events.frame())
+                .await
+                .expect("an event")
+                .unwrap()
+                .unwrap();
+            if let Ok(data) = frame.into_data() {
+                text.push_str(&String::from_utf8_lossy(&data));
+            }
         }
+        text
     }
+
+    // Bob's events carry only redacted views.
+    let text = until_killed(&mut events).await;
     assert!(!text.contains("secret-command"), "{text}");
     assert!(!text.contains("\"details\""), "{text}");
+    // Alice's carry details, but no environment (like the job list).
+    let text = until_killed(&mut own_events).await;
+    assert!(text.contains("secret-command"), "{text}");
+    assert!(
+        !text.contains("envs") && !text.contains("hunter2"),
+        "{text}"
+    );
 
     h.stop().await;
 }

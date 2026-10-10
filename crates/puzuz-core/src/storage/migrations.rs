@@ -136,9 +136,27 @@ INSERT INTO job_errors (job_id, kind, message, recorded_at, acknowledged)
 UPDATE checkpoints SET failure_reason = NULL WHERE status = 'complete';
 "#;
 
+/// Version 4: flat JSON for finished jobs in `jobs.state_data`.
+///
+/// The `JobResult` of a `done` or `terminating` state used to be nested
+/// under `result` (`{"state":"done","result":{"result":"failed","exit_code":1}}`);
+/// its fields are now flattened into the state object
+/// (`{"state":"done","result":"failed","exit_code":1}`, see
+/// [`JobState`](crate::model::JobState)). Rows whose `result` is an object are
+/// rewritten by merging that object into the state; rows already flat (or
+/// without a result) are left alone. `state_data` is the only column holding
+/// serialized `JobState`/`JobResult` values.
+const V4: &str = r#"
+UPDATE jobs
+    SET state_data = json_patch(json_remove(state_data, '$.result'),
+                                json_extract(state_data, '$.result'))
+    WHERE json_valid(state_data)
+      AND json_type(state_data, '$.result') = 'object';
+"#;
+
 /// All migrations, in order. The schema version after migrating is
 /// `MIGRATIONS.len()`.
-pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3];
+pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// The schema version this build of puzuz writes.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
