@@ -214,7 +214,9 @@ columns, and `Checkpointed` jobs show the image size.
   `CUDA_DEVICE_ORDER=PCI_BUS_ID`. Inside the job, `CUDA_VISIBLE_DEVICES` lists the requested
   GPUs, so the program sees them as `cuda:0`, `cuda:1`, ...
 - Groups work as in pueue (the `default` group starts with `parallel 1`). Both limits apply.
-- GPUs are detected when the daemon starts. Restart `puzuz.service` after adding or removing a GPU.
+- GPUs are detected with NVML when the daemon starts (the `[[gpus]]` list in the configuration is
+  only a fallback). Restart `puzuz.service` after adding or removing a GPU. `puzuz doctor`
+  compares what the daemon detected with `nvidia-smi`.
 
 ## Requirements
 
@@ -283,7 +285,8 @@ Pre-release (version 0.1.0). Tested so far:
   container.
 - With a real GPU in Docker (driver 595, CRIU 4.2.1 in manual mode, PyTorch 2.8 on Python 3.12):
   checkpoint/restore of a CUDA counter and of PyTorch training with forked DataLoader workers,
-  with results identical to an uninterrupted run.
+  with results identical to an uninterrupted run, and NVML GPU detection by the daemon inside the
+  packaged, sandboxed `puzuz.service`.
 
 Not tested yet:
 

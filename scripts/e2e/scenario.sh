@@ -394,6 +394,50 @@ s11_gpu_fork_workers() {
     gpu_train_variant 80 2 2 pin epochs
 }
 
+# PUZUZ_E2E_GPU=1 only: NVML detection under the packaged, sandboxed
+# puzuz.service. The daemon is restarted with gpu_detection = "auto" and
+# no [[gpus]] list; it must find the real GPU with NVML (name, UUID,
+# memory and driver as nvidia-smi reports them) and `puzuz doctor` must be
+# happy with that. The static test configuration is put back afterwards.
+s12_nvml_detection() {
+    local since out smi
+    mkdir -p "$STATE"
+    cp /etc/puzuz/config.toml "$STATE/config-static.toml"
+    printf 'grace_secs = 5\ngpu_detection = "auto"\n' >/etc/puzuz/config.toml
+    since=$(date '+%Y-%m-%d %H:%M:%S')
+    systemctl restart puzuz.service
+    wait_socket
+    out=$(pz carol gpu --json) || fail "gpu --json"
+    echo "$out"
+    smi=$(nvidia-smi --query-gpu=index,uuid,name,memory.total,driver_version \
+        --format=csv,noheader,nounits) || fail "nvidia-smi"
+    echo "nvidia-smi: $smi"
+    python3 - "$out" "$smi" <<'EOF' || fail "puzuz gpu does not show the GPU NVML should detect"
+import json, sys
+gpus = {g["index"]: g for g in json.loads(sys.argv[1])["gpus"]}
+index, uuid, name, mib, driver = [f.strip() for f in sys.argv[2].splitlines()[0].split(",")]
+g = gpus[int(index)]
+assert g.get("available", True), f"GPU {index} is not available: {g}"
+assert g["uuid"] == uuid, f"uuid {g['uuid']} != {uuid}"
+assert g["name"] == name, f"name {g['name']} != {name}"
+assert g.get("driver_version") == driver, f"driver {g.get('driver_version')} != {driver}"
+memory = g.get("memory_total_bytes") or 0
+assert abs(memory - (int(mib) << 20)) <= 1 << 20, f"memory {memory} != {mib} MiB"
+print(f"NVML detected GPU {index}: {name}, {uuid}, {memory} bytes, driver {driver}")
+EOF
+    journalctl -u puzuz.service --since "$since" -o cat --no-pager \
+        | grep -q 'detected 1 GPU(s) with NVML' || fail "the daemon did not log NVML detection"
+    ! journalctl -u puzuz.service --since "$since" -o cat --no-pager \
+        | grep 'NVML failed' || fail "the daemon logged an NVML failure"
+    out=$(pz carol doctor 2>&1) || true
+    grep -E '^OK +gpus: 1 GPU\(s\), detected with NVML$' <<<"$out" \
+        || fail "doctor does not report NVML detection: $(grep gpus <<<"$out")"
+
+    install -m 0644 "$STATE/config-static.toml" /etc/puzuz/config.toml
+    systemctl restart puzuz.service
+    wait_socket
+}
+
 # s7 is split across two containers by scripts/e2e-test.sh.
 s7_prepare() {
     local a b
@@ -487,6 +531,7 @@ main)
     if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers
+        run "12 NVML GPU detection in the packaged unit" s12_nvml_detection
     fi
     ;;
 reboot-prepare) run "7 reboot (prepare)" s7_prepare ;;

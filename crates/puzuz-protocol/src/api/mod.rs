@@ -28,9 +28,9 @@ pub use jobs::{
     ResetRequest, RestartOptions, RestoreOptions, StashOptions, SwitchRequest,
 };
 pub use resources::{
-    CheckpointStorage, CreateGroupRequest, GpuJob, GpuView, HelperStatus, ListGpusResponse,
-    ListGroupsResponse, SetGpusParallelRequest, SetParallelRequest, ShutdownRequest,
-    VersionResponse,
+    CheckpointStorage, CreateGroupRequest, DetectedGpuSummary, GpuDetection, GpuDetectionStatus,
+    GpuJob, GpuSource, GpuView, HelperStatus, ListGpusResponse, ListGroupsResponse,
+    SetGpusParallelRequest, SetParallelRequest, ShutdownRequest, VersionResponse,
 };
 pub use routes::{Method, Route};
 pub use warnings::{WARNINGS_HEADER, Warning};

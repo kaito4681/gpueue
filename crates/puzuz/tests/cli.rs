@@ -140,6 +140,7 @@ async fn route(
                         version: None,
                     },
                     checkpoints: None,
+                    gpu_detection: None,
                 },
             );
         }

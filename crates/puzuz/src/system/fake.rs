@@ -108,6 +108,7 @@ impl FakeSystem {
                 version: helper_connected.then(|| puzuz_protocol::BINARY_VERSION.to_owned()),
             },
             checkpoints: None,
+            gpu_detection: None,
         })
     }
 }

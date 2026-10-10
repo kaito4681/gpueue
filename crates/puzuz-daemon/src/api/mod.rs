@@ -408,6 +408,7 @@ async fn version(State(core): State<AppState>) -> Json<VersionResponse> {
             version: helper.version,
         },
         checkpoints,
+        gpu_detection: Some(core.gpu_detection.clone()),
     })
 }
 

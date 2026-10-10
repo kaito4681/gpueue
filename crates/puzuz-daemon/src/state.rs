@@ -32,7 +32,7 @@ use puzuz_core::storage::StorageError;
 use puzuz_core::storage::{
     CheckpointRecord, CheckpointStatus, JobError, JobErrorKind, JobFilter, Store, StoreOps, Tx,
 };
-use puzuz_protocol::api::{self, ErrorCode, JobView, Warning};
+use puzuz_protocol::api::{self, ErrorCode, GpuDetectionStatus, JobView, Warning};
 use puzuz_protocol::helper::{
     self as hp, CheckpointOptions, CheckpointOutcome, HelperErrorCode, RestoreOutcome,
     RestoreRequest, RunningJob, SpawnRequest, signal,
@@ -272,6 +272,8 @@ pub struct Core {
     /// The GPUs detected at start-up. GPUs in the store but not here are
     /// unavailable (see [`crate::gpu`]).
     pub detected_gpus: HashMap<GpuIndex, DetectedGpu>,
+    /// How the GPUs were detected, for `GET /v1/version`.
+    pub gpu_detection: GpuDetectionStatus,
     /// Testing only: let the `x-puzuz-test-uid` header override the peer
     /// uid. Never settable from the configuration file.
     pub trust_uid_header: bool,
@@ -315,6 +317,7 @@ impl Core {
         helper: Arc<dyn Helper>,
         users: Arc<dyn UserDb>,
         detected_gpus: HashMap<GpuIndex, DetectedGpu>,
+        gpu_detection: GpuDetectionStatus,
         trust_uid_header: bool,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
@@ -325,6 +328,7 @@ impl Core {
             helper,
             users,
             detected_gpus,
+            gpu_detection,
             trust_uid_header,
             events,
             changes,
@@ -1675,6 +1679,12 @@ mod tests {
             Arc::new(FakeHelper::new()),
             Arc::new(StaticUserDb::with_admins([])),
             gpus.into_iter().map(|g| (g.index, g)).collect(),
+            GpuDetectionStatus {
+                mode: crate::config::GpuDetection::Auto,
+                source: puzuz_protocol::api::GpuSource::Config,
+                nvml_error: None,
+                gpus: Vec::new(),
+            },
             false,
         )
     }
