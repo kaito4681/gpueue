@@ -17,6 +17,8 @@
   - `crates/puzuz-daemon` — the daemon (runs as the unprivileged `puzuz` system user)
   - `crates/puzuz-checkpoint` — CRIU and cuda-checkpoint integration
   - `crates/puzuz-helper` — the root helper binary (spawns jobs as their owner, checkpoints)
+- User documentation: `README.md`, `docs/install.md`, `docs/architecture.md`. Update them when
+  commands, flags, configuration keys, packaging files or behavior change.
 - Shared dependencies are declared once in the root `[workspace.dependencies]`.
 - Keep `puzuz-core` free of I/O other than its storage module, and keep `puzuz-helper`'s
   dependency tree minimal (no HTTP server, no SQLite).
