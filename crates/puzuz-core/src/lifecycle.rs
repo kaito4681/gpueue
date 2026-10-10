@@ -536,7 +536,14 @@ pub enum Event {
     },
     Exited(ExitStatus),
     CheckpointSucceeded,
+    /// The dump was attempted and failed; CRIU rolled back, so the process
+    /// still runs.
     CheckpointFailed {
+        reason: String,
+    },
+    /// The helper declined the dump before touching the process (its
+    /// pre-checks failed); the process runs on as it was.
+    CheckpointRefused {
         reason: String,
     },
     RestoreSucceeded,
@@ -556,6 +563,7 @@ impl Event {
             Event::Exited(_) => "marked as exited",
             Event::CheckpointSucceeded => "marked as checkpointed",
             Event::CheckpointFailed { .. } => "marked as checkpoint failed",
+            Event::CheckpointRefused { .. } => "marked as checkpoint refused",
             Event::RestoreSucceeded => "marked as restored",
             Event::RestoreFailed { .. } => "marked as restore failed",
             Event::Lost => "marked as lost",
@@ -579,6 +587,13 @@ fn done(result: JobResult) -> Transition {
 /// - After a checkpoint failure the job is `Terminating{CheckpointFailed}`
 ///   and keeps its slots until its `Exited` (or `Lost`) arrives; it then
 ///   becomes `Done` with the checkpoint-failure result.
+/// - A refused checkpoint did not touch the process, so the job simply
+///   keeps running (the daemon records the reason and warns the owner).
+/// - On an OS shutdown the helper dumps running jobs on its own, and
+///   systemd stops whatever it could not save: a failed or refused dump of
+///   a `Running`/`Paused` job also ends in `Terminating{CheckpointFailed}`
+///   (without effects), so the job ends as "checkpoint failed" when its
+///   exit, or its absence after the reboot, is noticed.
 pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
     let state = &job.state;
     let transition = match (event, state) {
@@ -601,10 +616,21 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
         (Event::CheckpointSucceeded, JobState::Running | JobState::Paused) => {
             Transition::to(JobState::Checkpointed)
         }
-        // A failed shutdown dump leaves the job running until systemd stops
-        // it; its exit (or `Lost`) follows.
-        (Event::CheckpointFailed { .. }, JobState::Running | JobState::Paused) => {
-            Transition::unchanged()
+        // A failed or refused dump on an OS shutdown leaves the job running
+        // until systemd stops it; its exit (or `Lost`) follows and keeps
+        // this result.
+        (
+            Event::CheckpointFailed { reason } | Event::CheckpointRefused { reason },
+            JobState::Running | JobState::Paused,
+        ) => Transition::to(JobState::Terminating {
+            result: JobResult::CheckpointFailed {
+                reason: reason.clone(),
+            },
+        }),
+        // The process was not touched (a paused job was resumed for the
+        // dump, so it runs now).
+        (Event::CheckpointRefused { .. }, JobState::Checkpointing) => {
+            Transition::to(JobState::Running)
         }
         // CRIU leaves the process running when a dump fails; stop it, giving
         // it a chance to save its own checkpoint on SIGTERM.
@@ -1265,21 +1291,62 @@ mod tests {
     }
 
     #[test]
+    fn refused_checkpoint_keeps_the_job_running() {
+        let refused = Event::CheckpointRefused {
+            reason: "not enough free space".to_owned(),
+        };
+        let t = on_event(&job(1, JobState::Checkpointing), &refused).unwrap();
+        assert_eq!(t.next, Some(JobState::Running));
+        assert!(t.effects.is_empty(), "no signal, no image to delete");
+        assert!(on_event(&job(1, JobState::Checkpointed), &refused).is_err());
+        assert!(on_event(&job(1, JobState::Queued { enqueued_at: 0 }), &refused).is_err());
+    }
+
+    #[test]
     fn shutdown_dump_by_the_helper() {
         // The helper dumped a running job while the daemon was down.
         for state in [JobState::Running, JobState::Paused] {
             let t = on_event(&job(1, state.clone()), &Event::CheckpointSucceeded).unwrap();
             assert_eq!(t.next, Some(JobState::Checkpointed));
             assert!(t.effects.is_empty());
-            let t = on_event(
-                &job(1, state),
-                &Event::CheckpointFailed {
+            // A failed or refused one: systemd stops the job, which ends as
+            // "checkpoint failed" whether its exit or its absence is seen.
+            for event in [
+                Event::CheckpointFailed {
                     reason: "x".to_owned(),
                 },
-            )
-            .unwrap();
-            assert_eq!(t.next, None);
-            assert!(t.effects.is_empty());
+                Event::CheckpointRefused {
+                    reason: "x".to_owned(),
+                },
+            ] {
+                let result = JobResult::CheckpointFailed {
+                    reason: "x".to_owned(),
+                };
+                let mut j = job(1, state.clone());
+                let t = on_event(&j, &event).unwrap();
+                assert_eq!(
+                    t.next,
+                    Some(JobState::Terminating {
+                        result: result.clone()
+                    })
+                );
+                assert!(t.effects.is_empty(), "systemd stops it");
+                t.apply(&mut j, NOW);
+                // A replayed duplicate is ignored.
+                assert!(on_event(&j, &event).is_err());
+                for end in [
+                    Event::Exited(ExitStatus::Signal(15)),
+                    Event::Exited(ExitStatus::Code(1)),
+                    Event::Lost,
+                ] {
+                    assert_eq!(
+                        on_event(&j, &end).unwrap().next,
+                        Some(JobState::Done {
+                            result: result.clone()
+                        })
+                    );
+                }
+            }
         }
     }
 

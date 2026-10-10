@@ -56,6 +56,12 @@ pub fn now_ms() -> Timestamp {
         .unwrap_or(0)
 }
 
+/// The reason recorded for a dump the helper refused before touching the
+/// job (`code: checkpoint_refused`).
+pub fn refusal_reason(helper_reason: &str) -> String {
+    format!("checkpoint refused: {helper_reason}")
+}
+
 /// The single SQLite connection, used from blocking threads.
 #[derive(Clone)]
 pub struct Db(Arc<Mutex<Store>>);
@@ -997,7 +1003,24 @@ impl Core {
             ) => {
                 // The dump never started; the job keeps running.
                 let id = job.id;
-                let reason = e.to_string();
+                let refused = matches!(
+                    e,
+                    HelperError::Rejected {
+                        code: HelperErrorCode::CheckpointRefused,
+                        ..
+                    }
+                );
+                let reason = if refused {
+                    refusal_reason(&e.to_string())
+                } else {
+                    e.to_string()
+                };
+                let failure = refused.then(|| {
+                    Failure::new(
+                        ErrorCode::InvalidState,
+                        format!("{reason}; the job keeps running"),
+                    )
+                });
                 let core = self.clone();
                 let now = now_ms();
                 self.write(move |tx, ch| {
@@ -1024,7 +1047,7 @@ impl Core {
                     Ok(())
                 })
                 .await?;
-                Err(e.into())
+                Err(failure.unwrap_or_else(|| e.into()))
             }
             Err(e) => Err(e.into()),
         }
@@ -1177,7 +1200,21 @@ impl Core {
                         Some(image_size_bytes),
                         None,
                     ),
-                    CheckpointOutcome::Failed { reason } => (
+                    CheckpointOutcome::Failed {
+                        reason,
+                        code: Some(HelperErrorCode::CheckpointRefused),
+                    } => {
+                        let reason = refusal_reason(&reason);
+                        (
+                            E::CheckpointRefused {
+                                reason: reason.clone(),
+                            },
+                            CheckpointStatus::Failed,
+                            None,
+                            Some(reason),
+                        )
+                    }
+                    CheckpointOutcome::Failed { reason, .. } => (
                         E::CheckpointFailed {
                             reason: reason.clone(),
                         },
@@ -1507,6 +1544,12 @@ impl Core {
 
     /// `puzuz shutdown`: checkpoint (or with `no_checkpoint`, terminate)
     /// every running job, one checkpoint at a time, then stop the daemon.
+    ///
+    /// A job whose dump fails is terminated (as for `checkpoint`). A job
+    /// whose dump the helper refuses before touching it (see
+    /// [`refusal_reason`]) is left running: terminating it would lose the
+    /// work the refusal protects. Its owner is warned, and the next daemon
+    /// finds it running again.
     pub async fn shutdown(self: &Arc<Self>, no_checkpoint: bool) {
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
@@ -1514,6 +1557,7 @@ impl Core {
         tracing::info!(no_checkpoint, "shutting down");
         let checkpoint_wait = Duration::from_secs(30 * 60);
         let settle_wait = Duration::from_secs(self.config.grace_secs + 10);
+        let mut left_running: HashSet<JobId> = HashSet::new();
         for _pass in 0..3 {
             // New launches are refused from now on; let the ones in flight
             // be answered so the jobs can be signalled or checkpointed.
@@ -1529,6 +1573,9 @@ impl Core {
                 Err(_) => break,
             };
             for job in jobs {
+                if left_running.contains(&job.id) {
+                    continue;
+                }
                 match lifecycle::shutdown_action(&job, !no_checkpoint) {
                     ShutdownAction::Keep => {}
                     ShutdownAction::Terminate => {
@@ -1539,7 +1586,17 @@ impl Core {
                     ShutdownAction::Checkpoint(_) => {
                         let id = job.id;
                         if let Err(e) = self.checkpoint_for_shutdown(id).await {
-                            tracing::warn!(job = %id, "cannot checkpoint job: {}", e.0.message);
+                            if e.code() == ErrorCode::InvalidState {
+                                left_running.insert(id);
+                                tracing::warn!(
+                                    job = %id,
+                                    "{} (stop it with `puzuz kill` or \
+                                     `puzuz shutdown --no-checkpoint`)",
+                                    e.0.message
+                                );
+                            } else {
+                                tracing::warn!(job = %id, "cannot checkpoint job: {}", e.0.message);
+                            }
                             continue;
                         }
                         // One dump at a time.
@@ -1549,12 +1606,23 @@ impl Core {
                                 .is_none_or(|j| j.state != JobState::Checkpointing)
                         })
                         .await;
+                        // Back to running: refused once the dump was due.
+                        if let Ok(Some(job)) = self.read(move |s| s.get_job(id)).await
+                            && matches!(job.state, JobState::Running | JobState::Paused)
+                        {
+                            left_running.insert(id);
+                            tracing::warn!(
+                                job = %id,
+                                "the helper refused to checkpoint the job; leaving it running"
+                            );
+                        }
                     }
                 }
             }
             let settled = self
                 .wait_until(settle_wait, |jobs| {
-                    jobs.iter().all(|j| !j.state.occupies_slot())
+                    jobs.iter()
+                        .all(|j| !j.state.occupies_slot() || left_running.contains(&j.id))
                 })
                 .await;
             if settled {

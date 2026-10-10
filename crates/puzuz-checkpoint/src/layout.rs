@@ -8,6 +8,8 @@
 //!     restore.pid    host PID of the restored tree root (criu --pidfile)
 //!     meta.json      CheckpointMeta, written once the dump succeeded
 //!     COMPLETE       completion marker, written last
+//! <base>/failed-logs/
+//!     <job id>-<unix ms>.log   dump.log of a failed dump (newest kept)
 //! ```
 //!
 //! Both `meta.json` and `COMPLETE` are written via write-to-temp + fsync +
@@ -32,6 +34,12 @@ pub const RESTORE_LOG: &str = "restore.log";
 pub const RESTORE_PIDFILE: &str = "restore.pid";
 /// File CRIU always writes into a successful image set.
 pub const CRIU_INVENTORY: &str = "inventory.img";
+
+/// Directory under the checkpoint base that keeps the CRIU logs of failed
+/// dumps (the checkpoint directory itself is removed).
+pub const FAILED_LOGS_SUBDIR: &str = "failed-logs";
+/// How many failed dump logs [`preserve_failed_log`] keeps.
+pub const FAILED_LOGS_KEEP: usize = 20;
 
 /// Current `meta.json` format version.
 pub const META_FORMAT_VERSION: u32 = 1;
@@ -368,6 +376,67 @@ pub fn dir_size(path: &Path) -> io::Result<u64> {
     Ok(total)
 }
 
+/// Move the dump log of a failed dump of `dir` to
+/// `<base>/failed-logs/<job>-<created_at>.log` (directory mode 0700, so
+/// only root can read it), then delete the oldest logs there beyond
+/// `keep`. Returns the new path, or `None` when there was no log.
+pub fn preserve_failed_log(
+    base: &Path,
+    dir: &CheckpointDir,
+    created_at: i64,
+    keep: usize,
+) -> io::Result<Option<PathBuf>> {
+    let log = dir.dump_log();
+    if !log.exists() {
+        return Ok(None);
+    }
+    let logs = base.join(FAILED_LOGS_SUBDIR);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&logs)?;
+    let mut dest = logs.join(format!("{}-{created_at}.log", dir.job_id()));
+    let mut n = 1;
+    while dest.exists() {
+        dest = logs.join(format!("{}-{created_at}.{n}.log", dir.job_id()));
+        n += 1;
+    }
+    fs::rename(&log, &dest)?;
+    prune_failed_logs(&logs, keep)?;
+    Ok(Some(dest))
+}
+
+/// Delete the oldest `<job>-<ms>[.<n>].log` files in `logs` beyond `keep`.
+fn prune_failed_logs(logs: &Path, keep: usize) -> io::Result<()> {
+    let mut found: Vec<(i64, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(logs)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(stamp) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".log"))
+            .and_then(|n| n.split_once('-'))
+            .and_then(|(_, rest)| rest.split('.').next())
+            .and_then(|ms| ms.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        found.push((stamp, entry.path()));
+    }
+    if found.len() <= keep {
+        return Ok(());
+    }
+    found.sort();
+    let excess = found.len() - keep;
+    for (_, path) in found.into_iter().take(excess) {
+        remove_if_exists(&path)?;
+    }
+    Ok(())
+}
+
 /// Write `data` to `path` atomically: `<path>.tmp` → fsync → rename → fsync
 /// of the parent directory.
 pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
@@ -414,6 +483,46 @@ mod tests {
         fs::write(dir.images_dir().join(CRIU_INVENTORY), b"inv").unwrap();
         fs::write(dir.images_dir().join("pages-1.img"), vec![0u8; 1000]).unwrap();
         fs::write(dir.dump_log(), b"log").unwrap();
+    }
+
+    #[test]
+    fn failed_logs_are_moved_and_pruned() {
+        let tmp = TempDir::new();
+        let base = tmp.path();
+        let dir = CheckpointDir::for_job(base, 7);
+        // No log: nothing to keep.
+        assert_eq!(preserve_failed_log(base, &dir, 1, 3).unwrap(), None);
+
+        for stamp in [10, 20, 30, 40] {
+            dir.prepare().unwrap();
+            fs::write(dir.dump_log(), format!("log {stamp}")).unwrap();
+            let kept = preserve_failed_log(base, &dir, stamp, 3).unwrap().unwrap();
+            assert_eq!(
+                kept,
+                base.join(FAILED_LOGS_SUBDIR).join(format!("7-{stamp}.log"))
+            );
+            assert_eq!(fs::read_to_string(&kept).unwrap(), format!("log {stamp}"));
+            assert!(!dir.dump_log().exists());
+        }
+        // The same timestamp twice does not overwrite.
+        fs::write(dir.dump_log(), "again").unwrap();
+        let again = preserve_failed_log(base, &dir, 40, 3).unwrap().unwrap();
+        assert_eq!(again, base.join(FAILED_LOGS_SUBDIR).join("7-40.1.log"));
+
+        let mut left: Vec<String> = fs::read_dir(base.join(FAILED_LOGS_SUBDIR))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["7-30.log", "7-40.1.log", "7-40.log"]);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(base.join(FAILED_LOGS_SUBDIR))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // The log directory is not mistaken for a checkpoint.
+        assert!(scan(base).unwrap().iter().all(|(id, _)| *id == 7));
     }
 
     fn meta(job: u64) -> CheckpointMeta {

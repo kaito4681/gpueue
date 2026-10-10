@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use puzuz_checkpoint::layout::{CheckpointDir, DirStatus};
+use puzuz_checkpoint::layout::{CheckpointDir, DirStatus, FAILED_LOGS_SUBDIR};
 use puzuz_checkpoint::plan::Action;
 use puzuz_checkpoint::{CudaMode, Executor};
 use puzuz_helper::config::SHUTDOWN_MANIFEST;
@@ -643,7 +643,7 @@ async fn failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first()
     assert_eq!(r, ResponseResult::Accepted);
     let ev = c.event().await;
     let Event::CheckpointFinished {
-        outcome: CheckpointOutcome::Failed { reason },
+        outcome: CheckpointOutcome::Failed { reason, code: None },
         ..
     } = ev.event
     else {
@@ -656,7 +656,40 @@ async fn failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first()
         [signal::SIGSTOP, signal::SIGCONT, signal::SIGSTOP]
     );
     assert_eq!(c.running().await, [(job, RunningPhase::Stopped)]);
-    assert!(!CheckpointDir::for_job(&env.base(), 4).images_dir().exists());
+
+    // CRIU's log was moved out of the checkpoint directory, which is gone,
+    // and the reason names it.
+    let logs = env.base().join(FAILED_LOGS_SUBDIR);
+    let kept: Vec<PathBuf> = std::fs::read_dir(&logs)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    let name = kept[0].file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with("4-") && name.ends_with(".log"), "{name}");
+    assert!(
+        reason.contains(&format!("(CRIU log: {})", kept[0].display())),
+        "{reason}"
+    );
+    assert!(
+        std::fs::read_to_string(&kept[0])
+            .unwrap()
+            .contains("fake criu log")
+    );
+    assert!(!env.base().join("4").exists());
+
+    // The daemon's cleanup after the job ends leaves the log alone.
+    env.launcher.exit(job, ExitStatus::Signaled { signal: 9 });
+    assert!(matches!(c.event().await.event, Event::JobExited { .. }));
+    assert_eq!(
+        c.request(Request::DeleteCheckpoint {
+            job,
+            image_dir: env.base().join("4"),
+        })
+        .await,
+        ResponseResult::Ok
+    );
+    assert!(kept[0].exists());
 }
 
 #[tokio::test]
@@ -677,24 +710,74 @@ async fn dump_refuses_a_job_that_depends_on_a_hidden_mount() {
             options: Default::default(),
         })
         .await;
-    assert_eq!(r, ResponseResult::Accepted);
-    let ev = c.event().await;
-    let Event::CheckpointFinished {
-        outcome: CheckpointOutcome::Failed { reason },
-        ..
-    } = ev.event
+    // Refused in the answer; no outcome event follows.
+    let ResponseResult::Error {
+        code: HelperErrorCode::CheckpointRefused,
+        message,
+    } = r
     else {
-        panic!("{ev:?}")
+        panic!("{r:?}")
     };
     assert!(
-        reason.contains("/run/nvidia-persistenced/socket"),
-        "{reason}"
+        message.contains("/run/nvidia-persistenced/socket"),
+        "{message}"
     );
+    c.no_event().await;
     assert!(
         env.exec.lock().unwrap().actions.is_empty(),
         "nothing was run against the job"
     );
+    assert!(env.launcher.unit(job).unwrap().signals.is_empty());
+    assert!(!env.base().join("5").exists());
     assert_eq!(c.running().await, [(job, RunningPhase::Running)]);
+
+    // Once the problem is gone the job can be dumped.
+    env.host.set_unreachable_mounts(vec![]);
+    let r = c
+        .request(Request::Checkpoint {
+            job,
+            image_dir: env.base().join("5"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    assert!(matches!(
+        c.event().await.event,
+        Event::CheckpointFinished {
+            outcome: CheckpointOutcome::Success { .. },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn dump_refuses_without_free_space_and_keeps_a_stopped_job_stopped() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let job = JobId(7);
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(7))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    c.request(Request::Signal {
+        job,
+        signal: signal::SIGSTOP,
+    })
+    .await;
+    env.host.set_available(1);
+    let r = c
+        .request(Request::Checkpoint {
+            job,
+            image_dir: env.base().join("7"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(err_code(&r), HelperErrorCode::CheckpointRefused, "{r:?}");
+    c.no_event().await;
+    // Not even resumed for the dump.
+    assert_eq!(env.launcher.unit(job).unwrap().signals, [signal::SIGSTOP]);
+    assert_eq!(c.running().await, [(job, RunningPhase::Stopped)]);
+    assert!(env.exec.lock().unwrap().actions.is_empty());
 }
 
 #[tokio::test]
@@ -727,6 +810,71 @@ async fn delete_checkpoint_refuses_live_jobs() {
         c.request(Request::Spawn(env.spawn_req(6))).await,
         ResponseResult::Spawned { .. }
     ));
+}
+
+#[tokio::test]
+async fn shutdown_reports_refused_and_failed_dumps_apart() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    for job in [20, 21] {
+        assert!(matches!(
+            c.request(Request::Spawn(env.spawn_req(job))).await,
+            ResponseResult::Spawned { .. }
+        ));
+    }
+    // Job 20's dump fails; job 21's is refused (the hidden mount shows up
+    // after the first dump, as if it had been mounted meanwhile).
+    env.exec.lock().unwrap().fail_on = Some(|a| matches!(a, Action::CriuDump { .. }));
+    let host = env.host.clone();
+    let manifest = env
+        .helper
+        .shutdown(move |job| {
+            if job == JobId(21) {
+                host.set_unreachable_mounts(vec!["/hidden".into()]);
+            }
+        })
+        .await;
+    let [first, second] = &manifest.jobs[..] else {
+        panic!("{manifest:?}")
+    };
+    let ManifestResult::Failed {
+        reason,
+        refused: false,
+    } = &first.result
+    else {
+        panic!("{first:?}")
+    };
+    assert_eq!(first.job, JobId(20));
+    assert!(reason.contains("CRIU log:"), "{reason}");
+    let ManifestResult::Failed {
+        reason,
+        refused: true,
+    } = &second.result
+    else {
+        panic!("{second:?}")
+    };
+    assert_eq!(second.job, JobId(21));
+    assert!(reason.contains("/hidden"), "{reason}");
+    let on_disk: ShutdownManifest =
+        serde_json::from_slice(&std::fs::read(env.base().join(SHUTDOWN_MANIFEST)).unwrap())
+            .unwrap();
+    assert_eq!(on_disk, manifest);
+
+    // The daemon hears about both, told apart.
+    let outcomes = events(&mut c, 2, |e| match e {
+        Event::CheckpointFinished { job, outcome } => Some((job, outcome.is_refused())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(outcomes, [(JobId(20), false), (JobId(21), true)]);
+    // Both are left for systemd to stop.
+    assert_eq!(
+        c.running().await,
+        [
+            (JobId(20), RunningPhase::Running),
+            (JobId(21), RunningPhase::Running)
+        ]
+    );
 }
 
 #[tokio::test]

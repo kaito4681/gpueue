@@ -100,10 +100,21 @@ is appended to the same log.
 3. Each owner (or an administrator) resumes their jobs with `puzuz restore <id>` or
    `puzuz restore -a`. Restores are not started automatically.
 
-If a job cannot be checkpointed, it is stopped (SIGTERM, which gives it a chance to save its own
-checkpoint, then SIGKILL after `grace_secs`). The owner is warned on their next `puzuz` command.
-After a `puzuz checkpoint` the job is shown as `Checkpoint failed`, and the reason appears in
-`puzuz status` and `puzuz log`. Nothing is saved on a power loss or a kernel crash.
+A checkpoint can go wrong in two ways:
+
+- **Refused:** the helper's checks fail before the job is touched (not enough free space, a mount
+  that could never be restored, ...). The job keeps running. `puzuz checkpoint` fails with the
+  reason. If the refusal only comes when the dump is due (for example during `puzuz shutdown`),
+  the owner is warned on their next `puzuz` command. The reason is the job's last error in
+  `puzuz status` and `puzuz log`.
+- **Failed:** the dump itself fails. CRIU puts the job back, but it has been frozen, so it is
+  stopped (SIGTERM, which gives it a chance to save its own checkpoint, then SIGKILL after
+  `grace_secs`) and shown as `Checkpoint failed` with the reason. The owner is warned on their next
+  `puzuz` command.
+
+During an OS shutdown or reboot, systemd stops every job that could not be saved, whether its dump
+was refused or failed. After the boot it is shown as `Checkpoint failed` with the reason, and the
+owner is warned. Nothing is saved on a power loss or a kernel crash.
 
 ## pueue compatibility and differences
 
@@ -116,7 +127,7 @@ and does not read pueue's files. These are the differences:
 | Daemon | one per user, started by the user (`pueued`) | one for the whole system, run by systemd (`puzuz daemon`, user `puzuz`). Users never start a daemon. |
 | Selecting a daemon | `-c/--config`, `-p/--profile` | `--socket <path>` (env `PUZUZ_SOCKET`, default `/run/puzuz/puzuz.sock`) |
 | `send` | sends input to a task's stdin | not supported: jobs' stdin is `/dev/null`. Make the command non-interactive. |
-| `shutdown` | kills all tasks and stops the daemon | administrators only. Checkpoints all running jobs, then stops the daemon. `--no-checkpoint` kills them instead. |
+| `shutdown` | kills all tasks and stops the daemon | administrators only. Checkpoints all running jobs, then stops the daemon. A job whose checkpoint is refused keeps running. `--no-checkpoint` kills them instead. |
 | `restart` | finished tasks | also works on `Checkpointed` jobs: they start over as a new job, and the image is kept |
 | `reset`, `-a/--all`, `-g/--group` | all tasks | your own jobs. Administrators act on everyone's. |
 | Wording | "task" | "job". Option names such as `--print-task-id` are kept for compatibility. |
@@ -251,7 +262,7 @@ Details are in [docs/install.md](docs/install.md).
   - Checkpoints take roughly RSS + VRAM of disk space per job and are written one job at a time.
     In tests, a job with 7 GB of VRAM took about 10 to 20 s to dump.
 - **Mounts covering `/`:** a job whose root directory is covered by another mount cannot be
-  checkpointed. puzuz refuses the dump and tells you why.
+  checkpointed. puzuz refuses the dump and tells you why. The job keeps running.
 - Checkpoint images are never deleted automatically while their job exists. They are removed when
   the job is restored successfully, removed (`remove`, `clean`, `reset`), or when its dump fails.
   Above `checkpoint_size_limit_bytes`, puzuz warns but does not refuse.

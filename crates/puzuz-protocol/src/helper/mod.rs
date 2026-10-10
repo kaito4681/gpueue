@@ -131,7 +131,9 @@ pub enum Request {
     /// [`ResponseResult::Ok`].
     Signal { job: JobId, signal: i32 },
     /// Checkpoint a running job and stop it. Answered with
-    /// [`ResponseResult::Accepted`], then [`Event::CheckpointFinished`].
+    /// [`ResponseResult::Accepted`], then [`Event::CheckpointFinished`], or
+    /// with [`HelperErrorCode::CheckpointRefused`] when the pre-checks
+    /// already show the dump cannot succeed (the job is left alone).
     Checkpoint {
         job: JobId,
         image_dir: PathBuf,
@@ -282,6 +284,10 @@ pub enum HelperErrorCode {
     /// The helper is shutting down and accepts no new spawns or restores.
     ShuttingDown,
     SpawnFailed,
+    /// The helper declined to dump the job before touching it (its mounts
+    /// could not be restored, not enough free space, ...). The job keeps
+    /// running as it was; the message says why.
+    CheckpointRefused,
     Internal,
 }
 
@@ -339,9 +345,50 @@ impl ExitStatus {
 pub enum CheckpointOutcome {
     /// The image is complete (marker written) and the job is stopped.
     Success { image_size_bytes: u64 },
-    /// The dump failed; CRIU rolled back and the job is still running.
-    /// Terminating it is up to the daemon.
-    Failed { reason: String },
+    /// The dump failed.
+    ///
+    /// Without `code`, the dump was attempted: CRIU rolled back and the job
+    /// is still running, but it has been frozen and its CUDA state toggled,
+    /// so terminating it is up to the daemon. CRIU's log, if any, was kept
+    /// for administrators and `reason` names its path.
+    Failed {
+        reason: String,
+        /// Why, when the dump was not attempted. Only
+        /// `checkpoint_refused` so far: the pre-checks failed before the
+        /// job was touched, and it keeps running as it was. Absent from
+        /// older helpers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<HelperErrorCode>,
+    },
+}
+
+impl CheckpointOutcome {
+    /// A dump that was attempted and failed.
+    pub fn failed(reason: impl Into<String>) -> Self {
+        CheckpointOutcome::Failed {
+            reason: reason.into(),
+            code: None,
+        }
+    }
+
+    /// A dump refused before the job was touched.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        CheckpointOutcome::Failed {
+            reason: reason.into(),
+            code: Some(HelperErrorCode::CheckpointRefused),
+        }
+    }
+
+    /// Whether the dump was refused before the job was touched.
+    pub fn is_refused(&self) -> bool {
+        matches!(
+            self,
+            CheckpointOutcome::Failed {
+                code: Some(HelperErrorCode::CheckpointRefused),
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
