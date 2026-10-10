@@ -78,8 +78,8 @@ pub fn router(core: Arc<Core>) -> Router {
 }
 
 /// Hands the caller's pending warnings (a failed checkpoint of one of their
-/// jobs) to the CLI in the [`WARNINGS_HEADER`] of a successful response,
-/// once. Only requests from the puzuz CLI (with the [`VERSION_HEADER`]) get
+/// jobs, checkpoint images over the size limit) to the CLI in the
+/// [`WARNINGS_HEADER`] of a successful response, once. Only requests from the puzuz CLI (with the [`VERSION_HEADER`]) get
 /// them, and `/v1/version` never does.
 async fn attach_warnings(State(core): State<AppState>, request: Request, next: Next) -> Response {
     let uid = if request.headers().contains_key(VERSION_HEADER)
@@ -114,7 +114,10 @@ async fn attach_warnings(State(core): State<AppState>, request: Request, next: N
             return response;
         }
     };
-    if let Err(e) = core.acknowledge_warnings(&pending).await {
+    let Some(uid) = uid else {
+        return response;
+    };
+    if let Err(e) = core.acknowledge_warnings(Uid(uid), &pending).await {
         tracing::warn!("cannot record delivered warnings: {}", e.0.message);
     }
     response.headers_mut().insert(WARNINGS_HEADER, value);
@@ -386,6 +389,11 @@ async fn shutdown(
 
 async fn version(State(core): State<AppState>) -> Json<VersionResponse> {
     let helper = core.helper.state();
+    let checkpoints = core
+        .checkpoint_storage()
+        .await
+        .inspect_err(|e| tracing::warn!("cannot sum up checkpoint sizes: {}", e.0.message))
+        .ok();
     Json(VersionResponse {
         api_version: API_VERSION,
         daemon_version: BINARY_VERSION.to_owned(),
@@ -393,6 +401,7 @@ async fn version(State(core): State<AppState>) -> Json<VersionResponse> {
             connected: helper.connected,
             version: helper.version,
         },
+        checkpoints,
     })
 }
 

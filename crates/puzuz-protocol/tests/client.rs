@@ -126,6 +126,7 @@ async fn route(req: Request<Incoming>, log: Arc<Mutex<Vec<Recorded>>>) -> Respon
                     connected: true,
                     version: None,
                 },
+                checkpoints: None,
             },
         ),
         ("GET", "/v1/groups") => json(

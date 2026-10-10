@@ -357,9 +357,46 @@ fn resource_bodies_golden() {
                 connected: true,
                 version: Some("0.1.0".into()),
             },
+            checkpoints: None,
         },
         r#"{"api_version":1,"daemon_version":"0.1.0","helper":{"connected":true,"version":"0.1.0"}}"#,
     );
+    let with_usage = VersionResponse {
+        api_version: API_VERSION,
+        daemon_version: "0.1.0".into(),
+        helper: HelperStatus {
+            connected: false,
+            version: None,
+        },
+        checkpoints: Some(CheckpointStorage {
+            images: 2,
+            total_bytes: 1500,
+            limit_bytes: Some(1000),
+            available_bytes: Some(1 << 40),
+        }),
+    };
+    assert_golden(
+        &with_usage,
+        concat!(
+            r#"{"api_version":1,"daemon_version":"0.1.0","helper":{"connected":false},"#,
+            r#""checkpoints":{"images":2,"total_bytes":1500,"limit_bytes":1000,"#,
+            r#""available_bytes":1099511627776}}"#
+        ),
+    );
+    assert!(with_usage.checkpoints.as_ref().unwrap().over_limit());
+    // Without a limit or free space (e.g. the directory is missing).
+    assert_golden(
+        &CheckpointStorage {
+            images: 0,
+            total_bytes: 0,
+            limit_bytes: None,
+            available_bytes: None,
+        },
+        r#"{"images":0,"total_bytes":0}"#,
+    );
+    let unlimited: CheckpointStorage =
+        serde_json::from_str(r#"{"images":1,"total_bytes":5}"#).unwrap();
+    assert!(!unlimited.over_limit());
     assert_golden(
         &GpuView {
             index: GpuIndex(0),

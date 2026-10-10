@@ -107,6 +107,7 @@ impl FakeSystem {
                 connected: helper_connected,
                 version: helper_connected.then(|| puzuz_protocol::BINARY_VERSION.to_owned()),
             },
+            checkpoints: None,
         })
     }
 }

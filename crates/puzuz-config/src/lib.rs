@@ -23,6 +23,7 @@
 //! grace_secs = 30
 //! shell = ["sh", "-c"]
 //! # checkpoint_size_limit_bytes = 500_000_000_000
+//! checkpoint_size_warning_interval_secs = 3600
 //! checkpoint_tcp_close = true
 //! criu_path = "criu"
 //! cuda_checkpoint_path = "cuda-checkpoint"
@@ -82,8 +83,12 @@ pub struct Config {
     pub grace_secs: u64,
     /// Command prefix a job's command line is appended to.
     pub shell: Vec<String>,
-    /// Warn when all checkpoint images together exceed this size.
+    /// Warn when all checkpoint images together exceed this size (images
+    /// are never deleted automatically).
     pub checkpoint_size_limit_bytes: Option<u64>,
+    /// Remind each administrator of an exceeded
+    /// `checkpoint_size_limit_bytes` at most this often (daemon only).
+    pub checkpoint_size_warning_interval_secs: u64,
     /// Close TCP connections when checkpointing (`criu --tcp-close`).
     pub checkpoint_tcp_close: bool,
     /// Path of `criu` (used by the helper).
@@ -172,6 +177,7 @@ impl Default for Config {
             grace_secs: 30,
             shell: vec!["sh".to_owned(), "-c".to_owned()],
             checkpoint_size_limit_bytes: None,
+            checkpoint_size_warning_interval_secs: 3600,
             checkpoint_tcp_close: true,
             criu_path: PathBuf::from("criu"),
             cuda_checkpoint_path: PathBuf::from("cuda-checkpoint"),
@@ -349,6 +355,7 @@ mod tests {
             grace_secs = 5
             shell = ["bash", "-lc"]
             checkpoint_size_limit_bytes = 1000
+            checkpoint_size_warning_interval_secs = 60
             checkpoint_tcp_close = false
             gpu_detection = "static"
             nvml_library = "/opt/nvml.so"
@@ -381,6 +388,7 @@ mod tests {
         assert_eq!(config.grace_secs, 5);
         assert_eq!(config.shell, ["bash", "-lc"]);
         assert_eq!(config.checkpoint_size_limit_bytes, Some(1000));
+        assert_eq!(config.checkpoint_size_warning_interval_secs, 60);
         assert!(!config.checkpoint_tcp_close);
         assert_eq!(config.gpu_detection, GpuDetection::Static);
         assert_eq!(config.nvml_library, Some(PathBuf::from("/opt/nvml.so")));

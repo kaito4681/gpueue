@@ -20,10 +20,12 @@
 //! Checkpoint bookkeeping: each record gets the GPU model and driver version
 //! of the job's GPUs, and the image size the helper reports. When all
 //! complete images together exceed `checkpoint_size_limit_bytes`, the daemon
-//! logs a warning (at start-up and after each dump); images are never
-//! deleted automatically and dumps are not refused. The owner of a job whose
-//! dump failed is told on their next command (see
-//! [`puzuz_protocol::api::WARNINGS_HEADER`]).
+//! logs a warning (at start-up and after each dump) and warns the owner of
+//! the new checkpoint and administrators on their commands (see [`usage`]);
+//! images are never deleted automatically and dumps are not refused. The
+//! owner of a job whose dump failed is told on their next command (see
+//! [`puzuz_protocol::api::WARNINGS_HEADER`]). `GET /v1/version` reports the
+//! usage for `puzuz doctor`.
 //!
 //! Known gaps, for integration:
 //! - Removing or truncating a log file (`remove`, `clean`, `restart
@@ -40,6 +42,7 @@ pub mod gpu;
 pub mod helper;
 mod launch;
 mod state;
+mod usage;
 pub mod users;
 
 use std::collections::{BTreeMap, HashMap};

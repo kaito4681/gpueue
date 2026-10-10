@@ -108,6 +108,35 @@ pub struct VersionResponse {
     pub api_version: u32,
     pub daemon_version: String,
     pub helper: HelperStatus,
+    /// How much space checkpoint images take (for `puzuz doctor`, which
+    /// cannot read the root-only image directory itself). Aggregates only,
+    /// so every caller may see it. Absent from daemons that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<CheckpointStorage>,
+}
+
+/// Checkpoint image usage, as the daemon accounts for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointStorage {
+    /// Number of complete images.
+    pub images: u64,
+    /// Total size of the complete images.
+    pub total_bytes: u64,
+    /// `checkpoint_size_limit_bytes`; `None` without a limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_bytes: Option<u64>,
+    /// Free space (for unprivileged users) on the filesystem holding the
+    /// image directory; `None` when the daemon cannot tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_bytes: Option<u64>,
+}
+
+impl CheckpointStorage {
+    /// Whether the images exceed the configured limit.
+    pub fn over_limit(&self) -> bool {
+        self.limit_bytes
+            .is_some_and(|limit| self.total_bytes > limit)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

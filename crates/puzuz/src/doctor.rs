@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use puzuz_checkpoint::probe::{Version, parse_criu_version, parse_cuda_checkpoint_help};
 use puzuz_daemon::config::{Config, DEFAULT_CONFIG_PATH};
+use puzuz_protocol::api::{CheckpointStorage, VersionResponse};
 
 use crate::service::{ADMIN_GROUP, DAEMON_UNIT, HELPER_UNIT, TMPFILES_PATH, UNIT_DIR};
 use crate::system::{System, find_program, is_root_owned_and_protected};
@@ -262,8 +263,13 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
         &config.helper_socket,
         HELPER_UNIT,
     ));
-    checks.extend(check_daemon(sys, &api_socket));
-    checks.push(check_checkpoint_dir(sys, &config));
+    let daemon = sys.daemon_version(&api_socket);
+    checks.extend(check_daemon(&daemon));
+    let storage = daemon.as_ref().ok().and_then(|v| v.checkpoints.as_ref());
+    checks.push(check_checkpoint_dir(sys, &config, storage));
+    if let Some(storage) = storage {
+        checks.push(check_checkpoint_usage(storage));
+    }
     checks.push(check_admin(sys));
     Report { checks }
 }
@@ -593,8 +599,8 @@ fn check_socket(sys: &dyn System, name: &'static str, path: &Path, unit: &str) -
     }
 }
 
-fn check_daemon(sys: &dyn System, socket: &Path) -> Vec<Check> {
-    match sys.daemon_version(socket) {
+fn check_daemon(daemon: &Result<VersionResponse, String>) -> Vec<Check> {
+    match daemon {
         Ok(version) => {
             let mut checks = Vec::new();
             let ours = puzuz_protocol::BINARY_VERSION;
@@ -634,7 +640,14 @@ fn check_daemon(sys: &dyn System, socket: &Path) -> Vec<Check> {
     }
 }
 
-fn check_checkpoint_dir(sys: &dyn System, config: &Config) -> Check {
+/// Existence, filesystem type and free space of the image directory. The
+/// daemon's figures (`storage`) are preferred: it knows how much the images
+/// already take, and sees the directory it actually uses.
+fn check_checkpoint_dir(
+    sys: &dyn System,
+    config: &Config,
+    storage: Option<&CheckpointStorage>,
+) -> Check {
     const NAME: &str = "checkpoint dir";
     let dir = config.checkpoints_dir();
     let shown = dir.display();
@@ -642,11 +655,10 @@ fn check_checkpoint_dir(sys: &dyn System, config: &Config) -> Check {
         return Check::fail(NAME, format!("{shown} does not exist"))
             .hint(format!("sudo systemd-tmpfiles --create {TMPFILES_PATH}"));
     }
-    let usage = match sys.fs_usage(&dir) {
-        Ok(usage) => usage,
-        Err(err) => return Check::warn(NAME, format!("cannot inspect {shown}: {err}")),
-    };
-    if usage.tmpfs {
+    let local = sys.fs_usage(&dir);
+    if let Ok(usage) = &local
+        && usage.tmpfs
+    {
         return Check::fail(
             NAME,
             format!("{shown} is on tmpfs; images would compete with jobs for RAM"),
@@ -655,12 +667,23 @@ fn check_checkpoint_dir(sys: &dyn System, config: &Config) -> Check {
             "mount a disk at {shown} or set `checkpoints_dir` in {DEFAULT_CONFIG_PATH}"
         ));
     }
-    let free = format_bytes(usage.available_bytes);
-    let needed = config
-        .checkpoint_size_limit_bytes
-        .unwrap_or(0)
-        .max(LOW_SPACE_BYTES);
-    if usage.available_bytes < needed {
+    let available = match (storage.and_then(|s| s.available_bytes), &local) {
+        (Some(bytes), _) => bytes,
+        (None, Ok(usage)) => usage.available_bytes,
+        (None, Err(err)) => return Check::warn(NAME, format!("cannot inspect {shown}: {err}")),
+    };
+    let free = format_bytes(available);
+    // Room for the images still allowed under the limit, and at least for a
+    // large dump. The daemon does not know jobs' RSS and VRAM use, so a
+    // fixed threshold stands in for "RSS + VRAM x 1.2 of the largest job".
+    let budget = match storage {
+        Some(storage) => storage
+            .limit_bytes
+            .map(|limit| limit.saturating_sub(storage.total_bytes)),
+        None => config.checkpoint_size_limit_bytes,
+    };
+    let needed = budget.unwrap_or(0).max(LOW_SPACE_BYTES);
+    if available < needed {
         return Check::warn(
             NAME,
             format!("{shown}: only {free} free; a dump needs about RAM + VRAM of the job"),
@@ -668,6 +691,40 @@ fn check_checkpoint_dir(sys: &dyn System, config: &Config) -> Check {
         .hint("free space there or move `checkpoints_dir` to a larger disk");
     }
     Check::ok(NAME, format!("{shown}: {free} free"))
+}
+
+/// The total size of the images versus `checkpoint_size_limit_bytes`, as
+/// the daemon accounts for it (the image directory is root-only).
+fn check_checkpoint_usage(storage: &CheckpointStorage) -> Check {
+    const NAME: &str = "checkpoint usage";
+    let used = format!(
+        "{} image(s) take {}",
+        storage.images,
+        format_bytes(storage.total_bytes)
+    );
+    match storage.limit_bytes {
+        None => Check::info(NAME, format!("{used}; no checkpoint_size_limit_bytes set")),
+        Some(limit) if storage.total_bytes > limit => Check::warn(
+            NAME,
+            format!(
+                "{used}, over checkpoint_size_limit_bytes ({}); images are never deleted \
+                 automatically",
+                format_bytes(limit)
+            ),
+        )
+        .hint(format!(
+            "find large checkpoints with `puzuz status` (administrators see every job), then \
+             restore them or `puzuz remove <id>` jobs that are no longer needed; or raise \
+             `checkpoint_size_limit_bytes` in {DEFAULT_CONFIG_PATH}"
+        )),
+        Some(limit) => Check::ok(
+            NAME,
+            format!(
+                "{used} of checkpoint_size_limit_bytes ({})",
+                format_bytes(limit)
+            ),
+        ),
+    }
 }
 
 fn check_admin(sys: &dyn System) -> Check {

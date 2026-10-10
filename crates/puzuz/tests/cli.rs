@@ -109,6 +109,8 @@ fn jobs() -> Vec<JobView> {
 enum Mode {
     Normal,
     VersionMismatch,
+    /// Like `Normal`, with checkpoint size warnings on every response.
+    SizeWarnings,
 }
 
 async fn route(
@@ -136,6 +138,7 @@ async fn route(
                         connected: true,
                         version: None,
                     },
+                    checkpoints: None,
                 },
             );
         }
@@ -219,7 +222,26 @@ impl FakeDaemon {
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
                         let log = log.clone();
-                        async move { Ok::<_, Infallible>(route(req, mode, log).await) }
+                        async move {
+                            let mut response = route(req, mode, log).await;
+                            if mode == Mode::SizeWarnings {
+                                let warnings = Warning::encode_header(&[
+                                    Warning::CheckpointOverLimit {
+                                        job: JobId(7),
+                                        total_bytes: 3 << 30,
+                                        limit_bytes: 2 << 30,
+                                    },
+                                    Warning::CheckpointUsageOverLimit {
+                                        total_bytes: 3 << 30,
+                                        limit_bytes: 2 << 30,
+                                    },
+                                ]);
+                                response
+                                    .headers_mut()
+                                    .insert(WARNINGS_HEADER, warnings.parse().unwrap());
+                            }
+                            Ok::<_, Infallible>(response)
+                        }
                     });
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
@@ -274,6 +296,28 @@ fn status_prints_a_table() {
     assert!(text.contains("python train.py"), "{text}");
     assert!(text.contains("Running"), "{text}");
     assert!(text.contains("Success"), "{text}");
+}
+
+#[test]
+fn checkpoint_size_warnings_go_to_stderr() {
+    let daemon = FakeDaemon::start(Mode::SizeWarnings);
+    let output = puzuz(&daemon.socket, &["group"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("default"), "{}", stdout(&output));
+    assert!(!stdout(&output).contains("warning"));
+    let text = stderr(&output);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(
+        lines[0].starts_with("puzuz: warning: the checkpoint of job 7 brought checkpoint images to 3.0 GiB, over the limit of 2.0 GiB"),
+        "{text}"
+    );
+    assert!(lines[0].contains("`puzuz remove 7`"), "{text}");
+    assert!(
+        lines[1].starts_with("puzuz: warning: checkpoint images take 3.0 GiB, over checkpoint_size_limit_bytes (2.0 GiB)"),
+        "{text}"
+    );
+    assert!(lines[1].contains("`puzuz status`"), "{text}");
 }
 
 #[test]
