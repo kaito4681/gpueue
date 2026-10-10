@@ -8,9 +8,9 @@ use puzuz_core::lifecycle::{self, Action, Effect, Transition};
 use puzuz_core::model::{Caller, Gpu, GpuIndex, Group, Job, JobId, JobState, Timestamp};
 use puzuz_core::storage::{JobFilter, StoreOps};
 use puzuz_protocol::api::{
-    AddJobRequest, BulkJobRequest, BulkJobResponse, CleanRequest, CleanResponse,
-    CreateGroupRequest, ErrorCode, GpuJob, GpuView, JobAction, JobActionResult, JobSelector,
-    JobView, KillOptions, ResetRequest, SetGpusParallelRequest, SwitchRequest,
+    ActionOutcome, AddJobRequest, AddJobResponse, BulkJobRequest, BulkJobResponse, CleanRequest,
+    CleanResponse, CreateGroupRequest, ErrorCode, GpuJob, GpuView, JobAction, JobActionResult,
+    JobSelector, JobView, KillOptions, ResetRequest, SetGpusParallelRequest, SwitchRequest,
 };
 
 use crate::error::{ApiResult, Failure};
@@ -48,6 +48,31 @@ fn transition_for(
         JobAction::Enqueue(options) => lifecycle::enqueue(job, options.at, now),
         JobAction::Remove => lifecycle::remove(job),
     }
+}
+
+/// What a successful [`Core::job_action`] reports.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ActionDone {
+    /// The job created by `restart` (unless in place).
+    pub new_id: Option<JobId>,
+    /// The launch the action asked for waits for the helper to connect.
+    pub launch_pending: bool,
+}
+
+impl ActionDone {
+    pub fn outcome(self) -> ActionOutcome {
+        ActionOutcome::Ok {
+            new_id: self.new_id,
+            launch_pending: self.launch_pending,
+        }
+    }
+}
+
+/// A launch (`Spawn` or `Restore`) among the effects.
+fn launches(effects: &[Effect]) -> bool {
+    effects
+        .iter()
+        .any(|e| matches!(e, Effect::Spawn | Effect::Restore))
 }
 
 fn job_not_found(id: JobId) -> Failure {
@@ -99,11 +124,15 @@ impl Core {
     // Jobs: add
     // -----------------------------------------------------------------
 
+    /// `POST /v1/jobs`. With `immediate` the job starts right away,
+    /// ignoring slots; while the helper is not connected it is added as
+    /// queued instead and started (still ignoring slots) as soon as the
+    /// helper is back, which the response points out.
     pub async fn add_job(
         self: &Arc<Self>,
         caller: Caller,
         request: AddJobRequest,
-    ) -> ApiResult<JobId> {
+    ) -> ApiResult<AddJobResponse> {
         self.reject_if_shutting_down()?;
         if caller.uid.0 == 0 {
             return Err(Failure::bad_request(
@@ -124,9 +153,7 @@ impl Core {
         if let Some(gpu) = spec.gpus.iter().find(|g| !seen.insert(**g)) {
             return Err(Failure::bad_request(format!("GPU {gpu} is listed twice")));
         }
-        if request.immediate && !self.helper_ready() {
-            return Err(Core::helper_unavailable());
-        }
+        let helper_ready = self.helper_ready();
         let now = now_ms();
         let core = self.clone();
         let (job, effects) = self
@@ -160,17 +187,35 @@ impl Core {
                 ch.added(job.id);
                 let mut effects = Vec::new();
                 if request.immediate {
-                    let t = lifecycle::start(&job)?;
+                    let t = if helper_ready {
+                        lifecycle::start(&job)?
+                    } else {
+                        lifecycle::queue_for_launch(&job, now)?
+                    };
                     core.apply_in_tx(tx, &mut job, &t, now, ch)?;
+                    // Also when starting now: should the helper not start
+                    // it after all (it is stopping), it is retried the same
+                    // way.
+                    core.force_launch(job.id);
                     effects = t.effects;
                 }
                 Ok((job, effects))
             })
             .await?;
-        if let Err(e) = self.run_effects(&job, &effects).await {
-            tracing::warn!(job = %job.id, "cannot start job immediately: {}", e.0.message);
+        let mut launch_pending = request.immediate && !helper_ready;
+        match self.run_launch_effects(&job, &effects).await {
+            Ok(deferred) => launch_pending |= deferred,
+            Err(e) => {
+                tracing::warn!(job = %job.id, "cannot start job immediately: {}", e.0.message)
+            }
         }
-        Ok(job.id)
+        if launch_pending {
+            tracing::info!(job = %job.id, "the helper is not connected; the job starts once it is");
+        }
+        Ok(AddJobResponse {
+            id: job.id,
+            launch_pending,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -185,16 +230,23 @@ impl Core {
     /// whose spawn or restore request has not been answered yet waits for
     /// that answer, then re-evaluates the action against the job's state at
     /// that point (so it fails cleanly if the spawn failed).
+    ///
+    /// Launching actions (`start` of a queued or stashed job, `restore
+    /// --immediate`, `restart --immediate`) ignore slots. While the helper
+    /// is not connected they do not fail: the job is queued (or queued for
+    /// restore) and launched, still ignoring slots, as soon as the helper
+    /// is back ([`ActionDone::launch_pending`]). Actions on a live process
+    /// (`start` of a paused job, `pause`, `kill`, `checkpoint`) need the
+    /// helper and fail with `helper_unavailable` instead.
     pub async fn job_action(
         self: &Arc<Self>,
         caller: Caller,
         id: JobId,
         action: JobAction,
         removed_together: Vec<JobId>,
-    ) -> ApiResult<Option<JobId>> {
+    ) -> ApiResult<ActionDone> {
         self.reject_if_shutting_down()?;
-        type Launch = (Job, Vec<Effect>);
-        let (job, effects, copy): (Job, Vec<Effect>, Option<Launch>) = loop {
+        let (job, effects, copy, launch_pending) = loop {
             let step = self
                 .job_action_tx(caller, id, action.clone(), removed_together.clone())
                 .await?;
@@ -204,18 +256,43 @@ impl Core {
                 None => self.wait_for_launch(id).await?,
             }
         };
-        let result = self.run_effects(&job, &effects).await;
+        let mut launch_pending = launch_pending;
+        let result = self.run_launch_effects(&job, &effects).await;
         if let Some((copy, effects)) = &copy {
             // Run even if the first effects failed: the copy may be launching.
-            self.run_effects(copy, effects).await?;
+            launch_pending |= self.run_launch_effects(copy, effects).await?;
         }
-        result?;
-        Ok(copy.map(|(copy, _)| copy.id))
+        launch_pending |= result?;
+        Ok(ActionDone {
+            new_id: copy.map(|(copy, _)| copy.id),
+            launch_pending,
+        })
+    }
+
+    /// Runs the effects of an action. A launch the helper did not carry
+    /// out but that is retried by itself (the helper is stopping or went
+    /// away, see [`Core::launch_retried`]) is no failure: returns whether
+    /// that happened.
+    async fn run_launch_effects(
+        self: &Arc<Self>,
+        job: &Job,
+        effects: &[Effect],
+    ) -> ApiResult<bool> {
+        match self.run_effects(job, effects).await {
+            Ok(()) => Ok(false),
+            Err(e) if launches(effects) && self.launch_retried(job.id).await => {
+                tracing::info!(job = %job.id, "launch deferred until the helper is back: {}", e.0.message);
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The transaction of [`Core::job_action`]. Returns `None`, changing
     /// nothing, when the action targets the live process and the job's
-    /// launch is still in flight.
+    /// launch is still in flight. Otherwise returns the job and the effects
+    /// to run, the job created by `restart` and its effects, and whether a
+    /// launch waits for the helper.
     #[allow(clippy::type_complexity)]
     async fn job_action_tx(
         self: &Arc<Self>,
@@ -223,14 +300,14 @@ impl Core {
         id: JobId,
         action: JobAction,
         removed_together: Vec<JobId>,
-    ) -> ApiResult<Option<(Job, Vec<Effect>, Option<(Job, Vec<Effect>)>)>> {
+    ) -> ApiResult<Option<(Job, Vec<Effect>, Option<(Job, Vec<Effect>)>, bool)>> {
         let helper_ready = self.helper_ready();
         let now = now_ms();
         let core = self.clone();
         self.write(move |tx, ch| {
                 let mut job = tx.get_job(id)?.ok_or_else(|| job_not_found(id))?;
                 authz::require_mutate(&caller, &job)?;
-                let transition = transition_for(&action, &job, now).map_err(|e| {
+                let mut transition = transition_for(&action, &job, now).map_err(|e| {
                     Failure::invalid_transition(e, lifecycle_action(&action), &job.state)
                 })?;
                 if transition.effects.iter().any(targets_live_process)
@@ -239,17 +316,16 @@ impl Core {
                     return Ok(None);
                 }
                 let immediate_copy = matches!(&action, JobAction::Restart(o) if o.immediate && !o.in_place && !o.stashed);
-                if !helper_ready
-                    && (transition.effects.iter().any(needs_helper) || immediate_copy)
-                {
+                let launch = launches(&transition.effects);
+                // A launch waits for the helper instead of failing.
+                let launch_pending = !helper_ready && (launch || immediate_copy);
+                if launch && !helper_ready {
+                    transition = lifecycle::queue_for_launch(&job, now)?;
+                }
+                if !helper_ready && transition.effects.iter().any(needs_helper) {
                     return Err(Core::helper_unavailable());
                 }
-                let launches = immediate_copy
-                    || transition
-                        .effects
-                        .iter()
-                        .any(|e| matches!(e, Effect::Spawn | Effect::Restore));
-                if launches {
+                if launch || immediate_copy {
                     core.require_gpus_available(&job.spec.gpus)?;
                 }
                 if action == JobAction::Remove {
@@ -269,11 +345,22 @@ impl Core {
                 }
                 let snapshot = job.clone();
                 let copy = core.apply_in_tx(tx, &mut job, &transition, now, ch)?;
+                if launch {
+                    // Also when launching now: should the helper not start
+                    // it after all (it is stopping), it is retried the same
+                    // way.
+                    core.force_launch(id);
+                }
                 let copy = match copy {
                     Some(mut copy) if immediate_copy => {
-                        let start = lifecycle::start(&copy)?;
-                        core.apply_in_tx(tx, &mut copy, &start, now, ch)?;
-                        Some((copy, start.effects))
+                        core.force_launch(copy.id);
+                        if helper_ready {
+                            let start = lifecycle::start(&copy)?;
+                            core.apply_in_tx(tx, &mut copy, &start, now, ch)?;
+                            Some((copy, start.effects))
+                        } else {
+                            Some((copy, Vec::new()))
+                        }
                     }
                     Some(copy) => Some((copy, Vec::new())),
                     None => None,
@@ -281,9 +368,9 @@ impl Core {
                 if action == JobAction::Remove {
                     tx.remove_job(id)?;
                     ch.removed(id);
-                    return Ok(Some((snapshot, transition.effects, copy)));
+                    return Ok(Some((snapshot, transition.effects, copy, launch_pending)));
                 }
-                Ok(Some((job, transition.effects, copy)))
+                Ok(Some((job, transition.effects, copy, launch_pending)))
             })
             .await
     }
@@ -356,9 +443,9 @@ impl Core {
                 .job_action(caller, id, action.clone(), together.clone())
                 .await
             {
-                Ok(new_id) => results.push(JobActionResult {
+                Ok(done) => results.push(JobActionResult {
                     id,
-                    outcome: puzuz_protocol::api::ActionOutcome::Ok { new_id },
+                    outcome: done.outcome(),
                 }),
                 // Group/all selections only touch jobs the action applies to.
                 Err(e) if !explicit && e.code() == ErrorCode::InvalidState => {}
@@ -474,7 +561,7 @@ impl Core {
                 )
                 .await
             } else {
-                Ok(None)
+                Ok(ActionDone::default())
             };
             match result {
                 Ok(_) => results.push(JobActionResult::ok(job.id)),

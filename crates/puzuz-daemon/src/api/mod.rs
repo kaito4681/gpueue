@@ -187,8 +187,8 @@ async fn add_job(
     Auth(caller): Auth,
     JsonBody(request): JsonBody<AddJobRequest>,
 ) -> ApiResult<(StatusCode, Json<AddJobResponse>)> {
-    let id = detached(async move { core.add_job(caller, request).await }).await?;
-    Ok((StatusCode::CREATED, Json(AddJobResponse { id })))
+    let response = detached(async move { core.add_job(caller, request).await }).await?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn get_job(
@@ -239,11 +239,11 @@ async fn job_action(
         JobActionKind::Enqueue => JobAction::Enqueue(opts::<EnqueueOptions>(&body)?),
         JobActionKind::Remove => unreachable!("filtered above"),
     };
-    let new_id =
+    let done =
         detached(async move { core.job_action(caller, id, action, Vec::new()).await }).await?;
     Ok(Json(JobActionResult {
         id,
-        outcome: puzuz_protocol::api::ActionOutcome::Ok { new_id },
+        outcome: done.outcome(),
     }))
 }
 

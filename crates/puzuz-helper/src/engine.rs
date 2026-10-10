@@ -1029,7 +1029,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         let job = req.job;
         let fail = |this: &Self, reason: String| {
             this.table().remove(&job);
-            RestoreOutcome::Failed { reason }
+            RestoreOutcome::failed(reason)
         };
         let dir = CheckpointDir::for_job(&self.cfg.checkpoint_base, job.0);
         if let Err(e) = files.prepare(true) {
@@ -1074,6 +1074,16 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         };
         let pid = match self.launcher.restore(&spec).await {
             Ok(pid) => pid,
+            Err(e) if e.code == HelperErrorCode::ShuttingDown => {
+                // Abandoned by a stopping helper before systemd started the
+                // unit: nothing ran and the image is untouched. Not a
+                // failure of the restore; the daemon queues the job again.
+                self.table().remove(&job);
+                return RestoreOutcome::Failed {
+                    reason: e.to_string(),
+                    code: Some(HelperErrorCode::ShuttingDown),
+                };
+            }
             Err(e) => {
                 let summary = fs::read_to_string(dir.restore_log())
                     .map(|l| probe::summarize_criu_log(&l, 5).join("; "))

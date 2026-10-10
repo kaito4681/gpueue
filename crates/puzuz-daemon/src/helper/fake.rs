@@ -52,8 +52,10 @@ struct State {
     next_seq: u64,
     unacked: Vec<EventEnvelope>,
     spawn_failure: Option<String>,
-    /// Refuse spawns as a stopping helper does.
+    /// Refuse spawns and restores as a stopping helper does.
     stopping: bool,
+    /// Accept restores, then report them abandoned (`shutting_down`).
+    abandon_restores: bool,
     checkpoint_outcome: FakeOutcome,
     restore_outcome: FakeOutcome,
     restore_rejection: Option<String>,
@@ -226,10 +228,19 @@ impl FakeHelper {
         self.with(|s| s.spawn_failure = reason.map(str::to_owned));
     }
 
-    /// Refuse spawns with `shutting_down`, as a helper that is stopping
-    /// does (`false` to accept them again).
+    /// Refuse spawns and restores with `shutting_down`, as a helper that
+    /// is stopping does (`false` to accept them again).
     pub fn set_stopping(&self, stopping: bool) {
         self.with(|s| s.stopping = stopping);
+    }
+
+    /// Accept restores but report them abandoned by a stopping helper (a
+    /// failed outcome with code `shutting_down`, image untouched), as the
+    /// real helper does for restores whose unit systemd had not begun to
+    /// start when it was stopped. The helper then counts as stopping (see
+    /// [`FakeHelper::set_stopping`]); `false` to restore them again.
+    pub fn set_abandon_restores(&self, abandon: bool) {
+        self.with(|s| s.abandon_restores = abandon);
     }
 
     /// Holds spawn and restore requests until [`release_launches`].
@@ -444,6 +455,12 @@ impl FakeHelper {
                     message: format!("job {job} is already running"),
                 });
             }
+            if s.stopping {
+                return Err(HelperError::Rejected {
+                    code: HelperErrorCode::ShuttingDown,
+                    message: "the helper is shutting down".to_owned(),
+                });
+            }
             if let Some(reason) = &s.restore_rejection {
                 return Err(HelperError::Rejected {
                     code: HelperErrorCode::InvalidRequest,
@@ -451,8 +468,14 @@ impl FakeHelper {
                 });
             }
             let outcome = if !s.images.contains(&job) {
+                RestoreOutcome::failed("no checkpoint image")
+            } else if s.abandon_restores {
+                // Only a stopping helper abandons restores; it refuses the
+                // next ones up front.
+                s.stopping = true;
                 RestoreOutcome::Failed {
-                    reason: "no checkpoint image".to_owned(),
+                    reason: "the helper is stopping; the restore unit was not started".to_owned(),
+                    code: Some(HelperErrorCode::ShuttingDown),
                 }
             } else {
                 match s.restore_outcome.clone() {
@@ -468,7 +491,7 @@ impl FakeHelper {
                         );
                         RestoreOutcome::Success { pid }
                     }
-                    FakeOutcome::Fail(reason) => RestoreOutcome::Failed { reason },
+                    FakeOutcome::Fail(reason) => RestoreOutcome::failed(reason),
                 }
             };
             s.emit(Event::RestoreFinished { job, outcome });

@@ -431,6 +431,15 @@ impl Report {
     }
 }
 
+/// Said when a job could not be started (or restored) right away because
+/// the helper is not connected; the daemon launches it once it is.
+pub fn launch_pending_note(id: JobId) -> String {
+    format!(
+        "Job {id} will start as soon as the puzuz helper is connected again \
+         (it is not right now; see `puzuz doctor`)."
+    )
+}
+
 /// Summarizes per-job results like pueue (`{message}: 1, 2`) and lists every
 /// failure with its reason.
 ///
@@ -457,11 +466,23 @@ pub fn action_report(
             .map(|result| match &result.outcome {
                 ActionOutcome::Ok {
                     new_id: Some(new_id),
+                    ..
                 } => format!("{} (new id {new_id})", result.id),
                 _ => result.id.to_string(),
             })
             .collect();
         report.stdout.push(format!("{message}: {}", ids.join(", ")));
+    }
+    for result in &succeeded {
+        if let ActionOutcome::Ok {
+            new_id,
+            launch_pending: true,
+        } = &result.outcome
+        {
+            report
+                .stdout
+                .push(launch_pending_note(new_id.unwrap_or(result.id)));
+        }
     }
 
     for result in results {

@@ -890,7 +890,10 @@ async fn validation_versions_groups_and_bulk_operations() {
     // Restart creates a new job.
     let reply = alice.action(first, "restart", json!({})).await;
     let result: puzuz_protocol::api::JobActionResult = reply.json();
-    let puzuz_protocol::api::ActionOutcome::Ok { new_id: Some(copy) } = result.outcome else {
+    let puzuz_protocol::api::ActionOutcome::Ok {
+        new_id: Some(copy), ..
+    } = result.outcome
+    else {
         panic!("{result:?}");
     };
     alice
@@ -1264,9 +1267,9 @@ async fn interrupted_restore_is_recorded_and_refined_by_a_late_answer() {
     h.helper
         .emit_event(puzuz_protocol::helper::Event::RestoreFinished {
             job: id,
-            outcome: puzuz_protocol::helper::RestoreOutcome::Failed {
-                reason: "criu restore failed (unit inactive)".to_owned(),
-            },
+            outcome: puzuz_protocol::helper::RestoreOutcome::failed(
+                "criu restore failed (unit inactive)",
+            ),
         });
     wait_restore_error(&h, id, "criu restore failed (unit inactive)").await;
     assert_eq!(
@@ -1563,5 +1566,227 @@ async fn a_daemon_restart_during_a_spawn_marks_the_job_lost() {
     alice.wait_state(id, &done(JobResult::Lost)).await;
     assert!(!h.helper.is_running(id));
 
+    h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Launches the helper cannot carry out right now: restores abandoned by a
+// stopping helper are requeued like spawns, and immediate launches wait for
+// a disconnected helper instead of failing.
+// ---------------------------------------------------------------------------
+
+/// The owner has no pending warning and the job no recorded error.
+async fn assert_no_restore_error(h: &Harness, id: JobId) {
+    use puzuz_core::storage::StoreOps;
+
+    assert_eq!(h.store().get_job_error(id).unwrap(), None);
+    assert_eq!(last_error(&h.client(ADMIN).job(id).await), None);
+    assert!(
+        h.client(ALICE)
+            .get("/v1/groups")
+            .await
+            .warnings()
+            .is_empty()
+    );
+}
+
+/// Polls `id` for `duration`, failing if it is ever plain checkpointed (a
+/// failed restore) instead of waiting to be restored again.
+async fn assert_never_checkpointed(client: &Client, id: JobId, duration: Duration) {
+    let deadline = tokio::time::Instant::now() + duration;
+    while tokio::time::Instant::now() < deadline {
+        let state = client.job(id).await.state;
+        assert!(
+            matches!(state, JobState::RestoreQueued { .. } | JobState::Restoring),
+            "job {id}: {state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restores_refused_by_a_stopping_helper_are_requeued_not_failed() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(2).await;
+    let first = h.checkpointed_job().await;
+    let second = h.checkpointed_job().await;
+    let admin = h.client(ADMIN);
+    h.helper.set_stopping(true);
+
+    // `restore --immediate`: put back in line (still ignoring slots), not
+    // failed; the reply says the restore is pending.
+    let reply = admin
+        .action(first, "restore", json!({"immediate": true}))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json::<Value>()["launch_pending"], json!(true));
+    // A queued restore picked by the scheduler: the same.
+    let reply = admin.action(second, "restore", json!({})).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    for id in [first, second] {
+        assert_never_checkpointed(&admin, id, Duration::from_millis(1500)).await;
+        assert_no_restore_error(&h, id).await;
+        assert!(h.helper.has_image(id));
+    }
+
+    // Restored once the (next) helper accepts restores.
+    h.helper.set_stopping(false);
+    for id in [first, second] {
+        admin.wait_state(id, &JobState::Running).await;
+        assert!(h.helper.is_running(id));
+        assert_no_restore_error(&h, id).await;
+    }
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restores_abandoned_by_a_stopping_helper_are_requeued_not_failed() {
+    let mut h = Harness::new(0).await;
+    let id = h.checkpointed_job().await;
+    let admin = h.client(ADMIN);
+
+    // Accepted, then abandoned before systemd started the unit; the helper
+    // goes on stopping and refuses the retries.
+    h.helper.set_abandon_restores(true);
+    let reply = admin
+        .action(id, "restore", json!({"immediate": true}))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_never_checkpointed(&admin, id, Duration::from_millis(1500)).await;
+    assert_no_restore_error(&h, id).await;
+
+    // The helper restarts: the restore is retried and succeeds.
+    h.helper.disconnect();
+    h.helper.set_abandon_restores(false);
+    h.helper.set_stopping(false);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_never_checkpointed(&admin, id, Duration::from_millis(200)).await;
+    h.helper.reconnect();
+    admin.wait_state(id, &JobState::Running).await;
+    assert!(h.helper.is_running(id));
+    assert_no_restore_error(&h, id).await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_cut_off_by_a_helper_restart_is_requeued_not_failed() {
+    let mut h = Harness::new(0).await;
+    let id = h.checkpointed_job().await;
+    let admin = h.client(ADMIN);
+    h.helper.hold_launches();
+    let restore = send_action(&admin, id, "restore", json!({"immediate": true}));
+    h.helper.wait_held(1).await;
+
+    // The helper restarts before reading the request: its answer is lost
+    // and the restarted helper knows nothing about it.
+    h.helper.disconnect();
+    h.helper.lose_held_launches();
+    let reply = restore.await.unwrap();
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json::<Value>()["launch_pending"], json!(true));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.helper.reconnect();
+
+    // Requeued (not marked interrupted) and restored again.
+    let job = admin
+        .wait_for(id, "restored", |j| {
+            assert!(j.state != JobState::Checkpointed, "restore given up");
+            j.state == JobState::Running
+        })
+        .await;
+    assert_eq!(last_error(&job), None);
+    assert!(h.helper.is_running(id));
+    assert_no_restore_error(&h, id).await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn immediate_launches_wait_for_a_disconnected_helper() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(2).await;
+    let alice = h.client(ALICE);
+    let checkpointed = h.checkpointed_job().await;
+    let blocker = alice.add(&job_request("blocker", &[])).await;
+    alice.wait_state(blocker, &JobState::Running).await;
+    let done_job = alice.add(&job_request("done", &[])).await;
+    h.exit(done_job, 0).await;
+    alice.wait_state(done_job, &done(JobResult::Success)).await;
+    // Every slot is taken from now on.
+    h.set_default_parallel(1).await;
+    let queued = alice.add(&job_request("queued", &[])).await;
+    let waiting = alice.add(&job_request("waiting", &[])).await;
+    let stashed = alice
+        .add(&AddJobRequest {
+            stashed: true,
+            ..job_request("stashed", &[])
+        })
+        .await;
+
+    h.helper.disconnect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // `add --immediate`: created, and pending.
+    let reply = alice
+        .post(
+            "/v1/jobs",
+            serde_json::to_value(AddJobRequest {
+                immediate: true,
+                ..job_request("immediate", &[])
+            })
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    let added: AddJobResponse = reply.json();
+    assert!(added.launch_pending);
+    let immediate = added.id;
+
+    // `start` of queued and stashed jobs, `restore --immediate`, `restart
+    // --immediate`: pending too.
+    let mut copy = None;
+    for (id, action, body) in [
+        (queued, "start", json!({})),
+        (stashed, "start", json!({})),
+        (checkpointed, "restore", json!({"immediate": true})),
+        (done_job, "restart", json!({"immediate": true})),
+    ] {
+        let reply = alice.action(id, action, body).await;
+        assert_eq!(reply.status, StatusCode::OK, "{action} {id}");
+        let result: Value = reply.json();
+        assert_eq!(result["launch_pending"], json!(true), "{action} {id}");
+        if action == "restart" {
+            copy = Some(JobId(result["new_id"].as_u64().unwrap()));
+        }
+    }
+    let copy = copy.unwrap();
+    // Actions on a live process still need the helper.
+    let reply = alice.action(blocker, "pause", json!({})).await;
+    assert_eq!(reply.error().code, ErrorCode::HelperUnavailable);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for id in [immediate, queued, stashed, copy] {
+        assert!(
+            matches!(alice.job(id).await.state, JobState::Queued { .. }),
+            "job {id}"
+        );
+    }
+    assert!(matches!(
+        alice.job(checkpointed).await.state,
+        JobState::RestoreQueued { .. }
+    ));
+
+    // Launched as soon as the helper is back, ignoring the full slots;
+    // the plain queued job keeps waiting.
+    h.helper.reconnect();
+    for id in [immediate, queued, stashed, copy, checkpointed] {
+        alice.wait_state(id, &JobState::Running).await;
+        h.wait_spawned(id).await;
+    }
+    alice.wait_state(blocker, &JobState::Running).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(matches!(
+        alice.job(waiting).await.state,
+        JobState::Queued { .. }
+    ));
     h.stop().await;
 }

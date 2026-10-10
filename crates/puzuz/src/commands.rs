@@ -403,7 +403,8 @@ impl App {
     ) -> Result<ExitCode> {
         let group = request.spec.group.clone();
         let enqueue_at = request.enqueue_at;
-        let id = self.client.add_job(&request).await?.id;
+        let response = self.client.add_job(&request).await?;
+        let id = response.id;
 
         let mut output = if print_task_id {
             id.to_string()
@@ -415,6 +416,16 @@ impl App {
         } else {
             format!("New job added (id {id}).")
         };
+        if response.launch_pending {
+            let note = render::launch_pending_note(id);
+            if print_task_id {
+                // Keep stdout to the bare id for scripts.
+                eprintln!("{note}");
+            } else {
+                output.push('\n');
+                output.push_str(&note);
+            }
+        }
         if !print_task_id && !follow {
             let groups = self.client.list_groups().await?.groups;
             if groups.iter().any(|g| g.name == group && g.paused) {

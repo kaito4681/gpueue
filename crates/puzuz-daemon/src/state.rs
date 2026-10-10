@@ -221,6 +221,18 @@ pub fn needs_helper(effect: &Effect) -> bool {
     )
 }
 
+/// The states a forced launch (see [`Core::force_launch`]) goes through:
+/// waiting for the helper, then launching or launched.
+fn is_launch_state(state: &JobState) -> bool {
+    matches!(
+        state,
+        JobState::Queued { .. }
+            | JobState::RestoreQueued { .. }
+            | JobState::Running
+            | JobState::Restoring
+    )
+}
+
 /// Whether an effect acts on the job's live process, which the helper only
 /// knows once the spawn or restore request that started it was answered.
 pub fn targets_live_process(effect: &Effect) -> bool {
@@ -272,9 +284,17 @@ pub struct Core {
     launches: Launches,
     /// Bounds the scheduler's concurrent spawn/restore requests.
     launch_slots: Semaphore,
-    /// Jobs whose spawn request went unanswered (connection lost or
-    /// timed out); see [`Core::spawn_lost_check`].
-    unconfirmed_spawns: Mutex<HashSet<JobId>>,
+    /// Jobs whose spawn or restore request went unanswered (connection
+    /// lost or timed out), with the state that launch put them in
+    /// (`Running` or `Restoring`); see [`Core::spawn_lost_check`].
+    unconfirmed_launches: Mutex<HashMap<JobId, JobState>>,
+    /// Jobs to launch regardless of free slots (`start`, `add
+    /// --immediate`, `restore --immediate`, `restart --immediate`), kept
+    /// until they leave the queued, running and restoring states. While
+    /// one is queued (the helper was not connected, or did not start it),
+    /// the scheduler launches it as soon as it can, ignoring slots. Kept in
+    /// memory only: after a daemon restart such a job waits for a slot.
+    forced: Mutex<HashSet<JobId>>,
 }
 
 impl Core {
@@ -306,7 +326,8 @@ impl Core {
             orphans: Mutex::new(BTreeSet::new()),
             launches: Launches::default(),
             launch_slots: Semaphore::new(MAX_CONCURRENT_LAUNCHES),
-            unconfirmed_spawns: Mutex::new(HashSet::new()),
+            unconfirmed_launches: Mutex::new(HashMap::new()),
+            forced: Mutex::new(HashSet::new()),
         })
     }
 
@@ -368,6 +389,33 @@ impl Core {
                     "the puzuz helper has not confirmed that job {id} started; try again later"
                 ),
             )),
+        }
+    }
+
+    /// Marks `id` to be launched regardless of free slots (see
+    /// [`Core::forced`]).
+    pub fn force_launch(&self, id: JobId) {
+        self.forced.lock().unwrap().insert(id);
+    }
+
+    /// Whether a forced launch of `id` that the helper did not carry out
+    /// is being retried: the job is back in line, launching again, or its
+    /// request's answer was lost (it is requeued if the helper never got
+    /// it, see [`Core::spawn_lost_check`]).
+    pub async fn launch_retried(&self, id: JobId) -> bool {
+        if !self.forced.lock().unwrap().contains(&id) {
+            return false;
+        }
+        match self.read(move |s| s.get_job(id)).await {
+            Ok(Some(job)) => match job.state {
+                JobState::Queued { .. } | JobState::RestoreQueued { .. } => true,
+                JobState::Running | JobState::Restoring => {
+                    self.launches.in_flight(id)
+                        || self.unconfirmed_launches.lock().unwrap().contains_key(&id)
+                }
+                _ => false,
+            },
+            _ => false,
         }
     }
 
@@ -605,6 +653,9 @@ impl Core {
                 && transition.next.as_ref() == Some(&JobState::Running);
             transition.apply(job, now);
             tx.update_job_state(job.id, &job.state, job.started_at, job.finished_at)?;
+            if !is_launch_state(&job.state) {
+                self.forced.lock().unwrap().remove(&job.id);
+            }
             if restored {
                 // The job runs again; an earlier failed attempt is history.
                 tx.clear_job_error(job.id)?;
@@ -774,7 +825,8 @@ impl Core {
                     _ = self.cancel.cancelled() => {}
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
-                self.requeue_unstarted(job.id, job.started_at).await?;
+                self.requeue_unstarted(job.id, Some(job.started_at), JobState::Running)
+                    .await?;
                 Err(e.into())
             }
             Err(HelperError::Rejected { message, .. }) => {
@@ -788,7 +840,8 @@ impl Core {
             }
             Err(HelperError::NotConnected) => {
                 // Never reached the helper: put the job back in line.
-                self.requeue_unstarted(job.id, job.started_at).await?;
+                self.requeue_unstarted(job.id, Some(job.started_at), JobState::Running)
+                    .await?;
                 Err(HelperError::NotConnected.into())
             }
             // Unknown whether it started (the connection broke or the
@@ -796,7 +849,10 @@ impl Core {
             // check below tells: a job the helper does not know was never
             // started and goes back in line, see `Core::spawn_lost_check`.
             Err(e) => {
-                self.unconfirmed_spawns.lock().unwrap().insert(job.id);
+                self.unconfirmed_launches
+                    .lock()
+                    .unwrap()
+                    .insert(job.id, JobState::Running);
                 if matches!(e, HelperError::Timeout) {
                     self.spawn_lost_check(job.id, job.started_at);
                 }
@@ -805,29 +861,30 @@ impl Core {
         }
     }
 
-    /// Puts a job whose spawn request did not start it back in line (unless
-    /// it has moved on since the launch that `started_at` identifies).
+    /// Puts a job whose spawn or restore request did not start it back in
+    /// line (see [`lifecycle::requeue_unlaunched`]), unless it has moved on
+    /// since: it must still be in `launched` (`Running` after a spawn,
+    /// `Restoring` after a restore) and, if given, have the `started_at`
+    /// that identifies the launch. Returns whether it was requeued. A job
+    /// that was to be launched regardless of slots stays so.
     async fn requeue_unstarted(
         self: &Arc<Self>,
         id: JobId,
-        started_at: Option<Timestamp>,
-    ) -> ApiResult<()> {
+        started_at: Option<Option<Timestamp>>,
+        launched: JobState,
+    ) -> ApiResult<bool> {
+        let core = self.clone();
+        let now = now_ms();
         self.write(move |tx, ch| {
-            if let Some(job) = tx.get_job(id)?
-                && job.state == JobState::Running
-                && job.started_at == started_at
-            {
-                tx.update_job_state(
-                    id,
-                    &JobState::Queued {
-                        enqueued_at: now_ms(),
-                    },
-                    None,
-                    None,
-                )?;
-                ch.updated(id);
+            let Some(mut job) = tx.get_job(id)? else {
+                return Ok(false);
+            };
+            if job.state != launched || started_at.is_some_and(|at| at != job.started_at) {
+                return Ok(false);
             }
-            Ok(())
+            let t = lifecycle::requeue_unlaunched(&job, now)?;
+            core.apply_in_tx(tx, &mut job, &t, now, ch)?;
+            Ok(true)
         })
         .await
     }
@@ -913,26 +970,31 @@ impl Core {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
             if !core.still_live(id, started_at).await {
-                core.unconfirmed_spawns.lock().unwrap().remove(&id);
+                core.unconfirmed_launches.lock().unwrap().remove(&id);
                 return;
             }
             let Ok(running) = core.helper.list_running().await else {
                 return;
             };
             if running.iter().any(|r| r.job == id) {
-                core.unconfirmed_spawns.lock().unwrap().remove(&id);
+                core.unconfirmed_launches.lock().unwrap().remove(&id);
                 return;
             }
-            if core.unconfirmed_spawns.lock().unwrap().remove(&id) {
-                // An exit reported just before the list was taken arrives
-                // shortly; give it time before starting the job again.
+            let unconfirmed = core.unconfirmed_launches.lock().unwrap().remove(&id);
+            if let Some(launched) = unconfirmed {
+                // An exit (or restore outcome) reported just before the
+                // list was taken arrives shortly; give it time before
+                // launching the job again.
                 tokio::select! {
                     _ = core.cancel.cancelled() => return,
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
-                if core.still_live(id, started_at).await {
-                    tracing::warn!(job = %id, "the helper never started the job; requeueing it");
-                    if let Err(e) = core.requeue_unstarted(id, started_at).await {
+                match core.requeue_unstarted(id, Some(started_at), launched).await {
+                    Ok(true) => {
+                        tracing::warn!(job = %id, "the helper never started the job; requeueing it");
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
                         tracing::warn!(job = %id, "cannot requeue the job: {}", e.0.message);
                     }
                 }
@@ -1005,10 +1067,30 @@ impl Core {
         match self.helper.restore(request).await {
             Ok(()) => Ok(()),
             Err(
-                e @ (HelperError::NotConnected
-                | HelperError::Rejected { .. }
-                | HelperError::Protocol(_)),
+                e @ HelperError::Rejected {
+                    code: HelperErrorCode::ShuttingDown,
+                    ..
+                },
             ) => {
+                // As for spawns (see `Core::spawn_job`): nothing was
+                // restored and it is not the job's fault; wait for that
+                // helper to go away, then put the job back in line.
+                tracing::info!(job = %job.id, "the helper is stopping; requeueing the restore");
+                tokio::select! {
+                    _ = self.cancel.cancelled() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                self.requeue_unstarted(job.id, Some(job.started_at), JobState::Restoring)
+                    .await?;
+                Err(e.into())
+            }
+            Err(HelperError::NotConnected) => {
+                // Never reached the helper.
+                self.requeue_unstarted(job.id, Some(job.started_at), JobState::Restoring)
+                    .await?;
+                Err(HelperError::NotConnected.into())
+            }
+            Err(e @ (HelperError::Rejected { .. } | HelperError::Protocol(_))) => {
                 self.handle_event(
                     job.id,
                     lifecycle::Event::RestoreFailed {
@@ -1019,7 +1101,19 @@ impl Core {
                 .await;
                 Err(e.into())
             }
-            Err(e) => Err(e.into()),
+            // Unknown whether the helper got the request (see
+            // `Core::spawn_job`): its outcome event arrives if it did, and a
+            // restore it neither reports nor runs is requeued.
+            Err(e) => {
+                self.unconfirmed_launches
+                    .lock()
+                    .unwrap()
+                    .insert(job.id, JobState::Restoring);
+                if matches!(e, HelperError::Timeout) {
+                    self.spawn_lost_check(job.id, job.started_at);
+                }
+                Err(e.into())
+            }
         }
     }
 
@@ -1139,7 +1233,22 @@ impl Core {
             hp::Event::RestoreFinished { job, outcome } => {
                 let event = match outcome {
                     RestoreOutcome::Success { .. } => E::RestoreSucceeded,
-                    RestoreOutcome::Failed { reason } => E::RestoreFailed { reason },
+                    RestoreOutcome::Failed {
+                        code: Some(HelperErrorCode::ShuttingDown),
+                        reason,
+                    } => {
+                        // A stopping helper abandoned the restore before
+                        // anything ran: queue it again rather than report a
+                        // failure. (A restore already given up as
+                        // interrupted stays as it is.)
+                        tracing::info!(job = %job, "restore abandoned by the helper ({reason}); requeueing it");
+                        if let Err(e) = self.requeue_unstarted(job, None, JobState::Restoring).await
+                        {
+                            tracing::warn!(job = %job, "cannot requeue the job: {}", e.0.message);
+                        }
+                        return;
+                    }
+                    RestoreOutcome::Failed { reason, .. } => E::RestoreFailed { reason },
                 };
                 self.handle_event(job, event, no_pre).await;
             }
@@ -1263,8 +1372,33 @@ impl Core {
         let core = self.clone();
         let launched = self
             .write(move |tx, ch| {
-                let jobs = tx.list_jobs(&JobFilter::all())?;
+                let mut jobs = tx.list_jobs(&JobFilter::all())?;
                 let groups = tx.list_groups()?;
+                let mut launched = Vec::new();
+                // Forced launches first, ignoring slots; they still take
+                // theirs, which the plan below accounts for.
+                let forced: HashSet<JobId> = {
+                    let mut forced = core.forced.lock().unwrap();
+                    forced.retain(|id| {
+                        jobs.iter()
+                            .any(|j| j.id == *id && is_launch_state(&j.state))
+                    });
+                    forced.clone()
+                };
+                if launch {
+                    for job in jobs.iter_mut().filter(|j| forced.contains(&j.id)) {
+                        let queued = matches!(
+                            job.state,
+                            JobState::Queued { .. } | JobState::RestoreQueued { .. }
+                        );
+                        if !queued || job.spec.gpus.iter().any(|g| !core.gpu_available(*g)) {
+                            continue;
+                        }
+                        let t = lifecycle::dispatch(job)?;
+                        core.apply_in_tx(tx, job, &t, now, ch)?;
+                        launched.push((job.clone(), t.effects));
+                    }
+                }
                 // Undetected GPUs are left out, so jobs that need them wait.
                 let gpus: Vec<_> = tx
                     .list_gpus()?
@@ -1273,7 +1407,6 @@ impl Core {
                     .collect();
                 let plan = scheduler::plan(now, &jobs, &groups, &gpus);
                 let mut by_id: HashMap<JobId, Job> = jobs.into_iter().map(|j| (j.id, j)).collect();
-                let mut launched = Vec::new();
                 for id in &plan.enqueue {
                     let Some(job) = by_id.get_mut(id) else {
                         continue;
@@ -1283,6 +1416,10 @@ impl Core {
                     }
                 }
                 for id in &plan.dependency_failed {
+                    // A forced start ignores dependencies.
+                    if forced.contains(id) {
+                        continue;
+                    }
                     let Some(job) = by_id.get_mut(id) else {
                         continue;
                     };

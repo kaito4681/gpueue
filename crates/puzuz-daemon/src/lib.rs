@@ -25,6 +25,20 @@
 //! dump failed is told on their next command (see
 //! [`puzuz_protocol::api::WARNINGS_HEADER`]).
 //!
+//! When the helper is not connected, launches asked for explicitly (`add
+//! --immediate`, `start` of a queued or stashed job, `restore --immediate`,
+//! `restart --immediate`) do not fail: the job is queued (or queued for
+//! restore) and launched as soon as the helper is back, still ignoring
+//! slots and dependencies; the reply's `launch_pending` says so. Actions on
+//! a live process (`pause`, `kill`, `checkpoint`, resuming a paused job)
+//! still fail with `helper_unavailable`. A spawn or restore the helper did
+//! not carry out because it is stopping (refused with `shutting_down`, or
+//! accepted and then abandoned before systemd started its unit), or whose
+//! answer was lost while the helper never started it, is put back in line
+//! the same way and retried; no restore error is recorded for it. The "launch
+//! regardless of slots" mark is kept in memory only: after a daemon restart
+//! such a job waits for a slot like any other.
+//!
 //! Known gaps, for integration:
 //! - Removing or truncating a log file (`remove`, `clean`, `restart
 //!   --in-place`) needs write access to `<logs_dir>/<uid>/`, which the

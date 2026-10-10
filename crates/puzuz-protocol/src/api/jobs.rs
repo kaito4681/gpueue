@@ -167,6 +167,23 @@ pub struct AddJobRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddJobResponse {
     pub id: JobId,
+    /// `--immediate` while the helper is not connected: the job is queued
+    /// and starts (still ignoring slots) as soon as the helper is back.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub launch_pending: bool,
+}
+
+impl AddJobResponse {
+    pub fn new(id: JobId) -> Self {
+        Self {
+            id,
+            launch_pending: false,
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +346,10 @@ impl JobActionResult {
     pub fn ok(id: JobId) -> Self {
         Self {
             id,
-            outcome: ActionOutcome::Ok { new_id: None },
+            outcome: ActionOutcome::Ok {
+                new_id: None,
+                launch_pending: false,
+            },
         }
     }
 
@@ -352,6 +372,12 @@ pub enum ActionOutcome {
         /// The id of the job created by `restart` (unless in place).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         new_id: Option<JobId>,
+        /// The job (for `restart`, the new one) was to be started or
+        /// restored right away (`start`, `restore --immediate`, `restart
+        /// --immediate`), but the helper is not connected: it is queued and
+        /// launched, still ignoring slots, as soon as the helper is back.
+        #[serde(default, skip_serializing_if = "is_false")]
+        launch_pending: bool,
     },
     Error {
         error: ApiError,

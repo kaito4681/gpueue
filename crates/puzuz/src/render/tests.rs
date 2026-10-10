@@ -328,6 +328,7 @@ fn action_report_lists_successes_and_failures() {
             id: JobId(2),
             outcome: ActionOutcome::Ok {
                 new_id: Some(JobId(9)),
+                launch_pending: false,
             },
         },
         JobActionResult::error(
@@ -356,6 +357,30 @@ fn action_report_lists_successes_and_failures() {
 
     let report = action_report(&[], "Jobs are being killed", None, &Style::PLAIN);
     assert_eq!(report.stdout, vec!["No matching jobs."]);
+
+    // Launches waiting for the helper are pointed out.
+    let pending = |id, new_id| JobActionResult {
+        id: JobId(id),
+        outcome: ActionOutcome::Ok {
+            new_id,
+            launch_pending: true,
+        },
+    };
+    let report = action_report(
+        &[pending(4, None), pending(5, Some(JobId(8)))],
+        "Jobs are being started",
+        None,
+        &Style::PLAIN,
+    );
+    assert!(report.ok);
+    assert_eq!(
+        report.stdout,
+        vec![
+            "Jobs are being started: 4, 5 (new id 8)".to_owned(),
+            super::launch_pending_note(JobId(4)),
+            super::launch_pending_note(JobId(8)),
+        ]
+    );
 }
 
 #[test]

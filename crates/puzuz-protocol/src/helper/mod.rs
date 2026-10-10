@@ -350,5 +350,23 @@ pub enum RestoreOutcome {
     /// The job runs again; the helper has removed the image.
     Success { pid: u32 },
     /// The image was left in place.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+        /// Why, when it is not a failure of the restore itself. Only
+        /// `shutting_down` so far: the helper was stopping and abandoned the
+        /// restore before anything ran (the daemon queues the job again).
+        /// Absent from older helpers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<HelperErrorCode>,
+    },
+}
+
+impl RestoreOutcome {
+    /// A failure of the restore itself.
+    pub fn failed(reason: impl Into<String>) -> Self {
+        RestoreOutcome::Failed {
+            reason: reason.into(),
+            code: None,
+        }
+    }
 }

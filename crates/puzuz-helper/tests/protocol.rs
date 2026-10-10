@@ -980,3 +980,65 @@ async fn a_stopping_helper_abandons_queued_launches_and_refuses_new_ones() {
     // ...and the running job is left alone.
     assert_eq!(c.running().await, [(JobId(1), RunningPhase::Running)]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopping_helper_reports_an_abandoned_restore_as_not_started() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let job = JobId(8);
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(8))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    let image_dir = env.base().join("8");
+    assert_eq!(
+        c.request(Request::Checkpoint {
+            job,
+            image_dir: image_dir.clone(),
+            options: Default::default(),
+        })
+        .await,
+        ResponseResult::Accepted
+    );
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::CheckpointFinished {
+                outcome: CheckpointOutcome::Success { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+
+    // The restore's unit is not started yet (the fake's delay) when the
+    // helper is stopped: it is abandoned, tagged `shutting_down`.
+    env.launcher.set_delay(Some(Duration::from_secs(30)));
+    let request = Request::Restore(RestoreRequest {
+        job,
+        uid: Uid(uid()),
+        image_dir,
+        gpus: vec![],
+    });
+    assert_eq!(c.request(request).await, ResponseResult::Accepted);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(WAIT, env.helper.drain())
+        .await
+        .unwrap();
+    let ev = c.event().await;
+    let Event::RestoreFinished {
+        outcome: RestoreOutcome::Failed { code, .. },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert_eq!(code, Some(HelperErrorCode::ShuttingDown));
+    // The image is still there to restore later.
+    assert!(matches!(
+        CheckpointDir::for_job(&env.base(), 8).status(),
+        DirStatus::Complete(_)
+    ));
+    assert!(c.running().await.is_empty());
+}

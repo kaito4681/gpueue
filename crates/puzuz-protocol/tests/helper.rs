@@ -233,12 +233,23 @@ fn events_golden() {
             43,
             Event::RestoreFinished {
                 job: JobId(7),
-                outcome: RestoreOutcome::Failed {
-                    reason: "GPU model changed".into(),
-                },
+                outcome: RestoreOutcome::failed("GPU model changed"),
             },
         ),
         r#"{"type":"event","seq":43,"event":"restore_finished","job":7,"outcome":{"result":"failed","reason":"GPU model changed"}}"#,
+    );
+    assert_golden_line(
+        &event(
+            44,
+            Event::RestoreFinished {
+                job: JobId(7),
+                outcome: RestoreOutcome::Failed {
+                    reason: "the helper is stopping".into(),
+                    code: Some(HelperErrorCode::ShuttingDown),
+                },
+            },
+        ),
+        r#"{"type":"event","seq":44,"event":"restore_finished","job":7,"outcome":{"result":"failed","reason":"the helper is stopping","code":"shutting_down"}}"#,
     );
     assert!(ExitStatus::Exited { code: 0 }.success());
     assert!(!ExitStatus::Signaled { signal: 9 }.success());

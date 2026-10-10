@@ -475,6 +475,34 @@ pub fn dispatch(job: &Job) -> Result<Transition, Error> {
     }
 }
 
+/// A launch the helper cannot carry out right now (it is not connected):
+/// keep the job waiting for a slot instead. A queued job stays queued, a
+/// stashed one is enqueued, and a checkpointed one waits to be restored.
+/// The daemon then launches it as soon as the helper is back; with
+/// `start`, `add --immediate` or `restore --immediate` it does so
+/// regardless of free slots, as if the helper had been there.
+pub fn queue_for_launch(job: &Job, now: Timestamp) -> Result<Transition, Error> {
+    match job.state {
+        JobState::Queued { .. } | JobState::RestoreQueued { .. } => Ok(Transition::unchanged()),
+        JobState::Stashed { .. } => Ok(Transition::to(JobState::Queued { enqueued_at: now })),
+        JobState::Checkpointed => Ok(Transition::to(JobState::RestoreQueued { enqueued_at: now })),
+        _ => Err(invalid(job, "queued for launch")),
+    }
+}
+
+/// The helper did not start the job it was asked to spawn or restore (it
+/// refused because it is stopping, or a request whose answer was lost
+/// never reached it): put the job back in line, as if it had never been
+/// picked. Not the job's fault, so nothing is recorded against it; the
+/// scheduler orders by priority and id, so it keeps its place.
+pub fn requeue_unlaunched(job: &Job, now: Timestamp) -> Result<Transition, Error> {
+    match job.state {
+        JobState::Running => Ok(Transition::to(JobState::Queued { enqueued_at: now })),
+        JobState::Restoring => Ok(Transition::to(JobState::RestoreQueued { enqueued_at: now })),
+        _ => Err(invalid(job, "requeued")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime events
 // ---------------------------------------------------------------------------
@@ -1035,6 +1063,51 @@ mod tests {
         let t = dispatch(&job(1, JobState::RestoreQueued { enqueued_at: 1 })).unwrap();
         assert_eq!(t.next, Some(JobState::Restoring));
         assert_eq!(t.effects, vec![Effect::Restore]);
+    }
+
+    #[test]
+    fn queue_for_launch_rules() {
+        assert_accepts(
+            |j| queue_for_launch(j, NOW),
+            |s| {
+                matches!(
+                    s,
+                    JobState::Queued { .. }
+                        | JobState::RestoreQueued { .. }
+                        | JobState::Stashed { .. }
+                        | JobState::Checkpointed
+                )
+            },
+            "queued for launch",
+        );
+        let t = queue_for_launch(&job(1, JobState::Queued { enqueued_at: 1 }), NOW).unwrap();
+        assert_eq!((t.next, t.effects), (None, vec![]));
+        let t = queue_for_launch(&job(1, JobState::Stashed { enqueue_at: None }), NOW).unwrap();
+        assert_eq!(t.next, Some(JobState::Queued { enqueued_at: NOW }));
+        assert!(t.effects.is_empty());
+        let t = queue_for_launch(&job(1, JobState::Checkpointed), NOW).unwrap();
+        assert_eq!(t.next, Some(JobState::RestoreQueued { enqueued_at: NOW }));
+        assert!(t.effects.is_empty());
+    }
+
+    #[test]
+    fn requeue_unlaunched_rules() {
+        assert_accepts(
+            |j| requeue_unlaunched(j, NOW),
+            |s| matches!(s, JobState::Running | JobState::Restoring),
+            "requeued",
+        );
+        let mut running = job(1, JobState::Running);
+        running.started_at = Some(5);
+        let t = requeue_unlaunched(&running, NOW).unwrap();
+        assert_eq!(t.next, Some(JobState::Queued { enqueued_at: NOW }));
+        assert!(t.effects.is_empty());
+        t.apply(&mut running, NOW);
+        assert_eq!(running.started_at, None);
+        let t = requeue_unlaunched(&job(1, JobState::Restoring), NOW).unwrap();
+        assert_eq!(t.next, Some(JobState::RestoreQueued { enqueued_at: NOW }));
+        // No restore error is recorded.
+        assert!(t.effects.is_empty());
     }
 
     #[test]

@@ -158,7 +158,7 @@ async fn route(
         ),
         ("GET", "/v1/jobs") => json(StatusCode::OK, ListJobsResponse { jobs: jobs() }),
         ("GET", "/v1/jobs/2") => json(StatusCode::OK, jobs().remove(1)),
-        ("POST", "/v1/jobs") => json(StatusCode::CREATED, AddJobResponse { id: JobId(5) }),
+        ("POST", "/v1/jobs") => json(StatusCode::CREATED, AddJobResponse::new(JobId(5))),
         ("POST", "/v1/jobs/bulk") => json(
             StatusCode::OK,
             BulkJobResponse {

@@ -137,7 +137,7 @@ async fn route(req: Request<Incoming>, log: Arc<Mutex<Vec<Recorded>>>) -> Respon
         ("POST", "/v1/groups") => json(StatusCode::CREATED, group("gpu", 2)),
         ("DELETE", "/v1/groups/a%20b") => full(StatusCode::NO_CONTENT, CONTENT_TYPE_JSON, ""),
         ("PUT", "/v1/groups/default/parallel") => json(StatusCode::OK, group("default", 4)),
-        ("POST", "/v1/jobs") => json(StatusCode::CREATED, AddJobResponse { id: JobId(5) }),
+        ("POST", "/v1/jobs") => json(StatusCode::CREATED, AddJobResponse::new(JobId(5))),
         ("GET", "/v1/jobs/404") => json(
             StatusCode::NOT_FOUND,
             ApiError::new(ErrorCode::JobNotFound, "job 404 does not exist"),

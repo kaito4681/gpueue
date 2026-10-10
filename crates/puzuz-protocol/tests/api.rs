@@ -277,18 +277,37 @@ fn bulk_response_golden() {
                 id: JobId(2),
                 outcome: ActionOutcome::Ok {
                     new_id: Some(JobId(9)),
+                    launch_pending: false,
                 },
             },
             JobActionResult::error(
                 JobId(3),
                 ApiError::new(ErrorCode::InvalidState, "job 3 is not running"),
             ),
+            JobActionResult {
+                id: JobId(4),
+                outcome: ActionOutcome::Ok {
+                    new_id: None,
+                    launch_pending: true,
+                },
+            },
         ],
     };
     assert!(!resp.all_ok());
     assert_golden(
         &resp,
-        r#"{"results":[{"id":1,"status":"ok"},{"id":2,"status":"ok","new_id":9},{"id":3,"status":"error","error":{"code":"invalid_state","message":"job 3 is not running"}}]}"#,
+        r#"{"results":[{"id":1,"status":"ok"},{"id":2,"status":"ok","new_id":9},{"id":3,"status":"error","error":{"code":"invalid_state","message":"job 3 is not running"}},{"id":4,"status":"ok","launch_pending":true}]}"#,
+    );
+    // The field is optional for older daemons.
+    let add: AddJobResponse = serde_json::from_str(r#"{"id":5}"#).unwrap();
+    assert_eq!(add, AddJobResponse::new(JobId(5)));
+    assert_golden(&add, r#"{"id":5}"#);
+    assert_golden(
+        &AddJobResponse {
+            id: JobId(6),
+            launch_pending: true,
+        },
+        r#"{"id":6,"launch_pending":true}"#,
     );
 }
 
