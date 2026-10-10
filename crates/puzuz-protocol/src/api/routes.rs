@@ -57,11 +57,13 @@ impl fmt::Display for Method {
 /// Every endpoint, with its request and success response types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// `GET /v1/jobs` — query [`super::ListJobsQuery`] → [`super::ListJobsResponse`].
+    /// `GET /v1/jobs` — query [`super::ListJobsQuery`] → [`super::ListJobsResponse`]
+    /// (views without `envs` unless `?details=envs`).
     ListJobs,
     /// `POST /v1/jobs` — [`super::AddJobRequest`] → `201` [`super::AddJobResponse`].
     AddJob,
-    /// `GET /v1/jobs/{id}` → [`super::JobView`].
+    /// `GET /v1/jobs/{id}` → [`super::JobView`] (with `envs` for the owner and
+    /// administrators).
     GetJob(JobId),
     /// `POST /v1/jobs/{id}/{action}` (`DELETE /v1/jobs/{id}` for remove) —
     /// the action's options → [`super::JobActionResult`].

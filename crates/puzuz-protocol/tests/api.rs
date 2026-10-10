@@ -103,7 +103,7 @@ fn full_view_for_owner_and_admin() {
         let view = JobView::for_caller(&job, &caller);
         let details = view.details.as_ref().expect("full view");
         assert_eq!(details.command, job.spec.command);
-        assert_eq!(details.envs, job.spec.envs);
+        assert_eq!(details.envs.as_ref(), Some(&job.spec.envs));
     }
     let view = JobView::full(&job);
     let json = serde_json::to_string(&view).unwrap();
@@ -112,6 +112,31 @@ fn full_view_for_owner_and_admin() {
     ));
     let back: JobView = serde_json::from_str(&json).unwrap();
     assert_eq!(back, view);
+}
+
+#[test]
+fn list_view_leaves_out_envs() {
+    let job = sample_job();
+    let view = JobView::full(&job).without_envs();
+    assert_golden(
+        &view,
+        r#"{"id":7,"owner":1000,"group":"default","gpus":[0,1],"dependencies":[],"priority":0,"label":"run1","no_checkpoint":false,"state":{"state":"running"},"created_at":1000,"started_at":2000,"finished_at":null,"details":{"command":"python train.py --secret-token abc","cwd":"/home/alice/proj"}}"#,
+    );
+    assert!(!view.is_redacted());
+
+    // An empty environment is still sent as such in the full view.
+    let mut empty = sample_job();
+    empty.spec.envs.clear();
+    let json = serde_json::to_string(&JobView::full(&empty)).unwrap();
+    assert!(json.ends_with(r#""envs":{}}}"#), "{json}");
+
+    // Dropping envs from a redacted view changes nothing.
+    let stranger = Caller {
+        uid: Uid(1001),
+        is_admin: false,
+    };
+    let redacted = JobView::for_caller(&job, &stranger);
+    assert_eq!(redacted.clone().without_envs(), redacted);
 }
 
 #[test]
@@ -294,13 +319,36 @@ fn bulk_response_golden() {
 
 #[test]
 fn done_state_shape() {
-    // Pins how puzuz-core's JobState nests inside API views.
+    // Pins how puzuz-core's JobState appears inside API views: the result's
+    // fields are flattened next to `state`.
     let state = JobState::Done {
         result: JobResult::Failed { exit_code: 1 },
     };
     assert_golden(
         &state,
-        r#"{"state":"done","result":{"result":"failed","exit_code":1}}"#,
+        r#"{"state":"done","result":"failed","exit_code":1}"#,
+    );
+    let state = JobState::Terminating {
+        result: JobResult::CheckpointFailed {
+            reason: "criu".into(),
+        },
+    };
+    assert_golden(
+        &state,
+        r#"{"state":"terminating","result":"checkpoint_failed","reason":"criu"}"#,
+    );
+    let mut job = sample_job();
+    job.state = JobState::Done {
+        result: JobResult::Killed,
+    };
+    job.finished_at = Some(3_000);
+    let stranger = Caller {
+        uid: Uid(1001),
+        is_admin: false,
+    };
+    assert_golden(
+        &JobView::for_caller(&job, &stranger),
+        r#"{"id":7,"owner":1000,"group":"default","gpus":[0,1],"dependencies":[],"priority":0,"label":null,"no_checkpoint":false,"state":{"state":"done","result":"killed"},"created_at":1000,"started_at":2000,"finished_at":3000}"#,
     );
 }
 
@@ -477,9 +525,20 @@ fn query_strings() {
     );
     assert_eq!(
         ListJobsQuery {
-            group: Some("my group".into())
+            group: Some("my group".into()),
+            details: None,
         }
         .to_query_string(),
         "group=my%20group"
     );
+    assert_eq!(
+        ListJobsQuery {
+            group: Some("gpu".into()),
+            details: Some(ListDetails::Envs),
+        }
+        .to_query_string(),
+        "group=gpu&details=envs"
+    );
+    assert!(!ListJobsQuery::default().include_envs());
+    assert_eq!(ListJobsQuery::default().to_query_string(), "");
 }

@@ -69,6 +69,7 @@ fn delayed(content_type: &str, delay: Duration, chunks: Vec<String>) -> Response
         .unwrap()
 }
 
+/// A job as `GET /v1/jobs` lists it: without its environment.
 fn job(id: u64, state: JobState) -> JobView {
     JobView {
         id: JobId(id),
@@ -87,7 +88,7 @@ fn job(id: u64, state: JobState) -> JobView {
         details: Some(JobDetails {
             command: "python train.py".into(),
             cwd: PathBuf::from("/work"),
-            envs: BTreeMap::new(),
+            envs: None,
             last_error: None,
         }),
     }
@@ -160,7 +161,15 @@ async fn route(
             },
         ),
         ("GET", "/v1/jobs") => json(StatusCode::OK, ListJobsResponse { jobs: jobs() }),
-        ("GET", "/v1/jobs/2") => json(StatusCode::OK, jobs().remove(1)),
+        ("GET", "/v1/jobs/2") => {
+            // A single job comes with its environment.
+            let mut job = jobs().remove(1);
+            job.details.as_mut().unwrap().envs = Some(BTreeMap::from([(
+                "SECRET".to_owned(),
+                "hunter2".to_owned(),
+            )]));
+            json(StatusCode::OK, job)
+        }
         ("POST", "/v1/jobs") => json(StatusCode::CREATED, AddJobResponse { id: JobId(5) }),
         ("POST", "/v1/jobs/bulk") => json(
             StatusCode::OK,
@@ -330,6 +339,20 @@ fn status_query_and_json() {
     let jobs = value["jobs"].as_array().unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0]["id"], 1);
+    assert_eq!(jobs[0]["state"], serde_json::json!({"state": "running"}));
+
+    // Finished jobs carry their result flat inside `state`.
+    let output = puzuz(&daemon.socket, &["status", "--json", "status=success"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["jobs"][0]["state"],
+        serde_json::json!({"state": "done", "result": "success"})
+    );
+    assert_eq!(
+        value["jobs"][0]["details"],
+        serde_json::json!({"command": "python train.py", "cwd": "/work"})
+    );
 
     let output = puzuz(&daemon.socket, &["status", "status=bogus"]);
     assert!(!output.status.success());
@@ -400,6 +423,26 @@ fn log_writes_raw_bytes_to_stdout() {
     assert!(header.contains("completed successfully"), "{header}");
     assert!(header.contains("output:"), "{header}");
     assert!(!header.contains("last 15 lines"), "{header}");
+}
+
+#[test]
+fn log_json_has_a_flat_state_and_no_environment() {
+    let daemon = FakeDaemon::start(Mode::Normal);
+    let output = puzuz(&daemon.socket, &["log", "--json", "2"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let job = &value["2"]["job"];
+    assert_eq!(
+        job["state"],
+        serde_json::json!({"state": "done", "result": "success"})
+    );
+    // Fetched with `GET /v1/jobs/2`, which includes the environment, but
+    // `log --json` leaves it out like for listed jobs.
+    assert_eq!(
+        job["details"],
+        serde_json::json!({"command": "python train.py", "cwd": "/work"})
+    );
+    assert_eq!(value["2"]["output"], "epoch 1\nepoch 2\n\u{fffd} raw\n");
 }
 
 #[test]

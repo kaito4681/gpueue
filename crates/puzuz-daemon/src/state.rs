@@ -142,13 +142,15 @@ pub enum DaemonEvent {
 }
 
 impl DaemonEvent {
+    /// The event as `caller` may see it. Job views leave out the
+    /// environment, like `GET /v1/jobs`.
     pub fn to_api(&self, caller: &Caller) -> api::Event {
         match self {
             DaemonEvent::JobAdded(info) => api::Event::JobAdded {
-                job: info.view(caller),
+                job: info.view(caller).without_envs(),
             },
             DaemonEvent::JobUpdated(info) => api::Event::JobUpdated {
-                job: info.view(caller),
+                job: info.view(caller).without_envs(),
             },
             DaemonEvent::JobRemoved(id) => api::Event::JobRemoved { id: *id },
             DaemonEvent::GroupUpdated(group) => api::Event::GroupUpdated {

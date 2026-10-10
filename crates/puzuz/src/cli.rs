@@ -12,7 +12,8 @@
 //! - `shutdown` checkpoints all jobs before stopping (`--no-checkpoint` kills them instead).
 //! - `status` accepts pueue's query language plus the puzuz columns `owner` and `gpu` and the
 //!   checkpoint states (see `crate::query`). `status --json` prints puzuz's own schema
-//!   (`{"groups": [...], "jobs": [...]}`), not pueue's state dump.
+//!   (`{"groups": [...], "jobs": [...]}`, job views without their environment), not pueue's
+//!   state dump.
 //! - puzuz extensions: `add --gpu/--no-checkpoint`, `checkpoint`, `restore`, `gpu`, `daemon`,
 //!   `service` and `doctor`.
 

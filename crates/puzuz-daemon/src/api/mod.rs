@@ -18,7 +18,7 @@ use puzuz_protocol::BINARY_VERSION;
 use puzuz_protocol::api::routes::{self, JobActionKind};
 use puzuz_protocol::api::{
     API_VERSION, AddJobRequest, AddJobResponse, BulkJobRequest, CleanRequest, CreateGroupRequest,
-    EnqueueOptions, ErrorCode, HelperStatus, JobAction, JobActionResult, KillOptions,
+    EnqueueOptions, ErrorCode, HelperStatus, JobAction, JobActionResult, JobView, KillOptions,
     ListGpusResponse, ListGroupsResponse, ListJobsQuery, ListJobsResponse, PauseOptions,
     ResetRequest, RestartOptions, RestoreOptions, SetGpusParallelRequest, SetParallelRequest,
     ShutdownRequest, StashOptions, SwitchRequest, VERSION_HEADER, VersionResponse, WARNINGS_HEADER,
@@ -181,7 +181,13 @@ async fn list_jobs(
     query: Result<Query<ListJobsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<Json<ListJobsResponse>> {
     let Query(query) = query.map_err(|e| Failure::bad_request(e.body_text()))?;
-    let jobs = core.list_jobs(caller, query.group).await?;
+    let include_envs = query.include_envs();
+    let mut jobs = core.list_jobs(caller, query.group).await?;
+    // Every job's whole environment would make the list huge; it is sent by
+    // `GET /v1/jobs/{id}`, or here on request.
+    if !include_envs {
+        jobs = jobs.into_iter().map(JobView::without_envs).collect();
+    }
     Ok(Json(ListJobsResponse { jobs }))
 }
 

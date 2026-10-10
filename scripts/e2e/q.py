@@ -23,15 +23,15 @@ def job(i):
 
 
 def st(i):
+    # A state is one flat object: {"state": "done", "result": "failed",
+    # "exit_code": 3}; the result's fields sit next to `state`.
     s = job(i)["state"]
-    name = s["state"]
+    parts = [s["state"]]
     if "result" in s:
-        r = s["result"]
-        parts = [name, r["result"]]
-        if "exit_code" in r:
-            parts.append(str(r["exit_code"]))
-        return "/".join(parts)
-    return name
+        parts.append(s["result"])
+        if "exit_code" in s:
+            parts.append(str(s["exit_code"]))
+    return "/".join(parts)
 
 
 def ids(prefix):
