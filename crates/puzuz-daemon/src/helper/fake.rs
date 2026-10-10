@@ -9,7 +9,9 @@
 //! [`FakeHelper::hold_launches`] makes spawn and restore requests wait
 //! (unanswered and without effect) until [`FakeHelper::release_launches`],
 //! to reproduce the window in which the daemon has recorded a launch the
-//! helper does not know about yet.
+//! helper does not know about yet. Combined with
+//! [`FakeHelper::refuse_launches`], it holds the daemon's retry of a launch
+//! a stopping helper refused.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -68,6 +70,9 @@ struct State {
     ignore_sigterm: bool,
     spawned: Vec<SpawnRequest>,
     signals: Vec<(JobId, i32)>,
+    /// Spawn/restore requests still to refuse with `shutting_down` right
+    /// away (also while launches are held).
+    refuse_launches: usize,
     hold_launches: bool,
     /// Held requests fail with `ConnectionLost` when released.
     lose_held: bool,
@@ -238,6 +243,29 @@ impl FakeHelper {
     /// is stopping does (`false` to accept them again).
     pub fn set_stopping(&self, stopping: bool) {
         self.with(|s| s.stopping = stopping);
+    }
+
+    /// Refuses the next `count` spawn and restore requests with
+    /// `shutting_down`, as a stopping helper does, then accepts them again
+    /// (as the next helper does). They are refused right away, also while
+    /// launches are held, so that the daemon's retry can be held (see
+    /// [`FakeHelper::hold_launches`]).
+    pub fn refuse_launches(&self, count: usize) {
+        self.with(|s| s.refuse_launches = count);
+    }
+
+    /// A refusal due by [`FakeHelper::refuse_launches`].
+    fn take_refusal(&self) -> HelperResult<()> {
+        self.with(|s| {
+            if !s.connected || s.refuse_launches == 0 {
+                return Ok(());
+            }
+            s.refuse_launches -= 1;
+            Err(HelperError::Rejected {
+                code: HelperErrorCode::ShuttingDown,
+                message: "the helper is shutting down".to_owned(),
+            })
+        })
     }
 
     /// Accept restores but report them abandoned by a stopping helper (a
@@ -551,6 +579,7 @@ impl Helper for FakeHelper {
 
     fn spawn(&self, request: SpawnRequest) -> BoxFuture<'_, HelperResult<u32>> {
         async move {
+            self.take_refusal()?;
             self.launch_gate().await?;
             self.do_spawn(request)
         }
@@ -574,6 +603,7 @@ impl Helper for FakeHelper {
 
     fn restore(&self, request: RestoreRequest) -> BoxFuture<'_, HelperResult<()>> {
         async move {
+            self.take_refusal()?;
             self.launch_gate().await?;
             self.do_restore(request)
         }

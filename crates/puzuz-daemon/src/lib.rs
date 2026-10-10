@@ -78,6 +78,8 @@ pub use crate::gpu::{
 };
 pub use crate::helper::{FakeHelper, Helper, HelperClient};
 use crate::state::Core;
+#[doc(hidden)]
+pub use crate::state::LaunchCheckHook;
 pub use crate::users::{StaticUserDb, SystemUserDb, UserDb};
 
 /// Everything [`Daemon::start`] needs.
@@ -218,6 +220,14 @@ impl Daemon {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket
+    }
+
+    /// Testing only: `hook` is awaited by an action whose spawn or restore
+    /// request failed, before it finds out whether the launch is retried,
+    /// so tests can let the retry run (or finish) first.
+    #[doc(hidden)]
+    pub fn set_launch_check_hook(&self, hook: Option<LaunchCheckHook>) {
+        self.core.set_launch_check_hook(hook);
     }
 
     /// Resolves once `puzuz shutdown` has checkpointed or stopped every

@@ -14,7 +14,7 @@ use puzuz_protocol::api::{
 };
 
 use crate::error::{ApiResult, Failure};
-use crate::state::{Core, JobInfo, needs_helper, now_ms, targets_live_process};
+use crate::state::{Core, JobInfo, Retried, needs_helper, now_ms, targets_live_process};
 
 fn lifecycle_action(action: &JobAction) -> Action {
     match action {
@@ -291,19 +291,42 @@ impl Core {
     /// Runs the effects of an action. A launch the helper did not carry
     /// out but that is retried by itself (the helper is stopping or went
     /// away, see [`Core::launch_retried`]) is no failure: returns whether
-    /// that happened.
+    /// that retry is still pending. A retry that has already succeeded is
+    /// reported as a launch, one that has already failed with its error.
     async fn run_launch_effects(
         self: &Arc<Self>,
         job: &Job,
         effects: &[Effect],
     ) -> ApiResult<bool> {
-        match self.run_effects(job, effects).await {
-            Ok(()) => Ok(false),
-            Err(e) if launches(effects) && self.launch_retried(job.id).await => {
-                tracing::info!(job = %job.id, "launch deferred until the helper is back: {}", e.0.message);
+        // The launch these effects run, registered by the action's
+        // transaction (the job cannot be launched again before its request
+        // has been answered).
+        let launch = if launches(effects) {
+            self.latest_launch(job.id)
+        } else {
+            None
+        };
+        let error = match self.run_effects(job, effects).await {
+            Ok(()) => return Ok(false),
+            Err(e) => e,
+        };
+        let Some(seq) = launch else {
+            return Err(error);
+        };
+        match self.launch_retried(job.id, seq).await {
+            Retried::No => Err(error),
+            Retried::Pending => {
+                tracing::info!(job = %job.id, "launch deferred until the helper is back: {}", error.0.message);
                 Ok(true)
             }
-            Err(e) => Err(e),
+            Retried::Launched => {
+                tracing::info!(job = %job.id, "launch retried successfully after: {}", error.0.message);
+                Ok(false)
+            }
+            Retried::Failed(retry) => {
+                tracing::info!(job = %job.id, "retried launch failed: {}", retry.0.message);
+                Err(retry)
+            }
         }
     }
 

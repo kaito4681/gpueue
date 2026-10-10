@@ -44,7 +44,7 @@ use crate::config::Config;
 use crate::error::{ApiResult, Failure};
 use crate::gpu::DetectedGpu;
 use crate::helper::{Helper, HelperError, HelperNotice};
-use crate::launch::Launches;
+use crate::launch::{LaunchOutcome, Launches, RetryStatus, SettleGuard};
 use crate::usage::SizeWarnings;
 use crate::users::UserDb;
 
@@ -256,8 +256,75 @@ pub fn targets_live_process(effect: &Effect) -> bool {
 /// restore request (the helper client gives up on a request after 60 s).
 const LAUNCH_WAIT: Duration = Duration::from_secs(75);
 
+/// How long an action whose launch is being retried waits for the retry's
+/// request to return before it reports the launch as pending.
+const RETRY_SETTLE_WAIT: Duration = Duration::from_millis(500);
+
 /// Spawn/restore requests the scheduler has outstanding at most.
 const MAX_CONCURRENT_LAUNCHES: usize = 8;
+
+/// Testing only: awaited by an action whose launch the helper did not carry
+/// out, before it finds out whether the launch is being retried (see
+/// [`Core::set_launch_check_hook`]).
+pub type LaunchCheckHook = Arc<dyn Fn(JobId) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// How a launching action's launch that failed fares (see
+/// [`Core::launch_retried`]).
+#[derive(Debug)]
+pub enum Retried {
+    /// Not retried: the failure stands.
+    No,
+    /// Being retried (back in line, or launching again), or unknown whether
+    /// the helper got the request.
+    Pending,
+    /// Retried, and the retry succeeded.
+    Launched,
+    /// Retried, and the retry failed with this error.
+    Failed(Failure),
+}
+
+/// A spawn or restore request that failed: the error to report and what
+/// became of the launch.
+struct LaunchFailure {
+    error: Failure,
+    outcome: LaunchOutcome,
+}
+
+impl LaunchFailure {
+    fn new(error: Failure, outcome: LaunchOutcome) -> Self {
+        Self { error, outcome }
+    }
+
+    /// Put back in line (`requeued`), or failed as the job has moved on.
+    fn requeued(error: Failure, requeued: bool) -> Self {
+        let outcome = if requeued {
+            LaunchOutcome::Requeued
+        } else {
+            LaunchOutcome::Failed(error.clone())
+        };
+        Self { error, outcome }
+    }
+}
+
+impl From<Failure> for LaunchFailure {
+    fn from(error: Failure) -> Self {
+        Self::new(error.clone(), LaunchOutcome::Failed(error))
+    }
+}
+
+/// Settles a launch with the outcome of its request.
+fn settle_launch(settle: SettleGuard<'_>, result: Result<(), LaunchFailure>) -> ApiResult<()> {
+    match result {
+        Ok(()) => {
+            settle.finish(LaunchOutcome::Done);
+            Ok(())
+        }
+        Err(LaunchFailure { error, outcome }) => {
+            settle.finish(outcome);
+            Err(error)
+        }
+    }
+}
 
 /// A pre-transition hook for [`Core::handle_event`] that does nothing.
 pub fn no_pre(_: &dyn StoreOps, _: &Job) -> Result<(), StorageError> {
@@ -306,6 +373,8 @@ pub struct Core {
     /// the scheduler launches it as soon as it can, ignoring slots. Kept in
     /// memory only: after a daemon restart such a job waits for a slot.
     forced: Mutex<HashSet<JobId>>,
+    /// See [`LaunchCheckHook`].
+    launch_check_hook: Mutex<Option<LaunchCheckHook>>,
     /// Checkpoint size warnings (see [`crate::usage`]).
     pub(crate) size_warnings: Mutex<SizeWarnings>,
 }
@@ -343,6 +412,7 @@ impl Core {
             launch_slots: Semaphore::new(MAX_CONCURRENT_LAUNCHES),
             unconfirmed_launches: Mutex::new(HashMap::new()),
             forced: Mutex::new(HashSet::new()),
+            launch_check_hook: Mutex::new(None),
             size_warnings: Mutex::default(),
         })
     }
@@ -385,6 +455,12 @@ impl Core {
         self.launches.in_flight(id)
     }
 
+    /// The sequence number of the latest launch of `id` (see
+    /// [`Launches::latest`]).
+    pub fn latest_launch(&self, id: JobId) -> Option<u64> {
+        self.launches.latest(id)
+    }
+
     /// Waits until the helper has answered a pending spawn or restore
     /// request for `id`, so that requests for the live process do not
     /// overtake it. Fails (retryably) when the daemon stops or the helper
@@ -414,25 +490,76 @@ impl Core {
         self.forced.lock().unwrap().insert(id);
     }
 
-    /// Whether a forced launch of `id` that the helper did not carry out
-    /// is being retried: the job is back in line, launching again, or its
-    /// request's answer was lost (it is requeued if the helper never got
-    /// it, see [`Core::spawn_lost_check`]).
-    pub async fn launch_retried(&self, id: JobId) -> bool {
-        if !self.forced.lock().unwrap().contains(&id) {
-            return false;
+    /// Testing only: see [`LaunchCheckHook`].
+    pub fn set_launch_check_hook(&self, hook: Option<LaunchCheckHook>) {
+        *self.launch_check_hook.lock().unwrap() = hook;
+    }
+
+    /// How launch `seq` of `id`, whose request failed, fares: whether it
+    /// is retried by itself (the helper is stopping or went away) and, if
+    /// it has been retried already, how the retry went. Derived from the
+    /// outcomes the launches recorded (see [`Launches::retry_status`]), so
+    /// the answer does not depend on how far the retry has got by now:
+    /// - launched again: the latest launch is in flight, or was itself put
+    ///   back in line (or its answer lost) → [`Retried::Pending`]; it
+    ///   succeeded → [`Retried::Launched`]; it failed →
+    ///   [`Retried::Failed`];
+    /// - not launched again yet: requeued, still waiting in line and
+    ///   forced → [`Retried::Pending`], as when its answer was lost (it is
+    ///   requeued if the helper never got it, see
+    ///   [`Core::spawn_lost_check`]); otherwise [`Retried::No`].
+    ///
+    /// A retry in flight is given [`RETRY_SETTLE_WAIT`] to return first.
+    pub async fn launch_retried(self: &Arc<Self>, id: JobId, seq: u64) -> Retried {
+        let hook = self.launch_check_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(id).await;
         }
-        match self.read(move |s| s.get_job(id)).await {
-            Ok(Some(job)) => match job.state {
-                JobState::Queued { .. } | JobState::RestoreQueued { .. } => true,
-                JobState::Running | JobState::Restoring => {
-                    self.launches.in_flight(id)
-                        || self.unconfirmed_launches.lock().unwrap().contains_key(&id)
-                }
-                _ => false,
-            },
-            _ => false,
+        match self.retry_outcome(id, seq).await {
+            // The retry may be about to settle (its effect on the job can be
+            // visible before its request returns): give it a moment, so
+            // the reply reflects its outcome rather than a pending launch.
+            Retried::Pending if self.launches.in_flight(id) => {
+                let _ = tokio::time::timeout(RETRY_SETTLE_WAIT, self.launches.wait(id)).await;
+                self.retry_outcome(id, seq).await
+            }
+            retried => retried,
         }
+    }
+
+    /// See [`Core::launch_retried`].
+    async fn retry_outcome(self: &Arc<Self>, id: JobId, seq: u64) -> Retried {
+        let core = self.clone();
+        // Under the database lock, so that a job waiting in line has not
+        // been launched again in between.
+        let result = self
+            .read(move |s| {
+                Ok(match core.launches.retry_status(id, seq) {
+                    RetryStatus::RetryInFlight
+                    | RetryStatus::RetrySettled(
+                        None | Some(LaunchOutcome::Requeued | LaunchOutcome::Unconfirmed),
+                    ) => Retried::Pending,
+                    RetryStatus::RetrySettled(Some(LaunchOutcome::Done)) => Retried::Launched,
+                    RetryStatus::RetrySettled(Some(LaunchOutcome::Failed(e))) => Retried::Failed(e),
+                    RetryStatus::NotRelaunched(Some(LaunchOutcome::Unconfirmed)) => {
+                        Retried::Pending
+                    }
+                    RetryStatus::NotRelaunched(Some(LaunchOutcome::Requeued)) => {
+                        let waiting = matches!(
+                            s.get_job(id)?.map(|job| job.state),
+                            Some(JobState::Queued { .. } | JobState::RestoreQueued { .. })
+                        );
+                        if waiting && core.forced.lock().unwrap().contains(&id) {
+                            Retried::Pending
+                        } else {
+                            Retried::No
+                        }
+                    }
+                    RetryStatus::NotRelaunched(_) => Retried::No,
+                })
+            })
+            .await;
+        result.unwrap_or(Retried::No)
     }
 
     pub fn orphans(&self) -> Vec<JobId> {
@@ -555,6 +682,9 @@ impl Core {
                 if changed {
                     for &id in &changes.launching {
                         core.launches.begin(id);
+                    }
+                    for &id in &changes.removed {
+                        core.launches.forget(id);
                     }
                     core.publish(store, &changes);
                 }
@@ -712,8 +842,8 @@ impl Core {
     async fn run_effect(self: &Arc<Self>, job: &Job, effect: &Effect) -> ApiResult<()> {
         match effect {
             Effect::Spawn => {
-                let _settle = self.launches.settle_on_drop(job.id);
-                self.spawn_job(job).await
+                let settle = self.launches.settle_on_drop(job.id);
+                settle_launch(settle, self.spawn_job(job).await)
             }
             Effect::SignalStop => self.signal(job, signal::SIGSTOP).await,
             Effect::SignalContinue => self.signal(job, signal::SIGCONT).await,
@@ -721,8 +851,8 @@ impl Core {
             Effect::Kill | Effect::Terminate => self.terminate(job).await,
             Effect::Checkpoint => self.start_checkpoint(job).await,
             Effect::Restore => {
-                let _settle = self.launches.settle_on_drop(job.id);
-                self.start_restore(job).await
+                let settle = self.launches.settle_on_drop(job.id);
+                settle_launch(settle, self.start_restore(job).await)
             }
             // After a successful restore the helper has already removed the
             // image (and refuses to touch the directory of a live job).
@@ -757,7 +887,7 @@ impl Core {
         }
     }
 
-    async fn spawn_job(self: &Arc<Self>, job: &Job) -> ApiResult<()> {
+    async fn spawn_job(self: &Arc<Self>, job: &Job) -> Result<(), LaunchFailure> {
         let users = self.users.clone();
         let owner = job.owner;
         let gid = tokio::task::spawn_blocking(move || users.primary_gid(owner))
@@ -809,9 +939,10 @@ impl Core {
                     _ = self.cancel.cancelled() => {}
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
-                self.requeue_unstarted(job.id, Some(job.started_at), JobState::Running)
+                let requeued = self
+                    .requeue_unstarted(job.id, Some(job.started_at), JobState::Running)
                     .await?;
-                Err(e.into())
+                Err(LaunchFailure::requeued(e.into(), requeued))
             }
             Err(HelperError::Rejected { message, .. }) => {
                 self.handle_event(
@@ -824,9 +955,13 @@ impl Core {
             }
             Err(HelperError::NotConnected) => {
                 // Never reached the helper: put the job back in line.
-                self.requeue_unstarted(job.id, Some(job.started_at), JobState::Running)
+                let requeued = self
+                    .requeue_unstarted(job.id, Some(job.started_at), JobState::Running)
                     .await?;
-                Err(HelperError::NotConnected.into())
+                Err(LaunchFailure::requeued(
+                    HelperError::NotConnected.into(),
+                    requeued,
+                ))
             }
             // Unknown whether it started (the connection broke or the
             // answer is late). Reconciliation (after a reconnect) or the
@@ -840,7 +975,7 @@ impl Core {
                 if matches!(e, HelperError::Timeout) {
                     self.spawn_lost_check(job.id, job.started_at);
                 }
-                Err(e.into())
+                Err(LaunchFailure::new(e.into(), LaunchOutcome::Unconfirmed))
             }
         }
     }
@@ -1057,7 +1192,7 @@ impl Core {
         }
     }
 
-    async fn start_restore(self: &Arc<Self>, job: &Job) -> ApiResult<()> {
+    async fn start_restore(self: &Arc<Self>, job: &Job) -> Result<(), LaunchFailure> {
         self.warn_if_gpus_changed(job).await;
         let request = RestoreRequest {
             job: job.id,
@@ -1081,15 +1216,20 @@ impl Core {
                     _ = self.cancel.cancelled() => {}
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
-                self.requeue_unstarted(job.id, Some(job.started_at), JobState::Restoring)
+                let requeued = self
+                    .requeue_unstarted(job.id, Some(job.started_at), JobState::Restoring)
                     .await?;
-                Err(e.into())
+                Err(LaunchFailure::requeued(e.into(), requeued))
             }
             Err(HelperError::NotConnected) => {
                 // Never reached the helper.
-                self.requeue_unstarted(job.id, Some(job.started_at), JobState::Restoring)
+                let requeued = self
+                    .requeue_unstarted(job.id, Some(job.started_at), JobState::Restoring)
                     .await?;
-                Err(HelperError::NotConnected.into())
+                Err(LaunchFailure::requeued(
+                    HelperError::NotConnected.into(),
+                    requeued,
+                ))
             }
             Err(e @ (HelperError::Rejected { .. } | HelperError::Protocol(_))) => {
                 self.handle_event(
@@ -1100,7 +1240,7 @@ impl Core {
                     no_pre,
                 )
                 .await;
-                Err(e.into())
+                Err(Failure::from(e).into())
             }
             // Unknown whether the helper got the request (see
             // `Core::spawn_job`): its outcome event arrives if it did, and a
@@ -1113,7 +1253,7 @@ impl Core {
                 if matches!(e, HelperError::Timeout) {
                     self.spawn_lost_check(job.id, job.started_at);
                 }
-                Err(e.into())
+                Err(LaunchFailure::new(e.into(), LaunchOutcome::Unconfirmed))
             }
         }
     }

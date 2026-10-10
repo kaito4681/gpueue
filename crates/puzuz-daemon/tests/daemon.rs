@@ -16,7 +16,7 @@ use puzuz_daemon::api::TEST_UID_HEADER;
 use puzuz_daemon::helper::FakeOutcome;
 use puzuz_daemon::{
     Config, Daemon, DaemonOptions, DetectedGpu, FakeHelper, FallbackGpuDetector, GpuDetector,
-    StaticGpuDetector, StaticUserDb,
+    LaunchCheckHook, StaticGpuDetector, StaticUserDb,
 };
 use puzuz_protocol::BINARY_VERSION;
 use puzuz_protocol::api::{
@@ -27,6 +27,7 @@ use puzuz_protocol::api::{
 use puzuz_protocol::helper::signal;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use tokio::sync::{mpsc, oneshot};
 
 const ALICE: u32 = 1000;
 const BOB: u32 = 1001;
@@ -2130,6 +2131,253 @@ async fn restores_abandoned_by_a_stopping_helper_are_requeued_not_failed() {
     admin.wait_state(id, &JobState::Running).await;
     assert!(h.helper.is_running(id));
     assert_no_restore_error(&h, id).await;
+    h.stop().await;
+}
+
+/// Holds an action whose spawn or restore request failed before it finds
+/// out whether the launch is retried (see `Daemon::set_launch_check_hook`),
+/// so that tests decide how far the retry gets first.
+struct LaunchCheckGate(mpsc::UnboundedReceiver<(JobId, oneshot::Sender<()>)>);
+
+impl LaunchCheckGate {
+    /// Waits for an action to reach the check; it goes on once the
+    /// returned sender is dropped.
+    async fn reached(&mut self) -> (JobId, oneshot::Sender<()>) {
+        tokio::time::timeout(Duration::from_secs(10), self.0.recv())
+            .await
+            .expect("no action reached the launch check")
+            .unwrap()
+    }
+}
+
+impl Harness {
+    fn gate_launch_checks(&self) -> LaunchCheckGate {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let hook: LaunchCheckHook = Arc::new(move |id| {
+            let (release, released) = oneshot::channel::<()>();
+            let _ = tx.send((id, release));
+            Box::pin(async move {
+                let _ = released.await;
+            })
+        });
+        self.daemon
+            .as_ref()
+            .unwrap()
+            .set_launch_check_hook(Some(hook));
+        LaunchCheckGate(rx)
+    }
+}
+
+fn launch_pending(reply: &Reply) -> bool {
+    reply.json::<Value>()["launch_pending"] == json!(true)
+}
+
+/// Jobs for launching actions: a checkpointed one, a queued one (the only
+/// slot is taken by a running job) and a finished one.
+async fn launch_targets(h: &Harness) -> (JobId, JobId, JobId) {
+    let alice = h.client(ALICE);
+    h.set_default_parallel(2).await;
+    let checkpointed = h.checkpointed_job().await;
+    let blocker = alice.add(&job_request("blocker", &[])).await;
+    alice.wait_state(blocker, &JobState::Running).await;
+    let finished = alice.add(&job_request("finished", &[])).await;
+    h.exit(finished, 0).await;
+    alice.wait_state(finished, &done(JobResult::Success)).await;
+    h.set_default_parallel(1).await;
+    let queued = alice.add(&job_request("queued", &[])).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(
+        alice.job(queued).await.state,
+        JobState::Queued { .. }
+    ));
+    (checkpointed, queued, finished)
+}
+
+fn add_immediately(client: &Client, command: &str) -> tokio::task::JoinHandle<Reply> {
+    let client = client.clone();
+    let request = serde_json::to_value(AddJobRequest {
+        immediate: true,
+        ..job_request(command, &[])
+    })
+    .unwrap();
+    tokio::spawn(async move { client.post("/v1/jobs", request).await })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launches_retried_successfully_before_the_action_looks_are_reported_launched() {
+    let mut h = Harness::new(0).await;
+    let (checkpointed, queued, finished) = launch_targets(&h).await;
+    let alice = h.client(ALICE);
+    let mut gate = h.gate_launch_checks();
+
+    // A stopping helper refuses the launch; the daemon puts the job back in
+    // line and the next helper launches it before the action looks: the
+    // action reports the launch, not an error nor a pending launch.
+    for (id, action, body) in [
+        (checkpointed, "restore", json!({"immediate": true})),
+        (queued, "start", json!({})),
+        (finished, "restart", json!({"immediate": true})),
+    ] {
+        h.helper.refuse_launches(1);
+        let reply = send_action(&alice, id, action, body);
+        let (launched, release) = gate.reached().await;
+        alice.wait_state(launched, &JobState::Running).await;
+        h.wait_spawned(launched).await;
+        drop(release);
+        let reply = reply.await.unwrap();
+        assert_eq!(reply.status, StatusCode::OK, "{action} {id}");
+        assert!(!launch_pending(&reply), "{action} {id}");
+        if action == "restart" {
+            assert_eq!(reply.json::<Value>()["new_id"], json!(launched.0));
+        } else {
+            assert_eq!(launched, id);
+        }
+        assert_no_restore_error(&h, id).await;
+    }
+
+    // `add --immediate` alike.
+    h.helper.refuse_launches(1);
+    let reply = add_immediately(&alice, "immediate");
+    let (launched, release) = gate.reached().await;
+    alice.wait_state(launched, &JobState::Running).await;
+    h.wait_spawned(launched).await;
+    drop(release);
+    let reply = reply.await.unwrap();
+    assert_eq!(reply.status, StatusCode::CREATED);
+    let added: AddJobResponse = reply.json();
+    assert_eq!(added.id, launched);
+    assert!(!added.launch_pending);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launches_still_being_retried_when_the_action_looks_are_pending() {
+    let mut h = Harness::new(0).await;
+    let (checkpointed, queued, _) = launch_targets(&h).await;
+    let alice = h.client(ALICE);
+    let mut gate = h.gate_launch_checks();
+
+    // The retry is in flight (held by the helper) when the action looks.
+    h.helper.hold_launches();
+    for (held, (id, action, body)) in [
+        (checkpointed, "restore", json!({"immediate": true})),
+        (queued, "start", json!({})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        h.helper.refuse_launches(1);
+        let reply = send_action(&alice, id, action, body);
+        let (launched, release) = gate.reached().await;
+        assert_eq!(launched, id);
+        h.helper.wait_held(held + 1).await;
+        drop(release);
+        let reply = reply.await.unwrap();
+        assert_eq!(reply.status, StatusCode::OK, "{action} {id}");
+        assert!(launch_pending(&reply), "{action} {id}");
+    }
+    h.helper.refuse_launches(1);
+    let reply = add_immediately(&alice, "immediate");
+    let (immediate, release) = gate.reached().await;
+    h.helper.wait_held(3).await;
+    drop(release);
+    let reply = reply.await.unwrap();
+    assert_eq!(reply.status, StatusCode::CREATED);
+    assert!(reply.json::<AddJobResponse>().launch_pending);
+    h.helper.release_launches();
+    for id in [checkpointed, queued, immediate] {
+        alice.wait_state(id, &JobState::Running).await;
+        h.wait_spawned(id).await;
+    }
+    assert_no_restore_error(&h, checkpointed).await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launches_requeued_but_not_retried_yet_when_the_action_looks_are_pending() {
+    let mut h = Harness::new(0).await;
+    let id = h.checkpointed_job().await;
+    let admin = h.client(ADMIN);
+    let mut gate = h.gate_launch_checks();
+
+    // The helper goes away before reading the request: the job is put back
+    // in line and waits for the helper when the action looks.
+    h.helper.hold_launches();
+    let reply = send_action(&admin, id, "restore", json!({"immediate": true}));
+    h.helper.wait_held(1).await;
+    h.helper.disconnect();
+    h.helper.release_launches();
+    let (launched, release) = gate.reached().await;
+    assert_eq!(launched, id);
+    assert!(matches!(
+        admin.job(id).await.state,
+        JobState::RestoreQueued { .. }
+    ));
+    drop(release);
+    let reply = reply.await.unwrap();
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(launch_pending(&reply));
+
+    h.helper.reconnect();
+    admin.wait_state(id, &JobState::Running).await;
+    assert_no_restore_error(&h, id).await;
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launches_that_fail_for_a_real_reason_report_it() {
+    let mut h = Harness::new(0).await;
+    let (checkpointed, queued, _) = launch_targets(&h).await;
+    let admin = h.client(ADMIN);
+    let mut gate = h.gate_launch_checks();
+    let reason = "checkpoint is not compatible with this host";
+    h.helper.set_restore_rejection(Some(reason));
+
+    // Refused for a real reason right away: the error.
+    let reply = send_action(&admin, checkpointed, "restore", json!({"immediate": true}));
+    drop(gate.reached().await);
+    let reply = reply.await.unwrap();
+    assert_eq!(reply.error().code, ErrorCode::Internal);
+    assert!(
+        reply.error().message.contains(reason),
+        "{}",
+        reply.error().message
+    );
+    wait_restore_error(&h, checkpointed, reason).await;
+
+    // Refused by a stopping helper, then the retry is refused for a real
+    // reason before the action looks: that error, not a pending launch.
+    let reason = "the GPU driver changed";
+    h.helper.set_restore_rejection(Some(reason));
+    h.helper.refuse_launches(1);
+    let reply = send_action(&admin, checkpointed, "restore", json!({"immediate": true}));
+    let (launched, release) = gate.reached().await;
+    assert_eq!(launched, checkpointed);
+    wait_restore_error(&h, checkpointed, reason).await;
+    drop(release);
+    let reply = reply.await.unwrap();
+    assert_eq!(reply.error().code, ErrorCode::Internal);
+    assert!(
+        reply.error().message.contains(reason),
+        "{}",
+        reply.error().message
+    );
+
+    // A spawn the helper refuses for a real reason fails the job, and the
+    // action succeeds, retried or not.
+    h.helper.set_spawn_failure(Some("no such directory"));
+    h.helper.refuse_launches(1);
+    let reply = send_action(&admin, queued, "start", json!({}));
+    let (launched, release) = gate.reached().await;
+    assert_eq!(launched, queued);
+    let failed = done(JobResult::FailedToSpawn {
+        reason: "no such directory".to_owned(),
+    });
+    admin.wait_state(queued, &failed).await;
+    drop(release);
+    let reply = reply.await.unwrap();
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(!launch_pending(&reply));
     h.stop().await;
 }
 
