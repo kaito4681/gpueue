@@ -4,7 +4,7 @@
 # alice (1000) and bob (1001) are regular users, carol (1002) is in
 # puzuz-admin.
 #
-# Usage: scenario.sh main | reboot-prepare | reboot-verify
+# Usage: scenario.sh main | reboot-prepare | reboot-verify | lib
 # Prints "PASS <scenario>" / "FAIL <scenario>: <reason>" per scenario and
 # exits non-zero if any failed.
 set -uo pipefail
@@ -777,6 +777,8 @@ main)
     ;;
 reboot-prepare) run "7 reboot (prepare)" s7_prepare ;;
 reboot-verify) run "7 reboot" s7_verify ;;
+# Only defines the helpers above (sourced by scripts/vm/guest.sh).
+lib) ;;
 *) fail "unknown phase $1" ;;
 esac
 
