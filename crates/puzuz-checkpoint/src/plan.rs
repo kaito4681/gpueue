@@ -10,7 +10,9 @@
 //! - Plugin mode: CRIU's CUDA plugin does the CUDA part itself.
 //! - On failure the CUDA steps already taken are undone in reverse
 //!   ([`rollback_plan`]): checkpointed PIDs are restored, then every locked
-//!   PID is unlocked.
+//!   PID is unlocked. After a killed plugin-mode `criu dump`, the CUDA
+//!   processes are resumed according to their queried state
+//!   ([`plugin_dump_rollback`]).
 
 use std::time::Duration;
 
@@ -18,6 +20,7 @@ use crate::command::{
     self, CommandSpec, CriuOptions, CudaAction, CudaCheckpointOptions, CudaMode, DeviceMap,
     DumpTarget, RestoreTarget,
 };
+use crate::probe::CudaState;
 
 /// Stand-in for "no timeout of its own" on a step that is still bounded by
 /// its operation's deadline (see [`Timeouts::operation_deadline`]).
@@ -35,9 +38,9 @@ const GIB: u64 = 1 << 30;
 /// `docs/install.md`, "Checkpoint timeouts"): `criu dump` wrote 14 GiB of
 /// RSS in 18-25 s (up to ~1.8 s/GiB under memory pressure), `criu restore`
 /// read it back in ~9 s from a cold page cache, `cuda-checkpoint` moved
-/// GPU memory at ~0.5 s/GiB (restore ~0.4 s/GiB), and a lock or unlock
-/// took a few milliseconds: about 2-2.5 s per GiB end to end, against the
-/// default deadline's 30 s/GiB + 180 s.
+/// GPU memory at 0.6-1.0 s/GiB (11.8 GiB: 8-10 s; restore 6-8 s), and a
+/// lock or unlock took a few milliseconds: about 1.5-2.5 s per GiB end to
+/// end, against the default deadline's 30 s/GiB + 180 s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timeouts {
     /// Added to the lock `--timeout` to get the outer timeout of a lock.
@@ -93,7 +96,8 @@ impl Timeouts {
     /// CUDA processes: each one restored and unlocked, plus a few seconds
     /// for thawing and the runnable checks.
     pub fn rollback_budget(&self, cuda_pids: usize) -> Duration {
-        let per_pid = self.cuda_restore + self.cuda_unlock;
+        // Plus two state queries in plugin mode ([`plugin_dump_rollback`]).
+        let per_pid = self.cuda_restore + self.cuda_unlock + 2 * CUDA_GET_STATE_TIMEOUT;
         Duration::from_secs(5)
             + per_pid.saturating_mul(u32::try_from(cuda_pids).unwrap_or(u32::MAX))
     }
@@ -134,13 +138,28 @@ pub enum Step {
         command: CommandSpec,
         timeout: Duration,
     },
+    /// Rollback of a CUDA process whose state is not known (CRIU's CUDA
+    /// plugin was killed during a dump): run `get_state` (killed after
+    /// [`CUDA_GET_STATE_TIMEOUT`]) and run `then` (a [`Step::Run`]) if the
+    /// process is in state `when`. Running, locked and checkpointed
+    /// processes in another state are left alone; any other state fails.
+    IfCudaState {
+        pid: u32,
+        get_state: CommandSpec,
+        when: CudaState,
+        then: Box<Step>,
+    },
 }
+
+/// Outer timeout of the `cuda-checkpoint --get-state` of a
+/// [`Step::IfCudaState`].
+pub const CUDA_GET_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Step {
     pub fn action(&self) -> Option<Action> {
         match self {
             Step::Run { action, .. } => Some(*action),
-            Step::EnsureRunnable { .. } | Step::Thaw { .. } => None,
+            Step::EnsureRunnable { .. } | Step::Thaw { .. } | Step::IfCudaState { .. } => None,
         }
     }
 }
@@ -362,6 +381,34 @@ pub fn rollback_plan(
             .iter()
             .map(|&p| cuda_step(cfg, CudaAction::Unlock, p, None)),
     );
+    steps
+}
+
+/// The CUDA part of the rollback after a plugin-mode `criu dump` that was
+/// killed (its deadline, or a signal from elsewhere), to run after the
+/// [`Step::Thaw`] of [`rollback_plan`]. CRIU's CUDA plugin locks and
+/// checkpoints `cuda_pids` inside `criu dump` and resumes them itself when
+/// the dump fails, but not when CRIU is killed: they may then be left
+/// locked or checkpointed, and the job would hang in its next CUDA call.
+/// Their state is queried: checkpointed PIDs are restored, then locked
+/// ones unlocked. Empty in manual mode (the helper's own CUDA steps are
+/// undone by [`rollback_plan`]) or without CUDA PIDs.
+pub fn plugin_dump_rollback(cfg: &CheckpointConfig, cuda_pids: &[u32]) -> Vec<Step> {
+    let pids = dedup(cuda_pids);
+    if cfg.mode != CudaMode::Plugin || pids.is_empty() {
+        return Vec::new();
+    }
+    let when = |state: CudaState, action: CudaAction| {
+        pids.iter().map(move |&pid| Step::IfCudaState {
+            pid,
+            get_state: command::cuda_get_state(&cfg.cuda, pid),
+            when: state,
+            then: Box::new(cuda_step(cfg, action, pid, None)),
+        })
+    };
+    let mut steps = vec![Step::EnsureRunnable { pids: pids.clone() }];
+    steps.extend(when(CudaState::Checkpointed, CudaAction::Restore));
+    steps.extend(when(CudaState::Locked, CudaAction::Unlock));
     steps
 }
 
@@ -676,7 +723,41 @@ pub(crate) mod tests {
         assert_eq!(t.operation_deadline(24 << 30), Duration::from_secs(900));
         assert_eq!(t.operation_deadline(u64::MAX), UNBOUNDED);
         assert_eq!(t.rollback_budget(0), Duration::from_secs(5));
-        assert_eq!(t.rollback_budget(2), Duration::from_secs(5 + 2 * 360));
+        assert_eq!(t.rollback_budget(2), Duration::from_secs(5 + 2 * 420));
+    }
+
+    #[test]
+    fn plugin_dump_rollback_restores_then_unlocks_by_state() {
+        assert!(plugin_dump_rollback(&cfg(CudaMode::Manual), &[1]).is_empty());
+        let c = cfg(CudaMode::Plugin);
+        assert!(plugin_dump_rollback(&c, &[]).is_empty());
+        let rb = plugin_dump_rollback(&c, &[1, 2, 1]);
+        assert_eq!(rb[0], Step::EnsureRunnable { pids: vec![1, 2] });
+        let conds: Vec<_> = rb[1..]
+            .iter()
+            .map(|s| match s {
+                Step::IfCudaState {
+                    pid,
+                    get_state,
+                    when,
+                    then,
+                } => {
+                    let p = pid.to_string();
+                    assert_eq!(get_state.args_lossy(), ["--get-state", "--pid", p.as_str()]);
+                    (*pid, *when, then.action().unwrap())
+                }
+                s => panic!("unexpected {s:?}"),
+            })
+            .collect();
+        assert_eq!(
+            conds,
+            [
+                (1, CudaState::Checkpointed, CudaRestore { pid: 1 }),
+                (2, CudaState::Checkpointed, CudaRestore { pid: 2 }),
+                (1, CudaState::Locked, CudaUnlock { pid: 1 }),
+                (2, CudaState::Locked, CudaUnlock { pid: 2 }),
+            ]
+        );
     }
 
     #[test]

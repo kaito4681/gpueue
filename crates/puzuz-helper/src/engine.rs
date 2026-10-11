@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use puzuz_checkpoint::exec::{Deadline, StepError, run_plan_until, run_with_rollback};
+use puzuz_checkpoint::exec::{Deadline, StepError, run_dump_with_rollback, run_plan_until};
 use puzuz_checkpoint::layout::{
     self, CheckpointDir, CheckpointMeta, DirStatus, GpuMeta, check_compatibility, write_atomic,
 };
@@ -1637,7 +1637,7 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     }
     let deadline = Deadline::after(budget);
     on_deadline(deadline.at + ck.timeouts.rollback_budget(cuda_pids.len()) + OP_SLACK);
-    if let Err(failure) = run_with_rollback(exec, ck, steps, Some(&deadline)) {
+    if let Err(failure) = run_dump_with_rollback(exec, ck, steps, &cuda_pids, Some(&deadline)) {
         let mut reason = failure.to_string();
         if matches!(failure.error, StepError::DeadlineExceeded { .. }) {
             reason = format!(

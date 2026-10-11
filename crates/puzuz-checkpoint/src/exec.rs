@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::command::{CommandSpec, DeviceMap, RestoreTarget};
 use crate::plan::{self, Action, CheckpointConfig, PlanError, Step};
-use crate::probe::{CudaError, classify_cuda_error};
+use crate::probe::{CudaError, CudaState, classify_cuda_error, parse_cuda_state};
 use crate::procfs::{self, Unrunnable};
 
 /// Captured output of a successful step.
@@ -160,6 +160,10 @@ impl std::fmt::Display for PlanFailure {
             Step::EnsureRunnable { .. } => write!(f, "precheck failed: {}", self.error),
             Step::Thaw { root_pid } => write!(f, "resuming {root_pid} failed: {}", self.error),
             Step::Run { command, .. } => write!(f, "`{command}` failed: {}", self.error),
+            Step::IfCudaState { pid, then, .. } => match &**then {
+                Step::Run { command, .. } => write!(f, "`{command}` failed: {}", self.error),
+                _ => write!(f, "resuming CUDA in {pid} failed: {}", self.error),
+            },
         }
     }
 }
@@ -277,6 +281,37 @@ pub fn run_with_rollback<E: Executor + ?Sized>(
     Err(failure)
 }
 
+/// [`run_with_rollback`] for a dump plan ([`plan::dump_plan`]) of a tree
+/// whose CUDA processes are `cuda_pids`. In plugin mode, after a
+/// `criu dump` that was killed and a successful thaw, it also runs
+/// [`plan::plugin_dump_rollback`] (CRIU's CUDA plugin may have left them
+/// locked or checkpointed).
+pub fn run_dump_with_rollback<E: Executor + ?Sized>(
+    exec: &mut E,
+    cfg: &CheckpointConfig,
+    steps: Vec<Step>,
+    cuda_pids: &[u32],
+    deadline: Option<&Deadline>,
+) -> Result<Vec<StepRecord>, Box<PlanFailure>> {
+    let mut failure = match run_with_rollback(exec, cfg, steps, deadline) {
+        Ok(done) => return Ok(done),
+        Err(f) => f,
+    };
+    let criu_killed = matches!(failure.failed.action(), Some(Action::CriuDump { .. }))
+        && failure.error.is_killed();
+    if criu_killed && failure.rolled_back_cleanly() {
+        for step in plan::plugin_dump_rollback(cfg, cuda_pids) {
+            let result = exec.execute(&step);
+            let stop = matches!(step, Step::EnsureRunnable { .. }) && result.is_err();
+            failure.rollback.push(StepRecord { step, result });
+            if stop {
+                break;
+            }
+        }
+    }
+    Err(failure)
+}
+
 /// Why a restore failed.
 #[derive(Debug, thiserror::Error)]
 pub enum RestoreError {
@@ -353,6 +388,37 @@ impl Executor for SystemExecutor {
             Step::Run {
                 command, timeout, ..
             } => run_with_timeout(command, *timeout, self.poll_interval),
+            Step::IfCudaState {
+                pid,
+                get_state,
+                when,
+                then,
+            } => {
+                let out =
+                    run_with_timeout(get_state, plan::CUDA_GET_STATE_TIMEOUT, self.poll_interval)?;
+                match parse_cuda_state(&out.stdout) {
+                    Some(state) if state == *when => self.execute(then),
+                    Some(
+                        state @ (CudaState::Running | CudaState::Locked | CudaState::Checkpointed),
+                    ) => Ok(StepOutput {
+                        stdout: format!("process {pid} is {state:?}"),
+                        stderr: String::new(),
+                    }),
+                    state => Err(StepError::Failed {
+                        code: None,
+                        output: StepOutput {
+                            stderr: format!(
+                                "unexpected CUDA state of process {pid}: {}",
+                                state.map_or_else(
+                                    || out.stdout.trim().to_owned(),
+                                    |s| format!("{s:?}")
+                                )
+                            ),
+                            stdout: out.stdout,
+                        },
+                    }),
+                }
+            }
         }
     }
 }
@@ -677,6 +743,74 @@ mod tests {
             Some(CudaError::OutOfMemory)
         );
         assert!(f.rollback[3..].iter().all(|r| r.result.is_ok()));
+    }
+
+    /// `criu dump` dies of `signal` (or fails on its own when `None`);
+    /// everything else succeeds.
+    struct KilledCriu(Option<i32>, Vec<Step>);
+
+    impl Executor for KilledCriu {
+        fn execute(&mut self, step: &Step) -> Result<StepOutput, StepError> {
+            self.1.push(step.clone());
+            match (step.action(), self.0) {
+                (Some(CriuDump { .. }), Some(signal)) => Err(StepError::Signaled {
+                    signal,
+                    output: StepOutput::default(),
+                }),
+                (Some(CriuDump { .. }), None) => Err(StepError::Failed {
+                    code: Some(1),
+                    output: StepOutput::default(),
+                }),
+                _ => Ok(StepOutput::default()),
+            }
+        }
+    }
+
+    #[test]
+    fn killed_plugin_dump_resumes_cuda_by_state() {
+        let c = cfg(CudaMode::Plugin);
+        let mut ex = KilledCriu(Some(9), Vec::new());
+        let f = run_dump_with_rollback(
+            &mut ex,
+            &c,
+            plan::dump_plan(&c, &dump_target(), &[101]),
+            &[101],
+            None,
+        )
+        .unwrap_err();
+        assert!(f.rolled_back_cleanly());
+        assert_eq!(f.rollback[0].step, Step::Thaw { root_pid: 100 });
+        let rest: Vec<_> = f.rollback[1..].iter().map(|r| r.step.clone()).collect();
+        assert_eq!(rest, plan::plugin_dump_rollback(&c, &[101]));
+        assert_eq!(rest.len(), 3);
+
+        // CRIU failing on its own resumes the devices itself; so does a
+        // manual-mode dump, whose own CUDA steps are rolled back.
+        let mut ex = KilledCriu(None, Vec::new());
+        let f = run_dump_with_rollback(
+            &mut ex,
+            &c,
+            plan::dump_plan(&c, &dump_target(), &[101]),
+            &[101],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(f.rollback.len(), 1);
+        let m = cfg(CudaMode::Manual);
+        let mut ex = KilledCriu(Some(9), Vec::new());
+        let f = run_dump_with_rollback(
+            &mut ex,
+            &m,
+            plan::dump_plan(&m, &dump_target(), &[101]),
+            &[101],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            f.rollback
+                .iter()
+                .all(|r| !matches!(r.step, Step::IfCudaState { .. }))
+        );
     }
 
     #[test]
@@ -1228,5 +1362,29 @@ mod tests {
         assert_eq!(ex.execute(&step).unwrap().stdout, "hi\n");
         let ok = run_plan(&mut ex, vec![step.clone(), step]).unwrap();
         assert_eq!(ok.len(), 2);
+    }
+
+    #[test]
+    fn system_executor_acts_on_cuda_state() {
+        let mut ex = SystemExecutor::default();
+        let cond = |state: &str, when| Step::IfCudaState {
+            pid: 7,
+            get_state: sh(&format!("echo {state}")),
+            when,
+            then: Box::new(Step::Run {
+                action: CudaUnlock { pid: 7 },
+                command: sh("echo unlocked"),
+                timeout: Duration::from_secs(5),
+            }),
+        };
+        let out = ex.execute(&cond("locked", CudaState::Locked)).unwrap();
+        assert_eq!(out.stdout, "unlocked\n");
+        let out = ex.execute(&cond("running", CudaState::Locked)).unwrap();
+        assert_eq!(out.stdout, "process 7 is Running");
+        let err = ex
+            .execute(&cond("restoring", CudaState::Locked))
+            .unwrap_err();
+        assert!(err.to_string().contains("Restoring"), "{err}");
+        assert!(ex.execute(&cond("garbage", CudaState::Locked)).is_err());
     }
 }

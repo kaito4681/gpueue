@@ -88,7 +88,9 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
   its stop timeout up to the end of the running dump's deadline (plus its rollback), and writes
   `shutdown-manifest.json`. Every checkpoint and restore has a deadline that scales with the
   job's size; when it passes, the tool's whole process tree is killed and a checkpoint is rolled
-  back (the job is thawed and its CUDA state restored and unlocked). Paused jobs are dumped too
+  back (the job is thawed and its CUDA state restored and unlocked; in plugin mode, where the
+  killed CRIU's plugin may have left the CUDA processes locked or checkpointed, the helper asks
+  `cuda-checkpoint --get-state` and restores and unlocks them as needed). Paused jobs are dumped too
   (resumed first), and come back paused after `puzuz restore`. Job units are
   `Before=puzuz-helper.service`, so systemd stops them only after the helper has finished. On the
   next boot the daemon gets the results from the helper's replayed events and marks the jobs
