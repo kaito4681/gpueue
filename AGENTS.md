@@ -7,6 +7,8 @@
 - Full-stack e2e (daemon + helper + CLI under systemd in a privileged container, incl. a
   simulated reboot): `scripts/e2e-test.sh` (`PUZUZ_SYSTEMD_BASE=puzuz-poc/systemd259:0.1`
   where apt is offline; `PUZUZ_E2E_GPU=1` with a CUDA base image adds a GPU scenario).
+- Real OS reboot/poweroff in a QEMU/KVM VM (Ubuntu 26.04, CPU jobs; needs /dev/kvm, image cached in
+  the `puzuz-vm-cache` volume): `scripts/vm-reboot-test.sh [reboot|poweroff|inflight]`.
 - Workspace layout:
   - `crates/puzuz` — the `puzuz` binary (pueue-compatible CLI, `puzuz daemon` entry point)
   - `crates/puzuz-core` — domain model, scheduling decisions, authorization, SQLite storage

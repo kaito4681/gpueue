@@ -1,0 +1,55 @@
+#cloud-config
+# Provisioning of the cached VM image of scripts/vm-reboot-test.sh (runs
+# once; run.sh substitutes @SSH_KEY@). Users as in scripts/e2e: alice
+# (1000) and bob (1001) are regular users, carol (1002) is in puzuz-admin
+# (the group is created here; puzuz's sysusers.d entry keeps it).
+hostname: puzuz-vm
+disable_root: false
+ssh_pwauth: false
+groups:
+  - puzuz-admin
+users:
+  - {name: alice, uid: "1000", shell: /bin/bash, lock_passwd: true}
+  - {name: bob, uid: "1001", shell: /bin/bash, lock_passwd: true}
+  - {name: carol, uid: "1002", shell: /bin/bash, lock_passwd: true, groups: [puzuz-admin]}
+write_files:
+  - path: /root/.ssh/authorized_keys
+    permissions: "0600"
+    content: |
+      @SSH_KEY@
+# Plain HTTP (port 80) may be blocked; the image has CA certificates.
+apt:
+  preserve_sources_list: false
+  primary:
+    - arches: [default]
+      uri: https://archive.ubuntu.com/ubuntu
+  security:
+    - arches: [default]
+      uri: https://security.ubuntu.com/ubuntu
+package_update: true
+package_upgrade: false
+packages:
+  - criu
+  - python3
+  - e2fsprogs
+runcmd:
+  # A persistent journal, to read the previous boot's shutdown.
+  - mkdir -p /var/log/journal
+  - systemd-tmpfiles --create --prefix /var/log/journal
+  # Nothing that runs on its own timer during the test, and no cloud-init
+  # on later boots (it would look for a datasource).
+  - systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service motd-news.timer || true
+  - touch /etc/cloud/cloud-init.disabled
+  - apt-get clean
+  - rm -rf /var/lib/apt/lists/*
+  - fstrim -av || true
+  - |
+    if [ -e /proc/sys/kernel/ns_last_pid ] && command -v criu >/dev/null; then
+      echo "PUZUZ-PROVISION-OK kernel $(uname -r), $(criu --version | head -n1), $(systemctl --version | head -n1)" >/dev/ttyS0
+    else
+      echo "PUZUZ-PROVISION-FAILED kernel $(uname -r), ns_last_pid: $(ls /proc/sys/kernel/ns_last_pid 2>&1), criu: $(command -v criu)" >/dev/ttyS0
+    fi
+power_state:
+  mode: poweroff
+  timeout: 120
+  condition: true
