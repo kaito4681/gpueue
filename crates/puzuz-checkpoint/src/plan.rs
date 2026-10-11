@@ -35,8 +35,9 @@ const GIB: u64 = 1 << 30;
 /// `docs/install.md`, "Checkpoint timeouts"): `criu dump` wrote 14 GiB of
 /// RSS in 18-25 s (up to ~1.8 s/GiB under memory pressure), `criu restore`
 /// read it back in ~9 s from a cold page cache, `cuda-checkpoint` moved
-/// GPU memory at ~1 s/GiB on a busy GPU, and a lock or unlock took a few
-/// milliseconds.
+/// GPU memory at ~0.5 s/GiB (restore ~0.4 s/GiB), and a lock or unlock
+/// took a few milliseconds: about 2-2.5 s per GiB end to end, against the
+/// default deadline's 30 s/GiB + 180 s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timeouts {
     /// Added to the lock `--timeout` to get the outer timeout of a lock.

@@ -52,7 +52,7 @@ pub enum StepError {
     },
     /// Killed by a signal it did not get from us (e.g. an OOM kill or an
     /// administrator's `kill -9`).
-    #[error("was killed by signal {signal}: {}", .output.stderr.trim())]
+    #[error("was killed by signal {signal}{}", stderr_suffix(.output))]
     Signaled { signal: i32, output: StepOutput },
     #[error("exited unsuccessfully (code {code:?}): {}", .output.stderr.trim())]
     Failed {
@@ -63,6 +63,14 @@ pub enum StepError {
     Unrunnable { pid: u32, reason: Unrunnable },
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+/// `": <stderr>"`, or nothing when the tool printed nothing.
+fn stderr_suffix(output: &StepOutput) -> String {
+    match output.stderr.trim() {
+        "" => String::new(),
+        e => format!(": {e}"),
+    }
 }
 
 impl StepError {
@@ -1159,7 +1167,7 @@ mod tests {
         let e = run_with_timeout(&sh("kill -9 $$"), Duration::from_secs(10), POLL).unwrap_err();
         assert!(matches!(e, StepError::Signaled { signal: 9, .. }), "{e:?}");
         assert!(e.is_killed());
-        assert!(e.to_string().starts_with("was killed by signal 9"), "{e}");
+        assert_eq!(e.to_string(), "was killed by signal 9");
     }
 
     #[test]

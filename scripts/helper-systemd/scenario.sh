@@ -232,6 +232,123 @@ EOF
     [ "$after" -gt "$before" ] || fail "the restored job did not continue"
     [ -e /var/lib/puzuz/checkpoints/3 ] && fail "the image was not removed after restore"
 
+    say "a dump past its deadline, and a criu killed from outside, leave the job running"
+    # Job 4 holds 2 GiB of random data (so that criu takes a while) and
+    # prints a counter and whether the data is intact.
+    big='import os, time
+b = bytearray(os.urandom(1 << 20)) * 2048
+s = sum(b[::4096])
+i = 0
+while True:
+    print(i, sum(b[::4096]) == s, flush=True)
+    i += 1
+    time.sleep(0.2)'
+    log4=/var/lib/puzuz/logs/1000/4.log
+    client "$(steps <<EOF
+[
+ {"send": {"op": "spawn", "job": 4, "uid": 1000, "gid": 1000, "cwd": "/home/alice",
+           "command": $(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "python3 -c '$big'"),
+           "shell": ["sh", "-c"], "envs": {"PATH": "/usr/bin:/bin"}, "gpus": [],
+           "log_path": "$log4"},
+  "expect": {"result": "spawned"}}
+]
+EOF
+)"
+    for _ in $(seq 100); do [ "$(wc -l <"$log4")" -ge 3 ] && break; sleep 0.2; done
+    # signal_criu <signal>...: in the background, wait for criu to start
+    # and send it the signals, 2 s apart.
+    signal_criu() {
+        (
+            pid=
+            for _ in $(seq 400); do pid=$(pgrep -x criu | head -n1 || true); [ -n "$pid" ] && break; sleep 0.02; done
+            [ -n "$pid" ] || { echo "criu never ran" >&2; exit 1; }
+            for sig in "$@"; do
+                sleep 0.1
+                kill -s "$sig" "$pid"
+                echo "sent SIG$sig to criu ($pid)"
+                sleep 1.7
+            done
+        ) &
+    }
+    # job_runs_on: no criu is left, no process of job 4 is stopped, and the
+    # counter goes on with intact data.
+    job_runs_on() {
+        pgrep -x criu && fail "criu is still running"
+        local cg pid st before after
+        cg=$(systemctl show -p ControlGroup --value puzuz-job-4.service)
+        for pid in $(cat "/sys/fs/cgroup$cg/cgroup.procs"); do
+            st=$(awk '{print $3}' "/proc/$pid/stat")
+            case "$st" in T | t) fail "process $pid of job 4 is stopped ($st)" ;; esac
+        done
+        before=$(wc -l <"$log4")
+        sleep 2
+        after=$(wc -l <"$log4")
+        [ "$after" -gt $((before + 4)) ] || fail "job 4 does not run on ($before -> $after lines)"
+        grep -q ' False$' "$log4" && fail "job 4's data changed"
+        tail -n1 "$log4"
+    }
+
+    # The deadline (here 3 s) passes while criu is stopped: the helper
+    # kills criu's process group, and the job runs on.
+    signal_criu STOP
+    t0=$SECONDS
+    client "$(steps <<'EOF'
+[
+ {"send": {"op": "checkpoint", "job": 4, "image_dir": "/var/lib/puzuz/checkpoints/4",
+           "options": {"timeout_secs": 3}},
+  "expect": {"result": "accepted"}},
+ {"event": {"event": "checkpoint_finished", "job": 4, "outcome": {"result": "failed"}}, "timeout": 60, "ack": true}
+]
+EOF
+)"
+    wait
+    echo "checkpoint failed after $((SECONDS - t0)) s"
+    journalctl -u puzuz-helper.service -o cat | grep 'checkpoint of job 4 failed' | tail -n1
+    journalctl -u puzuz-helper.service -o cat | grep 'checkpoint of job 4 failed' | tail -n1 \
+        | grep -q 'did not finish within its deadline of 3s.*the job was resumed' \
+        || fail "no deadline error for job 4"
+    job_runs_on
+    [ -e /var/lib/puzuz/checkpoints/4 ] && fail "the failed image of job 4 was kept"
+
+    # criu is SIGKILLed by someone else in the middle of the dump.
+    signal_criu STOP KILL
+    client "$(steps <<'EOF'
+[
+ {"send": {"op": "checkpoint", "job": 4, "image_dir": "/var/lib/puzuz/checkpoints/4"},
+  "expect": {"result": "accepted"}},
+ {"event": {"event": "checkpoint_finished", "job": 4, "outcome": {"result": "failed"}}, "timeout": 60, "ack": true}
+]
+EOF
+)"
+    wait
+    journalctl -u puzuz-helper.service -o cat | grep 'checkpoint of job 4 failed' | tail -n1 \
+        | grep -q 'was killed by signal 9.*the job was resumed' \
+        || fail "no killed-criu error for job 4"
+    job_runs_on
+
+    # And it can still be checkpointed and restored.
+    client "$(steps <<'EOF'
+[
+ {"send": {"op": "checkpoint", "job": 4, "image_dir": "/var/lib/puzuz/checkpoints/4"},
+  "expect": {"result": "accepted"}},
+ {"event": {"event": "checkpoint_finished", "job": 4, "outcome": {"result": "success"}}, "timeout": 120, "ack": true},
+ {"send": {"op": "restore", "job": 4, "uid": 1000, "image_dir": "/var/lib/puzuz/checkpoints/4", "gpus": []},
+  "expect": {"result": "accepted"}},
+ {"event": {"event": "restore_finished", "job": 4, "outcome": {"result": "success"}}, "timeout": 120, "ack": true},
+ {"sleep": 1.5},
+ {"send": {"op": "signal", "job": 4, "signal": 15}, "expect": {"result": "ok"}},
+ {"event": {"event": "job_exited", "job": 4, "status": {"kind": "signaled", "signal": 15}}, "ack": true}
+]
+EOF
+)"
+    grep -q ' False$' "$log4" && fail "job 4's data changed across checkpoint/restore"
+    python3 - "$log4" <<'PY' || fail "the counter of job 4 has gaps or repeats"
+import sys
+nums = [int(l.split()[0]) for l in open(sys.argv[1]) if l.split() and l.split()[0].isdigit()]
+assert nums[0] == 0 and all(b == a + 1 for a, b in zip(nums, nums[1:])), nums[-5:]
+print(f"job 4: {len(nums)} steps without gaps")
+PY
+
     say "checkpoints, then restores and spawns at once"
     counter='i=0; while :; do echo $i; i=$((i+1)); sleep 0.2; done'
     # Restores of 150..153, each followed by two spawns and a list_running.
