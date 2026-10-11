@@ -7,11 +7,17 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+/// CRIU's built-in plugin directory (`CR_PLUGIN_DEFAULT`), used when no
+/// `-L` is given.
+pub const DEFAULT_CRIU_PLUGIN_DIR: &str = "/usr/lib/criu";
+/// File name of CRIU's CUDA plugin (built with `make cuda_plugin`).
+pub const CUDA_PLUGIN_FILE: &str = "cuda_plugin.so";
 
 /// How GPU state is handled during a checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -153,6 +159,14 @@ impl Default for CriuOptions {
 }
 
 impl CriuOptions {
+    /// Where CRIU looks for `cuda_plugin.so` in plugin mode.
+    pub fn cuda_plugin_path(&self) -> PathBuf {
+        self.plugin_dir
+            .as_deref()
+            .unwrap_or(Path::new(DEFAULT_CRIU_PLUGIN_DIR))
+            .join(CUDA_PLUGIN_FILE)
+    }
+
     fn push_common(&self, cmd: &mut CommandSpec, mode: CudaMode) {
         cmd.arg(format!("-v{}", self.log_level.min(4)));
         if self.external_mounts {

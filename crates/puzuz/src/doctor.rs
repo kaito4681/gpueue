@@ -6,8 +6,9 @@ use std::io::{self, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
+use puzuz_checkpoint::command::{CUDA_PLUGIN_FILE, DEFAULT_CRIU_PLUGIN_DIR};
 use puzuz_checkpoint::probe::{Version, parse_criu_version, parse_cuda_checkpoint_help};
-use puzuz_daemon::config::{Config, DEFAULT_CONFIG_PATH, GpuDetection};
+use puzuz_daemon::config::{Config, CudaCheckpointMode, DEFAULT_CONFIG_PATH, GpuDetection};
 use puzuz_protocol::api::{CheckpointStorage, GpuDetectionStatus, GpuSource, VersionResponse};
 
 use crate::service::{ADMIN_GROUP, DAEMON_UNIT, HELPER_UNIT, TMPFILES_PATH, UNIT_DIR};
@@ -248,6 +249,9 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
         &config.cuda_checkpoint_path,
         driver.as_ref().ok(),
     ));
+    if config.cuda_checkpoint_mode == CudaCheckpointMode::Plugin {
+        checks.push(check_cuda_plugin(sys, driver.is_ok()));
+    }
     if driver.is_ok() {
         let detection = daemon.as_ref().ok().and_then(|v| v.gpu_detection.as_ref());
         checks.push(check_gpus(sys, &config, detection));
@@ -343,6 +347,35 @@ fn check_driver(driver: &Result<Version, String>) -> Check {
             "install the NVIDIA driver (r570 or newer for cuda-checkpoint) if this host has GPUs",
         ),
     }
+}
+
+/// `cuda_checkpoint_mode = "plugin"`: CRIU needs its CUDA plugin in its
+/// built-in plugin directory (the helper passes no `-L` then).
+fn check_cuda_plugin(sys: &dyn System, have_driver: bool) -> Check {
+    const NAME: &str = "cuda plugin";
+    let path = Path::new(DEFAULT_CRIU_PLUGIN_DIR).join(CUDA_PLUGIN_FILE);
+    if sys.path(&path).is_file() {
+        return Check::ok(NAME, path.display().to_string());
+    }
+    let level = if have_driver {
+        Level::Fail
+    } else {
+        Level::Warn
+    };
+    Check::new(
+        level,
+        NAME,
+        format!(
+            "cuda_checkpoint_mode is \"plugin\" but {} is missing; GPU jobs cannot be \
+             checkpointed",
+            path.display()
+        ),
+    )
+    .hint(format!(
+        "build CRIU with `make criu cuda_plugin` and install plugins/cuda/{CUDA_PLUGIN_FILE} \
+         into {DEFAULT_CRIU_PLUGIN_DIR}, or set cuda_checkpoint_mode = \"manual\" in \
+         {DEFAULT_CONFIG_PATH}"
+    ))
 }
 
 fn check_cuda_checkpoint(sys: &dyn System, configured: &Path, driver: Option<&Version>) -> Check {

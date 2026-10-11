@@ -26,8 +26,11 @@
 #   PUZUZ_E2E_GPU=1     also run the GPU scenarios (9: a
 #                       GPU counter, 11: PyTorch training with forked
 #                       DataLoader workers, both checkpointed and restored;
-#                       12: NVML detection in the packaged puzuz.service
-#                       with gpu_detection = "auto") on GPU 0
+#                       14: both paused before the checkpoint, and pause
+#                       during a GPU dump; 12: NVML detection in the
+#                       packaged puzuz.service with gpu_detection = "auto";
+#                       the reboot scenario 7 also dumps a running and a
+#                       paused CUDA counter) on GPU 0
 #                       (`docker run --gpus all`; the base image needs CUDA,
 #                       torch in /opt/venv and cuda-checkpoint, e.g.
 #                       puzuz-poc/criu-cuda-systemd:0.1, with
@@ -37,6 +40,12 @@
 #                       container's /run tmpfs there; the shim removes such
 #                       hidden mounts from each job's namespace (see
 #                       crates/puzuz-helper/src/mounts.rs).
+#   PUZUZ_E2E_CUDA_MODE=plugin  run the helper with
+#                       cuda_checkpoint_mode = "plugin" (CRIU's cuda_plugin.so
+#                       drives cuda-checkpoint) instead of the default
+#                       "manual"; the image's criu must have the plugin in
+#                       its plugin directory (puzuz-poc/criu-cuda-systemd:0.1
+#                       has /usr/lib/criu/cuda_plugin.so from CRIU 4.2.1).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -55,7 +64,7 @@ if [ "${PUZUZ_E2E_ONLY_REBOOT:-}" = 1 ]; then only="${only:+$only }7"; fi
 only="${only//,/ }"
 # selected <n>: whether scenario <n> runs.
 selected() { [ -z "$only" ] || [[ " $only " == *" $1 "* ]]; }
-gpu_env+=(-e "PUZUZ_E2E_ONLY=$only")
+gpu_env+=(-e "PUZUZ_E2E_ONLY=$only" -e "PUZUZ_E2E_CUDA_MODE=${PUZUZ_E2E_CUDA_MODE:-}")
 
 if [ "${PUZUZ_E2E_SKIP_BUILD:-}" != 1 ]; then
     "$root/scripts/test-in-docker.sh" build -p puzuz -p puzuz-helper

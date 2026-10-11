@@ -38,8 +38,8 @@ Install the distribution's package (for example `sudo apt install criu`) or buil
 plugins. The distribution package works for this, even though it ships without CRIU's CUDA plugin.
 
 The **plugin** mode (`cuda_checkpoint_mode = "plugin"`) lets CRIU's CUDA plugin (`cuda_plugin.so`,
-CRIU 4.0 or newer, usually built from source) drive cuda-checkpoint. It is optional and has not
-been tested with puzuz yet.
+CRIU 4.0 or newer) drive cuda-checkpoint instead. It is optional; see
+[CUDA plugin mode](#cuda-plugin-mode).
 
 ### cuda-checkpoint
 
@@ -307,6 +307,51 @@ unlimited).
 
   Move or restore existing checkpoints before you change the path.
 
+## CUDA plugin mode
+
+By default (`cuda_checkpoint_mode = "manual"`) the helper runs cuda-checkpoint itself (`lock`,
+`checkpoint`, then `criu dump`; `criu restore`, then `restore` and `unlock`) and points CRIU at an
+empty plugin directory. In plugin mode it runs only `criu`, and CRIU's CUDA plugin calls
+cuda-checkpoint at the right moments of the dump and the restore. To enable it:
+
+1. Build CRIU 4.0 or newer with the plugin (puzuz is tested with 4.2.1) and install the plugin in
+   CRIU's built-in plugin directory `/usr/lib/criu`. In plugin mode the helper passes no `-L`, so
+   CRIU looks there.
+
+   ```sh
+   git clone --branch v4.2.1 https://github.com/checkpoint-restore/criu && cd criu
+   make -j criu cuda_plugin
+   sudo install -m 0755 criu/criu /usr/local/sbin/criu
+   sudo install -D -m 0755 plugins/cuda/cuda_plugin.so /usr/lib/criu/cuda_plugin.so
+   ```
+
+2. Put cuda-checkpoint in `/usr/local/bin` (or elsewhere on the default `PATH` of systemd
+   services). The plugin runs `cuda-checkpoint` by name and ignores `cuda_checkpoint_path`.
+3. Set `cuda_checkpoint_mode = "plugin"` in `/etc/puzuz/config.toml`, run
+   `sudo systemctl restart puzuz-helper.service`, and check with `puzuz doctor` (the `cuda plugin`
+   line).
+
+Each image records its mode in `meta.json` and is restored in that mode, so existing checkpoints
+survive a change of `cuda_checkpoint_mode`. Restoring a plugin-mode image needs the plugin, so
+keep it installed until those images are restored. If the plugin is missing, the helper refuses to
+dump CUDA jobs in plugin mode (they keep running) instead of letting the dump fail. CPU-only jobs
+do not need it.
+
+Trade-offs:
+
+| | manual (default) | plugin |
+| --- | --- | --- |
+| CRIU | any CRIU 4.2 or newer, including distribution packages without the plugin | CRIU built with `cuda_plugin.so` |
+| GPU on restore | same model and driver; a different card of the same model is remapped (`--device-map`) | same model and driver, and the same GPU UUIDs (CRIU 4.2.1's plugin cannot remap) |
+| Timeouts | per cuda-checkpoint step (lock, checkpoint, restore, unlock), plus the CRIU timeouts | only the CRIU timeouts (`criu_dump_timeout_secs`, `criu_restore_timeout_secs`); how long cuda-checkpoint may take is up to the plugin |
+| Failure handling | the helper rolls back (restores and unlocks) the CUDA steps it took | CRIU's plugin resumes the processes when the dump fails |
+
+Both modes behave the same for users. In both, the fork guard is what makes PyTorch DataLoader
+workers forked from a CUDA process checkpointable: without it, plugin mode fails on them as well
+(`handle_device_vma plugin failed`, `Can't handle non-regular mapping`). The guard is preloaded
+into every job regardless of the mode. Paused jobs are resumed for the dump in both modes, because
+cuda-checkpoint hangs on a stopped process.
+
 ## Upgrading
 
 ```sh
@@ -382,6 +427,7 @@ stopped until `sudo systemctl start puzuz` or the next boot.
 | `criu` | not found, or too old | install CRIU 4.2 or newer, or set `criu_path` |
 | `cuda-checkpoint` | not found, or lacks `--action lock/checkpoint/restore/unlock` | install the binary for a driver of r570 or newer into `/usr/local/bin` |
 | `cuda-checkpoint` | version X but the driver is Y | use the cuda-checkpoint that matches the driver's major version |
+| `cuda plugin` | `cuda_checkpoint_mode` is `"plugin"` but `/usr/lib/criu/cuda_plugin.so` is missing | install the plugin (see [CUDA plugin mode](#cuda-plugin-mode)) or use the manual mode |
 | `gpus` | nvidia-smi lists N GPU(s), the configuration M | update `[[gpus]]` (see [GPU detection](#gpu-detection)) |
 | `kernel` | lacks `/proc/sys/kernel/ns_last_pid` | use a kernel with `CONFIG_CHECKPOINT_RESTORE=y` |
 | `puzuz.service`, `puzuz-helper.service` | not installed / not active | `sudo puzuz service install`, or `sudo systemctl start <unit>` and read `journalctl -u <unit>` |
@@ -406,6 +452,11 @@ warned on their next command. Refusals:
   restored. Run the job again (`puzuz restart`). New jobs get a cleaned-up namespace.
 - Mounts covering `/` itself cannot be handled. puzuz refuses such dumps.
 - `<dir> is on tmpfs`: move `checkpoints_dir` to a disk.
+- `cuda_checkpoint_mode is "plugin" but CRIU's CUDA plugin ... is missing`: install the plugin
+  (see [CUDA plugin mode](#cuda-plugin-mode)) or switch to the manual mode.
+
+A paused job that is checkpointed is resumed for the dump. If the dump is refused, it is paused
+again.
 
 A dump that is attempted and **fails** stops the job (SIGTERM, then SIGKILL after `grace_secs`),
 because CRIU and cuda-checkpoint have already frozen it. The job is marked `Checkpoint failed`

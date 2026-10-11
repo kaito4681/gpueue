@@ -13,6 +13,12 @@ if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
 else
     install -m 0644 /e2e/config.toml /etc/puzuz/config.toml
 fi
+if [ -n "${PUZUZ_E2E_CUDA_MODE:-}" ]; then
+    # Top-level key: prepend it, before any [[gpus]] table.
+    { echo "cuda_checkpoint_mode = \"$PUZUZ_E2E_CUDA_MODE\""; cat /etc/puzuz/config.toml; } >/etc/puzuz/config.toml.new
+    mv /etc/puzuz/config.toml.new /etc/puzuz/config.toml
+    chmod 0644 /etc/puzuz/config.toml
+fi
 # Exits non-zero when its final checks warn (e.g. no GPUs); the state of
 # the services is checked below.
 /e2e/bin/puzuz service install --bin-dir /usr/local/bin || true

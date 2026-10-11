@@ -752,3 +752,17 @@ fn byte_formatting() {
     assert_eq!(format_bytes(1536), "1.5 KiB");
     assert_eq!(format_bytes(20 << 30), "20.0 GiB");
 }
+
+#[test]
+fn plugin_mode_needs_the_cuda_plugin() {
+    let (sys, _listeners) = healthy();
+    assert!(run(&sys, None).find("cuda plugin").is_none(), "manual mode");
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!("cuda_checkpoint_mode = \"plugin\"\n{CONFIG}"),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "cuda plugin"), Level::Fail, "{report:#?}");
+    sys.write("/usr/lib/criu/cuda_plugin.so", "");
+    assert_eq!(level(&run(&sys, None), "cuda plugin"), Level::Ok);
+}

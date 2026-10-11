@@ -1093,7 +1093,12 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         }
         let unit = record.unit.clone();
         let _ = fs::remove_file(dir.restore_pidfile());
-        let ck = self.cfg.checkpoint.clone();
+        // Restore in the mode the image was dumped in, even if the
+        // configuration changed since: a plugin-mode image needs CRIU's
+        // CUDA plugin, a manual-mode one the helper's CUDA steps (and no
+        // plugin).
+        let mut ck = self.cfg.checkpoint.clone();
+        ck.mode = meta.mode;
         let target = RestoreTarget {
             images_dir: dir.images_dir(),
             log_file: dir.restore_log(),
@@ -1411,6 +1416,18 @@ pub fn dump_job<H: HostProbe + ?Sized>(
                 cuda_pids.push(p.host_pid);
                 meta.cuda_ns_pids.push(p.ns_pid);
             }
+        }
+    }
+    // Without its CUDA plugin CRIU cannot dump the NVIDIA device mappings
+    // and the failed dump would end the job; refuse instead.
+    if ck.mode == CudaMode::Plugin && !cuda_pids.is_empty() {
+        let plugin = ck.criu.cuda_plugin_path();
+        if !plugin.is_file() {
+            return Err(DumpError::Refused(format!(
+                "cuda_checkpoint_mode is \"plugin\" but CRIU's CUDA plugin {} is missing; \
+                 install it or use the manual mode",
+                plugin.display()
+            )));
         }
     }
 

@@ -47,6 +47,8 @@ struct Env {
     exec: Arc<Mutex<FakeExecState>>,
     helper: Arc<TestHelper>,
     stop: watch::Sender<bool>,
+    /// `cuda_checkpoint_mode` of the helper (taken by [`Env::restart`]).
+    mode: CudaMode,
 }
 
 impl Env {
@@ -68,6 +70,7 @@ impl Env {
             launcher.clone(),
             host.clone(),
             exec.clone(),
+            CudaMode::Manual,
         )
         .await;
         Self {
@@ -78,6 +81,7 @@ impl Env {
             exec,
             helper,
             stop,
+            mode: CudaMode::Manual,
         }
     }
 
@@ -90,6 +94,7 @@ impl Env {
             self.launcher.clone(),
             self.host.clone(),
             self.exec.clone(),
+            self.mode,
         )
         .await;
         self.helper = helper;
@@ -149,10 +154,14 @@ async fn start(
     launcher: Arc<FakeLauncher>,
     host: Arc<FakeHost>,
     exec: Arc<Mutex<FakeExecState>>,
+    mode: CudaMode,
 ) -> (Arc<TestHelper>, watch::Sender<bool>) {
     let factory: ExecutorFactory =
         Arc::new(move || Box::new(FakeExecutor(exec.clone())) as Box<dyn Executor + Send>);
-    let cfg = config(root, daemon_uid);
+    let mut cfg = config(root, daemon_uid);
+    cfg.checkpoint.mode = mode;
+    // CRIU's plugins, for the plugin mode (empty unless a test adds one).
+    cfg.checkpoint.criu.plugin_dir = Some(root.join("criu-plugins"));
     let socket = cfg.socket_path.clone();
     let helper = Helper::new(cfg, launcher, host, factory).unwrap();
     helper.recover().await.unwrap();
@@ -616,6 +625,177 @@ async fn checkpoint_then_restore() {
     // Once it exits, it is reported like any other job.
     env.launcher.exit(job, ExitStatus::Exited { code: 0 });
     assert!(matches!(c.event().await.event, Event::JobExited { .. }));
+}
+
+/// An image is restored in the CUDA mode it was dumped in, even after
+/// `cuda_checkpoint_mode` changed: a plugin-mode image with CRIU's plugin
+/// directory and no CUDA steps of the helper, a manual-mode one with the
+/// empty plugin directory and the helper's restore/unlock.
+#[tokio::test]
+async fn restore_uses_the_mode_of_the_image() {
+    for (dumped, now) in [
+        (CudaMode::Plugin, CudaMode::Manual),
+        (CudaMode::Manual, CudaMode::Plugin),
+    ] {
+        let mut env = Env::new().await;
+        env.mode = dumped;
+        env.restart().await;
+        let plugins = env.root.join("criu-plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::write(plugins.join("cuda_plugin.so"), b"").unwrap();
+        let mut c = env.client().await;
+        let job = JobId(5);
+        assert!(matches!(
+            c.request(Request::Spawn(env.spawn_req(5))).await,
+            ResponseResult::Spawned { .. }
+        ));
+        env.host.set_cuda_pids(vec![10_001]);
+        let image_dir = env.base().join("5");
+        let r = c
+            .request(Request::Checkpoint {
+                job,
+                image_dir: image_dir.clone(),
+                options: Default::default(),
+            })
+            .await;
+        assert_eq!(r, ResponseResult::Accepted);
+        let ev = c.event().await;
+        assert!(
+            matches!(
+                ev.event,
+                Event::CheckpointFinished {
+                    outcome: CheckpointOutcome::Success { .. },
+                    ..
+                }
+            ),
+            "{ev:?}"
+        );
+        let DirStatus::Complete(meta) = CheckpointDir::for_job(&env.base(), 5).status() else {
+            panic!("no image")
+        };
+        assert_eq!(meta.mode, dumped);
+        assert_eq!(
+            c.request(Request::AckEvents { up_to: ev.seq }).await,
+            ResponseResult::Ok
+        );
+        drop(c);
+
+        env.mode = now;
+        env.restart().await;
+        let mut c = env.client().await;
+        env.exec.lock().unwrap().actions.clear();
+        let r = c
+            .request(Request::Restore(RestoreRequest {
+                job,
+                uid: Uid(uid()),
+                image_dir,
+                gpus: vec![GpuIndex(0)],
+            }))
+            .await;
+        assert_eq!(r, ResponseResult::Accepted);
+        let ev = c.event().await;
+        assert!(
+            matches!(
+                ev.event,
+                Event::RestoreFinished {
+                    outcome: RestoreOutcome::Success { .. },
+                    ..
+                }
+            ),
+            "{ev:?}"
+        );
+        let manual = dumped == CudaMode::Manual;
+        let restored = env.launcher.restored();
+        let plugin_dir = if manual {
+            env.helper.config().checkpoint.criu.empty_plugin_dir.clone()
+        } else {
+            plugins
+        };
+        assert_eq!(
+            restored[0].command.value_of("-L"),
+            Some(plugin_dir.as_os_str()),
+            "plugin directory of a {dumped:?} image"
+        );
+        let cuda_steps = env
+            .exec
+            .lock()
+            .unwrap()
+            .actions
+            .iter()
+            .any(|a| matches!(a, Some(Action::CudaRestore { .. })));
+        assert_eq!(cuda_steps, manual, "CUDA steps of a {dumped:?} image");
+    }
+}
+
+/// In plugin mode a CUDA job is not dumped without CRIU's CUDA plugin
+/// (the dump would fail and end the job): the dump is refused and the job
+/// keeps running. A job without CUDA does not need the plugin.
+#[tokio::test]
+async fn plugin_mode_refuses_to_dump_cuda_jobs_without_the_plugin() {
+    let mut env = Env::new().await;
+    env.mode = CudaMode::Plugin;
+    env.restart().await;
+    let mut c = env.client().await;
+    for job in [6, 7] {
+        assert!(matches!(
+            c.request(Request::Spawn(env.spawn_req(job))).await,
+            ResponseResult::Spawned { .. }
+        ));
+    }
+    env.host.set_cuda_pids(vec![10_001]);
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(6),
+            image_dir: env.base().join("6"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    let Event::CheckpointFinished {
+        outcome: CheckpointOutcome::Failed { reason, code },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert_eq!(code, Some(HelperErrorCode::CheckpointRefused), "{reason}");
+    assert!(reason.contains("cuda_plugin.so"), "{reason}");
+    assert!(
+        !env.exec
+            .lock()
+            .unwrap()
+            .actions
+            .iter()
+            .any(|a| matches!(a, Some(Action::CriuDump { .. }))),
+        "criu ran"
+    );
+    assert!(
+        c.running()
+            .await
+            .contains(&(JobId(6), RunningPhase::Running))
+    );
+
+    env.host.set_cuda_pids(Vec::new());
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(7),
+            image_dir: env.base().join("7"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::CheckpointFinished {
+                outcome: CheckpointOutcome::Success { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
 }
 
 #[tokio::test]
