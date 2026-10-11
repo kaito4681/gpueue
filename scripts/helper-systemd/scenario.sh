@@ -55,17 +55,32 @@ EOF
     exit 0
 fi
 
-say "install"
-install -m 0755 /e2e/puzuz-helper /usr/bin/puzuz-helper
-mkdir -p /etc/sysusers.d /etc/tmpfiles.d
-install -m 0644 /e2e/packaging/systemd/puzuz-helper.service /etc/systemd/system/
-install -m 0644 /e2e/packaging/sysusers.d/puzuz.conf /etc/sysusers.d/
-install -m 0644 /e2e/packaging/tmpfiles.d/puzuz.conf /etc/tmpfiles.d/
-systemd-sysusers
-systemd-tmpfiles --create /etc/tmpfiles.d/puzuz.conf
-systemctl daemon-reload
-systemctl start puzuz-helper.service
-systemctl is-active puzuz-helper.service
+install_helper() {
+    say "install"
+    install -m 0755 /e2e/puzuz-helper /usr/bin/puzuz-helper
+    mkdir -p /etc/sysusers.d /etc/tmpfiles.d
+    install -m 0644 /e2e/packaging/systemd/puzuz-helper.service /etc/systemd/system/
+    install -m 0644 /e2e/packaging/sysusers.d/puzuz.conf /etc/sysusers.d/
+    install -m 0644 /e2e/packaging/tmpfiles.d/puzuz.conf /etc/tmpfiles.d/
+    systemd-sysusers
+    systemd-tmpfiles --create /etc/tmpfiles.d/puzuz.conf
+    systemctl daemon-reload
+    systemctl start puzuz-helper.service
+    systemctl is-active puzuz-helper.service
+}
+
+if [ "${1:-}" = gpu ]; then
+    # GPU-only run (PUZUZ_HELPER_GPU=1, see scripts/helper-systemd-test.sh).
+    mkdir -p /etc/puzuz
+    echo "cuda_checkpoint_mode = \"${PUZUZ_HELPER_CUDA_MODE:-manual}\"" >/etc/puzuz/config.toml
+    install_helper
+    # shellcheck source=gpu.sh
+    . /e2e/gpu.sh
+    say "ALL OK"
+    exit 0
+fi
+
+install_helper
 
 LOG1=/var/lib/puzuz/logs/1000/1.log
 say "spawn a job, collect its exit code, check namespace and credentials"

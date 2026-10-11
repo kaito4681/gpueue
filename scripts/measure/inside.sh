@@ -5,12 +5,21 @@
 # criu restore, CUDA restore, unlock - the same commands the helper runs in
 # manual mode - once restoring from a warm page cache and once after
 # evicting the image from the page cache. Prints one CSV line per cycle.
+#
+# MODE=plugin instead lets CRIU's CUDA plugin do the CUDA part: the lock and
+# checkpoint are then inside the criu dump time and the CUDA restore and
+# unlock inside the criu restore time (their own columns print "-").
 set -euo pipefail
 DATA=${DATA:-/data}
-EMPTY=$DATA/no-plugins
-mkdir -p "$EMPTY"
+MODE=${MODE:-manual}
 PY=/opt/venv/bin/python3
-CRIU_COMMON=(-v4 --tcp-close -L "$EMPTY")
+CRIU_COMMON=(-v4 --tcp-close)
+if [ "$MODE" = manual ]; then
+    EMPTY=$DATA/no-plugins
+    mkdir -p "$EMPTY"
+    CRIU_COMMON+=(-L "$EMPTY")
+fi
+cuda_manual() { [ "$vram" != 0 ] && [ "$MODE" = manual ]; }
 
 now() { date +%s.%N; }
 dt() { python3 -c "print(f'{$2-$1:.2f}')"; }
@@ -58,7 +67,7 @@ EOF2
 }
 last_step() { grep -c '^step ' "$1" || true; }
 
-echo "case,cycle,cache,rss_gb,vram_gb,lock_s,cuda_ckpt_s,criu_dump_s,image_gb,criu_restore_s,cuda_restore_s,unlock_s,cached_pct_before_restore,ok"
+echo "mode,case,cycle,cache,rss_gb,vram_gb,lock_s,cuda_ckpt_s,criu_dump_s,image_gb,criu_restore_s,cuda_restore_s,unlock_s,cached_pct_before_restore,ok"
 for c in "$@"; do
     vram=${c%%:*}
     ram=${c##*:}
@@ -80,7 +89,7 @@ for c in "$@"; do
         img=$run/img-$cycle
         mkdir -p "$img"
         lock=- ck=- res=- unl=-
-        if [ "$vram" != 0 ]; then
+        if cuda_manual; then
             t0=$(now); cuda-checkpoint --action lock --pid "$pid" --timeout 30000; t1=$(now)
             cuda-checkpoint --action checkpoint --pid "$pid"; t2=$(now)
             lock=$(dt "$t0" "$t1"); ck=$(dt "$t1" "$t2")
@@ -99,7 +108,7 @@ for c in "$@"; do
         t5=$(now)
         rst=$(dt "$t4" "$t5")
         pid=$(cat "$run/pid-$cycle")
-        if [ "$vram" != 0 ]; then
+        if cuda_manual; then
             cuda-checkpoint --action restore --pid "$pid"; t6=$(now)
             cuda-checkpoint --action unlock --pid "$pid"; t7=$(now)
             res=$(dt "$t5" "$t6"); unl=$(dt "$t6" "$t7")
@@ -108,7 +117,7 @@ for c in "$@"; do
         for _ in $(seq 100); do [ "$(last_step "$run/job.log")" -ge $((before + 3)) ] && break; sleep 0.2; done
         ok=bad
         if [ "$(last_step "$run/job.log")" -ge $((before + 3)) ] && ! grep -q ' ok 0$' "$run/job.log"; then ok=ok; fi
-        echo "$vram:$ram,$cycle,$cache,$rss,$used,$lock,$ck,$dump,$size,$rst,$res,$unl,$cached,$ok"
+        echo "$MODE,$vram:$ram,$cycle,$cache,$rss,$used,$lock,$ck,$dump,$size,$rst,$res,$unl,$cached,$ok"
         rm -rf "$img"
     done
     kill -9 "$pid" 2>/dev/null || true

@@ -337,8 +337,11 @@ scripts/helper-systemd-test.sh    # the helper alone under systemd
 ```
 
 `scripts/e2e-test.sh` documents its environment variables at the top, for example
-`PUZUZ_E2E_ONLY`, and `PUZUZ_E2E_GPU=1` for the GPU scenarios. None of the scripts run anything
-privileged on the host.
+`PUZUZ_E2E_ONLY`, and `PUZUZ_E2E_GPU=1` for the GPU scenarios. `PUZUZ_HELPER_GPU=1
+scripts/helper-systemd-test.sh` (with a CUDA base image, see the script) forces GPU checkpoints
+past their deadline and kills `criu` / `cuda-checkpoint` mid-dump, in either
+`PUZUZ_HELPER_CUDA_MODE`. `scripts/measure-checkpoint.sh` measures how long each checkpoint step
+takes. None of the scripts run anything privileged on the host.
 
 ## License
 

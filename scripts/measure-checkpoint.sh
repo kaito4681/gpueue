@@ -18,6 +18,9 @@
 #                        than squeezing the host
 #   PUZUZ_MEASURE_CYCLES dump/restore cycles per case, alternating warm and
 #                        cold page cache for the restore (default 2)
+#   PUZUZ_MEASURE_MODE   cuda_checkpoint_mode to mimic: manual (default) or
+#                        plugin (CRIU's CUDA plugin does the CUDA part, so
+#                        it is counted in the criu dump / restore times)
 #   PUZUZ_MEASURE_NAME   container/volume name (default puzuz-measure-$$)
 set -euo pipefail
 
@@ -35,5 +38,5 @@ trap cleanup EXIT
 docker volume create "$name" >/dev/null
 docker run --rm --name "$name" "${gpu_args[@]}" --privileged \
     --memory "${PUZUZ_MEASURE_MEMORY:-7g}" --memory-swap "${PUZUZ_MEASURE_MEMORY:-7g}" \
-    -e CYCLES="${PUZUZ_MEASURE_CYCLES:-2}" -v "$root/scripts/measure":/m:ro -v "$name":/data \
+    -e CYCLES="${PUZUZ_MEASURE_CYCLES:-2}" -e MODE="${PUZUZ_MEASURE_MODE:-manual}" -v "$root/scripts/measure":/m:ro -v "$name":/data \
     --entrypoint /bin/bash "$image" /m/inside.sh "$@"

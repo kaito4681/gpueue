@@ -8,11 +8,26 @@
 # privileged because systemd, namespaces and criu need it.
 #
 # Usage: scripts/helper-systemd-test.sh [--keep]
+# Environment:
+#   PUZUZ_SYSTEMD_BASE   base image (see below)
+#   PUZUZ_SYSTEMD_IMAGE  tag of the test image (default puzuz-helper-systemd:test)
+#   PUZUZ_HELPER_NAME    container name (default puzuz-helper-e2e-<pid>)
+#   PUZUZ_HELPER_GPU=1   instead of the CPU scenarios, run the GPU
+#                        forced-timeout scenario (scripts/helper-systemd/gpu.sh)
+#                        with `docker run --gpus all`: a CUDA training job whose
+#                        dump is forced past its deadline or killed (criu and
+#                        cuda-checkpoint) must be resumed with its CUDA state
+#                        restored and unlocked. The base image needs CUDA, torch
+#                        in /opt/venv and cuda-checkpoint, e.g.
+#                        PUZUZ_SYSTEMD_BASE=puzuz-poc/criu-cuda-systemd:0.1 with
+#                        a different PUZUZ_SYSTEMD_IMAGE tag.
+#   PUZUZ_HELPER_CUDA_MODE=plugin  run the GPU scenario with
+#                        cuda_checkpoint_mode = "plugin" (default manual)
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 image="${PUZUZ_SYSTEMD_IMAGE:-puzuz-helper-systemd:test}"
-name="puzuz-helper-e2e-$$"
+name="${PUZUZ_HELPER_NAME:-puzuz-helper-e2e}-$$"
 keep="${1:-}"
 
 "$root/scripts/test-in-docker.sh" build -p puzuz-helper
@@ -35,11 +50,14 @@ cleanup() {
 }
 trap cleanup EXIT
 cp "$binary" "$stage/puzuz-helper"
-cp "$root/scripts/helper-systemd/client.py" "$root/scripts/helper-systemd/scenario.sh" "$stage/"
+cp "$root/scripts/helper-systemd/client.py" "$root/scripts/helper-systemd/scenario.sh" \
+    "$root/scripts/helper-systemd/gpu.sh" "$root/scripts/helper-systemd/gpu_job.py" "$stage/"
 cp -r "$root/packaging" "$stage/packaging"
 chmod -R a+rX "$stage"
 
-docker run -d --name "$name" --privileged --cgroupns=private \
+gpu_args=()
+[ "${PUZUZ_HELPER_GPU:-}" = 1 ] && gpu_args=(--gpus all)
+docker run -d "${gpu_args[@]}" --name "$name" --privileged --cgroupns=private \
     --tmpfs /run --tmpfs /run/lock \
     -v "$stage":/e2e:ro \
     "$image" >/dev/null
@@ -53,6 +71,15 @@ done
 echo "container systemd: ${state:-unknown}"
 
 status=0
+if [ "${PUZUZ_HELPER_GPU:-}" = 1 ]; then
+    docker exec -e "PUZUZ_HELPER_CUDA_MODE=${PUZUZ_HELPER_CUDA_MODE:-manual}" "$name" \
+        bash /e2e/scenario.sh gpu || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "--- journal (helper and jobs)"
+        docker exec "$name" journalctl --no-pager -n 300 -u 'puzuz-helper.service' -u 'puzuz-job-*' || true
+    fi
+    exit "$status"
+fi
 docker exec "$name" bash /e2e/scenario.sh || status=$?
 if [ "$status" -ne 0 ]; then
     echo "--- journal (helper and jobs)"

@@ -160,22 +160,30 @@ every process it forked. Then:
   CUDA processes that were (or may have been) checkpointed are restored and every locked one is
   unlocked - and the checkpoint fails with "the checkpoint did not finish within its deadline of
   ... s for ... GiB of memory; the job was resumed". The partial image is removed. The same
-  rollback runs when `criu` is killed from outside (e.g. `kill -9`, the OOM killer).
+  rollback runs when `criu` is killed from outside (e.g. `kill -9`, the OOM killer). In plugin
+  mode, CRIU's CUDA plugin locks and checkpoints the CUDA processes inside `criu dump` and
+  cannot undo that once CRIU is killed, so the helper asks `cuda-checkpoint --get-state` for
+  each of them and restores and unlocks them as needed.
 - **restore**: the restored processes are killed and the restore fails; the image is kept.
 
 Measured on an NVMe disk (RTX 5070 Ti, 38 GB RAM), cold and warm page cache:
 
 | step | time |
 | --- | --- |
-| CUDA lock / unlock | ~0.02 s |
-| CUDA checkpoint (VRAM to host memory) | ~0.5 s/GiB (2 and 7 GB of VRAM) |
-| CUDA restore | ~0.4 s/GiB (2 and 7 GB of VRAM) |
+| CUDA lock / unlock | 0.01-0.04 s |
+| CUDA checkpoint (VRAM to host memory) | 0.6-1.0 s/GiB (1.3-11.8 GiB of VRAM; 11.8 GiB: 8-10 s) |
+| CUDA restore | 0.5-0.9 s/GiB (11.8 GiB: 6-8 s) |
 | `criu dump` | 0.3-1.8 s/GiB (1-14 GiB of RSS; 14 GiB: 18-25 s, slower under memory pressure) |
 | `criu restore` | 0.3-0.7 s/GiB (14 GiB: 8.6 s warm, 9.2 s cold) |
 
-So a job needs about 2-2.5 s per GiB of RSS + VRAM end to end; the default deadline leaves a
-margin of more than 10x (enough for a disk of about 35 MB/s). On slower storage (network file
-systems, HDDs), raise `checkpoint_deadline_secs_per_gib`.
+A GPU job with 11.8 GiB of VRAM and 1.2 GiB of RSS (13 GiB, deadline 600 s) took 19-20 s to
+checkpoint and 14-16 s to restore, in manual and in plugin mode alike (plugin mode: `criu dump`
+20-21 s, `criu restore` 16 s, the CUDA steps included). So a job needs about 1.5-2.5 s per GiB
+of RSS + VRAM end to end; the default deadline leaves a margin of more than 10x (about 30x for
+that job; enough for a disk of about 35 MB/s). On slower storage (network file systems, HDDs),
+raise `checkpoint_deadline_secs_per_gib`. The fixed 300 s timeouts of a CUDA checkpoint and
+restore leave 10x for up to about 30 GiB of VRAM per process at the measured speed (an 80 GB
+GPU at the same speed would still finish in about a quarter of them).
 
 ## Verifying
 
