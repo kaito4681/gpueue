@@ -15,8 +15,14 @@
 //! The shim removes hidden mounts from each job's namespace (see
 //! [`crate::shim`]); the helper refuses a dump that depends on one (see
 //! [`unreachable_sources`]).
+//!
+//! Also here: automount points in a job's namespace
+//! ([`untriggered_automounts`], [`triggered_automounts`]) and what a restore
+//! needs from the host's mounts ([`SourceMount`]).
 
 use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
 
 /// One line of mountinfo (`proc(5)`), with the fields puzuz uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +35,9 @@ pub struct MountEntry {
     pub root: String,
     /// Mount point relative to the reader's root.
     pub mount_point: String,
+    /// Filesystem type (`ext4`, `tmpfs`, `autofs`, `fuse.sshfs`, ...);
+    /// empty if the line has none.
+    pub fstype: String,
 }
 
 /// Parse mountinfo, skipping malformed lines.
@@ -36,13 +45,19 @@ pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
     text.lines()
         .filter_map(|l| {
             let mut f = l.split_whitespace();
-            Some(MountEntry {
+            let mut e = MountEntry {
                 id: f.next()?.parse().ok()?,
                 parent: f.next()?.parse().ok()?,
                 dev: f.next()?.to_owned(),
                 root: unescape_octal(f.next()?),
                 mount_point: unescape_octal(f.next()?),
-            })
+                fstype: String::new(),
+            };
+            // Options, optional fields, then "-" and the filesystem type.
+            if f.by_ref().any(|x| x == "-") {
+                e.fstype = f.next().map(unescape_octal).unwrap_or_default();
+            }
+            Some(e)
         })
         .collect()
 }
@@ -238,6 +253,123 @@ pub fn unreachable_sources(job: &MountTree, helper: &MountTree) -> Vec<String> {
     out
 }
 
+/// Where a host path that CRIU bind-mounts on restore (an external mount
+/// source) lived at dump time: the mount of the helper's namespace that a
+/// lookup of the path ended in. A restore needs the same filesystem type
+/// mounted at the same place again; the device and the mount id may
+/// differ (a reboot mounts it anew).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceMount {
+    /// The external source path (as in CRIU's dump log).
+    pub path: String,
+    /// Mount point of the mount `path` was on.
+    pub mount_point: String,
+    pub fstype: String,
+}
+
+impl MountTree {
+    /// The mount a lookup of `path` ends in.
+    pub fn top(&self, path: &str) -> Option<&MountEntry> {
+        self.resolve(path).last().and_then(|id| self.get(*id))
+    }
+}
+
+/// [`SourceMount`]s of `paths` in `helper` (the helper's own namespace),
+/// without duplicates.
+pub fn describe_sources(paths: &[String], helper: &MountTree) -> Vec<SourceMount> {
+    let mut out: Vec<SourceMount> = Vec::new();
+    for p in paths {
+        if out.iter().any(|s| &s.path == p) {
+            continue;
+        }
+        if let Some(m) = helper.top(p) {
+            out.push(SourceMount {
+                path: p.clone(),
+                mount_point: m.mount_point.clone(),
+                fstype: m.fstype.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Why `src` cannot be restored from `now` (the helper's namespace at
+/// restore time), if it cannot: the lookup of its path must pass through
+/// a mount of the recorded type at the recorded mount point. Any mount in
+/// the stack at that point counts, so an automount point recorded before
+/// it was triggered still matches once the filesystem is mounted on top.
+pub fn source_problem(src: &SourceMount, now: &MountTree) -> Option<String> {
+    let chain = now.resolve(&src.path);
+    let found = chain.iter().filter_map(|id| now.get(*id)).any(|m| {
+        m.mount_point == src.mount_point && (m.fstype == src.fstype || src.fstype.is_empty())
+    });
+    if found {
+        return None;
+    }
+    let what = |m: &MountEntry| format!("{} on {}", nonempty(&m.fstype), m.mount_point);
+    let current = now
+        .top(&src.path)
+        .map(what)
+        .unwrap_or_else(|| "nothing".into());
+    Some(format!(
+        "{} needs {} on {} (found {current})",
+        src.path,
+        nonempty(&src.fstype),
+        src.mount_point
+    ))
+}
+
+/// Whether a lookup of `path` ends on an automount point (an `autofs`
+/// mount nothing is mounted on yet).
+pub fn ends_on_automount(path: &str, now: &MountTree) -> bool {
+    now.top(path).is_some_and(|m| m.fstype == "autofs")
+}
+
+/// Automount points (`autofs` mounts) of `tree` that nothing is mounted on
+/// yet: the shim looks them up once, so that the automounter mounts their
+/// filesystems before the job's namespace is made private.
+pub fn untriggered_automounts(tree: &MountTree) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in tree.entries() {
+        if e.fstype == "autofs"
+            && tree.is_visible(e.id)
+            && tree.top(&e.mount_point).is_some_and(|t| t.id == e.id)
+            && !out.contains(&e.mount_point)
+        {
+            out.push(e.mount_point.clone());
+        }
+    }
+    out
+}
+
+/// Mount points where a filesystem is mounted on top of an automount
+/// point (a triggered `x-systemd.automount`): the shim replaces each stack
+/// with a copy of its top mount. CRIU would restore both layers as bind
+/// mounts of the same host path, and the job only needs the filesystem.
+pub fn triggered_automounts(tree: &MountTree) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in tree.entries() {
+        if e.fstype != "autofs" || !tree.is_visible(e.id) || out.contains(&e.mount_point) {
+            continue;
+        }
+        if tree
+            .top(&e.mount_point)
+            .is_some_and(|t| t.id != e.id && t.mount_point == e.mount_point && t.fstype != "autofs")
+        {
+            out.push(e.mount_point.clone());
+        }
+    }
+    out
+}
+
+fn nonempty(fstype: &str) -> &str {
+    if fstype.is_empty() {
+        "a filesystem"
+    } else {
+        fstype
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +473,77 @@ mod tests {
         assert!(!path_under("/dev/shmx", "/dev/shm"));
         assert!(path_under("/a", "/"));
         assert!(path_under("/", "/"));
+    }
+
+    /// The helper's namespace with an untriggered automount on /data, a
+    /// triggered one on /nfs, and other filesystems.
+    const AUTOFS: &str = "\
+1 0 8:1 / / rw shared:1 - ext4 /dev/sda1 rw
+2 1 0:50 / /data rw shared:2 - autofs systemd-1 rw,fd=50
+3 1 0:51 / /nfs rw shared:3 - autofs systemd-1 rw,fd=51
+4 3 0:60 / /nfs rw shared:4 - fuse.sshfs host:/export rw
+5 1 7:3 / /srv/ext4 rw shared:5 - ext4 /dev/loop3 rw
+6 1 7:3 /home/alice /home/alice rw shared:6 - ext4 /dev/loop3 rw
+";
+
+    #[test]
+    fn parses_the_filesystem_type() {
+        let t = MountTree::parse(AUTOFS);
+        assert_eq!(t.get(2).unwrap().fstype, "autofs");
+        assert_eq!(t.get(4).unwrap().fstype, "fuse.sshfs");
+        assert_eq!(parse_mountinfo("1 0 8:1 / / rw\n")[0].fstype, "");
+    }
+
+    #[test]
+    fn finds_automount_points() {
+        let t = MountTree::parse(AUTOFS);
+        assert_eq!(untriggered_automounts(&t), ["/data"]);
+        assert_eq!(triggered_automounts(&t), ["/nfs"]);
+        assert!(ends_on_automount("/data/x", &t));
+        assert!(!ends_on_automount("/nfs/x", &t));
+    }
+
+    #[test]
+    fn describes_external_sources() {
+        let t = MountTree::parse(AUTOFS);
+        let s = describe_sources(
+            &["/home/alice".into(), "/nfs".into(), "/home/alice".into()],
+            &t,
+        );
+        assert_eq!(
+            s,
+            [
+                SourceMount {
+                    path: "/home/alice".into(),
+                    mount_point: "/home/alice".into(),
+                    fstype: "ext4".into(),
+                },
+                SourceMount {
+                    path: "/nfs".into(),
+                    mount_point: "/nfs".into(),
+                    fstype: "fuse.sshfs".into(),
+                },
+            ]
+        );
+        // The same filesystems mounted anew (other ids and devices).
+        let again = MountTree::parse(
+            "10 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+             11 10 0:70 / /nfs rw - fuse.sshfs host:/export rw\n\
+             12 10 7:9 /home/alice /home/alice rw - ext4 /dev/loop9 rw\n",
+        );
+        assert!(s.iter().all(|s| source_problem(s, &again).is_none()));
+        // /nfs not mounted again: only the root file system's directory.
+        let gone = MountTree::parse("10 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        assert_eq!(
+            source_problem(&s[1], &gone).unwrap(),
+            "/nfs needs fuse.sshfs on /nfs (found ext4 on /)"
+        );
+        // An automount point recorded untriggered matches once triggered.
+        let auto = SourceMount {
+            path: "/data".into(),
+            mount_point: "/data".into(),
+            fstype: "autofs".into(),
+        };
+        assert!(source_problem(&auto, &t).is_none());
     }
 }

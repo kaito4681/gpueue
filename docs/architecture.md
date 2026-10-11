@@ -41,9 +41,11 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    daemon, the helper and the user's session, so it survives restarts of the daemon and the
    helper and the user logging out.
 5. **Shim.** Still root, the shim creates a PID namespace and a mount namespace and starts the
-   namespace's init. The init makes the mounts private and mounts a fresh `/proc`. It removes
-   mounts hidden under other mounts and mounts that do not survive a reboot (`/run/*`, `/mnt/*`,
-   `/media/*`), and mounts private tmpfs on `/tmp` and `/dev/shm`. Then it drops to the owner's
+   namespace's init, after it triggered the host's automount points (so that the namespace gets
+   the automounted filesystems). The init makes the mounts private and mounts a fresh `/proc`. It removes mounts hidden under other mounts and mounts that do not survive a
+   reboot (`/run/*`, `/media/*`), replaces each automounted filesystem stacked on its `autofs`
+   mount with a plain copy, and mounts private tmpfs on `/tmp` and `/dev/shm`. Then it drops to
+   the owner's
    uid, gid and groups with `no_new_privs`, opens the log
    (`/var/lib/puzuz/logs/<uid>/<id>.log`) and the working directory as the owner, and runs the
    command through `sh -c`. The environment is the client's, plus `CUDA_VISIBLE_DEVICES`,
@@ -65,7 +67,10 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    pauses it again (SIGSTOP) as soon as it is restored, or when the dump is refused. The job
    therefore runs for a moment during the dump and right after the restore. `pause` is refused
    while a dump is in progress.
-7. **Restore.** The helper checks the GPU model, driver, free VRAM and mount paths. It starts a
+7. **Restore.** The helper checks the GPU model, driver, free VRAM and mounts: the paths CRIU
+   binds must exist, the filesystems they were on at the dump (recorded in `helper-mounts.json`)
+   must be mounted at the same place with the same type (automount points are triggered), and
+   the files and working directories the job had open must exist. It starts a
    new unit `puzuz-job-<id>-r<n>.service` that runs `criu restore --root` on a bind mount of `/`
    (`/run/puzuz-helper/criu-root`). In manual mode it then runs cuda-checkpoint `restore` and
    `unlock` on the CUDA processes. In plugin mode CRIU's plugin does this before `criu restore`

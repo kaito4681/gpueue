@@ -34,6 +34,7 @@ use crate::jobs::{self, JobFiles, JobRecord, RecordPhase, ShimSpec, UnitKind};
 use crate::launcher::{
     LaunchError, LaunchSpec, Launcher, RestoreSpec, UnitState, restore_unit_name, unit_name,
 };
+use crate::mounts::SourceMount;
 use crate::validate::{self, Rejection};
 
 /// File in a checkpoint directory recording the job's owner, so a restore
@@ -55,6 +56,14 @@ pub enum SavedMounts {
         /// auto-detected external mounts, from the dump log).
         #[serde(default)]
         external_sources: Vec<String>,
+        /// The filesystems those paths were on (in the helper's
+        /// namespace); a restore needs them mounted again.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        source_mounts: Vec<SourceMount>,
+        /// Regular files on the host's filesystems that the job had open,
+        /// and its working directories; CRIU reopens them by path.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        open_files: Vec<String>,
     },
     MountPoints(Vec<String>),
 }
@@ -67,6 +76,7 @@ impl SavedMounts {
             SavedMounts::Full {
                 mount_points,
                 external_sources,
+                ..
             } => (mount_points, external_sources),
             SavedMounts::MountPoints(m) => (m, &[]),
         };
@@ -77,6 +87,22 @@ impl SavedMounts {
             }
         }
         out
+    }
+
+    /// See [`SavedMounts::Full`].
+    pub fn source_mounts(&self) -> &[SourceMount] {
+        match self {
+            SavedMounts::Full { source_mounts, .. } => source_mounts,
+            SavedMounts::MountPoints(_) => &[],
+        }
+    }
+
+    /// See [`SavedMounts::Full`].
+    pub fn open_files(&self) -> &[String] {
+        match self {
+            SavedMounts::Full { open_files, .. } => open_files,
+            SavedMounts::MountPoints(_) => &[],
+        }
     }
 }
 
@@ -1085,6 +1111,43 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     ),
                 ));
             }
+            // A filesystem that is not mounted again leaves its (empty)
+            // mount point directory: CRIU would bind that instead, and the
+            // job would go on writing to the filesystem underneath.
+            let problems = self
+                .host
+                .source_problems(mounts.source_mounts())
+                .map_err(|e| {
+                    error(
+                        HelperErrorCode::Internal,
+                        format!("reading the helper's mounts: {e}"),
+                    )
+                })?;
+            if !problems.is_empty() {
+                return Err(error(
+                    HelperErrorCode::InvalidRequest,
+                    format!(
+                        "filesystems the checkpoint depends on are not mounted as at the dump \
+                         (mount them and restore again): {}",
+                        problems.join("; ")
+                    ),
+                ));
+            }
+            let gone: Vec<&String> = mounts
+                .open_files()
+                .iter()
+                .filter(|f| fs::symlink_metadata(f).is_err())
+                .collect();
+            if !gone.is_empty() {
+                return Err(error(
+                    HelperErrorCode::InvalidRequest,
+                    format!(
+                        "files or directories the job used are missing on this host: \
+                         {gone:?} (the contents of a tmpfs, such as an administrator's \
+                         /scratch, do not survive a reboot)"
+                    ),
+                ));
+            }
         }
 
         if !meta.gpus.is_empty() {
@@ -1422,6 +1485,8 @@ pub struct DumpPrecheck {
     /// Without the CUDA PIDs yet.
     meta: CheckpointMeta,
     mounts: Vec<String>,
+    /// See [`SavedMounts::Full`].
+    open_files: Vec<String>,
 }
 
 /// The checks before a dump, which only read the job's state: the image
@@ -1486,10 +1551,14 @@ pub fn precheck_dump<H: HostProbe + ?Sized>(
     }
     let available = host.available_bytes(base).map_err(|e| e.to_string())?;
     space::check_free_space(rss, meta.vram_bytes, available).map_err(|e| e.to_string())?;
+    // Only for the restore's pre-check; never a reason to refuse the dump.
+    let host_pids: Vec<u32> = procs.iter().map(|p| p.host_pid).collect();
+    let open_files = host.open_files(&host_pids).unwrap_or_default();
     Ok(DumpPrecheck {
         procs,
         meta,
         mounts,
+        open_files,
     })
 }
 
@@ -1520,6 +1589,7 @@ pub fn dump_job<H: HostProbe + ?Sized>(
         procs,
         mut meta,
         mounts,
+        open_files,
     } = precheck_dump(host, ck.mode, base, record, init_pid).map_err(DumpError::Refused)?;
     let mut cuda_pids = Vec::new();
     if !record.gpus.is_empty() {
@@ -1603,11 +1673,14 @@ pub fn dump_job<H: HostProbe + ?Sized>(
         owner.phase = RecordPhase::Checkpointed;
         let owner_json = serde_json::to_vec_pretty(&owner).map_err(|e| e.to_string())?;
         write_atomic(&dir.root().join(OWNER_FILE), &owner_json).map_err(|e| e.to_string())?;
+        let external_sources = fs::read_to_string(dir.dump_log())
+            .map(|log| probe::criu_external_mounts(&log))
+            .unwrap_or_default();
         let saved = SavedMounts::Full {
             mount_points: mounts,
-            external_sources: fs::read_to_string(dir.dump_log())
-                .map(|log| probe::criu_external_mounts(&log))
-                .unwrap_or_default(),
+            source_mounts: host.source_mounts(&external_sources).unwrap_or_default(),
+            external_sources,
+            open_files,
         };
         let mounts_json = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
         write_atomic(&dir.root().join(MOUNTS_FILE), &mounts_json).map_err(|e| e.to_string())?;

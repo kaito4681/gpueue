@@ -79,6 +79,12 @@ pub enum UnitKind {
 /// so that it only contains mounts that also exist after a reboot (CRIU
 /// recreates the namespace on restore and fails on missing mount points or
 /// bind sources). See `docker-systemd-poc.md` §8.
+///
+/// `/mnt` is not pruned: administrators mount persistent filesystems there
+/// (`/mnt/data`), and a job whose cwd is below a pruned mount would write
+/// to the directory underneath it on the root filesystem. A restore checks
+/// that such filesystems are mounted again (see
+/// [`crate::mounts::SourceMount`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountPlan {
     /// Detach every mount at or below these paths. A trailing `/` means
@@ -90,15 +96,18 @@ pub struct MountPlan {
     pub tmpfs: Vec<String>,
 }
 
+impl MountPlan {
+    /// Whether the mount point `m` is detached.
+    pub fn prunes(&self, m: &str) -> bool {
+        use crate::mounts::path_under;
+        self.prune.iter().any(|p| path_under(m, p)) && !self.keep.iter().any(|k| path_under(m, k))
+    }
+}
+
 impl Default for MountPlan {
     fn default() -> Self {
         Self {
-            prune: vec![
-                "/run/".into(),
-                "/mnt/".into(),
-                "/media/".into(),
-                "/dev/shm".into(),
-            ],
+            prune: vec!["/run/".into(), "/media/".into(), "/dev/shm".into()],
             keep: vec!["/run/nvidia-persistenced".into()],
             tmpfs: vec!["/tmp".into(), "/dev/shm".into()],
         }

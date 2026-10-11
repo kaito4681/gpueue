@@ -5,7 +5,8 @@
 //! runtime), which `unshare(CLONE_NEWNS)` requires.
 //!
 //! 1. Outer shim (the unit's main process, stays outside the dumped tree):
-//!    unshares a PID and a mount namespace, starts
+//!    triggers the host's automount points, unshares a PID and a mount
+//!    namespace, starts
 //!    `puzuz-helper shim-init <job dir>` — PID 1 of the new namespace —
 //!    forwards SIGTERM/SIGINT/SIGHUP/SIGQUIT/SIGUSR1/SIGUSR2 to it, waits
 //!    for it and writes `init-status`.
@@ -17,10 +18,12 @@
 //!    - cleans the mount namespace so that it only holds mounts that also
 //!      exist after a reboot: makes everything private, detaches the
 //!      inherited `/proc` tree and mounts a fresh `/proc` (CUDA fails with
-//!      error 304 without it), removes mounts hidden under later mounts
-//!      (see [`crate::mounts`]), detaches volatile mounts (`/run/*`, `/mnt/*`,
-//!      ...) and mounts private tmpfs on `/tmp` and `/dev/shm` (CRIU saves
-//!      their contents in the image),
+//!      error 304 without it), removes mounts
+//!      hidden under later mounts (see [`crate::mounts`]), detaches volatile
+//!      mounts (`/run/*`, `/media/*`, ...), replaces each automounted
+//!      filesystem stacked on its `autofs` mount with a plain copy, and
+//!      mounts private tmpfs on `/tmp` and `/dev/shm` (CRIU saves their
+//!      contents in the image),
 //!    - drops privileges: supplementary groups → gid → bounding set → uid →
 //!      `no_new_privs`,
 //!    - opens the log and enters the cwd with the owner's permissions only,
@@ -54,7 +57,7 @@ use nix::unistd::{Gid, Pid, Uid};
 use puzuz_protocol::helper::ExitStatus;
 
 use crate::jobs::{JobFiles, MountPlan, ShimSpec, StartFailure, StartReport, write_status_to};
-use crate::mounts::MountTree;
+use crate::mounts::{MountTree, triggered_automounts, untriggered_automounts};
 pub use crate::mounts::{path_under, unescape_octal};
 
 /// Exit code of the shim when it could not start the job.
@@ -156,6 +159,15 @@ pub fn run_outer(job_dir: PathBuf) -> i32 {
 
 fn outer(files: &JobFiles) -> Result<i32, Failure> {
     let sfd = signal_fd().map_err(|e| Failure::other(format!("signalfd: {e}")))?;
+    // In the host's namespace, so that the job's starts with the
+    // automounted filesystems. A spec that cannot be read is reported by
+    // the init.
+    if let Ok(spec) = std::fs::read(files.spec())
+        .map_err(|e| e.to_string())
+        .and_then(|b| serde_json::from_slice::<ShimSpec>(&b).map_err(|e| e.to_string()))
+    {
+        trigger_automounts(&spec.mounts).map_err(Failure::other)?;
+    }
     nix::sched::unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS)
         .map_err(|e| Failure::other(format!("creating PID/mount namespaces: {e}")))?;
     let exe = std::env::current_exe()
@@ -327,10 +339,7 @@ pub fn mounts_to_prune(mountinfo: &str, plan: &MountPlan) -> Vec<String> {
         .lines()
         .filter_map(|l| l.split_whitespace().nth(4))
         .map(unescape_octal)
-        .filter(|m| {
-            plan.prune.iter().any(|p| path_under(m, p))
-                && !plan.keep.iter().any(|k| path_under(m, k))
-        })
+        .filter(|m| plan.prunes(m))
         .collect()
 }
 
@@ -427,7 +436,114 @@ fn remove_hidden_mounts() -> Result<(), String> {
     Ok(())
 }
 
+/// How long the shim waits for the automounter to mount the automount
+/// points (an NFS server that does not answer).
+const AUTOMOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Look up every automount point that nothing is mounted on yet, so that
+/// the automounter mounts it. Runs in the host's namespace before the
+/// job's is created. The lookups run in child processes
+/// (`puzuz-helper shim-automount <path>`), all at once: threads would
+/// prevent `unshare(CLONE_NEWNS)`, and a lookup can hang. Those still
+/// running after [`AUTOMOUNT_TIMEOUT`] are killed, and the job's copy of
+/// that automount point stays unusable. Automount points that `plan` prunes anyway
+/// are skipped.
+fn trigger_automounts(plan: &MountPlan) -> Result<(), String> {
+    let paths: Vec<String> = untriggered_automounts(&read_mount_tree()?)
+        .into_iter()
+        .filter(|p| !plan.prunes(p))
+        .collect();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("locating the helper binary: {e}"))?;
+    let mut children = Vec::new();
+    for path in paths {
+        match Command::new(&exe)
+            .arg("shim-automount")
+            .arg(&path)
+            .stdin(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => children.push((path, child)),
+            Err(e) => eprintln!("puzuz shim: automount {path}: {e}"),
+        }
+    }
+    let deadline = std::time::Instant::now() + AUTOMOUNT_TIMEOUT;
+    while !children.is_empty() {
+        children.retain_mut(|(path, child)| match child.try_wait() {
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                eprintln!("puzuz shim: automount {path}: timed out");
+                let _ = child.kill();
+                let _ = child.wait();
+                false
+            }
+            Ok(None) => true,
+            Ok(Some(_)) | Err(_) => false,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// `puzuz-helper shim-automount <path>`: see [`trigger_automounts`].
+pub fn run_automount(path: PathBuf) -> i32 {
+    match std::fs::metadata(path.join(".")) {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("puzuz shim: automount {}: {e}", path.display());
+            1
+        }
+    }
+}
+
+/// Replace each filesystem mounted on an automount point with a copy of
+/// it directly on the mount point (see [`triggered_automounts`]): copy the
+/// top mount with its submounts, detach the stack, attach the copy.
+fn flatten_automounts() -> Result<(), String> {
+    use rustix::fs::CWD;
+    use rustix::mount::{MoveMountFlags, OpenTreeFlags, move_mount, open_tree};
+
+    for path in triggered_automounts(&read_mount_tree()?) {
+        let copy = match open_tree(
+            CWD,
+            path.as_str(),
+            OpenTreeFlags::OPEN_TREE_CLONE
+                | OpenTreeFlags::AT_RECURSIVE
+                | OpenTreeFlags::OPEN_TREE_CLOEXEC,
+        ) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!(
+                    "puzuz shim: cannot copy the automounted {path}: {e};                      the job will not be restorable"
+                );
+                continue;
+            }
+        };
+        // Detach the layers on `path` (filesystem, then autofs).
+        for _ in 0..8 {
+            let tree = read_mount_tree()?;
+            if tree.top(&path).is_none_or(|t| t.mount_point != path) {
+                break;
+            }
+            umount2(path.as_str(), MntFlags::MNT_DETACH)
+                .map_err(|e| format!("detaching the automount {path}: {e}"))?;
+        }
+        move_mount(
+            &copy,
+            "",
+            CWD,
+            path.as_str(),
+            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+        )
+        .map_err(|e| format!("re-attaching {path}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn setup_mounts(plan: &MountPlan) -> Result<(), String> {
+    // From here on the namespace is fixed: later host mounts do not show
+    // up, so the job's view is the one that is dumped.
     mount(
         None::<&str>,
         "/",
@@ -454,6 +570,7 @@ fn setup_mounts(plan: &MountPlan) -> Result<(), String> {
     for m in mounts_to_prune(&mountinfo, plan).iter().rev() {
         let _ = umount2(m.as_str(), MntFlags::MNT_DETACH);
     }
+    flatten_automounts()?;
     for t in &plan.tmpfs {
         mount(
             Some("tmpfs"),
@@ -590,13 +707,14 @@ mod tests {
 2 1 0:2 / /run rw - tmpfs tmpfs rw
 3 2 0:3 / /run/user/1000 rw - tmpfs tmpfs rw
 4 2 0:4 / /run/nvidia-persistenced/socket rw - tmpfs tmpfs rw
-5 1 0:5 / /mnt/data\\040disk rw - ext4 /dev/y rw
+5 1 0:5 / /media/usb\\040disk rw - ext4 /dev/y rw
+8 1 0:8 / /mnt/data rw - ext4 /dev/w rw
 6 1 0:6 / /dev/shm rw - tmpfs tmpfs rw
 7 1 0:7 / /runner rw - ext4 /dev/z rw
 ";
         assert_eq!(
             mounts_to_prune(mi, &MountPlan::default()),
-            ["/run/user/1000", "/mnt/data disk", "/dev/shm"]
+            ["/run/user/1000", "/media/usb disk", "/dev/shm"]
         );
         assert!(path_under("/run/a", "/run/"));
         assert!(!path_under("/run", "/run/"));

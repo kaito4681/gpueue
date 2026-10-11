@@ -712,6 +712,184 @@ s7_verify() {
     fi
 }
 
+# s15/s16: the administrator's mounts of scripts/e2e/mounts.sh (a separate
+# ext4 filesystem, a bind-mounted /home/alice, an x-systemd.automount
+# /data, a tmpfs /scratch, overlayfs, a read-only bind, a private bind and
+# sshfs as the network filesystem) across a reboot: they come back as new
+# mounts, the loop-mounted ones on other devices.
+
+# mjob <name> <cwd> <file> [prefix]: a counter job of alice's that appends
+# to <file> (fd 3) with its cwd in <cwd>; records "<id> <name> <file>" in
+# $STATE/mounts and prints the id.
+mjob() {
+    local name=$1 cwd=$2 file=$3 pre=${4:-} id
+    id=$( (cd "$cwd" && runuser -u alice -- puzuz --color never add -p -g free -- \
+        "$pre exec 3>>$file; i=0; while :; do echo \$i >&3; i=\$((i+1)); sleep 0.2; done"))
+    echo "$id $name $file" >>"$STATE/mounts"
+    echo "$id"
+}
+# The counter file must be 0, 1, 2, ... without gaps or repeats.
+check_counter_file() {
+    python3 - "$1" <<'EOF' || fail "$1 has gaps or repeats"
+import sys
+nums = [int(l) for l in open(sys.argv[1]) if l.strip().isdigit()]
+bad = [(a, b) for a, b in zip(nums, nums[1:]) if b != a + 1]
+if not nums or nums[0] != 0 or bad:
+    print(f"first={nums[:1]} breaks={bad[:5]}", file=sys.stderr)
+    sys.exit(1)
+EOF
+}
+# restore_continues <id> <file>: restore a checkpointed job and check that
+# it goes on appending to <file> consistently.
+restore_continues() {
+    local id=$1 file=$2 before after
+    wait_state "$id" checkpointed 60
+    before=$(tail -n1 "$file")
+    pz alice restore "$id" >/dev/null || fail "restore $id"
+    wait_state "$id" running 120
+    sleep 1.5
+    after=$(tail -n1 "$file")
+    echo "job $id ($file): $before before the dump, $after after the restore"
+    [ "$after" -gt "$before" ] || fail "job $id did not continue"
+    check_counter_file "$file"
+}
+# restore_refused <id> <pattern>: the restore of a checkpointed job must be
+# refused (before CRIU runs) with an error matching <pattern>.
+restore_refused() {
+    local id=$1 err
+    wait_state "$id" checkpointed 60
+    pz alice restore "$id" >/dev/null 2>&1 || true
+    sleep 2
+    wait_state "$id" checkpointed 60
+    err=$(q carol "job($id)['details'].get('last_error')")
+    echo "restore of job $id refused: $err"
+    grep -q -- "$2" <<<"$err" || fail "the restore of job $id was not refused clearly: $err"
+}
+need_mounts() {
+    mountpoint -q /srv/ext4 || fail "the mounts of mounts.sh are missing"
+}
+# mount_dev <path>: major:minor of the filesystem mounted on <path>.
+mount_dev() { findmnt -fno MAJ:MIN "$1" | tail -n1; }
+# job_mountinfo <id>: mountinfo of the job's namespace.
+job_mountinfo() {
+    local pid
+    pid=$(systemctl show -p MainPID --value "puzuz-job-$1.service")
+    cat "/proc/$(pgrep -P "$pid" | head -n1)/mountinfo"
+}
+
+s15_prepare() {
+    local id name f
+    need_mounts
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    mkdir -p "$STATE"
+    : >"$STATE/mounts"
+    mount_dev /srv/ext4 >"$STATE/ext4-dev"
+    rm -f /home/alice/m-*.txt /data/alice/m-*.txt /srv/ext4/export/m-*.txt /ovl/m-*.txt \
+        /priv/m-*.txt
+    # Before the automount of /data is triggered: the job's namespace must
+    # still get the filesystem (the shim triggers it) and not an empty
+    # directory or a dead automount point.
+    systemctl stop data.mount
+    findmnt -n /data | grep -q autofs || fail "/data is not an automount point"
+    ! findmnt -n /data | grep -q ext4 || fail "/data is still mounted"
+    mjob data-before /home/alice /data/alice/m-before.txt 'sleep 1;' >/dev/null
+    mjob home /home/alice /home/alice/m-home.txt >/dev/null
+    mjob data /data/alice /data/alice/m-data.txt >/dev/null
+    mjob ext4 /srv/ext4/export /srv/ext4/export/m-ext4.txt >/dev/null
+    mjob overlay /ovl /ovl/m-ovl.txt >/dev/null
+    mjob ro-bind /ref /home/alice/m-ref.txt 'exec 4</ref/input.txt;' >/dev/null
+    mjob private-bind /priv /priv/m-priv.txt >/dev/null
+    if mountpoint -q /nfs; then
+        # Also a state file of its own, replaced every few steps (a rename
+        # on the network filesystem). /nfs exports /srv/ext4/export, hence
+        # another prefix than the ext4 job's.
+        rm -f /nfs/n-*
+        mjob sshfs /nfs /nfs/n-nfs.txt \
+            '(while :; do date +%s%N >/nfs/n-state.tmp && mv /nfs/n-state.tmp /nfs/n-state; sleep 0.3; done) &' \
+            >/dev/null
+    else
+        echo "sshfs is not installed: no network filesystem"
+    fi
+    mkdir -p /scratch/alice && chown alice: /scratch/alice
+    mjob scratch /scratch/alice /scratch/alice/m-scratch.txt >/dev/null
+    while read -r id _ _; do wait_state "$id" running; done <"$STATE/mounts"
+    sleep 2
+    while read -r id _ f; do
+        [ "$(tail -n1 "$f")" -gt 0 ] || fail "job $id does not write $f"
+    done <"$STATE/mounts"
+    ! runuser -u alice -- touch /ref/x 2>/dev/null || fail "/ref is writable"
+    # The job started before the trigger sees the filesystem itself on
+    # /data, not the automount point.
+    id=$(head -n1 "$STATE/mounts" | cut -d' ' -f1)
+    job_mountinfo "$id" | grep ' /data ' | grep -q ' - ext4 ' \
+        || fail "the job's /data is not the automounted ext4"
+    ! job_mountinfo "$id" | grep ' /data ' | grep -q autofs \
+        || fail "the job's namespace still has the automount point"
+    # Before the reboot: a checkpoint and restore of the job on /data.
+    id=$(awk '$2 == "data" {print $1}' "$STATE/mounts")
+    pz alice checkpoint "$id" >/dev/null || fail "checkpoint"
+    restore_continues "$id" /data/alice/m-data.txt
+    # The tmpfs still has the job's files on the same boot.
+    id=$(awk '$2 == "scratch" {print $1}' "$STATE/mounts")
+    pz alice checkpoint "$id" >/dev/null || fail "checkpoint"
+    restore_continues "$id" /scratch/alice/m-scratch.txt
+    # The jobs stay running: the shutdown dumps them.
+}
+s15_verify() {
+    local id name f a b
+    need_mounts
+    echo "/srv/ext4 on $(cat "$STATE/ext4-dev") before the reboot, on $(mount_dev /srv/ext4) now"
+    [ "$(cat "$STATE/ext4-dev")" != "$(mount_dev /srv/ext4)" ] \
+        || echo "note: /srv/ext4 is on the same device as before the reboot"
+    while read -r id name f; do
+        if [ "$name" = scratch ]; then
+            # The tmpfs came back empty.
+            restore_refused "$id" 'missing on this host.*/scratch/alice'
+            pz alice remove "$id" >/dev/null || fail "remove $id"
+        else
+            restore_continues "$id" "$f"
+        fi
+    done <"$STATE/mounts"
+    if [ -f /nfs/n-nfs.txt ]; then
+        a=$(cat /nfs/n-state)
+        sleep 1
+        b=$(cat /nfs/n-state)
+        [ "$b" -gt "$a" ] || fail "the job's state file on sshfs is not updated"
+    fi
+    while read -r id name _; do
+        if [ "$name" != scratch ]; then
+            pz alice kill "$id" >/dev/null
+            wait_state "$id" 'done/*'
+        fi
+    done <"$STATE/mounts"
+}
+
+s16_prepare() {
+    local id
+    need_mounts
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    rm -f /data/alice/m-gone.txt
+    id=$( (cd /data/alice && runuser -u alice -- puzuz --color never add -p -g free -- \
+        'exec 3>>/data/alice/m-gone.txt; i=0; while :; do echo $i >&3; i=$((i+1)); sleep 0.2; done'))
+    wait_state "$id" running
+    sleep 1.5
+    mkdir -p "$STATE"
+    echo "$id" >"$STATE/gone"
+    # /data does not come back at the next boot (no fstab entry).
+    echo /data >>/var/lib/puzuz-e2e-disk/skip-next-boot
+}
+s16_verify() {
+    local id
+    id=$(cat "$STATE/gone")
+    ! findmnt -n /data >/dev/null || fail "/data is mounted"
+    restore_refused "$id" '/data needs ext4 on /data'
+    # Mounted again (the automount comes back), the restore works.
+    bash /e2e/mounts.sh setup >/dev/null
+    restore_continues "$id" /data/alice/m-gone.txt
+    pz alice kill "$id" >/dev/null
+    wait_state "$id" 'done/*'
+}
+
 # Many jobs at once: `add --immediate` from several CLIs in parallel races
 # the scheduler, so the helper gets concurrent spawns; then again while the
 # helper restarts. No job may fail to spawn or get lost.
@@ -775,8 +953,17 @@ main)
         run "12 NVML GPU detection in the packaged unit" s12_nvml_detection
     fi
     ;;
-reboot-prepare) run "7 reboot (prepare)" s7_prepare ;;
-reboot-verify) run "7 reboot" s7_verify ;;
+reboot-prepare)
+    run "7 reboot (prepare)" s7_prepare
+    run "15 mounts across a reboot (prepare)" s15_prepare
+    run "16 a mount missing after a reboot (prepare)" s16_prepare
+    ;;
+reboot-verify)
+    # 16 first: until it mounts /data again, every restore is refused.
+    run "16 a mount missing after a reboot" s16_verify
+    run "7 reboot" s7_verify
+    run "15 mounts across a reboot" s15_verify
+    ;;
 # Only defines the helpers above (sourced by scripts/vm/guest.sh).
 lib) ;;
 *) fail "unknown phase $1" ;;
