@@ -307,6 +307,59 @@ unlimited).
 
   Move or restore existing checkpoints before you change the path.
 
+## Filesystems and mounts
+
+Each job runs in a mount namespace of its own. When the job starts, the shim copies the host's
+mounts into it and then fixes them, so that what the job sees is what CRIU dumps and recreates on
+restore:
+
+- Automount points (`x-systemd.automount`, autofs direct maps) are triggered once, before the job
+  runs, and the job's namespace gets the mounted filesystem itself instead of the automount point.
+  An automount whose filesystem does not appear within 20 s (an NFS server that does not answer)
+  is left as it is, and the job cannot use that path.
+- The namespace is private from then on: filesystems that the administrator mounts or unmounts
+  later do not show up in running jobs. Start new jobs to use them.
+- Mounts below `/run` and `/media`, and mounts hidden under other mounts, are removed. Each job
+  gets its own tmpfs on `/tmp` and `/dev/shm`, which is saved in the checkpoint.
+
+CRIU recreates every mount of the job's namespace on restore by bind-mounting the same host path,
+so **every filesystem that was mounted when the job started must be mounted again, at the same
+path and with the same type, before the job can be restored**, even if the job never used it. The
+filesystem may come back as a new mount (another device number, a new loop device, a new NFS
+mount). At the dump the helper records the filesystem type and mount point of each of these
+paths, and the files and working directories the job has open. Before a restore it checks that
+they are still there (triggering automount points on the way) and refuses with a clear error
+otherwise (see [Restore failures](#restore-failures)). The image is kept, so you can mount the
+filesystem and run `puzuz restore` again.
+
+Tested across a simulated reboot (`scripts/e2e-test.sh`, scenarios 13 and 14) with the job's
+working directory and open files on each of these:
+
+| Mount | Restore after a reboot |
+|---|---|
+| separate local filesystem (ext4 on a loop device) mounted at a fixed path, on another device after the reboot | works |
+| bind mount (`/home/<user>` from another filesystem), read-only bind mount, bind mount with private propagation; `/` with shared propagation (the systemd default) | works |
+| overlayfs | works |
+| `x-systemd.automount` (job started before and after the trigger; not yet triggered at restore time) | works: the restore pre-check triggers it |
+| FUSE network filesystem (sshfs), with the job writing and renaming its own files there | works while the FUSE daemon is up again before the restore |
+| filesystem not mounted after the reboot (missing fstab entry, NFS server down) | refused: `<path> needs <type> on <mount point>` |
+| tmpfs mounted by the administrator (e.g. `/scratch`) with the job's files or working directory on it | refused: its contents are gone after a reboot. Use a tmpfs only for jobs that do not need to survive one. A restore on the same boot works. |
+
+Not tested, or not supported:
+
+- **Kernel NFS** (NFSv3/v4) was not tested: the Docker test environment cannot load the host's
+  `nfs` module. NFS behaves like any other filesystem in the checks above. Mount it from
+  `/etc/fstab` (`_netdev`, or `x-systemd.automount`) so that it is mounted before the helper
+  starts and unmounted only after the helper has dumped the jobs at shutdown
+  (`puzuz-helper.service` is ordered after `remote-fs.target`). Files that the job had open are
+  reopened by path, so they must still exist on the server.
+- **autofs indirect maps** (an autofs daemon mounting `/net/<host>` or `/home/<user>` on demand):
+  keys mounted when the job starts are visible to it; keys first accessed later are not (the
+  namespace is private). Restoring such a namespace has not been tested.
+- **Removable media and `/run`:** not visible to jobs at all.
+- Filesystems that cannot be mounted again at the same path after a reboot (paths with a boot ID
+  or a random name) make every job that started while they were mounted unrestorable.
+
 ## Upgrading
 
 ```sh
@@ -433,6 +486,15 @@ A failed restore keeps the job `Checkpointed` and keeps its image, so you can fi
   `Can't stat mountpoint` or `Failed to open_tree <path>`. The job's namespace contained a mount
   point, or a bind mount from a host path, that does not exist now (for example a filesystem that
   is not mounted after the reboot). Mount it, or create the path, and restore again.
+- `filesystems the checkpoint depends on are not mounted as at the dump (mount them and restore
+  again): /data needs ext4 on /data (found overlay on /)`: a filesystem that was mounted when the
+  job started is not mounted now, or another filesystem type is mounted there. CRIU would bind
+  the empty mount point directory instead, and the job would go on writing to the filesystem
+  underneath. Mount it (`systemctl start data.mount`, `mount -a`, start the NFS server, ...) and
+  restore again. See [Filesystems and mounts](#filesystems-and-mounts).
+- `files or directories the job used are missing on this host: [...]`: files the job had open,
+  or its working directory, are gone, typically because they were on a tmpfs (`/scratch`) that
+  is empty after the reboot. The job cannot be restored. Remove it (`puzuz remove`).
 - `checkpoint is not compatible with this host`: a different GPU model or driver version, or a
   missing GPU. Restore with the original driver and GPU. In plugin mode the GPU UUIDs must match
   as well. In manual mode a different card of the same model is remapped.

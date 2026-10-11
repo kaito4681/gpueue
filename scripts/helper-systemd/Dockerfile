@@ -24,5 +24,15 @@ RUN set -e; \
         useradd -m -u 1000 -s /bin/sh alice; \
     fi; \
     getent passwd 1001 >/dev/null || useradd -m -u 1001 -s /bin/sh bob
+# Optional: sshfs and an SSH server for the FUSE mount scenario of
+# scripts/e2e/scenario.sh (skipped when they are missing, e.g. where apt is
+# offline).
+RUN if ! command -v sshfs >/dev/null || ! command -v sshd >/dev/null; then \
+        (apt-get update \
+         && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            sshfs openssh-server openssh-client \
+         && rm -rf /var/lib/apt/lists/*) \
+        || echo "sshfs/openssh-server not installed; the FUSE scenario will be skipped"; \
+    fi
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]

@@ -241,8 +241,13 @@ Details are in [docs/install.md](docs/install.md).
   restore the program sees a broken connection and must reconnect.
 - **Private `/tmp` and `/dev/shm`:** each job has its own empty tmpfs on `/tmp` and `/dev/shm`. It
   is saved in the checkpoint and is not shared with other jobs or with your shell. Mounts that do
-  not survive a reboot (anything below `/run`, `/mnt` and `/media`) are not visible inside jobs.
-  Use a path on a persistent filesystem to exchange files.
+  not survive a reboot (anything below `/run` and `/media`) are not visible inside jobs. Use a
+  path on a persistent filesystem to exchange files.
+- **Mounts are fixed at the start:** a job sees the filesystems that were mounted when it started
+  (automount points are triggered then), not those mounted later. To restore a job, every one of
+  those filesystems must be mounted again at the same path; otherwise the restore is refused and
+  the image is kept. Files on a tmpfs such as `/scratch` do not survive a reboot. See
+  [Filesystems and mounts](docs/install.md#filesystems-and-mounts).
 - **No crash safety:** checkpoints are taken only on an orderly shutdown, `puzuz shutdown` and
   `puzuz checkpoint`. Nothing is saved on a power loss, a kernel panic or a hard reset. Periodic
   checkpoints are not available yet. Keep saving your own training checkpoints.
@@ -288,7 +293,8 @@ Pre-release (version 0.1.0). Tested so far:
   cover basic queue operations, three-user authorization, groups and GPU limits,
   checkpoint/restore, daemon and helper restarts, many jobs added at once, `puzuz shutdown`, and a
   simulated reboot: the container is shut down with systemd and the jobs are restored in a new
-  container.
+  container, also with jobs working on a separate ext4 filesystem, bind mounts, an
+  `x-systemd.automount`, overlayfs, a tmpfs and sshfs that come back as new mounts.
 - With a real GPU in Docker (driver 595, CRIU 4.2.1 in manual mode, PyTorch 2.8 on Python 3.12):
   checkpoint/restore of a CUDA counter and of PyTorch training with forked DataLoader workers,
   with results identical to an uninterrupted run, and NVML GPU detection by the daemon inside the
@@ -298,7 +304,8 @@ Not tested yet:
 
 - A real OS reboot on a host: driver reload, and the stop order relative to the filesystems and
   `nvidia-persistenced`.
-- Restoring with a real host's mount layout (NFS, autofs, ...).
+- Kernel NFS and autofs indirect maps (FUSE network filesystems and `x-systemd.automount` are
+  tested).
 - `cuda_checkpoint_mode = "plugin"`, multi-GPU and NCCL jobs, and GPU models other than the one
   used for testing.
 
