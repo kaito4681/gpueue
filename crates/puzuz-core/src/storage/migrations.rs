@@ -154,9 +154,16 @@ UPDATE jobs
       AND json_type(state_data, '$.result') = 'object';
 "#;
 
+/// Version 5: `checkpoints.paused`, whether the job was paused when its
+/// dump began, so that it comes back paused after the restore.
+const V5: &str = r#"
+ALTER TABLE checkpoints
+    ADD COLUMN paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1));
+"#;
+
 /// All migrations, in order. The schema version after migrating is
 /// `MIGRATIONS.len()`.
-pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
+pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
 
 /// The schema version this build of puzuz writes.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

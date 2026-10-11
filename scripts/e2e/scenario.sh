@@ -75,6 +75,35 @@ wait_socket() {
 }
 started_at() { q carol "job($1)['started_at']"; }
 finished_at() { q carol "job($1)['finished_at']"; }
+log_lines() { grep -c . "$LOGS/$1/$2.log"; }
+# proc_states <id>: the states (R, S, T, ...) of the processes of job <id>'s
+# live unit, counted, for information.
+proc_states() {
+    local unit cg
+    unit=$(systemctl list-units --no-legend --plain --state=active \
+        "puzuz-job-$1.service" "puzuz-job-$1-r*.service" | awk '{print $1}' | tail -n1)
+    [ -n "$unit" ] || { echo "no active unit"; return; }
+    cg=$(systemctl show -p ControlGroup --value "$unit")
+    find "/sys/fs/cgroup$cg" -name cgroup.procs -exec cat {} + 2>/dev/null \
+        | while read -r p; do awk '/^State:/ {print $2}' "/proc/$p/status" 2>/dev/null; done \
+        | sort | uniq -c | tr -s ' \n' ' '
+}
+# expect_paused <uid> <id>: job <id> is paused and its log does not grow.
+expect_paused() {
+    local n
+    expect_state "$2" paused
+    n=$(log_lines "$1" "$2")
+    sleep 1.5
+    [ "$(log_lines "$1" "$2")" = "$n" ] || fail "job $2 runs although it is paused"
+    expect_state "$2" paused
+    echo "job $2 paused; process states: $(proc_states "$2")"
+}
+# expect_continues <uid> <id>: the log of job <id> grows.
+expect_continues() {
+    local n
+    n=$(log_lines "$1" "$2")
+    wait_for 30 "job $2 to continue" bash -c "[ \$(grep -c . $LOGS/$1/$2.log) -gt $n ]"
+}
 
 diagnose() {
     echo "--- jobs with errors"
@@ -263,23 +292,28 @@ s5_daemon_restart() { restart_while_running puzuz.service; }
 s6_helper_restart() { restart_while_running puzuz-helper.service; }
 
 s8_shutdown() {
-    local a b c
+    local a b c d
     a=$(add alice -g free -- "$COUNTER")
     b=$(add bob -g free -- "$COUNTER")
     c=$(add alice -g free --no-checkpoint -- 'trap "echo got TERM; exit 0" TERM; while :; do sleep 0.1; done')
-    for i in "$a" "$b" "$c"; do wait_state "$i" running; done
+    d=$(add alice -g free -- "$COUNTER")
+    for i in "$a" "$b" "$c" "$d"; do wait_state "$i" running; done
     sleep 1
+    # A paused job is dumped too, and comes back paused.
+    pz alice pause "$d" || fail "pause $d"
+    wait_state "$d" paused
     ! pz alice shutdown 2>/dev/null || fail "a regular user can shut the daemon down"
     pz carol shutdown || fail "shutdown"
     wait_for 120 "the daemon to exit" bash -c '! systemctl is-active --quiet puzuz.service'
-    for i in "$a" "$b" "$c"; do
+    for i in "$a" "$b" "$c" "$d"; do
         ! systemctl is-active --quiet "puzuz-job-$i.service" || fail "job $i still runs after shutdown"
     done
-    [ -e "$CKPT/$a" ] && [ -e "$CKPT/$b" ] || fail "no images for jobs $a and $b"
+    [ -e "$CKPT/$a" ] && [ -e "$CKPT/$b" ] && [ -e "$CKPT/$d" ] || fail "no images for jobs $a, $b and $d"
     systemctl start puzuz.service
     wait_socket
     expect_state "$a" checkpointed
     expect_state "$b" checkpointed
+    expect_state "$d" checkpointed
     expect_state "$c" 'done/*'
     grep -q 'got TERM' "$LOGS/1000/$c.log" || fail "the no-checkpoint job was not terminated gracefully"
     local before_a before_b
@@ -294,9 +328,87 @@ s8_shutdown() {
     [ "$(last_line 1001 "$b")" -gt "$before_b" ] || fail "job $b did not continue"
     check_counter_log 1000 "$a"
     check_counter_log 1001 "$b"
-    pz carol kill "$a" "$b"
+    pz alice restore "$d" || fail "restore $d"
+    wait_state "$d" paused 120
+    expect_paused 1000 "$d"
+    pz alice start "$d" || fail "start $d"
+    wait_state "$d" running
+    expect_continues 1000 "$d"
+    check_counter_log 1000 "$d"
+    pz carol kill "$a" "$b" "$d"
     wait_state "$a" 'done/*'
     wait_state "$b" 'done/*'
+    wait_state "$d" 'done/*'
+}
+
+# A job paused before its checkpoint is restored paused (the dump needs it
+# running, so it is resumed for the dump and stopped again after the
+# restore), and `puzuz start` resumes it. `pause` is refused while a dump
+# is in progress; the job is then checkpointed as asked and restored
+# running.
+s13_paused_checkpoint() {
+    local id big state out
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    id=$(add alice -g free -- "$COUNTER")
+    wait_state "$id" running
+    sleep 1
+    pz alice pause "$id" || fail "pause"
+    wait_state "$id" paused
+    pz alice checkpoint "$id" || fail "checkpoint"
+    wait_state "$id" checkpointed 120
+    pz alice restore "$id" || fail "restore"
+    wait_state "$id" paused 120
+    expect_paused 1000 "$id"
+    pz alice start "$id" || fail "start"
+    wait_state "$id" running
+    expect_continues 1000 "$id"
+    check_counter_log 1000 "$id"
+    # Checkpointed again while running: restored running.
+    pz alice checkpoint "$id" || fail "checkpoint 2"
+    wait_state "$id" checkpointed 120
+    pz alice restore "$id" || fail "restore 2"
+    wait_state "$id" running 120
+    expect_continues 1000 "$id"
+    check_counter_log 1000 "$id"
+    pz alice kill "$id" || fail "kill"
+    wait_state "$id" 'done/*'
+
+    # 1 GiB of memory, so that the dump takes a moment.
+    big=$(add alice -g free -- 'exec python3 -u /e2e/mem_counter.py 1024')
+    wait_state "$big" running
+    wait_for 60 "the job to print" bash -c "[ \$(grep -c . $LOGS/1000/$big.log) -ge 3 ]"
+    pz alice checkpoint "$big" || fail "checkpoint big"
+    state=$(st "$big")
+    if out=$(pz alice pause "$big" 2>&1); then
+        fail "pause accepted while the job is $state"
+    fi
+    echo "pause while $state: $out"
+    if [ "$state" = checkpointing ]; then
+        grep -q 'checkpoint' <<<"$out" || fail "the refusal does not mention the checkpoint: $out"
+    else
+        echo "(the dump was done before the pause; not a test of a dump in progress)"
+    fi
+    wait_state "$big" checkpointed 120
+    pz alice restore "$big" || fail "restore big"
+    wait_state "$big" running 120
+    expect_continues 1000 "$big"
+    check_counter_log 1000 "$big"
+    pz alice kill "$big" || fail "kill big"
+    wait_state "$big" 'done/*'
+}
+
+# check_cuda_mode <id>: the checkpoint of GPU job <id> was made in the
+# configured CUDA mode (PUZUZ_E2E_CUDA_MODE, default manual): in plugin
+# mode CRIU loaded cuda_plugin.so, in manual mode it did not.
+check_cuda_mode() {
+    local mode=${PUZUZ_E2E_CUDA_MODE:-manual}
+    grep -q "\"mode\": *\"$mode\"" "$CKPT/$1/meta.json" \
+        || fail "the checkpoint of job $1 is not in $mode mode: $(cat "$CKPT/$1/meta.json")"
+    if [ "$mode" = plugin ]; then
+        grep -q 'cuda_plugin' "$CKPT/$1/dump.log" || fail "CRIU did not load cuda_plugin.so"
+    elif grep -q 'cuda_plugin' "$CKPT/$1/dump.log"; then
+        fail "CRIU loaded cuda_plugin.so in manual mode"
+    fi
 }
 
 # PUZUZ_E2E_GPU=1 only: a CUDA job (GPU 0 is real) keeps its GPU memory
@@ -311,6 +423,7 @@ s9_gpu() {
     wait_for 60 "the GPU job to print" bash -c "[ \$(wc -l < $LOGS/1000/$id.log) -ge 5 ]"
     pz alice checkpoint "$id" || fail "checkpoint"
     wait_state "$id" checkpointed 300
+    check_cuda_mode "$id"
     before=$(last_line 1000 "$id" | cut -d' ' -f1)
     pz alice restore "$id" || fail "restore"
     wait_state "$id" running 300
@@ -318,15 +431,66 @@ s9_gpu() {
     after=$(last_line 1000 "$id" | cut -d' ' -f1)
     echo "GPU counter before dump: $before, after restore: $after"
     [ "$after" -gt "$before" ] || fail "the restored GPU job did not continue"
-    python3 - "$LOGS/1000/$id.log" <<'EOF' || fail "the GPU job's log has gaps or a wrong GPU value"
+    check_gpu_log "$id"
+    pz alice kill "$id" || fail "kill"
+    wait_state "$id" 'done/*'
+}
+
+# check_gpu_log <id>: the log of gpu_counter.py job <id> (alice's) has
+# consecutive steps, each equal to the counter kept in GPU memory.
+check_gpu_log() {
+    python3 - "$LOGS/1000/$1.log" <<'EOF' || fail "the GPU job's log has gaps or a wrong GPU value"
 import sys
 rows = [l.split() for l in open(sys.argv[1]) if l.strip()]
 rows = [(int(a), int(b)) for a, b in rows]
 assert all(a == b for a, b in rows), "GPU memory not preserved"
 assert [a for a, _ in rows] == list(range(1, len(rows) + 1)), "steps not consecutive"
 EOF
+}
+
+# PUZUZ_E2E_GPU=1 only: s13 for CUDA jobs. A paused CUDA counter and a
+# paused PyTorch training job (forked DataLoader workers) are restored
+# paused with their GPU state, and continue on `start`; `pause` during a
+# GPU dump is refused.
+s14_gpu_paused() {
+    local id state out
+    pz carol gpu parallel 1 || fail "gpu parallel"
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    id=$(add alice -g free --gpu 0 -- 'exec /opt/venv/bin/python3 -u /e2e/gpu_counter.py')
+    wait_state "$id" running
+    wait_for 60 "the GPU job to print" bash -c "[ \$(wc -l < $LOGS/1000/$id.log) -ge 5 ]"
+    pz alice pause "$id" || fail "pause"
+    wait_state "$id" paused
+    pz alice checkpoint "$id" || fail "checkpoint"
+    wait_state "$id" checkpointed 300
+    check_cuda_mode "$id"
+    pz alice restore "$id" || fail "restore"
+    wait_state "$id" paused 300
+    expect_paused 1000 "$id"
+    pz alice start "$id" || fail "start"
+    wait_state "$id" running
+    expect_continues 1000 "$id"
+    sleep 1
+    check_gpu_log "$id"
+
+    # pause during the GPU dump.
+    pz alice checkpoint "$id" || fail "checkpoint 2"
+    state=$(st "$id")
+    if out=$(pz alice pause "$id" 2>&1); then
+        fail "pause accepted while the job is $state"
+    fi
+    echo "pause while $state: $out"
+    wait_state "$id" checkpointed 300
+    pz alice restore "$id" || fail "restore 2"
+    wait_state "$id" running 300
+    expect_continues 1000 "$id"
+    sleep 1
+    check_gpu_log "$id"
     pz alice kill "$id" || fail "kill"
     wait_state "$id" 'done/*'
+
+    say "paused training with fork workers"
+    PAUSED_CHECKPOINT=1 gpu_train_variant 60 1 2
 }
 
 # PUZUZ_E2E_GPU=1 only: PyTorch training whose DataLoader forks its workers
@@ -352,11 +516,21 @@ gpu_train_variant() {
         lines=$((last + 12))
         wait_for 120 "the training job to reach $lines steps" \
             bash -c "[ \$(grep -c ^step= $LOGS/1000/$id.log) -ge $lines ]"
+        if [ "${PAUSED_CHECKPOINT:-}" = 1 ]; then
+            pz alice pause "$id" || fail "pause $k"
+            wait_state "$id" paused
+        fi
         pz alice checkpoint "$id" || fail "checkpoint $k"
         wait_state "$id" checkpointed 300
+        check_cuda_mode "$id"
         last=$(grep -c ^step= "$LOGS/1000/$id.log")
         marks+=("$last")
         pz alice restore "$id" || fail "restore $k"
+        if [ "${PAUSED_CHECKPOINT:-}" = 1 ]; then
+            wait_state "$id" paused 300
+            expect_paused 1000 "$id"
+            pz alice start "$id" || fail "start $k"
+        fi
         wait_state "$id" running 300
     done
     wait_state "$id" 'done/*' 300
@@ -403,7 +577,8 @@ s12_nvml_detection() {
     local since out smi
     mkdir -p "$STATE"
     cp /etc/puzuz/config.toml "$STATE/config-static.toml"
-    printf 'grace_secs = 5\ngpu_detection = "auto"\n' >/etc/puzuz/config.toml
+    { grep '^cuda_checkpoint_mode' "$STATE/config-static.toml" || true
+      printf 'grace_secs = 5\ngpu_detection = "auto"\n'; } >/etc/puzuz/config.toml
     since=$(date '+%Y-%m-%d %H:%M:%S')
     systemctl restart puzuz.service
     wait_socket
@@ -439,26 +614,50 @@ EOF
 }
 
 # s7 is split across two containers by scripts/e2e-test.sh.
+# The helper dumps the jobs on its own during the OS shutdown: a running
+# and a paused counter (the paused one comes back paused), and with
+# PUZUZ_E2E_GPU=1 a running and a paused CUDA counter on GPU 0.
 s7_prepare() {
-    local a b
+    local a b c g h
     # Created by s3 unless only the reboot scenario runs.
     pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
     a=$(add alice -g free -- "$COUNTER")
     b=$(add bob -g free --no-checkpoint -- 'trap "echo got TERM; exit 0" TERM; while :; do sleep 0.1; done')
+    c=$(add alice -g free -- "$COUNTER")
     wait_state "$a" running
     wait_state "$b" running
-    sleep 1.5
+    wait_state "$c" running
     mkdir -p "$STATE"
+    if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
+        pz carol gpu parallel 2 || fail "gpu parallel"
+        g=$(add alice -g free --gpu 0 -- 'exec /opt/venv/bin/python3 -u /e2e/gpu_counter.py')
+        h=$(add alice -g free --gpu 0 -- 'exec /opt/venv/bin/python3 -u /e2e/gpu_counter.py')
+        for i in "$g" "$h"; do
+            wait_state "$i" running
+            wait_for 60 "GPU job $i to print" bash -c "[ \$(wc -l < $LOGS/1000/$i.log) -ge 5 ]"
+        done
+        pz alice pause "$h" || fail "pause $h"
+        wait_state "$h" paused
+        echo "$g" >"$STATE/g"
+        echo "$h" >"$STATE/h"
+    fi
+    sleep 1.5
+    pz alice pause "$c" || fail "pause $c"
+    wait_state "$c" paused
     echo "$a" >"$STATE/a"
     echo "$b" >"$STATE/b"
+    echo "$c" >"$STATE/c"
 }
 s7_verify() {
-    local a b before after
+    local a b c g h before after
     a=$(cat "$STATE/a")
     b=$(cat "$STATE/b")
+    c=$(cat "$STATE/c")
     cat "$CKPT/shutdown-manifest.json" || true
-    [ -e "$CKPT/$a/COMPLETE" ] || fail "job $a has no complete image"
-    wait_state "$a" checkpointed 30
+    for i in "$a" "$c"; do
+        [ -e "$CKPT/$i/COMPLETE" ] || fail "job $i has no complete image"
+        wait_state "$i" checkpointed 30
+    done
     wait_state "$b" 'done/*' 30
     grep -q 'got TERM' "$LOGS/1001/$b.log" || fail "the no-checkpoint job was not stopped by systemd"
     before=$(last_line 1000 "$a")
@@ -471,6 +670,41 @@ s7_verify() {
     check_counter_log 1000 "$a"
     pz alice kill "$a"
     wait_state "$a" 'done/*'
+
+    pz alice restore "$c" || fail "restore $c"
+    wait_state "$c" paused 120
+    expect_paused 1000 "$c"
+    pz alice start "$c" || fail "start $c"
+    wait_state "$c" running
+    expect_continues 1000 "$c"
+    check_counter_log 1000 "$c"
+    pz alice kill "$c"
+    wait_state "$c" 'done/*'
+
+    if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
+        g=$(cat "$STATE/g")
+        h=$(cat "$STATE/h")
+        for i in "$g" "$h"; do
+            [ -e "$CKPT/$i/COMPLETE" ] || fail "GPU job $i has no complete image"
+            wait_state "$i" checkpointed 30
+            check_cuda_mode "$i"
+        done
+        pz alice restore "$g" || fail "restore $g"
+        wait_state "$g" running 300
+        expect_continues 1000 "$g"
+        pz alice restore "$h" || fail "restore $h"
+        wait_state "$h" paused 300
+        expect_paused 1000 "$h"
+        pz alice start "$h" || fail "start $h"
+        wait_state "$h" running
+        expect_continues 1000 "$h"
+        sleep 1
+        check_gpu_log "$g"
+        check_gpu_log "$h"
+        pz alice kill "$g" "$h"
+        wait_state "$g" 'done/*'
+        wait_state "$h" 'done/*'
+    fi
 }
 
 # Many jobs at once: `add --immediate` from several CLIs in parallel races
@@ -528,9 +762,11 @@ main)
     run "6 helper restart" s6_helper_restart
     run "8 puzuz shutdown" s8_shutdown
     run "10 many jobs at once" s10_burst
+    run "13 checkpoint of a paused job" s13_paused_checkpoint
     if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers
+        run "14 GPU checkpoint of paused jobs" s14_gpu_paused
         run "12 NVML GPU detection in the packaged unit" s12_nvml_detection
     fi
     ;;

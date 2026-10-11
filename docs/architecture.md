@@ -54,14 +54,23 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    daemon warns the owner). In manual mode it then runs
    `cuda-checkpoint --action lock` and `checkpoint` on each CUDA process, followed by
    `criu dump` of the namespace's init with `--tcp-close` and the image directory under
-   `/var/lib/puzuz/checkpoints/<id>/`. It writes `meta.json` and the `COMPLETE` marker last. A
-   successful dump stops the process. If the dump fails, CRIU leaves the process running and the
-   daemon then terminates it. The helper moves CRIU's `dump.log` to
-   `/var/lib/puzuz/checkpoints/failed-logs/` and removes the image directory.
+   `/var/lib/puzuz/checkpoints/<id>/`. In plugin mode it runs only `criu dump`, with CRIU's
+   default plugin directory, and CRIU's `cuda_plugin.so` calls cuda-checkpoint (in plugin mode a
+   CUDA job is refused when the plugin is missing). It writes `meta.json` (including the mode)
+   and the `COMPLETE` marker last. A successful dump stops the process. If the dump fails, CRIU
+   leaves the process running and the daemon then terminates it. The helper moves CRIU's
+   `dump.log` to `/var/lib/puzuz/checkpoints/failed-logs/` and removes the image directory.
+   A **paused** job is resumed (SIGCONT) before the dump, because cuda-checkpoint hangs on a
+   stopped process. The daemon records in the checkpoint record that the job was paused, and
+   pauses it again (SIGSTOP) as soon as it is restored, or when the dump is refused. The job
+   therefore runs for a moment during the dump and right after the restore. `pause` is refused
+   while a dump is in progress.
 7. **Restore.** The helper checks the GPU model, driver, free VRAM and mount paths. It starts a
    new unit `puzuz-job-<id>-r<n>.service` that runs `criu restore --root` on a bind mount of `/`
-   (`/run/puzuz-helper/criu-root`), then runs cuda-checkpoint `restore` and `unlock` on the CUDA
-   processes. The job keeps its id and log, and the image is deleted afterwards.
+   (`/run/puzuz-helper/criu-root`). In manual mode it then runs cuda-checkpoint `restore` and
+   `unlock` on the CUDA processes. In plugin mode CRIU's plugin does this before `criu restore`
+   returns. Each image is restored in the mode it was dumped in, whatever `cuda_checkpoint_mode`
+   says now. The job keeps its id and log, and the image is deleted afterwards.
 
 ## Shutdown ordering
 
@@ -71,7 +80,8 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
   `nvidia-persistenced` and `nvidia-fabricmanager`, so those are still available while it stops.
   On SIGTERM the helper asks systemd whether the whole system is stopping. If so, it refuses new
   work, dumps every running job one at a time (except `--no-checkpoint` jobs), extends its stop
-  timeout before each job, and writes `shutdown-manifest.json`. Job units are
+  timeout before each job, and writes `shutdown-manifest.json`. Paused jobs are dumped too
+  (resumed first), and come back paused after `puzuz restore`. Job units are
   `Before=puzuz-helper.service`, so systemd stops them only after the helper has finished. On the
   next boot the daemon gets the results from the helper's replayed events and marks the jobs
   `Checkpointed`. Jobs whose dump failed or was refused were stopped by systemd. They are marked

@@ -202,6 +202,11 @@ pub struct CheckpointRecord {
     /// Why the dump failed (a summary of the CRIU log). Restore errors are
     /// kept as a [`JobError`] instead.
     pub failure_reason: Option<String>,
+    /// The job was paused when the dump began. CRIU and cuda-checkpoint
+    /// need it running, so it is resumed for the dump; it is paused again
+    /// once restored (or when the dump is refused), see
+    /// [`crate::lifecycle::keep_paused`].
+    pub paused: bool,
 }
 
 /// What a [`JobError`] is about.

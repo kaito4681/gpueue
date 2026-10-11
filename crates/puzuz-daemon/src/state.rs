@@ -604,8 +604,9 @@ impl Core {
         (model, driver)
     }
 
-    /// A new in-progress checkpoint record for `job`.
-    fn new_checkpoint_record(&self, job: &Job, now: Timestamp) -> CheckpointRecord {
+    /// A new in-progress checkpoint record for `job`; `paused`: the job
+    /// was paused when the dump began (see [`lifecycle::keep_paused`]).
+    fn new_checkpoint_record(&self, job: &Job, paused: bool, now: Timestamp) -> CheckpointRecord {
         let (gpu_model, driver_version) = self.gpu_identity(&job.spec.gpus);
         CheckpointRecord {
             job_id: job.id,
@@ -616,6 +617,7 @@ impl Core {
             created_at: now,
             status: CheckpointStatus::InProgress,
             failure_reason: None,
+            paused,
         }
     }
 
@@ -760,6 +762,7 @@ impl Core {
         now: Timestamp,
         changes: &mut Changes,
     ) -> ApiResult<Option<Job>> {
+        let was_paused = job.state == JobState::Paused;
         if transition.next.is_some() {
             // From `Checkpointed`: a late success of a restore that was
             // given up as interrupted.
@@ -781,7 +784,7 @@ impl Core {
             match effect {
                 Effect::Spawn | Effect::Restore => changes.launching(job.id),
                 Effect::Checkpoint => {
-                    tx.put_checkpoint(&self.new_checkpoint_record(job, now))?;
+                    tx.put_checkpoint(&self.new_checkpoint_record(job, was_paused, now))?;
                     changes.updated(job.id);
                 }
                 Effect::RecordRestoreError(reason) => {
@@ -855,8 +858,13 @@ impl Core {
                 settle_launch(settle, self.start_restore(job).await)
             }
             // After a successful restore the helper has already removed the
-            // image (and refuses to touch the directory of a live job).
-            Effect::DeleteCheckpointImage if job.state == JobState::Running => Ok(()),
+            // image (and refuses to touch the directory of a live job). A
+            // job paused before its dump is `Paused` after the restore.
+            Effect::DeleteCheckpointImage
+                if matches!(job.state, JobState::Running | JobState::Paused) =>
+            {
+                Ok(())
+            }
             Effect::DeleteCheckpointImage => Ok(self
                 .helper
                 .delete_checkpoint(job.id, self.image_dir(job.id))
@@ -1154,20 +1162,28 @@ impl Core {
                 } else {
                     e.to_string()
                 };
-                let failure = refused.then(|| {
-                    Failure::new(
-                        ErrorCode::InvalidState,
-                        format!("{reason}; the job keeps running"),
-                    )
-                });
                 let core = self.clone();
                 let now = now_ms();
-                self.write(move |tx, ch| {
-                    if let Some(job) = tx.get_job(id)?
-                        && job.state == JobState::Checkpointing
-                    {
-                        tx.update_job_state(id, &JobState::Running, job.started_at, None)?;
-                        if tx.get_checkpoint(id)?.is_some() {
+                let failure_reason = reason.clone();
+                // A job that was paused for the dump is paused again (see
+                // `lifecycle::keep_paused`).
+                let repause = self
+                    .write(move |tx, ch| {
+                        let Some(mut job) = tx.get_job(id)? else {
+                            return Ok(None);
+                        };
+                        if job.state != JobState::Checkpointing {
+                            return Ok(None);
+                        }
+                        let record = tx.get_checkpoint(id)?;
+                        let paused = record.as_ref().is_some_and(|r| r.paused);
+                        let next = if paused {
+                            JobState::Paused
+                        } else {
+                            JobState::Running
+                        };
+                        tx.update_job_state(id, &next, job.started_at, None)?;
+                        if record.is_some() {
                             tx.set_checkpoint_status(
                                 id,
                                 CheckpointStatus::Failed,
@@ -1178,14 +1194,31 @@ impl Core {
                             tx.put_checkpoint(&CheckpointRecord {
                                 status: CheckpointStatus::Failed,
                                 failure_reason: Some(reason),
-                                ..core.new_checkpoint_record(&job, now)
+                                ..core.new_checkpoint_record(&job, false, now)
                             })?;
                         }
                         ch.updated(id);
-                    }
-                    Ok(())
-                })
-                .await?;
+                        job.state = next;
+                        Ok(paused.then_some(job))
+                    })
+                    .await?;
+                let paused = repause.is_some();
+                if let Some(job) = repause
+                    && let Err(err) = self.signal(&job, signal::SIGSTOP).await
+                {
+                    tracing::warn!(job = %id, "cannot pause the job again: {}", err.0.message);
+                }
+                let failure = refused.then(|| {
+                    let keeps = if paused {
+                        "the job stays paused"
+                    } else {
+                        "the job keeps running"
+                    };
+                    Failure::new(
+                        ErrorCode::InvalidState,
+                        format!("{failure_reason}; {keeps}"),
+                    )
+                });
                 Err(failure.unwrap_or_else(|| e.into()))
             }
             Err(e) => Err(e.into()),
@@ -1300,13 +1333,16 @@ impl Core {
                 let Some(mut job) = tx.get_job(id)? else {
                     return Ok(None);
                 };
-                let transition = match lifecycle::on_event(&job, &event) {
+                let mut transition = match lifecycle::on_event(&job, &event) {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::debug!("ignoring helper event: {e}");
                         return Ok(None);
                     }
                 };
+                if tx.get_checkpoint(id)?.is_some_and(|r| r.paused) {
+                    transition = lifecycle::keep_paused(&event, transition);
+                }
                 pre(tx, &job)?;
                 ch.updated(id);
                 core.apply_in_tx(tx, &mut job, &transition, now, ch)?;
@@ -1369,14 +1405,23 @@ impl Core {
                 };
                 let core = self.clone();
                 self.handle_event(job, event, move |tx, current| {
-                    if tx.get_checkpoint(job)?.is_some() {
+                    // The record of a dump the daemon asked for exists since
+                    // then; one the helper made on its own (OS shutdown)
+                    // replaces any older record, so its `paused` flag is
+                    // the job's state now.
+                    if current.state == JobState::Checkpointing && tx.get_checkpoint(job)?.is_some()
+                    {
                         tx.set_checkpoint_status(job, status, size, reason.as_deref())
                     } else {
                         tx.put_checkpoint(&CheckpointRecord {
                             size_bytes: size,
                             status,
                             failure_reason: reason,
-                            ..core.new_checkpoint_record(current, now)
+                            ..core.new_checkpoint_record(
+                                current,
+                                current.state == JobState::Paused,
+                                now,
+                            )
                         })
                     }
                 })
@@ -1859,6 +1904,7 @@ mod tests {
                         created_at: 0,
                         status,
                         failure_reason: None,
+                        paused: false,
                     })
                     .unwrap();
             })

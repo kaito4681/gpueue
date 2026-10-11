@@ -714,6 +714,7 @@ fn checkpoint(job_id: JobId) -> CheckpointRecord {
         created_at: 1_700_000_000_000,
         status: CheckpointStatus::InProgress,
         failure_reason: None,
+        paused: false,
     }
 }
 
@@ -743,10 +744,14 @@ fn checkpoint_record_lifecycle() {
     let mut rec_b = checkpoint(b.id);
     rec_b.gpu_model = None;
     rec_b.driver_version = None;
+    rec_b.paused = true;
     store.put_checkpoint(&rec_b).unwrap();
+    assert_eq!(store.get_checkpoint(b.id).unwrap().unwrap(), rec_b);
     store
         .set_checkpoint_status(b.id, CheckpointStatus::Failed, None, Some("criu: ENOSPC"))
         .unwrap();
+    // A status change keeps the paused flag.
+    assert!(store.get_checkpoint(b.id).unwrap().unwrap().paused);
 
     let list = store.list_checkpoints().unwrap();
     assert_eq!(list.len(), 2);
@@ -875,6 +880,7 @@ fn version_one_database_is_upgraded_keeping_checkpoints() {
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     let record = store.get_checkpoint(JobId(0)).unwrap().unwrap();
     assert_eq!(record.failure_reason.as_deref(), Some("boom"));
+    assert!(!record.paused, "old records were not paused");
     assert_eq!(
         store.unacknowledged_checkpoint_failures(Uid(1)).unwrap(),
         [JobId(0)]
@@ -953,6 +959,7 @@ fn swap_job_ids_moves_every_row_and_dependency() {
             created_at: 5,
             status: CheckpointStatus::Complete,
             failure_reason: None,
+            paused: false,
         })
         .unwrap();
 

@@ -40,6 +40,9 @@ pub enum FakeOutcome {
     /// helper does when its pre-checks fail at dump time. The job keeps
     /// running.
     Refuse(String),
+    /// Checkpoints only: accept the request and report nothing, as if the
+    /// dump were still running (finish it with [`FakeHelper::dump`]).
+    Hold,
 }
 
 /// A simulated live job.
@@ -218,6 +221,22 @@ impl FakeHelper {
     /// The job vanishes without any event (e.g. lost across a reboot).
     pub fn vanish(&self, job: JobId) {
         self.with(|s| s.jobs.remove(&job));
+    }
+
+    /// The helper dumps the job on its own, as on an OS shutdown: the
+    /// process is gone, its image is there, and the outcome is an event.
+    pub fn dump(&self, job: JobId) {
+        self.with(|s| {
+            if s.jobs.remove(&job).is_some() {
+                s.images.insert(job);
+                s.emit(Event::CheckpointFinished {
+                    job,
+                    outcome: CheckpointOutcome::Success {
+                        image_size_bytes: 4096,
+                    },
+                });
+            }
+        });
     }
 
     /// A live job the daemon does not know about.
@@ -479,6 +498,7 @@ impl FakeHelper {
                 });
             }
             let outcome = match s.checkpoint_outcome.clone() {
+                FakeOutcome::Hold => return Ok(()),
                 FakeOutcome::Succeed => {
                     s.jobs.remove(&job);
                     s.images.insert(job);
@@ -543,6 +563,7 @@ impl FakeHelper {
                     FakeOutcome::Fail(reason) | FakeOutcome::Refuse(reason) => {
                         RestoreOutcome::failed(reason)
                     }
+                    FakeOutcome::Hold => return Ok(()),
                 }
             };
             s.emit(Event::RestoreFinished { job, outcome });

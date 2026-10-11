@@ -6,8 +6,7 @@ use super::{CheckpointRecord, CheckpointStatus, Result};
 use crate::error::{Error, StorageError};
 use crate::model::{JobId, Uid};
 
-const COLUMNS: &str =
-    "job_id, path, size_bytes, gpu_model, driver_version, created_at, status, failure_reason";
+const COLUMNS: &str = "job_id, path, size_bytes, gpu_model, driver_version, created_at, status, failure_reason, paused";
 
 fn checkpoint_row(row: &Row<'_>) -> rusqlite::Result<CheckpointRecord> {
     let status: String = row.get(6)?;
@@ -27,13 +26,14 @@ fn checkpoint_row(row: &Row<'_>) -> rusqlite::Result<CheckpointRecord> {
         created_at: row.get(5)?,
         status,
         failure_reason: row.get(7)?,
+        paused: row.get(8)?,
     })
 }
 
 pub(super) fn put(conn: &Connection, r: &CheckpointRecord) -> Result<()> {
     let result = conn
         .prepare_cached(&format!(
-            "INSERT OR REPLACE INTO checkpoints ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            "INSERT OR REPLACE INTO checkpoints ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
         ))?
         .execute(params![
             r.job_id.0,
@@ -44,6 +44,7 @@ pub(super) fn put(conn: &Connection, r: &CheckpointRecord) -> Result<()> {
             r.created_at,
             r.status.as_str(),
             r.failure_reason,
+            r.paused,
         ]);
     match result {
         Ok(_) => Ok(()),

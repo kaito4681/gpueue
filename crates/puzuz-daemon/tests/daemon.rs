@@ -24,7 +24,7 @@ use puzuz_protocol::api::{
     GpuDetection, GpuSource, JobView, ListGpusResponse, ListJobsResponse, VERSION_HEADER,
     VersionResponse, WARNINGS_HEADER, Warning,
 };
-use puzuz_protocol::helper::signal;
+use puzuz_protocol::helper::{RunningPhase, signal};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -797,7 +797,7 @@ async fn refused_checkpoint_fails_the_command_and_leaves_the_job_running() {
         [Warning::CheckpointFailed { job: id }]
     );
 
-    // A paused job was resumed for the dump and runs on.
+    // A paused job was resumed for the dump; it is paused again.
     assert_eq!(
         alice.action(id, "pause", json!({})).await.status,
         StatusCode::OK
@@ -805,18 +805,166 @@ async fn refused_checkpoint_fails_the_command_and_leaves_the_job_running() {
     alice.wait_state(id, &JobState::Paused).await;
     alice.action(id, "checkpoint", json!(null)).await;
     alice
-        .wait_for(id, "running", |j| j.state == JobState::Running)
+        .wait_for(id, "paused again", |j| {
+            j.state == JobState::Paused && h.helper.signals().len() == 3
+        })
         .await;
     assert_eq!(
         h.helper.signals(),
-        [(id, signal::SIGSTOP), (id, signal::SIGCONT)]
+        [
+            (id, signal::SIGSTOP),
+            (id, signal::SIGCONT),
+            (id, signal::SIGSTOP)
+        ]
     );
+    // Also when refused up front.
+    h.helper
+        .set_checkpoint_rejection(Some("not enough free space for the image"));
+    let reply = alice.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(
+        reply.error().message,
+        "checkpoint refused: not enough free space for the image; the job stays paused"
+    );
+    assert_eq!(alice.job(id).await.state, JobState::Paused);
+    assert_eq!(h.helper.signals().len(), 5);
+    assert_eq!(h.helper.jobs()[&id].phase, RunningPhase::Stopped);
+    h.helper.set_checkpoint_rejection(None);
 
     // Once the problem is gone it can be checkpointed.
     h.helper.set_checkpoint_outcome(FakeOutcome::Succeed);
     alice.action(id, "checkpoint", json!(null)).await;
     alice.wait_state(id, &JobState::Checkpointed).await;
 
+    h.stop().await;
+}
+
+/// A job paused when it is checkpointed is resumed for the dump (CRIU and
+/// cuda-checkpoint need it running) and paused again once restored, still
+/// holding its GPU. One running when checkpointed comes back running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_paused_before_its_checkpoint_is_restored_paused() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    let id = alice.add(&job_request("train", &[0])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+    assert_eq!(
+        alice.action(id, "pause", json!({})).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Paused).await;
+    let reply = alice.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    alice.wait_state(id, &JobState::Checkpointed).await;
+    let reply = alice
+        .action(id, "restore", json!({"immediate": true}))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    alice.wait_state(id, &JobState::Paused).await;
+    assert_eq!(
+        h.helper.signals(),
+        [
+            (id, signal::SIGSTOP),
+            (id, signal::SIGCONT),
+            (id, signal::SIGSTOP)
+        ]
+    );
+    assert_eq!(h.helper.jobs()[&id].phase, RunningPhase::Stopped);
+    assert!(!h.helper.has_image(id));
+    assert_eq!(alice.job(id).await.checkpoint_size_bytes, None);
+    // It keeps its GPU while paused.
+    let other = alice.add(&job_request("other", &[0])).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(
+        alice.job(other).await.state,
+        JobState::Queued { .. }
+    ));
+    let reply = alice
+        .call(Method::DELETE, &format!("/v1/jobs/{other}"), None)
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    // `start` resumes it; checkpointed while running, it is restored running.
+    assert_eq!(
+        alice.action(id, "start", json!(null)).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Running).await;
+    alice.action(id, "checkpoint", json!(null)).await;
+    alice.wait_state(id, &JobState::Checkpointed).await;
+    alice
+        .action(id, "restore", json!({"immediate": true}))
+        .await;
+    alice.wait_state(id, &JobState::Running).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(alice.job(id).await.state, JobState::Running);
+    assert_eq!(h.helper.signals().len(), 4, "{:?}", h.helper.signals());
+    assert_eq!(h.helper.jobs()[&id].phase, RunningPhase::Running);
+
+    h.stop().await;
+}
+
+/// On an OS shutdown the helper dumps a paused job on its own (resuming it
+/// first); after the reboot it is restored paused as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_paused_at_an_os_shutdown_is_restored_paused() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(2).await;
+    let alice = h.client(ALICE);
+    let paused = alice.add(&job_request("a", &[])).await;
+    let running = alice.add(&job_request("b", &[])).await;
+    for id in [paused, running] {
+        alice.wait_state(id, &JobState::Running).await;
+        h.wait_spawned(id).await;
+    }
+    alice.action(paused, "pause", json!({})).await;
+    alice.wait_state(paused, &JobState::Paused).await;
+    h.stop().await;
+    h.helper.dump(paused);
+    h.helper.dump(running);
+
+    h.start(0).await;
+    let alice = h.client(ALICE);
+    for id in [paused, running] {
+        alice.wait_state(id, &JobState::Checkpointed).await;
+        let reply = alice
+            .action(id, "restore", json!({"immediate": true}))
+            .await;
+        assert_eq!(reply.status, StatusCode::OK);
+    }
+    alice.wait_state(paused, &JobState::Paused).await;
+    alice.wait_state(running, &JobState::Running).await;
+    assert_eq!(
+        h.helper.signals(),
+        [(paused, signal::SIGSTOP), (paused, signal::SIGSTOP)]
+    );
+    h.stop().await;
+}
+
+/// `pause` is refused while a dump is in progress (SIGSTOP would make
+/// cuda-checkpoint hang); the job is checkpointed as asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_is_refused_while_the_job_is_checkpointed() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let id = alice.add(&job_request("a", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+    // The dump never finishes on its own.
+    h.helper.set_checkpoint_outcome(FakeOutcome::Hold);
+    assert_eq!(
+        alice.action(id, "checkpoint", json!(null)).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Checkpointing).await;
+    let reply = alice.action(id, "pause", json!({})).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    let error = reply.error();
+    assert_eq!(error.code, ErrorCode::InvalidState);
+    assert!(error.message.contains("checkpoint"), "{}", error.message);
+    assert!(h.helper.signals().is_empty());
+    h.helper.dump(id);
+    alice.wait_state(id, &JobState::Checkpointed).await;
     h.stop().await;
 }
 

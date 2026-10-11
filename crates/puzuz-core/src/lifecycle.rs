@@ -166,6 +166,15 @@ pub fn hint(action: Action, state: &JobState) -> Option<&'static str> {
             Some("kill the job first with `puzuz kill`")
         }
         (Action::Restore, JobState::Paused) => Some("use `puzuz start` to resume a paused job"),
+        // SIGSTOP during a dump would make cuda-checkpoint hang; the dump
+        // stops the job anyway.
+        (Action::Pause, JobState::Checkpointing) => Some(
+            "the job stops when its checkpoint is done; if the dump fails it is ended, if it \
+             is refused the job keeps running and can be paused then",
+        ),
+        (Action::Pause, JobState::Restoring) => {
+            Some("the job is being restored; pause it once it runs again")
+        }
         (Action::Restart, JobState::Checkpointed) => Some(
             "a checkpointed job cannot be restarted in place; restart without --in-place \
              creates a new job and keeps the checkpoint",
@@ -402,9 +411,11 @@ pub fn check_switch(a: &Job, b: &Job) -> Result<(), Error> {
 
 /// `checkpoint`: dump a running job and stop it.
 ///
-/// A paused job is resumed first (`SignalContinue`, then `Checkpoint`): the
-/// CUDA driver cannot checkpoint a stopped process, so the job comes back
-/// running after `restore`.
+/// A paused job is resumed first (`SignalContinue`, then `Checkpoint`):
+/// `cuda-checkpoint` hangs on a stopped process and CRIU would record it
+/// as stopped anyway. The daemon remembers that it was paused (the
+/// checkpoint record's `paused` flag) and pauses it again with
+/// [`keep_paused`] once it is restored, or when the dump is refused.
 pub fn checkpoint(job: &Job) -> Result<Transition, Error> {
     match job.state {
         JobState::Running => Ok(Transition::to(JobState::Checkpointing).with(Effect::Checkpoint)),
@@ -679,6 +690,25 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
     Ok(transition)
 }
 
+/// Adjust the transition of `event` for a job that was paused when its
+/// checkpoint began (it was resumed for the dump, see [`checkpoint`]):
+/// where the job would run again without the user asking for it, after a
+/// successful restore or a refused dump, it is paused again instead
+/// (`Paused` plus [`Effect::SignalStop`], after the transition's own
+/// effects). The process runs for the moment between the restore and the
+/// stop. Other transitions are returned unchanged.
+pub fn keep_paused(event: &Event, mut transition: Transition) -> Transition {
+    let resumes = matches!(
+        event,
+        Event::RestoreSucceeded | Event::CheckpointRefused { .. }
+    ) && transition.next == Some(JobState::Running);
+    if resumes {
+        transition.next = Some(JobState::Paused);
+        transition.effects.push(Effect::SignalStop);
+    }
+    transition
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -772,6 +802,9 @@ mod tests {
         let t = pause(&job(1, JobState::Running)).unwrap();
         assert_eq!(t.next, Some(JobState::Paused));
         assert_eq!(t.effects, vec![Effect::SignalStop]);
+        // Not while a dump is in progress (it stops the job anyway).
+        assert!(hint(Action::Pause, &JobState::Checkpointing).is_some());
+        assert!(hint(Action::Pause, &JobState::Restoring).is_some());
     }
 
     #[test]
@@ -1447,5 +1480,51 @@ mod tests {
         let before = j.clone();
         Transition::unchanged().apply(&mut j, 80);
         assert_eq!(j, before);
+    }
+
+    #[test]
+    fn keep_paused_pauses_a_restored_or_refused_job_again() {
+        let restoring = job(1, JobState::Restoring);
+        let t = keep_paused(
+            &Event::RestoreSucceeded,
+            on_event(&restoring, &Event::RestoreSucceeded).unwrap(),
+        );
+        assert_eq!(t.next, Some(JobState::Paused));
+        assert_eq!(
+            t.effects,
+            vec![Effect::DeleteCheckpointImage, Effect::SignalStop]
+        );
+        // Also a late success of a restore given up as interrupted.
+        let checkpointed = job(1, JobState::Checkpointed);
+        let t = keep_paused(
+            &Event::RestoreSucceeded,
+            on_event(&checkpointed, &Event::RestoreSucceeded).unwrap(),
+        );
+        assert_eq!(t.next, Some(JobState::Paused));
+
+        let refused = Event::CheckpointRefused { reason: "x".into() };
+        let t = keep_paused(
+            &refused,
+            on_event(&job(1, JobState::Checkpointing), &refused).unwrap(),
+        );
+        assert_eq!(t.next, Some(JobState::Paused));
+        assert_eq!(t.effects, vec![Effect::SignalStop]);
+    }
+
+    #[test]
+    fn keep_paused_leaves_other_transitions_alone() {
+        let failed = Event::CheckpointFailed { reason: "x".into() };
+        let t = on_event(&job(1, JobState::Checkpointing), &failed).unwrap();
+        assert_eq!(keep_paused(&failed, t.clone()), t);
+        let ok = Event::CheckpointSucceeded;
+        let t = on_event(&job(1, JobState::Checkpointing), &ok).unwrap();
+        assert_eq!(keep_paused(&ok, t.clone()), t);
+        // A refused dump on an OS shutdown ends the job anyway.
+        let refused = Event::CheckpointRefused { reason: "x".into() };
+        let t = on_event(&job(1, JobState::Paused), &refused).unwrap();
+        assert_eq!(keep_paused(&refused, t.clone()), t);
+        let failed = Event::RestoreFailed { reason: "x".into() };
+        let t = on_event(&job(1, JobState::Restoring), &failed).unwrap();
+        assert_eq!(keep_paused(&failed, t.clone()), t);
     }
 }

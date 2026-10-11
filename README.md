@@ -90,6 +90,11 @@ puzuz restore -i 0    # ...or resume right away, ignoring slot limits
 A restored job continues from the moment it was checkpointed. It keeps its job id, and its output
 is appended to the same log.
 
+A paused job can be checkpointed as well, also on a reboot. It is restored paused, still holding
+its GPU slots, and `puzuz start` resumes it. CRIU and cuda-checkpoint need a running process, so
+the job runs for a moment during the dump and right after the restore. `puzuz pause` is refused
+while a checkpoint is in progress.
+
 ### What happens on reboot
 
 1. When the OS shuts down, `puzuz-helper.service` is stopped before the filesystems and NVIDIA
@@ -299,8 +304,9 @@ Not tested yet:
 - A real OS reboot on a host: driver reload, and the stop order relative to the filesystems and
   `nvidia-persistenced`.
 - Restoring with a real host's mount layout (NFS, autofs, ...).
-- `cuda_checkpoint_mode = "plugin"`, multi-GPU and NCCL jobs, and GPU models other than the one
-  used for testing.
+- `cuda_checkpoint_mode = "plugin"` with a real GPU: the e2e scenarios exist
+  (`PUZUZ_E2E_CUDA_MODE=plugin`) but have not been run to completion yet.
+- Multi-GPU and NCCL jobs, and GPU models other than the one used for testing.
 
 Please report what works and what does not on your hardware.
 
