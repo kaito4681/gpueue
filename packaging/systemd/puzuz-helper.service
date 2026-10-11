@@ -31,11 +31,16 @@ ExecStart=/usr/bin/puzuz-helper serve
 # KillMode=mixed: only the helper itself gets SIGTERM; criu and
 # cuda-checkpoint children in the middle of a dump are not interrupted.
 KillMode=mixed
-# Upper bound for dumping everything. The helper additionally extends the
-# timeout with EXTEND_TIMEOUT_USEC before each job, so this mostly matters
-# for systemd versions without that. Size it for your jobs: a dump writes
-# roughly RSS + VRAM per job (PoC: 7 GB of VRAM in ~11 s; a 16 GB job takes
-# 20-30 s on an NVMe disk) and jobs are dumped sequentially.
+# Initial budget for dumping everything. While it dumps, the helper extends
+# the timeout with EXTEND_TIMEOUT_USEC, but only up to the end of the running
+# dump's deadline (checkpoint_deadline_base_secs +
+# checkpoint_deadline_secs_per_gib * GiB of RSS + VRAM, 180 s + 30 s/GiB by
+# default) plus its rollback, so this mostly matters for systemd versions
+# without that. Jobs are dumped sequentially; measured on an NVMe disk, a
+# dump takes about 2-2.5 s per GiB of RSS + VRAM, so 30 min covers several
+# hundred GiB in total, and ~50 GiB even at the deadline's rate of 30 s/GiB
+# (see docs/install.md, "Checkpoint timeouts"). Raise it for larger jobs or
+# slower disks.
 TimeoutStopSec=30min
 Restart=on-failure
 RestartSec=2s

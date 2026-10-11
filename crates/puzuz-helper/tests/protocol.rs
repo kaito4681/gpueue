@@ -17,10 +17,10 @@ use puzuz_helper::launcher::{Launcher, UnitState};
 use puzuz_helper::testing::{FakeExecState, FakeExecutor, FakeHost};
 use puzuz_helper::{ExecutorFactory, Helper, HelperConfig, ShutdownManifest, server};
 use puzuz_protocol::helper::{
-    CheckpointOutcome, DaemonMessage, Event, EventEnvelope, EventSeq, ExitStatus, Gid, GpuIndex,
-    Hello, HelperErrorCode, HelperMessage, JobId, PROTOCOL_VERSION, Request, RequestEnvelope,
-    RequestId, ResponseResult, RestoreOutcome, RestoreRequest, RunningPhase, SpawnRequest, Uid,
-    decode_line, encode_line, signal,
+    CheckpointOptions, CheckpointOutcome, DaemonMessage, Event, EventEnvelope, EventSeq,
+    ExitStatus, Gid, GpuIndex, Hello, HelperErrorCode, HelperMessage, JobId, PROTOCOL_VERSION,
+    Request, RequestEnvelope, RequestId, ResponseResult, RestoreOutcome, RestoreRequest,
+    RunningPhase, SpawnRequest, Uid, decode_line, encode_line, signal,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -87,14 +87,18 @@ impl Env {
 
     /// Simulate a helper restart on the same state and units.
     async fn restart(&mut self) {
+        self.restart_with(with_mode(config(&self.root, uid()), &self.root, self.mode))
+            .await;
+    }
+
+    /// [`Self::restart`] with another configuration.
+    async fn restart_with(&mut self, cfg: HelperConfig) {
         let _ = self.stop.send(true);
-        let (helper, stop) = start(
-            &self.root,
-            uid(),
+        let (helper, stop) = start_with(
+            cfg,
             self.launcher.clone(),
             self.host.clone(),
             self.exec.clone(),
-            self.mode,
         )
         .await;
         self.helper = helper;
@@ -156,12 +160,25 @@ async fn start(
     exec: Arc<Mutex<FakeExecState>>,
     mode: CudaMode,
 ) -> (Arc<TestHelper>, watch::Sender<bool>) {
-    let factory: ExecutorFactory =
-        Arc::new(move || Box::new(FakeExecutor(exec.clone())) as Box<dyn Executor + Send>);
-    let mut cfg = config(root, daemon_uid);
+    let cfg = with_mode(config(root, daemon_uid), root, mode);
+    start_with(cfg, launcher, host, exec).await
+}
+
+fn with_mode(mut cfg: HelperConfig, root: &Path, mode: CudaMode) -> HelperConfig {
     cfg.checkpoint.mode = mode;
     // CRIU's plugins, for the plugin mode (empty unless a test adds one).
     cfg.checkpoint.criu.plugin_dir = Some(root.join("criu-plugins"));
+    cfg
+}
+
+async fn start_with(
+    cfg: HelperConfig,
+    launcher: Arc<FakeLauncher>,
+    host: Arc<FakeHost>,
+    exec: Arc<Mutex<FakeExecState>>,
+) -> (Arc<TestHelper>, watch::Sender<bool>) {
+    let factory: ExecutorFactory =
+        Arc::new(move || Box::new(FakeExecutor(exec.clone())) as Box<dyn Executor + Send>);
     let socket = cfg.socket_path.clone();
     let helper = Helper::new(cfg, launcher, host, factory).unwrap();
     helper.recover().await.unwrap();
@@ -873,6 +890,84 @@ async fn failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first()
 }
 
 #[tokio::test]
+async fn a_dump_past_its_deadline_is_killed_and_the_job_resumed() {
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(8))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    env.exec.lock().unwrap().hang_on = Some(|a| matches!(a, Action::CriuDump { .. }));
+    // The daemon's cap on the whole operation: 1 s.
+    let started = std::time::Instant::now();
+    let res = c
+        .request(Request::Checkpoint {
+            job: JobId(8),
+            image_dir: env.base().join("8"),
+            options: CheckpointOptions {
+                timeout_secs: Some(1),
+                ..Default::default()
+            },
+        })
+        .await;
+    assert_eq!(res, ResponseResult::Accepted);
+    let env_event = c.event().await;
+    let Event::CheckpointFinished { job, outcome } = env_event.event else {
+        panic!("expected a checkpoint event")
+    };
+    assert_eq!(
+        c.request(Request::AckEvents {
+            up_to: env_event.seq
+        })
+        .await,
+        ResponseResult::Ok
+    );
+    assert_eq!(job, JobId(8));
+    let CheckpointOutcome::Failed { reason, code: None } = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(
+        reason.contains("did not finish within its deadline of 1s"),
+        "{reason}"
+    );
+    assert!(reason.contains("the job was resumed"), "{reason}");
+    assert!(reason.contains("CRIU log:"), "{reason}");
+    // The interrupted dump was followed by a thaw of the job's tree, and
+    // the job is still there, running.
+    assert_eq!(env.exec.lock().unwrap().thawed.len(), 1);
+    assert_eq!(c.running().await, [(JobId(8), RunningPhase::Running)]);
+    assert!(!env.base().join("8").join("COMPLETE").exists());
+
+    // The configured deadline applies without a cap from the daemon.
+    let mut cfg = env.helper.config().clone();
+    cfg.checkpoint.timeouts.deadline_base = Duration::from_secs(1);
+    cfg.checkpoint.timeouts.deadline_per_gib = Duration::ZERO;
+    env.restart_with(cfg).await;
+    let mut c = env.client().await;
+    env.exec.lock().unwrap().hang_on = Some(|a| matches!(a, Action::CriuDump { .. }));
+    assert_eq!(
+        c.request(Request::Checkpoint {
+            job: JobId(8),
+            image_dir: env.base().join("8"),
+            options: Default::default(),
+        })
+        .await,
+        ResponseResult::Accepted
+    );
+    let outcome = loop {
+        if let Event::CheckpointFinished { outcome, .. } = c.event().await.event {
+            break outcome;
+        }
+    };
+    assert!(
+        matches!(&outcome, CheckpointOutcome::Failed { reason, .. } if reason.contains("deadline of 1s")),
+        "{outcome:?}"
+    );
+    assert_eq!(c.running().await, [(JobId(8), RunningPhase::Running)]);
+}
+
+#[tokio::test]
 async fn dump_refuses_a_job_that_depends_on_a_hidden_mount() {
     let env = Env::new().await;
     let mut c = env.client().await;
@@ -1008,11 +1103,14 @@ async fn shutdown_reports_refused_and_failed_dumps_apart() {
     let host = env.host.clone();
     let manifest = env
         .helper
-        .shutdown(move |job| {
-            if job == JobId(21) {
-                host.set_unreachable_mounts(vec!["/hidden".into()]);
-            }
-        })
+        .shutdown(
+            move |job| {
+                if job == JobId(21) {
+                    host.set_unreachable_mounts(vec!["/hidden".into()]);
+                }
+            },
+            |_| {},
+        )
         .await;
     let [first, second] = &manifest.jobs[..] else {
         panic!("{manifest:?}")
@@ -1074,7 +1172,7 @@ async fn shutdown_checkpoints_everything_except_no_checkpoint_jobs() {
     let d = dumped.clone();
     let manifest = env
         .helper
-        .shutdown(move |job| d.lock().unwrap().push(job))
+        .shutdown(move |job| d.lock().unwrap().push(job), |_| {})
         .await;
     assert_eq!(*dumped.lock().unwrap(), [JobId(10)]);
     assert_eq!(manifest.jobs.len(), 2);

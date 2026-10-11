@@ -32,8 +32,8 @@
 //! cuda_checkpoint_path = "cuda-checkpoint"
 //! nvidia_smi_path = "nvidia-smi"
 //! cuda_checkpoint_mode = "manual"
-//! criu_dump_timeout_secs = 1800
-//! criu_restore_timeout_secs = 1800
+//! checkpoint_deadline_base_secs = 180
+//! checkpoint_deadline_secs_per_gib = 30
 //! fork_guard = true
 //! # GPUs are detected with NVML ("auto"). Without NVML (no driver, no
 //! # libnvidia-ml.so.1) the [[gpus]] list is used instead; "static" always
@@ -42,6 +42,8 @@
 //!
 //! # Examples; unset by default.
 //! checkpoint_size_limit_bytes = 500_000_000_000   # default: no limit
+//! criu_dump_timeout_secs = 3600      # default: only the deadline applies
+//! criu_restore_timeout_secs = 3600   # default: only the deadline applies
 //! nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
 //!
 //! # The [[gpus]] list is empty by default. See [`GpuConfig`] for the fields.
@@ -107,10 +109,22 @@ pub struct Config {
     pub nvidia_smi_path: PathBuf,
     /// Who drives `cuda-checkpoint` during a dump/restore (helper only).
     pub cuda_checkpoint_mode: CudaCheckpointMode,
-    /// Seconds a `criu dump` may take before it is killed (helper only).
-    pub criu_dump_timeout_secs: u64,
-    /// Seconds a `criu restore` may take before it is killed (helper only).
-    pub criu_restore_timeout_secs: u64,
+    /// Fixed part of the deadline of a whole checkpoint or restore of a
+    /// job, in seconds (helper only). The deadline is
+    /// `checkpoint_deadline_base_secs + checkpoint_deadline_secs_per_gib *
+    /// GiB`, where GiB is the job's RSS + VRAM (rounded up) for a
+    /// checkpoint and the image size for a restore. When it passes, the
+    /// running tool is killed and the job is resumed (checkpoint) or
+    /// killed (restore; the image is kept).
+    pub checkpoint_deadline_base_secs: u64,
+    /// Seconds per GiB of the deadline above (helper only).
+    pub checkpoint_deadline_secs_per_gib: u64,
+    /// Optional cap, in seconds, on `criu dump` alone (helper only). Unset:
+    /// only the deadline applies.
+    pub criu_dump_timeout_secs: Option<u64>,
+    /// Optional cap, in seconds, on `criu restore` alone (helper only).
+    /// Unset: only the deadline applies.
+    pub criu_restore_timeout_secs: Option<u64>,
     /// Preload the fork guard into jobs (helper only): children that a
     /// CUDA process forks without exec, such as PyTorch DataLoader workers
     /// with the default `fork` start method, drop the inherited NVIDIA
@@ -196,8 +210,10 @@ impl Default for Config {
             cuda_checkpoint_path: PathBuf::from("cuda-checkpoint"),
             nvidia_smi_path: PathBuf::from("nvidia-smi"),
             cuda_checkpoint_mode: CudaCheckpointMode::Manual,
-            criu_dump_timeout_secs: 1800,
-            criu_restore_timeout_secs: 1800,
+            checkpoint_deadline_base_secs: 180,
+            checkpoint_deadline_secs_per_gib: 30,
+            criu_dump_timeout_secs: None,
+            criu_restore_timeout_secs: None,
             fork_guard: true,
             gpu_detection: GpuDetection::Auto,
             nvml_library: None,
@@ -271,8 +287,11 @@ impl Config {
         if self.daemon_user.is_empty() {
             return Err("`daemon_user` must not be empty".to_owned());
         }
-        if self.criu_dump_timeout_secs == 0 || self.criu_restore_timeout_secs == 0 {
+        if self.criu_dump_timeout_secs == Some(0) || self.criu_restore_timeout_secs == Some(0) {
             return Err("criu timeouts must be positive".to_owned());
+        }
+        if self.checkpoint_deadline_base_secs == 0 {
+            return Err("`checkpoint_deadline_base_secs` must be positive".to_owned());
         }
         let mut seen = std::collections::HashSet::new();
         for gpu in &self.gpus {
@@ -353,7 +372,9 @@ mod tests {
         );
         assert_eq!(config.daemon_user, "puzuz");
         assert_eq!(config.cuda_checkpoint_mode, CudaCheckpointMode::Manual);
-        assert_eq!(config.criu_dump_timeout_secs, 1800);
+        assert_eq!(config.criu_dump_timeout_secs, None);
+        assert_eq!(config.checkpoint_deadline_base_secs, 180);
+        assert_eq!(config.checkpoint_deadline_secs_per_gib, 30);
         assert!(config.fork_guard);
     }
 
@@ -377,6 +398,8 @@ mod tests {
             cuda_checkpoint_mode = "plugin"
             criu_dump_timeout_secs = 60
             criu_restore_timeout_secs = 90
+            checkpoint_deadline_base_secs = 20
+            checkpoint_deadline_secs_per_gib = 0
             some_future_setting = "x"
 
             [some_future_table]
@@ -415,8 +438,10 @@ mod tests {
         assert_eq!(config.daemon_user, "svc-puzuz");
         assert_eq!(config.nvidia_smi_path, PathBuf::from("/opt/nvidia-smi"));
         assert_eq!(config.cuda_checkpoint_mode, CudaCheckpointMode::Plugin);
-        assert_eq!(config.criu_dump_timeout_secs, 60);
-        assert_eq!(config.criu_restore_timeout_secs, 90);
+        assert_eq!(config.criu_dump_timeout_secs, Some(60));
+        assert_eq!(config.criu_restore_timeout_secs, Some(90));
+        assert_eq!(config.checkpoint_deadline_base_secs, 20);
+        assert_eq!(config.checkpoint_deadline_secs_per_gib, 0);
     }
 
     #[test]
@@ -442,9 +467,13 @@ mod tests {
                 memory_total_bytes: Some(25_757_220_864),
             }]
         );
+        assert_eq!(config.criu_dump_timeout_secs, Some(3600));
+        assert_eq!(config.criu_restore_timeout_secs, Some(3600));
         // Everything else is the default.
         config.checkpoint_size_limit_bytes = None;
         config.nvml_library = None;
+        config.criu_dump_timeout_secs = None;
+        config.criu_restore_timeout_secs = None;
         config.gpus.clear();
         assert_eq!(config, Config::default());
     }
@@ -469,6 +498,10 @@ mod tests {
         ));
         assert!(matches!(
             Config::parse("criu_dump_timeout_secs = 0"),
+            Err(ParseError::Invalid(_))
+        ));
+        assert!(matches!(
+            Config::parse("checkpoint_deadline_base_secs = 0"),
             Err(ParseError::Invalid(_))
         ));
         assert!(matches!(

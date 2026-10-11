@@ -108,6 +108,11 @@ pub struct FakeExecState {
     pub actions: Vec<Option<Action>>,
     /// Fail the first step whose action matches.
     pub fail_on: Option<fn(&Action) -> bool>,
+    /// Let the first step whose action matches hang until its timeout,
+    /// then fail as killed (as a real stuck tool would).
+    pub hang_on: Option<fn(&Action) -> bool>,
+    /// Roots of the [`Step::Thaw`]s run.
+    pub thawed: Vec<u32>,
 }
 
 /// Executes plans by recording them. `criu dump` creates a minimal image
@@ -119,6 +124,9 @@ impl Executor for FakeExecutor {
     fn execute(&mut self, step: &Step) -> Result<StepOutput, StepError> {
         let mut st = self.0.lock().unwrap();
         st.actions.push(step.action());
+        if let Step::Thaw { root_pid } = step {
+            st.thawed.push(*root_pid);
+        }
         // CRIU writes its log whether or not the dump succeeds.
         if let Step::Run {
             action: Action::CriuDump { .. },
@@ -128,6 +136,22 @@ impl Executor for FakeExecutor {
             && let Some(log) = command.value_of("-o")
         {
             fs::write(log, b"(00.000001) Error (criu/fake.c:1): fake criu log\n")?;
+        }
+        if let (
+            Step::Run {
+                action, timeout, ..
+            },
+            Some(hang),
+        ) = (step, st.hang_on)
+            && hang(action)
+        {
+            st.hang_on = None;
+            drop(st);
+            std::thread::sleep(*timeout);
+            return Err(StepError::TimedOut {
+                after: *timeout,
+                output: StepOutput::default(),
+            });
         }
         if let (Some(action), Some(fail)) = (step.action(), st.fail_on)
             && fail(&action)

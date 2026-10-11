@@ -79,8 +79,11 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
   never stops jobs. `puzuz-helper.service` runs after the local and remote filesystems, D-Bus,
   `nvidia-persistenced` and `nvidia-fabricmanager`, so those are still available while it stops.
   On SIGTERM the helper asks systemd whether the whole system is stopping. If so, it refuses new
-  work, dumps every running job one at a time (except `--no-checkpoint` jobs), extends its stop
-  timeout before each job, and writes `shutdown-manifest.json`. Paused jobs are dumped too
+  work, dumps every running job one at a time (except `--no-checkpoint` jobs), keeps extending
+  its stop timeout up to the end of the running dump's deadline (plus its rollback), and writes
+  `shutdown-manifest.json`. Every checkpoint and restore has a deadline that scales with the
+  job's size; when it passes, the tool's whole process tree is killed and a checkpoint is rolled
+  back (the job is thawed and its CUDA state restored and unlocked). Paused jobs are dumped too
   (resumed first), and come back paused after `puzuz restore`. Job units are
   `Before=puzuz-helper.service`, so systemd stops them only after the helper has finished. On the
   next boot the daemon gets the results from the helper's replayed events and marks the jobs

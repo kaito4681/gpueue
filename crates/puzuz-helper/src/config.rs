@@ -163,8 +163,10 @@ impl HelperConfig {
         ck.cuda.path = o
             .cuda_checkpoint
             .unwrap_or_else(|| file.cuda_checkpoint_path.clone());
-        ck.timeouts.criu_dump = Duration::from_secs(file.criu_dump_timeout_secs);
-        ck.timeouts.criu_restore = Duration::from_secs(file.criu_restore_timeout_secs);
+        ck.timeouts.criu_dump = file.criu_dump_timeout_secs.map(Duration::from_secs);
+        ck.timeouts.criu_restore = file.criu_restore_timeout_secs.map(Duration::from_secs);
+        ck.timeouts.deadline_base = Duration::from_secs(file.checkpoint_deadline_base_secs);
+        ck.timeouts.deadline_per_gib = Duration::from_secs(file.checkpoint_deadline_secs_per_gib);
         Resolved {
             config: cfg,
             daemon_user: o.daemon_user.unwrap_or_else(|| file.daemon_user.clone()),
@@ -244,6 +246,8 @@ mod tests {
             cuda_checkpoint_mode = "plugin"
             criu_dump_timeout_secs = 11
             criu_restore_timeout_secs = 12
+            checkpoint_deadline_base_secs = 13
+            checkpoint_deadline_secs_per_gib = 14
             daemon_only_key = "ignored"
             "#,
         );
@@ -268,8 +272,19 @@ mod tests {
             c.checkpoint.cuda.path,
             PathBuf::from("/opt/cuda-checkpoint")
         );
-        assert_eq!(c.checkpoint.timeouts.criu_dump, Duration::from_secs(11));
-        assert_eq!(c.checkpoint.timeouts.criu_restore, Duration::from_secs(12));
+        assert_eq!(
+            c.checkpoint.timeouts.criu_dump,
+            Some(Duration::from_secs(11))
+        );
+        assert_eq!(
+            c.checkpoint.timeouts.criu_restore,
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(c.checkpoint.timeouts.deadline_base, Duration::from_secs(13));
+        assert_eq!(
+            c.checkpoint.timeouts.deadline_per_gib,
+            Duration::from_secs(14)
+        );
         // Settings the file does not have keep their defaults.
         assert!(
             c.checkpoint

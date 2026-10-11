@@ -70,9 +70,23 @@
 # the distribution's criu). "plugin": CRIU's CUDA plugin does it.
 # cuda_checkpoint_mode = "manual"
 
-# [helper] Seconds `criu dump` / `criu restore` may take before they are killed.
-# criu_dump_timeout_secs = 1800
-# criu_restore_timeout_secs = 1800
+# [helper] Deadline of a whole checkpoint (CUDA lock + checkpoint + criu dump)
+# or restore (criu restore + CUDA restore + unlock) of one job, in seconds:
+#   base + per_gib * GiB
+# where GiB is the job's RSS + VRAM (rounded up) for a checkpoint and the image
+# size for a restore. When it passes, the running tool (with all its child
+# processes) is killed; a checkpoint is rolled back and the job keeps running,
+# a restore is abandoned (the restored processes are killed, the image is
+# kept). Measured on an NVMe disk: ~1-2 s per GiB, so the default leaves a
+# 15x margin for slow disks and busy hosts (see docs/install.md).
+# checkpoint_deadline_base_secs = 180
+# checkpoint_deadline_secs_per_gib = 30
+
+# [helper] Optional caps, in seconds, on `criu dump` / `criu restore` alone.
+# Unset by default: only the deadline above applies.
+# Example:
+#   criu_dump_timeout_secs = 3600
+#   criu_restore_timeout_secs = 3600
 
 # [helper] Preload the fork guard (<data_dir>/lib/puzuz-forkguard-*.so) into
 # jobs. Children that a CUDA process forks without exec, such as PyTorch

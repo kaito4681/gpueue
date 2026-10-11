@@ -127,10 +127,55 @@ Unit files owned by a distribution package (`/usr/lib/systemd/...`) are never to
 the units with drop-ins (`sudo systemctl edit puzuz-helper.service`). Edits to the files in
 `/etc/systemd/system` are lost on the next install.
 
-The helper's `TimeoutStopSec=30min` caps how long it may spend checkpointing all jobs when the
-system shuts down. The helper also asks systemd for more time before each job (on systemd versions
-that support it). A dump writes roughly RSS + VRAM per job, and jobs are dumped one after another.
-In tests, 7 GB of VRAM took about 11 s. If your jobs are large, raise the timeout in a drop-in.
+The helper's `TimeoutStopSec=30min` is the initial budget for checkpointing all jobs when the
+system shuts down. While it dumps, the helper keeps asking systemd for more time
+(`EXTEND_TIMEOUT_USEC`), but only up to the end of the running dump's deadline plus its rollback
+(see [Checkpoint timeouts](#checkpoint-timeouts)), so a stuck dump cannot hold up the shutdown
+forever. Jobs are dumped one after another. With systemd versions that ignore the extension, 30
+minutes covers about 50 GiB of RSS + VRAM in total at the rate the deadline allows (30 s/GiB),
+and several hundred GiB at the measured speed of an NVMe disk (~2.5 s/GiB); raise it in a
+drop-in if your jobs are larger or your disk is slower.
+
+### Checkpoint timeouts
+
+A whole checkpoint (CUDA lock + checkpoint of every CUDA process, then `criu dump`) or restore
+(`criu restore`, then CUDA restore + unlock) must finish within a deadline that scales with the
+job's size:
+
+```
+deadline = checkpoint_deadline_base_secs + checkpoint_deadline_secs_per_gib * GiB
+         = 180 s + 30 s * GiB            (defaults)
+```
+
+GiB is the job's RSS + VRAM, rounded up, for a checkpoint, and the image size for a restore. A
+14 GiB job gets 180 + 30 * 14 = 600 s. Each step also has its own timeout (a lock: the lock
+`--timeout` of 30 s + 15 s; a CUDA checkpoint or restore: 300 s; an unlock: 60 s), and
+`criu_dump_timeout_secs` / `criu_restore_timeout_secs` can cap `criu` alone; a step gets
+whichever ends first.
+
+When the deadline passes, the running tool is killed together with its whole process group and
+every process it forked. Then:
+
+- **checkpoint**: the job is resumed - its stopped tasks get SIGCONT, frozen cgroups are thawed,
+  CUDA processes that were (or may have been) checkpointed are restored and every locked one is
+  unlocked - and the checkpoint fails with "the checkpoint did not finish within its deadline of
+  ... s for ... GiB of memory; the job was resumed". The partial image is removed. The same
+  rollback runs when `criu` is killed from outside (e.g. `kill -9`, the OOM killer).
+- **restore**: the restored processes are killed and the restore fails; the image is kept.
+
+Measured on an NVMe disk (RTX 5070 Ti, 38 GB RAM), cold and warm page cache:
+
+| step | time |
+| --- | --- |
+| CUDA lock / unlock | ~0.02 s |
+| CUDA checkpoint (VRAM to host memory) | ~0.5 s/GiB (2 and 7 GB of VRAM) |
+| CUDA restore | ~0.4 s/GiB (2 and 7 GB of VRAM) |
+| `criu dump` | 0.3-1.8 s/GiB (1-14 GiB of RSS; 14 GiB: 18-25 s, slower under memory pressure) |
+| `criu restore` | 0.3-0.7 s/GiB (14 GiB: 8.6 s warm, 9.2 s cold) |
+
+So a job needs about 2-2.5 s per GiB of RSS + VRAM end to end; the default deadline leaves a
+margin of more than 10x (enough for a disk of about 35 MB/s). On slower storage (network file
+systems, HDDs), raise `checkpoint_deadline_secs_per_gib`.
 
 ## Verifying
 
@@ -198,8 +243,10 @@ changed with `puzuz group`, `puzuz parallel` and `puzuz gpu parallel`.
 | `cuda_checkpoint_path` | `"cuda-checkpoint"` | helper | same |
 | `nvidia_smi_path` | `"nvidia-smi"` | helper | same |
 | `cuda_checkpoint_mode` | `"manual"` | helper | `"manual"`: the helper calls cuda-checkpoint around criu. `"plugin"`: CRIU's CUDA plugin does it. |
-| `criu_dump_timeout_secs` | `1800` | helper | kill `criu dump` after this long |
-| `criu_restore_timeout_secs` | `1800` | helper | kill `criu restore` after this long |
+| `checkpoint_deadline_base_secs` | `180` | helper | fixed part of the deadline of a whole checkpoint or restore (see [Checkpoint timeouts](#checkpoint-timeouts)) |
+| `checkpoint_deadline_secs_per_gib` | `30` | helper | part of that deadline per GiB of RSS + VRAM (checkpoint) or image (restore) |
+| `criu_dump_timeout_secs` | unset | helper | optional cap on `criu dump` alone; unset: only the deadline applies |
+| `criu_restore_timeout_secs` | unset | helper | optional cap on `criu restore` alone; unset: only the deadline applies |
 | `fork_guard` | `true` | helper | preload the fork guard into jobs (see the README's limitations) |
 | `gpu_detection` | `"auto"` | daemon | `"auto"`: NVML, falling back to `[[gpus]]`. `"static"`: only `[[gpus]]`. |
 | `nvml_library` | unset | daemon | NVML library path or name; by default `libnvidia-ml.so.1`, then `libnvidia-ml.so` |
