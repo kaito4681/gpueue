@@ -311,8 +311,6 @@ Not tested yet:
   `nvidia-persistenced`.
 - Kernel NFS and autofs indirect maps (FUSE network filesystems and `x-systemd.automount` are
   tested).
-- `cuda_checkpoint_mode = "plugin"` with a real GPU: the e2e scenarios exist
-  (`PUZUZ_E2E_CUDA_MODE=plugin`) but have not been run to completion yet.
 - Multi-GPU and NCCL jobs, and GPU models other than the one used for testing.
 
 Please report what works and what does not on your hardware.
