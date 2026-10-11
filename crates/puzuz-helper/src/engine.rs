@@ -9,9 +9,9 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use puzuz_checkpoint::exec::{run_plan, run_with_rollback};
+use puzuz_checkpoint::exec::{Deadline, StepError, run_plan_until, run_with_rollback};
 use puzuz_checkpoint::layout::{
     self, CheckpointDir, CheckpointMeta, DirStatus, GpuMeta, check_compatibility, write_atomic,
 };
@@ -77,6 +77,62 @@ impl SavedMounts {
             }
         }
         out
+    }
+}
+
+/// Time allowed around a checkpoint or restore for the work outside its
+/// deadline: pre-checks, writing the metadata, stopping the unit.
+const OP_SLACK: Duration = Duration::from_secs(60);
+
+/// How often a stopping helper asks systemd for more time
+/// (`EXTEND_TIMEOUT_USEC`) while it waits for or runs dumps.
+const EXTEND_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The latest time each running checkpoint or restore may still need:
+/// its deadline, plus its rollback and [`OP_SLACK`]. A stopping helper
+/// extends systemd's stop timeout up to it, never beyond, so systemd stays
+/// a backstop for an operation stuck past its own deadline.
+#[derive(Debug, Default, Clone)]
+pub struct OpEnds(Arc<Mutex<BTreeMap<JobId, Instant>>>);
+
+impl OpEnds {
+    fn set(&self, job: JobId, at: Instant) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(job, at);
+    }
+
+    /// Track `job` until the guard is dropped, initially for [`OP_SLACK`].
+    fn track(&self, job: JobId) -> OpEndGuard {
+        self.set(job, Instant::now() + OP_SLACK);
+        OpEndGuard(self.clone(), job)
+    }
+
+    /// How much more stop time to ask for: up to the latest end of a
+    /// running operation, [`OP_SLACK`] when none runs, `None` when every
+    /// running operation is past its end (systemd should not wait longer).
+    pub fn stop_budget(&self) -> Option<Duration> {
+        let ends = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match ends.values().max() {
+            None => Some(OP_SLACK),
+            Some(end) => {
+                let left = end.saturating_duration_since(Instant::now());
+                (!left.is_zero()).then_some(left)
+            }
+        }
+    }
+}
+
+struct OpEndGuard(OpEnds, JobId);
+
+impl Drop for OpEndGuard {
+    fn drop(&mut self) {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.1);
     }
 }
 
@@ -258,6 +314,7 @@ pub struct Helper<L: Launcher, H: HostProbe> {
     inflight: Arc<InFlight>,
     /// Dumps and restores run one at a time.
     heavy: tokio::sync::Mutex<()>,
+    op_ends: OpEnds,
 }
 
 impl<L: Launcher, H: HostProbe> Helper<L, H> {
@@ -284,6 +341,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             shutting_down: AtomicBool::new(false),
             inflight: Arc::new(InFlight::default()),
             heavy: tokio::sync::Mutex::new(()),
+            op_ends: OpEnds::default(),
         }))
     }
 
@@ -851,6 +909,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         was_stopped: bool,
     ) -> CheckpointOutcome {
         let _heavy = self.heavy.lock().await;
+        let _op_end = self.op_ends.track(job);
         let Some(entry) = self.table().get(&job).cloned() else {
             return CheckpointOutcome::refused("job vanished");
         };
@@ -871,16 +930,24 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             Ok(init_pid) => {
                 let mut ck = self.cfg.checkpoint.clone();
                 ck.criu.tcp_close |= options.tcp_close;
-                if let Some(secs) = options.timeout_secs {
-                    ck.timeouts.criu_dump = ck.timeouts.criu_dump.min(Duration::from_secs(secs));
-                }
+                let cap = options.timeout_secs.map(Duration::from_secs);
                 let host = self.host.clone();
                 let factory = self.executor.clone();
                 let base = self.cfg.checkpoint_base.clone();
                 let record = entry.record.clone();
+                let op_ends = self.op_ends.clone();
                 tokio::task::spawn_blocking(move || {
                     let mut exec = factory();
-                    dump_job(&*host, &mut *exec, &ck, &base, &record, init_pid)
+                    dump_job(
+                        &*host,
+                        &mut *exec,
+                        &ck,
+                        &base,
+                        &record,
+                        init_pid,
+                        cap,
+                        &|end| op_ends.set(job, end),
+                    )
                 })
                 .await
                 .unwrap_or_else(|e| {
@@ -1075,6 +1142,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
     ) -> RestoreOutcome {
         let _heavy = self.heavy.lock().await;
         let job = req.job;
+        let _op_end = self.op_ends.track(job);
         let fail = |this: &Self, reason: String| {
             this.table().remove(&job);
             RestoreOutcome::failed(reason)
@@ -1094,6 +1162,21 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         let unit = record.unit.clone();
         let _ = fs::remove_file(dir.restore_pidfile());
         let ck = self.cfg.checkpoint.clone();
+        // One deadline for `criu restore` and the CUDA restore + unlock.
+        let deadline = Deadline::after(ck.timeouts.operation_deadline(meta.size_bytes));
+        self.op_ends.set(job, deadline.at + OP_SLACK);
+        let past_deadline = |what: String| {
+            if deadline.remaining().is_zero() {
+                format!(
+                    "{what} (the restore did not finish within its deadline of {}s for {} \
+                     of checkpoint data; the image is kept)",
+                    deadline.budget.as_secs(),
+                    gib(meta.size_bytes)
+                )
+            } else {
+                what
+            }
+        };
         let target = RestoreTarget {
             images_dir: dir.images_dir(),
             log_file: dir.restore_log(),
@@ -1117,7 +1200,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             unit: unit.clone(),
             command,
             pidfile: dir.restore_pidfile(),
-            timeout,
+            timeout: timeout.min(deadline.remaining()),
             criu_root: self.cfg.criu_root.clone(),
         };
         let pid = match self.launcher.restore(&spec).await {
@@ -1136,7 +1219,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 let summary = fs::read_to_string(dir.restore_log())
                     .map(|l| probe::summarize_criu_log(&l, 5).join("; "))
                     .unwrap_or_default();
-                return fail(self, format!("{e}: {summary}"));
+                return fail(self, past_deadline(format!("{e}: {summary}")));
             }
         };
 
@@ -1152,7 +1235,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 let map = device_map(&*host, &saved, &gpus)?;
                 let steps = plan::restore_cuda_plan(&ck2, &host_pids, map.as_ref());
                 let mut exec = factory();
-                run_plan(&mut *exec, steps)
+                run_plan_until(&mut *exec, steps, Some(&deadline))
                     .map(|_| ())
                     .map_err(|f| format!("CUDA restore failed: {f}"))
             })
@@ -1163,7 +1246,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 // is still there.
                 let _ = self.launcher.signal(&unit, signal::SIGKILL).await;
                 let _ = self.launcher.release(&unit).await;
-                return fail(self, reason);
+                return fail(self, past_deadline(reason));
             }
         }
 
@@ -1198,11 +1281,34 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         self.inflight.wait_idle().await;
     }
 
-    /// First SIGTERM: refuse new spawns/restores, wait for running
-    /// operations, then dump every live job one by one (`no_checkpoint`
-    /// jobs are skipped) and write the manifest. `before_each` is called
-    /// before each dump (used to extend systemd's stop timeout).
-    pub async fn shutdown(self: &Arc<Self>, before_each: impl Fn(JobId)) -> ShutdownManifest {
+    /// First SIGTERM of an OS shutdown: [`Self::shutdown_jobs`], calling
+    /// `extend` every few seconds with how much more time to ask systemd
+    /// for (`EXTEND_TIMEOUT_USEC`; see [`OpEnds::stop_budget`]). Every
+    /// operation it waits for has a deadline, so the extensions end.
+    pub async fn shutdown(
+        self: &Arc<Self>,
+        before_each: impl Fn(JobId),
+        extend: impl Fn(Duration),
+    ) -> ShutdownManifest {
+        let work = self.shutdown_jobs(before_each);
+        tokio::pin!(work);
+        let mut tick = tokio::time::interval(EXTEND_INTERVAL);
+        loop {
+            tokio::select! {
+                manifest = &mut work => return manifest,
+                _ = tick.tick() => {
+                    if let Some(budget) = self.op_ends.stop_budget() {
+                        extend(budget);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Refuse new spawns/restores, wait for running operations, then dump
+    /// every live job one by one (`no_checkpoint` jobs are skipped) and
+    /// write the manifest. `before_each` is called before each dump.
+    async fn shutdown_jobs(self: &Arc<Self>, before_each: impl Fn(JobId)) -> ShutdownManifest {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.inflight.wait_idle().await;
         let live: Vec<(JobId, bool)> = self
@@ -1382,8 +1488,19 @@ pub fn precheck_dump<H: HostProbe + ?Sized>(
     })
 }
 
+/// `bytes` as GiB for messages.
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / f64::from(1u32 << 30))
+}
+
 /// The blocking part of a checkpoint: [`precheck_dump`], the dump plan with
 /// rollback, `meta.json`, owner record and the `COMPLETE` marker.
+///
+/// The plan runs within a [`Deadline`] of
+/// [`plan::Timeouts::operation_deadline`] for the job's RSS + VRAM (at most
+/// `cap`); `on_deadline` is told the latest time the dump may take, its
+/// rollback included.
+#[allow(clippy::too_many_arguments)]
 pub fn dump_job<H: HostProbe + ?Sized>(
     host: &H,
     exec: &mut dyn Executor,
@@ -1391,6 +1508,8 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     base: &Path,
     record: &JobRecord,
     init_pid: u32,
+    cap: Option<Duration>,
+    on_deadline: &dyn Fn(Instant),
 ) -> Result<CheckpointMeta, DumpError> {
     let DumpPrecheck {
         procs,
@@ -1424,10 +1543,35 @@ pub fn dump_job<H: HostProbe + ?Sized>(
         leave_running: false,
     };
     let steps = plan::dump_plan(ck, &target, &cuda_pids);
-    if let Err(failure) = run_with_rollback(exec, ck, steps) {
+    let size = procs.iter().map(|p| p.rss_bytes).sum::<u64>() + meta.vram_bytes;
+    let mut budget = ck.timeouts.operation_deadline(size);
+    if let Some(cap) = cap {
+        budget = budget.min(cap);
+    }
+    let deadline = Deadline::after(budget);
+    on_deadline(deadline.at + ck.timeouts.rollback_budget(cuda_pids.len()) + OP_SLACK);
+    if let Err(failure) = run_with_rollback(exec, ck, steps, Some(&deadline)) {
         let mut reason = failure.to_string();
-        if !failure.rolled_back_cleanly() {
-            reason.push_str(" (CUDA rollback incomplete)");
+        if matches!(failure.error, StepError::DeadlineExceeded { .. }) {
+            reason = format!(
+                "the checkpoint did not finish within its deadline of {}s for {} of memory: \
+                 {reason}",
+                budget.as_secs(),
+                gib(size)
+            );
+        }
+        match failure.rollback.iter().find(|r| r.result.is_err()) {
+            None if failure.rollback.is_empty() => {}
+            None => reason.push_str("; the job was resumed"),
+            Some(r) => match (&r.step, &r.result) {
+                (plan::Step::Thaw { .. }, Err(StepError::Io(e)))
+                    if e.kind() == io::ErrorKind::NotFound =>
+                {
+                    reason.push_str("; the job is gone (CRIU had already stopped it)");
+                }
+                (_, Err(e)) => reason.push_str(&format!("; rollback incomplete: {e}")),
+                (_, Ok(_)) => unreachable!(),
+            },
         }
         if let Ok(log) = fs::read_to_string(dir.dump_log()) {
             let lines = probe::summarize_criu_log(&log, 5);

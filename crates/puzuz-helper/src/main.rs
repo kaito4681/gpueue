@@ -214,7 +214,6 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     let host = SystemHost::new(cfg.nvidia_smi.clone(), cfg.checkpoint.cuda.clone());
     let factory: puzuz_helper::ExecutorFactory =
         Arc::new(|| Box::new(SystemExecutor::default()) as Box<dyn Executor + Send>);
-    let dump_budget = cfg.checkpoint.timeouts.criu_dump + cfg.checkpoint.timeouts.cuda_checkpoint;
     let socket_path = cfg.socket_path.clone();
     let daemon_uid = cfg.daemon_uid;
 
@@ -279,10 +278,10 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     });
 
     let manifest = helper
-        .shutdown(|job| {
-            eprintln!("puzuz-helper: checkpointing job {}", job.0);
-            notify::extend_timeout(dump_budget);
-        })
+        .shutdown(
+            |job| eprintln!("puzuz-helper: checkpointing job {}", job.0),
+            notify::extend_timeout,
+        )
         .await;
     eprintln!(
         "puzuz-helper: shutdown manifest written ({} jobs)",
