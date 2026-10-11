@@ -10,6 +10,8 @@ use puzuz_checkpoint::command::{CudaCheckpointOptions, cuda_get_state};
 use puzuz_checkpoint::exec::run_with_timeout;
 use puzuz_checkpoint::{CommandSpec, probe, procfs, space};
 
+use crate::mounts::{MountTree, SourceMount};
+
 /// One process of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcInfo {
@@ -71,6 +73,24 @@ pub trait HostProbe: Send + Sync + 'static {
     fn unreachable_mounts(&self, _pid: u32) -> io::Result<Vec<String>> {
         Ok(Vec::new())
     }
+    /// Where the external mount sources `paths` live in the helper's own
+    /// namespace (see [`SourceMount`]), recorded at dump time.
+    fn source_mounts(&self, _paths: &[String]) -> io::Result<Vec<SourceMount>> {
+        Ok(Vec::new())
+    }
+    /// Which of `sources` are not mounted as they were at dump time (see
+    /// [`crate::mounts::source_problem`]); triggers automount points on
+    /// the way.
+    fn source_problems(&self, _sources: &[SourceMount]) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Regular files that the processes `host_pids` have open, and their
+    /// working directories, that the helper reaches by the same path (the
+    /// same inode): paths on the host's filesystems, which a restore needs
+    /// to find again.
+    fn open_files(&self, _host_pids: &[u32]) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
@@ -100,6 +120,15 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     }
     fn unreachable_mounts(&self, pid: u32) -> io::Result<Vec<String>> {
         (**self).unreachable_mounts(pid)
+    }
+    fn source_mounts(&self, paths: &[String]) -> io::Result<Vec<SourceMount>> {
+        (**self).source_mounts(paths)
+    }
+    fn source_problems(&self, sources: &[SourceMount]) -> io::Result<Vec<String>> {
+        (**self).source_problems(sources)
+    }
+    fn open_files(&self, host_pids: &[u32]) -> io::Result<Vec<String>> {
+        (**self).open_files(host_pids)
     }
 }
 
@@ -245,13 +274,90 @@ impl HostProbe for SystemHost {
     }
 
     fn unreachable_mounts(&self, pid: u32) -> io::Result<Vec<String>> {
-        use crate::mounts::{MountTree, unreachable_sources};
+        use crate::mounts::unreachable_sources;
         let job = fs::read_to_string(self.proc_root.join(pid.to_string()).join("mountinfo"))?;
         let own = fs::read_to_string(self.proc_root.join("self/mountinfo"))?;
         Ok(unreachable_sources(
             &MountTree::parse(&job),
             &MountTree::parse(&own),
         ))
+    }
+
+    fn source_mounts(&self, paths: &[String]) -> io::Result<Vec<SourceMount>> {
+        let own = fs::read_to_string(self.proc_root.join("self/mountinfo"))?;
+        Ok(crate::mounts::describe_sources(
+            paths,
+            &MountTree::parse(&own),
+        ))
+    }
+
+    fn source_problems(&self, sources: &[SourceMount]) -> io::Result<Vec<String>> {
+        use crate::mounts::{ends_on_automount, source_problem};
+        let read = || -> io::Result<MountTree> {
+            Ok(MountTree::parse(&fs::read_to_string(
+                self.proc_root.join("self/mountinfo"),
+            )?))
+        };
+        let mut tree = read()?;
+        // An automount point recorded with its filesystem mounted: a
+        // lookup makes the automounter mount it (in the helper's namespace,
+        // which is the host's). In a thread, so that an NFS server that
+        // does not answer only delays the check.
+        let mut triggered = false;
+        for s in sources {
+            if source_problem(s, &tree).is_some() && ends_on_automount(&s.path, &tree) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let path = format!("{}/.", s.path);
+                std::thread::spawn(move || {
+                    let _ = tx.send(fs::metadata(path));
+                });
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(20));
+                triggered = true;
+            }
+        }
+        if triggered {
+            tree = read()?;
+        }
+        Ok(sources
+            .iter()
+            .filter_map(|s| source_problem(s, &tree))
+            .collect())
+    }
+
+    fn open_files(&self, host_pids: &[u32]) -> io::Result<Vec<String>> {
+        use std::os::unix::fs::MetadataExt;
+        let mut out: Vec<String> = Vec::new();
+        for pid in host_pids {
+            let dir = self.proc_root.join(pid.to_string());
+            let fds = fs::read_dir(dir.join("fd"))
+                .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            for link in fds
+                .iter()
+                .map(|p| (p, false))
+                .chain([(&dir.join("cwd"), true)])
+            {
+                let (link, is_cwd) = link;
+                let (Ok(target), Ok(meta)) = (fs::read_link(link), fs::metadata(link)) else {
+                    continue;
+                };
+                if !(meta.is_file() || is_cwd && meta.is_dir()) {
+                    continue;
+                }
+                let Some(path) = target.to_str() else {
+                    continue;
+                };
+                // Deleted files (CRIU saves them) and files of mounts the
+                // helper does not have (the job's private /tmp) are not
+                // reached by the same path.
+                let same = fs::metadata(path)
+                    .is_ok_and(|m| m.dev() == meta.dev() && m.ino() == meta.ino());
+                if same && !out.iter().any(|p| p == path) {
+                    out.push(path.to_owned());
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

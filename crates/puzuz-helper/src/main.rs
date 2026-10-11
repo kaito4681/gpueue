@@ -41,6 +41,10 @@ enum Command {
     /// PID 1 of a job's namespace (internal).
     #[command(hide = true)]
     ShimInit { job_dir: PathBuf },
+    /// Look up PATH, which makes the automounter mount it (internal, run
+    /// by the shim).
+    #[command(hide = true)]
+    ShimAutomount { path: PathBuf },
     /// `ExecStart` of a restore unit: bind-mount / on ROOT in a private
     /// mount namespace (unless ROOT is empty), then exec criu (internal).
     #[command(hide = true)]
@@ -110,6 +114,7 @@ fn main() -> ExitCode {
         // The shim must stay single-threaded: no runtime.
         Command::Shim { job_dir } => shim::run_outer(job_dir),
         Command::ShimInit { job_dir } => shim::run_init(job_dir),
+        Command::ShimAutomount { path } => shim::run_automount(path),
         Command::CriuWrap { root, criu } => shim::run_criu_wrap(root, criu),
         Command::Serve(args) => match serve(*args) {
             Ok(()) => 0,
