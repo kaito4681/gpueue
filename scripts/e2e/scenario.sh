@@ -75,6 +75,11 @@ wait_socket() {
 }
 started_at() { q carol "job($1)['started_at']"; }
 finished_at() { q carol "job($1)['finished_at']"; }
+# free_group: the unlimited group "free" (created by s3, or here when s3
+# does not run).
+free_group() {
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+}
 log_lines() { grep -c . "$LOGS/$1/$2.log"; }
 # proc_states <id>: the states (R, S, T, ...) of the processes of job <id>'s
 # live unit, counted, for information.
@@ -245,6 +250,7 @@ s3_limits() {
 
 s4_checkpoint_restore() {
     local id before after
+    free_group
     id=$(add alice -g free -- "$COUNTER")
     wait_state "$id" running
     sleep 1.5
@@ -293,6 +299,7 @@ s6_helper_restart() { restart_while_running puzuz-helper.service; }
 
 s8_shutdown() {
     local a b c d
+    free_group
     a=$(add alice -g free -- "$COUNTER")
     b=$(add bob -g free -- "$COUNTER")
     c=$(add alice -g free --no-checkpoint -- 'trap "echo got TERM; exit 0" TERM; while :; do sleep 0.1; done')
@@ -348,7 +355,7 @@ s8_shutdown() {
 # running.
 s13_paused_checkpoint() {
     local id big state out
-    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    free_group
     id=$(add alice -g free -- "$COUNTER")
     wait_state "$id" running
     sleep 1
@@ -416,8 +423,7 @@ check_cuda_mode() {
 s9_gpu() {
     local id before after
     pz carol gpu parallel 1 || fail "gpu parallel"
-    # Created by s3 unless only GPU scenarios run.
-    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    free_group
     id=$(add alice -g free --gpu 0 -- 'exec /opt/venv/bin/python3 -u /e2e/gpu_counter.py')
     wait_state "$id" running
     wait_for 60 "the GPU job to print" bash -c "[ \$(wc -l < $LOGS/1000/$id.log) -ge 5 ]"
@@ -455,7 +461,7 @@ EOF
 s14_gpu_paused() {
     local id state out
     pz carol gpu parallel 1 || fail "gpu parallel"
-    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    free_group
     id=$(add alice -g free --gpu 0 -- 'exec /opt/venv/bin/python3 -u /e2e/gpu_counter.py')
     wait_state "$id" running
     wait_for 60 "the GPU job to print" bash -c "[ \$(wc -l < $LOGS/1000/$id.log) -ge 5 ]"
@@ -559,7 +565,7 @@ EOF
 }
 s11_gpu_fork_workers() {
     pz carol gpu parallel 1 || fail "gpu parallel"
-    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    free_group
     say "fork workers"
     gpu_train_variant 60 1 2
     say "fork workers, pin_memory, persistent_workers"
@@ -619,8 +625,7 @@ EOF
 # PUZUZ_E2E_GPU=1 a running and a paused CUDA counter on GPU 0.
 s7_prepare() {
     local a b c g h
-    # Created by s3 unless only the reboot scenario runs.
-    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    free_group
     a=$(add alice -g free -- "$COUNTER")
     b=$(add bob -g free --no-checkpoint -- 'trap "echo got TERM; exit 0" TERM; while :; do sleep 0.1; done')
     c=$(add alice -g free -- "$COUNTER")
@@ -727,7 +732,7 @@ s10_burst() {
         wait
         cat "$STATE"/burst-"$tag"-*
     }
-    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    free_group
 
     mapfile -t ids < <(burst a 24 'echo ok; sleep 1')
     [ "${#ids[@]}" = 24 ] || fail "only ${#ids[@]} of 24 jobs were added"
