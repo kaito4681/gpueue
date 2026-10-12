@@ -1,6 +1,53 @@
-[package]
-name = "puzuz"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/kaito4681/puzuz"
 
-[dependencies]
+[workspace.dependencies]
+puzuz-core = { path = "crates/puzuz-core" }
+puzuz-protocol = { path = "crates/puzuz-protocol" }
+puzuz-daemon = { path = "crates/puzuz-daemon" }
+puzuz-checkpoint = { path = "crates/puzuz-checkpoint" }
+puzuz-config = { path = "crates/puzuz-config" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4.5"
+clap_complete_nushell = "4.5"
+chrono = "0.4"
+interim = { version = "0.2", features = ["chrono_0_4"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+tempfile = "3"
+rustix = { version = "1", features = ["fs"] }
+# Async stack: no features here; each crate enables exactly what it uses so the
+# root helper does not inherit the daemon's or the CLI's needs.
+tokio = { version = "1", default-features = false }
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+http-body-util = "0.1"
+comfy-table = "7"
+nix = { version = "0.30", features = ["user", "sched", "mount", "signal", "process", "fs"] }
+axum = "0.8"
+futures = "0.3"
+tokio-util = "0.7"
+# Only `from_str` is used (puzuz-config); a crate that serializes adds "display".
+toml = { version = "0.9", default-features = false, features = ["std", "serde", "parse"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+nvml-wrapper = "0.13"
+cc = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

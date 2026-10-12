@@ -1,0 +1,29 @@
+# Notes for contributors and coding agents
+
+- Code, comments, docs and commit messages are written in English.
+- Run tests inside Docker: `scripts/test-in-docker.sh` (defaults to `cargo test --workspace`;
+  pass other cargo arguments, e.g. `clippy --workspace --all-targets` or `fmt --all`;
+  the toolchain image is built from `docker/test.Dockerfile`).
+- Full-stack e2e (daemon + helper + CLI under systemd in a privileged container, incl. a
+  simulated reboot): `scripts/e2e-test.sh` (`PUZUZ_SYSTEMD_BASE=puzuz-poc/systemd259:0.1`
+  where apt is offline; `PUZUZ_E2E_GPU=1` with a CUDA base image adds a GPU scenario).
+- Real OS reboot/poweroff in a QEMU/KVM VM (Ubuntu 26.04, CPU jobs; needs /dev/kvm, image cached in
+  the `puzuz-vm-cache` volume): `scripts/vm-reboot-test.sh [reboot|poweroff|inflight]`.
+- CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, an MSRV check (`rust-version`),
+  shellcheck and the CPU e2e on pull requests; pushing a `v<version>` tag builds the release
+  tarball and a draft GitHub release (`.github/workflows/release.yml`).
+- Workspace layout:
+  - `crates/puzuz` — the `puzuz` binary (pueue-compatible CLI, `puzuz daemon` entry point)
+  - `crates/puzuz-core` — domain model, scheduling decisions, authorization, SQLite storage
+  - `crates/puzuz-protocol` — wire types: CLI ⇄ daemon (HTTP over a Unix socket),
+    daemon ⇄ helper (newline-delimited JSON)
+  - `crates/puzuz-config` — schema of `/etc/puzuz/config.toml`, shared by the daemon, the
+    helper (which loads it with root-ownership checks) and `puzuz doctor`
+  - `crates/puzuz-daemon` — the daemon (runs as the unprivileged `puzuz` system user)
+  - `crates/puzuz-checkpoint` — CRIU and cuda-checkpoint integration
+  - `crates/puzuz-helper` — the root helper binary (spawns jobs as their owner, checkpoints)
+- User documentation: `README.md`, `docs/install.md`, `docs/architecture.md`. Update them when
+  commands, flags, configuration keys, packaging files or behavior change.
+- Shared dependencies are declared once in the root `[workspace.dependencies]`.
+- Keep `puzuz-core` free of I/O other than its storage module, and keep `puzuz-helper`'s
+  dependency tree minimal (no HTTP server, no SQLite).
