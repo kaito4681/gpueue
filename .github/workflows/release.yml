@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build the release for
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # Build on Debian bookworm, as scripts/test-in-docker.sh does, so the
+    # binaries need only glibc 2.36 (see docs/install.md).
+    container: rust:1.98.1-bookworm
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Check the tag matches the crate version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          [ "$TAG" = "v$version" ] || { echo "tag $TAG != v$version"; exit 1; }
+      # The job runs as root in the container; the helper's tests refuse
+      # root, so they run as an unprivileged user.
+      - name: Test
+        run: |
+          useradd -m builder
+          chown -R builder: .
+          runuser -u builder -- env PATH="$PATH" RUSTUP_HOME="$RUSTUP_HOME" \
+            CARGO_HOME=/home/builder/.cargo CARGO_TARGET_DIR=/home/builder/target \
+            cargo test --workspace --locked
+      - run: cargo build --release --locked -p puzuz -p puzuz-helper
+      - name: Package
+        run: |
+          name="puzuz-$TAG-$TARGET"
+          mkdir -p "dist/$name"
+          install -m 0755 target/release/puzuz target/release/puzuz-helper "dist/$name/"
+          cp -r README.md LICENSE docs "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*.tar.gz*
+
+  release:
+    needs: [build]
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Create or update the GitHub release
+        run: |
+          if draft=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null); then
+            # Replacing the assets of a published release would change what
+            # users already downloaded.
+            if [ "$draft" != true ]; then
+              echo "release $TAG is already published; refusing to replace its assets"
+              exit 1
+            fi
+            gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --generate-notes --draft -R "$GITHUB_REPOSITORY"
+          fi
