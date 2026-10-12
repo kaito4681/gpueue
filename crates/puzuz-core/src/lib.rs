@@ -8,5 +8,7 @@ pub mod error;
 pub mod lifecycle;
 pub mod model;
 pub mod scheduler;
+#[cfg(feature = "storage")]
+pub mod storage;
 
 pub use error::Error;
