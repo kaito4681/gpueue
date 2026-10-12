@@ -1,0 +1,42 @@
+[package]
+name = "puzuz-daemon"
+description = "The puzuz daemon: API, scheduler and state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+puzuz-core = { workspace = true, features = ["storage"] }
+puzuz-protocol.workspace = true
+puzuz-config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "fs",
+    "sync",
+    "time",
+    "signal",
+] }
+axum.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
+nix.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+nvml-wrapper.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http-body-util.workspace = true
+
+[lints]
+workspace = true
