@@ -1,0 +1,130 @@
+# Configuration of puzuz: read by the daemon (puzuz.service) and by the root
+# helper (puzuz-helper.service). Keys marked [helper] are used by the helper,
+# [both] by both; unmarked keys are the daemon's.
+#
+# Created by `puzuz service install`, which never overwrites this file.
+# Every key is optional and unknown keys are ignored. A commented line
+# `# key = value` shows the key's default. Lines indented below `# Example:`
+# are examples, not defaults: keys that are unset by default, and the [[gpus]]
+# list. Restart what uses a changed key:
+# `sudo systemctl restart puzuz-helper.service puzuz.service`.
+# (Restarting the helper leaves running jobs alone.)
+#
+# The helper runs as root and refuses to start unless this file and
+# /etc/puzuz are owned by root and not group/world-writable. Flags on the
+# helper's ExecStart= (see `puzuz-helper serve --help`) override this file.
+# Groups and GPU slot limits are not configured here; they are stored in the
+# daemon's database and changed with `puzuz group` and `puzuz gpu parallel`.
+#
+# Paths must be absolute; programs are a bare name (looked up in PATH) or an
+# absolute path. Every *_secs key is at most one year (31536000).
+
+# [both] Base directory of the state database (daemon/state.sqlite), the
+# helper's state (helper/), job logs (logs/) and checkpoint images
+# (checkpoints/). Keep the layout created by /etc/tmpfiles.d/puzuz.conf: the
+# helper requires the base directory to be owned by root.
+# data_dir = "/var/lib/puzuz"
+
+# Override single locations below data_dir. helper_state_dir [helper],
+# logs_dir and checkpoints_dir [both] must be owned by root.
+# state_db = "/var/lib/puzuz/daemon/state.sqlite"
+# helper_state_dir = "/var/lib/puzuz/helper"
+# logs_dir = "/var/lib/puzuz/logs"
+# checkpoints_dir = "/var/lib/puzuz/checkpoints"
+
+# The socket clients connect to (callers are identified by SO_PEERCRED).
+# api_socket = "/run/puzuz/puzuz.sock"
+
+# [both] The root helper's socket.
+# helper_socket = "/run/puzuz/helper.sock"
+
+# [helper] The system user the daemon runs as (User= of puzuz.service); the
+# helper accepts connections only from it.
+# daemon_user = "puzuz"
+
+# [both] Seconds between SIGTERM and SIGKILL when stopping a job.
+# grace_secs = 30
+
+# Command prefix a job's command line is appended to.
+# shell = ["sh", "-c"]
+
+# Warn when all checkpoint images together exceed this many bytes. Images are
+# never deleted automatically: the owner of a job whose checkpoint crosses the
+# limit is told once, administrators (root, puzuz-admin) on their commands
+# while it is exceeded, and `puzuz doctor` reports it. Unset by default (no
+# limit).
+# Example:
+#   checkpoint_size_limit_bytes = 500_000_000_000
+
+# Remind each administrator of exceeded checkpoint_size_limit_bytes at most
+# this often (seconds); going back under the limit resets the reminder.
+# checkpoint_size_warning_interval_secs = 3600
+
+# [both] Close TCP connections when checkpointing (`criu --tcp-close`).
+# checkpoint_tcp_close = true
+
+# [helper] Paths of criu, cuda-checkpoint and nvidia-smi (names are looked up
+# in PATH; absolute paths must be owned by root).
+# criu_path = "criu"
+# cuda_checkpoint_path = "cuda-checkpoint"
+# nvidia_smi_path = "nvidia-smi"
+
+# [helper] "manual": the helper calls cuda-checkpoint around criu (works with
+# the distribution's criu). "plugin": CRIU's CUDA plugin does it.
+# cuda_checkpoint_mode = "manual"
+
+# [helper] Deadline of a whole checkpoint (CUDA lock + checkpoint + criu dump)
+# or restore (criu restore + CUDA restore + unlock) of one job, in seconds:
+#   base + per_gib * GiB
+# where GiB is the job's RSS + VRAM (rounded up) for a checkpoint and the image
+# size for a restore. When it passes, the running tool (with all its child
+# processes) is killed; a checkpoint is rolled back and the job keeps running,
+# a restore is abandoned (the restored processes are killed, the image is
+# kept). Measured on an NVMe disk: ~1-2 s per GiB, so the default leaves a
+# 15x margin for slow disks and busy hosts (see docs/install.md).
+# checkpoint_deadline_base_secs = 180
+# checkpoint_deadline_secs_per_gib = 30
+
+# [helper] Optional caps, in seconds, on `criu dump` / `criu restore` alone.
+# Unset by default: only the deadline above applies.
+# Example:
+#   criu_dump_timeout_secs = 3600
+#   criu_restore_timeout_secs = 3600
+
+# [helper] Preload the fork guard (<data_dir>/lib/puzuz-forkguard-*.so) into
+# jobs. Children that a CUDA process forks without exec, such as PyTorch
+# DataLoader workers with the default "fork" start method, inherit NVIDIA
+# device mappings that CRIU cannot dump; the guard drops them in the child,
+# so such jobs can be checkpointed without changes. It does not apply to
+# statically linked programs.
+# fork_guard = true
+
+# How GPUs are found at start-up: "auto" uses NVML and falls back to the
+# [[gpus]] list below when NVML is unavailable; "static" always uses the list.
+# gpu_detection = "auto"
+
+# Path (or name) of the NVML library. Unset by default: libnvidia-ml.so.1 and
+# then libnvidia-ml.so are tried.
+# Example:
+#   nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
+
+# GPUs used when NVML is unavailable (or with gpu_detection = "static"). Empty
+# by default; `puzuz service install` appends an entry for each GPU that
+# `nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv` lists.
+# Keep the list in sync with the hardware (`puzuz doctor` compares the two).
+# Fields of an entry:
+# - index (required, unique): the GPU's index in PCI bus order, as nvidia-smi
+#   numbers it. `puzuz add --gpu` takes it, and jobs see it in
+#   CUDA_VISIBLE_DEVICES (with CUDA_DEVICE_ORDER=PCI_BUS_ID).
+# - uuid (default ""): the GPU's UUID. The daemon warns at start-up when a GPU
+#   with a different UUID than before is found at an index.
+# - name (default ""): the model, shown by `puzuz gpu` and recorded with each
+#   checkpoint; restoring requires the same model.
+# - memory_total_bytes (unset by default): the GPU's memory in bytes, shown by
+#   `puzuz gpu`.
+# Example:
+#   [[gpus]]
+#   index = 0
+#   uuid = "GPU-..."
+#   name = "NVIDIA GeForce RTX 4090"
+#   memory_total_bytes = 25_757_220_864
