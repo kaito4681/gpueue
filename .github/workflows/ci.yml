@@ -59,3 +59,16 @@ jobs:
       - run: |
           docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:v0.10.0 \
             -S warning $(git ls-files '*.sh')
+
+  # Daemon + helper + CLI under systemd in a privileged container, including
+  # a simulated reboot (CPU-only; the GPU scenarios need an NVIDIA GPU).
+  e2e:
+    runs-on: ubuntu-24.04
+    needs: [test]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/e2e-test.sh
+        env:
+          # The FUSE part of scenario 15 must not be skipped silently.
+          PUZUZ_E2E_REQUIRE_SSHFS: "1"
