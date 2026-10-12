@@ -1,6 +1,6 @@
 # Configuration of puzuz: read by the daemon (puzuz.service) and by the root
 # helper (puzuz-helper.service). Keys marked [helper] are used by the helper,
-# [both] by both; unmarked keys are the daemon's.
+# [both] by both, [cli] by the puzuz command; unmarked keys are the daemon's.
 #
 # Created by `puzuz service install`, which never overwrites this file.
 # Every key is optional and unknown keys are ignored. A commented line
@@ -98,6 +98,13 @@
 # so such jobs can be checkpointed without changes. It does not apply to
 # statically linked programs.
 # fork_guard = true
+
+# [cli] Where `puzuz update` and `puzuz doctor` look for releases:
+# "github:<owner>/<repo>" (the GitHub releases of that repository).
+# update_source = "github:kaito4681/puzuz"
+
+# [cli] Whether `puzuz doctor` asks the release source for a newer version.
+# update_check = true
 
 # How GPUs are found at start-up: "auto" uses NVML and falls back to the
 # [[gpus]] list below when NVML is unavailable; "static" always uses the list.

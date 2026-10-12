@@ -162,6 +162,7 @@ async fn route(
                     },
                     checkpoints: None,
                     gpu_detection: None,
+                    schema_version: None,
                 },
             );
         }

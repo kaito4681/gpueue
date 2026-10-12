@@ -4,12 +4,10 @@
 //! test key that development builds carry.
 
 /// The public key file: an `untrusted comment:` line and the base64 key.
-// Used by `puzuz update` (next change); only the tests read it until then.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const RELEASE_PUBKEY: &str = include_str!("../../../packaging/minisign.pub");
 
 /// The base64 key line of [`RELEASE_PUBKEY`].
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn release_pubkey_base64() -> &'static str {
     RELEASE_PUBKEY
         .lines()

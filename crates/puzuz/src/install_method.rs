@@ -69,13 +69,7 @@ impl Method {
     /// How to update puzuz installed this way.
     pub fn update_hint(&self) -> String {
         match self {
-            Method::ServiceInstall { bin_dir } => format!(
-                "re-run `sudo <new puzuz> service install --bin-dir {}` with the new binaries",
-                bin_dir
-                    .as_deref()
-                    .unwrap_or(Path::new("/usr/local/bin"))
-                    .display()
-            ),
+            Method::ServiceInstall { .. } => "run `sudo puzuz update`".to_owned(),
             Method::Package { .. } => {
                 "update the package with your package manager (e.g. `sudo apt upgrade`)".to_owned()
             }

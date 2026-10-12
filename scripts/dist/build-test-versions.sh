@@ -5,9 +5,12 @@
 # scripts/test-in-docker.sh does) and packaged like .github/workflows/release.yml
 # does, into OUT/v<version>-<SUFFIX>/:
 #   puzuz-v<v>-x86_64-unknown-linux-gnu.tar.gz and .tar.gz.sha256
-# Signing is left to the caller.
+# Signing is left to the caller. A SUFFIX written as SUFFIX:migration also
+# gets one more (no-op) database migration, i.e. a newer schema version, so
+# that a later downgrade to an older test version must be refused.
 #
-# Usage: scripts/dist/build-test-versions.sh OUT SUFFIX...   (e.g. OUT test.1 test.2)
+# Usage: scripts/dist/build-test-versions.sh OUT SUFFIX[:migration]...
+#        (e.g. OUT test.1 test.2:migration)
 # PUZUZ_DIST_PROFILE=release builds optimized binaries (default: dev, faster).
 set -euo pipefail
 
@@ -29,7 +32,8 @@ out="$(cd "$out" && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-for suffix in "$@"; do
+for arg in "$@"; do
+    suffix="${arg%%:*}"
     version="$base-${suffix#-}"
     tag="v$version"
     src="$work/src"
@@ -39,6 +43,12 @@ for suffix in "$@"; do
     (cd "$root" && git ls-files -z --cached --others --exclude-standard |
         tar --null --ignore-failed-read -T - -cf -) 2>/dev/null | tar -C "$src" -xf -
     sed -i "/^\[workspace.package\]/,/^\[/s/^version = \".*\"/version = \"$version\"/" "$src/Cargo.toml"
+    if [ "$arg" != "$suffix" ]; then
+        [ "${arg#*:}" = migration ] || { echo "unknown option in $arg" >&2; exit 2; }
+        migrations="$src/crates/puzuz-core/src/storage/migrations.rs"
+        sed -i 's/^\(pub(crate) const MIGRATIONS: &\[&str\] = &\[.*\)\];$/\1, "CREATE TABLE dist_test_marker (x INTEGER) STRICT;"];/' "$migrations"
+        grep -q dist_test_marker "$migrations" || { echo "cannot add a migration" >&2; exit 1; }
+    fi
 
     # Every copy is mounted at the same path, so the shared target directory
     # only rebuilds the workspace crates.

@@ -13,7 +13,7 @@
 #                          ubuntu:24.04, ubuntu:22.04, debian:12); see
 #                          scripts/dist/Dockerfile
 #   PUZUZ_DIST_SKIP_BUILD=1  reuse the release tarballs in target/dist-releases
-#   PUZUZ_DIST_SCENARIOS   scenarios to run (default: all, "17")
+#   PUZUZ_DIST_SCENARIOS   scenarios to run (default: all, "17 18")
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +22,7 @@ image="${PUZUZ_DIST_IMAGE:-puzuz-dist:$(tr -c 'a-zA-Z0-9.\n' '-' <<<"$base")}"
 name="puzuz-dist-$$"
 keep="${1:-}"
 releases="$root/target/dist-releases"
-scenarios="${PUZUZ_DIST_SCENARIOS:-17}"
+scenarios="${PUZUZ_DIST_SCENARIOS:-17 18}"
 
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$root/Cargo.toml")"
 v1="$version-test.1"
@@ -31,7 +31,7 @@ target=x86_64-unknown-linux-gnu
 
 if [ "${PUZUZ_DIST_SKIP_BUILD:-}" != 1 ] || [ ! -d "$releases/v$v2" ]; then
     rm -rf "$releases"
-    "$root/scripts/dist/build-test-versions.sh" "$releases" test.1 test.2
+    "$root/scripts/dist/build-test-versions.sh" "$releases" test.1 test.2:migration
 fi
 minisign="$("$root/scripts/dist/get-minisign.sh" "$root/target/dist-tools")"
 docker build -q -t "$image" --build-arg "BASE=$base" "$root/scripts/dist" >/dev/null

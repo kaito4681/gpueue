@@ -129,6 +129,15 @@ pub struct VersionResponse {
         deserialize_with = "lenient_option"
     )]
     pub gpu_detection: Option<GpuDetectionStatus>,
+    /// The schema version of the daemon's database (`PRAGMA user_version`),
+    /// which `puzuz update` compares with what a release supports before
+    /// installing it. Absent from daemons that predate it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_option"
+    )]
+    pub schema_version: Option<i64>,
 }
 
 /// Decodes an optional field, yielding `None` instead of an error when the

@@ -221,10 +221,9 @@ fn a_mask_alone_is_not_an_installation() {
 
 #[test]
 fn hints_name_the_right_tool() {
-    assert!(
-        service_install("/opt/bin")
-            .update_hint()
-            .contains("service install --bin-dir /opt/bin")
+    assert_eq!(
+        service_install("/opt/bin").update_hint(),
+        "run `sudo puzuz update`"
     );
     assert!(package(LIB_UNIT).update_hint().contains("package manager"));
     assert!(package(LIB_UNIT).removal_hint().contains("apt remove"));

@@ -409,6 +409,8 @@ async fn version(State(core): State<AppState>) -> Json<VersionResponse> {
         },
         checkpoints,
         gpu_detection: Some(core.gpu_detection.clone()),
+        // The database is at this version once the daemon has opened it.
+        schema_version: Some(puzuz_core::storage::SCHEMA_VERSION),
     })
 }
 

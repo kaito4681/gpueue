@@ -1077,7 +1077,7 @@ fn doctor() {
 #[test]
 fn subcommand_names_match_clap() {
     let command = Cli::command();
-    let samples: [&[&str]; 28] = [
+    let samples: [&[&str]; 29] = [
         &["add", "x"],
         &["remove", "1"],
         &["switch", "1", "2"],
@@ -1106,6 +1106,7 @@ fn subcommand_names_match_clap() {
         &["daemon"],
         &["service", "status"],
         &["doctor"],
+        &["update"],
     ];
     assert_eq!(samples.len(), command.get_subcommands().count());
     for args in samples {
@@ -1311,10 +1312,12 @@ fn value_examples_in_help_parse() {
 #[test]
 fn commands_and_options_in_help_texts_exist() {
     // Options of other programs that help texts mention on purpose.
-    let foreign_options: [(&[&str], &str); 3] = [
-        (&[], "config"),    // pueue's, which puzuz replaces with --socket
-        (&[], "profile"),   // likewise
-        (&["send"], "yes"), // a job command's own flag
+    let foreign_options: [(&[&str], &str); 5] = [
+        (&[], "config"),             // pueue's, which puzuz replaces with --socket
+        (&[], "profile"),            // likewise
+        (&["send"], "yes"),          // a job command's own flag
+        (&["update"], "bin-dir"),    // of `service install`
+        (&["update"], "save-token"), // of install.sh
     ];
     let root = Cli::command();
     let mut commands = 0;

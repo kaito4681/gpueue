@@ -2,7 +2,7 @@
 //! with canned output.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use puzuz_protocol::api::{HelperStatus, VersionResponse};
 
-use super::{CmdOutput, FsUsage, System};
+use super::{CmdOutput, FsUsage, HttpResponse, System};
+
+/// Request headers, as sent.
+pub type Headers = Vec<(String, String)>;
 
 pub struct FakeSystem {
     pub dir: tempfile::TempDir,
@@ -30,6 +33,13 @@ pub struct FakeSystem {
     pub daemon: Result<VersionResponse, String>,
     pub confirm_answer: bool,
     pub prompts: RefCell<Vec<String>>,
+    /// Environment variables.
+    pub env: RefCell<HashMap<String, String>>,
+    /// `(url, answer)`: a GET of exactly `url` gets `answer` (`Err` is a network failure);
+    /// other URLs fail with "offline". The last matching entry wins.
+    pub http: RefCell<Vec<(String, Result<HttpResponse, String>)>>,
+    /// Every URL fetched, with the headers sent.
+    pub http_log: RefCell<Vec<(String, Headers)>>,
 }
 
 impl FakeSystem {
@@ -49,7 +59,27 @@ impl FakeSystem {
             daemon: Err("cannot connect to the daemon socket: not found".to_owned()),
             confirm_answer: false,
             prompts: RefCell::default(),
+            env: RefCell::default(),
+            http: RefCell::default(),
+            http_log: RefCell::default(),
         }
+    }
+
+    pub fn set_env(&self, name: &str, value: &str) {
+        self.env
+            .borrow_mut()
+            .insert(name.to_owned(), value.to_owned());
+    }
+
+    /// Answers GETs of `url` with `status` and `body`.
+    pub fn serve(&self, url: &str, status: u16, body: impl Into<Vec<u8>>) {
+        self.http.borrow_mut().push((
+            url.to_owned(),
+            Ok(HttpResponse {
+                status,
+                body: body.into(),
+            }),
+        ));
     }
 
     pub fn respond(&self, prefix: &str, output: CmdOutput) {
@@ -109,6 +139,7 @@ impl FakeSystem {
             },
             checkpoints: None,
             gpu_detection: None,
+            schema_version: None,
         })
     }
 }
@@ -179,4 +210,30 @@ impl System for FakeSystem {
     }
 
     fn sleep(&self, _duration: Duration) {}
+
+    fn env_var(&self, name: &str) -> Option<String> {
+        self.env.borrow().get(name).cloned()
+    }
+
+    fn http_get(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        _timeout: Duration,
+    ) -> Result<HttpResponse, String> {
+        self.http_log.borrow_mut().push((
+            url.to_owned(),
+            headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        ));
+        self.http
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(served, _)| served == url)
+            .map(|(_, answer)| answer.clone())
+            .unwrap_or_else(|| Err("offline".to_owned()))
+    }
 }

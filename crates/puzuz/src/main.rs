@@ -10,6 +10,7 @@ mod requests;
 mod service;
 mod style;
 mod system;
+mod update;
 mod users;
 
 use std::{io, path::Path, process::ExitCode};
@@ -78,6 +79,21 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
+            }
+        }
+        SubCommand::Update {
+            check,
+            version,
+            yes,
+        } => {
+            let options = update::UpdateOptions {
+                check,
+                version,
+                yes,
+            };
+            match update::update(&system::RealSystem, &options, &mut io::stdout()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => fail(&err),
             }
         }
         other @ (SubCommand::Edit { .. } | SubCommand::Env { .. }) => {
@@ -157,6 +173,12 @@ fn run_service(cmd: ServiceCommand, socket: Option<&Path>) -> ExitCode {
             println!("{}", install_method::detect(&sys).keyword());
             Ok(true)
         }
+        ServiceCommand::VersionInfo => serde_json::to_string(&update::VersionInfo::this_binary())
+            .map(|json| {
+                println!("{json}");
+                true
+            })
+            .map_err(|e| e.to_string()),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,
