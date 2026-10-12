@@ -1,0 +1,14 @@
+# /etc/puzuz/config.toml of the full-stack e2e test.
+grace_secs = 5
+gpu_detection = "static"
+
+# Fake GPUs: jobs on them are CPU-only and just get CUDA_VISIBLE_DEVICES.
+[[gpus]]
+index = 0
+uuid = "GPU-fake-0"
+name = "Fake GPU 0"
+
+[[gpus]]
+index = 1
+uuid = "GPU-fake-1"
+name = "Fake GPU 1"
