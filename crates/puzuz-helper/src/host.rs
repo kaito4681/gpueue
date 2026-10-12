@@ -475,6 +475,7 @@ impl HostProbe for SystemHost {
                             path: target.into_owned(),
                             dev: m.dev(),
                             ino: m.ino(),
+                            attrs: None,
                         };
                         if !out.held_files.contains(&held) {
                             out.held_files.push(held);

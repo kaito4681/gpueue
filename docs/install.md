@@ -486,6 +486,26 @@ they are still there (triggering automount points on the way) and refuses with a
 otherwise (see [Restore failures](#restore-failures)). The image is kept, so you can mount the
 filesystem and run `puzuz restore` again.
 
+Before a restored job runs, the helper checks that its owner could open each of its files the way
+the job has it open, by the same path and without symlinks (see
+[Restores and paths](architecture.md#restores-and-paths)). A file the job already had open at the
+dump passes even if its owner could not open it that way now (a file the job created read-only,
+or an sshfs mount on which every file shows as root's), as long as it is that very file:
+
+- on the same mounted filesystem (no reboot or remount in between): the same device and inode, or
+- after the filesystem was mounted again: the same owner, group, mode, size, modification time
+  and change time as right after the dump. Device numbers change with a new mount, and inode
+  numbers are not stable on every filesystem: FUSE filesystems such as sshfs number inodes in the
+  order they are looked up, so after a reboot the job's files usually have other numbers (and
+  another file may have the old one). The change time is set by the kernel (or, on sshfs, by the
+  server) and cannot be set by the job's owner on a file that is not theirs.
+
+So do not touch a checkpointed job's files until it is restored: a file whose times changed is
+checked against its owner's permissions like any other, and with an sshfs mount that shows files
+as root's (`root@server:`, `allow_other,default_permissions`) the restore is then refused. On
+filesystems where the owner may open the files as the job does (the usual case), changes do not
+matter.
+
 Tested across a simulated reboot (`scripts/e2e-test.sh`, scenarios 15 and 16) with the job's
 working directory and open files on each of these:
 
@@ -495,7 +515,7 @@ working directory and open files on each of these:
 | bind mount (`/home/<user>` from another filesystem), read-only bind mount, bind mount with private propagation; `/` with shared propagation (the systemd default) | works |
 | overlayfs | works |
 | `x-systemd.automount` (job started before and after the trigger; not yet triggered at restore time) | works: the restore pre-check triggers it |
-| FUSE network filesystem (sshfs), with the job writing and renaming its own files there | works while the FUSE daemon is up again before the restore |
+| FUSE network filesystem (sshfs, mounted by root with `allow_other,default_permissions`, so that files show as root's), with the job writing and renaming its own files there, and other inode numbers after the reboot | works while the FUSE daemon is up again before the restore |
 | filesystem not mounted after the reboot (missing fstab entry, NFS server down) | refused: `<path> needs <type> on <mount point>` |
 | tmpfs mounted by the administrator (e.g. `/scratch`) with the job's files or working directory on it | refused: its contents are gone after a reboot. Use a tmpfs only for jobs that do not need to survive one. A restore on the same boot works. |
 

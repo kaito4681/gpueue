@@ -379,21 +379,80 @@ pub struct Pinned {
     pub fd: OwnedFd,
 }
 
-/// A file the job held open (or mapped) at the dump, by path, device and
-/// inode.
+/// A file the job held open (or mapped) at the dump: its path, device and
+/// inode, and its attributes once the dump is done ([`complete_held_files`]).
 ///
 /// A job may hold a file with an access its owner could not get by opening
 /// it again, e.g. one it created read-only, or on a filesystem that shows
 /// files as root's (sshfs). When CRIU reopened that very file (same path,
-/// no symlinks, same inode), the restore gives the job nothing new. The
-/// device may change across a reboot; then the inode and path have to do,
-/// which is only accepted with `fs.protected_hardlinks = 1` (otherwise the
-/// owner could hard-link a foreign file with the same inode number there).
+/// no symlinks), the restore gives the job nothing new. It is that very
+/// file if
+///
+/// - its device and inode are those of the dump (the same mounted
+///   filesystem, e.g. no reboot in between), or
+/// - its owner, group, mode, size, modification and change times are those
+///   of the dump, to the nanosecond. Device numbers change when a
+///   filesystem is mounted again, and inode numbers are not stable on every
+///   filesystem: FUSE filesystems such as sshfs number inodes in the order
+///   they are looked up, so after a reboot another file may have the old
+///   number. The change time cannot be set by users: renaming or linking
+///   another file into the path, or changing it, gives it a new one (on
+///   sshfs, which reports the modification time as the change time, the
+///   server lets only the file's owner set it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldFile {
     pub path: String,
     pub dev: u64,
     pub ino: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attrs: Option<FileAttrs>,
+}
+
+/// See [`HeldFile`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileAttrs {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    pub size: i64,
+    pub mtime: (i64, i64),
+    pub ctime: (i64, i64),
+}
+
+impl FileAttrs {
+    pub fn of(st: &rustix::fs::Stat) -> Self {
+        #[allow(clippy::unnecessary_cast)]
+        Self {
+            uid: st.st_uid,
+            gid: st.st_gid,
+            mode: st.st_mode as u32,
+            size: st.st_size as i64,
+            mtime: (st.st_mtime as i64, st.st_mtime_nsec as i64),
+            ctime: (st.st_ctime as i64, st.st_ctime_nsec as i64),
+        }
+    }
+}
+
+/// After a successful dump (nothing of the job runs any more): records the
+/// attributes of each held file that its path still leads to, without
+/// symlinks, as the same device and inode as before the dump (a file the
+/// job closed or replaced meanwhile is left without them).
+pub fn complete_held_files(files: &mut [HeldFile]) {
+    for f in files {
+        f.attrs = open_no_symlinks(&f.path)
+            .and_then(|fd| rustix::fs::fstat(&fd))
+            .ok()
+            .filter(|st| (st.st_dev, st.st_ino) == (f.dev, f.ino))
+            .map(|st| FileAttrs::of(&st));
+    }
+}
+
+impl HeldFile {
+    /// Whether `st`, found at this path, is this file (see [`HeldFile`]).
+    pub fn is(&self, st: &rustix::fs::Stat) -> bool {
+        (st.st_dev, st.st_ino) == (self.dev, self.ino)
+            || self.attrs.is_some_and(|a| a == FileAttrs::of(st))
+    }
 }
 
 /// The owner's part for one object (run with the owner's credentials, in
@@ -651,8 +710,6 @@ fn check_restored_procs(c: &RestoredCheck, procs: &[u32]) -> VerifyReply {
         .map(|m| m.id)
         .collect();
 
-    let protected_hardlinks = fs::read_to_string(proc_root.join("sys/fs/protected_hardlinks"))
-        .is_ok_and(|v| v.trim() == "1");
     let mut objects = Vec::new();
     let mut seen = HashSet::new();
     let mut add = |what: String, link: &Path, want: Want, problems: &mut Vec<String>| {
@@ -694,10 +751,7 @@ fn check_restored_procs(c: &RestoredCheck, procs: &[u32]) -> VerifyReply {
         if !seen.insert((st.st_dev, st.st_ino, want, deleted, path.clone())) {
             return;
         }
-        let held = !deleted
-            && c.held.iter().any(|h| {
-                h.path == path && h.ino == st.st_ino && (h.dev == st.st_dev || protected_hardlinks)
-            });
+        let held = !deleted && c.held.iter().any(|h| h.path == path && h.is(&st));
         objects.push(Pinned {
             what,
             path,
@@ -1042,12 +1096,36 @@ VmFlags: rd ex mr mw me
             path: data.to_str().unwrap().to_owned(),
             dev: std::os::unix::fs::MetadataExt::dev(&st),
             ino: std::os::unix::fs::MetadataExt::ino(&st),
+            attrs: None,
         }];
         assert_eq!(check(&held), Ok(vec![]));
-        // Another file at that path is not.
+        // After a remount the device and inode numbers may differ (sshfs
+        // numbers inodes in lookup order): the attributes recorded after
+        // the dump identify the file then.
+        complete_held_files(&mut held.held);
+        assert!(held.held[0].attrs.is_some());
+        held.held[0].dev += 1;
+        held.held[0].ino += 1000;
+        assert_eq!(check(&held), Ok(vec![]));
+        // Another file at that path is not that file, even with the same
+        // owner, mode, size and times (renaming it there changed its
+        // change time).
+        let other = tmp.path().join("y/other");
+        fs::write(&other, vec![b'x'; usize::try_from(st.len()).unwrap()]).unwrap();
+        let mtime = fs::metadata(&data).unwrap().modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&other)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime).set_accessed(mtime))
+            .unwrap();
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(fs::metadata(&other).unwrap().modified().unwrap(), mtime);
         fs::rename(&data, tmp.path().join("y/data.old")).unwrap();
-        fs::write(&data, b"x").unwrap();
-        fs::set_permissions(&data, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::rename(&other, &data).unwrap();
+        assert!(!check(&held).unwrap().is_empty());
+        // Nor is it with the device and inode of the dump unrecorded.
+        held.held[0].attrs = None;
         assert!(!check(&held).unwrap().is_empty());
         let mut req2 = req.clone();
         req2.allowed_gids = vec![];
