@@ -2,6 +2,7 @@ mod cli;
 mod clock;
 mod commands;
 mod doctor;
+mod install_method;
 mod query;
 mod render;
 mod requests;
@@ -150,6 +151,10 @@ fn run_service(cmd: ServiceCommand, socket: Option<&Path>) -> ExitCode {
         }
         ServiceCommand::Status => {
             service::status(&sys, socket, &mut out).map_err(|e| format!("writing output: {e}"))
+        }
+        ServiceCommand::InstallMethod => {
+            println!("{}", install_method::detect(&sys).keyword());
+            Ok(true)
         }
     };
     match result {

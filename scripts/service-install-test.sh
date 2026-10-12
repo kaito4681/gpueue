@@ -92,6 +92,21 @@ grep -q "unchanged /etc/systemd/system/puzuz.service" /tmp/install2.out || fail 
 grep -q "kept the existing /etc/puzuz/config.toml" /tmp/install2.out || fail "config not kept"
 grep -q "grace_secs = 7" /etc/puzuz/config.toml || fail "config overwritten"
 systemctl is-active puzuz.service
+[ "$(puzuz service install-method)" = service-install ] || fail "install method not detected"
+
+step "a packaged unit next to the installed one is a conflict"
+cp /etc/systemd/system/puzuz.service /tmp/puzuz.service.etc
+sed 1d /tmp/puzuz.service.etc > /usr/lib/systemd/system/puzuz.service
+[ "$(puzuz service install-method)" = mixed ] || fail "mixed setup not detected"
+out="$(puzuz doctor 2>&1)" && fail "doctor passed a mixed setup"
+grep -q "FAIL  install method: mixed: distribution package" <<<"$out" || fail "$out"
+out="$(/usr/local/bin/puzuz service install --force 2>&1)" && fail "install --force over a package succeeded"
+grep -q "distribution package" <<<"$out" || fail "$out"
+out="$(/usr/local/bin/puzuz service uninstall --purge --yes 2>&1)" && fail "purge of a mixed setup succeeded"
+grep -q "refusing to purge" <<<"$out" || fail "$out"
+cmp /etc/systemd/system/puzuz.service /tmp/puzuz.service.etc || fail "installed unit changed"
+rm /usr/lib/systemd/system/puzuz.service
+[ "$(puzuz service install-method)" = service-install ] || fail "conflict not resolved"
 
 step "uninstall keeps data"
 /usr/local/bin/puzuz service uninstall
@@ -110,6 +125,23 @@ step "install from /usr/local/bin needs no --bin-dir"
 /usr/local/bin/puzuz service install --no-start > /tmp/install3.out || true
 systemctl is-enabled puzuz.service
 systemctl is-active puzuz.service && fail "--no-start started the daemon"
+
+step "a package-managed machine is refused"
+/usr/local/bin/puzuz service uninstall
+printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' > /usr/lib/systemd/system/puzuz.service
+[ "$(puzuz service install-method)" = package ] || fail "package not detected"
+out="$(/usr/local/bin/puzuz service install --force 2>&1)" && fail "install over a package succeeded"
+grep -q "package manager" <<<"$out" || fail "$out"
+test ! -e /etc/systemd/system/puzuz.service || fail "install wrote a unit"
+out="$(/usr/local/bin/puzuz service uninstall 2>&1)" && fail "uninstall of a package succeeded"
+grep -q "not by \`puzuz service install\`" <<<"$out" || fail "$out"
+rm /usr/lib/systemd/system/puzuz.service
+
+step "NixOS is refused"
+touch /etc/NIXOS
+out="$(/usr/local/bin/puzuz service install 2>&1)" && fail "install on NixOS succeeded"
+grep -q "installed as NixOS" <<<"$out" || fail "$out"
+rm /etc/NIXOS
 echo
 echo "=== service e2e passed"
 EOF

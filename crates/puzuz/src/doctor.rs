@@ -11,6 +11,7 @@ use puzuz_checkpoint::probe::{Version, parse_criu_version, parse_cuda_checkpoint
 use puzuz_daemon::config::{Config, CudaCheckpointMode, DEFAULT_CONFIG_PATH, GpuDetection};
 use puzuz_protocol::api::{CheckpointStorage, GpuDetectionStatus, GpuSource, VersionResponse};
 
+use crate::install_method::{self, InstallMethod, Method};
 use crate::service::{ADMIN_GROUP, DAEMON_UNIT, HELPER_UNIT, TMPFILES_PATH, UNIT_DIR};
 use crate::system::{System, check_root_owned_chain, find_program, is_root_owned_and_protected};
 
@@ -323,7 +324,7 @@ pub fn parse_show_exec_start(text: &str) -> Option<ExecStart> {
 /// Runs every check. `socket` overrides the daemon socket from the configuration.
 pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     let LoadedConfig { config, check } = load_config(sys);
-    let mut checks = vec![check];
+    let mut checks = vec![check, check_install_method(sys)];
     let api_socket = socket.map_or_else(|| config.api_socket.clone(), Path::to_owned);
     let daemon = sys.daemon_version(&api_socket);
 
@@ -367,6 +368,41 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     }
     checks.push(check_admin(sys));
     Report { checks }
+}
+
+/// How puzuz is installed; two ways at once shadow each other's units.
+fn check_install_method(sys: &dyn System) -> Check {
+    const NAME: &str = "install method";
+    let method = install_method::detect(sys);
+    match &method {
+        InstallMethod::None => Check::info(NAME, "not installed"),
+        InstallMethod::One(Method::Manual { unit }) => {
+            Check::info(NAME, method.to_string()).hint(format!(
+                "`sudo puzuz service install --force` replaces {} with the packaged units",
+                unit.display()
+            ))
+        }
+        InstallMethod::One(_) => Check::ok(NAME, method.to_string()),
+        InstallMethod::Mixed(methods) => {
+            let fixes: Vec<String> = methods
+                .iter()
+                .map(|m| {
+                    let kept = methods
+                        .iter()
+                        .filter(|other| *other != m)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" and ");
+                    format!("to keep {kept}: {}", m.removal_hint())
+                })
+                .collect();
+            Check::fail(
+                NAME,
+                format!("{method}; their units and data directories conflict"),
+            )
+            .hint(format!("remove all but one of them:\n{}", fixes.join("\n")))
+        }
+    }
 }
 
 fn check_criu(sys: &dyn System, configured: &Path) -> Check {
