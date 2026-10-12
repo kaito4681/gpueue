@@ -1,0 +1,45 @@
+[package]
+name = "puzuz-helper"
+description = "Privileged helper that runs, signals and checkpoints puzuz jobs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "puzuz-helper"
+path = "src/main.rs"
+
+[dependencies]
+puzuz-protocol.workspace = true
+puzuz-checkpoint.workspace = true
+puzuz-config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+] }
+zbus.workspace = true
+nix.workspace = true
+rustix = { workspace = true, features = ["thread", "process", "mount", "fs"] }
+
+[build-dependencies]
+cc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
