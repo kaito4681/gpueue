@@ -112,12 +112,16 @@ hold a root file opened with the dump-time mode. The helper therefore:
   way it is open (`faccessat2` on the pinned file) and reaches it by its path, without
   symlinks, as the same inode. It also requires that every task runs as the owner, with groups
   the owner is still in and without capabilities. Files on the job's own mounts (`/proc`, the
-  private tmpfs) come from the image and are skipped. A file the job held at the dump (recorded
-  then by path, device and inode) only needs its path to lead to that very inode: a job may hold
-  a file in a way its owner could not open it again (created read-only, or on an sshfs mount that
-  shows files as root's), and getting that same file back gives it nothing new. After a reboot,
-  when the device number may have changed, path and inode are accepted only with
-  `fs.protected_hardlinks = 1`. If the hook finds a problem, it kills the tasks while they are
+  private tmpfs) come from the image and are skipped. A file the job held at the dump only
+  needs its path to lead to that very file: a job may hold a file in a way its owner could not
+  open it again (created read-only, or on an sshfs mount that shows files as root's), and
+  getting that same file back gives it nothing new. It is that file if it has the device and
+  inode recorded before the dump, or (after a remount, when device numbers change and FUSE
+  filesystems such as sshfs have renumbered their inodes) the owner, group, mode, size,
+  modification and change times recorded right after the dump; the change time cannot be set by
+  users, and renaming or linking another file there changes it (see
+  [Filesystems and mounts](install.md#filesystems-and-mounts)). If the hook finds a problem, it
+  kills the tasks while they are
   still stopped (CRIU itself ignores a failed `pre-resume` script), so they never run; the
   restore fails with the reason and the image is kept. If the hook did not run at all, the
   helper kills the restored job as soon as `criu restore` returns.

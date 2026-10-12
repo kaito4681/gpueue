@@ -2012,7 +2012,12 @@ pub fn dump_job<H: HostProbe + ?Sized>(
             source_mounts: host.source_mounts(&external_sources).unwrap_or_default(),
             external_sources,
             open_files,
-            held_files: hazards.held_files,
+            held_files: {
+                // The job is gone now: its files no longer change.
+                let mut held = hazards.held_files;
+                crate::access::complete_held_files(&mut held);
+                held
+            },
         };
         let mounts_json = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
         write_atomic(&dir.root().join(MOUNTS_FILE), &mounts_json).map_err(|e| e.to_string())?;
