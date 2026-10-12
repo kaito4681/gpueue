@@ -1,0 +1,54 @@
+[Unit]
+Description=puzuz root helper (runs, checkpoints and restores puzuz jobs)
+Documentation=https://github.com/kaito4681/puzuz
+# Units are stopped in the reverse order of starting. Being After= the
+# filesystems, D-Bus and the NVIDIA services means the helper is stopped -
+# and dumps every running job - while they are still available.
+# Job units (puzuz-job-<id>.service) are created with
+# Before=puzuz-helper.service, so they are stopped only after the helper
+# has finished its dumps.
+After=local-fs.target remote-fs.target dbus.service systemd-tmpfiles-setup.service
+After=nvidia-persistenced.service nvidia-fabricmanager.service
+Requires=dbus.service
+RequiresMountsFor=/var/lib/puzuz
+
+[Service]
+# READY=1 is sent once jobs are re-discovered and the socket is bound.
+Type=notify
+# Settings come from /etc/puzuz/config.toml (shared with the daemon), which
+# must be owned by root. Flags (`puzuz-helper serve --help`) override it;
+# prefer the file so that `puzuz doctor` reports what the helper uses.
+ExecStart=/usr/bin/puzuz-helper serve
+# On SIGTERM the helper asks systemd whether the whole system is stopping
+# (SystemState=stopping). Only then does it refuse new spawns/restores, dump
+# every running job one by one (except --no-checkpoint jobs, which systemd
+# stops after the helper) and write <checkpoint dir>/shutdown-manifest.json.
+# A plain `systemctl stop/restart puzuz-helper` (e.g. an upgrade) leaves the
+# jobs running; the next helper re-discovers them. It refuses new
+# spawns/restores and first lets the operations in flight finish (a dump
+# in progress may take a while). A second SIGTERM makes the helper exit at
+# once.
+# KillMode=mixed: only the helper itself gets SIGTERM; criu and
+# cuda-checkpoint children in the middle of a dump are not interrupted.
+KillMode=mixed
+# Initial budget for dumping everything. While it dumps, the helper extends
+# the timeout with EXTEND_TIMEOUT_USEC, but only up to the end of the running
+# dump's deadline (checkpoint_deadline_base_secs +
+# checkpoint_deadline_secs_per_gib * GiB of RSS + VRAM, 180 s + 30 s/GiB by
+# default) plus its rollback, so this mostly matters for systemd versions
+# without that. Jobs are dumped sequentially; measured on an NVMe disk, a
+# dump takes about 2-2.5 s per GiB of RSS + VRAM, so 30 min covers several
+# hundred GiB in total, and ~50 GiB even at the deadline's rate of 30 s/GiB
+# (see docs/install.md, "Checkpoint timeouts"). Raise it for larger jobs or
+# slower disks.
+TimeoutStopSec=30min
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+# Jobs run in their own units, so restarting the helper does not touch
+# them; it re-discovers them on start.
+# No mount sandboxing (ProtectSystem=, PrivateTmp=, ...): the helper
+# bind-mounts / for `criu restore --root` and must see the host's mounts.
+
+[Install]
+WantedBy=multi-user.target
