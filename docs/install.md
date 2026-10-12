@@ -73,6 +73,16 @@ scripts/test-in-docker.sh build --release -p puzuz -p puzuz-helper
 # -> target/docker/release/puzuz, target/docker/release/puzuz-helper
 ```
 
+Tagged versions also come as prebuilt binaries for x86_64 Linux (built on Debian bookworm, glibc
+2.36 or newer) on the GitHub releases page: `puzuz-v<version>-x86_64-unknown-linux-gnu.tar.gz`
+holds `puzuz`, `puzuz-helper` and the documentation, with a `.sha256` file next to it.
+
+```sh
+sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar xzf puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+sudo puzuz-v0.1.0-x86_64-unknown-linux-gnu/puzuz service install --bin-dir /usr/local/bin
+```
+
 ## Installing
 
 ```sh
