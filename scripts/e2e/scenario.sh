@@ -894,7 +894,7 @@ s16_verify() {
 # the scheduler, so the helper gets concurrent spawns; then again while the
 # helper restarts. No job may fail to spawn or get lost.
 s10_burst() {
-    local ids=() i id u pids=()
+    local ids=() i id u
     burst() { # burst <tag> <count> <command>: add jobs in parallel, ids in $STATE/burst-<tag>
         local tag=$1 n=$2 cmd=$3 k
         mkdir -p "$STATE"

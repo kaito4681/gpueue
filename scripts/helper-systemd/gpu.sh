@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # GPU part of the helper-systemd test, sourced by scenario.sh (`scenario.sh
 # gpu`, run by `PUZUZ_HELPER_GPU=1 scripts/helper-systemd-test.sh`) after
 # the helper is installed with cuda_checkpoint_mode =
