@@ -1,0 +1,38 @@
+name: Release (Nix stable branch)
+
+# Nix users follow releases with `github:kaito4681/puzuz/stable` (see
+# docs/install.md). Each release tag moves the `stable` branch to the tagged
+# commit; pre-releases (`v1.2.0-rc.1`: a `-` in the tag) leave it alone.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-nix-stable
+  cancel-in-progress: false
+
+jobs:
+  stable-branch:
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Move the stable branch to the tag
+        run: |
+          # A patch release of an older line (v0.1.5 after v0.2.0) must not
+          # move stable backwards: only the highest release version moves it.
+          latest="$(git tag -l 'v*' | grep -v -- - | sort -V | tail -n1)"
+          if [ "$latest" != "$TAG" ]; then
+            echo "$TAG is not the latest release ($latest); stable stays" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git push --force origin "refs/tags/$TAG^{commit}:refs/heads/stable"
+          echo "stable -> $TAG ($(git rev-parse "refs/tags/$TAG^{commit}"))" >>"$GITHUB_STEP_SUMMARY"
