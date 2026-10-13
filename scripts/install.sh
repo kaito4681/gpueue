@@ -17,7 +17,7 @@ TOKEN_FILE_SAVED="/etc/puzuz/github-token"
 INSTALL_MARKER='# Installed by `puzuz service install`; re-running it overwrites this file.'
 # The release signing key; must match packaging/minisign.pub (checked by the
 # release workflow and a unit test).
-MINISIGN_PUBKEY="RWQI3XV1shOR22n9kPlB9C81e0sx6XdiE3jTLTgBXVhx+M8c5Vq1r2Sc"
+MINISIGN_PUBKEY="RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv"
 
 usage() {
     cat <<EOF
