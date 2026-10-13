@@ -61,9 +61,10 @@ jobs:
             -S warning $(git ls-files '*.sh' 'packaging/scripts/*')
 
   # flake.nix: evaluate the outputs and run the checks (the home-manager
-  # module evaluation; on x86_64 also the NixOS VM test of the module, which
-  # needs KVM), then build puzuz (which runs the tests that work in the Nix
-  # sandbox) and CRIU on both architectures.
+  # module evaluation; on x86_64 also two NixOS VM tests, which need KVM: the
+  # NixOS module, and every puzuz-helper test including those the sandboxed
+  # package build skips), then build puzuz (which runs the tests that work in
+  # the Nix sandbox) and CRIU on both architectures.
   nix:
     strategy:
       fail-fast: false

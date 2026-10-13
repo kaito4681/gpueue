@@ -412,6 +412,7 @@ scripts/helper-systemd-test.sh    # the helper alone under systemd
 scripts/dist-test.sh              # install.sh against a fake GitHub API (PUZUZ_DIST_BASE=debian:12 ...)
 nix build -L .#checks.x86_64-linux.nixos         # NixOS module in a VM (needs KVM)
 nix build -L .#checks.x86_64-linux.home-manager  # home-manager module evaluation
+nix build -L .#checks.x86_64-linux.helper-tests  # all puzuz-helper tests in a VM (needs KVM)
 ```
 
 `scripts/e2e-test.sh` documents its environment variables at the top, for example

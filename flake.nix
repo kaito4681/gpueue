@@ -19,6 +19,8 @@
         default = puzuz;
         # CRIU 4.2.x (nixpkgs has 4.1.1); not a dependency of puzuz.
         criu = pkgs.callPackage ./nix/criu.nix { };
+        # The puzuz-helper test executables, for checks.x86_64-linux.helper-tests.
+        helper-tests = pkgs.callPackage ./nix/helper-tests.nix { inherit puzuz; };
       });
 
       devShells = forAllSystems (pkgs: {
@@ -46,9 +48,11 @@
         {
           home-manager = import ./nix/tests/home-manager.nix { inherit self pkgs; };
         }
-        # A NixOS VM test of the NixOS module; it needs KVM.
+        # NixOS VM tests (they need KVM): the NixOS module, and every
+        # puzuz-helper test, including those the package build skips.
         // nixpkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
           nixos = import ./nix/tests/nixos.nix { inherit self pkgs; };
+          helper-tests = import ./nix/tests/helper-tests.nix { inherit self pkgs; };
         }
       );
     };
