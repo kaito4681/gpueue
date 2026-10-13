@@ -391,7 +391,7 @@ fn check_update(sys: &dyn System, config: &Config, detection: &Detection) -> Opt
             NAME,
             format!("puzuz {newer} is available (this is {current})"),
         )
-        .hint(crate::update::update_hint(detection)),
+        .hint(crate::update::update_hint(detection, config, Some(&newer))),
         Ok(None) => Check::ok(NAME, format!("{current} is the latest release")),
         Err(err) => Check::info(NAME, format!("cannot check for a newer release: {err}")),
     })

@@ -1,0 +1,67 @@
+name: APT repository
+
+# Adds the .deb files of a published release to the puzuz APT repository, a
+# flat repository in the release `apt` (scripts/dist/apt-repo.sh; see
+# docs/install.md, "The APT repository (maintainers)").
+#
+# release.yml creates each release as a draft, and drafts never reach the
+# repository. It runs on `released`: when a person publishes a release as a
+# stable one or turns a pre-release into one (or a tool does so with a
+# personal access token). A release published with the GITHUB_TOKEN of a
+# workflow does not trigger it (GitHub does not start workflows for events
+# caused by GITHUB_TOKEN); run it by hand then. Which releases go to the
+# repository (published, not pre-releases, `v*` tags) is decided by
+# scripts/dist/apt-repo.sh, so `apt upgrade` only installs stable versions.
+#
+# Re-run for a tag (e.g. after a failed upload): Actions > APT repository >
+# Run workflow, or `gh workflow run release-apt.yml -f tag=v0.1.0`.
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release (tag) to add to the APT repository
+        required: true
+
+permissions:
+  contents: write
+
+# One update of the `apt` release at a time, none cancelled.
+concurrency:
+  group: apt-repository
+  cancel-in-progress: false
+
+jobs:
+  apt-repo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+      HAVE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY != '' && secrets.APT_GPG_PASSPHRASE != '' }}
+    steps:
+      - name: Check the signing secrets
+        id: gate
+        run: |
+          if [ "$HAVE_KEY" = true ]; then
+            echo "publish=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::notice::the repository secrets APT_GPG_PRIVATE_KEY and APT_GPG_PASSPHRASE are not set (scripts/dist/gen-apt-key.sh); skipping the APT repository"
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+          fi
+      # The scripts of the workflow's own commit (the tag's for a release
+      # event). apt-repo.sh takes the archive key from the packages and the
+      # minisign key from the tag's commit.
+      - if: steps.gate.outputs.publish == 'true'
+        uses: actions/checkout@v4
+      - if: steps.gate.outputs.publish == 'true'
+        name: Install apt-ftparchive
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends apt-utils
+      - if: steps.gate.outputs.publish == 'true'
+        name: Update the APT repository
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: scripts/dist/apt-repo.sh github "$TAG"

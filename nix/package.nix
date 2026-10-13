@@ -62,9 +62,11 @@ rustPlatform.buildRustPackage {
       ../Cargo.toml
       ../Cargo.lock
       ../crates
-      # Embedded with include_str!: unit templates, config, release key, install.sh.
+      # Embedded with include_str!: unit templates, config, release key, maintainer
+      # scripts, install.sh, deb-check.sh (the last ones by the marker test).
       ../packaging
       ../scripts/install.sh
+      ../scripts/dist/deb-check.sh
       ../README.md
       ../LICENSE
       ../docs

@@ -675,8 +675,8 @@ pub enum SubCommand {
     /// the installed directory with its own `puzuz service install`. Running jobs keep
     /// running. Only for an installation made by `puzuz service install` (or install.sh);
     /// packages are updated with their package manager. Without root it only checks, like
-    /// --check. The repository is private: set GH_TOKEN to a token that can read it, or save one
-    /// with `install.sh --save-token` (/etc/puzuz/github-token).
+    /// --check. A GitHub token is optional (it raises the API rate limit): set GH_TOKEN, or save
+    /// one with `install.sh --save-token` (/etc/puzuz/github-token).
     Update {
         /// Only report whether a newer release exists.
         #[arg(long)]

@@ -387,7 +387,7 @@ fn missing_or_bad_tokens_are_explained() {
     sys.serve(&format!("{REPO_API}/releases/latest"), 404, "{}");
     let err = run(&sys, &opts(true, None)).unwrap_err();
     assert!(
-        err.contains("A GitHub token that can read kaito4681/puzuz"),
+        err.contains("kaito4681/puzuz has no published release"),
         "{err}"
     );
     assert!(
@@ -400,7 +400,7 @@ fn missing_or_bad_tokens_are_explained() {
     sys.set_env("GITHUB_TOKEN", "expired");
     let err = run(&sys, &opts(true, None)).unwrap_err();
     assert!(
-        err.contains("The token from GITHUB_TOKEN cannot read"),
+        err.contains("with the token from GITHUB_TOKEN: it may be expired or revoked"),
         "{err}"
     );
     assert!(!err.contains("expired\""), "{err}");
@@ -587,6 +587,71 @@ fn only_service_install_is_updated() {
 }
 
 #[test]
+fn the_puzuz_rpm_is_updated_from_the_release_url() {
+    let sys = system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.missing("dpkg-query");
+    sys.respond("rpm -qf", CmdOutput::ok("puzuz\n"));
+    std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
+    let arch = std::env::consts::ARCH;
+    let base = "https://github.com/kaito4681/puzuz/releases/download";
+
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("installed as distribution package"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "run `sudo dnf upgrade {base}/v<version>/puzuz-<version>-1.{arch}.rpm` with the \
+             version of https://github.com/kaito4681/puzuz/releases/latest"
+        )),
+        "{err}"
+    );
+    assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
+
+    // Checking names the release found.
+    let out = run(&sys, &opts(true, None)).unwrap();
+    assert!(
+        out.contains(&format!(
+            "sudo dnf upgrade {base}/v9.0.0/puzuz-9.0.0-1.{arch}.rpm"
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "sudo rpm --import {base}/v9.0.0/RPM-GPG-KEY-puzuz"
+        )),
+        "{out}"
+    );
+
+    // doctor's hint, for a pre-release.
+    let hint = update_hint(
+        &install_method::detect(&sys),
+        &Config::default(),
+        Some(&Version::parse("9.1.0-rc.1").unwrap()),
+    );
+    assert!(
+        hint.contains(&format!(
+            "{base}/v9.1.0-rc.1/puzuz-9.1.0-rc.1-1.{arch}.rpm`"
+        )),
+        "{hint}"
+    );
+
+    // Another rpm named differently (e.g. a distribution's own package) gets the generic hint.
+    let sys = system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.missing("dpkg-query");
+    sys.respond("rpm -qf", CmdOutput::ok("puzuz-bin\n"));
+    std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("run `sudo dnf upgrade`."), "{err}");
+}
+
+#[test]
 fn the_install_method_is_checked_before_contacting_github() {
     // A package-managed machine: no token and no reachable release, but the error names the
     // package manager.
@@ -642,7 +707,7 @@ fn doctor_reports_a_newer_release_as_info() {
         Some(Version::new(9, 0, 0))
     );
     assert_eq!(
-        update_hint(&install_method::detect(&sys)),
+        update_hint(&install_method::detect(&sys), &Config::default(), None),
         "sudo puzuz update"
     );
     sys.serve(&format!("{REPO_API}/releases/latest"), 500, "");
@@ -690,7 +755,7 @@ fn other_install_methods_get_their_own_hint() {
     sys.missing("dpkg-query");
     sys.respond("rpm -qf", CmdOutput::ok("puzuz\n"));
     let err = run(&sys, &opts(false, None)).unwrap_err();
-    assert!(err.contains("run `sudo dnf upgrade`"), "{err}");
+    assert!(err.contains("run `sudo dnf upgrade https://"), "{err}");
 
     // The NixOS module.
     let sys = bare_system();
@@ -714,7 +779,7 @@ fn other_install_methods_get_their_own_hint() {
     let err = run(&sys, &opts(false, None)).unwrap_err();
     assert!(err.contains("`services.puzuz` NixOS module"), "{err}");
     assert_eq!(
-        update_hint(&install_method::detect(&sys)),
+        update_hint(&install_method::detect(&sys), &Config::default(), None),
         "install it with the `services.puzuz` NixOS module (see docs/install.md)"
     );
 
@@ -743,7 +808,10 @@ fn a_packaged_helper_unit_blocks_the_update() {
         "{err}"
     );
     assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
-    assert!(update_hint(&install_method::detect(&sys)).contains("run `puzuz doctor` first"));
+    assert!(
+        update_hint(&install_method::detect(&sys), &Config::default(), None)
+            .contains("run `puzuz doctor` first")
+    );
 }
 
 #[test]

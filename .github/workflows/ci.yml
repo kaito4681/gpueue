@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: |
           docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:v0.10.0 \
-            -S warning $(git ls-files '*.sh')
+            -S warning $(git ls-files '*.sh' 'packaging/scripts/*')
 
   # flake.nix: evaluate the outputs, then build puzuz (which runs the tests
   # that work in the Nix sandbox) and CRIU on both architectures.
@@ -126,6 +126,85 @@ jobs:
         env:
           PUZUZ_DIST_BASE: ${{ matrix.base }}
           PUZUZ_DIST_SKIP_BUILD: "1"
+
+  # The .deb of each architecture (built like release.yml does, but from a
+  # debug build), installed, reinstalled, removed and purged in plain
+  # containers without systemd (scripts/deb-test.sh). On arm64 the
+  # workspace tests run too, since release.yml runs them there.
+  deb:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - if: matrix.runner == 'ubuntu-24.04-arm'
+        run: scripts/test-in-docker.sh test --workspace --locked
+      - run: scripts/test-in-docker.sh build --locked -p puzuz -p puzuz-helper
+      - run: scripts/dist/build-package.sh target/docker/debug target/deb
+      - run: |
+          for base in debian:12 ubuntu:24.04; do
+            PUZUZ_DEB_BASE="$base" scripts/deb-test.sh target/deb/puzuz_*.deb
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.runner }}
+          path: target/deb/puzuz_*.deb
+          retention-days: 3
+
+  # The APT repository: v1 of the .deb installed, its sources pointed at a
+  # flat repository built by scripts/dist/apt-repo.sh (throwaway key), then
+  # `apt-get update && apt-get upgrade` to v2, remove and purge
+  # (scripts/apt-repo-test.sh).
+  apt-repo:
+    needs: [deb]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, base: "debian:12" }
+          - { runner: ubuntu-24.04, base: "ubuntu:22.04" }
+          - { runner: ubuntu-24.04, base: "ubuntu:24.04" }
+          - { runner: ubuntu-24.04, base: "ubuntu:26.04" }
+          - { runner: ubuntu-24.04-arm, base: "ubuntu:24.04" }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-${{ matrix.runner }}
+          path: target/deb
+      - run: scripts/apt-repo-test.sh target/deb/puzuz_*.deb
+        env:
+          PUZUZ_APT_BASES: ${{ matrix.base }}
+
+  # The .rpm of each architecture (built like release.yml does, but from a
+  # debug build), installed, upgraded from an older pre-release package and
+  # removed in plain Rocky Linux 9 and Fedora containers without systemd
+  # (scripts/rpm-test.sh).
+  rpm:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/test-in-docker.sh build --locked -p puzuz -p puzuz-helper
+      - name: Build the .rpm, and a pre-release of it to upgrade from
+        run: |
+          . scripts/dist/lib.sh
+          version="$(workspace_version .)"
+          PUZUZ_PKG_VERSION="$version-rc.1" scripts/dist/build-package.sh target/docker/debug target/rpm-old rpm
+          scripts/dist/build-package.sh target/docker/debug target/rpm rpm
+      - run: |
+          for base in rockylinux/rockylinux:9 fedora:latest; do
+            PUZUZ_RPM_BASE="$base" scripts/rpm-test.sh target/rpm-old/puzuz-*.rpm target/rpm/puzuz-*.rpm
+          done
 
   # Daemon + helper + CLI under systemd in a privileged container, including
   # a simulated reboot (CPU-only; the GPU scenarios need an NVIDIA GPU).

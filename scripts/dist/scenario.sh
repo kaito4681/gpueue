@@ -106,8 +106,10 @@ scenario_17() {
     local install=/dist/install.sh
 
     step "17: refusals before anything is installed"
-    expect_fail "A GitHub token that can read" bash "$install"
-    GH_TOKEN=wrong expect_fail "The token cannot read" bash "$install"
+    # The fake API answers 404 without the token (like a private repository),
+    # which is also how a repository without releases looks.
+    expect_fail "has no published release" bash "$install"
+    GH_TOKEN=wrong expect_fail "with the GitHub token: it may be expired or revoked" bash "$install"
     GH_TOKEN="$TOKEN" expect_fail "release v9.9.9 not found" bash "$install" --version 9.9.9
     expect_fail "must run as root" runuser -u alice -- bash "$install"
     mkdir -p /tmp/oldglibc
@@ -254,8 +256,8 @@ scenario_18() {
     set_latest "$V2"
     "$puzuz" update --check | tee /tmp/check.out
     grep -qF "puzuz $V2 is available (installed: $V1)" /tmp/check.out || fail "no newer release reported"
-    # A user cannot read the saved token, and is told what is missing.
-    expect_fail "A GitHub token that can read" \
+    # A user cannot read the saved token, so the fake API answers 404.
+    expect_fail "has no published release" \
         runuser -u alice -- env PUZUZ_RELEASE_API_URL="$PUZUZ_RELEASE_API_URL" "$puzuz" update
     # With a token, a user's `update` only checks.
     runuser -u alice -- env PUZUZ_RELEASE_API_URL="$PUZUZ_RELEASE_API_URL" GH_TOKEN="$TOKEN" \

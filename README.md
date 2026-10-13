@@ -48,32 +48,46 @@ See [docs/install.md](docs/install.md) for requirements and details.
 
 ### Install (administrator)
 
-On x86_64 Linux with systemd and glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+), the
-installer downloads the latest release, checks it, and installs puzuz into /usr/local/bin. The
-repository is private, so the download needs a GitHub token that can read it. With the GitHub CLI
-logged in (`gh auth login`), that is all:
+On x86_64 or aarch64 Linux with systemd and glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+,
+RHEL 9+), the installer downloads the latest release, checks it, and installs puzuz into
+/usr/local/bin:
 
 ```sh
-gh release download -R kaito4681/puzuz -p install.sh -O - | sudo bash
-```
-
-Without `gh`, use a token (a fine-grained personal access token with read-only "Contents" access
-to this repository):
-
-```sh
-curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-  -H "Accept: application/vnd.github.raw" \
-  https://api.github.com/repos/kaito4681/puzuz/contents/scripts/install.sh \
-  | sudo GH_TOKEN="$GH_TOKEN" bash
+curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
 ```
 
 The installer sets up the systemd units, the `puzuz` user, the `puzuz-admin` group, the
 directories and a default /etc/puzuz/config.toml, starts the services and prints the
 `puzuz doctor` report. It does not install CRIU or cuda-checkpoint; it tells you if they are
-missing. Update later with `sudo puzuz update` (running jobs keep running; pass `--save-token`
-to the installer once, or `GH_TOKEN` each time). Remove it with `sudo puzuz uninstall`, which
-keeps the data (`--purge` deletes it too). Other ways to install (apt, rpm, AUR) are coming later; until then you can
-also build from source (see [docs/install.md](docs/install.md)).
+missing. Update later with `sudo puzuz update` (running jobs keep running). Remove it with
+`sudo puzuz uninstall`, which keeps the data (`--purge` deletes it too). A GitHub token is not needed (`GH_TOKEN` is used when set; it only raises
+the API rate limit).
+
+On Debian and Ubuntu (amd64 or arm64) you can install the package from the release instead:
+
+```sh
+sudo apt install ./puzuz_<version>_amd64.deb     # or _arm64.deb
+```
+
+It installs and starts the same services and recommends `criu`. It also registers the puzuz APT
+repository (in the GitHub release `apt`), so you install the `.deb` by hand only once: later
+versions come with `sudo apt update && sudo apt upgrade`. `sudo apt remove puzuz` stops the
+services; `sudo apt purge puzuz` also deletes /etc/puzuz. Both keep /var/lib/puzuz and running
+jobs.
+
+On Fedora, RHEL, Rocky and Alma Linux 9+ (x86_64 or aarch64), install the .rpm from the release
+(a file or its URL):
+
+```sh
+sudo dnf install ./puzuz-<version>-1.x86_64.rpm   # or -1.aarch64.rpm, or the release URL
+```
+
+There is no dnf repository yet (planned, issue #23): update by installing the newer release's
+.rpm with `sudo dnf upgrade <its URL>`. `sudo dnf remove puzuz` stops the services and keeps
+/var/lib/puzuz and running jobs. It recommends `criu`; Fedora's is new enough, Rocky/RHEL 9 ship
+only 3.19, so checkpointing there needs a newer CRIU (jobs run without it). An AUR package is
+coming later; you can also build from source or use the Nix flake (see
+[docs/install.md](docs/install.md)).
 
 With Nix (x86_64 or aarch64), build the flake and install the service from the result (it is
 copied to /usr/local/bin and kept from Nix's garbage collection; see
@@ -263,10 +277,11 @@ columns, and `Checkpointed` jobs show the image size.
 
 ## Requirements
 
-- Linux with systemd 240 or newer (tested: 259). Only x86_64 has been tested. The prebuilt
-  binaries need glibc 2.34 or newer.
+- Linux with systemd 240 or newer (tested: 259). Releases are built for x86_64 and aarch64; only
+  x86_64 has been tested on real hardware. The prebuilt binaries need glibc 2.34 or newer.
 - A kernel with `CONFIG_CHECKPOINT_RESTORE`, 5.5 or newer recommended (tested: 7.0).
-- CRIU 4.2 or newer. The distribution package works.
+- CRIU 4.2 or newer. The distribution package works where it is new enough (Ubuntu 26.04, Fedora,
+  Arch); on older releases build it from source (see [docs/install.md](docs/install.md#criu)).
 - For GPU jobs: an NVIDIA driver whose `cuda-checkpoint` supports `--action lock/checkpoint/
   restore/unlock` (r570 or newer; tested: 595), the `cuda-checkpoint` binary, and `nvidia-smi`.
 
@@ -350,6 +365,11 @@ Not tested yet:
   `nvidia-persistenced`.
 - Installing with `install.sh` from the real GitHub releases (tested against a fake release
   server, `scripts/dist-test.sh`, on Ubuntu 22.04/24.04/26.04 and Debian 12 containers).
+- The `.deb` under a running systemd (its install, reinstall, remove and purge are tested in
+  plain Debian 12 and Ubuntu containers without systemd, `scripts/deb-test.sh`, and so is an
+  upgrade through a local copy of the APT repository, `scripts/apt-repo-test.sh`), the same for the
+  `.rpm` (install, upgrade and remove are tested in plain Rocky Linux 9 and Fedora containers,
+  `scripts/rpm-test.sh`), the APT repository in the real `apt` release, and arm64 on real hardware.
 - Kernel NFS and autofs indirect maps (FUSE network filesystems and `x-systemd.automount` are
   tested).
 - Multi-GPU and NCCL jobs, and GPU models other than the one used for testing.
