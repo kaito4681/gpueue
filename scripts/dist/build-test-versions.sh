@@ -20,10 +20,12 @@ shift
 [ "$#" -gt 0 ] || { echo "usage: $0 OUT SUFFIX..." >&2; exit 2; }
 image="${PUZUZ_TEST_IMAGE:-puzuz-test:1.98.1}"
 profile="${PUZUZ_DIST_PROFILE:-dev}"
+# shellcheck source=scripts/dist/lib.sh
+. "$root/scripts/dist/lib.sh"
 # The release target of this machine (x86_64 or aarch64), as install.sh picks it.
-target="$(uname -m)-unknown-linux-gnu"
-base="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$root/Cargo.toml")"
-[ -n "$base" ] || { echo "cannot read the workspace version" >&2; exit 1; }
+dist_arch
+target="$DIST_TARGET"
+base="$(workspace_version "$root")"
 
 # The toolchain image (built on first use) and the shared cargo cache.
 "$root/scripts/test-in-docker.sh" --version >/dev/null

@@ -19,13 +19,11 @@ out="${2:?usage: $0 BIN_DIR OUT_DIR [FORMAT]}"
 format="${3:-deb}"
 [ "$format" = deb ] || { echo "unsupported package format: $format" >&2; exit 2; }
 
-case "$(uname -m)" in
-x86_64) arch=amd64 ;;
-aarch64 | arm64) arch=arm64 ;;
-*) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-esac
-version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$root/Cargo.toml")"
-[ -n "$version" ] || { echo "cannot read the workspace version" >&2; exit 1; }
+# shellcheck source=scripts/dist/lib.sh
+. "$root/scripts/dist/lib.sh"
+dist_arch
+arch="$DIST_DEB_ARCH"
+version="$(workspace_version "$root")"
 
 if command -v nfpm >/dev/null 2>&1; then
     nfpm="$(command -v nfpm)"

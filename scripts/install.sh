@@ -145,6 +145,8 @@ check_systemd() {
     [ -d /run/systemd/system ] || die "systemd is not the init system (PID 1); puzuz runs as systemd services"
 }
 
+# Same mapping as dist_arch in scripts/dist/lib.sh (this script is downloaded
+# alone, so it keeps its own copy).
 check_arch() {
     local arch
     arch="$(uname -m)"

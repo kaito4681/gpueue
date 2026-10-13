@@ -7,19 +7,19 @@
 # Usage: scripts/dist/get-nfpm.sh DIR
 set -euo pipefail
 
+# shellcheck source=scripts/dist/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 version=2.47.0
-case "$(uname -m)" in
-x86_64)
+dist_arch
+case "$DIST_DEB_ARCH" in
+amd64)
     asset="nfpm_${version}_Linux_x86_64.tar.gz"
     sha256=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
     ;;
-aarch64 | arm64)
+arm64)
     asset="nfpm_${version}_Linux_arm64.tar.gz"
     sha256=1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c
-    ;;
-*)
-    echo "no pinned nfpm for $(uname -m)" >&2
-    exit 1
     ;;
 esac
 url="https://github.com/goreleaser/nfpm/releases/download/v$version/$asset"
