@@ -63,14 +63,15 @@ step "install without root fails"
 out="$(runuser -u alice -- /build/puzuz service install 2>&1)" && fail "non-root install succeeded"
 grep -q "must run as root" <<<"$out" || fail "$out"
 
-step "install from a non-system directory needs --bin-dir"
-out="$(/build/puzuz service install 2>&1)" && fail "install without --bin-dir succeeded"
-grep -q -- "--bin-dir /usr/local/bin" <<<"$out" || fail "$out"
-
-step "install --bin-dir /usr/local/bin"
-/build/puzuz service install --bin-dir /usr/local/bin | tee /tmp/install.out || true
+step "install from a non-system directory copies the binaries to /usr/local/bin"
+/build/puzuz service install | tee /tmp/install.out || true
+grep -q "installing into /usr/local/bin" /tmp/install.out || fail "no note about /usr/local/bin"
 cmp /build/puzuz /usr/local/bin/puzuz
 cmp /build/puzuz-helper /usr/local/bin/puzuz-helper
+grep -q '^ExecStart=/usr/local/bin/puzuz daemon' /etc/systemd/system/puzuz.service || fail "unit does not run /usr/local/bin/puzuz"
+[ "$(stat -c '%U %a' /var/lib/puzuz/install-receipt)" = "root 644" ] || fail "receipt not root 0644"
+grep -qx 'copied = \["/usr/local/bin/puzuz", "/usr/local/bin/puzuz-helper"\]' /var/lib/puzuz/install-receipt ||
+    fail "receipt: $(cat /var/lib/puzuz/install-receipt)"
 systemctl is-active puzuz-helper.service puzuz.service
 systemctl is-enabled puzuz-helper.service puzuz.service
 getent passwd puzuz >/dev/null || fail "no puzuz user"
@@ -103,6 +104,8 @@ echo "grace_secs = 7" >> /etc/puzuz/config.toml
 grep -q "unchanged /etc/systemd/system/puzuz.service" /tmp/install2.out || fail "units rewritten"
 grep -q "kept the existing /etc/puzuz/config.toml" /tmp/install2.out || fail "config not kept"
 grep -q "grace_secs = 7" /etc/puzuz/config.toml || fail "config overwritten"
+grep -q "installing into" /tmp/install2.out && fail "a re-run chose a directory again"
+grep -q 'puzuz-helper"\]$' /var/lib/puzuz/install-receipt || fail "a re-run forgot the copies"
 systemctl is-active puzuz.service
 [ "$(puzuz service install-method)" = service-install ] || fail "install method not detected"
 
@@ -114,39 +117,49 @@ out="$(puzuz doctor 2>&1)" && fail "doctor passed a mixed setup"
 grep -q "FAIL  install method: mixed: distribution package (puzuz, dpkg" <<<"$out" || fail "$out"
 out="$(/usr/local/bin/puzuz service install --force 2>&1)" && fail "install --force over a package succeeded"
 grep -q "distribution package" <<<"$out" || fail "$out"
-out="$(/usr/local/bin/puzuz service uninstall --purge --yes 2>&1)" && fail "purge of a mixed setup succeeded"
+out="$(/usr/local/bin/puzuz uninstall --purge --yes 2>&1)" && fail "purge of a mixed setup succeeded"
 grep -q "refusing to purge" <<<"$out" || fail "$out"
 cmp /etc/systemd/system/puzuz.service /tmp/puzuz.service.etc || fail "installed unit changed"
 dpkg -r puzuz >/dev/null
 [ "$(puzuz service install-method)" = service-install ] || fail "conflict not resolved"
 
-step "uninstall keeps data"
-/usr/local/bin/puzuz service uninstall
+step "puzuz uninstall keeps data and removes the copied binaries"
+/usr/local/bin/puzuz uninstall | tee /tmp/uninstall.out
 test ! -e /etc/systemd/system/puzuz.service || fail "unit left behind"
 systemctl is-active puzuz.service && fail "daemon still active"
 test -f /var/lib/puzuz/daemon/state.sqlite || fail "state removed without --purge"
+test ! -e /usr/local/bin/puzuz || fail "copied puzuz left behind"
+test ! -e /usr/local/bin/puzuz-helper || fail "copied puzuz-helper left behind"
+test ! -e /var/lib/puzuz/install-receipt || fail "receipt left behind"
+test -x /build/puzuz || fail "the source binary was removed"
 
-step "uninstall --purge"
-echo n | /usr/local/bin/puzuz service uninstall --purge && fail "purge without confirmation"
+step "uninstall --purge (also as service uninstall)"
+/build/puzuz service install >/dev/null || true
+echo n | /usr/local/bin/puzuz uninstall --purge && fail "purge without confirmation"
 test -d /var/lib/puzuz || fail "purged although declined"
 /usr/local/bin/puzuz service uninstall --purge --yes
 test ! -e /var/lib/puzuz || fail "/var/lib/puzuz left"
 test ! -e /etc/puzuz || fail "/etc/puzuz left"
+test ! -e /usr/local/bin/puzuz || fail "copied puzuz left after service uninstall --purge"
 
-step "install from /usr/local/bin needs no --bin-dir"
+step "binaries already in /usr/local/bin are used in place and kept by uninstall"
+install -m 0755 /build/puzuz /build/puzuz-helper /usr/local/bin/
 /usr/local/bin/puzuz service install --no-start > /tmp/install3.out || true
+grep -q "installing into" /tmp/install3.out && fail "in-place install chose a directory"
+grep -qx 'copied = \[\]' /var/lib/puzuz/install-receipt || fail "receipt: $(cat /var/lib/puzuz/install-receipt)"
 systemctl is-enabled puzuz.service
 systemctl is-active puzuz.service && fail "--no-start started the daemon"
 
 step "a package-managed machine is refused"
-/usr/local/bin/puzuz service uninstall
+/usr/local/bin/puzuz uninstall
+test -x /usr/local/bin/puzuz || fail "uninstall removed a binary it did not copy"
 dpkg -i /tmp/puzuz.deb >/dev/null
 [ "$(puzuz service install-method)" = package ] || fail "package not detected"
 out="$(/usr/local/bin/puzuz service install --force 2>&1)" && fail "install over a package succeeded"
 grep -q "distribution package (puzuz, dpkg" <<<"$out" || fail "$out"
 grep -q "sudo apt update && sudo apt upgrade" <<<"$out" || fail "$out"
 test ! -e /etc/systemd/system/puzuz.service || fail "install wrote a unit"
-out="$(/usr/local/bin/puzuz service uninstall 2>&1)" && fail "uninstall of a package succeeded"
+out="$(/usr/local/bin/puzuz uninstall 2>&1)" && fail "uninstall of a package succeeded"
 grep -q "not by \`puzuz service install\`" <<<"$out" || fail "$out"
 grep -q "sudo apt remove puzuz" <<<"$out" || fail "$out"
 dpkg -r puzuz >/dev/null

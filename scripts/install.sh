@@ -31,13 +31,14 @@ Usage:
 Options:
   --version X        install version X (default: the latest release); re-running
                      with a newer version updates puzuz, running jobs keep running
-  --bin-dir DIR      where to put puzuz and puzuz-helper (default: the directory
-                     of the current installation, else $DEFAULT_BIN_DIR)
+  --bin-dir DIR      install somewhere else than the default (the current
+                     installation's directory, else $DEFAULT_BIN_DIR)
   --token-file FILE  read the GitHub token from FILE
   --save-token       save the token to $TOKEN_FILE_SAVED (root, 0600) for
                      \`puzuz update\`
-  --uninstall        stop and remove the services and the binaries; keeps
-                     /etc/puzuz and /var/lib/puzuz (state, logs, checkpoints)
+  --uninstall        stop and remove the services and the binaries (runs
+                     \`puzuz uninstall\`); keeps /etc/puzuz and /var/lib/puzuz
+                     (state, logs, checkpoints)
   --purge            with --uninstall: also delete /etc/puzuz and /var/lib/puzuz
   -y, --yes          do not ask before purging
   -h, --help         show this help
@@ -60,8 +61,7 @@ die() {
 
 parse_args() {
     VERSION=""
-    BIN_DIR="$DEFAULT_BIN_DIR"
-    BIN_DIR_GIVEN=0
+    BIN_DIR=""
     UNINSTALL=0
     PURGE=0
     YES=0
@@ -82,12 +82,10 @@ parse_args() {
         --bin-dir)
             [ "$#" -ge 2 ] || die "--bin-dir needs a value"
             BIN_DIR="$2"
-            BIN_DIR_GIVEN=1
             shift 2
             ;;
         --bin-dir=*)
             BIN_DIR="${1#--bin-dir=}"
-            BIN_DIR_GIVEN=1
             shift
             ;;
         --token-file)
@@ -123,7 +121,7 @@ parse_args() {
         esac
     done
     case "$BIN_DIR" in
-    /*) ;;
+    "" | /*) ;;
     *) die "--bin-dir must be an absolute path" ;;
     esac
     if [ "$PURGE" = 1 ] && [ "$UNINSTALL" = 0 ]; then
@@ -559,7 +557,6 @@ do_install() {
     method="$(installed_method)"
     if [ -z "$method" ]; then
         check_obvious_conflicts
-        # A `service install` whose binary cannot answer: keep its bin dir.
         if marker_unit_installed; then
             method=service-install
         else
@@ -567,12 +564,6 @@ do_install() {
         fi
     fi
     check_install_method "$method"
-    # An update stays where the current installation is, unless --bin-dir says otherwise.
-    if [ "$BIN_DIR_GIVEN" = 0 ] && [ "$method" = service-install ]; then
-        local current
-        current="$(installed_bin_dir)"
-        [ -z "$current" ] || BIN_DIR="$current"
-    fi
 
     local token
     token="$(resolve_token)"
@@ -597,10 +588,15 @@ do_install() {
 
     [ "$SAVE_TOKEN" = 1 ] && save_token "$token"
 
-    local status=0
-    "$new" service install --bin-dir "$BIN_DIR" || status=$?
+    # `service install` chooses the directory (the current installation's, else
+    # /usr/local/bin) unless --bin-dir was given.
+    local args=(service install) status=0 bin_dir
+    [ -z "$BIN_DIR" ] || args+=(--bin-dir "$BIN_DIR")
+    "$new" "${args[@]}" || status=$?
+    bin_dir="$(installed_bin_dir)"
+    [ -n "$bin_dir" ] || bin_dir="${BIN_DIR:-$DEFAULT_BIN_DIR}"
     if [ "$status" -ne 0 ]; then
-        if "$BIN_DIR/puzuz" service status >/dev/null 2>&1; then
+        if "$bin_dir/puzuz" service status >/dev/null 2>&1; then
             warn "puzuz $version is installed and running, but some checks above failed; fix them and re-run \`puzuz doctor\`"
         else
             print_missing_deps
@@ -609,13 +605,13 @@ do_install() {
     fi
     print_missing_deps
     info ""
-    info "puzuz $version is installed in $BIN_DIR."
+    info "puzuz $version is installed in $bin_dir."
 }
 
 # --- uninstall -------------------------------------------------------------
 
 do_uninstall() {
-    local method puzuz bin_dir=""
+    local method puzuz bin_dir
     method="$(installed_method)"
     if [ -z "$method" ] && marker_unit_installed; then
         method=service-install
@@ -626,11 +622,16 @@ do_uninstall() {
     *) check_install_method "$method" ;;
     esac
     bin_dir="$(installed_bin_dir)"
-    [ -n "$bin_dir" ] || bin_dir="$BIN_DIR"
+    [ -n "$bin_dir" ] || bin_dir="${BIN_DIR:-$DEFAULT_BIN_DIR}"
     puzuz="$bin_dir/puzuz"
     [ -x "$puzuz" ] || die "$puzuz not found"
-
-    local args=(service uninstall)
+    # `puzuz uninstall` also removes the binaries `service install` copied. A
+    # puzuz from before it has only `service uninstall`, which keeps them.
+    local args=(uninstall) legacy=0
+    if ! "$puzuz" uninstall --help >/dev/null 2>&1; then
+        legacy=1
+        args=(service uninstall)
+    fi
     if [ "$PURGE" = 1 ]; then
         args+=(--purge)
         if [ "$YES" = 1 ]; then
@@ -645,13 +646,16 @@ do_uninstall() {
     else
         "$puzuz" "${args[@]}" </dev/null
     fi
-    local file
-    for file in "$bin_dir/puzuz" "$bin_dir/puzuz-helper"; do
-        if [ -e "$file" ]; then
-            rm -f "$file"
-            info "removed $file"
-        fi
-    done
+    if [ "$legacy" = 1 ]; then
+        # What install.sh installed before the receipt existed.
+        local file
+        for file in "$bin_dir/puzuz" "$bin_dir/puzuz-helper"; do
+            if [ -e "$file" ]; then
+                rm -f "$file"
+                info "removed $file"
+            fi
+        done
+    fi
 }
 
 main() {

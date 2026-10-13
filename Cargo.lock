@@ -1212,6 +1212,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "toml",
  "ureq",
 ]
 

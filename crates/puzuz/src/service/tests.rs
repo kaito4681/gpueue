@@ -51,7 +51,7 @@ fn install_and_uninstall_require_root() {
     assert!(err.contains("must run as root"), "{err}");
     assert!(err.contains("sudo puzuz service install"), "{err}");
     let err = run_uninstall(&sys, false, false).unwrap_err();
-    assert!(err.contains("sudo puzuz service uninstall"), "{err}");
+    assert!(err.contains("sudo puzuz uninstall"), "{err}");
     assert!(sys.commands().is_empty());
     assert!(!sys.exists("/etc/systemd/system/puzuz.service"));
 }
@@ -167,15 +167,363 @@ fn install_waits_for_the_daemon() {
     assert!(out.contains("OK    helper: connected"), "{out}");
 }
 
+/// No dpkg, rpm or pacman: no package owns anything.
+fn no_package_managers(sys: &FakeSystem) {
+    for program in ["dpkg-query", "rpm", "pacman"] {
+        sys.missing(program);
+    }
+}
+
+/// A minimal 64-bit little-endian ELF file whose program interpreter is `interp`.
+fn elf(interp: &str) -> Vec<u8> {
+    let mut bytes = vec![0u8; 64 + 56];
+    bytes[..4].copy_from_slice(b"\x7fELF");
+    bytes[4] = 2; // 64-bit
+    bytes[5] = 1; // little-endian
+    bytes[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    bytes[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    bytes[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+    let ph = 64;
+    bytes[ph..ph + 4].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+    let offset = bytes.len() as u64;
+    let size = interp.len() as u64 + 1;
+    bytes[ph + 8..ph + 16].copy_from_slice(&offset.to_le_bytes());
+    bytes[ph + 32..ph + 40].copy_from_slice(&size.to_le_bytes());
+    bytes.extend_from_slice(interp.as_bytes());
+    bytes.push(0);
+    bytes
+}
+
+const NIX_LOADER: &str = "/nix/store/xyz-glibc-2.40/lib/ld-linux-x86-64.so.2";
+
+fn write_bytes(sys: &FakeSystem, path: &str, bytes: &[u8]) {
+    let local = sys.path(Path::new(path));
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::fs::write(&local, bytes).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn read_bytes(sys: &FakeSystem, path: &str) -> Vec<u8> {
+    std::fs::read(sys.path(Path::new(path))).unwrap()
+}
+
+/// A root-run system with both binaries in a build directory.
+fn build_dir_system() -> FakeSystem {
+    let mut sys = FakeSystem::new();
+    no_package_managers(&sys);
+    sys.exe = PathBuf::from("/home/u/target/release/puzuz");
+    sys.write_exe("/home/u/target/release/puzuz", "new puzuz");
+    sys.write_exe("/home/u/target/release/puzuz-helper", "new helper");
+    sys
+}
+
+fn receipt(sys: &FakeSystem) -> Receipt {
+    toml::from_str(&sys.read(RECEIPT_PATH).expect("no receipt")).unwrap()
+}
+
+fn paths(list: &[&str]) -> Vec<PathBuf> {
+    list.iter().map(PathBuf::from).collect()
+}
+
 #[test]
-fn binaries_outside_system_dirs_need_bin_dir() {
-    let mut sys = system();
-    sys.exe = PathBuf::from("/home/u/.cargo/bin/puzuz");
-    sys.write_exe("/home/u/.cargo/bin/puzuz", "new puzuz");
-    sys.write_exe("/home/u/.cargo/bin/puzuz-helper", "new helper");
-    let err = run_install(&sys, &opts()).unwrap_err();
-    assert!(err.contains("--bin-dir /usr/local/bin"), "{err}");
-    assert!(!sys.exists("/etc/systemd/system/puzuz.service"));
+fn binaries_outside_system_dirs_are_copied_to_usr_local_bin() {
+    let sys = build_dir_system();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(
+        out.contains("installing into /usr/local/bin (use --bin-dir to choose another directory)"),
+        "{out}"
+    );
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "new puzuz");
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "new helper"
+    );
+    let unit = sys.read("/etc/systemd/system/puzuz.service").unwrap();
+    assert!(unit.contains("\nExecStart=/usr/local/bin/puzuz daemon\n"));
+    assert_eq!(
+        receipt(&sys),
+        Receipt {
+            version: puzuz_protocol::BINARY_VERSION.to_owned(),
+            bin_dir: PathBuf::from("/usr/local/bin"),
+            copied: paths(&["/usr/local/bin/puzuz", "/usr/local/bin/puzuz-helper"]),
+            ..Receipt::default()
+        }
+    );
+    assert_eq!(mode(&sys, RECEIPT_PATH), 0o644);
+
+    // Re-running the installed copy uses it in place and keeps it recorded as copied.
+    let mut sys = sys;
+    sys.exe = PathBuf::from("/usr/local/bin/puzuz");
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(!out.contains("installing into"), "{out}");
+    assert_eq!(
+        receipt(&sys).copied,
+        paths(&["/usr/local/bin/puzuz", "/usr/local/bin/puzuz-helper"])
+    );
+}
+
+#[test]
+fn binaries_in_a_system_dir_are_used_in_place() {
+    let sys = system();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(!out.contains("installing into"), "{out}");
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    let unit = sys.read("/etc/systemd/system/puzuz.service").unwrap();
+    assert!(unit.contains("\nExecStart=/usr/bin/puzuz daemon\n"));
+    let receipt = receipt(&sys);
+    assert_eq!(receipt.bin_dir, PathBuf::from("/usr/bin"));
+    assert!(receipt.copied.is_empty());
+}
+
+#[test]
+fn a_reinstall_stays_in_the_installed_directory() {
+    let mut sys = build_dir_system();
+    sys.mkdir("/opt/tools/bin");
+    let options = InstallOptions {
+        bin_dir: Some(PathBuf::from("/opt/tools/bin")),
+        ..opts()
+    };
+    run_install(&sys, &options).unwrap();
+    sys.write_exe("/home/u/target/release/puzuz", "newer puzuz");
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(!out.contains("installing into"), "{out}");
+    assert_eq!(sys.read("/opt/tools/bin/puzuz").unwrap(), "newer puzuz");
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    let unit = sys.read("/etc/systemd/system/puzuz.service").unwrap();
+    assert!(unit.contains("\nExecStart=/opt/tools/bin/puzuz daemon\n"));
+
+    // Even a binary in /usr/bin installs there (copied), not in place.
+    sys.exe = PathBuf::from("/usr/bin/puzuz");
+    sys.write_exe("/usr/bin/puzuz", "other puzuz");
+    sys.write_exe("/usr/bin/puzuz-helper", "other helper");
+    run_install(&sys, &opts()).unwrap();
+    assert_eq!(sys.read("/opt/tools/bin/puzuz").unwrap(), "other puzuz");
+}
+
+#[test]
+fn moving_the_installation_removes_the_previous_copies() {
+    let sys = build_dir_system();
+    run_install(&sys, &opts()).unwrap();
+    sys.mkdir("/opt/tools/bin");
+    let options = InstallOptions {
+        bin_dir: Some(PathBuf::from("/opt/tools/bin")),
+        ..opts()
+    };
+    let out = run_install(&sys, &options).unwrap();
+    assert!(
+        out.contains("removed /usr/local/bin/puzuz-helper (copied by the previous install)"),
+        "{out}"
+    );
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    assert_eq!(
+        receipt(&sys).copied,
+        paths(&["/opt/tools/bin/puzuz", "/opt/tools/bin/puzuz-helper"])
+    );
+
+    // An in-place installation's binaries were never copied and are never removed.
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.mkdir("/opt/tools/bin");
+    run_install(&sys, &options).unwrap();
+    assert!(sys.exists("/usr/bin/puzuz"));
+    assert!(sys.exists("/usr/bin/puzuz-helper"));
+}
+
+#[test]
+fn an_invalid_receipt_stops_the_install() {
+    let sys = build_dir_system();
+    let untrusted =
+        "version = \"0.0.1\"\nbin_dir = \"/usr/sbin\"\ncopied = [\"/usr/sbin/puzuz\"]\n";
+    sys.write(RECEIPT_PATH, untrusted);
+    std::fs::set_permissions(
+        sys.path(Path::new(RECEIPT_PATH)),
+        std::fs::Permissions::from_mode(0o666),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let err = install(&sys, &opts(), &mut out).unwrap_err();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("writable by others, so it cannot be trusted"),
+        "{out}"
+    );
+    assert!(
+        err.contains("refusing to replace /var/lib/puzuz/install-receipt"),
+        "{err}"
+    );
+    assert!(
+        err.contains("sudo rm /var/lib/puzuz/install-receipt"),
+        "{err}"
+    );
+    assert_eq!(sys.read(RECEIPT_PATH).unwrap(), untrusted);
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+
+    // Unparseable: the same.
+    sys.write(RECEIPT_PATH, "copied = [\n");
+    std::fs::set_permissions(
+        sys.path(Path::new(RECEIPT_PATH)),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    install(&sys, &opts(), &mut out).unwrap_err();
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains("is not a valid receipt"),
+        "parse error not reported"
+    );
+}
+
+#[test]
+fn unknown_receipt_keys_are_ignored() {
+    let sys = build_dir_system();
+    sys.write(
+        RECEIPT_PATH,
+        "version = \"9.0.0\"\nbin_dir = \"/usr/local/bin\"\ncopied = []\nsomething_new = 1\n",
+    );
+    run_install(&sys, &opts()).unwrap();
+    assert_eq!(receipt(&sys).bin_dir, PathBuf::from("/usr/local/bin"));
+}
+
+#[test]
+fn receipt_lists_only_binaries_in_its_directory_as_removable() {
+    let receipt = Receipt {
+        version: "0.1.0".to_owned(),
+        bin_dir: PathBuf::from("/usr/local/bin"),
+        copied: paths(&[
+            "/usr/local/bin/puzuz",
+            "/usr/local/bin/../sbin/puzuz",
+            "/etc/passwd",
+            "/usr/local/bin/puzuz-helper",
+        ]),
+        gc_root: Some(PathBuf::from(GC_ROOT)),
+        gc_root_target: Some(PathBuf::from("/nix/store/abc-puzuz-0.1.0")),
+    };
+    assert_eq!(
+        receipt.removable_copies(),
+        paths(&["/usr/local/bin/puzuz", "/usr/local/bin/puzuz-helper"])
+    );
+    let parsed: Receipt = toml::from_str(&receipt.to_toml()).unwrap();
+    assert_eq!(parsed, receipt);
+}
+
+const STORE_PATH: &str = "/nix/store/abc-puzuz-0.1.0";
+
+/// A root-run system running puzuz from the Nix store through `./result` (as after
+/// `nix build`).
+fn nix_build_system() -> FakeSystem {
+    let mut sys = FakeSystem::new();
+    no_package_managers(&sys);
+    write_bytes(&sys, &format!("{STORE_PATH}/bin/puzuz"), &elf(NIX_LOADER));
+    write_bytes(
+        &sys,
+        &format!("{STORE_PATH}/bin/puzuz-helper"),
+        &elf(NIX_LOADER),
+    );
+    sys.mkdir("/home/u");
+    std::os::unix::fs::symlink(
+        sys.path(Path::new(STORE_PATH)),
+        sys.path(Path::new("/home/u/result")),
+    )
+    .unwrap();
+    sys.exe = PathBuf::from("/home/u/result/bin/puzuz");
+    sys
+}
+
+#[test]
+fn binaries_from_the_nix_store_are_copied_and_kept_by_a_gc_root() {
+    let sys = nix_build_system();
+    sys.write_exe("/nix/var/nix/profiles/default/bin/nix-store", "");
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(out.contains("installing into /usr/local/bin"), "{out}");
+    assert_eq!(read_bytes(&sys, "/usr/local/bin/puzuz"), elf(NIX_LOADER));
+    assert!(
+        sys.ran(&format!(
+            "nix-store --add-root /nix/var/nix/gcroots/puzuz --realise {STORE_PATH}"
+        )),
+        "{:?}",
+        sys.commands()
+    );
+    assert!(
+        out.contains(&format!(
+            "registered the Nix GC root /nix/var/nix/gcroots/puzuz for {STORE_PATH}"
+        )),
+        "{out}"
+    );
+    let receipt = receipt(&sys);
+    assert_eq!(receipt.gc_root, Some(PathBuf::from(GC_ROOT)));
+    assert_eq!(receipt.gc_root_target, Some(PathBuf::from(STORE_PATH)));
+    assert!(
+        sys.read(RECEIPT_PATH)
+            .unwrap()
+            .contains(&format!("gc_root_target = \"{STORE_PATH}\"\n"))
+    );
+}
+
+#[test]
+fn without_nix_store_the_gc_root_is_only_a_warning() {
+    let sys = nix_build_system();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(out.contains("warning: nix-store not found"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "sudo nix-store --add-root /nix/var/nix/gcroots/puzuz --realise {STORE_PATH}"
+        )),
+        "{out}"
+    );
+    assert_eq!(read_bytes(&sys, "/usr/local/bin/puzuz"), elf(NIX_LOADER));
+    assert_eq!(receipt(&sys).gc_root, None);
+
+    // A failing nix-store, too.
+    let sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    sys.respond("nix-store", CmdOutput::failed("", "permission denied"));
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(out.contains("warning: `"), "{out}");
+    assert!(out.contains("permission denied"), "{out}");
+    assert_eq!(receipt(&sys).gc_root, None);
+}
+
+/// Pretends `nix-store --add-root` ran: the GC root symlink exists.
+fn make_gc_root(sys: &FakeSystem) {
+    sys.mkdir("/nix/var/nix/gcroots");
+    let root = sys.path(Path::new(GC_ROOT));
+    let _ = std::fs::remove_file(&root);
+    std::os::unix::fs::symlink(STORE_PATH, root).unwrap();
+}
+
+#[test]
+fn the_gc_root_goes_once_the_binaries_no_longer_come_from_the_store() {
+    let mut sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    run_install(&sys, &opts()).unwrap();
+    make_gc_root(&sys);
+
+    // Re-running the installed copy changes nothing: the copies still need the store.
+    sys.exe = PathBuf::from("/usr/local/bin/puzuz");
+    sys.log.borrow_mut().clear();
+    run_install(&sys, &opts()).unwrap();
+    assert!(!sys.ran("nix-store"));
+    assert!(sys.exists(GC_ROOT));
+    assert_eq!(receipt(&sys).gc_root, Some(PathBuf::from(GC_ROOT)));
+    assert_eq!(
+        receipt(&sys).gc_root_target,
+        Some(PathBuf::from(STORE_PATH))
+    );
+
+    // Binaries from elsewhere replace them; the store path is no longer needed.
+    sys.exe = PathBuf::from("/home/u/target/release/puzuz");
+    sys.write_exe("/home/u/target/release/puzuz", "new puzuz");
+    sys.write_exe("/home/u/target/release/puzuz-helper", "new helper");
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(
+        out.contains("removed the Nix GC root /nix/var/nix/gcroots/puzuz"),
+        "{out}"
+    );
+    assert!(!sys.exists(GC_ROOT));
+    assert_eq!(receipt(&sys).gc_root, None);
+    assert_eq!(receipt(&sys).gc_root_target, None);
 }
 
 #[test]
@@ -321,12 +669,235 @@ fn uninstall_removes_units_but_keeps_data() {
     assert!(sys.exists("/etc/puzuz/config.toml"));
     assert!(sys.exists("/var/lib/puzuz/daemon"));
     assert!(sys.exists("/usr/bin/puzuz-helper"));
-    assert!(out.contains("--purge"), "{out}");
+    assert!(
+        out.contains("kept /usr/bin/puzuz and /usr/bin/puzuz-helper (used in place"),
+        "{out}"
+    );
+    assert!(!sys.exists(RECEIPT_PATH));
+    assert!(out.contains("sudo puzuz uninstall --purge"), "{out}");
 
     // Again: nothing left to do.
     sys.log.borrow_mut().clear();
     run_uninstall(&sys, false, false).unwrap();
     assert!(!sys.ran("systemctl disable"));
+}
+
+#[test]
+fn uninstall_removes_the_copied_binaries() {
+    let sys = build_dir_system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write_exe("/usr/local/bin/other-tool", "");
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(out.contains("removed /usr/local/bin/puzuz\n"), "{out}");
+    assert!(
+        out.contains("removed /usr/local/bin/puzuz-helper\n"),
+        "{out}"
+    );
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    assert!(!sys.exists("/usr/local/bin/puzuz-helper"));
+    assert!(sys.exists("/usr/local/bin/other-tool"));
+    assert!(sys.exists("/home/u/target/release/puzuz"));
+    assert!(!sys.exists(RECEIPT_PATH));
+    assert!(sys.exists("/etc/puzuz/config.toml"));
+
+    // With --purge, too.
+    run_install(&sys, &opts()).unwrap();
+    run_uninstall(&sys, true, true).unwrap();
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    assert!(!sys.exists("/var/lib/puzuz"));
+}
+
+#[test]
+fn uninstall_removes_only_puzuz_binaries_listed_in_the_receipt() {
+    let sys = build_dir_system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write("/etc/important", "keep me");
+    let receipt = Receipt {
+        version: "0.1.0".to_owned(),
+        bin_dir: PathBuf::from("/usr/local/bin"),
+        copied: paths(&["/usr/local/bin/puzuz", "/etc/important"]),
+        ..Receipt::default()
+    };
+    sys.write(RECEIPT_PATH, &receipt.to_toml());
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(
+        out.contains("warning: ignoring /etc/important in /var/lib/puzuz/install-receipt"),
+        "{out}"
+    );
+    assert_eq!(sys.read("/etc/important").unwrap(), "keep me");
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    // Not listed: kept.
+    assert!(sys.exists("/usr/local/bin/puzuz-helper"));
+}
+
+#[test]
+fn uninstall_without_a_receipt_keeps_the_binaries() {
+    let sys = build_dir_system();
+    run_install(&sys, &opts()).unwrap();
+    std::fs::remove_file(sys.path(Path::new(RECEIPT_PATH))).unwrap();
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(
+        out.contains("remove /usr/local/bin/puzuz /usr/local/bin/puzuz-helper by hand"),
+        "{out}"
+    );
+    assert!(sys.exists("/usr/local/bin/puzuz"));
+    assert!(sys.exists("/usr/local/bin/puzuz-helper"));
+    assert!(!sys.exists("/etc/systemd/system/puzuz.service"));
+}
+
+#[test]
+fn uninstall_removes_the_gc_root() {
+    let sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    run_install(&sys, &opts()).unwrap();
+    make_gc_root(&sys);
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(
+        out.contains("removed the Nix GC root /nix/var/nix/gcroots/puzuz"),
+        "{out}"
+    );
+    assert!(!sys.exists(GC_ROOT));
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    // The store itself is Nix's.
+    assert!(sys.exists(&format!("{STORE_PATH}/bin/puzuz")));
+}
+
+#[test]
+fn copies_of_nix_built_binaries_keep_their_gc_root() {
+    let mut sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    run_install(&sys, &opts()).unwrap();
+    make_gc_root(&sys);
+
+    // Moving the installation from the Nix-built copy: the new copies still use the store.
+    sys.exe = PathBuf::from("/usr/local/bin/puzuz");
+    sys.mkdir("/opt/puzuz/bin");
+    sys.log.borrow_mut().clear();
+    let options = InstallOptions {
+        bin_dir: Some(PathBuf::from("/opt/puzuz/bin")),
+        ..opts()
+    };
+    let out = run_install(&sys, &options).unwrap();
+    assert!(!out.contains("removed the Nix GC root"), "{out}");
+    assert!(sys.exists(GC_ROOT));
+    assert!(!sys.ran("nix-store"));
+    let receipt = receipt(&sys);
+    assert_eq!(receipt.bin_dir, PathBuf::from("/opt/puzuz/bin"));
+    assert_eq!(receipt.gc_root, Some(PathBuf::from(GC_ROOT)));
+    assert_eq!(receipt.gc_root_target, Some(PathBuf::from(STORE_PATH)));
+}
+
+#[test]
+fn nix_built_copies_without_a_recorded_root_get_a_warning() {
+    let mut sys = build_dir_system();
+    write_bytes(&sys, "/home/u/target/release/puzuz", &elf(NIX_LOADER));
+    write_bytes(
+        &sys,
+        "/home/u/target/release/puzuz-helper",
+        &elf(NIX_LOADER),
+    );
+    sys.exe = PathBuf::from("/home/u/target/release/puzuz");
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(
+        out.contains("the store path they came from is unknown"),
+        "{out}"
+    );
+    assert_eq!(receipt(&sys).gc_root, None);
+}
+
+#[test]
+fn a_failing_nix_store_keeps_the_previous_gc_root() {
+    let sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    run_install(&sys, &opts()).unwrap();
+    make_gc_root(&sys);
+
+    // A new build from another store path, but nix-store fails now.
+    let mut sys = sys;
+    let newer = "/nix/store/def-puzuz-0.2.0";
+    write_bytes(&sys, &format!("{newer}/bin/puzuz"), &elf(NIX_LOADER));
+    write_bytes(
+        &sys,
+        &format!("{newer}/bin/puzuz-helper"),
+        &[elf(NIX_LOADER), b"x".to_vec()].concat(),
+    );
+    sys.exe = PathBuf::from(format!("{newer}/bin/puzuz"));
+    sys.respond("nix-store", CmdOutput::failed("", "database is locked"));
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(out.contains("database is locked"), "{out}");
+    assert!(out.contains("kept the previous Nix GC root"), "{out}");
+    assert!(sys.exists(GC_ROOT));
+    let receipt = receipt(&sys);
+    assert_eq!(receipt.gc_root, Some(PathBuf::from(GC_ROOT)));
+    assert_eq!(receipt.gc_root_target, Some(PathBuf::from(STORE_PATH)));
+}
+
+#[test]
+fn uninstall_keeps_binaries_a_package_owns_now() {
+    let sys = build_dir_system();
+    run_install(&sys, &opts()).unwrap();
+    sys.dpkg_owns("/usr/local/bin/puzuz-helper", "puzuz");
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(
+        out.contains(
+            "kept /usr/local/bin/puzuz-helper (it belongs to the package puzuz, dpkg now)"
+        ),
+        "{out}"
+    );
+    assert!(sys.exists("/usr/local/bin/puzuz-helper"));
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    // Nothing of ours is left to record.
+    assert!(!sys.exists(RECEIPT_PATH));
+}
+
+#[test]
+fn uninstall_keeps_the_receipt_for_what_it_could_not_remove() {
+    let sys = build_dir_system();
+    run_install(&sys, &opts()).unwrap();
+    // The package manager cannot answer for one binary.
+    sys.respond(
+        "dpkg-query -S /usr/local/bin/puzuz-helper",
+        CmdOutput::exited(2, "", "dpkg: error: database is locked"),
+    );
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(
+        out.contains("kept /usr/local/bin/puzuz-helper (the package manager could not tell"),
+        "{out}"
+    );
+    assert!(
+        out.contains("kept /var/lib/puzuz/install-receipt listing them"),
+        "{out}"
+    );
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    assert_eq!(
+        receipt(&sys).copied,
+        paths(&["/usr/local/bin/puzuz-helper"])
+    );
+
+    // Once it answers, a second run finishes the job.
+    sys.missing("dpkg-query");
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(out.contains("removed /usr/local/bin/puzuz-helper"), "{out}");
+    assert!(!sys.exists(RECEIPT_PATH));
+}
+
+#[test]
+fn uninstall_with_an_invalid_receipt_keeps_the_binaries() {
+    let sys = build_dir_system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write(RECEIPT_PATH, "this is not toml = = =\n");
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(
+        out.contains("warning: /var/lib/puzuz/install-receipt is not a valid receipt"),
+        "{out}"
+    );
+    assert!(
+        out.contains("kept the binaries and any Nix GC root"),
+        "{out}"
+    );
+    assert!(sys.exists("/usr/local/bin/puzuz"));
+    assert!(sys.exists(RECEIPT_PATH));
+    assert!(!sys.exists("/etc/systemd/system/puzuz.service"));
 }
 
 #[test]
@@ -1112,7 +1683,7 @@ fn a_packaged_helper_next_to_installed_units_is_refused() {
     };
     let err = run_install(&sys, &forced).unwrap_err();
     assert!(err.contains("distribution package (puzuz, dpkg"), "{err}");
-    assert!(err.contains("sudo puzuz service uninstall"), "{err}");
+    assert!(err.contains("sudo puzuz uninstall"), "{err}");
     let err = run_uninstall(&sys, true, true).unwrap_err();
     assert!(err.contains("refusing to purge"), "{err}");
     run_uninstall(&sys, false, true).unwrap();

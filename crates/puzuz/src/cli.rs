@@ -644,6 +644,24 @@ pub enum SubCommand {
         cmd: ServiceCommand,
     },
 
+    /// (puzuz) Uninstall puzuz (requires root).
+    ///
+    /// Stops, disables and removes the systemd units, the binaries `puzuz service install`
+    /// copied (as recorded in /var/lib/puzuz/install-receipt; binaries it used in place are
+    /// kept) and its Nix GC root. Configuration, state, logs and checkpoint images are kept
+    /// unless --purge is given. Only for an installation made by `puzuz service install` (or
+    /// install.sh); packages are removed with their package manager.
+    Uninstall {
+        /// Also delete /etc/puzuz, /var/lib/puzuz (state, logs, checkpoint images) and the
+        /// runtime directories.
+        #[arg(long)]
+        purge: bool,
+
+        /// Do not ask for confirmation before purging.
+        #[arg(short, long)]
+        yes: bool,
+    },
+
     /// (puzuz) Check the installation and print how to fix problems.
     ///
     /// Checks criu, cuda-checkpoint, the NVIDIA driver, the kernel, systemd, the daemon and
@@ -653,8 +671,8 @@ pub enum SubCommand {
 
     /// (puzuz) Update puzuz itself (administrators).
     ///
-    /// Downloads a release from GitHub, checks its signature and checksum, and installs it with
-    /// its own `puzuz service install --bin-dir <the installed directory>`. Running jobs keep
+    /// Downloads a release from GitHub, checks its signature and checksum, and installs it into
+    /// the installed directory with its own `puzuz service install`. Running jobs keep
     /// running. Only for an installation made by `puzuz service install` (or install.sh);
     /// packages are updated with their package manager. Without root it only checks, like
     /// --check. The repository is private: set GH_TOKEN to a token that can read it, or save one
@@ -715,6 +733,7 @@ impl SubCommand {
             SubCommand::Gpu { .. } => "gpu",
             SubCommand::Daemon { .. } => "daemon",
             SubCommand::Service { .. } => "service",
+            SubCommand::Uninstall { .. } => "uninstall",
             SubCommand::Doctor => "doctor",
             SubCommand::Update { .. } => "update",
         }
@@ -786,17 +805,19 @@ pub enum ServiceCommand {
     /// configuration, then enable and start the services (requires root). Safe to re-run, e.g.
     /// after upgrading the binaries.
     ///
-    /// The units run `puzuz` and `puzuz-helper` from the directory this `puzuz` binary is in
-    /// when that is /usr/bin or /usr/local/bin. Otherwise pass --bin-dir to install copies of
-    /// both binaries (`puzuz-helper` must be next to `puzuz`) into a system directory.
+    /// Where the units run `puzuz` and `puzuz-helper` from (`puzuz-helper` must be next to
+    /// `puzuz`): the directory of the current installation; else the directory this `puzuz`
+    /// binary is in, when that is /usr/bin or /usr/local/bin; else copies of both binaries in
+    /// /usr/local/bin. What was copied is recorded in /var/lib/puzuz/install-receipt for
+    /// `puzuz uninstall`.
     Install {
         /// Enable the services but do not start (or restart) them now.
         #[arg(long)]
         no_start: bool,
 
-        /// Copy `puzuz` and `puzuz-helper` into this directory (e.g. /usr/local/bin) and run
-        /// them from there. It and its parents must be owned by root and not group/world-
-        /// writable (puzuz-helper runs as root).
+        /// Install somewhere else than the default: copy `puzuz` and `puzuz-helper` into this
+        /// directory and run them from there. It and its parents must be owned by root and not
+        /// group/world-writable (puzuz-helper runs as root).
         #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
         bin_dir: Option<PathBuf>,
 
@@ -806,8 +827,9 @@ pub enum ServiceCommand {
         force: bool,
     },
 
-    /// Stop, disable and remove the systemd units (requires root). Configuration, state, logs
-    /// and checkpoint images are kept unless --purge is given.
+    /// Same as `puzuz uninstall`: stop, disable and remove the systemd units and the binaries
+    /// `puzuz service install` copied (requires root). Configuration, state, logs and
+    /// checkpoint images are kept unless --purge is given.
     Uninstall {
         /// Also delete /etc/puzuz, /var/lib/puzuz (state, logs, checkpoint images) and the
         /// runtime directories.
