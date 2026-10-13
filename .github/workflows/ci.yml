@@ -84,8 +84,8 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - uses: cachix/install-nix-action@v31.11.1
         with:
-          extra_nix_config: |
-            system-features = nixos-test benchmark big-parallel kvm
+          # Only where KVM is enabled; the arm runner has no VM tests.
+          extra_nix_config: ${{ matrix.runner == 'ubuntu-24.04' && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
       - run: nix flake check -L
       - run: nix build -L .#default
       - run: |
