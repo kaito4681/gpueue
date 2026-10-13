@@ -47,6 +47,18 @@ set -euo pipefail
 fail() { echo "FAIL: $*"; exit 1; }
 step() { echo; echo "=== $*"; }
 
+# A dummy .deb named puzuz that ships both units in /usr/lib/systemd/system.
+make_deb() {
+    local root=/tmp/puzuz-deb
+    rm -rf "$root"
+    mkdir -p "$root/DEBIAN" "$root/usr/lib/systemd/system"
+    printf 'Package: puzuz\nVersion: 0.0.1\nArchitecture: all\nMaintainer: test <test@example.com>\nDescription: dummy puzuz package for the e2e test\n' >"$root/DEBIAN/control"
+    printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' >"$root/usr/lib/systemd/system/puzuz.service"
+    printf '[Service]\nExecStart=/usr/bin/puzuz-helper serve\n' >"$root/usr/lib/systemd/system/puzuz-helper.service"
+    dpkg-deb --build --root-owner-group "$root" /tmp/puzuz.deb >/dev/null
+}
+make_deb
+
 step "install without root fails"
 out="$(runuser -u alice -- /build/puzuz service install 2>&1)" && fail "non-root install succeeded"
 grep -q "must run as root" <<<"$out" || fail "$out"
@@ -96,16 +108,16 @@ systemctl is-active puzuz.service
 
 step "a packaged unit next to the installed one is a conflict"
 cp /etc/systemd/system/puzuz.service /tmp/puzuz.service.etc
-sed 1d /tmp/puzuz.service.etc > /usr/lib/systemd/system/puzuz.service
+dpkg -i /tmp/puzuz.deb >/dev/null
 [ "$(puzuz service install-method)" = mixed ] || fail "mixed setup not detected"
 out="$(puzuz doctor 2>&1)" && fail "doctor passed a mixed setup"
-grep -q "FAIL  install method: mixed: distribution package" <<<"$out" || fail "$out"
+grep -q "FAIL  install method: mixed: distribution package (puzuz, dpkg" <<<"$out" || fail "$out"
 out="$(/usr/local/bin/puzuz service install --force 2>&1)" && fail "install --force over a package succeeded"
 grep -q "distribution package" <<<"$out" || fail "$out"
 out="$(/usr/local/bin/puzuz service uninstall --purge --yes 2>&1)" && fail "purge of a mixed setup succeeded"
 grep -q "refusing to purge" <<<"$out" || fail "$out"
 cmp /etc/systemd/system/puzuz.service /tmp/puzuz.service.etc || fail "installed unit changed"
-rm /usr/lib/systemd/system/puzuz.service
+dpkg -r puzuz >/dev/null
 [ "$(puzuz service install-method)" = service-install ] || fail "conflict not resolved"
 
 step "uninstall keeps data"
@@ -128,20 +140,51 @@ systemctl is-active puzuz.service && fail "--no-start started the daemon"
 
 step "a package-managed machine is refused"
 /usr/local/bin/puzuz service uninstall
-printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' > /usr/lib/systemd/system/puzuz.service
+dpkg -i /tmp/puzuz.deb >/dev/null
 [ "$(puzuz service install-method)" = package ] || fail "package not detected"
 out="$(/usr/local/bin/puzuz service install --force 2>&1)" && fail "install over a package succeeded"
-grep -q "package manager" <<<"$out" || fail "$out"
+grep -q "distribution package (puzuz, dpkg" <<<"$out" || fail "$out"
+grep -q "sudo apt update && sudo apt upgrade" <<<"$out" || fail "$out"
 test ! -e /etc/systemd/system/puzuz.service || fail "install wrote a unit"
 out="$(/usr/local/bin/puzuz service uninstall 2>&1)" && fail "uninstall of a package succeeded"
 grep -q "not by \`puzuz service install\`" <<<"$out" || fail "$out"
-rm /usr/lib/systemd/system/puzuz.service
+grep -q "sudo apt remove puzuz" <<<"$out" || fail "$out"
+dpkg -r puzuz >/dev/null
 
-step "NixOS is refused"
-touch /etc/NIXOS
+step "a unit no package owns needs --force"
+printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' > /usr/lib/systemd/system/puzuz.service
+printf '[Service]\nExecStart=/usr/bin/puzuz-helper serve\n' > /usr/lib/systemd/system/puzuz-helper.service
+[ "$(puzuz service install-method)" = unowned ] || fail "unowned unit not detected"
+runuser -u alice -- puzuz doctor > /tmp/doctor-unowned.out 2>&1 || true
+grep -q "WARN  install method: a unit no package owns" /tmp/doctor-unowned.out || fail "$(cat /tmp/doctor-unowned.out)"
+out="$(/usr/local/bin/puzuz service install --no-start 2>&1)" && fail "install over an unowned unit succeeded"
+grep -q "no package owns /usr/lib/systemd/system/puzuz.service" <<<"$out" || fail "$out"
+/usr/local/bin/puzuz service install --no-start --force > /tmp/install-unowned.out || true
+grep -q "warning: no package owns" /tmp/install-unowned.out || fail "$(cat /tmp/install-unowned.out)"
+[ "$(puzuz service install-method)" = service-install ] || fail "install --force did not take over"
+runuser -u alice -- puzuz doctor > /tmp/doctor-leftover.out 2>&1 || true
+grep -q "WARN  install method: puzuz service install .*no package owns" /tmp/doctor-leftover.out || fail "$(cat /tmp/doctor-leftover.out)"
+/usr/local/bin/puzuz service uninstall
+rm /usr/lib/systemd/system/puzuz.service /usr/lib/systemd/system/puzuz-helper.service
+
+step "units from /nix/store are refused"
+ln -s /nix/store/abc-puzuz.service /etc/systemd/system/puzuz.service
+[ "$(puzuz service install-method)" = nix ] || fail "nix unit not detected"
+out="$(/usr/local/bin/puzuz service install --force 2>&1)" && fail "install over a nix unit succeeded"
+grep -q "installed as Nix" <<<"$out" || fail "$out"
+rm /etc/systemd/system/puzuz.service
+
+step "NixOS without puzuz is refused"
+cp -P /etc/os-release /tmp/os-release.saved
+rm /etc/os-release
+printf 'NAME=NixOS\nID=nixos\n' > /etc/os-release
+[ "$(puzuz service install-method)" = none ] || fail "NixOS without units is not none"
 out="$(/usr/local/bin/puzuz service install 2>&1)" && fail "install on NixOS succeeded"
-grep -q "installed as NixOS" <<<"$out" || fail "$out"
-rm /etc/NIXOS
+grep -q "this is NixOS" <<<"$out" || fail "$out"
+runuser -u alice -- puzuz doctor > /tmp/doctor-nixos.out 2>&1 || true
+grep -q "INFO  install method: not installed (NixOS" /tmp/doctor-nixos.out || fail "$(cat /tmp/doctor-nixos.out)"
+rm /etc/os-release
+mv /tmp/os-release.saved /etc/os-release
 echo
 echo "=== service e2e passed"
 EOF

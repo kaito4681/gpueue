@@ -1063,6 +1063,13 @@ fn service_subcommands() {
             cmd: ServiceCommand::Status
         }
     );
+    // Hidden, for install.sh.
+    assert_eq!(
+        cmd(&["service", "install-method"]),
+        SubCommand::Service {
+            cmd: ServiceCommand::InstallMethod
+        }
+    );
     assert_eq!(
         parse_err(&["service"]),
         ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand

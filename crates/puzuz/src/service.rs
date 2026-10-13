@@ -14,7 +14,7 @@ use std::time::Duration;
 use puzuz_daemon::config::DEFAULT_CONFIG_PATH;
 
 use crate::doctor::{self, Report};
-use crate::install_method::{self, InstallMethod};
+use crate::install_method::{self, Detection, Method};
 use crate::system::{System, check_root_owned_chain, run_checked};
 
 pub const DAEMON_UNIT: &str = "puzuz.service";
@@ -347,36 +347,74 @@ fn check_foreign_files(sys: &dyn System, files: &[InstallFile], force: bool) -> 
     ))
 }
 
-/// Refuses to touch a machine where a package manager or NixOS manages puzuz: the units in
-/// /etc would shadow the packaged ones, and both would share /etc/puzuz and /var/lib/puzuz.
-/// `--force` does not override this.
-fn check_install_method(method: &InstallMethod) -> Result<()> {
-    let Some(managed) = method.managed_elsewhere() else {
-        return Ok(());
-    };
-    let mut message = format!(
-        "puzuz is installed as {managed}; `puzuz service install` would conflict with it \
-         (--force does not change this). To update it, {}.",
-        managed.update_hint()
-    );
-    if method.has_service_install() {
-        message.push_str(
-            " It is also installed by `puzuz service install`; remove that copy with \
-             `sudo puzuz service uninstall`.",
+/// Refuses to touch a machine where a package manager or Nix manages puzuz: the units in /etc
+/// would shadow the packaged ones, and both would share /etc/puzuz and /var/lib/puzuz.
+/// `--force` does not override this. A unit in /usr/lib that no package owns is refused
+/// without `--force`. Returns warnings to print before installing.
+fn check_install_method(detection: &Detection, force: bool) -> Result<Vec<String>> {
+    if let Some(managed) = detection.managed_elsewhere() {
+        let mut message = format!(
+            "puzuz is installed as {managed}; `puzuz service install` would conflict with it \
+             (--force does not change this). To update it, {}.",
+            detection.update_hint(managed)
         );
-    } else {
-        message.push_str(&format!(
-            " To switch to `puzuz service install`, first {}.",
-            managed.removal_hint()
+        if detection.has_service_install() {
+            message.push_str(
+                " It is also installed by `puzuz service install`; remove that copy with \
+                 `sudo puzuz service uninstall`.",
+            );
+        } else {
+            message.push_str(&format!(
+                " To switch to `puzuz service install`, first {}.",
+                detection.removal_hint(managed)
+            ));
+        }
+        return Err(message);
+    }
+    if detection.os.is_nixos() {
+        return Err(
+            "this is NixOS: install puzuz with the `services.puzuz` NixOS module instead of \
+             `puzuz service install` (--force does not change this)"
+                .to_owned(),
+        );
+    }
+    if detection.unit_dir_in_store {
+        return Err(format!(
+            "{UNIT_DIR} resolves into /nix/store: Nix manages it, and it cannot be written. \
+             Install puzuz through the Nix configuration that manages it (--force does not \
+             change this)"
         ));
     }
-    Err(message)
+    let mut warnings = Vec::new();
+    for method in detection.methods() {
+        if let Method::Unowned { unit, .. } = method {
+            let unit = unit.display();
+            let note = format!(
+                "no package owns {unit} (left over from a removed package, or copied there by \
+                 hand); delete it (`sudo rm {unit}`)"
+            );
+            if !force && detection.unowned_needs_force() {
+                return Err(format!(
+                    "{note} and re-run, or re-run with --force to install next to it"
+                ));
+            }
+            warnings.push(format!("{note}: the units in {UNIT_DIR} shadow it"));
+        }
+    }
+    for leftover in &detection.leftovers {
+        let leftover = leftover.display();
+        warnings.push(format!(
+            "no package owns {leftover}, which the units in {UNIT_DIR} shadow; delete it \
+             (`sudo rm {leftover}`)"
+        ));
+    }
+    Ok(warnings)
 }
 
 /// `puzuz service install`. Prints progress and finally the doctor report to `out`.
 pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) -> Result<Report> {
     require_root(sys, "install")?;
-    check_install_method(&install_method::detect(sys))?;
+    let warnings = check_install_method(&install_method::detect(sys), options.force)?;
     if let Some(bin_dir) = &options.bin_dir {
         // Validated before anything is copied; the files below then name it.
         valid_bin_dir(bin_dir)?;
@@ -386,6 +424,9 @@ pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) 
         &packaged_files(options.bin_dir.as_deref().unwrap_or(Path::new("/usr/bin"))),
         options.force,
     )?;
+    for warning in warnings {
+        writeln!(out, "warning: {warning}").ok();
+    }
     let (bin_dir, binaries_changed) = install_binaries(sys, options.bin_dir.as_deref(), out)?;
 
     let mut units_changed = false;
@@ -495,20 +536,28 @@ fn active_job_units(sys: &dyn System) -> Vec<String> {
 pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Write) -> Result<()> {
     require_root(sys, "uninstall")?;
     let method = install_method::detect(sys);
-    if let Some(managed) = method.managed_elsewhere() {
-        if !method.has_service_install() {
-            return Err(format!(
-                "puzuz is installed as {managed}, not by `puzuz service install`; {}",
-                managed.removal_hint()
-            ));
+    if !method.has_service_install() {
+        match method.methods().next() {
+            // Removes what may be left of an earlier installation (and the data with --purge).
+            None => {
+                writeln!(out, "puzuz is not installed (no units found)").ok();
+            }
+            Some(other) => {
+                return Err(format!(
+                    "puzuz is installed as {other}, not by `puzuz service install`; {}",
+                    method.removal_hint(other)
+                ));
+            }
         }
-        if options.purge {
-            return Err(format!(
-                "puzuz is also installed as {managed}, which uses {CONFIG_DIR} and \
-                 /var/lib/puzuz too; refusing to purge them. `sudo puzuz service uninstall` \
-                 (without --purge) removes only what `puzuz service install` wrote"
-            ));
-        }
+    }
+    if let Some(managed) = method.managed_elsewhere()
+        && options.purge
+    {
+        return Err(format!(
+            "puzuz is also installed as {managed}, which uses {CONFIG_DIR} and \
+             /var/lib/puzuz too; refusing to purge them. `sudo puzuz service uninstall` \
+             (without --purge) removes only what `puzuz service install` wrote"
+        ));
     }
     let jobs = active_job_units(sys);
     if !jobs.is_empty() {
@@ -700,9 +749,12 @@ fn remove_tree_inner(
 /// `puzuz service status`. Returns whether both services run and are connected.
 pub fn status(sys: &dyn System, socket: Option<&Path>, out: &mut dyn Write) -> io::Result<bool> {
     let mut healthy = true;
-    let method = install_method::detect(sys);
-    healthy &= !matches!(method, InstallMethod::Mixed(_));
-    writeln!(out, "{:<22} {method}", "installed")?;
+    let detection = install_method::detect(sys);
+    healthy &= !detection.is_conflicting();
+    writeln!(out, "{:<22} {}", "installed", detection.install)?;
+    if let Some(partial) = &detection.partial {
+        writeln!(out, "{:<22} {partial}", "")?;
+    }
     for unit in [HELPER_UNIT, DAEMON_UNIT] {
         let (enabled, active) = doctor::unit_state(sys, unit);
         healthy &= active == "active";

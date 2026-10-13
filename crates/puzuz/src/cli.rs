@@ -822,8 +822,8 @@ pub enum ServiceCommand {
     /// Show the state of both services and whether daemon and helper are connected.
     Status,
 
-    /// Print how puzuz is installed as one word: none, service-install, package, nixos, manual
-    /// or mixed (used by install.sh).
+    /// Print how puzuz is installed as one word: none, service-install, package, unowned, nix,
+    /// manual or mixed (used by install.sh; before v2 it printed nixos instead of nix).
     #[command(hide = true)]
     InstallMethod,
 
