@@ -146,8 +146,9 @@ running either way.
 
 On Debian and Ubuntu you can use the [.deb](#installing-the-debianubuntu-package) instead, on
 Fedora, RHEL, Rocky and Alma Linux the [.rpm](#installing-the-fedorarhelrocky-package), or
-[Nix](#installing-with-nix) anywhere, and on Arch Linux the [AUR package](#arch-linux-aur). You
-can also build from source as described below.
+[Nix](#installing-with-nix) anywhere, and on Arch Linux the [AUR package](#arch-linux-aur) once it
+is published (until then, use `install.sh` as above). You can also build from source as described
+below.
 
 ### Verifying a release by hand
 
@@ -443,8 +444,22 @@ must be installed as above.
 
 ## Arch Linux (AUR)
 
+**The AUR package is not published yet.** Until it is, install puzuz on Arch Linux with
+`install.sh` (it works on Arch: glibc 2.34 or newer, systemd, x86_64 or aarch64, and it verifies
+the minisign signature). CRIU 4.2 or newer comes from the official repositories:
+
+```sh
+sudo pacman -S criu
+curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
+```
+
+Update with `sudo puzuz update` and remove with `sudo puzuz uninstall` (see
+[Upgrading](#upgrading) and [Uninstalling](#uninstalling)). The rest of this section describes
+the AUR package for once it is on the AUR (the maintainer setup is below).
+
 The AUR package [`puzuz-bin`](https://aur.archlinux.org/packages/puzuz-bin) (x86_64 and aarch64)
-repackages the release tarballs. Install it with any AUR helper, for example yay:
+repackages the release tarballs. Once it is published, install it with any AUR helper, for
+example yay:
 
 ```sh
 yay -S puzuz-bin
@@ -1104,7 +1119,7 @@ and its "update" line says when a newer release exists):
 | the `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>` (no dnf repository yet) |
 | built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install` |
 | `puzuz service install` from a Nix build (not NixOS) | the same `nix build` and `service install` again (see [Installing with Nix](#installing-with-nix)) |
-| the AUR package `puzuz-bin` | `yay -Syu` (any AUR helper), then `sudo systemctl restart puzuz-helper.service puzuz.service`; `puzuz update` refuses |
+| the AUR package `puzuz-bin` (once published; until then Arch uses `install.sh` and `sudo puzuz update`) | `yay -Syu` (any AUR helper), then `sudo systemctl restart puzuz-helper.service puzuz.service`; `puzuz update` refuses |
 | another distribution package or Nix (later) | the package manager or Nix (see [Install method](#install-method)); `puzuz update` refuses and names the command |
 
 ### puzuz update
@@ -1165,8 +1180,9 @@ For the `.deb`, use `sudo apt remove puzuz` or `sudo apt purge puzuz` (see
 [Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)); for the `.rpm`,
 `sudo dnf remove puzuz` (see
 [Installing the Fedora/RHEL/Rocky package](#installing-the-fedorarhelrocky-package)); for the AUR
-package, `sudo pacman -R puzuz-bin` (see [Arch Linux (AUR)](#arch-linux-aur)). For an installation
-made by `install.sh` or `puzuz service install`:
+package (once it is published), `sudo pacman -R puzuz-bin` (see
+[Arch Linux (AUR)](#arch-linux-aur)). On Arch Linux for now, and for an installation made by
+`install.sh` or `puzuz service install`:
 
 ```sh
 sudo puzuz uninstall            # stop, disable and remove the units, snippets and copied binaries

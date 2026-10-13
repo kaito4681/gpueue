@@ -97,19 +97,17 @@ nix build github:kaito4681/puzuz/stable
 sudo ./result/bin/puzuz service install
 ```
 
-On Arch Linux (x86_64, aarch64), install the AUR package
-[`puzuz-bin`](https://aur.archlinux.org/packages/puzuz-bin) with any AUR helper instead, and
-enable the services yourself:
+On Arch Linux (x86_64, aarch64), use the installer above for now: the AUR package `puzuz-bin` is
+not published yet. CRIU (4.2 or newer, for checkpoints) is in the official repositories:
 
 ```sh
-yay -S puzuz-bin
-sudo systemctl enable --now puzuz-helper.service puzuz.service
-sudo pacman -S criu   # for checkpoints (4.2 or newer)
+sudo pacman -S criu
+curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
 ```
 
-Update with `yay -Syu` (then `sudo systemctl restart puzuz-helper.service puzuz.service`; jobs
-keep running) and remove with `sudo pacman -R puzuz-bin` (see
-[docs/install.md](docs/install.md#arch-linux-aur)).
+Update with `sudo puzuz update` and remove with `sudo puzuz uninstall`. Once the package is on
+the AUR, you can install [`puzuz-bin`](https://aur.archlinux.org/packages/puzuz-bin) with any AUR
+helper instead (see [docs/install.md](docs/install.md#arch-linux-aur)).
 
 ```sh
 # Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.
