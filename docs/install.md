@@ -6,6 +6,7 @@ command on their `PATH`.
 - [Requirements](#requirements)
 - [Installing with install.sh](#installing-with-installsh)
 - [Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)
+- [Installing the Fedora/RHEL/Rocky package](#installing-the-fedorarhelrocky-package)
 - [Building](#building)
 - [Installing](#installing)
 - [Verifying](#verifying)
@@ -36,13 +37,13 @@ Without an NVIDIA driver puzuz still runs CPU-only jobs, and checkpoints them as
 
 puzuz needs CRIU 4.2 or newer to checkpoint; jobs run without it. `puzuz doctor` reports a
 missing or older CRIU. The distribution's package is new enough on Ubuntu 26.04
-(`sudo apt install criu`, universe), Fedora (`sudo dnf install criu`) and Arch
-(`sudo pacman -S criu`). Ubuntu 22.04 (3.16), Ubuntu 24.04 (no package), Debian 12 (3.17) and
-Debian 13 (4.1) do not have it: build CRIU from source following
+(`sudo apt install criu`, universe), Fedora (`sudo dnf install criu`, 4.2) and Arch
+(`sudo pacman -S criu`). Ubuntu 22.04 (3.16), Ubuntu 24.04 (no package), Debian 12 (3.17),
+Debian 13 (4.1) and RHEL/Rocky/Alma 9 (3.19) do not have it: build CRIU from source following
 <https://criu.org/Installation> (the upstream release tarball, `make` and `sudo make install`
 into `/usr/local/sbin`), or point `criu_path` in `/etc/puzuz/config.toml` at a root-owned build.
-The `.deb` only recommends `criu`, so on those releases apt installs the old package or none;
-a CRIU in `/usr/local/sbin` comes first in the helper's `PATH`. In the default **manual** mode
+The `.deb` and the `.rpm` only recommend `criu`, so on those releases apt or dnf installs the old
+package or none; a CRIU in `/usr/local/sbin` comes first in the helper's `PATH`. In the default **manual** mode
 (`cuda_checkpoint_mode = "manual"`) the helper calls cuda-checkpoint itself and runs CRIU without
 plugins. The distribution package works for this, even though it ships without CRIU's CUDA plugin.
 
@@ -140,16 +141,17 @@ Afterwards, update with `sudo puzuz update` (see [Upgrading](#upgrading)). Runni
 again also installs the latest (or the given) version over the installed one. Running jobs keep
 running either way.
 
-On Debian and Ubuntu you can use the [package](#installing-the-debianubuntu-package) instead.
-Other ways to install (rpm, AUR, Nix) are coming later. Until then, build from source as described
-below.
+On Debian and Ubuntu you can use the [.deb](#installing-the-debianubuntu-package) instead, on
+Fedora, RHEL, Rocky and Alma Linux the [.rpm](#installing-the-fedorarhelrocky-package). Other ways
+to install (AUR, Nix) are coming later. Until then, build from source as described below.
 
 ### Verifying a release by hand
 
 Each release has, for each target (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`),
 `puzuz-v<X>-<target>.tar.gz` with `.sha256` and `.minisig` files, the packages
-`puzuz_<X>_amd64.deb` and `puzuz_<X>_arm64.deb` with the same two files each, and `install.sh`.
-To check a tarball (or a `.deb`) yourself:
+`puzuz_<X>_amd64.deb`, `puzuz_<X>_arm64.deb`, `puzuz-<X>-1.x86_64.rpm` and
+`puzuz-<X>-1.aarch64.rpm` with the same two files each, and `install.sh`. To check a tarball (or a
+package) yourself:
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
@@ -255,8 +257,69 @@ Back up the secret key and its passphrase. Every installed package trusts this k
 can only be rolled out by a package version, signed with the old key, that ships the new one.
 
 The packages are built with [nfpm](https://nfpm.goreleaser.com) from `packaging/nfpm.yaml`
-(`scripts/dist/build-package.sh BIN_DIR OUT_DIR` builds a `.deb` from built binaries, and
-`scripts/deb-test.sh` checks one in a container).
+(`scripts/dist/build-package.sh BIN_DIR OUT_DIR [deb|rpm]` builds a `.deb` or an `.rpm` from built
+binaries; `scripts/deb-test.sh` and `scripts/rpm-test.sh` check them in containers).
+
+## Installing the Fedora/RHEL/Rocky package
+
+Each release has an `.rpm` for x86_64 and aarch64 (`uname -m` tells which), for Fedora and
+RHEL-compatible 9 or newer (RHEL, Rocky Linux, AlmaLinux; glibc 2.34 or newer). Install it with
+dnf, from a downloaded file or straight from the release URL; dnf pulls in what it depends on:
+
+```sh
+sudo dnf install ./puzuz-0.1.0-1.x86_64.rpm
+# or
+sudo dnf install https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz-0.1.0-1.x86_64.rpm
+```
+
+(A pre-release such as `v0.2.0-rc.1` is `puzuz-0.2.0-rc.1-1.<arch>.rpm`; inside the package its
+version is `0.2.0~rc.1`, which sorts before `0.2.0`.)
+
+It installs the same files as the `.deb` (binaries, units in `/usr/lib/systemd/system`,
+sysusers.d and tmpfiles.d entries, `/etc/puzuz/config.toml`, shell completions, documentation,
+and the license in `/usr/share/licenses/puzuz`), but no repository configuration. The
+configuration is `%config(noreplace)`: your edits are kept on upgrades. The first installation
+sets up and starts the services exactly like the `.deb` (only enables them without systemd as
+PID 1), and refuses to install next to an installation made by `puzuz service install` or
+`install.sh`. It requires systemd and glibc 2.34 and only **recommends** `criu` (a weak
+dependency, which dnf installs by default when the distribution has it): Fedora's CRIU (4.2) is
+new enough, the 3.19 of RHEL/Rocky/Alma 9 is not, so checkpointing there needs a newer CRIU (see
+[CRIU](#criu)). Running jobs works without it.
+
+**Verifying.** Like every release asset, the `.rpm` has `.sha256` and `.minisig` files (see
+[Verifying a release by hand](#verifying-a-release-by-hand)). Releases built with the GPG key also
+sign the `.rpm` itself, and attach that key as `RPM-GPG-KEY-puzuz` (the APT repository's key):
+
+```sh
+sudo rpm --import https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz
+rpm -K puzuz-0.1.0-1.x86_64.rpm                     # "digests signatures OK"
+# or let dnf refuse an unsigned or badly signed file:
+sudo dnf install --setopt=localpkg_gpgcheck=1 ./puzuz-0.1.0-1.x86_64.rpm
+```
+
+**Updates.** There is no dnf repository yet (it is planned, see
+[issue #23](https://github.com/kaito4681/puzuz/issues/23)), so `dnf upgrade` alone does not see new
+versions. Install the newer `.rpm` of the release instead; dnf takes the URL directly:
+
+```sh
+sudo dnf upgrade https://github.com/kaito4681/puzuz/releases/download/v<new version>/puzuz-<new version>-1.x86_64.rpm
+```
+
+When a newer release exists, the "update" line of `puzuz doctor` (and `puzuz update --check`)
+prints this command with the release's URL for the machine's architecture, and how to check the
+signature first. An upgrade restarts the running services. Running jobs keep running.
+
+**Removing.**
+
+```sh
+sudo dnf remove puzuz
+```
+
+It stops and disables the services and removes the binaries and units. It keeps `/var/lib/puzuz`
+(state, job logs, checkpoint images), the `puzuz` user and the `puzuz-admin` group, and never
+touches running jobs. rpm has no purge: an edited `config.toml` is kept as
+`/etc/puzuz/config.toml.rpmsave`; delete `/etc/puzuz` and `/var/lib/puzuz` by hand if you no
+longer need them (`sudo systemctl stop 'puzuz-job-*'` first if jobs still run).
 
 ## Building
 
@@ -815,6 +878,7 @@ and its "update" line says when a newer release exists):
 | --- | --- |
 | `install.sh` (or `puzuz service install` of a release) | `sudo puzuz update` |
 | the `.deb` | `sudo apt update && sudo apt upgrade` once the APT repository is published; until then `sudo apt install ./puzuz_<new version>_<arch>.deb` |
+| the `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>` (no dnf repository yet) |
 | built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install --bin-dir /usr/local/bin` |
 | another distribution package or Nix (later) | the package manager or Nix (see [Install method](#install-method)); `puzuz update` refuses and names the command |
 
@@ -872,7 +936,9 @@ services if anything changed. The configuration file is kept.
 ## Uninstalling
 
 For the `.deb`, use `sudo apt remove puzuz` or `sudo apt purge puzuz` (see
-[Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)). For an installation
+[Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)); for the `.rpm`,
+`sudo dnf remove puzuz` (see
+[Installing the Fedora/RHEL/Rocky package](#installing-the-fedorarhelrocky-package)). For an installation
 made by `install.sh` or `puzuz service install`:
 
 ```sh
