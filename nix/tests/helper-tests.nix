@@ -6,7 +6,9 @@
 # that start a job, because the helper makes the job's log directory setgid
 # and the sandbox refuses setgid modes. The tests use fakes for systemd, CRIU
 # and the host, and must run as an unprivileged user (tests/protocol.rs
-# asserts it), so the VM only needs a normal user and a real /tmp.
+# asserts it), so the VM only needs a normal user, a real /tmp and python3.
+# A test that skips itself prints "skipped: <why>"; the check fails then, so
+# that nothing is skipped here.
 { self, pkgs }:
 let
   tests = self.packages.${pkgs.stdenv.hostPlatform.system}.helper-tests;
@@ -24,6 +26,8 @@ pkgs.testers.runNixOSTest {
 
   nodes.machine = {
     users.users.alice.isNormalUser = true;
+    # forkguard's test runs a Python script (and skips itself without it).
+    environment.systemPackages = [ pkgs.python3 ];
     virtualisation.memorySize = 2048;
     virtualisation.cores = 4;
   };
@@ -43,7 +47,7 @@ pkgs.testers.runNixOSTest {
             # root), so the tests see what a user's shell would give them.
             out_file = f"/tmp/{name}.log"
             cmd = (
-                f"cd /tmp && PATH=${dashSh}/bin:$PATH ${tests}/bin/{name} --test-threads=2"
+                f"cd /tmp && PATH=${dashSh}/bin:$PATH ${tests}/bin/{name} --test-threads=2 --nocapture"
                 f" </dev/null >{out_file} 2>&1"
             )
             status, _ = machine.execute(f"su -l alice -c {shlex.quote(cmd)}")
@@ -57,6 +61,8 @@ pkgs.testers.runNixOSTest {
                 totals["failed"] += int(failed)
                 totals["ignored"] += int(ignored)
             assert status == 0 and summaries, f"{name} failed (exit status {status})"
+            skipped = [l for l in out.splitlines() if "skipped: " in l]
+            assert not skipped, f"{name}: tests skipped themselves: {skipped}"
 
     print(f"puzuz-helper tests: {totals}")
     assert totals["failed"] == 0, totals
