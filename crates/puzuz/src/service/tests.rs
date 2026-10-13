@@ -51,7 +51,7 @@ fn install_and_uninstall_require_root() {
     assert!(err.contains("must run as root"), "{err}");
     assert!(err.contains("sudo puzuz service install"), "{err}");
     let err = run_uninstall(&sys, false, false).unwrap_err();
-    assert!(err.contains("sudo puzuz service uninstall"), "{err}");
+    assert!(err.contains("sudo puzuz uninstall"), "{err}");
     assert!(sys.commands().is_empty());
     assert!(!sys.exists("/etc/systemd/system/puzuz.service"));
 }
@@ -586,12 +586,97 @@ fn uninstall_removes_units_but_keeps_data() {
     assert!(sys.exists("/etc/puzuz/config.toml"));
     assert!(sys.exists("/var/lib/puzuz/daemon"));
     assert!(sys.exists("/usr/bin/puzuz-helper"));
-    assert!(out.contains("--purge"), "{out}");
+    assert!(
+        out.contains("kept /usr/bin/puzuz and /usr/bin/puzuz-helper (used in place"),
+        "{out}"
+    );
+    assert!(!sys.exists(RECEIPT_PATH));
+    assert!(out.contains("sudo puzuz uninstall --purge"), "{out}");
 
     // Again: nothing left to do.
     sys.log.borrow_mut().clear();
     run_uninstall(&sys, false, false).unwrap();
     assert!(!sys.ran("systemctl disable"));
+}
+
+#[test]
+fn uninstall_removes_the_copied_binaries() {
+    let sys = build_dir_system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write_exe("/usr/local/bin/other-tool", "");
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(out.contains("removed /usr/local/bin/puzuz\n"), "{out}");
+    assert!(
+        out.contains("removed /usr/local/bin/puzuz-helper\n"),
+        "{out}"
+    );
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    assert!(!sys.exists("/usr/local/bin/puzuz-helper"));
+    assert!(sys.exists("/usr/local/bin/other-tool"));
+    assert!(sys.exists("/home/u/target/release/puzuz"));
+    assert!(!sys.exists(RECEIPT_PATH));
+    assert!(sys.exists("/etc/puzuz/config.toml"));
+
+    // With --purge, too.
+    run_install(&sys, &opts()).unwrap();
+    run_uninstall(&sys, true, true).unwrap();
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    assert!(!sys.exists("/var/lib/puzuz"));
+}
+
+#[test]
+fn uninstall_removes_only_puzuz_binaries_listed_in_the_receipt() {
+    let sys = build_dir_system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write("/etc/important", "keep me");
+    let receipt = Receipt {
+        version: "0.1.0".to_owned(),
+        bin_dir: PathBuf::from("/usr/local/bin"),
+        copied: paths(&["/usr/local/bin/puzuz", "/etc/important"]),
+        ..Receipt::default()
+    };
+    sys.write(RECEIPT_PATH, &receipt.to_toml());
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(
+        out.contains("warning: ignoring /etc/important in /var/lib/puzuz/install-receipt"),
+        "{out}"
+    );
+    assert_eq!(sys.read("/etc/important").unwrap(), "keep me");
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    // Not listed: kept.
+    assert!(sys.exists("/usr/local/bin/puzuz-helper"));
+}
+
+#[test]
+fn uninstall_without_a_receipt_keeps_the_binaries() {
+    let sys = build_dir_system();
+    run_install(&sys, &opts()).unwrap();
+    std::fs::remove_file(sys.path(Path::new(RECEIPT_PATH))).unwrap();
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(
+        out.contains("remove /usr/local/bin/puzuz /usr/local/bin/puzuz-helper by hand"),
+        "{out}"
+    );
+    assert!(sys.exists("/usr/local/bin/puzuz"));
+    assert!(sys.exists("/usr/local/bin/puzuz-helper"));
+    assert!(!sys.exists("/etc/systemd/system/puzuz.service"));
+}
+
+#[test]
+fn uninstall_removes_the_gc_root() {
+    let sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    run_install(&sys, &opts()).unwrap();
+    make_gc_root(&sys);
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(
+        out.contains("removed the Nix GC root /nix/var/nix/gcroots/puzuz"),
+        "{out}"
+    );
+    assert!(!sys.exists(GC_ROOT));
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    // The store itself is Nix's.
+    assert!(sys.exists(&format!("{STORE_PATH}/bin/puzuz")));
 }
 
 #[test]
@@ -1377,7 +1462,7 @@ fn a_packaged_helper_next_to_installed_units_is_refused() {
     };
     let err = run_install(&sys, &forced).unwrap_err();
     assert!(err.contains("distribution package (puzuz, dpkg"), "{err}");
-    assert!(err.contains("sudo puzuz service uninstall"), "{err}");
+    assert!(err.contains("sudo puzuz uninstall"), "{err}");
     let err = run_uninstall(&sys, true, true).unwrap_err();
     assert!(err.contains("refusing to purge"), "{err}");
     run_uninstall(&sys, false, true).unwrap();

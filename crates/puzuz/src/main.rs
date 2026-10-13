@@ -69,6 +69,9 @@ fn main() -> ExitCode {
         SubCommand::Service { cmd } => {
             run_service(cmd, socket_is_explicit.then_some(cli.socket.as_path()))
         }
+        SubCommand::Uninstall { purge, yes } => {
+            run_service(ServiceCommand::Uninstall { purge, yes }, None)
+        }
         SubCommand::Doctor => {
             let report = doctor::run(
                 &system::RealSystem,

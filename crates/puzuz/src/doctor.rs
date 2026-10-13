@@ -459,8 +459,8 @@ fn check_install_method(detection: &Detection) -> Check {
                 format!("{partial}; their units and data directories conflict"),
             )
             .hint(format!(
-                "remove all but one of them:\nto keep {managed}: run `sudo puzuz service \
-                 uninstall`\nto keep puzuz service install: {}",
+                "remove all but one of them:\nto keep {managed}: run `sudo puzuz uninstall`\n\
+                 to keep puzuz service install: {}",
                 detection.removal_hint(managed)
             ));
         }

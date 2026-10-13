@@ -587,7 +587,7 @@ fn check_install_method(detection: &Detection, force: bool) -> Result<Vec<String
         if detection.has_service_install() {
             message.push_str(
                 " It is also installed by `puzuz service install`; remove that copy with \
-                 `sudo puzuz service uninstall`.",
+                 `sudo puzuz uninstall`.",
             );
         } else {
             message.push_str(&format!(
@@ -769,9 +769,81 @@ fn active_job_units(sys: &dyn System) -> Vec<String> {
         .collect()
 }
 
-/// `puzuz service uninstall`.
+/// Removes what the install receipt lists: the binaries `service install` copied (never
+/// binaries it used in place, nor anything else), the Nix GC root and the receipt itself.
+/// Without a receipt (an installation by an older puzuz) the binaries are kept.
+fn remove_binaries(
+    sys: &dyn System,
+    receipt: Option<&Receipt>,
+    method: &Detection,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let Some(receipt) = receipt else {
+        if method.has_service_install() {
+            let kept = match installed_bin_dir(method) {
+                Some(dir) => receipt::BINARIES
+                    .iter()
+                    .map(|name| dir.join(name).display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                None => "puzuz and puzuz-helper".to_owned(),
+            };
+            writeln!(
+                out,
+                "kept the binaries: {RECEIPT_PATH} is missing (installed by an older puzuz), so \
+                 what was copied is unknown; remove {kept} by hand unless something else uses \
+                 them"
+            )
+            .ok();
+        }
+        return Ok(());
+    };
+    let removable = receipt.removable_copies();
+    for path in receipt.copied.iter().filter(|p| !removable.contains(p)) {
+        writeln!(
+            out,
+            "warning: ignoring {} in {RECEIPT_PATH} (not a puzuz binary in {})",
+            path.display(),
+            receipt.bin_dir.display()
+        )
+        .ok();
+    }
+    // The running binary may be one of them; unlinking it is fine.
+    for path in &removable {
+        let local = sys.path(path);
+        match std::fs::symlink_metadata(&local) {
+            Ok(meta) if !meta.is_dir() => {
+                std::fs::remove_file(&local)
+                    .map_err(io_err(format!("removing {}", path.display())))?;
+                writeln!(out, "removed {}", path.display()).ok();
+            }
+            _ => {}
+        }
+    }
+    if receipt.copied.is_empty() {
+        writeln!(
+            out,
+            "kept {} and {} (used in place, not copied by `puzuz service install`)",
+            receipt.bin_dir.join("puzuz").display(),
+            receipt.bin_dir.join("puzuz-helper").display()
+        )
+        .ok();
+    }
+    if let Some(root) = &receipt.gc_root {
+        remove_gc_root(sys, root, out);
+    }
+    match std::fs::remove_file(sys.path(Path::new(RECEIPT_PATH))) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => {
+            writeln!(out, "warning: removing {RECEIPT_PATH}: {err}").ok();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `puzuz uninstall` (also `puzuz service uninstall`).
 pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Write) -> Result<()> {
-    require_root(sys, "service uninstall")?;
+    require_root(sys, "uninstall")?;
     let method = install_method::detect(sys);
     if !method.has_service_install() {
         match method.methods().next() {
@@ -792,7 +864,7 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
     {
         return Err(format!(
             "puzuz is also installed as {managed}, which uses {CONFIG_DIR} and \
-             /var/lib/puzuz too; refusing to purge them. `sudo puzuz service uninstall` \
+             /var/lib/puzuz too; refusing to purge them. `sudo puzuz uninstall` \
              (without --purge) removes only what `puzuz service install` wrote"
         ));
     }
@@ -821,6 +893,12 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
             return Err("aborted; nothing was changed".to_owned());
         }
     }
+
+    // Read before anything is removed (and before --purge deletes it).
+    let receipt = receipt::read(sys).unwrap_or_else(|err| {
+        writeln!(out, "warning: {err}").ok();
+        None
+    });
 
     // Daemon first, then the helper (it would otherwise be restarted by Wants=).
     let units_present = [DAEMON_UNIT, HELPER_UNIT]
@@ -863,6 +941,8 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
         writeln!(out, "warning: {err}").ok();
     }
 
+    remove_binaries(sys, receipt.as_ref(), &method, out)?;
+
     if let Some(managed) = method.managed_elsewhere() {
         writeln!(
             out,
@@ -894,14 +974,14 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
         }
         writeln!(
             out,
-            "The system user puzuz, the group {ADMIN_GROUP} and the binaries are kept."
+            "The system user puzuz and the group {ADMIN_GROUP} are kept."
         )
         .ok();
     } else {
         writeln!(
             out,
             "Kept {CONFIG_DIR} and /var/lib/puzuz (state, logs, checkpoints); \
-             `sudo puzuz service uninstall --purge` deletes them."
+             `sudo puzuz uninstall --purge` deletes them."
         )
         .ok();
     }

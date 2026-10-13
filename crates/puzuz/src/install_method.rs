@@ -215,7 +215,7 @@ impl Method {
     /// How to remove puzuz installed this way.
     pub fn removal_hint(&self, os: &OsRelease) -> String {
         match self {
-            Method::ServiceInstall { .. } => "run `sudo puzuz service uninstall`".to_owned(),
+            Method::ServiceInstall { .. } => "run `sudo puzuz uninstall`".to_owned(),
             Method::Package { owner, .. } => match owner {
                 Owner::Dpkg(name) => format!("run `sudo apt remove {name}`"),
                 Owner::Rpm(name) => format!("run `sudo dnf remove {name}`"),

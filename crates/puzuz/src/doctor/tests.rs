@@ -973,7 +973,7 @@ fn mixed_install_methods_fail() {
     assert_eq!(level(&report, "install method"), Level::Fail);
     assert!(message(&report, "install method").starts_with("mixed: "));
     let hint = hint(&report, "install method");
-    assert!(hint.contains("sudo puzuz service uninstall"), "{hint}");
+    assert!(hint.contains("sudo puzuz uninstall"), "{hint}");
     assert!(hint.contains("sudo apt remove puzuz"), "{hint}");
 }
 
@@ -1053,7 +1053,7 @@ fn units_installed_in_different_ways_warn() {
     assert_eq!(level(&report, "install method"), Level::Fail);
     assert!(message(&report, "install method").contains("conflict"));
     let hint = hint(&report, "install method");
-    assert!(hint.contains("sudo puzuz service uninstall"), "{hint}");
+    assert!(hint.contains("sudo puzuz uninstall"), "{hint}");
     assert!(hint.contains("sudo apt remove puzuz"), "{hint}");
 }
 
