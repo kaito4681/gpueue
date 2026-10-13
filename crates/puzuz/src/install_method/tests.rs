@@ -770,6 +770,74 @@ fn hints_name_the_right_tool() {
 }
 
 #[test]
+fn package_hints_follow_the_family() {
+    let unit = PathBuf::from(path(LIB, DAEMON_UNIT));
+    let package = |owner: Owner| Method::Package {
+        unit: unit.clone(),
+        owner,
+        local: None,
+    };
+    let rocky = os("rocky", &["rhel", "centos", "fedora"]);
+    let suse = os("opensuse-tumbleweed", &["opensuse", "suse"]);
+    let rpm = package(Owner::Rpm("puzuz".into()));
+    assert_eq!(rpm.update_hint(&rocky), "run `sudo dnf upgrade`");
+    assert_eq!(rpm.removal_hint(&rocky), "run `sudo dnf remove puzuz`");
+    // An rpm database on openSUSE is zypper's.
+    assert_eq!(rpm.update_hint(&suse), "run `sudo zypper update`");
+    assert_eq!(rpm.removal_hint(&suse), "run `sudo zypper remove puzuz`");
+    let pacman = package(Owner::Pacman("puzuz-bin".into()));
+    assert_eq!(
+        pacman.update_hint(&os("arch", &[])),
+        "run `yay -Syu` (AUR) or `sudo pacman -Syu`"
+    );
+    assert_eq!(
+        pacman.removal_hint(&os("arch", &[])),
+        "run `sudo pacman -R puzuz-bin`"
+    );
+    let unknown = package(Owner::Unknown);
+    assert_eq!(
+        unknown.update_hint(&suse),
+        "update the package with your package manager (e.g. `sudo zypper update`)"
+    );
+    assert_eq!(
+        unknown.removal_hint(&os("debian", &[])),
+        "remove the package with your package manager (e.g. `sudo apt remove <package>`)"
+    );
+    assert_eq!(
+        unknown.update_hint(&os("nixos", &[])),
+        "update the package with your package manager"
+    );
+}
+
+#[test]
+fn hints_for_hand_made_units_name_the_module_on_nixos() {
+    let nixos = os("nixos", &[]);
+    let ubuntu = os("ubuntu", &["debian"]);
+    let unowned = Method::Unowned {
+        unit: PathBuf::from(path(LIB, DAEMON_UNIT)),
+        local: None,
+    };
+    let manual = Method::Manual {
+        unit: PathBuf::from(path(ETC, DAEMON_UNIT)),
+    };
+    for method in [&unowned, &manual] {
+        let hint = method.update_hint(&nixos);
+        assert!(hint.contains("services.puzuz.enable = true"), "{hint}");
+        assert!(!hint.contains("sudo puzuz service install"), "{hint}");
+        assert!(
+            method
+                .update_hint(&ubuntu)
+                .contains("sudo puzuz service install")
+        );
+    }
+    assert_eq!(
+        unowned.update_hint(&ubuntu),
+        "no package owns /usr/lib/systemd/system/puzuz.service; delete it and install puzuz \
+         with install.sh or `sudo puzuz service install`"
+    );
+}
+
+#[test]
 fn resolve_follows_relative_and_absolute_links() {
     let sys = FakeSystem::new();
     sys.mkdir("/a/b");

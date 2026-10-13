@@ -153,17 +153,50 @@ pub enum LocalUnit {
     Overridden(PathBuf),
 }
 
-/// `(update, removal)` command examples for a package of unknown origin.
-fn family_examples(os: &OsRelease) -> Option<(&'static str, &'static str)> {
-    Some(match os.family()? {
-        Family::Debian => (
-            "sudo apt update && sudo apt upgrade",
-            "sudo apt remove <package>",
-        ),
-        Family::Rhel => ("sudo dnf upgrade", "sudo dnf remove <package>"),
-        Family::Arch => ("sudo pacman -Syu", "sudo pacman -R <package>"),
-        Family::Suse => ("sudo zypper update", "sudo zypper remove <package>"),
-    })
+impl Family {
+    /// The command that updates the installed packages.
+    fn update_command(self) -> &'static str {
+        match self {
+            Family::Debian => "sudo apt update && sudo apt upgrade",
+            Family::Rhel => "sudo dnf upgrade",
+            Family::Arch => "sudo pacman -Syu",
+            Family::Suse => "sudo zypper update",
+        }
+    }
+
+    /// The command that removes `package`.
+    fn remove_command(self, package: &str) -> String {
+        match self {
+            Family::Debian => format!("sudo apt remove {package}"),
+            Family::Rhel => format!("sudo dnf remove {package}"),
+            Family::Arch => format!("sudo pacman -R {package}"),
+            Family::Suse => format!("sudo zypper remove {package}"),
+        }
+    }
+}
+
+impl Owner {
+    /// The package manager to name for a package of this owner: the one of its database, except
+    /// that an rpm database is zypper's on the SUSE family (dnf's elsewhere), and the family of
+    /// the distribution when the owner is unknown.
+    fn family(&self, os: &OsRelease) -> Option<Family> {
+        match self {
+            Owner::Dpkg(_) => Some(Family::Debian),
+            Owner::Rpm(_) if os.family() == Some(Family::Suse) => Some(Family::Suse),
+            Owner::Rpm(_) => Some(Family::Rhel),
+            Owner::Pacman(_) => Some(Family::Arch),
+            Owner::Unknown => os.family(),
+        }
+    }
+}
+
+/// How to install puzuz instead of a unit that no package owns.
+fn reinstall_hint(os: &OsRelease) -> &'static str {
+    if os.is_nixos() {
+        "set `services.puzuz.enable = true` (the NixOS module) and run `sudo nixos-rebuild switch`"
+    } else {
+        "install puzuz with install.sh or `sudo puzuz service install`"
+    }
 }
 
 impl Method {
@@ -177,21 +210,20 @@ impl Method {
     pub fn update_hint(&self, os: &OsRelease) -> String {
         match self {
             Method::ServiceInstall { .. } => "run `sudo puzuz update`".to_owned(),
-            Method::Package { owner, .. } => match owner {
-                Owner::Dpkg(_) => "run `sudo apt update && sudo apt upgrade`".to_owned(),
-                Owner::Rpm(_) => "run `sudo dnf upgrade`".to_owned(),
-                Owner::Pacman(_) => "run `yay -Syu` (AUR) or `sudo pacman -Syu`".to_owned(),
-                Owner::Unknown => match family_examples(os) {
-                    Some((update, _)) => {
-                        format!("update the package with your package manager (e.g. `{update}`)")
-                    }
-                    None => "update the package with your package manager".to_owned(),
-                },
+            Method::Package { owner, .. } => match (owner, owner.family(os)) {
+                // puzuz-bin is in the AUR, which pacman itself does not update.
+                (Owner::Pacman(_), _) => "run `yay -Syu` (AUR) or `sudo pacman -Syu`".to_owned(),
+                (Owner::Unknown, Some(family)) => format!(
+                    "update the package with your package manager (e.g. `{}`)",
+                    family.update_command()
+                ),
+                (_, Some(family)) => format!("run `{}`", family.update_command()),
+                (_, None) => "update the package with your package manager".to_owned(),
             },
             Method::Unowned { unit, .. } => format!(
-                "no package owns {}; delete it and install puzuz with install.sh or `sudo \
-                 puzuz service install`",
-                unit.display()
+                "no package owns {}; delete it and {}",
+                unit.display(),
+                reinstall_hint(os)
             ),
             Method::Nix { unit } => {
                 if os.is_nixos() {
@@ -203,6 +235,11 @@ impl Method {
                     )
                 }
             }
+            Method::Manual { unit } if os.is_nixos() => format!(
+                "{} was not written by `puzuz service install`; remove it and {}",
+                unit.display(),
+                reinstall_hint(os)
+            ),
             Method::Manual { unit } => format!(
                 "{} was not written by `puzuz service install`; replace the binaries it runs \
                  by hand, or remove it and run `sudo puzuz service install`",
@@ -215,16 +252,15 @@ impl Method {
     pub fn removal_hint(&self, os: &OsRelease) -> String {
         match self {
             Method::ServiceInstall { .. } => "run `sudo puzuz uninstall`".to_owned(),
-            Method::Package { owner, .. } => match owner {
-                Owner::Dpkg(name) => format!("run `sudo apt remove {name}`"),
-                Owner::Rpm(name) => format!("run `sudo dnf remove {name}`"),
-                Owner::Pacman(name) => format!("run `sudo pacman -R {name}`"),
-                Owner::Unknown => match family_examples(os) {
-                    Some((_, remove)) => {
-                        format!("remove the package with your package manager (e.g. `{remove}`)")
-                    }
-                    None => "remove the package with your package manager".to_owned(),
-                },
+            Method::Package { owner, .. } => match (owner, owner.family(os)) {
+                (Owner::Unknown, Some(family)) => format!(
+                    "remove the package with your package manager (e.g. `{}`)",
+                    family.remove_command("<package>")
+                ),
+                (Owner::Dpkg(name) | Owner::Rpm(name) | Owner::Pacman(name), Some(family)) => {
+                    format!("run `{}`", family.remove_command(name))
+                }
+                _ => "remove the package with your package manager".to_owned(),
             },
             Method::Unowned { unit, .. } => format!(
                 "delete {} by hand (no package owns it) and run `sudo systemctl daemon-reload`",

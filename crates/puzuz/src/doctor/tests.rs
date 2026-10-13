@@ -1232,3 +1232,191 @@ fn nixos_is_reported() {
     assert_eq!(level(&report, "install method"), Level::Ok);
     assert!(message(&report, "install method").starts_with("Nix ("));
 }
+
+/// A healthy installation with `os_release`, and problems in checks whose hint differs on
+/// NixOS: CRIU, cuda-checkpoint and nvidia-smi missing, the daemon unit not installed and the
+/// helper's disabled, a configured directory outside `ReadWritePaths=`, no checkpoint directory.
+fn broken_on(os_release: &str) -> (FakeSystem, Vec<UnixListener>) {
+    let (sys, sockets) = healthy();
+    sys.write("/etc/os-release", os_release);
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!(
+            "criu_path = \"/missing/criu\"\n\
+             cuda_checkpoint_path = \"/missing/cuda-checkpoint\"\n\
+             nvidia_smi_path = \"/missing/nvidia-smi\"\n\
+             logs_dir = \"/srv/logs\"\n{CONFIG}"
+        ),
+    );
+    sys.respond(
+        "systemctl is-enabled puzuz.service",
+        CmdOutput::failed("not-found\n", ""),
+    );
+    sys.respond(
+        "systemctl is-enabled puzuz-helper.service",
+        CmdOutput::failed("disabled\n", ""),
+    );
+    sys.respond(
+        "systemctl show --property=ProtectSystem --property=ReadWritePaths puzuz.service",
+        CmdOutput::ok(
+            "ProtectSystem=strict\nReadWritePaths=/var/lib/puzuz/daemon /var/lib/puzuz/logs \
+             -/run/puzuz\n",
+        ),
+    );
+    std::fs::remove_dir(sys.path(Path::new("/var/lib/puzuz/checkpoints"))).unwrap();
+    (sys, sockets)
+}
+
+#[test]
+fn hints_outside_nixos_are_unchanged() {
+    for os_release in ["ID=ubuntu\nID_LIKE=debian\n", "ID=fedora\n", ""] {
+        let (sys, _sockets) = broken_on(os_release);
+        let report = run(&sys, None);
+        assert_eq!(
+            hint(&report, "criu"),
+            "install CRIU 4.2 or newer (https://criu.org/Installation), or set `criu_path` in \
+             /etc/puzuz/config.toml"
+        );
+        assert_eq!(
+            hint(&report, "cuda-checkpoint"),
+            "install cuda-checkpoint matching the driver \
+             (https://github.com/NVIDIA/cuda-checkpoint) into /usr/local/bin, or set \
+             `cuda_checkpoint_path` in /etc/puzuz/config.toml"
+        );
+        assert_eq!(
+            hint(&report, "gpus"),
+            "install nvidia-smi (part of the NVIDIA driver utilities)"
+        );
+        assert_eq!(hint(&report, "puzuz.service"), "sudo puzuz service install");
+        assert_eq!(
+            hint(&report, "puzuz-helper.service"),
+            "sudo systemctl enable --now puzuz-helper.service"
+        );
+        assert_eq!(
+            hint(&report, "daemon write paths"),
+            "add a drop-in with `sudo systemctl edit puzuz.service`:\n[Service]\n\
+             ReadWritePaths=/srv/logs\nthen `sudo systemctl restart puzuz.service`"
+        );
+        assert_eq!(
+            hint(&report, "checkpoint dir"),
+            "sudo systemd-tmpfiles --create /etc/tmpfiles.d/puzuz.conf"
+        );
+        assert!(message(&report, "admin").contains("sudo usermod -aG puzuz-admin"));
+        assert!(hint(&report, "install method").contains("--force"));
+    }
+}
+
+#[test]
+fn nixos_hints_name_the_module_options() {
+    let (sys, _sockets) = broken_on("NAME=NixOS\nID=nixos\n");
+    let report = run(&sys, None);
+    for name in [
+        "criu",
+        "cuda-checkpoint",
+        "gpus",
+        "puzuz.service",
+        "puzuz-helper.service",
+        "daemon write paths",
+        "checkpoint dir",
+        "install method",
+    ] {
+        let hint = hint(&report, name);
+        assert!(!hint.is_empty(), "{name}: no hint");
+        for wrong in [
+            "/usr/local/bin",
+            "service install",
+            "systemctl edit",
+            "systemctl enable",
+            "/etc/tmpfiles.d",
+            "in /etc/puzuz/config.toml",
+        ] {
+            assert!(!hint.contains(wrong), "{name}: {hint}");
+        }
+    }
+    let has = |name: &str, text: &str| {
+        let hint = hint(&report, name);
+        assert!(hint.contains(text), "{name}: {hint}");
+    };
+    has("criu", "services.puzuz.criuPackage");
+    has("criu", "sudo nixos-rebuild switch");
+    has("cuda-checkpoint", "services.puzuz.cudaCheckpointPackage");
+    has("gpus", "services.puzuz.nvidiaSmiPath");
+    has("puzuz.service", "services.puzuz.enable = true");
+    has("puzuz-helper.service", "services.puzuz.enable = true");
+    has(
+        "daemon write paths",
+        "systemd.services.puzuz.serviceConfig.ReadWritePaths = [ \"/srv/logs\" ];",
+    );
+    has("checkpoint dir", "sudo systemd-tmpfiles --create ");
+    // The units in /etc/systemd/system run binaries outside the store: by hand.
+    has("install method", "services.puzuz.enable = true");
+    assert!(message(&report, "admin").contains("services.puzuz.admins"));
+}
+
+#[test]
+fn nixos_config_hints_name_the_settings() {
+    let nixos = "ID=nixos\n";
+    // Missing.
+    let (sys, _sockets) = healthy();
+    sys.write("/etc/os-release", nixos);
+    std::fs::remove_file(sys.path(Path::new("/etc/puzuz/config.toml"))).unwrap();
+    let report = run(&sys, None);
+    assert!(hint(&report, "config").contains("services.puzuz.enable = true"));
+    assert!(!hint(&report, "config").contains("service install"));
+    sys.write("/etc/os-release", "ID=debian\n");
+    assert_eq!(
+        hint(&run(&sys, None), "config"),
+        "sudo puzuz service install   (creates a commented default configuration)"
+    );
+
+    // Invalid.
+    sys.write("/etc/puzuz/config.toml", "grace_secs = \"x\"\n");
+    assert_eq!(
+        hint(&run(&sys, None), "config"),
+        "fix /etc/puzuz/config.toml; the daemon does not start with it"
+    );
+    sys.write("/etc/os-release", nixos);
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "config"), Level::Fail);
+    assert!(
+        hint(&report, "config").starts_with("fix `services.puzuz.settings`"),
+        "{}",
+        hint(&report, "config")
+    );
+    // `load_config` (used by other commands) reads os-release itself.
+    let loaded = load_config(&sys).check.hint.unwrap_or_default();
+    assert!(loaded.contains("services.puzuz.settings"), "{loaded}");
+
+    // Writable by others: rebuilding rewrites it.
+    sys.write("/etc/puzuz/config.toml", CONFIG);
+    let file = sys.path(Path::new("/etc/puzuz/config.toml"));
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o664)).unwrap();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "config"), Level::Fail);
+    assert!(
+        hint(&report, "config").starts_with("`sudo nixos-rebuild switch` rewrites"),
+        "{}",
+        hint(&report, "config")
+    );
+    sys.write("/etc/os-release", "ID=debian\n");
+    assert_eq!(
+        hint(&run(&sys, None), "config"),
+        "sudo chown root:root /etc/puzuz/config.toml; sudo chmod go-w /etc/puzuz/config.toml"
+    );
+}
+
+#[test]
+fn nixos_helper_flags_hint_names_the_settings() {
+    let (sys, _sockets) = healthy();
+    sys.write("/etc/os-release", "ID=nixos\n");
+    sys.write(
+        "/etc/systemd/system/puzuz-helper.service",
+        "[Service]\nExecStart=/usr/bin/puzuz-helper serve --criu /opt/criu\n",
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "helper settings"), Level::Warn);
+    let shown = hint(&report, "helper settings");
+    assert!(shown.contains("services.puzuz.settings"), "{shown}");
+    assert!(shown.contains("systemd.services.puzuz-helper"), "{shown}");
+    assert!(!shown.contains("systemctl edit"), "{shown}");
+}

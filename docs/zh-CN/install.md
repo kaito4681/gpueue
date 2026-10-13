@@ -488,8 +488,8 @@ CLI、`puzuz` 系统用户、`puzuz-admin` 组、`/etc/puzuz/config.toml` 以及
   守护进程重启。
 - **属于 root 的路径。** `/nix/store` 中的程序能通过 helper 和 `puzuz doctor` 的属主检查（参见
   [cuda-checkpoint](#cuda-checkpoint)）。在没有 GPU 的 VM 中，`puzuz doctor` 不会报告失败：安装方式为
-  “Nix”，只有 NVIDIA 驱动和 cuda-checkpoint 的检查会给出警告（后者的提示中提到的是 `/usr/local/bin`；
-  在 NixOS 上请使用 `cudaCheckpointPackage`）。
+  “Nix”，只有 NVIDIA 驱动和 cuda-checkpoint 的检查会给出警告（后者的提示中提到的是
+  `services.puzuz.cudaCheckpointPackage`）。
 
 <a id="cuda-checkpoint-on-nixos"></a>
 #### NixOS 上的 cuda-checkpoint
@@ -1355,6 +1355,15 @@ sudo ls /var/lib/puzuz/checkpoints/failed-logs/   # dump.log of failed dumps (ne
 | `daemon` | runs version X while this puzuz is Y | 升级后运行 `sudo systemctl restart puzuz-helper.service puzuz.service`，或更新 CLI |
 | `checkpoint dir` | on tmpfs, or little free space | 将 `checkpoints_dir` 移到有足够空间容纳作业 RAM + VRAM 的磁盘上 |
 | `helper settings` | ExecStart= passes flags | 将设置移入 `config.toml` 并去掉这些参数 |
+
+在 NixOS 上（`/etc/os-release` 中为 `ID=nixos`），`fix:` 行给出的是[模块选项](#nixos)，而不是在 NixOS
+上不适用的步骤，并且之后都要运行 `sudo nixos-rebuild switch`：用 `services.puzuz.settings` 代替编辑
+`/etc/puzuz/config.toml`（该文件由模块重写），用 `services.puzuz.criuPackage` 和
+`services.puzuz.cudaCheckpointPackage` 代替把 CRIU 或 cuda-checkpoint 安装到 `/usr/local/bin`，
+nvidia-smi 和 NVML 用 `services.puzuz.nvidiaSmiPath` 和 `services.puzuz.nvmlLibrary`，用
+`services.puzuz.enable = true` 代替 `sudo puzuz service install` 或 `systemctl enable`，用
+`services.puzuz.admins` 代替 `usermod`，用 `systemd.services.puzuz.serviceConfig.ReadWritePaths`
+代替 `systemctl edit` drop-in。
 
 <a id="checkpoint-failures"></a>
 ### 检查点失败

@@ -546,8 +546,7 @@ flake の NixOS モジュール（`nixosModules.default`、ファイル `nix/nix
 - **root が所有するパス。** `/nix/store` にあるプログラムは、ヘルパーと `puzuz doctor` の所有者チェックを
   通ります（[cuda-checkpoint](#cuda-checkpoint) を参照）。GPU のない VM では、`puzuz doctor` は失敗を報告
   しません。インストール方法は "Nix" で、警告が出るのは NVIDIA ドライバーと cuda-checkpoint のチェック
-  だけです（後者のヒントは `/usr/local/bin` を挙げますが、NixOS では `cudaCheckpointPackage` を使って
-  ください）。
+  だけです（後者のヒントは `services.puzuz.cudaCheckpointPackage` を挙げます）。
 
 <a id="cuda-checkpoint-on-nixos"></a>
 #### NixOS での cuda-checkpoint
@@ -1463,6 +1462,15 @@ sudo ls /var/lib/puzuz/checkpoints/failed-logs/   # dump.log of failed dumps (ne
 | `daemon` | runs version X while this puzuz is Y | アップグレード後に `sudo systemctl restart puzuz-helper.service puzuz.service` を実行するか、CLI を更新します |
 | `checkpoint dir` | on tmpfs, or little free space | `checkpoints_dir` を、ジョブの RAM + VRAM を収められるディスクに移します |
 | `helper settings` | ExecStart= passes flags | 設定を `config.toml` に移し、フラグを削除します |
+
+NixOS（`/etc/os-release` が `ID=nixos`）では、`fix:` の行は NixOS では当てはまらない手順の代わりに
+[モジュールのオプション](#nixos) を挙げ、いずれも `sudo nixos-rebuild switch` を続けます。
+`/etc/puzuz/config.toml` を編集する代わりに `services.puzuz.settings`（ファイルはモジュールが書き直します）、
+CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わりに `services.puzuz.criuPackage` と
+`services.puzuz.cudaCheckpointPackage`、nvidia-smi と NVML には `services.puzuz.nvidiaSmiPath` と
+`services.puzuz.nvmlLibrary`、`sudo puzuz service install` や `systemctl enable` の代わりに
+`services.puzuz.enable = true`、`usermod` の代わりに `services.puzuz.admins`、`systemctl edit` の
+ドロップインの代わりに `systemd.services.puzuz.serviceConfig.ReadWritePaths` です。
 
 <a id="checkpoint-failures"></a>
 ### チェックポイントの失敗
