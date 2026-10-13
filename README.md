@@ -48,15 +48,33 @@ See [docs/install.md](docs/install.md) for requirements and details.
 
 ### Install (administrator)
 
+On x86_64 Linux with systemd and glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+), the
+installer downloads the latest release, checks it, and installs puzuz into /usr/local/bin. The
+repository is private, so the download needs a GitHub token that can read it. With the GitHub CLI
+logged in (`gh auth login`), that is all:
+
 ```sh
-# Build both binaries (puzuz and puzuz-helper).
-cargo build --release -p puzuz -p puzuz-helper
+gh release download -R kaito4681/puzuz -p install.sh -O - | sudo bash
+```
 
-# Install the systemd units, the `puzuz` user, the `puzuz-admin` group, the directories and a
-# default /etc/puzuz/config.toml, then start the services. --bin-dir copies both binaries
-# there (needed unless they already live in /usr/bin or /usr/local/bin).
-sudo target/release/puzuz service install --bin-dir /usr/local/bin
+Without `gh`, use a token (a fine-grained personal access token with read-only "Contents" access
+to this repository):
 
+```sh
+curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+  -H "Accept: application/vnd.github.raw" \
+  https://api.github.com/repos/kaito4681/puzuz/contents/scripts/install.sh \
+  | sudo GH_TOKEN="$GH_TOKEN" bash
+```
+
+The installer sets up the systemd units, the `puzuz` user, the `puzuz-admin` group, the
+directories and a default /etc/puzuz/config.toml, starts the services and prints the
+`puzuz doctor` report. It does not install CRIU or cuda-checkpoint; it tells you if they are
+missing. Running it again updates puzuz (running jobs keep running). `--uninstall` removes it and
+keeps the data. Other ways to install (apt, rpm, AUR, Nix) are coming later; until then you can
+also build from source (see [docs/install.md](docs/install.md)).
+
+```sh
 # Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.
 puzuz doctor
 
@@ -234,7 +252,8 @@ columns, and `Checkpointed` jobs show the image size.
 
 ## Requirements
 
-- Linux with systemd 240 or newer (tested: 259). Only x86_64 has been tested.
+- Linux with systemd 240 or newer (tested: 259). Only x86_64 has been tested. The prebuilt
+  binaries need glibc 2.34 or newer.
 - A kernel with `CONFIG_CHECKPOINT_RESTORE`, 5.5 or newer recommended (tested: 7.0).
 - CRIU 4.2 or newer. The distribution package works.
 - For GPU jobs: an NVIDIA driver whose `cuda-checkpoint` supports `--action lock/checkpoint/
@@ -318,6 +337,8 @@ Not tested yet:
 
 - A real OS reboot on a host: driver reload, and the stop order relative to the filesystems and
   `nvidia-persistenced`.
+- Installing with `install.sh` from the real GitHub releases (tested against a fake release
+  server, `scripts/dist-test.sh`, on Ubuntu 22.04/24.04/26.04 and Debian 12 containers).
 - Kernel NFS and autofs indirect maps (FUSE network filesystems and `x-systemd.automount` are
   tested).
 - Multi-GPU and NCCL jobs, and GPU models other than the one used for testing.
@@ -343,6 +364,7 @@ scripts/test-in-docker.sh fmt --all
 scripts/e2e-test.sh               # full stack under systemd in a privileged container
 scripts/service-install-test.sh   # service install / status / uninstall and doctor
 scripts/helper-systemd-test.sh    # the helper alone under systemd
+scripts/dist-test.sh              # install.sh against a fake GitHub API (PUZUZ_DIST_BASE=debian:12 ...)
 ```
 
 `scripts/e2e-test.sh` documents its environment variables at the top, for example

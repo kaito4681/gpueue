@@ -12,6 +12,10 @@
 - CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, an MSRV check (`rust-version`),
   shellcheck and the CPU e2e on pull requests; pushing a `v<version>` tag builds the release
   tarball and a draft GitHub release (`.github/workflows/release.yml`).
+- Distribution test (`scripts/install.sh` against a fake GitHub API, two test versions of the
+  tree): `scripts/dist-test.sh` (`PUZUZ_DIST_BASE=ubuntu:22.04|ubuntu:24.04|debian:12`, default
+  ubuntu:26.04). The release signing key is created once with `scripts/dist/gen-signing-key.sh`;
+  `packaging/minisign.pub` is a test key until then.
 - Workspace layout:
   - `crates/puzuz` — the `puzuz` binary (pueue-compatible CLI, `puzuz daemon` entry point)
   - `crates/puzuz-core` — domain model, scheduling decisions, authorization, SQLite storage

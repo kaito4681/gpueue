@@ -4,6 +4,7 @@ mod commands;
 mod doctor;
 mod install_method;
 mod query;
+mod release_key;
 mod render;
 mod requests;
 mod service;

@@ -4,6 +4,7 @@ This guide is for the administrator of the machine. Regular users need nothing b
 command on their `PATH`.
 
 - [Requirements](#requirements)
+- [Installing with install.sh](#installing-with-installsh)
 - [Building](#building)
 - [Installing](#installing)
 - [Verifying](#verifying)
@@ -55,6 +56,117 @@ You can put it somewhere else and set `cuda_checkpoint_path` in `/etc/puzuz/conf
 paths of `criu`, `cuda-checkpoint` and `nvidia-smi` must be owned by root, because the helper runs
 them as root.
 
+## Installing with install.sh
+
+`scripts/install.sh` is the usual way to install puzuz on x86_64 Linux. It is attached to every
+release. It downloads a release tarball, checks it, and runs that release's
+`puzuz service install --bin-dir /usr/local/bin` (see [Installing](#installing) for what that
+does).
+
+### A token for the private repository
+
+The repository is private, so every download goes through the GitHub API with a token that can
+read it. Use a fine-grained personal access token limited to this repository with the
+"Contents: Read-only" permission and an expiry date. `install.sh` takes the token from, in this
+order:
+
+1. the `GH_TOKEN` or `GITHUB_TOKEN` environment variable,
+2. `--token-file FILE` (the first line of FILE),
+3. `gh auth token`, run as the user who ran `sudo` (if the GitHub CLI is installed and logged in),
+4. `/etc/puzuz/github-token`, which `--save-token` writes (owned by root, mode 0600).
+
+The token is passed to `curl` in a header file, so it does not show up in `ps` or in the output.
+Without any token, `install.sh` tries without authentication, which works only once the
+repository is public. A missing or insufficient token fails with a message that says so (GitHub
+answers 404, not 403, when a token cannot read a private repository).
+
+### Installing
+
+With the GitHub CLI logged in:
+
+```sh
+gh release download -R kaito4681/puzuz -p install.sh -O - | sudo bash
+```
+
+Without the GitHub CLI, fetch the script through the API with your token:
+
+```sh
+curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+  -H "Accept: application/vnd.github.raw" \
+  https://api.github.com/repos/kaito4681/puzuz/contents/scripts/install.sh \
+  | sudo GH_TOKEN="$GH_TOKEN" bash
+```
+
+Options go after `bash -s --` when the script comes from a pipe (for example
+`... | sudo bash -s -- --version 0.2.0`), or after the file name with a downloaded copy
+(`sudo bash install.sh --version 0.2.0`):
+
+| Option | Meaning |
+| --- | --- |
+| `--version X` | install version X instead of the latest release |
+| `--bin-dir DIR` | where to put `puzuz` and `puzuz-helper` (default: the directory of the current `service install` installation, else `/usr/local/bin`) |
+| `--token-file FILE` | read the token from FILE |
+| `--save-token` | save the token to `/etc/puzuz/github-token` (root, 0600) for later runs |
+| `--uninstall` | remove puzuz (see [Uninstalling](#uninstalling)) |
+| `--purge` | with `--uninstall`, also delete `/etc/puzuz` and `/var/lib/puzuz` |
+| `-y`, `--yes` | do not ask before purging |
+
+The token is saved only with `--save-token`. Without it, an expired or revoked token cannot break
+a later run without you noticing which token was used.
+
+`install.sh` checks, before downloading anything, that it runs as root, that systemd is PID 1, that
+the machine is x86_64 with glibc 2.34 or newer, and that puzuz is not installed by a package
+manager or NixOS (see [Install method](#install-method)). It then:
+
+1. looks up the release (`/repos/kaito4681/puzuz/releases/latest`, or `/releases/tags/v<X>`),
+2. downloads `puzuz-v<X>-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256` file into a
+   temporary directory and checks the checksum,
+3. if `minisign` is installed, also checks the `.minisig` signature against the release key built
+   into the script (`packaging/minisign.pub`). Without `minisign` it says that the signature was
+   not checked,
+4. extracts the tarball (refusing links and paths outside it), runs the new
+   `puzuz service install --bin-dir <DIR>` (`--bin-dir`, else the directory the installed units
+   run puzuz from, else `/usr/local/bin`), and prints its `puzuz doctor` report,
+5. prints how to install CRIU and cuda-checkpoint if they are missing. It never installs them.
+
+If only some `puzuz doctor` checks fail (for example CRIU is missing) but the services run,
+`install.sh` succeeds with a warning.
+
+Running `install.sh` again installs the latest (or the given) version over the installed one.
+Running jobs keep running (see [Upgrading](#upgrading)).
+
+Other ways to install (apt, rpm, AUR, Nix) are coming later. Until then, build from source as
+described below.
+
+### Verifying a release by hand
+
+Each release has `puzuz-v<X>-x86_64-unknown-linux-gnu.tar.gz`, `.sha256` and `.minisig` files
+and `install.sh`. To check a tarball yourself:
+
+```sh
+sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.pub
+```
+
+### The release signing key (maintainers)
+
+Releases are signed in `.github/workflows/release.yml` with the minisign secret key stored in the
+repository secrets `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD`. The public key is
+`packaging/minisign.pub`, which is built into `puzuz`, and `MINISIGN_PUBKEY` in
+`scripts/install.sh`. The repository carries a test key until the real one is created, and the
+release workflow refuses to run with it. To create the real key once:
+
+```sh
+scripts/dist/gen-signing-key.sh        # asks for a password; writes the secret key under ~
+gh secret set MINISIGN_SECRET_KEY -R kaito4681/puzuz < ~/puzuz-release-key-*/minisign.key
+gh secret set MINISIGN_PASSWORD -R kaito4681/puzuz
+git commit packaging/minisign.pub scripts/install.sh
+```
+
+Back up the secret key and its password. A new key needs a new release of `puzuz` before
+`puzuz update` accepts releases signed with it. Releases are created as drafts: publish the
+draft on GitHub, or `install.sh` (which asks for the latest published release) does not see it.
+
 ## Building
 
 Both binaries are needed: `puzuz` (CLI and daemon) and `puzuz-helper` (the root helper). A plain
@@ -75,7 +187,8 @@ scripts/test-in-docker.sh build --release -p puzuz -p puzuz-helper
 
 Tagged versions also come as prebuilt binaries for x86_64 Linux (built on Debian bookworm, glibc
 2.34 or newer) on the GitHub releases page: `puzuz-v<version>-x86_64-unknown-linux-gnu.tar.gz`
-holds `puzuz`, `puzuz-helper` and the documentation, with a `.sha256` file next to it.
+holds `puzuz`, `puzuz-helper` and the documentation, with `.sha256` and `.minisig` files next to
+it. `install.sh` installs them (see above). By hand:
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
@@ -562,6 +675,9 @@ Not tested, or not supported:
 
 ## Upgrading
 
+Installed with `install.sh`: run it again (with `--version X` for a specific version). Built
+from source:
+
 ```sh
 cargo build --release -p puzuz -p puzuz-helper
 sudo target/release/puzuz service install --bin-dir /usr/local/bin
@@ -594,6 +710,15 @@ configuration file is kept.
 sudo puzuz service uninstall            # stop, disable and remove the units and snippets
 sudo puzuz service uninstall --purge    # also delete /etc/puzuz, /var/lib/puzuz, /run/puzuz, /run/puzuz-helper
 ```
+
+`install.sh --uninstall [--purge] [--yes]` runs the same command and then also deletes the
+`puzuz` and `puzuz-helper` binaries from the directory the units ran them from:
+
+```sh
+gh release download -R kaito4681/puzuz -p install.sh -O - | sudo bash -s -- --uninstall
+```
+
+`--purge` asks for confirmation on the terminal. When there is no terminal, pass `--yes`.
 
 - Only files that start with the install marker are removed. Others are reported and kept.
 - Running jobs keep running in their own units. `uninstall` warns about them, and `--purge`

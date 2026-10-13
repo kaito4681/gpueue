@@ -70,6 +70,42 @@ jobs:
       - uses: actions/checkout@v4
       - run: scripts/service-install-test.sh
 
+  # Two test versions of the tree, packaged like release.yml does, for the
+  # distribution tests below.
+  dist-build:
+    runs-on: ubuntu-24.04
+    needs: [test]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/dist/build-test-versions.sh target/dist-releases test.1 test.2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-releases
+          path: target/dist-releases
+          retention-days: 3
+
+  # install.sh (and `puzuz update`) against a fake GitHub API, in a systemd
+  # container per supported distribution (scripts/dist-test.sh).
+  dist:
+    runs-on: ubuntu-24.04
+    needs: [dist-build]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        base: ["ubuntu:26.04", "ubuntu:24.04", "ubuntu:22.04", "debian:12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-releases
+          path: target/dist-releases
+      - run: scripts/dist-test.sh
+        env:
+          PUZUZ_DIST_BASE: ${{ matrix.base }}
+          PUZUZ_DIST_SKIP_BUILD: "1"
+
   # Daemon + helper + CLI under systemd in a privileged container, including
   # a simulated reboot (CPU-only; the GPU scenarios need an NVIDIA GPU).
   e2e:
