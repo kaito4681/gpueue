@@ -3,13 +3,18 @@
 # as PID 1 (run by scripts/deb-test.sh): its metadata and contents, that
 # `apt-get install ./puzuz_*.deb` succeeds and sets up the user, directories
 # and services, that an edited conffile survives a reinstallation, that
-# installing next to `puzuz service install` is refused, and what
+# installing next to `puzuz service install` is refused, that a rolled-back
+# removal (postinst abort-remove) enables the services again, and what
 # `dpkg -r` and `dpkg -P` keep and delete.
+#
+# TODO(P4b): `apt-get update` / `apt upgrade` against a real (test) APT
+# repository, which P4b adds with the repository itself.
 #
 # Usage (as root, in the container): deb-check.sh DEB
 set -eu
 
 deb="$1"
+# Must equal service::MARKER (checked by a unit test in crates/puzuz).
 MARKER='# Installed by `puzuz service install`; re-running it overwrites this file.'
 export DEBIAN_FRONTEND=noninteractive
 
@@ -70,6 +75,21 @@ must_exist /etc/systemd/system/multi-user.target.wants/puzuz.service \
 # apt reads the repository from puzuz.sources (not fetched: it does not exist yet).
 apt-get indextargets --no-release-info 2>/dev/null | grep -q 'github.com/kaito4681/puzuz/releases/download/apt' ||
     fail "apt does not see the puzuz repository"
+
+step "a rolled-back removal enables the services again (prerm remove, postinst abort-remove)"
+wants=/etc/systemd/system/multi-user.target.wants
+# Also when /var/lib/puzuz is missing: prerm creates it for its marker.
+rm -rf /var/lib/puzuz
+/var/lib/dpkg/info/puzuz.prerm remove
+must_not_exist "$wants/puzuz.service" "$wants/puzuz-helper.service"
+must_exist /var/lib/puzuz/package-removed
+[ "$(stat -c '%U %G %a' /var/lib/puzuz)" = "root root 755" ] || fail "/var/lib/puzuz: $(stat -c '%U %G %a' /var/lib/puzuz)"
+/var/lib/dpkg/info/puzuz.postinst abort-remove
+must_exist "$wants/puzuz.service" "$wants/puzuz-helper.service" /var/lib/puzuz/daemon
+must_not_exist /var/lib/puzuz/package-removed
+# Without the marker (prerm did not get that far) abort-remove changes nothing.
+/var/lib/dpkg/info/puzuz.postinst abort-remove >/tmp/abort.out
+[ ! -s /tmp/abort.out ] || { cat /tmp/abort.out; fail "abort-remove without the marker did something"; }
 
 step "an edited conffile survives a reinstallation (the upgrade path)"
 echo '# edited by deb-check' >>/etc/puzuz/config.toml

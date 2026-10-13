@@ -5,8 +5,8 @@
 # (puzuz-job-<id>.service) and keep running while the services restart.
 #
 # Arguments: deb `configure [<last-configured-version>]` (empty on the first
-# installation) / `abort-upgrade|abort-remove|abort-deconfigure ...`; rpm %post
-# `1` (install) / `2` (upgrade).
+# installation) / `abort-remove` / `abort-deconfigure ...` / `abort-upgrade
+# <new-version>`; rpm %post `1` (install) / `2` (upgrade).
 #
 # Without systemd as PID 1 (a container or a chroot) nothing is started; the
 # services are only enabled, so they start when the system boots.
@@ -30,21 +30,24 @@ configure)
         action=upgrade
     fi
     ;;
+abort-remove | abort-deconfigure)
+    # The removal was rolled back after prerm ran: if it already stopped and
+    # disabled the services (it then left the marker), bring them back.
+    if [ -e "$REMOVED_MARKER" ]; then
+        action=install
+    else
+        exit 0
+    fi
+    ;;
 1) action=install ;;
 2) action=upgrade ;;
+# abort-upgrade: prerm `upgrade` changed nothing; the old version stays as it was.
 *) exit 0 ;;
 esac
 
-# The system user `puzuz` and the group `puzuz-admin` (sysusers.d/puzuz.conf).
-if command -v systemd-sysusers >/dev/null 2>&1; then
-    systemd-sysusers /usr/lib/sysusers.d/puzuz.conf
-else
-    getent group puzuz >/dev/null || groupadd --system puzuz
-    getent passwd puzuz >/dev/null ||
-        useradd --system --gid puzuz --home-dir /var/lib/puzuz/daemon --no-create-home \
-            --shell /usr/sbin/nologin --comment "puzuz job queue daemon" puzuz
-    getent group puzuz-admin >/dev/null || groupadd --system puzuz-admin
-fi
+# The system user `puzuz` and the group `puzuz-admin` (sysusers.d/puzuz.conf;
+# systemd-sysusers comes with the systemd the package depends on).
+systemd-sysusers /usr/lib/sysusers.d/puzuz.conf
 
 # /var/lib/puzuz and /run/puzuz (tmpfiles.d/puzuz.conf).
 if command -v systemd-tmpfiles >/dev/null 2>&1; then

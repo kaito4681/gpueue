@@ -29,10 +29,13 @@ else
     systemctl --no-reload disable puzuz.service puzuz-helper.service >/dev/null 2>&1 || true
 fi
 
-# deb: a later reinstallation of a removed (not purged) package is a first
-# installation again (see postinst).
-if [ "$1" = remove ] && [ -d /var/lib/puzuz ]; then
-    : >"$REMOVED_MARKER" || true
+# deb: a later reinstallation of a removed (not purged) package, or a
+# rolled-back removal (postinst abort-remove), enables and starts the services
+# again (see postinst). /var/lib/puzuz is created as tmpfiles.d/puzuz.conf
+# does, in case it is missing.
+if [ "$1" = remove ]; then
+    install -d -m 0755 -o root -g root /var/lib/puzuz
+    : >"$REMOVED_MARKER"
 fi
 
 exit 0
