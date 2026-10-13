@@ -147,7 +147,8 @@ running either way.
 On Debian and Ubuntu you can use the [.deb](#installing-the-debianubuntu-package) instead, on
 Fedora, RHEL, Rocky and Alma Linux the [.rpm](#installing-the-fedorarhelrocky-package), or
 [Nix](#installing-with-nix) anywhere, and on Arch Linux the [AUR package](#arch-linux-aur) once it
-is published (until then, use `install.sh` as above). You can also build from source as described below.
+is published (until then, use `install.sh` as above). You can also build from source as described
+below.
 
 ### Verifying a release by hand
 
