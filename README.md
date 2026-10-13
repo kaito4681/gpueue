@@ -70,7 +70,7 @@ sudo apt install ./puzuz_<version>_amd64.deb     # or _arm64.deb
 ```
 
 It installs and starts the same services and recommends `criu`. It also registers the puzuz APT
-repository, so once that repository is published (with the first release that has it), later
+repository (in the GitHub release `apt`), so you install the `.deb` by hand only once: later
 versions come with `sudo apt update && sudo apt upgrade`. `sudo apt remove puzuz` stops the
 services; `sudo apt purge puzuz` also deletes /etc/puzuz. Both keep /var/lib/puzuz and running
 jobs.
@@ -356,9 +356,10 @@ Not tested yet:
 - Installing with `install.sh` from the real GitHub releases (tested against a fake release
   server, `scripts/dist-test.sh`, on Ubuntu 22.04/24.04/26.04 and Debian 12 containers).
 - The `.deb` under a running systemd (its install, reinstall, remove and purge are tested in
-  plain Debian 12 and Ubuntu containers without systemd, `scripts/deb-test.sh`), the same for the
+  plain Debian 12 and Ubuntu containers without systemd, `scripts/deb-test.sh`, and so is an
+  upgrade through a local copy of the APT repository, `scripts/apt-repo-test.sh`), the same for the
   `.rpm` (install, upgrade and remove are tested in plain Rocky Linux 9 and Fedora containers,
-  `scripts/rpm-test.sh`), and arm64 on real hardware.
+  `scripts/rpm-test.sh`), the APT repository in the real `apt` release, and arm64 on real hardware.
 - Kernel NFS and autofs indirect maps (FUSE network filesystems and `x-systemd.automount` are
   tested).
 - Multi-GPU and NCCL jobs, and GPU models other than the one used for testing.
