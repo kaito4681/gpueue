@@ -1018,9 +1018,13 @@ VmFlags: rd ex mr mw me
         let e = check_pinned(&pinned(&sys, Want::ReadWrite)).unwrap_err();
         assert!(e.contains("may not read and write"), "{e}");
         assert_eq!(check_pinned(&pinned(&sys, Want::Read)), Ok(()));
-        // The real one, where it is root's.
-        if fs::metadata("/etc/passwd").is_ok_and(|m| {
-            std::os::unix::fs::MetadataExt::uid(&m) == 0 && m.permissions().mode() & 0o002 == 0
+        // The real one, where it is root's and not a symlink (in the
+        // nixos/nix image it is one into the store, which the check refuses
+        // for that reason).
+        if fs::symlink_metadata("/etc/passwd").is_ok_and(|m| {
+            m.is_file()
+                && std::os::unix::fs::MetadataExt::uid(&m) == 0
+                && m.permissions().mode() & 0o002 == 0
         }) {
             let etc = Path::new("/etc/passwd");
             let e = check_pinned(&pinned(etc, Want::ReadWrite)).unwrap_err();
