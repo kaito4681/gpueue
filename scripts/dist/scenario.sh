@@ -153,6 +153,10 @@ scenario_17() {
     grep -q "verified the SHA-256 checksum" /tmp/install-v1.out || fail "checksum not verified"
     grep -q "signature was not checked" /tmp/install-v1.out || fail "no note about the missing minisign"
     grep -q "puzuz $V1 is installed in /usr/local/bin" /tmp/install-v1.out || fail "no success message"
+    # install.sh no longer passes --bin-dir: `service install` chose /usr/local/bin.
+    grep -q "installing into /usr/local/bin" /tmp/install-v1.out || fail "no note about /usr/local/bin"
+    grep -q '^copied = \["/usr/local/bin/puzuz", "/usr/local/bin/puzuz-helper"\]' \
+        /var/lib/puzuz/install-receipt || fail "the receipt does not list the copies"
     wait_for 20 "the services" services_up
     [ "$(daemon_version)" = "$V1" ] || fail "daemon runs $(daemon_version), expected $V1"
     [ "$(puzuz service install-method)" = service-install ] || fail "install method"
@@ -186,6 +190,7 @@ scenario_17() {
     [ ! -e /etc/systemd/system/puzuz.service ] || fail "unit left behind"
     [ ! -e /usr/local/bin/puzuz ] || fail "binary left behind"
     [ ! -e /usr/local/bin/puzuz-helper ] || fail "helper binary left behind"
+    [ ! -e /var/lib/puzuz/install-receipt ] || fail "receipt left behind"
     ! systemctl is-active -q puzuz.service || fail "daemon still running"
     [ -f /var/lib/puzuz/daemon/state.sqlite ] || fail "state removed"
     [ -f /etc/puzuz/config.toml ] || fail "configuration removed"
@@ -275,8 +280,13 @@ scenario_18() {
     expect_fail "installed in more than one way" "$puzuz" update --yes
     dpkg -r puzuz >/dev/null
 
+    step "18: sudo puzuz uninstall removes the services and the copied binaries"
     systemctl stop 'puzuz-job-*' || true
-    bash "$install" --uninstall --purge --yes >/dev/null
+    "$puzuz" uninstall --purge --yes | tee /tmp/uninstall.out
+    grep -qF "removed /usr/local/bin/puzuz-helper" /tmp/uninstall.out || fail "helper not removed"
+    [ ! -e /etc/systemd/system/puzuz.service ] || fail "unit left behind"
+    [ ! -e "$puzuz" ] || fail "binary left behind"
+    [ ! -e /var/lib/puzuz ] || fail "/var/lib/puzuz left after --purge"
     echo
     echo "PASS 18"
 }
