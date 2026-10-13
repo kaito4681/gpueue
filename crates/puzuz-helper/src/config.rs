@@ -67,6 +67,9 @@ pub struct HelperConfig {
     pub job_stop_timeout: Duration,
     /// Path of this binary, run as `<exe> shim <job dir>` in job units.
     pub helper_exe: PathBuf,
+    /// Nix GC roots that keep `helper_exe` while jobs need it (see
+    /// [`crate::gcroots`]); disabled unless it runs from the Nix store.
+    pub gc_roots: crate::gcroots::GcRoots,
     /// `nvidia-smi`, used to find CUDA processes and GPU memory.
     pub nvidia_smi: PathBuf,
     /// Where the fork guard is installed at start-up (see
@@ -93,6 +96,7 @@ impl Default for HelperConfig {
             spawn_timeout: Duration::from_secs(30),
             job_stop_timeout: Duration::from_secs(30),
             helper_exe: PathBuf::from("/usr/bin/puzuz-helper"),
+            gc_roots: crate::gcroots::GcRoots::disabled(),
             nvidia_smi: PathBuf::from("nvidia-smi"),
             fork_guard_dir: Some(PathBuf::from(DEFAULT_FORK_GUARD_DIR)),
             job_preload: None,

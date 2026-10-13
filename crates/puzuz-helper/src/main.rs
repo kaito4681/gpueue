@@ -169,6 +169,14 @@ fn config(args: ServeArgs) -> Result<HelperConfig, String> {
     cfg.daemon_uid = user.uid.as_raw();
     cfg.daemon_gid = user.gid.as_raw();
     cfg.helper_exe = std::env::current_exe().map_err(|e| format!("locating myself: {e}"))?;
+    cfg.gc_roots = puzuz_helper::gcroots::GcRoots::detect(&cfg.helper_exe);
+    if let Some(target) = cfg.gc_roots.target() {
+        eprintln!(
+            "puzuz-helper: running from the Nix store; jobs keep {} as GC roots in {}/puzuz",
+            target.display(),
+            puzuz_helper::gcroots::NIX_GCROOTS
+        );
+    }
     eprintln!(
         "puzuz-helper: config {}; daemon user {daemon_user}; socket {}; checkpoints {}; \
          logs {}; cuda mode {}; criu {}; cuda-checkpoint {}",

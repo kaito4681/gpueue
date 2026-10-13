@@ -421,6 +421,10 @@ Linux; nothing is downloaded from the GitHub releases. Its outputs:
 | `packages.<system>.default` (also `puzuz`) | `bin/puzuz`, `bin/puzuz-helper`, bash/zsh/fish completions, the docs |
 | `packages.<system>.criu` | CRIU 4.2.1 (nixpkgs has an older version), for the NixOS module |
 | `devShells.<system>.default` | a development shell with the Rust toolchain (`nix develop`) |
+| `nixosModules.default` | the NixOS module `services.puzuz` (see [NixOS](#nixos)) |
+| `homeManagerModules.default` | the home-manager module `programs.puzuz` (see [home-manager](#home-manager)) |
+| `packages.<system>.helper-tests` | the puzuz-helper test executables (built, not run), for the `helper-tests` check |
+| `checks.<system>.*` | `home-manager` (module evaluation) and, on x86_64, two NixOS VM tests that need KVM: `nixos` (the module) and `helper-tests` (every puzuz-helper test, including those the sandboxed package build skips) |
 
 Use `github:kaito4681/puzuz/stable` to follow releases: the `stable` branch moves to every
 release tag (not to pre-releases). Plain `github:kaito4681/puzuz` is the development head
@@ -428,9 +432,183 @@ release tag (not to pre-releases). Plain `github:kaito4681/puzuz` is the develop
 
 ### NixOS
 
-A NixOS module (`services.puzuz`) is coming soon. `puzuz service install` refuses to run on
-NixOS (`ID=nixos` in `/etc/os-release`) and points to the module (see
-[Install method](#install-method)).
+The flake's NixOS module (`nixosModules.default`, file `nix/nixos-module.nix`) sets up the
+daemon, the root helper, the CLI, the `puzuz` system user, the `puzuz-admin` group,
+`/etc/puzuz/config.toml` and the directories below `/var/lib/puzuz`. Do not run
+`puzuz service install` or `puzuz update` on NixOS; both refuse to (NixOS is recognized by
+`ID=nixos` in `/etc/os-release`, see [Install method](#install-method)).
+
+Add the flake to the system's flake (the `stable` branch follows the latest release) and enable
+the service:
+
+```nix
+# flake.nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  inputs.puzuz.url = "github:kaito4681/puzuz/stable";
+  inputs.puzuz.inputs.nixpkgs.follows = "nixpkgs";
+
+  outputs = { nixpkgs, puzuz, ... }: {
+    nixosConfigurations.gpu-server = nixpkgs.lib.nixosSystem {
+      modules = [
+        puzuz.nixosModules.default
+        ./configuration.nix
+      ];
+    };
+  };
+}
+```
+
+```nix
+# configuration.nix
+{
+  services.puzuz = {
+    enable = true;
+    admins = [ "alice" ];
+    settings = {
+      grace_secs = 60;
+      checkpoint_size_limit_bytes = 500000000000;
+    };
+  };
+}
+```
+
+Then `sudo nixos-rebuild switch`. `puzuz doctor` checks the result.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `services.puzuz.enable` | `false` | Install and start puzuz. |
+| `services.puzuz.package` | the flake's `puzuz` | The package that runs the daemon (`bin/puzuz`) and the helper (`bin/puzuz-helper`); also added to `environment.systemPackages`. |
+| `services.puzuz.admins` | `[ ]` | Users added to the `puzuz-admin` group (see [Administrators](#administrators)). |
+| `services.puzuz.settings` | `{ }` | The contents of `/etc/puzuz/config.toml` as an attribute set (see [Configuration](#configuration) for the keys). |
+| `services.puzuz.criuPackage` | the flake's `criu` (4.2.1) | CRIU for the helper; sets `criu_path`. nixpkgs' own `criu` is older than 4.2. |
+| `services.puzuz.cudaCheckpointPackage` | `null` | A package with `bin/cuda-checkpoint`; sets `cuda_checkpoint_path`. With `null`, GPU jobs cannot be checkpointed. |
+| `services.puzuz.nvidiaSmiPath` | `nvidia-smi` of `hardware.nvidia.package` when `hardware.nvidia.enabled`, else `null` | Sets `nvidia_smi_path` (the helper finds a job's CUDA processes with it). |
+| `services.puzuz.nvmlLibrary` | `libnvidia-ml.so.1` of `hardware.nvidia.package` when `hardware.nvidia.enabled`, else `null` | Sets `nvml_library`, which the daemon loads to detect the GPUs. |
+
+The module sets `criu_path`, `cuda_checkpoint_path`, `nvidia_smi_path`, `nvml_library` and
+`shell` with `lib.mkDefault`, so a value in `settings` wins. Notes for NixOS:
+
+- **Units.** `puzuz.service` and `puzuz-helper.service` are the files in `packaging/systemd` of
+  the module's flake revision, with `ExecStart=` pointing into the store, and the tmpfiles.d
+  entries are `packaging/tmpfiles.d/puzuz.conf`. If you set `package` to another revision, the
+  units still come from the module's revision; keep the two together.
+- **Configuration file.** The helper runs as root and only reads a regular file that nobody but
+  root can change, never a symlink. The module therefore has NixOS copy the file into
+  `/etc/puzuz/config.toml` (mode 0644, owned by root) instead of linking it into the store.
+- **Restarts on `nixos-rebuild switch`.** A change to `settings` (or to the package) restarts
+  both the daemon and the helper. Running jobs are not stopped: they run in their own units. The
+  restarting helper first refuses new launches and lets the operations in flight finish, so a
+  switch during a checkpoint or restore waits for it (up to the helper's `TimeoutStopSec=`,
+  30 minutes). Jobs the daemon tries to start or restore in that window are put back in the
+  queue, not failed, and start once the new helper is up.
+- **Updates and Nix garbage collection.** A job's unit runs the helper binary that started it,
+  and its checkpoint image contains that binary too (restoring needs it). After an update, the
+  old store path is no longer part of the system, so the helper keeps it alive with a GC root,
+  `/nix/var/nix/gcroots/puzuz/job-<id>`, for as long as the job runs or its checkpoint image is
+  kept. The root is removed when the job ends or its checkpoint is deleted. `nix-collect-garbage`
+  then frees the old version. A job started, or a checkpoint taken, by a helper older than this
+  feature has no root: restoring it after the old version was collected fails, so restore or
+  finish such jobs before collecting garbage.
+- **The job environment.** A job runs with the environment of the `puzuz add` that submitted it,
+  so its `PATH` is the user's (`/run/wrappers/bin`, `/run/current-system/sw/bin`,
+  `~/.nix-profile/bin`, ...). NixOS keeps nothing in `/usr/bin` and only `sh` in `/bin`; the
+  module sets `shell = [ "/bin/sh" "-c" ]` so that starting a job does not depend on the `PATH`
+  at all.
+- **CRIU.** The module uses the flake's CRIU 4.2.1 by its store path. The NixOS kernels have
+  `CONFIG_CHECKPOINT_RESTORE=y`.
+- **NVIDIA.** With the NVIDIA driver enabled the usual NixOS way
+  (`services.xserver.videoDrivers = [ "nvidia" ]`, also on headless machines, or
+  `hardware.nvidia.datacenter.enable`), `nvidia-smi` and NVML are taken from
+  `hardware.nvidia.package`: the dynamic loader does not search the driver's directory on NixOS.
+  Otherwise set `nvidiaSmiPath` and `nvmlLibrary` (or `settings.gpus`, see
+  [GPU detection](#gpu-detection)). After a driver update, the new
+  store paths restart the daemon.
+- **Root-owned paths.** Programs in `/nix/store` pass the helper's and `puzuz doctor`'s ownership
+  checks (see [cuda-checkpoint](#cuda-checkpoint)). In a VM without a GPU, `puzuz doctor` reports
+  no failure: the install method is "Nix", and only the NVIDIA driver and cuda-checkpoint checks
+  warn (the latter's hint names `/usr/local/bin`; on NixOS use `cudaCheckpointPackage`).
+
+#### cuda-checkpoint on NixOS
+
+cuda-checkpoint is not in nixpkgs and puzuz does not package it (it is NVIDIA's binary). A
+derivation for it can look like this; take the release whose major version matches the driver,
+and fill in the hash that the first build reports:
+
+```nix
+# cuda-checkpoint.nix
+{ lib, stdenv, fetchFromGitHub, autoPatchelfHook, autoAddDriverRunpath }:
+stdenv.mkDerivation {
+  pname = "cuda-checkpoint";
+  version = "595";  # match the driver's major version
+  src = fetchFromGitHub {
+    owner = "NVIDIA";
+    repo = "cuda-checkpoint";
+    rev = "<commit>";
+    hash = lib.fakeHash;
+  };
+  # Sets the ELF interpreter, and adds /run/opengl-driver/lib so that libcuda.so.1 is found.
+  nativeBuildInputs = [ autoPatchelfHook autoAddDriverRunpath ];
+  dontBuild = true;
+  installPhase = ''
+    install -Dm755 bin/x86_64_Linux/cuda-checkpoint $out/bin/cuda-checkpoint
+  '';
+  meta.license = lib.licenses.unfree;
+}
+```
+
+```nix
+services.puzuz.cudaCheckpointPackage = pkgs.callPackage ./cuda-checkpoint.nix { };
+```
+
+(`lib.licenses.unfree` needs `nixpkgs.config.allowUnfree = true` or an
+`allowUnfreePredicate`.)
+
+#### Updating and removing on NixOS
+
+- Update: `nix flake update puzuz && sudo nixos-rebuild switch`. The changed units restart the
+  daemon and the helper (see "Restarts on `nixos-rebuild switch`" above). Running jobs keep
+  running on the old helper binary, and checkpoints taken before the update can be restored,
+  also after `nix-collect-garbage` (see "Updates and Nix garbage collection").
+- Roll back: `sudo nixos-rebuild switch --rollback` (or boot an older generation) brings back the
+  older binaries, but not the older database: after an update that migrated the database, the
+  older daemon refuses to start with the newer database.
+- Remove: set `services.puzuz.enable = false` and run `sudo nixos-rebuild switch`. The units,
+  `/etc/puzuz/config.toml` and the CLI go away; `/var/lib/puzuz` (state, logs, checkpoint
+  images) and the `puzuz` user's files stay. Kill or finish running jobs first: the helper
+  stops, but job units that are still running are left alone.
+
+### home-manager
+
+home-manager manages one user's environment, so it cannot install the daemon or the helper
+(they need root and the system's systemd). Its module (`homeManagerModules.default`) sets up the
+CLI's shell completions for a machine where an administrator installed puzuz
+(`homeManagerModules.default`, file `nix/home-manager-module.nix`):
+
+```nix
+{
+  imports = [ inputs.puzuz.homeManagerModules.default ];
+  programs.puzuz = {
+    enable = true;
+    # package = null;  # the default: use the system's puzuz
+  };
+}
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `programs.puzuz.enable` | `false` | Enable the module. |
+| `programs.puzuz.package` | `null` | `null`: install nothing, and load the completions of the system's `puzuz` (the one in `PATH`) when the shell starts: the completion files installed next to it (`<prefix>/share/...`, as on NixOS and in the packages), or, when there are none, the output of `puzuz completions <shell>`. A package (e.g. `inputs.puzuz.packages.${pkgs.stdenv.hostPlatform.system}.default`) is installed into the profile with its completion files. |
+| `programs.puzuz.enableBashIntegration` | `true` | Load the completions in Bash (`programs.bash.enable`), with `package = null`. |
+| `programs.puzuz.enableZshIntegration` | `true` | The same for Zsh (`programs.zsh.enable` with `programs.zsh.enableCompletion`, which runs `compinit`; home-manager 25.05 or newer). |
+| `programs.puzuz.enableFishIntegration` | `true` | The same for Fish (`programs.fish.enable`). |
+
+The CLI and the daemon must have the same version. Prefer `package = null`: the system's
+`puzuz` always matches the daemon. A `puzuz` from home-manager (or `nix profile`) comes from the
+revision your home-manager flake locks, so it can differ; commands then fail with a version
+mismatch that names the store path and, on NixOS or for a home-manager profile, suggests
+`programs.puzuz.package = null`. Update with
+`nix flake update && home-manager switch`; the daemon is the administrator's to update.
 
 ### Other distributions
 
@@ -455,7 +633,7 @@ but replaces the Nix build with the release tarball's binaries. Remove puzuz wit
 `sudo puzuz uninstall` (see [Uninstalling](#uninstalling)), which also removes the GC root.
 
 `nix profile install github:kaito4681/puzuz/stable` gives a user the `puzuz` command (with
-completions) only. The helper runs as root and cannot run from a user profile, so the service
+completions) only (see also [home-manager](#home-manager)). The helper runs as root and cannot run from a user profile, so the service
 must be installed as above.
 
 ## Arch Linux (AUR)
@@ -1136,7 +1314,8 @@ and its "update" line says when a newer release exists):
 | built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install` |
 | `puzuz service install` from a Nix build (not NixOS) | the same `nix build` and `service install` again (see [Installing with Nix](#installing-with-nix)) |
 | the AUR package `puzuz-bin` (once published; until then Arch uses `install.sh` and `sudo puzuz update`) | `yay -Syu` (any AUR helper), then `sudo systemctl restart puzuz-helper.service puzuz.service`; `puzuz update` refuses |
-| another distribution package or Nix (later) | the package manager or Nix (see [Install method](#install-method)); `puzuz update` refuses and names the command |
+| NixOS (`services.puzuz`) | `nix flake update puzuz && sudo nixos-rebuild switch` (see [NixOS](#nixos)); `puzuz update` refuses |
+| another distribution package | the package manager (see [Install method](#install-method)); `puzuz update` refuses and names the command |
 
 ### puzuz update
 
@@ -1191,6 +1370,9 @@ services if anything changed. The configuration file is kept.
   different driver version is refused.
 
 ## Uninstalling
+
+On NixOS, set `services.puzuz.enable = false` and run `sudo nixos-rebuild switch` instead (see
+[Updating and removing on NixOS](#updating-and-removing-on-nixos)).
 
 For the `.deb`, use `sudo apt remove puzuz` or `sudo apt purge puzuz` (see
 [Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)); for the `.rpm`,

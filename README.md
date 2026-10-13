@@ -88,9 +88,12 @@ There is no dnf repository yet (planned, issue #23): update by installing the ne
 only 3.19, so checkpointing there needs a newer CRIU (jobs run without it). You can also build
 from source or use the Nix flake (see [docs/install.md](docs/install.md)).
 
-With Nix (x86_64 or aarch64), build the flake and install the service from the result (it is
-copied to /usr/local/bin and kept from Nix's garbage collection; see
-[Installing with Nix](docs/install.md#installing-with-nix); a NixOS module is coming soon):
+On NixOS, import the flake's module (`github:kaito4681/puzuz/stable`, `nixosModules.default`) and
+set `services.puzuz.enable = true` (see [NixOS](docs/install.md#nixos)); home-manager users can add
+the CLI's completions with `homeManagerModules.default`. With Nix on another distribution
+(x86_64 or aarch64), build the flake and install the service from the result (it is copied to
+/usr/local/bin and kept from Nix's garbage collection; see
+[Installing with Nix](docs/install.md#installing-with-nix)):
 
 ```sh
 nix build github:kaito4681/puzuz/stable
@@ -407,6 +410,9 @@ scripts/e2e-test.sh               # full stack under systemd in a privileged con
 scripts/service-install-test.sh   # service install / status / uninstall and doctor
 scripts/helper-systemd-test.sh    # the helper alone under systemd
 scripts/dist-test.sh              # install.sh against a fake GitHub API (PUZUZ_DIST_BASE=debian:12 ...)
+nix build -L .#checks.x86_64-linux.nixos         # NixOS module in a VM (needs KVM)
+nix build -L .#checks.x86_64-linux.home-manager  # home-manager module evaluation
+nix build -L .#checks.x86_64-linux.helper-tests  # all puzuz-helper tests in a VM (needs KVM)
 ```
 
 `scripts/e2e-test.sh` documents its environment variables at the top, for example

@@ -501,6 +501,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             Err(res) => {
                 self.table().remove(&req.job);
                 let _ = files.remove();
+                self.cfg.gc_roots.remove(req.job);
                 res
             }
         }
@@ -559,6 +560,9 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         files
             .write_record(record)
             .map_err(|e| internal("writing the job record", e))?;
+        // A new job: its shim is this helper (a stale root of the id goes).
+        self.cfg.gc_roots.remove(req.job);
+        self.cfg.gc_roots.add(req.job);
         let spec = LaunchSpec {
             job: req.job,
             unit: record.unit.clone(),
@@ -698,6 +702,8 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         {
             let _ = files.remove();
         }
+        // Not live and no image: nothing needs the binary that ran it.
+        self.cfg.gc_roots.remove(job);
         ResponseResult::Ok
     }
 
@@ -755,6 +761,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             eprintln!("puzuz-helper: releasing job {}: {e}", job.0);
         }
         let _ = files.remove();
+        self.cfg.gc_roots.remove(job);
     }
 
     /// Run [`Self::poll_exits`] every `poll_interval` until `stop` fires.
@@ -867,6 +874,13 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 let _ = CheckpointDir::for_job(&self.cfg.checkpoint_base, id).remove();
             }
         }
+        // GC roots of jobs that have no record any more (see
+        // `crate::gcroots`).
+        let left: Vec<JobId> = jobs::scan(&self.cfg.jobs_dir())?
+            .into_iter()
+            .map(|(_, record)| record.job)
+            .collect();
+        self.cfg.gc_roots.retain(|job| left.contains(&job));
         Ok(())
     }
 

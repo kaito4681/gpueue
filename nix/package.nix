@@ -13,6 +13,8 @@ let
   # puzuz-helper/tests/protocol.rs: these spawn a job, and the helper makes
   # the job's log directory setgid (mode 2770). Nix's sandbox refuses setuid
   # and setgid modes (its seccomp filter fails chmod with EPERM).
+  # checks.x86_64-linux.helper-tests (nix/tests/helper-tests.nix) runs all
+  # puzuz-helper tests, these included, in a NixOS VM.
   skippedTests = [
     "a_dump_past_its_deadline_is_killed_and_the_job_resumed"
     "a_restored_job_holding_files_its_owner_may_not_open_is_killed"
@@ -27,6 +29,7 @@ let
     "dump_refuses_without_free_space_and_keeps_a_stopped_job_stopped"
     "exit_events_are_persisted_replayed_and_acked"
     "failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first"
+    "nix_gc_roots_follow_jobs_and_their_checkpoints"
     "plugin_mode_refuses_to_dump_cuda_jobs_without_the_plugin"
     "recovery_readopts_running_jobs_and_reports_exits"
     "restore_checks_the_images_paths_first"

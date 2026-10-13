@@ -14,12 +14,15 @@
 //! - [`mounts`]: mountinfo analysis (hidden mounts, CRIU's external binds).
 //! - [`forkguard`]: the preload library that makes forked children of CUDA
 //!   processes checkpointable.
+//! - [`gcroots`]: Nix GC roots that keep the helper's store path while jobs
+//!   need it.
 
 pub mod access;
 pub mod config;
 pub mod engine;
 pub mod events;
 pub mod forkguard;
+pub mod gcroots;
 pub mod host;
 pub mod images;
 pub mod jobs;
