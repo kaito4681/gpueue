@@ -19,10 +19,13 @@
   (`update DIR DEB...` locally, `github TAG` from `.github/workflows/release-apt.yml` when a
   release is published); `scripts/apt-repo-test.sh [DEB]` upgrades v1 to v2 through a local copy
   in containers (`PUZUZ_APT_BASES`, `PUZUZ_DEB_HTTPS=1`).
-- Nix flake: `flake.nix` and `nix/` (package, CRIU override). Without Nix on the host, run
-  `nix flake check` / `nix build .#default` in a pinned `nixos/nix` Docker image. Tests that cannot
+- Nix flake: `flake.nix` and `nix/` (package, CRIU override, the NixOS module
+  `nix/nixos-module.nix`, the home-manager module `nix/home-manager-module.nix`, and their tests
+  in `nix/tests/`). Without Nix on the host, run `nix flake check` / `nix build .#default` in a
+  pinned `nixos/nix` Docker image; the NixOS VM test (`.#checks.x86_64-linux.nixos`) needs
+  `--device /dev/kvm` and `--option system-features "kvm nixos-test"`. Tests that cannot
   pass in the Nix sandbox are listed in `nix/package.nix`. Release tags move the `stable` branch
-  (`.github/workflows/release-nix.yml`).
+  (`.github/workflows/release-nix.yml`). The module generates its units from `packaging/`.
 - CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, an MSRV check (`rust-version`),
   shellcheck and the CPU e2e on pull requests; pushing a `v<version>` tag builds the release
   tarball and a draft GitHub release (`.github/workflows/release.yml`).
