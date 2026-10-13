@@ -1,5 +1,7 @@
 # Architecture
 
+English | [日本語](ja/architecture.md) | [简体中文](zh-CN/architecture.md)
+
 ## Components
 
 | Process | Runs as | Role |

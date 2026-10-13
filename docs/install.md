@@ -1,5 +1,7 @@
 # Installing and operating puzuz
 
+English | [日本語](ja/install.md) | [简体中文](zh-CN/install.md)
+
 This guide is for the administrator of the machine. Regular users need nothing beyond the `puzuz`
 command on their `PATH`.
 

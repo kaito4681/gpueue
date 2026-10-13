@@ -1,5 +1,7 @@
 # puzuz
 
+English | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
+
 A GPU job queue for one Linux machine shared by several users. Its CLI works like
 [pueue](https://github.com/Nukesor/pueue). puzuz adds two things on top: GPU slots, and
 transparent checkpoint/restore of running jobs (CPU, memory and GPU state) with
