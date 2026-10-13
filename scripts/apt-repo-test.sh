@@ -255,8 +255,11 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n--- %s\n' "$*"; }
 export DEBIAN_FRONTEND=noninteractive
 status() { dpkg-query -W -f='${Status} ${Version}' puzuz 2>/dev/null || true; }
-# Buffered: `apt-cache … | grep -q` can fail with SIGPIPE under pipefail.
-madison() { local out; out="$(apt-cache madison puzuz)"; printf '%s\n' "$out"; }
+# Whether `apt-cache madison puzuz` has a line matching the pattern. Not
+# `… | grep -q`, even with the output buffered first: bash's printf writes one
+# line per write(2), so when grep -q exits on a match before the last line,
+# the next write dies of SIGPIPE and pipefail turns the match into a failure.
+in_madison() { local out; out="$(apt-cache madison puzuz)"; grep -q "$1" <<<"$out"; }
 clean_update() {
     apt-get update -q 2>&1 | tee /tmp/update.out
     if grep -E '^(W|E|Err):' /tmp/update.out; then fail "apt-get update reported a problem"; fi
@@ -277,14 +280,14 @@ if apt-get update -q >/tmp/update.out 2>&1 && ! grep -q 'repo:8000' /tmp/update.
     cat /tmp/update.out; fail "no error"
 fi
 grep -Eq 'NO_PUBKEY|not signed|signatures couldn.t be verified' /tmp/update.out || { cat /tmp/update.out; fail "no signature error"; }
-madison | grep -q 'repo:8000' && fail "apt uses the unverified index"
+in_madison 'repo:8000' && fail "apt uses the unverified index"
 cp -p /tmp/keyring.orig "$keyring"
 
 step "apt-get update verifies the index with the package's own files"
 echo '# edited by apt-repo-test' >>"$sources"
 echo '# edited by apt-repo-test' >>/etc/puzuz/config.toml
 clean_update
-madison | grep -q '9.9.9~rc.1 | *http://repo:8000' || { madison; fail "v1 not in the repository"; }
+in_madison '9.9.9~rc.1 | *http://repo:8000' || { apt-cache madison puzuz; fail "v1 not in the repository"; }
 if apt-get -s upgrade | grep '^Inst puzuz'; then fail "an upgrade before v2 is published"; fi
 EOF
 
@@ -295,8 +298,11 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n--- %s\n' "$*"; }
 export DEBIAN_FRONTEND=noninteractive
 status() { dpkg-query -W -f='${Status} ${Version}' puzuz 2>/dev/null || true; }
-# Buffered: `apt-cache … | grep -q` can fail with SIGPIPE under pipefail.
-madison() { local out; out="$(apt-cache madison puzuz)"; printf '%s\n' "$out"; }
+# Whether `apt-cache madison puzuz` has a line matching the pattern. Not
+# `… | grep -q`, even with the output buffered first: bash's printf writes one
+# line per write(2), so when grep -q exits on a match before the last line,
+# the next write dies of SIGPIPE and pipefail turns the match into a failure.
+in_madison() { local out; out="$(apt-cache madison puzuz)"; grep -q "$1" <<<"$out"; }
 clean_update() {
     apt-get update -q 2>&1 | tee /tmp/update.out
     if grep -E '^(W|E|Err):' /tmp/update.out; then fail "apt-get update reported a problem"; fi
@@ -327,7 +333,7 @@ apt-get remove -y -q puzuz >/dev/null
 [ -e /etc/puzuz/config.toml ] && [ -e "$sources" ] && [ -e "$keyring" ] || fail "conffiles removed"
 [ ! -e /usr/bin/puzuz ] || fail "/usr/bin/puzuz still there"
 clean_update
-madison | grep -q '9.9.9 | *http://repo:8000' || fail "the repository is gone after remove"
+in_madison '9.9.9 | *http://repo:8000' || { apt-cache madison puzuz; fail "the repository is gone after remove"; }
 
 step "apt-get purge deletes the source and the keyring, keeps /var/lib/puzuz"
 apt-get purge -y -q puzuz >/dev/null
