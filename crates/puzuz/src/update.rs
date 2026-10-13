@@ -10,7 +10,8 @@
 //! binary ([`crate::release_key`]) and the checksum, extracts the tarball (regular files and
 //! directories only), asks the new binary which database schema it supports, refuses a release
 //! that would not open the database, and runs the new binary's `service install --bin-dir <the
-//! installed directory>`. Running jobs are not affected (see `service install`).
+//! installed directory>`. A Nix GC root left from binaries built with Nix is removed afterwards
+//! (see `service install`). Running jobs are not affected.
 //!
 //! Test-only overrides, not shown in `--help`: `PUZUZ_RELEASE_API_URL` (a fake API) and
 //! `PUZUZ_UPDATE_PUBKEY_FILE` (another public key).
@@ -47,6 +48,8 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long to wait for the new daemon after installing it.
 const RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Pauses before sending a GET again after the server dropped the connection, one per retry.
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(200), Duration::from_secs(1)];
 
 /// A failed update; the message is meant for the user.
 pub type Result<T, E = String> = std::result::Result<T, E>;
@@ -209,10 +212,19 @@ impl<'a> Client<'a> {
         if let Some(auth) = &auth {
             headers.push(("Authorization", auth));
         }
-        let response = self
-            .sys
-            .http_get(&url, &headers, timeout)
-            .map_err(|err| (0, format!("cannot reach {}: {err}", self.api)))?;
+        let mut retry_delays = RETRY_DELAYS.iter();
+        let response = loop {
+            match self.sys.http_get(&url, &headers, timeout) {
+                Ok(response) => break response,
+                // A GET is idempotent: send it again when the server dropped the connection
+                // (e.g. a pooled keep-alive one); other failures and HTTP errors are final.
+                Err(err) if err.connection_lost => match retry_delays.next() {
+                    Some(delay) => self.sys.sleep(*delay),
+                    None => return Err((0, format!("cannot reach {}: {err}", self.api))),
+                },
+                Err(err) => return Err((0, format!("cannot reach {}: {err}", self.api))),
+            }
+        };
         match response.status {
             200 => Ok(response.body),
             401 | 403 | 404 => Err((response.status, self.no_access(path, response.status))),
@@ -416,7 +428,7 @@ fn service_install_bin_dir(detection: &Detection) -> Result<PathBuf> {
         InstallMethod::One(Method::ServiceInstall { bin_dir: Some(dir) }) => Ok(dir.clone()),
         InstallMethod::One(Method::ServiceInstall { bin_dir: None }) => Err(
             "cannot tell from /etc/systemd/system/puzuz.service where the binaries are; \
-                 re-run `sudo puzuz service install --bin-dir /usr/local/bin` first"
+                 re-run `sudo puzuz service install` first"
                 .to_owned(),
         ),
         InstallMethod::None => Err(format!(
@@ -636,6 +648,10 @@ fn install_release(sys: &dyn System, plan: &InstallPlan<'_>, out: &mut dyn Write
              `puzuz doctor`"
         )
         .ok();
+    }
+    // The release's binaries do not need a Nix store path the previous ones came from.
+    if let Err(err) = crate::service::release_gc_root(sys, &plan.target.to_string(), out) {
+        writeln!(out, "warning: {err}").ok();
     }
 
     wait_for_daemon(sys, plan)?;

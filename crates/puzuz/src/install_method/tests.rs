@@ -745,7 +745,7 @@ fn hints_name_the_right_tool() {
     );
     assert_eq!(
         service_install("/opt/bin").removal_hint(&ubuntu),
-        "run `sudo puzuz service uninstall`"
+        "run `sudo puzuz uninstall`"
     );
     assert_eq!(
         dpkg(&unit).update_hint(&ubuntu),

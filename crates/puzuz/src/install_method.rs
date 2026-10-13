@@ -205,8 +205,7 @@ impl Method {
             }
             Method::Manual { unit } => format!(
                 "{} was not written by `puzuz service install`; replace the binaries it runs \
-                 by hand, or remove it and run `sudo puzuz service install --bin-dir \
-                 /usr/local/bin`",
+                 by hand, or remove it and run `sudo puzuz service install`",
                 unit.display()
             ),
         }
@@ -215,7 +214,7 @@ impl Method {
     /// How to remove puzuz installed this way.
     pub fn removal_hint(&self, os: &OsRelease) -> String {
         match self {
-            Method::ServiceInstall { .. } => "run `sudo puzuz service uninstall`".to_owned(),
+            Method::ServiceInstall { .. } => "run `sudo puzuz uninstall`".to_owned(),
             Method::Package { owner, .. } => match owner {
                 Owner::Dpkg(name) => format!("run `sudo apt remove {name}`"),
                 Owner::Rpm(name) => format!("run `sudo dnf remove {name}`"),
@@ -596,8 +595,10 @@ enum Answer {
     Owned(String),
     /// Definitely owned by no package of this package manager.
     NotOwned,
-    /// Missing, failed in another way (e.g. a locked database) or said something unexpected.
+    /// Failed (e.g. a locked database) or said something unexpected.
     Undecided,
+    /// The package manager is not installed.
+    Missing,
 }
 
 /// A package manager's owner query: the program, its arguments before the path, how to read
@@ -639,8 +640,10 @@ impl Query {
         let path = path.to_string_lossy();
         let mut argv = self.args.to_vec();
         argv.push(&path);
-        let Ok(output) = sys.run(self.program, &argv) else {
-            return Answer::Undecided;
+        let output = match sys.run(self.program, &argv) {
+            Ok(output) => output,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Answer::Missing,
+            Err(_) => return Answer::Undecided,
         };
         if output.success {
             return (self.parse)(&output.stdout).map_or(Answer::Undecided, Answer::Owned);
@@ -673,7 +676,7 @@ fn query_owner(sys: &dyn System, unit: &Path) -> Option<Owner> {
                     not_owned = true;
                     break;
                 }
-                Answer::Undecided => {}
+                Answer::Undecided | Answer::Missing => {}
             }
         }
     }
@@ -681,6 +684,33 @@ fn query_owner(sys: &dyn System, unit: &Path) -> Option<Owner> {
         None
     } else {
         Some(Owner::Unknown)
+    }
+}
+
+/// Whether a package owns a file (`puzuz uninstall` asks before deleting a binary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileOwner {
+    Package(Owner),
+    /// No package owns it, or there is no package manager to own it.
+    NotOwned,
+    /// A package manager could not answer.
+    Unknown,
+}
+
+/// Asks every installed package manager whether a package owns the system path `path`.
+pub fn file_owner(sys: &dyn System, path: &Path) -> FileOwner {
+    let mut undecided = false;
+    for query in QUERIES {
+        match query.ask(sys, path) {
+            Answer::Owned(name) => return FileOwner::Package((query.owner)(name)),
+            Answer::Undecided => undecided = true,
+            Answer::NotOwned | Answer::Missing => {}
+        }
+    }
+    if undecided {
+        FileOwner::Unknown
+    } else {
+        FileOwner::NotOwned
     }
 }
 

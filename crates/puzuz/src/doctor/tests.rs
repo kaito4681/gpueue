@@ -940,6 +940,161 @@ fn install_method_is_reported() {
 }
 
 #[test]
+fn rhel_sudo_secure_path_without_usr_local_bin_is_explained() {
+    let (sys, _sockets) = healthy();
+    sys.write(
+        "/etc/systemd/system/puzuz.service",
+        &marker_unit("/usr/local/bin"),
+    );
+    sys.write(
+        "/etc/os-release",
+        "NAME=\"Rocky Linux\"\nID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n",
+    );
+    // Not readable (doctor without root): nothing to report.
+    assert!(run(&sys, None).find("sudo PATH").is_none());
+
+    sys.write(
+        "/etc/sudoers",
+        "Defaults   !visiblepw\n\
+         Defaults    secure_path = /sbin:/bin:/usr/sbin:/usr/bin\n\
+         Defaults:alice secure_path=/usr/local/bin\n\
+         #includedir /etc/sudoers.d\n",
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "sudo PATH"), Level::Info);
+    assert!(
+        message(&report, "sudo PATH").contains("(in /etc/sudoers) does not include /usr/local/bin"),
+        "{}",
+        message(&report, "sudo PATH")
+    );
+    assert!(hint(&report, "sudo PATH").contains("sudo /usr/local/bin/puzuz"));
+
+    // A drop-in that adds it (sudoers.d files with a dot are ignored, as by sudo).
+    sys.write(
+        "/etc/sudoers.d/ignored.conf",
+        "Defaults secure_path=\"/usr/local/bin:/usr/bin\"\n",
+    );
+    assert!(run(&sys, None).find("sudo PATH").is_some());
+    sys.write(
+        "/etc/sudoers.d/path",
+        "Defaults env_reset, secure_path=\"/usr/local/sbin:/usr/local/bin:/usr/bin\"\n",
+    );
+    assert!(run(&sys, None).find("sudo PATH").is_none());
+
+    // Not RHEL, or not in /usr/local/bin: nothing to report.
+    std::fs::remove_file(sys.path(Path::new("/etc/sudoers.d/path"))).unwrap();
+    sys.write("/etc/os-release", "ID=ubuntu\nID_LIKE=debian\n");
+    assert!(run(&sys, None).find("sudo PATH").is_none());
+    sys.write("/etc/os-release", "ID=fedora\n");
+    assert!(run(&sys, None).find("sudo PATH").is_some());
+    sys.write(
+        "/etc/systemd/system/puzuz.service",
+        &marker_unit("/usr/bin"),
+    );
+    assert!(run(&sys, None).find("sudo PATH").is_none());
+}
+
+/// A Rocky Linux machine with the binaries in /usr/local/bin and `sudoers` as /etc/sudoers.
+fn rocky_with_sudoers(sudoers: &str) -> (FakeSystem, Vec<UnixListener>) {
+    let (sys, sockets) = healthy();
+    sys.write(
+        "/etc/systemd/system/puzuz.service",
+        &marker_unit("/usr/local/bin"),
+    );
+    sys.write(
+        "/etc/os-release",
+        "ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n",
+    );
+    sys.write("/etc/sudoers", sudoers);
+    (sys, sockets)
+}
+
+fn sudo_path_reported(sys: &FakeSystem) -> bool {
+    run(sys, None).find("sudo PATH").is_some()
+}
+
+#[test]
+fn sudoers_are_read_in_sudos_order() {
+    // An include directory in the middle: the main file's later line wins.
+    let (sys, _sockets) = rocky_with_sudoers(
+        "@includedir /etc/sudoers.d\nDefaults secure_path=/sbin:/bin:/usr/sbin:/usr/bin\n",
+    );
+    sys.write(
+        "/etc/sudoers.d/path",
+        "Defaults secure_path=/usr/local/bin:/usr/bin\n",
+    );
+    assert!(sudo_path_reported(&sys));
+    let report = run(&sys, None);
+    assert!(message(&report, "sudo PATH").contains("(in /etc/sudoers)"));
+
+    // At the end, the drop-in wins.
+    sys.write(
+        "/etc/sudoers",
+        "Defaults secure_path=/sbin:/bin:/usr/sbin:/usr/bin\n#includedir /etc/sudoers.d\n",
+    );
+    assert!(!sudo_path_reported(&sys));
+
+    // `@include` of a file (relative to the including file), at its position.
+    sys.write(
+        "/etc/sudoers",
+        "Defaults secure_path=/usr/local/bin:/usr/bin\n@include sudoers.local\n",
+    );
+    sys.write("/etc/sudoers.local", "Defaults secure_path=/usr/bin\n");
+    let report = run(&sys, None);
+    assert!(
+        message(&report, "sudo PATH").contains("(in /etc/sudoers.local)"),
+        "{}",
+        message(&report, "sudo PATH")
+    );
+
+    // `!secure_path` unsets it: sudo keeps the caller's PATH.
+    sys.write(
+        "/etc/sudoers",
+        "Defaults secure_path=/usr/bin\nDefaults !secure_path\n",
+    );
+    assert!(!sudo_path_reported(&sys));
+}
+
+#[test]
+fn sudoers_continuations_and_comments() {
+    let (sys, _sockets) = rocky_with_sudoers(
+        "Defaults env_reset, \\\n    secure_path = /sbin:/bin:\\\n/usr/local/bin:/usr/bin\n",
+    );
+    assert!(!sudo_path_reported(&sys));
+
+    sys.write(
+        "/etc/sudoers",
+        "Defaults secure_path=\"/usr/local/bin:/usr/bin\" # the usual\n",
+    );
+    assert!(!sudo_path_reported(&sys));
+
+    // The comment does not count.
+    sys.write(
+        "/etc/sudoers",
+        "Defaults secure_path=/usr/bin # /usr/local/bin\n",
+    );
+    assert!(sudo_path_reported(&sys));
+}
+
+#[test]
+fn sudoers_that_cannot_be_read_with_confidence_skip_the_check() {
+    for sudoers in [
+        "Defaults secure_path=/usr/bin\n@include /etc/sudoers.%h\n",
+        "Defaults secure_path=/usr/bin\n@include /etc/missing\n",
+        "Defaults secure_path+=/usr/bin\n",
+        "Defaults secure_path=\"/usr/bin\n",
+        "Defaults secure_path\n",
+    ] {
+        let (sys, _sockets) = rocky_with_sudoers(sudoers);
+        assert!(!sudo_path_reported(&sys), "{sudoers:?}");
+    }
+    // An include loop.
+    let (sys, _sockets) =
+        rocky_with_sudoers("Defaults secure_path=/usr/bin\n@include /etc/sudoers\n");
+    assert!(!sudo_path_reported(&sys));
+}
+
+#[test]
 fn a_masked_or_overridden_package_does_not_fail() {
     let (sys, _sockets) = healthy();
     install_package(&sys);
@@ -973,7 +1128,7 @@ fn mixed_install_methods_fail() {
     assert_eq!(level(&report, "install method"), Level::Fail);
     assert!(message(&report, "install method").starts_with("mixed: "));
     let hint = hint(&report, "install method");
-    assert!(hint.contains("sudo puzuz service uninstall"), "{hint}");
+    assert!(hint.contains("sudo puzuz uninstall"), "{hint}");
     assert!(hint.contains("sudo apt remove puzuz"), "{hint}");
 }
 
@@ -1053,7 +1208,7 @@ fn units_installed_in_different_ways_warn() {
     assert_eq!(level(&report, "install method"), Level::Fail);
     assert!(message(&report, "install method").contains("conflict"));
     let hint = hint(&report, "install method");
-    assert!(hint.contains("sudo puzuz service uninstall"), "{hint}");
+    assert!(hint.contains("sudo puzuz uninstall"), "{hint}");
     assert!(hint.contains("sudo apt remove puzuz"), "{hint}");
 }
 

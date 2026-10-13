@@ -71,16 +71,17 @@ The installer sets up the systemd units, the `puzuz` user, the `puzuz-admin` gro
 directories and a default /etc/puzuz/config.toml, starts the services and prints the
 `puzuz doctor` report. It does not install CRIU or cuda-checkpoint; it tells you if they are
 missing. Update later with `sudo puzuz update` (running jobs keep running; pass `--save-token`
-to the installer once, or `GH_TOKEN` each time). `--uninstall` removes it and keeps the data. Other ways to install (apt, rpm, AUR) are coming later; until then you can
+to the installer once, or `GH_TOKEN` each time). Remove it with `sudo puzuz uninstall`, which
+keeps the data (`--purge` deletes it too). Other ways to install (apt, rpm, AUR) are coming later; until then you can
 also build from source (see [docs/install.md](docs/install.md)).
 
-With Nix (x86_64 or aarch64), build the flake and install the service from the result; keep the
-`result` link, since the installed copies use the Nix store (see
+With Nix (x86_64 or aarch64), build the flake and install the service from the result (it is
+copied to /usr/local/bin and kept from Nix's garbage collection; see
 [Installing with Nix](docs/install.md#installing-with-nix); a NixOS module is coming soon):
 
 ```sh
-nix build github:kaito4681/puzuz/stable --out-link ~/.local/state/puzuz/result
-sudo ~/.local/state/puzuz/result/bin/puzuz service install --bin-dir /usr/local/bin
+nix build github:kaito4681/puzuz/stable
+sudo ./result/bin/puzuz service install
 ```
 
 ```sh
@@ -178,6 +179,7 @@ Extra commands and options:
 | `restore [IDS] [-g GROUP] [-a] [-i]` | resume `Checkpointed` jobs (`-i`: right away, ignoring free slots) |
 | `gpu [-j]`, `gpu parallel <N> [--gpu LIST]` | list GPUs, or set the per-GPU job limit (administrators) |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | manage the systemd services; install exits non-zero if the final check fails (see [docs/install.md](docs/install.md)) |
+| `uninstall [--purge] [--yes]` | remove the services and the binaries `service install` copied (administrators) |
 | `doctor` | check the installation |
 | `daemon` | run the daemon in the foreground (systemd does this) |
 
