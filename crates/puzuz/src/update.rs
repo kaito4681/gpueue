@@ -48,6 +48,8 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long to wait for the new daemon after installing it.
 const RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Pauses before sending a GET again after the server dropped the connection, one per retry.
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(200), Duration::from_secs(1)];
 
 /// A failed update; the message is meant for the user.
 pub type Result<T, E = String> = std::result::Result<T, E>;
@@ -210,10 +212,19 @@ impl<'a> Client<'a> {
         if let Some(auth) = &auth {
             headers.push(("Authorization", auth));
         }
-        let response = self
-            .sys
-            .http_get(&url, &headers, timeout)
-            .map_err(|err| (0, format!("cannot reach {}: {err}", self.api)))?;
+        let mut retry_delays = RETRY_DELAYS.iter();
+        let response = loop {
+            match self.sys.http_get(&url, &headers, timeout) {
+                Ok(response) => break response,
+                // A GET is idempotent: send it again when the server dropped the connection
+                // (e.g. a pooled keep-alive one); other failures and HTTP errors are final.
+                Err(err) if err.connection_lost => match retry_delays.next() {
+                    Some(delay) => self.sys.sleep(*delay),
+                    None => return Err((0, format!("cannot reach {}: {err}", self.api))),
+                },
+                Err(err) => return Err((0, format!("cannot reach {}: {err}", self.api))),
+            }
+        };
         match response.status {
             200 => Ok(response.body),
             401 | 403 | 404 => Err((response.status, self.no_access(path, response.status))),
