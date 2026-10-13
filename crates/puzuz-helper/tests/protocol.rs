@@ -13,6 +13,7 @@ use puzuz_checkpoint::{CudaMode, Executor};
 use puzuz_helper::access::VerifyRequest;
 use puzuz_helper::config::SHUTDOWN_MANIFEST;
 use puzuz_helper::engine::{ManifestEntry, ManifestResult};
+use puzuz_helper::gcroots::GcRoots;
 use puzuz_helper::host::DumpHazards;
 use puzuz_helper::launcher::fake::FakeLauncher;
 use puzuz_helper::launcher::{Launcher, UnitState};
@@ -560,6 +561,75 @@ async fn recovery_readopts_running_jobs_and_reports_exits() {
         }
     );
     assert_eq!(c.running().await, [(JobId(7), RunningPhase::Running)]);
+}
+
+#[tokio::test]
+async fn nix_gc_roots_follow_jobs_and_their_checkpoints() {
+    let mut env = Env::new().await;
+    // A helper "in the Nix store".
+    let store = env.root.join("store");
+    let gcroots = env.root.join("gcroots");
+    let bin = store.join("abc-puzuz-0.1.0/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&gcroots).unwrap();
+    let exe = bin.join("puzuz-helper");
+    std::fs::write(&exe, b"").unwrap();
+    let mut cfg = with_mode(config(&env.root, uid()), &env.root, CudaMode::Manual);
+    cfg.gc_roots = GcRoots::new(&gcroots, &store, &exe);
+    env.restart_with(cfg.clone()).await;
+    let root = |job: u64| gcroots.join(format!("puzuz/job-{job}"));
+    let rooted = |job: u64| std::fs::symlink_metadata(root(job)).is_ok();
+
+    let mut c = env.client().await;
+    for job in [1, 2] {
+        assert!(matches!(
+            c.request(Request::Spawn(env.spawn_req(job))).await,
+            ResponseResult::Spawned { .. }
+        ));
+    }
+    assert_eq!(
+        std::fs::read_link(root(1)).unwrap(),
+        store.join("abc-puzuz-0.1.0")
+    );
+
+    // A job that exits needs nothing any more.
+    env.launcher.exit(JobId(1), ExitStatus::Exited { code: 0 });
+    assert!(matches!(c.event().await.event, Event::JobExited { .. }));
+    assert!(!rooted(1));
+
+    // A checkpoint keeps the root until it is deleted.
+    let image_dir = env.base().join("2");
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(2),
+            image_dir: image_dir.clone(),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    assert!(matches!(
+        c.event().await.event,
+        Event::CheckpointFinished {
+            outcome: CheckpointOutcome::Success { .. },
+            ..
+        }
+    ));
+    assert!(rooted(2));
+    assert_eq!(
+        c.request(Request::DeleteCheckpoint {
+            job: JobId(2),
+            image_dir
+        })
+        .await,
+        ResponseResult::Ok
+    );
+    assert!(!rooted(2));
+    drop(c);
+
+    // Roots of jobs the helper does not know go when it starts.
+    std::os::unix::fs::symlink(store.join("abc-puzuz-0.1.0"), root(9)).unwrap();
+    env.restart_with(cfg).await;
+    assert!(!rooted(9));
 }
 
 #[tokio::test]

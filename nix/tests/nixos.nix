@@ -5,9 +5,14 @@
 #      copy, and `puzuz doctor` reports no failure (only GPU warnings);
 #   2. a normal user's job runs with the user's PATH and finishes;
 #   3. a job is checkpointed with CRIU and restored, and keeps counting;
-#   4. switching to another package (a specialisation) restarts the daemon
+#   4. a checkpoint keeps the helper that ran the job: a job started by a
+#      helper from a store path that no system generation refers to is
+#      checkpointed, the helper goes back to the system's package,
+#      `nix-collect-garbage -d` runs, and the job is restored (the helper's
+#      GC root kept that store path; once the job is gone, GC deletes it);
+#   5. switching to another package (a specialisation) restarts the daemon
 #      and the helper from the new store paths while a job keeps running;
-#   5. `enable = false` (another specialisation) removes the units.
+#   6. `enable = false` (another specialisation) removes the units.
 { self, pkgs }:
 let
   inherit (pkgs) lib;
@@ -15,6 +20,12 @@ let
   # The same binaries at another store path: to NixOS this is an upgrade
   # (every ExecStart= changes) without building puzuz twice.
   puzuzCopy = pkgs.runCommand "puzuz-copy-${puzuz.version}" { } ''
+    cp -a ${puzuz} "$out"
+  '';
+  # Another copy that is in the VM's store but in no system closure (a
+  # specialisation is part of the booted system, so GC never deletes it):
+  # only a GC root of the helper keeps it.
+  puzuzOld = pkgs.runCommand "puzuz-old-${puzuz.version}" { } ''
     cp -a ${puzuz} "$out"
   '';
 in
@@ -36,6 +47,7 @@ pkgs.testers.runNixOSTest {
 
     virtualisation.memorySize = 2048;
     virtualisation.cores = 2;
+    virtualisation.additionalPaths = [ puzuzOld ];
 
     specialisation.upgraded.configuration.services.puzuz.package = puzuzCopy;
     specialisation.disabled.configuration.services.puzuz.enable = lib.mkForce false;
@@ -118,6 +130,44 @@ pkgs.testers.runNixOSTest {
         wait_counting(job, before)
         pz("alice", f"kill {job}")
         wait_state(job, "done")
+
+    with subtest("a checkpoint keeps the helper that ran the job across GC"):
+        dropin = "/run/systemd/system/puzuz-helper.service.d"
+
+        def restart_helper():
+            machine.succeed("systemctl daemon-reload")
+            machine.succeed("systemctl restart puzuz-helper.service")
+            machine.wait_for_unit("puzuz-helper.service")
+            retry(lambda _: "helper: connected" in machine.succeed("puzuz doctor 2>&1 || true"), 60)
+
+        machine.succeed(f"mkdir -p {dropin}")
+        machine.succeed(
+            f"printf '[Service]\\nExecStart=\\nExecStart=${puzuzOld}/bin/puzuz-helper serve\\n'"
+            f" > {dropin}/old.conf"
+        )
+        restart_helper()
+        job = add("alice", COUNTER)
+        wait_state(job, "running")
+        wait_counting(job, 5)
+        root = f"/nix/var/nix/gcroots/puzuz/job-{job}"
+        assert machine.succeed(f"readlink {root}").strip() == "${puzuzOld}"
+        pz("alice", f"checkpoint {job}")
+        wait_state(job, "checkpointed", 120)
+        before = last_count(job)
+        # Back to the system's helper, then collect everything unrooted.
+        machine.succeed(f"rm -r {dropin}")
+        restart_helper()
+        machine.succeed("nix-collect-garbage -d")
+        machine.succeed("test -x ${puzuzOld}/bin/puzuz-helper")
+        pz("alice", f"restore {job}")
+        wait_state(job, "running", 120)
+        wait_counting(job, before)
+        pz("alice", f"kill {job}")
+        wait_state(job, "done")
+        # Gone with the job: now GC may delete the old helper.
+        machine.succeed(f"test ! -L {root}")
+        machine.succeed("nix-collect-garbage -d")
+        machine.succeed("test ! -e ${puzuzOld}")
 
     with subtest("switching the package keeps jobs running"):
         job = add("alice", COUNTER)
