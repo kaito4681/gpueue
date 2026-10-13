@@ -1,0 +1,178 @@
+<a id="architecture"></a>
+# 架构
+
+[English](../architecture.md) | [日本語](../ja/architecture.md) | 简体中文
+
+<a id="components"></a>
+## 组件
+
+| 进程 | 运行身份 | 职责 |
+| --- | --- | --- |
+| `puzuz`（CLI） | 调用它的用户 | 通过 Unix 套接字上的 HTTP 向守护进程发送请求 |
+| `puzuz daemon`（`puzuz.service`） | 系统用户 `puzuz`，沙箱化，无 capability | HTTP API、授权、调度器、SQLite 状态。决定作业何时启动、停止、创建检查点和恢复。 |
+| `puzuz-helper`（`puzuz-helper.service`） | root | 以所有者身份启动作业、向其发送信号，并运行 CRIU 和 cuda-checkpoint。只接受来自守护进程用户的连接。 |
+| 作业单元（`puzuz-job-<id>.service`，第 n 次恢复后为 `puzuz-job-<id>-r<n>.service`） | 先是 root shim，然后是作业所有者 | 每个作业一个临时（transient）systemd 服务 |
+
+HTTP 服务器和数据库以非特权身份运行。root helper 的依赖树很小（没有 HTTP 服务器，没有 SQLite），
+并且自行校验每个请求：uid（绝不能是 0）、以所有者权限打开的工作目录和日志，以及位于其检查点目录下的镜像路径。
+
+<a id="how-a-job-flows"></a>
+## 作业的流程
+
+```
+puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──NDJSON over /run/puzuz/helper.sock──▶ puzuz-helper
+  (SO_PEERCRED identifies the caller)                (SQLite, scheduler)                                   │ D-Bus
+                                                                                                           ▼
+                                                                         systemd: puzuz-job-<id>.service ─▶ shim ─▶ sh -c '<command>'
+```
+
+1. **CLI → 守护进程。** CLI 向 `/run/puzuz/puzuz.sock` 发送 `/v1` 下的 REST/JSON 请求（例如 `POST /v1/jobs`），
+   并带有 `x-puzuz-version` 请求头。守护进程从 `SO_PEERCRED` 读取调用者的 uid，检查授权并保存作业。
+   日志以原始字节流的形式传输，状态变化则以 Server-Sent Events（`/v1/events`）传输。待处理的警告（例如转储失败）
+   通过 `x-puzuz-warnings` 响应头返回，由 CLI 打印到 stderr。
+2. **调度。** 当排队作业的组有空闲槽位，且其申请的每块 GPU 都有空闲槽位时，该作业启动。
+   守护进程随后请求 helper 创建它。
+3. **守护进程 → helper。** 守护进程与 `/run/puzuz/helper.sock` 保持一个连接，交换以换行分隔的 JSON。
+   首先由 Hello 消息检查协议版本。之后是带 id 的请求，以及来自 helper 的带编号的事件（作业已退出、检查点或恢复已完成）。
+   事件会被持久化，并在守护进程确认之前反复重放，因此守护进程停止期间不会丢失任何内容。
+   守护进程会把它最后应用的事件编号与该事件的效果一起保存，并跳过编号不超过它的重放事件，
+   因此即使守护进程在确认之前停止，一个事件也只会被应用一次。无法解码的事件（来自更新版本的 helper）
+   会被记录到日志并确认，而不会断开连接。重新连接后，双方会核对各自的作业列表：helper 已不再运行的作业视为丢失（lost）；
+   守护进程认为正在创建检查点、但 helper 仍在正常运行的作业，说明其检查点请求已丢失，该作业会以检查点失败的状态回到
+   运行（或暂停）状态。超时的检查点请求也按同样的方式处理。
+4. **helper → systemd。** helper 通过 D-Bus 启动一个临时服务，其主进程为
+   `puzuz-helper shim`。该单元设置了 `Before=puzuz-helper.service` 和 `KillMode=mixed`，stdin 为
+   `/dev/null`，停止超时为 `grace_secs`。每个作业都位于自己的 cgroup 中，独立于守护进程、helper 和用户会话，
+   因此在守护进程和 helper 重启以及用户注销后仍能继续存在。
+5. **Shim。** shim 仍以 root 身份运行，它创建一个 PID 命名空间和一个挂载命名空间，并在触发主机的自动挂载点之后
+   （以便命名空间获得自动挂载的文件系统）启动该命名空间的 init。init 把挂载设为私有，并挂载一个新的 `/proc`。它会移除被其他挂载遮盖的挂载以及重启后不会保留的挂载
+   （`/run/*`、`/media/*`），把每个叠加在其 `autofs` 挂载之上的自动挂载文件系统替换为普通的副本，
+   并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs。然后它切换到所有者的
+   uid、gid 和组并设置 `no_new_privs`，以所有者身份打开日志
+   （`/var/lib/puzuz/logs/<uid>/<id>.log`）和工作目录，并通过 `sh -c` 运行命令。
+   环境变量为客户端的环境变量，再加上 `CUDA_VISIBLE_DEVICES`、
+   `CUDA_DEVICE_ORDER=PCI_BUS_ID` 以及 `LD_PRELOAD` 中的 fork guard。
+6. **检查点。** helper 检查可用空间和挂载。如果检查失败，它会在触碰作业之前拒绝转储，作业继续运行，
+   `checkpoint` 请求会失败并给出原因（只有在应当转储时才发现的拒绝，会改为随结果一起报告，并由守护进程警告所有者）。
+   在手动模式下，它随后对每个 CUDA 进程运行
+   `cuda-checkpoint --action lock` 和 `checkpoint`，接着以 `--tcp-close` 和
+   `/var/lib/puzuz/checkpoints/<id>/` 下的镜像目录对命名空间的 init 执行 `criu dump`。
+   在插件模式下，它只运行 `criu dump`，使用 CRIU 的默认插件目录，由 CRIU 的 `cuda_plugin.so` 调用 cuda-checkpoint
+   （在插件模式下，如果插件缺失，CUDA 作业会被拒绝）。它最后写入 `meta.json`（包含模式）和 `COMPLETE` 标记。
+   转储成功后进程停止。如果转储失败，CRIU 会让进程继续运行，随后由守护进程将其终止。helper 会把 CRIU 的
+   `dump.log` 移动到 `/var/lib/puzuz/checkpoints/failed-logs/`，并删除镜像目录。
+   **暂停**的作业会在转储之前被继续（SIGCONT），因为 cuda-checkpoint 在已停止的进程上会挂起。
+   守护进程在检查点记录中记下该作业曾处于暂停状态，并在它恢复后或转储被拒绝时立即再次暂停它（SIGSTOP）。
+   因此，在转储期间和恢复之后的短暂时间内，作业会运行片刻。转储进行中时 `pause` 会被拒绝。
+7. **恢复。** helper 检查 GPU 型号、驱动、可用显存和挂载：CRIU 要绑定的路径必须存在，作业在转储时所在的文件系统
+   （记录在 `helper-mounts.json` 中）必须以相同类型挂载在相同位置（自动挂载点会被触发），
+   并且作业曾打开的文件和工作目录必须存在。它启动一个新单元 `puzuz-job-<id>-r<n>.service`，在 `/` 的 bind 挂载
+   （`/run/puzuz-helper/criu-root`）上运行 `criu restore --root`。在手动模式下，它随后对 CUDA 进程运行 cuda-checkpoint 的
+   `restore` 和 `unlock`。在插件模式下，CRIU 的插件会在 `criu restore` 返回之前完成这些操作。
+   每个镜像都以其转储时的模式恢复，而不管 `cuda_checkpoint_mode` 现在的设置。作业保留其 id 和日志，镜像随后被删除。
+   CRIU 以 root 身份按转储时的路径重新打开作业的文件，因此恢复过程会防范所有者在转储后更改这些路径（参见
+   [恢复与路径](#restores-and-paths)）。
+
+<a id="restores-and-paths"></a>
+## 恢复与路径
+
+CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑定恢复作业的所有内容。转储之后，
+所有者可以改变这样的路径所指向的对象，例如把自己的某个目录替换为指向 `/etc` 的符号链接；如果不加防范，
+恢复后的作业就会以转储时的模式持有一个 root 的文件。因此 helper 会：
+
+- **在转储时**拒绝在主机文件系统上绑定了 Unix 套接字的作业（CRIU 在恢复时会以 root 身份对这些路径执行绑定、
+  unlink 和 chown；作业自己的 `/tmp` 下的套接字没有问题），把主机文件系统上已删除的文件保存到镜像中，
+  而不是用 `--link-remap` 把它们链接回去（CRIU 会在转储期间以 root 身份按路径执行该操作），并记录作业运行时所属的组；
+- **在恢复之前**，如果所有者已离开其中某个组、镜像中有绑定在主机文件系统上的套接字，或者镜像中的某个路径
+  （`files.img`）已无法由所有者在途中不经过符号链接而到达（以所有者身份通过
+  `openat2(RESOLVE_NO_SYMLINKS)` 检查），则拒绝恢复；
+- **在恢复的作业运行之前**，检查 CRIU 实际打开了什么：CRIU 将
+  `puzuz-helper verify-restore-hook` 作为其 `pre-resume` 动作脚本（`--action-script`）运行，
+  此时恢复的任务已经完整，但仍在其控制下处于停止状态；该 hook 的子进程
+  （`puzuz-helper verify-access`）通过 `/proc` 固定（pin）任务的每个打开的文件、工作目录和根目录、
+  可执行文件以及文件映射，进入作业的挂载命名空间，切换到所有者身份，并要求所有者能够以它被打开的方式访问其中每一项
+  （对固定的文件执行 `faccessat2`），并且能够按其路径、不经过符号链接到达它，且是同一个 inode。
+  它还要求每个任务都以所有者身份运行，所属的组是所有者仍在其中的组，并且没有 capability。
+  位于作业自身挂载上的文件（`/proc`、私有 tmpfs）来自镜像，会被跳过。对于作业在转储时就已持有的文件，
+  只需要其路径通向那个文件本身：作业持有文件的方式可能是其所有者无法再次打开的方式（以只读方式创建，
+  或位于把文件显示为 root 所有的 sshfs 挂载上），而取回同一个文件并不会给它带来任何新的权限。
+  判断是否为同一文件的依据是：它具有转储前记录的设备号和 inode，或者（重新挂载后，设备号会变化，
+  sshfs 等 FUSE 文件系统会重新编号其 inode）具有转储后立即记录的所有者、组、模式、大小、修改时间和变更时间；
+  变更时间无法由用户设置，而在该位置重命名或链接另一个文件会改变它（参见
+  [文件系统与挂载](install.md#filesystems-and-mounts)）。如果 hook 发现问题，它会在任务
+  仍处于停止状态时将其终止（CRIU 本身会忽略失败的 `pre-resume` 脚本），因此这些任务永远不会运行；
+  恢复会失败并给出原因，镜像会被保留。如果 hook 根本没有运行，helper 会在 `criu restore` 返回后立即终止恢复的作业。
+
+最后一项检查查看的是 CRIU 打开的对象，因此通过更改路径与它竞争是没有用的。
+剩下的是 CRIU 自身在该检查之前以 root 身份处理路径的短暂窗口：重新创建保存在镜像中的已删除文件
+（一个名为 `<name>.cr.<id>.ghost` 的文件，只短暂存在，归作业所有者所有），或创建其路径上缺失的目录。
+在预检查与那一刻之间替换目录的所有者，可以让这样的临时文件出现在另一个目录中。
+
+如果 helper 在恢复期间崩溃，它下次启动时会终止恢复单元中运行的任何东西（它未经检查，且在手动模式下其 CUDA 状态可能尚未恢复），
+并将该恢复报告为失败；镜像会被保留。
+
+<a id="other-privilege-boundaries"></a>
+## 其他权限边界
+
+- helper 通过一个私有的、归 root 所有的暂存目录（只通过文件描述符使用）把它的套接字绑定到守护进程用户所拥有的
+  `/run/puzuz` 中。它一次只服务一个守护进程会话（新会话会取代旧会话），最多允许少量连接等待其 Hello，
+  并限制一个会话的队列和进行中请求的数量。
+- shim 在降低权限之前以 root 身份处理作业的挂载命名空间。它首先查找所有者的组（NSS 会按路径加载库），
+  并且只通过文件描述符移动挂载，这些文件描述符只经由只有 root 能修改的目录、且不跟随符号链接地获取一次，
+  因此所有者无法把挂载重定向到系统目录上。
+- 启动时，helper 会拒绝它要写入或从中加载代码的目录（包括传给 `criu -L` 的
+  `<data_dir>/criu-no-plugins`，以及 fork guard 的 `<data_dir>/lib`），除非这些目录及其父目录都归 root 所有。
+
+<a id="shutdown-ordering"></a>
+## 关机顺序
+
+- **操作系统关机或重启。** systemd 按启动的相反顺序停止单元。
+  `puzuz.service` 设置了 `After=puzuz-helper.service`，因此守护进程先停止。停止守护进程永远不会停止作业。
+  `puzuz-helper.service` 在本地和远程文件系统、D-Bus、
+  `nvidia-persistenced` 和 `nvidia-fabricmanager` 之后运行，因此在它停止期间这些服务仍然可用。
+  收到 SIGTERM 时，helper 会询问 systemd 整个系统是否正在停止。如果是，它会拒绝新的工作，
+  逐个转储每个运行中的作业（`--no-checkpoint` 作业除外），并不断延长自己的停止超时，直到正在进行的转储的期限结束
+  （再加上其回滚时间），然后写入 `shutdown-manifest.json`。每次检查点和恢复都有一个随作业大小而变化的期限；
+  超过期限时，该工具的整个进程树会被终止，检查点会被回滚（作业被解冻，其 CUDA 状态被恢复并解锁；
+  在插件模式下，被终止的 CRIU 的插件可能让 CUDA 进程停留在锁定或已创建检查点的状态，helper 会通过
+  `cuda-checkpoint --get-state` 查询，并按需恢复和解锁它们）。暂停的作业也会被转储
+  （先被继续），并在 `puzuz restore` 之后以暂停状态回来。作业单元设置了
+  `Before=puzuz-helper.service`，因此 systemd 只在 helper 完成之后才停止它们。下次启动时，
+  守护进程从 helper 重放的事件中获取结果，并将这些作业标记为
+  `Checkpointed`。转储失败或被拒绝的作业已被 systemd 停止。它们被标记为
+  `Checkpoint failed` 并附带原因，其所有者会收到警告。
+- **`puzuz shutdown`**（管理员）不依赖单元顺序。守护进程逐个为运行中的作业创建检查点
+  （或在 `--no-checkpoint` 时终止它们），等待它们稳定下来，然后退出。helper 继续运行。转储失败的作业会被终止。
+  转储被 helper 拒绝的作业会继续运行，因为终止它会丢失工作成果。守护进程会记录一条警告，所有者也会收到警告。
+  如有需要，请用 `puzuz kill` 或 `puzuz shutdown --no-checkpoint` 停止它。
+- 单独执行 **`systemctl stop/restart puzuz-helper` 或 `puzuz`** 时，作业会继续运行。
+
+<a id="state"></a>
+## 状态
+
+| 数据 | 位置 | 所有者 |
+| --- | --- | --- |
+| 作业、组、GPU 槽位上限、检查点记录、待处理的警告 | `/var/lib/puzuz/daemon/state.sqlite`（WAL，用 `PRAGMA user_version` 管理 schema 版本） | 守护进程 |
+| 作业记录、事件队列 | `/var/lib/puzuz/helper/` | helper |
+| 作业输出 | `/var/lib/puzuz/logs/<uid>/<id>.log` | 目录由 helper 创建（归该用户所有，组为 `puzuz`，模式 2770）。shim 以所有者身份写入日志。守护进程读取和截断日志时不跟随符号链接，并且仅当它是归作业所有者所有的普通文件时才这样做。 |
+| 检查点镜像 | `/var/lib/puzuz/checkpoints/<id>/` | helper（仅 root） |
+| 配置 | `/etc/puzuz/config.toml` | root |
+
+只有守护进程写入数据库。CLI 始终通过守护进程进行操作。
+
+<a id="crate-layout"></a>
+## crate 布局
+
+| Crate | 内容 |
+| --- | --- |
+| `crates/puzuz` | `puzuz` 二进制文件：兼容 pueue 的 CLI、`puzuz daemon`、`service`、`doctor`、`update`（唯一带有 HTTPS 客户端的 crate） |
+| `crates/puzuz-core` | 领域模型、作业生命周期、调度决策、授权、SQLite 存储（没有其他 I/O） |
+| `crates/puzuz-protocol` | 通信类型：CLI ⇄ 守护进程（HTTP API 和客户端）、守护进程 ⇄ helper（NDJSON 消息） |
+| `crates/puzuz-config` | `/etc/puzuz/config.toml` 的 schema，由守护进程、helper（带 root 所有权检查）和 `doctor` 共用 |
+| `crates/puzuz-daemon` | 守护进程：axum API、调度循环、helper 客户端、GPU 检测（NVML） |
+| `crates/puzuz-checkpoint` | CRIU 和 cuda-checkpoint 的命令计划、带超时和回滚的执行、镜像布局 |
+| `crates/puzuz-helper` | `puzuz-helper` 二进制文件：套接字服务器、作业引擎、systemd 启动器、shim、挂载分析、fork guard（`forkguard/forkguard.c`，嵌入在二进制文件中） |
+
+systemd 单元、sysusers.d 和 tmpfiles.d 片段以及默认配置位于
+[`packaging/`](../../packaging) 中，并嵌入到 `puzuz` 二进制文件中，供 `puzuz service install` 使用。
+AUR 软件包（`packaging/aur/puzuz-bin`）原样安装相同的文件。
