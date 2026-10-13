@@ -397,7 +397,10 @@ fn check_install_method(sys: &dyn System) -> Check {
     const NAME: &str = "install method";
     let detection = install_method::detect(sys);
     let method = &detection.install;
-    match method {
+    let check = match method {
+        InstallMethod::None if detection.os.is_nixos() => {
+            Check::info(NAME, "not installed (NixOS: use the services.puzuz module)")
+        }
         InstallMethod::None => Check::info(NAME, "not installed"),
         InstallMethod::One(Method::Manual { unit }) => {
             Check::info(NAME, method.to_string()).hint(format!(
@@ -412,6 +415,14 @@ fn check_install_method(sys: &dyn System) -> Check {
             "`sudo systemctl unmask {}` lets the packaged unit run again",
             crate::service::DAEMON_UNIT
         )),
+        InstallMethod::One(Method::Unowned { unit, .. }) => {
+            let unit = unit.display();
+            Check::warn(NAME, method.to_string()).hint(format!(
+                "if it is left over from a removed package, delete it (`sudo rm {unit}`); to \
+                 switch to `puzuz service install`, delete it first or run `sudo puzuz service \
+                 install --force`"
+            ))
+        }
         InstallMethod::One(_) => Check::ok(NAME, method.to_string()),
         InstallMethod::Mixed(methods) => {
             let fixes: Vec<String> = methods
@@ -426,13 +437,48 @@ fn check_install_method(sys: &dyn System) -> Check {
                     format!("to keep {kept}: {}", detection.removal_hint(m))
                 })
                 .collect();
-            Check::fail(
+            return Check::fail(
                 NAME,
                 format!("{method}; their units and data directories conflict"),
             )
-            .hint(format!("remove all but one of them:\n{}", fixes.join("\n")))
+            .hint(format!("remove all but one of them:\n{}", fixes.join("\n")));
         }
+    };
+    if check.level >= Level::Warn {
+        return check;
     }
+    if let Some(partial) = &detection.partial {
+        let hint = match detection.managed_elsewhere() {
+            Some(managed) => format!(
+                "keep one installation: to keep {managed}, delete the other unit; otherwise \
+                 {}",
+                detection.removal_hint(managed)
+            ),
+            None => "both units must come from the same installation: re-run it (e.g. `sudo \
+                     puzuz service install`) or delete the stray unit"
+                .to_owned(),
+        };
+        return Check::warn(NAME, partial.clone()).hint(hint);
+    }
+    if !detection.leftovers.is_empty() {
+        let leftovers: Vec<String> = detection
+            .leftovers
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        return Check::warn(
+            NAME,
+            format!(
+                "{method}; no package owns {} (shadowed by the units in {UNIT_DIR})",
+                leftovers.join(" and ")
+            ),
+        )
+        .hint(format!(
+            "remove the leftover /usr/lib unit: `sudo rm {}`",
+            leftovers.join(" ")
+        ));
+    }
+    check
 }
 
 fn check_criu(sys: &dyn System, configured: &Path) -> Check {

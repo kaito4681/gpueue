@@ -379,18 +379,25 @@ pub struct UpdateOptions {
     pub yes: bool,
 }
 
-/// How to update puzuz installed with `method`, for messages.
+/// How to update puzuz installed as `detection` says, for messages.
 fn how_to_update(detection: &Detection, version: Option<&Version>) -> String {
     match &detection.install {
-        InstallMethod::One(Method::ServiceInstall { .. }) => match version {
-            Some(version) => format!("sudo puzuz update --version {version}"),
-            None => "sudo puzuz update".to_owned(),
-        },
-        InstallMethod::One(method) => detection.update_hint(method),
-        InstallMethod::None => "install it with install.sh (see docs/install.md)".to_owned(),
-        InstallMethod::Mixed(_) => {
+        InstallMethod::One(Method::ServiceInstall { .. })
+            if detection.managed_elsewhere().is_none() =>
+        {
+            match version {
+                Some(version) => format!("sudo puzuz update --version {version}"),
+                None => "sudo puzuz update".to_owned(),
+            }
+        }
+        InstallMethod::One(Method::ServiceInstall { .. }) | InstallMethod::Mixed(_) => {
             "puzuz is installed in more than one way; run `puzuz doctor` first".to_owned()
         }
+        InstallMethod::One(method) => detection.update_hint(method),
+        InstallMethod::None if detection.os.is_nixos() => {
+            "install it with the `services.puzuz` NixOS module (see docs/install.md)".to_owned()
+        }
+        InstallMethod::None => "install it with install.sh (see docs/install.md)".to_owned(),
     }
 }
 
@@ -398,6 +405,15 @@ fn how_to_update(detection: &Detection, version: Option<&Version>) -> String {
 /// install over this one.
 fn service_install_bin_dir(detection: &Detection) -> Result<PathBuf> {
     let method = &detection.install;
+    if let (InstallMethod::One(Method::ServiceInstall { .. }), Some(managed)) =
+        (method, detection.managed_elsewhere())
+    {
+        return Err(format!(
+            "puzuz is installed in more than one way ({}; one of them is {managed}); run \
+             `puzuz doctor` and remove all but one first",
+            detection.partial.as_deref().unwrap_or("its units disagree")
+        ));
+    }
     match method {
         InstallMethod::One(Method::ServiceInstall { bin_dir: Some(dir) }) => Ok(dir.clone()),
         InstallMethod::One(Method::ServiceInstall { bin_dir: None }) => Err(
@@ -405,11 +421,10 @@ fn service_install_bin_dir(detection: &Detection) -> Result<PathBuf> {
                  re-run `sudo puzuz service install --bin-dir /usr/local/bin` first"
                 .to_owned(),
         ),
-        InstallMethod::None => Err(
-            "puzuz is not installed as a service; install it with install.sh (see \
-                 docs/install.md)"
-                .to_owned(),
-        ),
+        InstallMethod::None => Err(format!(
+            "puzuz is not installed as a service; {}",
+            how_to_update(detection, None)
+        )),
         InstallMethod::One(other) => Err(format!(
             "puzuz is installed as {other}; `puzuz update` only updates what \
                  `puzuz service install` installed. To update it, {}.",

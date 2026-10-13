@@ -399,9 +399,15 @@ impl Detection {
         self.install.keyword()
     }
 
-    /// The methods of both units.
+    /// The methods of both units (each once).
     pub fn methods(&self) -> impl Iterator<Item = &Method> {
-        self.install.methods().iter().chain(self.helper.methods())
+        let daemon = self.install.methods();
+        daemon.iter().chain(
+            self.helper
+                .methods()
+                .iter()
+                .filter(move |method| !daemon.contains(method)),
+        )
     }
 
     /// A unit of puzuz is owned by a package manager or Nix.

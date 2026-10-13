@@ -925,3 +925,186 @@ fn status_reports_the_install_method() {
     let out = String::from_utf8(out).unwrap();
     assert!(out.contains("installed              mixed: "), "{out}");
 }
+
+fn symlink(sys: &FakeSystem, target: &str, link: &str) {
+    let local = sys.path(Path::new(link));
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(target, local).unwrap();
+}
+
+/// Both units in /usr/lib, owned by no package.
+fn unowned_units(sys: &FakeSystem) {
+    for unit in [PACKAGED_UNIT, PACKAGED_HELPER_UNIT] {
+        sys.write(unit, "[Service]\nExecStart=/usr/bin/puzuz daemon\n");
+    }
+    sys.respond("dpkg-query -S", CmdOutput::failed("", "no path found\n"));
+    sys.missing("rpm");
+    sys.missing("pacman");
+}
+
+#[test]
+fn install_refuses_a_package_of_unknown_origin_even_with_force() {
+    let sys = system();
+    for unit in [PACKAGED_UNIT, PACKAGED_HELPER_UNIT] {
+        sys.write(unit, "[Service]\nExecStart=/usr/bin/puzuz daemon\n");
+    }
+    for tool in ["dpkg-query", "rpm", "pacman"] {
+        sys.missing(tool);
+    }
+    sys.write(
+        "/etc/os-release",
+        "ID=rocky\nID_LIKE=\"rhel centos fedora\"\n",
+    );
+    for force in [false, true] {
+        let options = InstallOptions { force, ..opts() };
+        let err = run_install(&sys, &options).unwrap_err();
+        assert!(err.contains("owner unknown"), "{err}");
+        assert!(err.contains("`sudo dnf upgrade`"), "{err}");
+    }
+    assert!(sys.commands_without_queries().is_empty());
+}
+
+#[test]
+fn install_refuses_nixos_without_puzuz() {
+    let sys = system();
+    sys.write("/etc/os-release", "NAME=NixOS\nID=nixos\n");
+    for force in [false, true] {
+        let options = InstallOptions { force, ..opts() };
+        let err = run_install(&sys, &options).unwrap_err();
+        assert!(err.contains("this is NixOS"), "{err}");
+        assert!(err.contains("`services.puzuz` NixOS module"), "{err}");
+    }
+    assert!(sys.commands().is_empty());
+
+    // /etc/NIXOS alone is not NixOS.
+    let sys = system();
+    sys.write("/etc/NIXOS", "");
+    run_install(&sys, &opts()).unwrap();
+}
+
+#[test]
+fn install_refuses_the_nixos_module() {
+    let sys = system();
+    sys.write("/etc/os-release", "ID=nixos\n");
+    symlink(&sys, "/nix/store/abc-system-units", UNIT_DIR);
+    for unit in [DAEMON_UNIT, HELPER_UNIT] {
+        sys.write(
+            &format!("/nix/store/abc-system-units/{unit}"),
+            "[Service]\nExecStart=/nix/store/def-puzuz/bin/puzuz daemon\n",
+        );
+    }
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(err.contains("installed as Nix"), "{err}");
+    assert!(err.contains("nixos-rebuild switch"), "{err}");
+    assert!(err.contains("services.puzuz.enable = false"), "{err}");
+    let err = run_uninstall(&sys, false, true).unwrap_err();
+    assert!(err.contains("services.puzuz.enable = false"), "{err}");
+}
+
+#[test]
+fn install_refuses_a_unit_directory_in_the_nix_store() {
+    let sys = system();
+    sys.write("/etc/os-release", "ID=ubuntu\nID_LIKE=debian\n");
+    symlink(&sys, "/nix/store/abc-units", UNIT_DIR);
+    let forced = InstallOptions {
+        force: true,
+        ..opts()
+    };
+    let err = run_install(&sys, &forced).unwrap_err();
+    assert!(err.contains("resolves into /nix/store"), "{err}");
+    assert!(sys.commands().is_empty());
+}
+
+#[test]
+fn install_over_an_unowned_unit_needs_force() {
+    let sys = system();
+    unowned_units(&sys);
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(
+        err.contains("no package owns /usr/lib/systemd/system/puzuz.service"),
+        "{err}"
+    );
+    assert!(
+        err.contains("`sudo rm /usr/lib/systemd/system/puzuz.service`"),
+        "{err}"
+    );
+    assert!(err.contains("--force"), "{err}");
+    assert!(sys.commands_without_queries().is_empty());
+    // Nothing of `service install` to uninstall.
+    let err = run_uninstall(&sys, false, true).unwrap_err();
+    assert!(err.contains("not by `puzuz service install`"), "{err}");
+    assert!(
+        err.contains("delete /usr/lib/systemd/system/puzuz.service"),
+        "{err}"
+    );
+
+    let forced = InstallOptions {
+        force: true,
+        ..opts()
+    };
+    let out = run_install(&sys, &forced).unwrap();
+    assert!(out.contains("warning: no package owns"), "{out}");
+    assert!(sys.exists("/etc/systemd/system/puzuz.service"));
+
+    // Now a `service install` with leftovers: re-running needs no --force, but warns.
+    let detection = install_method::detect(&sys);
+    assert_eq!(detection.keyword(), "service-install");
+    assert_eq!(detection.leftovers.len(), 2);
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(
+        out.contains("which the units in /etc/systemd/system shadow"),
+        "{out}"
+    );
+}
+
+#[test]
+fn uninstall_refuses_a_hand_written_unit() {
+    let sys = system();
+    for unit in [DAEMON_UNIT, HELPER_UNIT] {
+        sys.write(
+            &format!("/etc/systemd/system/{unit}"),
+            "[Service]\nExecStart=/opt/puzuz daemon\n",
+        );
+    }
+    let err = run_uninstall(&sys, false, true).unwrap_err();
+    assert!(err.contains("installed as by hand"), "{err}");
+    assert!(
+        err.contains("remove /etc/systemd/system/puzuz.service by hand"),
+        "{err}"
+    );
+    assert!(sys.exists("/etc/systemd/system/puzuz.service"));
+    assert!(sys.commands().is_empty());
+}
+
+#[test]
+fn uninstall_of_nothing_says_so() {
+    let sys = system();
+    let out = run_uninstall(&sys, false, true).unwrap();
+    assert!(out.contains("puzuz is not installed"), "{out}");
+}
+
+#[test]
+fn a_packaged_helper_next_to_installed_units_is_refused() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz-helper.service"))).unwrap();
+    sys.write(
+        PACKAGED_HELPER_UNIT,
+        "[Service]\nExecStart=/usr/bin/puzuz-helper serve\n",
+    );
+    sys.dpkg_owns(PACKAGED_HELPER_UNIT, "puzuz");
+    assert!(install_method::detect(&sys).partial.is_some());
+
+    let forced = InstallOptions {
+        force: true,
+        ..opts()
+    };
+    let err = run_install(&sys, &forced).unwrap_err();
+    assert!(err.contains("distribution package (puzuz, dpkg"), "{err}");
+    assert!(err.contains("sudo puzuz service uninstall"), "{err}");
+    let err = run_uninstall(&sys, true, true).unwrap_err();
+    assert!(err.contains("refusing to purge"), "{err}");
+    run_uninstall(&sys, false, true).unwrap();
+    assert!(!sys.exists("/etc/systemd/system/puzuz.service"));
+    assert!(sys.exists(PACKAGED_HELPER_UNIT));
+}
