@@ -1,7 +1,6 @@
 //! The main process of a job unit: `puzuz-helper shim <job dir>`.
 //!
-//! Follows the shim validated in `docker-systemd-poc.md` §3.1. It starts as
-//! root (the unit has no `User=`) and is single-threaded (no async
+//! It starts as root (the unit has no `User=`) and is single-threaded (no async
 //! runtime), which `unshare(CLONE_NEWNS)` requires.
 //!
 //! 1. Outer shim (the unit's main process, stays outside the dumped tree):

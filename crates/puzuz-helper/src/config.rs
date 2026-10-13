@@ -9,9 +9,8 @@ use puzuz_config::CudaCheckpointMode;
 use crate::jobs::MountPlan;
 
 /// Manual CUDA mode (the helper calls `cuda-checkpoint` itself) works with
-/// the distribution's criu without the CUDA plugin (docker-systemd-poc.md
-/// §4); `--manage-cgroups=ignore` keeps a restored tree in its restore
-/// unit's cgroup.
+/// the distribution's criu without the CUDA plugin; `--manage-cgroups=ignore`
+/// keeps a restored tree in its restore unit's cgroup.
 pub fn default_checkpoint_config() -> CheckpointConfig {
     let mut c = CheckpointConfig {
         mode: CudaMode::Manual,
