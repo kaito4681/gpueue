@@ -234,9 +234,11 @@ Built with Nix outside NixOS (`nix build`, then `sudo ./result/bin/puzuz service
 binaries are copied to `/usr/local/bin` like any other build. They still load their libraries
 from the Nix store, so install also registers the store path as a garbage-collector root,
 `/nix/var/nix/gcroots/puzuz` (with `nix-store --add-root /nix/var/nix/gcroots/puzuz --realise
-<store path>`). If `nix-store` is not found, install warns and prints that command.
-`puzuz uninstall` removes the root, and so does installing binaries that do not come from the
-store (for example `puzuz update`).
+<store path>`). If `nix-store` is not found or fails, install warns and prints that command, and
+a root recorded earlier is kept. Whether the root is still needed is decided from the installed
+binaries themselves (their dynamic loader is in `/nix/store`), so moving a Nix-built copy with
+`--bin-dir` keeps it. `puzuz uninstall` removes the root, and so does installing binaries that
+do not use the store (for example `puzuz update`).
 
 `puzuz service install` exits non-zero when the final `puzuz doctor` report has a FAIL. After
 `--no-start`, the failures that only mean "not running yet" (both units, both sockets, the
@@ -250,7 +252,9 @@ following:
    store, and writes `/var/lib/puzuz/install-receipt` (root, 0644). The receipt records the
    directory, the binaries it copied (none when they are used in place), the version and the GC
    root, so that `puzuz uninstall` removes exactly those. A re-install into another directory
-   (with `--bin-dir`) removes the copies the previous one made.
+   (with `--bin-dir`) removes the copies the previous one made. If the receipt exists but cannot
+   be used (not owned by root, writable by others, or not valid), install stops without
+   changing anything: fix the file, or delete it after checking what it lists.
 2. Writes these files from the packaging templates built into the binary. Each file starts with
    an "Installed by `puzuz service install`" marker line and is overwritten on the next install.
    If one of them exists without the marker (written by an administrator or a package), install
@@ -825,8 +829,13 @@ runs it. `--purge` asks for confirmation on the terminal. When there is no termi
 - The binaries are removed only if `/var/lib/puzuz/install-receipt` lists them as copied by
   `puzuz service install` (only `puzuz` and `puzuz-helper` in the recorded directory). Binaries
   that were used in place, for example in `/usr/bin`, are kept. An installation made before the
-  receipt existed keeps its binaries, and `uninstall` prints which to remove by hand. The Nix GC
-  root and the receipt are removed as well.
+  receipt existed keeps its binaries, and `uninstall` prints which to remove by hand; so does an
+  unusable receipt. A listed binary that a package owns by now (asked of dpkg, rpm and pacman)
+  is kept, and so is one whose owner a package manager could not tell. The Nix GC root and the
+  receipt are removed as well; if a binary could not be removed, the receipt is kept listing it
+  (re-run `sudo puzuz uninstall` later).
+- `install.sh --uninstall` with an installed `puzuz` older than `puzuz uninstall` runs its
+  `service uninstall` and then deletes `puzuz` and `puzuz-helper` from the units' directory.
 - Running jobs keep running in their own units. `uninstall` warns about them, and `--purge`
   refuses to run while any `puzuz-job-*` unit is active. Stop them first with
   `sudo systemctl stop 'puzuz-job-*'`, or checkpoint/kill them before uninstalling.
