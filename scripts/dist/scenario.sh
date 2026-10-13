@@ -218,6 +218,21 @@ scenario_17() {
     [ ! -e /usr/local/bin/puzuz-helper ] || fail "a re-run installed /usr/local/bin/puzuz-helper"
     bash "$install" --uninstall --purge --yes >/dev/null
     [ ! -e /opt/puzuz/bin/puzuz ] || fail "/opt/puzuz/bin/puzuz left after --uninstall"
+
+    step "17: --uninstall with a puzuz that predates \`puzuz uninstall\`"
+    GH_TOKEN="$TOKEN" bash "$install" >/dev/null
+    wait_for 20 "the services" services_up
+    # An older puzuz: no `uninstall` subcommand and no receipt.
+    mv /usr/local/bin/puzuz /root/puzuz.real
+    printf '#!/bin/sh\ncase "$1" in uninstall) echo "error: unrecognized subcommand" >&2; exit 2 ;; esac\nexec /root/puzuz.real "$@"\n' \
+        >/usr/local/bin/puzuz
+    chmod 0755 /usr/local/bin/puzuz
+    rm /var/lib/puzuz/install-receipt
+    bash "$install" --uninstall --purge --yes | tee /tmp/uninstall-legacy.out
+    grep -qF "removed /usr/local/bin/puzuz-helper" /tmp/uninstall-legacy.out || fail "legacy uninstall kept the helper"
+    [ ! -e /usr/local/bin/puzuz ] || fail "legacy uninstall kept puzuz"
+    [ ! -e /etc/systemd/system/puzuz.service ] || fail "legacy uninstall kept the unit"
+    rm -f /root/puzuz.real
     echo
     echo "PASS 17"
 }

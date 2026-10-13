@@ -625,11 +625,13 @@ do_uninstall() {
     [ -n "$bin_dir" ] || bin_dir="${BIN_DIR:-$DEFAULT_BIN_DIR}"
     puzuz="$bin_dir/puzuz"
     [ -x "$puzuz" ] || die "$puzuz not found"
-    "$puzuz" uninstall --help >/dev/null 2>&1 ||
-        die "$puzuz is too old for \`puzuz uninstall\`; run \`sudo $puzuz service uninstall\` and remove $bin_dir/puzuz and $bin_dir/puzuz-helper by hand"
-
-    # `puzuz uninstall` also removes the binaries `service install` copied.
-    local args=(uninstall)
+    # `puzuz uninstall` also removes the binaries `service install` copied. A
+    # puzuz from before it has only `service uninstall`, which keeps them.
+    local args=(uninstall) legacy=0
+    if ! "$puzuz" uninstall --help >/dev/null 2>&1; then
+        legacy=1
+        args=(service uninstall)
+    fi
     if [ "$PURGE" = 1 ]; then
         args+=(--purge)
         if [ "$YES" = 1 ]; then
@@ -643,6 +645,16 @@ do_uninstall() {
         "$puzuz" "${args[@]}" </dev/tty
     else
         "$puzuz" "${args[@]}" </dev/null
+    fi
+    if [ "$legacy" = 1 ]; then
+        # What install.sh installed before the receipt existed.
+        local file
+        for file in "$bin_dir/puzuz" "$bin_dir/puzuz-helper"; do
+            if [ -e "$file" ]; then
+                rm -f "$file"
+                info "removed $file"
+            fi
+        done
     fi
 }
 
