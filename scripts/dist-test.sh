@@ -79,6 +79,30 @@ release "v$version-test.badsha" "v$v2" release
 echo "corrupted" >>"$stage/releases/v$version-test.badsha/puzuz-v$version-test.badsha-$target.tar.gz"
 # A tarball signed with another key.
 release "v$version-test.badsig" "v$v2" other
+# A checksum file for another file (/dev/null), whose checksum is right.
+release "v$version-test.nullsha" "v$v2" release
+(cd "$stage/releases/v$version-test.nullsha" &&
+    sha256sum /dev/null >"puzuz-v$version-test.nullsha-$target.tar.gz.sha256")
+# A tarball (correctly checksummed and signed) holding a symlink right after
+# its top directory, then thousands of files: a check that stops reading the
+# listing at the link (and so kills tar with SIGPIPE) must still refuse it.
+symlink_release() {
+    local tag="v$version-test.symlink" work
+    local from="puzuz-v$v2-$target" to="puzuz-$tag-$target"
+    work="$(mktemp -d)"
+    tar -C "$work" -xzf "$releases/v$v2/$from.tar.gz"
+    mv "$work/$from" "$work/$to"
+    ln -s /etc/shadow "$work/$to/0-link"
+    mkdir "$work/$to/many"
+    (cd "$work/$to/many" && seq 3000 | xargs touch)
+    mkdir -p "$stage/releases/$tag"
+    (cd "$work" && { echo "$to"; echo "$to/0-link"; find "$to" -mindepth 1 ! -path "$to/0-link"; } |
+        tar --no-recursion -T - -czf "$stage/releases/$tag/$to.tar.gz")
+    rm -rf "$work"
+    (cd "$stage/releases/$tag" && sha256sum "$to.tar.gz" >"$to.tar.gz.sha256")
+    "$minisign" -S -s "$stage/keys/release.key" -m "$stage/releases/$tag/$to.tar.gz" -t "puzuz $tag"
+}
+symlink_release
 echo "v$v1" >"$stage/releases/latest"
 
 cp "$root/scripts/install.sh" "$root/scripts/dist/fake_github.py" "$root/scripts/dist/scenario.sh" \
