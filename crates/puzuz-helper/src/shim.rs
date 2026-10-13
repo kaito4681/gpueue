@@ -378,18 +378,31 @@ mod mountfd {
     const LEAF_FLAGS: OFlags = OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
     const RESOLVE: ResolveFlags = ResolveFlags::NO_SYMLINKS.union(ResolveFlags::NO_MAGICLINKS);
 
-    /// Whether a directory with this owner and mode can only be changed by
-    /// root: owned by root and not group/world-writable, or sticky (then
-    /// others cannot rename root's entries, and the next component is
-    /// checked in turn).
-    pub fn root_controlled(uid: u32, mode: u32) -> bool {
-        uid == 0 && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+    /// Whether a directory with the owner `uid` and this mode can only be
+    /// changed by `owner` (root, except in tests): owned by `owner` and not
+    /// group/world-writable, or sticky (then others cannot rename
+    /// `owner`'s entries, and the next component is checked in turn).
+    pub fn controlled_by(owner: u32, uid: u32, mode: u32) -> bool {
+        uid == owner && (mode & 0o022 == 0 || mode & 0o1000 != 0)
     }
 
     /// The parent directory of the absolute `path` and its last
     /// component; `Err` if a component is a symlink or a directory on the
-    /// way is not [`root_controlled`].
+    /// way is not controlled by root ([`controlled_by`]).
     pub fn open_parent(path: &str) -> Result<(OwnedFd, String), String> {
+        open_parent_in("/", path, 0)
+    }
+
+    /// [`open_parent`] with the walk starting at the directory `top`
+    /// (instead of `/`) and every directory on the way required to be
+    /// controlled by `owner` (instead of root): `path`'s components are
+    /// looked up from `top`. For tests, which cannot rely on `/` and the
+    /// system directories being root's (e.g. in a Nix build sandbox).
+    pub(super) fn open_parent_in(
+        top: &str,
+        path: &str,
+        owner: u32,
+    ) -> Result<(OwnedFd, String), String> {
         let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         let Some((last, dirs)) = comps.split_last() else {
             return Err(format!("{path:?} has no parent"));
@@ -397,23 +410,23 @@ mod mountfd {
         if comps.iter().any(|c| *c == "." || *c == "..") {
             return Err(format!("{path:?} is not a canonical path"));
         }
-        let mut fd = rustix::fs::open("/", PATH_FLAGS, Mode::empty())
-            .map_err(|e| format!("opening /: {e}"))?;
-        check(&fd, "/")?;
+        let mut fd = rustix::fs::open(top, PATH_FLAGS, Mode::empty())
+            .map_err(|e| format!("opening {top}: {e}"))?;
+        check(&fd, top, owner)?;
         let mut walked = String::new();
         for c in dirs {
             walked.push('/');
             walked.push_str(c);
             fd = rustix::fs::openat2(&fd, *c, PATH_FLAGS, Mode::empty(), RESOLVE)
                 .map_err(|e| format!("opening {walked} without following symlinks: {e}"))?;
-            check(&fd, &walked)?;
+            check(&fd, &walked, owner)?;
         }
         Ok((fd, (*last).to_owned()))
     }
 
-    fn check(fd: &OwnedFd, what: &str) -> Result<(), String> {
+    fn check(fd: &OwnedFd, what: &str, owner: u32) -> Result<(), String> {
         let st = rustix::fs::fstat(fd).map_err(|e| format!("{what}: {e}"))?;
-        if !root_controlled(st.st_uid, st.st_mode) {
+        if !controlled_by(owner, st.st_uid, st.st_mode) {
             return Err(format!(
                 "{what} is not a directory that only root can change"
             ));
@@ -896,25 +909,57 @@ mod tests {
 
     #[test]
     fn mount_surgery_only_walks_root_controlled_directories() {
-        assert!(mountfd::root_controlled(0, 0o40755));
-        assert!(mountfd::root_controlled(0, 0o41777), "sticky like /tmp");
-        assert!(!mountfd::root_controlled(0, 0o40777));
-        assert!(!mountfd::root_controlled(0, 0o40775));
-        assert!(!mountfd::root_controlled(1000, 0o40755));
+        assert!(mountfd::controlled_by(0, 0, 0o40755));
+        assert!(mountfd::controlled_by(0, 0, 0o41777), "sticky like /tmp");
+        assert!(!mountfd::controlled_by(0, 0, 0o40777));
+        assert!(!mountfd::controlled_by(0, 0, 0o40775));
+        assert!(!mountfd::controlled_by(0, 1000, 0o40755));
 
-        let (_, name) = mountfd::open_parent("/usr/bin/env").unwrap();
+        // The walk starts at a directory tree of our own, with ourselves
+        // as the owner that must control it: `/` and the system
+        // directories are not root's everywhere (e.g. in a Nix build
+        // sandbox).
+        use std::os::unix::fs::PermissionsExt;
+        let me = nix::unistd::geteuid().as_raw();
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().to_str().unwrap();
+        let mkdir = |rel: &str, mode: u32| {
+            let p = tmp.path().join(rel);
+            std::fs::create_dir(&p).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        mkdir("usr", 0o755);
+        mkdir("usr/bin", 0o755);
+        std::fs::write(tmp.path().join("usr/bin/env"), b"").unwrap();
+        mkdir("proc", 0o755);
+        mkdir("proc/1", 0o555);
+        std::os::unix::fs::symlink("1", tmp.path().join("proc/self")).unwrap();
+        mkdir("tmp", 0o1777);
+        mkdir("tmp/d", 0o755);
+        mkdir("home", 0o777);
+        mkdir("srv", 0o775);
+
+        let (_, name) = mountfd::open_parent_in(top, "/usr/bin/env", me).unwrap();
         assert_eq!(name, "env");
-        // A symlink on the way (`/proc/self`) is not followed.
-        let e = mountfd::open_parent("/proc/self/fd/0").unwrap_err();
+        // Sticky (like /tmp): the next component is checked in turn.
+        mountfd::open_parent_in(top, "/tmp/d/x", me).unwrap();
+        // A symlink on the way (like `/proc/self`) is not followed.
+        let e = mountfd::open_parent_in(top, "/proc/self/fd/0", me).unwrap_err();
         assert!(e.contains("/proc/self"), "{e}");
-        // A directory its owner (not root) can change: e.g. a user's
-        // directory that could be renamed or replaced by a symlink.
-        if !nix::unistd::geteuid().is_root() {
-            let tmp = tempfile::tempdir().unwrap();
-            let p = tmp.path().join("mnt");
-            let e = mountfd::open_parent(p.to_str().unwrap()).unwrap_err();
-            assert!(e.contains("only root can change"), "{e}");
-        }
+        // A directory that others than its owner can change: entries
+        // could be renamed or replaced by a symlink.
+        let e = mountfd::open_parent_in(top, "/home/mnt", me).unwrap_err();
+        assert!(
+            e.contains("/home is not") && e.contains("only root can change"),
+            "{e}"
+        );
+        let e = mountfd::open_parent_in(top, "/srv/mnt", me).unwrap_err();
+        assert!(e.contains("/srv is not"), "{e}");
+        // A directory owned by someone else (e.g. a user's directory when
+        // the walk wants root's): already the top is refused.
+        let e = mountfd::open_parent_in(top, "/usr/bin/env", me ^ 1).unwrap_err();
+        assert!(e.contains("only root can change"), "{e}");
         assert!(mountfd::open_parent("/").is_err());
         assert!(mountfd::open_parent("/usr/../etc/x").is_err());
     }
