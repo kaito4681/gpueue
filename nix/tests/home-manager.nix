@@ -88,8 +88,32 @@ pkgs.runCommand "puzuz-home-manager-module"
   ''
     bash -n "$bashInitPath"
     zsh -n "$zshInitPath"
-    HOME=$TMPDIR fish --no-execute "$fishInitPath"
-    # With a system puzuz in PATH, the bash hook registers its completion.
-    PATH=${puzuz}/bin:$PATH bash -c "complete -r; source $bashInitPath; complete -p puzuz"
+    export HOME=$TMPDIR
+    fish --no-execute "$fishInitPath"
+
+    # A "system" puzuz whose completion files are installed next to it, and
+    # that fails when asked to generate them: the hooks must use the files.
+    sys=$TMPDIR/system
+    mkdir -p "$sys/bin"
+    cp -r ${puzuz}/share "$sys/share"
+    printf '#!/bin/sh\nexit 1\n' > "$sys/bin/puzuz"
+    chmod +x "$sys/bin/puzuz"
+    # One that has no completion files: the hooks generate them.
+    gen=$TMPDIR/generated
+    mkdir -p "$gen/bin"
+    printf '#!/bin/sh\nexec ${puzuz}/bin/puzuz "$@"\n' > "$gen/bin/puzuz"
+    chmod +x "$gen/bin/puzuz"
+
+    for dir in "$sys" "$gen"; do
+      PATH=$dir/bin:$PATH bash -c "source $bashInitPath; complete -p puzuz"
+      PATH=$dir/bin:$PATH zsh -f -c \
+        "autoload -Uz compinit && compinit -u -d $TMPDIR/zcompdump; source $zshInitPath; [[ \''${_comps[puzuz]} == _puzuz ]]"
+      PATH=$dir/bin:$PATH fish -c "source $fishInitPath; complete -c puzuz | grep -q ."
+    done
+
+    # Without compinit (no compdef), the zsh hook does nothing and says
+    # nothing.
+    msg=$(PATH=$sys/bin:$PATH zsh -f -c "source $zshInitPath" 2>&1)
+    test -z "$msg"
     touch "$out"
   ''
