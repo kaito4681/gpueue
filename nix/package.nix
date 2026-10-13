@@ -14,6 +14,14 @@ let
     # Uses /etc/passwd as "a root-owned system file"; in the sandbox it is a
     # file that Nix generates for the build user.
     "access::tests::restored_objects_must_be_the_owners_to_open"
+    # Check the test process's own open files; under nix-daemon its stdout is
+    # the builder's pseudo-terminal (/dev/pts/N), which does not exist in the
+    # sandbox's /dev.
+    "access::tests::checks_every_object_of_a_process_tree"
+    "access::tests::zombies_are_not_checked"
+    # Expects `/` to be owned by root; in the sandbox of nix-daemon builds it
+    # is not ("/ is not a directory that only root can change").
+    "shim::tests::mount_surgery_only_walks_root_controlled_directories"
   ]
   # puzuz-helper/tests/protocol.rs: these spawn a job, and the helper makes
   # the job's log directory setgid (mode 2770). Nix's sandbox refuses setuid
