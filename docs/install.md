@@ -66,7 +66,7 @@ cargo build --release -p puzuz -p puzuz-helper
 ```
 
 Without a local Rust toolchain you can build in the project's Docker image (Rust 1.98.1 on Debian
-bookworm, so the binaries need glibc 2.36 or newer):
+bookworm; the binaries need glibc 2.34 or newer):
 
 ```sh
 scripts/test-in-docker.sh build --release -p puzuz -p puzuz-helper
@@ -74,7 +74,7 @@ scripts/test-in-docker.sh build --release -p puzuz -p puzuz-helper
 ```
 
 Tagged versions also come as prebuilt binaries for x86_64 Linux (built on Debian bookworm, glibc
-2.36 or newer) on the GitHub releases page: `puzuz-v<version>-x86_64-unknown-linux-gnu.tar.gz`
+2.34 or newer) on the GitHub releases page: `puzuz-v<version>-x86_64-unknown-linux-gnu.tar.gz`
 holds `puzuz`, `puzuz-helper` and the documentation, with a `.sha256` file next to it.
 
 ```sh
@@ -146,6 +146,31 @@ following:
 Unit files owned by a distribution package (`/usr/lib/systemd/...`) are never touched. Customize
 the units with drop-ins (`sudo systemctl edit puzuz-helper.service`). Edits to the files in
 `/etc/systemd/system` are lost on the next install.
+
+### Install method
+
+`puzuz service install` must not share a machine with a package manager or NixOS: its units in
+`/etc/systemd/system` would shadow the packaged ones, and both would use `/etc/puzuz` and
+`/var/lib/puzuz`. puzuz tells the ways apart by their files:
+
+| Install method | Recognized by |
+| --- | --- |
+| `puzuz service install` | `/etc/systemd/system/puzuz.service` starting with the install marker line |
+| distribution package | `/usr/lib/systemd/system/puzuz.service` (or `/lib/systemd/system/...`) |
+| NixOS | `/etc/NIXOS`, or a unit whose `ExecStart=` is below `/nix/store` |
+| by hand | `/etc/systemd/system/puzuz.service` without the marker, and no packaged unit |
+
+Next to a packaged unit, a `/etc/systemd/system/puzuz.service` without the marker is the
+administrator's replacement of it (`systemctl edit --full puzuz`), and a symlink to `/dev/null`
+there is a mask (`systemctl mask puzuz`). Neither is a second install method: puzuz reports the
+package as "overridden" or "masked". A mask without a package is ignored.
+
+`puzuz service install` refuses to run on a machine where puzuz comes from a package or from
+NixOS, even with `--force`, and names the package manager's way to update it instead.
+`puzuz service uninstall` refuses such a machine too. When both a package and `service install`
+are present ("mixed"), `uninstall` removes only the files that `service install` wrote, and
+refuses `--purge` (the package still uses `/etc/puzuz` and `/var/lib/puzuz`). `puzuz doctor`
+reports the install method and fails on a mixed setup. `puzuz service status` shows it too.
 
 The daemon runs with `ProtectSystem=strict`: it can only write below the unit's
 `ReadWritePaths=/var/lib/puzuz/daemon /var/lib/puzuz/logs /run/puzuz`. If you move `data_dir`,
@@ -236,7 +261,8 @@ puzuz doctor           # every check, with a `fix:` line for each problem; exits
 puzuz service status   # both units, and whether the daemon is reachable and connected to the helper
 ```
 
-`puzuz doctor` checks the configuration file and its ownership, `criu` (version 4.2 or newer), the
+`puzuz doctor` checks the configuration file and its ownership, the install method (see
+[Install method](#install-method)), `criu` (version 4.2 or newer), the
 NVIDIA driver, `cuda-checkpoint` (manual mode support, version matching the driver), the GPUs the
 daemon detected (with NVML or from `[[gpus]]`) against `nvidia-smi` (see
 [GPU detection](#gpu-detection)), the kernel, the systemd version, both units, the ownership of
@@ -613,6 +639,7 @@ stopped until `sudo systemctl start puzuz` or the next boot.
 | `cuda plugin` | `cuda_checkpoint_mode` is `"plugin"` but `/usr/lib/criu/cuda_plugin.so` is missing | install the plugin (see [CUDA plugin mode](#cuda-plugin-mode)) or use the manual mode |
 | `gpus` | nvidia-smi lists N GPU(s), the configuration M | update `[[gpus]]` (see [GPU detection](#gpu-detection)) |
 | `kernel` | lacks `/proc/sys/kernel/ns_last_pid` | use a kernel with `CONFIG_CHECKPOINT_RESTORE=y` |
+| `install method` | mixed: two install methods at once | remove all but one, as the `fix:` lines say (e.g. `sudo puzuz service uninstall` to keep the package) |
 | `puzuz.service`, `puzuz-helper.service` | not installed / not active | `sudo puzuz service install`, or `sudo systemctl start <unit>` and read `journalctl -u <unit>` |
 | `helper binary` | the binary or a directory above it is not owned by root or is writable by others | `sudo chown root:root <path>; sudo chmod 755 <path>` (and its directories), or reinstall with `--bin-dir /usr/local/bin` |
 | `daemon write paths` | cannot write to a configured directory: not below its ReadWritePaths= | add a `ReadWritePaths=` drop-in for `puzuz.service` (see [Installing](#installing)) |

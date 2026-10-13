@@ -60,6 +60,16 @@ jobs:
           docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:v0.10.0 \
             -S warning $(git ls-files '*.sh')
 
+  # `puzuz service install|uninstall|status` and the install method checks
+  # under systemd in a privileged container.
+  service-install:
+    runs-on: ubuntu-24.04
+    needs: [test]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/service-install-test.sh
+
   # Daemon + helper + CLI under systemd in a privileged container, including
   # a simulated reboot (CPU-only; the GPU scenarios need an NVIDIA GPU).
   e2e:

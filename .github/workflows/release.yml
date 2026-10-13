@@ -16,7 +16,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     # Build on Debian bookworm, as scripts/test-in-docker.sh does, so the
-    # binaries need only glibc 2.36 (see docs/install.md).
+    # binaries need only glibc 2.34 (see docs/install.md).
     container: rust:1.98.1-bookworm
     env:
       TAG: ${{ inputs.tag || github.ref_name }}

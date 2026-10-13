@@ -14,6 +14,7 @@ use std::time::Duration;
 use puzuz_daemon::config::DEFAULT_CONFIG_PATH;
 
 use crate::doctor::{self, Report};
+use crate::install_method::{self, InstallMethod};
 use crate::system::{System, check_root_owned_chain, run_checked};
 
 pub const DAEMON_UNIT: &str = "puzuz.service";
@@ -43,7 +44,8 @@ const TMPFILES: &str = include_str!("../../../packaging/tmpfiles.d/puzuz.conf");
 pub const CONFIG_TEMPLATE: &str = include_str!("../../../packaging/config.toml");
 
 /// First line of every file `install` writes; `uninstall` only removes files starting with it.
-const MARKER: &str = "# Installed by `puzuz service install`; re-running it overwrites this file.";
+pub const MARKER: &str =
+    "# Installed by `puzuz service install`; re-running it overwrites this file.";
 
 /// How long `install` waits for the daemon to connect to the helper after starting them.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -345,9 +347,36 @@ fn check_foreign_files(sys: &dyn System, files: &[InstallFile], force: bool) -> 
     ))
 }
 
+/// Refuses to touch a machine where a package manager or NixOS manages puzuz: the units in
+/// /etc would shadow the packaged ones, and both would share /etc/puzuz and /var/lib/puzuz.
+/// `--force` does not override this.
+fn check_install_method(method: &InstallMethod) -> Result<()> {
+    let Some(managed) = method.managed_elsewhere() else {
+        return Ok(());
+    };
+    let mut message = format!(
+        "puzuz is installed as {managed}; `puzuz service install` would conflict with it \
+         (--force does not change this). To update it, {}.",
+        managed.update_hint()
+    );
+    if method.has_service_install() {
+        message.push_str(
+            " It is also installed by `puzuz service install`; remove that copy with \
+             `sudo puzuz service uninstall`.",
+        );
+    } else {
+        message.push_str(&format!(
+            " To switch to `puzuz service install`, first {}.",
+            managed.removal_hint()
+        ));
+    }
+    Err(message)
+}
+
 /// `puzuz service install`. Prints progress and finally the doctor report to `out`.
 pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) -> Result<Report> {
     require_root(sys, "install")?;
+    check_install_method(&install_method::detect(sys))?;
     if let Some(bin_dir) = &options.bin_dir {
         // Validated before anything is copied; the files below then name it.
         valid_bin_dir(bin_dir)?;
@@ -465,6 +494,22 @@ fn active_job_units(sys: &dyn System) -> Vec<String> {
 /// `puzuz service uninstall`.
 pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Write) -> Result<()> {
     require_root(sys, "uninstall")?;
+    let method = install_method::detect(sys);
+    if let Some(managed) = method.managed_elsewhere() {
+        if !method.has_service_install() {
+            return Err(format!(
+                "puzuz is installed as {managed}, not by `puzuz service install`; {}",
+                managed.removal_hint()
+            ));
+        }
+        if options.purge {
+            return Err(format!(
+                "puzuz is also installed as {managed}, which uses {CONFIG_DIR} and \
+                 /var/lib/puzuz too; refusing to purge them. `sudo puzuz service uninstall` \
+                 (without --purge) removes only what `puzuz service install` wrote"
+            ));
+        }
+    }
     let jobs = active_job_units(sys);
     if !jobs.is_empty() {
         let list = jobs.join(" ");
@@ -530,6 +575,15 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
         && let Err(err) = run_checked(sys, "systemctl", &["daemon-reload"])
     {
         writeln!(out, "warning: {err}").ok();
+    }
+
+    if let Some(managed) = method.managed_elsewhere() {
+        writeln!(
+            out,
+            "puzuz is still installed as {managed}; start its services with \
+             `sudo systemctl enable --now {HELPER_UNIT} {DAEMON_UNIT}`."
+        )
+        .ok();
     }
 
     if options.purge {
@@ -646,6 +700,9 @@ fn remove_tree_inner(
 /// `puzuz service status`. Returns whether both services run and are connected.
 pub fn status(sys: &dyn System, socket: Option<&Path>, out: &mut dyn Write) -> io::Result<bool> {
     let mut healthy = true;
+    let method = install_method::detect(sys);
+    healthy &= !matches!(method, InstallMethod::Mixed(_));
+    writeln!(out, "{:<22} {method}", "installed")?;
     for unit in [HELPER_UNIT, DAEMON_UNIT] {
         let (enabled, active) = doctor::unit_state(sys, unit);
         healthy &= active == "active";
