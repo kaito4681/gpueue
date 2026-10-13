@@ -5,6 +5,7 @@ command on their `PATH`.
 
 - [Requirements](#requirements)
 - [Installing with install.sh](#installing-with-installsh)
+- [Installing with Nix](#installing-with-nix)
 - [Building](#building)
 - [Installing](#installing)
 - [Verifying](#verifying)
@@ -136,8 +137,8 @@ Afterwards, update with `sudo puzuz update` (see [Upgrading](#upgrading)). Runni
 again also installs the latest (or the given) version over the installed one. Running jobs keep
 running either way.
 
-Other ways to install (apt, rpm, AUR, Nix) are coming later. Until then, build from source as
-described below.
+Other ways to install (apt, rpm, AUR) are coming later. Until then, build from source as
+described below, or use [Nix](#installing-with-nix).
 
 ### Verifying a release by hand
 
@@ -167,6 +168,52 @@ git commit packaging/minisign.pub scripts/install.sh
 Back up the secret key and its password. A new key needs a new release of `puzuz` before
 `puzuz update` accepts releases signed with it. Releases are created as drafts: publish the
 draft on GitHub, or `install.sh` (which asks for the latest published release) does not see it.
+
+## Installing with Nix
+
+The repository is a Nix flake (`flake.nix`). It builds puzuz from source for x86_64 and aarch64
+Linux; nothing is downloaded from the GitHub releases. Its outputs:
+
+| Output | Contents |
+| --- | --- |
+| `packages.<system>.default` (also `puzuz`) | `bin/puzuz`, `bin/puzuz-helper`, bash/zsh/fish completions, the docs |
+| `packages.<system>.criu` | CRIU 4.2.1 (nixpkgs has an older version), for the NixOS module |
+| `devShells.<system>.default` | a development shell with the Rust toolchain (`nix develop`) |
+
+Use `github:kaito4681/puzuz/stable` to follow releases: the `stable` branch moves to every
+release tag (not to pre-releases). Plain `github:kaito4681/puzuz` is the development head
+(`main`).
+
+### NixOS
+
+A NixOS module (`services.puzuz`) is coming soon.
+
+### Other distributions
+
+Build the flake, then install the service from the result like a tarball:
+
+```sh
+nix build github:kaito4681/puzuz/stable
+sudo ./result/bin/puzuz service install --bin-dir /usr/local/bin
+```
+
+`--bin-dir` is required here: the binaries in the Nix store are copied to `/usr/local/bin`.
+The copies still use the Nix store (the dynamic loader and libraries of the build), so keep the
+build alive, or the next `nix-collect-garbage` can break them. The `result` link keeps it alive
+(it is a GC root) as long as it exists, so put it somewhere you will not delete:
+
+```sh
+nix build github:kaito4681/puzuz/stable --out-link ~/.local/state/puzuz/result
+sudo ~/.local/state/puzuz/result/bin/puzuz service install --bin-dir /usr/local/bin
+```
+
+Install CRIU as described in [CRIU](#criu). To update, run the same commands again (Nix fetches
+the current `stable`; add `--refresh` if it was fetched less than an hour ago); running jobs keep
+running.
+
+`nix profile install github:kaito4681/puzuz/stable` gives a user the `puzuz` command (with
+completions) only. The helper runs as root and cannot run from a user profile, so the service
+must be installed as above.
 
 ## Building
 
@@ -687,6 +734,7 @@ and its "update" line says when a newer release exists):
 | --- | --- |
 | `install.sh` (or `puzuz service install` of a release) | `sudo puzuz update` |
 | built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install --bin-dir /usr/local/bin` |
+| Nix on another distribution | the same `nix build` and `service install` again (see [Installing with Nix](#installing-with-nix)) |
 | a distribution package or NixOS (later) | the package manager; `puzuz update` refuses |
 
 ### puzuz update
