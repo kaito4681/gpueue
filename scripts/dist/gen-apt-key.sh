@@ -4,7 +4,7 @@
 #
 # - Writes the public key, in binary ("dearmored") form, to
 #   packaging/apt/puzuz-archive-keyring.gpg, which the .deb installs as
-#   /usr/share/keyrings/puzuz-archive-keyring.gpg (the Signed-By= of
+#   /etc/apt/keyrings/puzuz.gpg (the Signed-By= of
 #   /etc/apt/sources.list.d/puzuz.sources); commit it.
 # - Writes the passphrase-protected secret key (ASCII-armored) to OUT_DIR
 #   (default: a new directory under $HOME) and prints the `gh secret set`

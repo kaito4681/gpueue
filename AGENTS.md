@@ -15,6 +15,10 @@
 - The `.rpm` (same nfpm definition): `scripts/dist/build-package.sh BIN_DIR OUT_DIR rpm` builds it,
   `scripts/rpm-test.sh [OLD_RPM NEW_RPM]` installs/upgrades/removes it in a container
   (`PUZUZ_RPM_BASE`, default `rockylinux/rockylinux:9`; also `fedora:latest`).
+- The APT repository (a flat repository in the release `apt`): `scripts/dist/apt-repo.sh`
+  (`update DIR DEB...` locally, `github TAG` from `.github/workflows/release-apt.yml` when a
+  release is published); `scripts/apt-repo-test.sh [DEB]` upgrades v1 to v2 through a local copy
+  in containers (`PUZUZ_APT_BASES`, `PUZUZ_DEB_HTTPS=1`).
 - CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, an MSRV check (`rust-version`),
   shellcheck and the CPU e2e on pull requests; pushing a `v<version>` tag builds the release
   tarball and a draft GitHub release (`.github/workflows/release.yml`).

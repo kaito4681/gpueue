@@ -195,7 +195,7 @@ The package contains:
 | `/usr/lib/systemd/system/puzuz.service`, `puzuz-helper.service` | the units (`ExecStart=/usr/bin/...`) |
 | `/usr/lib/sysusers.d/puzuz.conf`, `/usr/lib/tmpfiles.d/puzuz.conf` | the `puzuz` user, the `puzuz-admin` group, the directories |
 | `/etc/puzuz/config.toml` | the default configuration (a conffile: your edits are kept on upgrades) |
-| `/etc/apt/sources.list.d/puzuz.sources`, `/usr/share/keyrings/puzuz-archive-keyring.gpg` | the puzuz APT repository and its signing key (see below) |
+| `/etc/apt/sources.list.d/puzuz.sources`, `/etc/apt/keyrings/puzuz.gpg` | the puzuz APT repository and its signing key (conffiles, see below) |
 | `/usr/share/bash-completion`, `zsh/vendor-completions`, `fish/vendor_completions.d` | shell completions |
 | `/usr/share/doc/puzuz` | README, this guide, the architecture notes, the license |
 
@@ -218,33 +218,83 @@ and `puzuz service install-method` report the package's installation as a distri
 
 **Updates.** The package registers the puzuz APT repository, a flat repository in the GitHub
 release `apt` (`https://github.com/kaito4681/puzuz/releases/download/apt/`, signed with the key in
-`/usr/share/keyrings/puzuz-archive-keyring.gpg`). Once it is published, with the first release
-that has it, later versions come with the rest of the system:
+`/etc/apt/keyrings/puzuz.gpg`). So the `.deb` is installed by hand only once;
+later versions come with the rest of the system:
 
 ```sh
 sudo apt update && sudo apt upgrade
 ```
 
-Until then, install a newer `.deb` the same way as the first one (`sudo apt install ./...`). An
-upgrade restarts the running services. Running jobs keep running, as with `puzuz update` (see
-[Upgrading](#upgrading)).
+The repository has the stable releases (not pre-releases) for amd64 and arm64, the newest five
+versions of each. An upgrade restarts the running services. Running jobs keep running, as with
+`puzuz update` (see [Upgrading](#upgrading)). Your edits to `/etc/puzuz/config.toml` and
+`/etc/apt/sources.list.d/puzuz.sources` are kept; `/etc/apt/keyrings/puzuz.gpg` is replaced by a
+new version's keyring when you have not changed it (that is how a new signing key arrives). While a new release is being uploaded,
+`apt update` may briefly fail with a hash mismatch or a missing file; running it again a minute
+later fixes it.
+
+**Adding the repository by hand.** Instead of installing the first `.deb` from the release page,
+you can add the repository and install from it. Use these exact file names and contents (they are
+what the package installs, so the package does not ask about them later):
+
+```sh
+sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
+sudo apt update && sudo apt install puzuz
+```
 
 **Removing.**
 
 ```sh
 sudo apt remove puzuz    # stop and disable the services, remove the binaries and units
-sudo apt purge puzuz     # also delete /etc/puzuz and the APT repository entry
+sudo apt purge puzuz     # also delete /etc/puzuz and the APT repository entry and key
 ```
 
-Both keep `/var/lib/puzuz` (state, job logs, checkpoint images), the `puzuz` user and the
+`remove` keeps the repository entry and its key (both conffiles), so `apt update` keeps working
+and `sudo apt install puzuz` brings puzuz back. Both keep `/var/lib/puzuz` (state, job logs, checkpoint images), the `puzuz` user and the
 `puzuz-admin` group, and never touch running jobs: they keep running in their own
 `puzuz-job-*` units. `purge` prints how to delete `/var/lib/puzuz`
 (`sudo systemctl stop 'puzuz-job-*'` first if jobs still run, then `sudo rm -rf /var/lib/puzuz`).
 
-### The APT archive key (maintainers)
+### The APT repository (maintainers)
 
-`packaging/apt/puzuz-archive-keyring.gpg` is a test key until the real one is created (its user
-ID says "TEST KEY"; the release workflow refuses it). To create the real key once:
+The repository is the set of assets of the release `apt` (a pre-release, so it never becomes the
+"latest" release that `install.sh` and `puzuz update` follow): the `.deb` files, `Packages`,
+`Packages.gz`, `Release`, `InRelease` and `Release.gpg`, the public key `puzuz.gpg` and
+`puzuz.sources`. `.github/workflows/release-apt.yml` updates it with
+`scripts/dist/apt-repo.sh github <tag>` when a release is **published as a stable release** (the
+`released` event: publishing a stable release, or turning a pre-release into one): it adds the release's
+`.deb` files (after checking their checksums and their minisign signatures, with the public key
+of the tag's commit), deletes all but the newest
+five versions per architecture (in Debian version order), regenerates and signs the index (and
+copies `puzuz.gpg` and `puzuz.sources` out of the newest package it keeps), and uploads the
+packages first and the index last, `InRelease` at the very end; old `.deb` files are deleted after
+that. It creates the `apt` release when it is missing. `apt-repo.sh` decides what is published:
+drafts, pre-releases and tags other than `v*` are skipped with a notice. The index has no
+`by-hash` files (they need a subdirectory, and release asset names cannot contain `/`), hence the
+short window described above.
+
+`release.yml` only creates drafts, so the repository is updated when a person publishes the draft
+on GitHub (or a tool does so with a personal access token). A release published with a workflow's
+`GITHUB_TOKEN` does not start other workflows; then run it by hand, which is also how to retry a
+failed upload:
+
+```sh
+gh workflow run release-apt.yml -R kaito4681/puzuz -f tag=v0.1.0
+```
+
+To try it without a real release, use a fork: create a key there with
+`scripts/dist/gen-apt-key.sh` (and the minisign key, for `release.yml`), commit the public keys,
+set the secrets, push a tag, publish the draft, and run `apt update` against the fork's `apt`
+release. Or run the local test, `scripts/apt-repo-test.sh` (`PUZUZ_APT_BASES="debian:12
+ubuntu:22.04 ubuntu:24.04 ubuntu:26.04"`), which builds a repository with
+`apt-repo.sh update DIR DEB...` and a throwaway key and upgrades through it in containers.
+
+**The archive key.** `packaging/apt/puzuz-archive-keyring.gpg` is a test key until the real one
+is created (its user ID says "TEST KEY"; `release.yml` and `apt-repo.sh` refuse it). To create
+the real key once:
 
 ```sh
 scripts/dist/gen-apt-key.sh     # asks for a passphrase; writes the secret key under ~
@@ -253,8 +303,27 @@ gh secret set APT_GPG_PASSPHRASE -R kaito4681/puzuz
 # then commit packaging/apt/puzuz-archive-keyring.gpg
 ```
 
+Without the two secrets, `release-apt.yml` skips the repository (with a notice). The index is
+signed only with a key that the newest package in the repository ships (`apt-repo.sh` reads
+`/etc/apt/keyrings/puzuz.gpg` out of the `.deb`), so a mismatch between the secret and the committed public key fails
+the run instead of breaking `apt update` for everyone.
+
 Back up the secret key and its passphrase. Every installed package trusts this key, so a new key
-can only be rolled out by a package version, signed with the old key, that ships the new one.
+can only be rolled out by a package version that ships it, through the repository signed with the
+old key:
+
+1. Create the new key (`scripts/dist/gen-apt-key.sh` in a scratch checkout) and append its public
+   key to `packaging/apt/puzuz-archive-keyring.gpg`, so the keyring holds both keys
+   (`cat old.gpg new.gpg >packaging/apt/puzuz-archive-keyring.gpg`). Keep the secrets on the old
+   key and release a version with the combined keyring.
+2. Wait until users have upgraded to it (at least one more release cycle).
+3. Switch the secrets `APT_GPG_PRIVATE_KEY` and `APT_GPG_PASSPHRASE` to the new key, and in the
+   same release remove the old key from the keyring. The keyring is a conffile: dpkg replaces it
+   on upgrade unless a user changed it (then dpkg asks). Users who skipped step 1's version get
+   `NO_PUBKEY` from `apt update` and install the next `.deb` by hand once, as on a first
+   installation.
+
+If the secret key leaks, do the same at once and tell users to install the new `.deb` by hand.
 
 The packages are built with [nfpm](https://nfpm.goreleaser.com) from `packaging/nfpm.yaml`
 (`scripts/dist/build-package.sh BIN_DIR OUT_DIR [deb|rpm]` builds a `.deb` or an `.rpm` from built
@@ -877,7 +946,7 @@ and its "update" line says when a newer release exists):
 | Installed with | Update with |
 | --- | --- |
 | `install.sh` (or `puzuz service install` of a release) | `sudo puzuz update` |
-| the `.deb` | `sudo apt update && sudo apt upgrade` once the APT repository is published; until then `sudo apt install ./puzuz_<new version>_<arch>.deb` |
+| the `.deb` | `sudo apt update && sudo apt upgrade` (or install a newer `.deb` from a release with `sudo apt install ./puzuz_<new version>_<arch>.deb`) |
 | the `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>` (no dnf repository yet) |
 | built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install --bin-dir /usr/local/bin` |
 | another distribution package or Nix (later) | the package manager or Nix (see [Install method](#install-method)); `puzuz update` refuses and names the command |

@@ -36,7 +36,7 @@ dpkg-deb --contents "$deb" >/tmp/contents
 for f in ./usr/bin/puzuz ./usr/bin/puzuz-helper \
     ./usr/lib/systemd/system/puzuz.service ./usr/lib/systemd/system/puzuz-helper.service \
     ./usr/lib/sysusers.d/puzuz.conf ./usr/lib/tmpfiles.d/puzuz.conf ./etc/puzuz/config.toml \
-    ./etc/apt/sources.list.d/puzuz.sources ./usr/share/keyrings/puzuz-archive-keyring.gpg \
+    ./etc/apt/sources.list.d/puzuz.sources ./etc/apt/keyrings/puzuz.gpg \
     ./usr/share/bash-completion/completions/puzuz ./usr/share/zsh/vendor-completions/_puzuz \
     ./usr/share/fish/vendor_completions.d/puzuz.fish ./usr/share/doc/puzuz/copyright; do
     grep -q " $f\$" /tmp/contents || fail "$f is not in the package"
@@ -44,6 +44,7 @@ done
 dpkg-deb --ctrl-tarfile "$deb" | tar -xOf - ./conffiles >/tmp/conffiles
 grep -qx /etc/puzuz/config.toml /tmp/conffiles || fail "config.toml is not a conffile"
 grep -qx /etc/apt/sources.list.d/puzuz.sources /tmp/conffiles || fail "puzuz.sources is not a conffile"
+grep -qx /etc/apt/keyrings/puzuz.gpg /tmp/conffiles || fail "the archive keyring is not a conffile"
 
 step "installing next to \`puzuz service install\` is refused"
 mkdir -p /etc/systemd/system
@@ -59,7 +60,7 @@ apt-get install -y "$deb" | tee /tmp/install.out
 grep -q 'systemd is not running' /tmp/install.out || fail "postinst did not say that systemd is not running"
 puzuz --version
 must_exist /usr/bin/puzuz-helper /usr/lib/systemd/system/puzuz.service \
-    /usr/share/keyrings/puzuz-archive-keyring.gpg /etc/apt/sources.list.d/puzuz.sources
+    /etc/apt/keyrings/puzuz.gpg /etc/apt/sources.list.d/puzuz.sources
 for unit in puzuz.service puzuz-helper.service; do
     [ "$(head -n 1 /usr/lib/systemd/system/$unit)" != "$MARKER" ] || fail "$unit has the service install marker"
 done
@@ -102,7 +103,8 @@ echo log >/var/lib/puzuz/logs/1000/job.log
 dpkg -r puzuz
 must_not_exist /usr/bin/puzuz /usr/bin/puzuz-helper /usr/lib/systemd/system/puzuz.service \
     /etc/systemd/system/multi-user.target.wants/puzuz.service
-must_exist /etc/puzuz/config.toml /etc/apt/sources.list.d/puzuz.sources /var/lib/puzuz/logs/1000/job.log
+must_exist /etc/puzuz/config.toml /etc/apt/sources.list.d/puzuz.sources /etc/apt/keyrings/puzuz.gpg \
+    /var/lib/puzuz/logs/1000/job.log
 [ "$(dpkg-query -W -f='${Status}' puzuz)" = "deinstall ok config-files" ] || fail "not in config-files state"
 
 step "a reinstallation after dpkg -r enables the services again"
@@ -114,7 +116,7 @@ grep -q 'edited by deb-check' /etc/puzuz/config.toml || fail "config.toml edit l
 step "dpkg -P deletes the configuration, keeps /var/lib/puzuz"
 echo token >/etc/puzuz/github-token
 dpkg -P puzuz | tee /tmp/purge.out
-must_not_exist /etc/puzuz /etc/apt/sources.list.d/puzuz.sources /usr/share/keyrings/puzuz-archive-keyring.gpg
+must_not_exist /etc/puzuz /etc/apt/sources.list.d/puzuz.sources /etc/apt/keyrings/puzuz.gpg
 must_exist /var/lib/puzuz/logs/1000/job.log
 grep -q 'rm -rf /var/lib/puzuz' /tmp/purge.out || fail "purge did not say how to delete /var/lib/puzuz"
 case "$(dpkg-query -W -f='${Status}' puzuz 2>/dev/null || true)" in

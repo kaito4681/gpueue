@@ -102,17 +102,21 @@ contents:
 
   # The APT repository (a flat repository in the GitHub release "apt") and
   # the key its index is signed with, so that installing one .deb by hand is
-  # enough to get later versions from `apt upgrade`. The .rpm ships no
-  # .repo file (and no key) until a dnf repository exists (issue #23): with
-  # dnf's default skip_if_unavailable=False, a configured repository that
-  # cannot be fetched makes every dnf command fail.
+  # enough to get later versions from `apt upgrade`. Both are conffiles:
+  # `apt remove` keeps them together (the source keeps working), purge
+  # deletes both, and an unmodified keyring is replaced on upgrade (how a
+  # new key is rolled out). The .rpm ships no .repo file (and no key) until
+  # a dnf repository exists (issue #23): with dnf's default
+  # skip_if_unavailable=False, a configured repository that cannot be
+  # fetched makes every dnf command fail.
   - src: packaging/apt/puzuz.sources
     dst: /etc/apt/sources.list.d/puzuz.sources
     type: config|noreplace
     packager: deb
     file_info: { mode: 0644 }
   - src: packaging/apt/puzuz-archive-keyring.gpg
-    dst: /usr/share/keyrings/puzuz-archive-keyring.gpg
+    dst: /etc/apt/keyrings/puzuz.gpg
+    type: config
     packager: deb
     file_info: { mode: 0644 }
 

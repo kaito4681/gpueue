@@ -127,6 +127,38 @@ jobs:
           for base in debian:12 ubuntu:24.04; do
             PUZUZ_DEB_BASE="$base" scripts/deb-test.sh target/deb/puzuz_*.deb
           done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.runner }}
+          path: target/deb/puzuz_*.deb
+          retention-days: 3
+
+  # The APT repository: v1 of the .deb installed, its sources pointed at a
+  # flat repository built by scripts/dist/apt-repo.sh (throwaway key), then
+  # `apt-get update && apt-get upgrade` to v2, remove and purge
+  # (scripts/apt-repo-test.sh).
+  apt-repo:
+    needs: [deb]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, base: "debian:12" }
+          - { runner: ubuntu-24.04, base: "ubuntu:22.04" }
+          - { runner: ubuntu-24.04, base: "ubuntu:24.04" }
+          - { runner: ubuntu-24.04, base: "ubuntu:26.04" }
+          - { runner: ubuntu-24.04-arm, base: "ubuntu:24.04" }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-${{ matrix.runner }}
+          path: target/deb
+      - run: scripts/apt-repo-test.sh target/deb/puzuz_*.deb
+        env:
+          PUZUZ_APT_BASES: ${{ matrix.base }}
 
   # The .rpm of each architecture (built like release.yml does, but from a
   # debug build), installed, upgraded from an older pre-release package and
