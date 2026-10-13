@@ -44,6 +44,22 @@ wait_for() {
     done
 }
 
+# A dummy .deb named puzuz that ships both units in /usr/lib/systemd/system.
+make_deb() {
+    local root=/tmp/puzuz-deb
+    [ -f /tmp/puzuz.deb ] && return
+    rm -rf "$root"
+    mkdir -p "$root/DEBIAN" "$root/usr/lib/systemd/system"
+    printf 'Package: puzuz\nVersion: 0.0.1\nArchitecture: all\nMaintainer: test <test@example.com>\nDescription: dummy puzuz package for the distribution test\n' >"$root/DEBIAN/control"
+    printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' >"$root/usr/lib/systemd/system/puzuz.service"
+    printf '[Service]\nExecStart=/usr/bin/puzuz-helper serve\n' >"$root/usr/lib/systemd/system/puzuz-helper.service"
+    dpkg-deb --build --root-owner-group "$root" /tmp/puzuz.deb >/dev/null
+}
+install_deb() {
+    make_deb
+    dpkg -i /tmp/puzuz.deb >/dev/null
+}
+
 start_server() {
     [ -d /srv/releases ] && return
     mkdir -p /srv
@@ -90,8 +106,10 @@ scenario_17() {
     local install=/dist/install.sh
 
     step "17: refusals before anything is installed"
-    expect_fail "A GitHub token that can read" bash "$install"
-    GH_TOKEN=wrong expect_fail "The token cannot read" bash "$install"
+    # The fake API answers 404 without the token (like a private repository),
+    # which is also how a repository without releases looks.
+    expect_fail "has no published release" bash "$install"
+    GH_TOKEN=wrong expect_fail "with the GitHub token: it may be expired or revoked" bash "$install"
     GH_TOKEN="$TOKEN" expect_fail "release v9.9.9 not found" bash "$install" --version 9.9.9
     expect_fail "must run as root" runuser -u alice -- bash "$install"
     mkdir -p /tmp/oldglibc
@@ -99,22 +117,35 @@ scenario_17() {
     chmod +x /tmp/oldglibc/getconf
     PATH="/tmp/oldglibc:$PATH" GH_TOKEN="$TOKEN" expect_fail "glibc 2.31 is too old" bash "$install"
     GH_TOKEN="$TOKEN" expect_fail "checksum mismatch" bash "$install" --version "$VERSION-test.badsha"
-    printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' >/usr/lib/systemd/system/puzuz.service
-    GH_TOKEN="$TOKEN" expect_fail "distribution package" bash "$install"
+    # A unit a package owns is refused before anything is downloaded.
+    install_deb
+    GH_TOKEN="$TOKEN" expect_fail "distribution package puzuz (dpkg" bash "$install" --version 9.9.9
     # A masked or overridden package unit is still the package, not "mixed".
     ln -s /dev/null /etc/systemd/system/puzuz.service
-    GH_TOKEN="$TOKEN" expect_fail "distribution package" bash "$install"
+    GH_TOKEN="$TOKEN" expect_fail "distribution package puzuz (dpkg" bash "$install" --version 9.9.9
     rm /etc/systemd/system/puzuz.service
     printf '[Service]\nExecStart=/usr/bin/puzuz daemon --verbose\n' >/etc/systemd/system/puzuz.service
-    GH_TOKEN="$TOKEN" expect_fail "distribution package" bash "$install"
-    rm /etc/systemd/system/puzuz.service /usr/lib/systemd/system/puzuz.service
+    GH_TOKEN="$TOKEN" expect_fail "distribution package puzuz (dpkg" bash "$install" --version 9.9.9
+    rm /etc/systemd/system/puzuz.service
+    dpkg -r puzuz >/dev/null
+    # A unit nobody owns: the downloaded binary refuses it.
+    printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' >/usr/lib/systemd/system/puzuz.service
+    GH_TOKEN="$TOKEN" expect_fail "no package owns /usr/lib/systemd/system/puzuz.service" bash "$install"
+    rm /usr/lib/systemd/system/puzuz.service
     # A mask alone is no installation: the pre-download check lets it through.
     ln -s /dev/null /etc/systemd/system/puzuz.service
     GH_TOKEN="$TOKEN" expect_fail "release v9.9.9 not found" bash "$install" --version 9.9.9
     rm /etc/systemd/system/puzuz.service
-    touch /etc/NIXOS
-    GH_TOKEN="$TOKEN" expect_fail "NixOS" bash "$install"
-    rm /etc/NIXOS
+    # Units from /nix/store, and NixOS (by os-release only).
+    ln -s /nix/store/abc-puzuz.service /etc/systemd/system/puzuz.service
+    GH_TOKEN="$TOKEN" expect_fail "come from /nix/store" bash "$install" --version 9.9.9
+    rm /etc/systemd/system/puzuz.service
+    cp -P /etc/os-release /tmp/os-release.saved
+    rm /etc/os-release
+    printf 'NAME=NixOS\nID=nixos\n' >/etc/os-release
+    GH_TOKEN="$TOKEN" expect_fail "this is NixOS" bash "$install" --version 9.9.9
+    rm /etc/os-release
+    mv /tmp/os-release.saved /etc/os-release
     [ ! -e /usr/local/bin/puzuz ] || fail "a refused install left /usr/local/bin/puzuz"
 
     step "17: install v1 (token from a file, saved for puzuz update)"
@@ -124,6 +155,10 @@ scenario_17() {
     grep -q "verified the SHA-256 checksum" /tmp/install-v1.out || fail "checksum not verified"
     grep -q "signature was not checked" /tmp/install-v1.out || fail "no note about the missing minisign"
     grep -q "puzuz $V1 is installed in /usr/local/bin" /tmp/install-v1.out || fail "no success message"
+    # install.sh no longer passes --bin-dir: `service install` chose /usr/local/bin.
+    grep -q "installing into /usr/local/bin" /tmp/install-v1.out || fail "no note about /usr/local/bin"
+    grep -q '^copied = \["/usr/local/bin/puzuz", "/usr/local/bin/puzuz-helper"\]' \
+        /var/lib/puzuz/install-receipt || fail "the receipt does not list the copies"
     wait_for 20 "the services" services_up
     [ "$(daemon_version)" = "$V1" ] || fail "daemon runs $(daemon_version), expected $V1"
     [ "$(puzuz service install-method)" = service-install ] || fail "install method"
@@ -157,6 +192,7 @@ scenario_17() {
     [ ! -e /etc/systemd/system/puzuz.service ] || fail "unit left behind"
     [ ! -e /usr/local/bin/puzuz ] || fail "binary left behind"
     [ ! -e /usr/local/bin/puzuz-helper ] || fail "helper binary left behind"
+    [ ! -e /var/lib/puzuz/install-receipt ] || fail "receipt left behind"
     ! systemctl is-active -q puzuz.service || fail "daemon still running"
     [ -f /var/lib/puzuz/daemon/state.sqlite ] || fail "state removed"
     [ -f /etc/puzuz/config.toml ] || fail "configuration removed"
@@ -172,6 +208,11 @@ scenario_17() {
 
     step "17: re-running without --bin-dir keeps the installed bin dir"
     GH_TOKEN="$TOKEN" bash "$install" --bin-dir /opt/puzuz/bin >/dev/null
+    # Even when the installed binary cannot answer `service install-method`
+    # (e.g. too old), the marker unit keeps the bin dir.
+    rm /opt/puzuz/bin/puzuz
+    printf '#!/bin/sh\nexit 1\n' >/opt/puzuz/bin/puzuz
+    chmod 0755 /opt/puzuz/bin/puzuz
     GH_TOKEN="$TOKEN" bash "$install" >/dev/null
     grep -q '^ExecStart=/opt/puzuz/bin/puzuz daemon' /etc/systemd/system/puzuz.service ||
         fail "the units no longer run /opt/puzuz/bin/puzuz"
@@ -179,6 +220,21 @@ scenario_17() {
     [ ! -e /usr/local/bin/puzuz-helper ] || fail "a re-run installed /usr/local/bin/puzuz-helper"
     bash "$install" --uninstall --purge --yes >/dev/null
     [ ! -e /opt/puzuz/bin/puzuz ] || fail "/opt/puzuz/bin/puzuz left after --uninstall"
+
+    step "17: --uninstall with a puzuz that predates \`puzuz uninstall\`"
+    GH_TOKEN="$TOKEN" bash "$install" >/dev/null
+    wait_for 20 "the services" services_up
+    # An older puzuz: no `uninstall` subcommand and no receipt.
+    mv /usr/local/bin/puzuz /root/puzuz.real
+    printf '#!/bin/sh\ncase "$1" in uninstall) echo "error: unrecognized subcommand" >&2; exit 2 ;; esac\nexec /root/puzuz.real "$@"\n' \
+        >/usr/local/bin/puzuz
+    chmod 0755 /usr/local/bin/puzuz
+    rm /var/lib/puzuz/install-receipt
+    bash "$install" --uninstall --purge --yes | tee /tmp/uninstall-legacy.out
+    grep -qF "removed /usr/local/bin/puzuz-helper" /tmp/uninstall-legacy.out || fail "legacy uninstall kept the helper"
+    [ ! -e /usr/local/bin/puzuz ] || fail "legacy uninstall kept puzuz"
+    [ ! -e /etc/systemd/system/puzuz.service ] || fail "legacy uninstall kept the unit"
+    rm -f /root/puzuz.real
     echo
     echo "PASS 17"
 }
@@ -200,8 +256,8 @@ scenario_18() {
     set_latest "$V2"
     "$puzuz" update --check | tee /tmp/check.out
     grep -qF "puzuz $V2 is available (installed: $V1)" /tmp/check.out || fail "no newer release reported"
-    # A user cannot read the saved token, and is told what is missing.
-    expect_fail "A GitHub token that can read" \
+    # A user cannot read the saved token, so the fake API answers 404.
+    expect_fail "has no published release" \
         runuser -u alice -- env PUZUZ_RELEASE_API_URL="$PUZUZ_RELEASE_API_URL" "$puzuz" update
     # With a token, a user's `update` only checks.
     runuser -u alice -- env PUZUZ_RELEASE_API_URL="$PUZUZ_RELEASE_API_URL" GH_TOKEN="$TOKEN" \
@@ -236,13 +292,18 @@ scenario_18() {
     job_alive "$id" || fail "job $id stopped"
 
     step "18: update refuses a package-managed machine"
-    printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' >/usr/lib/systemd/system/puzuz.service
+    install_deb
     set_latest "$VERSION-test.badsig"
     expect_fail "installed in more than one way" "$puzuz" update --yes
-    rm /usr/lib/systemd/system/puzuz.service
+    dpkg -r puzuz >/dev/null
 
+    step "18: sudo puzuz uninstall removes the services and the copied binaries"
     systemctl stop 'puzuz-job-*' || true
-    bash "$install" --uninstall --purge --yes >/dev/null
+    "$puzuz" uninstall --purge --yes | tee /tmp/uninstall.out
+    grep -qF "removed /usr/local/bin/puzuz-helper" /tmp/uninstall.out || fail "helper not removed"
+    [ ! -e /etc/systemd/system/puzuz.service ] || fail "unit left behind"
+    [ ! -e "$puzuz" ] || fail "binary left behind"
+    [ ! -e /var/lib/puzuz ] || fail "/var/lib/puzuz left after --purge"
     echo
     echo "PASS 18"
 }

@@ -5,8 +5,8 @@ use puzuz_protocol::api::{HelperStatus, VersionResponse};
 
 use super::*;
 use crate::service::MARKER;
-use crate::system::CmdOutput;
 use crate::system::fake::FakeSystem;
+use crate::system::{CmdOutput, HttpError};
 
 // A throwaway key pair (its secret key was not kept), another key, and data signed with the first.
 const TEST_PUB: &str = include_str!("testdata/test.pub");
@@ -292,6 +292,63 @@ fn check_reports_a_newer_release() {
     assert!(!out.contains("secret-token"));
 }
 
+fn dropped() -> HttpError {
+    HttpError {
+        message: "io: Peer disconnected".to_owned(),
+        connection_lost: true,
+    }
+}
+
+#[test]
+fn gets_are_retried_when_the_server_drops_the_connection() {
+    let latest = format!("{REPO_API}/releases/latest");
+    let sha256 = format!("{REPO_API}/releases/assets/12");
+
+    // Once on the API, twice on a download: the update still goes through.
+    let sys = system();
+    sys.fail_next(&latest, dropped());
+    sys.fail_next(&sha256, dropped());
+    sys.fail_next(&sha256, dropped());
+    run(&sys, &opts(false, None)).unwrap();
+    assert!(installed(&sys));
+    let log = sys.http_log.borrow();
+    assert_eq!(log.iter().filter(|(url, _)| *url == latest).count(), 2);
+    assert_eq!(log.iter().filter(|(url, _)| *url == sha256).count(), 3);
+    assert!(
+        log.iter()
+            .filter(|(url, _)| *url == latest)
+            .all(|(_, headers)| headers
+                .contains(&("Authorization".to_owned(), "Bearer secret-token".to_owned())))
+    );
+    let sleeps = sys.sleeps.borrow();
+    assert_eq!(
+        &sleeps[..3],
+        &[RETRY_DELAYS[0], RETRY_DELAYS[0], RETRY_DELAYS[1]]
+    );
+    drop((log, sleeps));
+
+    // Three dropped connections in a row: give up.
+    let sys = system();
+    for _ in 0..3 {
+        sys.fail_next(&latest, dropped());
+    }
+    let err = run(&sys, &opts(true, None)).unwrap_err();
+    assert_eq!(err, format!("cannot reach {API}: io: Peer disconnected"));
+    assert_eq!(sys.http_log.borrow().len(), 3);
+    assert!(!err.contains("secret-token"));
+
+    // Other network failures and HTTP errors are not retried.
+    let sys = system();
+    sys.fail_next(&latest, HttpError::new("connection refused"));
+    let err = run(&sys, &opts(true, None)).unwrap_err();
+    assert_eq!(err, format!("cannot reach {API}: connection refused"));
+    sys.serve(&latest, 502, "bad gateway");
+    let err = run(&sys, &opts(true, None)).unwrap_err();
+    assert!(err.contains("HTTP 502"), "{err}");
+    assert_eq!(sys.http_log.borrow().len(), 2);
+    assert!(sys.sleeps.borrow().is_empty());
+}
+
 #[test]
 fn without_root_update_only_checks() {
     let mut sys = system();
@@ -330,7 +387,7 @@ fn missing_or_bad_tokens_are_explained() {
     sys.serve(&format!("{REPO_API}/releases/latest"), 404, "{}");
     let err = run(&sys, &opts(true, None)).unwrap_err();
     assert!(
-        err.contains("A GitHub token that can read kaito4681/puzuz"),
+        err.contains("kaito4681/puzuz has no published release"),
         "{err}"
     );
     assert!(
@@ -343,7 +400,7 @@ fn missing_or_bad_tokens_are_explained() {
     sys.set_env("GITHUB_TOKEN", "expired");
     let err = run(&sys, &opts(true, None)).unwrap_err();
     assert!(
-        err.contains("The token from GITHUB_TOKEN cannot read"),
+        err.contains("with the token from GITHUB_TOKEN: it may be expired or revoked"),
         "{err}"
     );
     assert!(!err.contains("expired\""), "{err}");
@@ -390,6 +447,51 @@ fn update_installs_the_verified_release() {
     assert_eq!(install, "puzuz service install --bin-dir /usr/local/bin");
     // The work directory is gone afterwards.
     assert!(!sys.exists(WORK_DIR));
+}
+
+#[test]
+fn update_over_a_nix_built_installation_removes_the_gc_root() {
+    let sys = system();
+    let receipt = crate::service::Receipt {
+        version: "0.0.1".to_owned(),
+        bin_dir: PathBuf::from("/usr/local/bin"),
+        copied: vec![
+            PathBuf::from("/usr/local/bin/puzuz"),
+            PathBuf::from("/usr/local/bin/puzuz-helper"),
+        ],
+        gc_root: Some(PathBuf::from(crate::service::GC_ROOT)),
+        gc_root_target: Some(PathBuf::from("/nix/store/abc-puzuz-0.0.1")),
+    };
+    sys.write(crate::service::RECEIPT_PATH, &receipt.to_toml());
+    sys.mkdir("/nix/var/nix/gcroots");
+    std::os::unix::fs::symlink(
+        "/nix/store/abc-puzuz-0.0.1",
+        sys.path(Path::new(crate::service::GC_ROOT)),
+    )
+    .unwrap();
+
+    let out = run(&sys, &opts(false, None)).unwrap();
+    assert!(
+        out.contains("removed the Nix GC root /nix/var/nix/gcroots/puzuz"),
+        "{out}"
+    );
+    assert!(!sys.exists(crate::service::GC_ROOT));
+    let updated: crate::service::Receipt =
+        toml::from_str(&sys.read(crate::service::RECEIPT_PATH).unwrap()).unwrap();
+    assert_eq!(
+        updated,
+        crate::service::Receipt {
+            version: "9.0.0".to_owned(),
+            gc_root: None,
+            gc_root_target: None,
+            ..receipt
+        }
+    );
+
+    // Without a GC root the receipt is left to `service install`.
+    let sys = system();
+    run(&sys, &opts(false, None)).unwrap();
+    assert!(!sys.exists(crate::service::RECEIPT_PATH));
 }
 
 #[test]
@@ -469,18 +571,84 @@ fn only_service_install_is_updated() {
         "/usr/lib/systemd/system/puzuz.service",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
     );
+    sys.dpkg_owns("/usr/lib/systemd/system/puzuz.service", "puzuz");
     std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
     let err = run(&sys, &opts(false, None)).unwrap_err();
     assert!(err.contains("installed as distribution package"), "{err}");
-    assert!(err.contains("package manager"), "{err}");
+    assert!(err.contains("sudo apt update && sudo apt upgrade"), "{err}");
     // Checking still works and names the right tool.
     let out = run(&sys, &opts(true, None)).unwrap();
-    assert!(out.contains("package manager"), "{out}");
+    assert!(out.contains("sudo apt update && sudo apt upgrade"), "{out}");
 
     let sys = system();
     std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
     let err = run(&sys, &opts(false, None)).unwrap_err();
     assert!(err.contains("not installed as a service"), "{err}");
+}
+
+#[test]
+fn the_puzuz_rpm_is_updated_from_the_release_url() {
+    let sys = system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.missing("dpkg-query");
+    sys.respond("rpm -qf", CmdOutput::ok("puzuz\n"));
+    std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
+    let arch = std::env::consts::ARCH;
+    let base = "https://github.com/kaito4681/puzuz/releases/download";
+
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("installed as distribution package"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "run `sudo dnf upgrade {base}/v<version>/puzuz-<version>-1.{arch}.rpm` with the \
+             version of https://github.com/kaito4681/puzuz/releases/latest"
+        )),
+        "{err}"
+    );
+    assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
+
+    // Checking names the release found.
+    let out = run(&sys, &opts(true, None)).unwrap();
+    assert!(
+        out.contains(&format!(
+            "sudo dnf upgrade {base}/v9.0.0/puzuz-9.0.0-1.{arch}.rpm"
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "sudo rpm --import {base}/v9.0.0/RPM-GPG-KEY-puzuz"
+        )),
+        "{out}"
+    );
+
+    // doctor's hint, for a pre-release.
+    let hint = update_hint(
+        &install_method::detect(&sys),
+        &Config::default(),
+        Some(&Version::parse("9.1.0-rc.1").unwrap()),
+    );
+    assert!(
+        hint.contains(&format!(
+            "{base}/v9.1.0-rc.1/puzuz-9.1.0-rc.1-1.{arch}.rpm`"
+        )),
+        "{hint}"
+    );
+
+    // Another rpm named differently (e.g. a distribution's own package) gets the generic hint.
+    let sys = system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.missing("dpkg-query");
+    sys.respond("rpm -qf", CmdOutput::ok("puzuz-bin\n"));
+    std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("run `sudo dnf upgrade`."), "{err}");
 }
 
 #[test]
@@ -492,6 +660,7 @@ fn the_install_method_is_checked_before_contacting_github() {
         "/usr/lib/systemd/system/puzuz.service",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
     );
+    sys.dpkg_owns("/usr/lib/systemd/system/puzuz.service", "puzuz");
     std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
     sys.env.borrow_mut().remove("GH_TOKEN");
     sys.serve(&format!("{REPO_API}/releases/latest"), 404, "{}");
@@ -537,7 +706,125 @@ fn doctor_reports_a_newer_release_as_info() {
         newer_release(&sys, &config).unwrap(),
         Some(Version::new(9, 0, 0))
     );
-    assert_eq!(update_hint(&sys), "sudo puzuz update");
+    assert_eq!(
+        update_hint(&install_method::detect(&sys), &Config::default(), None),
+        "sudo puzuz update"
+    );
     sys.serve(&format!("{REPO_API}/releases/latest"), 500, "");
     assert!(newer_release(&sys, &config).is_err());
+}
+
+/// `system()` without its units.
+fn bare_system() -> FakeSystem {
+    let sys = system();
+    std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
+    sys
+}
+
+fn symlink(sys: &FakeSystem, target: &str, link: &str) {
+    let local = sys.path(Path::new(link));
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(target, local).unwrap();
+}
+
+#[test]
+fn other_install_methods_get_their_own_hint() {
+    // A unit nobody owns.
+    let sys = bare_system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("installed as a unit no package owns"), "{err}");
+    assert!(
+        err.contains("delete it and install puzuz with install.sh"),
+        "{err}"
+    );
+
+    // An rpm package.
+    let sys = bare_system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.missing("dpkg-query");
+    sys.respond("rpm -qf", CmdOutput::ok("puzuz\n"));
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("run `sudo dnf upgrade https://"), "{err}");
+
+    // The NixOS module.
+    let sys = bare_system();
+    sys.write("/etc/os-release", "ID=nixos\n");
+    symlink(
+        &sys,
+        "/nix/store/abc-puzuz.service",
+        "/etc/systemd/system/puzuz.service",
+    );
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("installed as Nix"), "{err}");
+    assert!(
+        err.contains("nix flake update && sudo nixos-rebuild switch"),
+        "{err}"
+    );
+    assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
+
+    // NixOS without puzuz.
+    let sys = bare_system();
+    sys.write("/etc/os-release", "ID=nixos\n");
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("`services.puzuz` NixOS module"), "{err}");
+    assert_eq!(
+        update_hint(&install_method::detect(&sys), &Config::default(), None),
+        "install it with the `services.puzuz` NixOS module (see docs/install.md)"
+    );
+
+    // A hand-written unit.
+    let sys = bare_system();
+    sys.write(
+        "/etc/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/local/bin/puzuz daemon\n",
+    );
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("installed as by hand"), "{err}");
+}
+
+#[test]
+fn a_packaged_helper_unit_blocks_the_update() {
+    let sys = system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz-helper.service",
+        "[Service]\nExecStart=/usr/bin/puzuz-helper serve\n",
+    );
+    sys.dpkg_owns("/usr/lib/systemd/system/puzuz-helper.service", "puzuz");
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("installed in more than one way"), "{err}");
+    assert!(
+        err.contains("puzuz-helper.service as distribution package"),
+        "{err}"
+    );
+    assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
+    assert!(
+        update_hint(&install_method::detect(&sys), &Config::default(), None)
+            .contains("run `puzuz doctor` first")
+    );
+}
+
+#[test]
+fn a_leftover_unit_does_not_block_the_update() {
+    let sys = system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
+    run(&sys, &opts(false, None)).unwrap();
+    assert!(installed(&sys));
 }

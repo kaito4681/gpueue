@@ -11,9 +11,11 @@ use puzuz_checkpoint::probe::{Version, parse_criu_version, parse_cuda_checkpoint
 use puzuz_daemon::config::{Config, CudaCheckpointMode, DEFAULT_CONFIG_PATH, GpuDetection};
 use puzuz_protocol::api::{CheckpointStorage, GpuDetectionStatus, GpuSource, VersionResponse};
 
-use crate::install_method::{self, InstallMethod, LocalUnit, Method};
+use crate::install_method::{self, Detection, InstallMethod, LocalUnit, Method};
 use crate::service::{ADMIN_GROUP, DAEMON_UNIT, HELPER_UNIT, TMPFILES_PATH, UNIT_DIR};
 use crate::system::{System, check_root_owned_chain, find_program, is_root_owned_and_protected};
+
+mod sudo_path;
 
 /// Oldest CRIU that works with the helper (restoring into systemd units, CUDA support).
 const MIN_CRIU: (u32, u32, u32) = (4, 2, 0);
@@ -324,7 +326,10 @@ pub fn parse_show_exec_start(text: &str) -> Option<ExecStart> {
 /// Runs every check. `socket` overrides the daemon socket from the configuration.
 pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     let LoadedConfig { config, check } = load_config(sys);
-    let mut checks = vec![check, check_install_method(sys)];
+    // Detected once, for the install method, sudo's PATH and the update hint.
+    let detection = install_method::detect(sys);
+    let mut checks = vec![check, check_install_method(&detection)];
+    checks.extend(sudo_path::check(sys, &detection));
     let api_socket = socket.map_or_else(|| config.api_socket.clone(), Path::to_owned);
     let daemon = sys.daemon_version(&api_socket);
 
@@ -367,7 +372,7 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
         checks.push(check_checkpoint_usage(storage));
     }
     checks.push(check_admin(sys));
-    if let Some(check) = check_update(sys, &config) {
+    if let Some(check) = check_update(sys, &config, &detection) {
         checks.push(check);
     }
     Report { checks }
@@ -375,7 +380,7 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
 
 /// Whether a newer release exists (`update_check = false` turns this off). Never more than
 /// INFO: being offline is not a problem of the installation.
-fn check_update(sys: &dyn System, config: &Config) -> Option<Check> {
+fn check_update(sys: &dyn System, config: &Config, detection: &Detection) -> Option<Check> {
     const NAME: &str = "update";
     if !config.update_check {
         return None;
@@ -386,17 +391,20 @@ fn check_update(sys: &dyn System, config: &Config) -> Option<Check> {
             NAME,
             format!("puzuz {newer} is available (this is {current})"),
         )
-        .hint(crate::update::update_hint(sys)),
+        .hint(crate::update::update_hint(detection, config, Some(&newer))),
         Ok(None) => Check::ok(NAME, format!("{current} is the latest release")),
         Err(err) => Check::info(NAME, format!("cannot check for a newer release: {err}")),
     })
 }
 
 /// How puzuz is installed; two ways at once shadow each other's units.
-fn check_install_method(sys: &dyn System) -> Check {
+fn check_install_method(detection: &Detection) -> Check {
     const NAME: &str = "install method";
-    let method = install_method::detect(sys);
-    match &method {
+    let method = &detection.install;
+    let check = match method {
+        InstallMethod::None if detection.os.is_nixos() => {
+            Check::info(NAME, "not installed (NixOS: use the services.puzuz module)")
+        }
         InstallMethod::None => Check::info(NAME, "not installed"),
         InstallMethod::One(Method::Manual { unit }) => {
             Check::info(NAME, method.to_string()).hint(format!(
@@ -411,6 +419,14 @@ fn check_install_method(sys: &dyn System) -> Check {
             "`sudo systemctl unmask {}` lets the packaged unit run again",
             crate::service::DAEMON_UNIT
         )),
+        InstallMethod::One(Method::Unowned { unit, .. }) => {
+            let unit = unit.display();
+            Check::warn(NAME, method.to_string()).hint(format!(
+                "if it is left over from a removed package, delete it (`sudo rm {unit}`); to \
+                 switch to `puzuz service install`, delete it first or run `sudo puzuz service \
+                 install --force`"
+            ))
+        }
         InstallMethod::One(_) => Check::ok(NAME, method.to_string()),
         InstallMethod::Mixed(methods) => {
             let fixes: Vec<String> = methods
@@ -422,16 +438,66 @@ fn check_install_method(sys: &dyn System) -> Check {
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(" and ");
-                    format!("to keep {kept}: {}", m.removal_hint())
+                    format!("to keep {kept}: {}", detection.removal_hint(m))
                 })
                 .collect();
-            Check::fail(
+            return Check::fail(
                 NAME,
                 format!("{method}; their units and data directories conflict"),
             )
-            .hint(format!("remove all but one of them:\n{}", fixes.join("\n")))
+            .hint(format!("remove all but one of them:\n{}", fixes.join("\n")));
         }
+    };
+    if check.level >= Level::Warn {
+        return check;
     }
+    if let Some(partial) = &detection.partial {
+        if detection.is_conflicting() {
+            // `service install` on one unit, a package or Nix on the other: like Mixed.
+            let managed = detection
+                .managed_elsewhere()
+                .expect("a conflict involves a package or Nix");
+            return Check::fail(
+                NAME,
+                format!("{partial}; their units and data directories conflict"),
+            )
+            .hint(format!(
+                "remove all but one of them:\nto keep {managed}: run `sudo puzuz uninstall`\n\
+                 to keep puzuz service install: {}",
+                detection.removal_hint(managed)
+            ));
+        }
+        let hint = match detection.managed_elsewhere() {
+            Some(managed) => format!(
+                "keep one installation: to keep {managed}, delete the other unit; otherwise \
+                 {}",
+                detection.removal_hint(managed)
+            ),
+            None => "both units must come from the same installation: re-run it (e.g. `sudo \
+                     puzuz service install`) or delete the stray unit"
+                .to_owned(),
+        };
+        return Check::warn(NAME, partial.clone()).hint(hint);
+    }
+    if !detection.leftovers.is_empty() {
+        let leftovers: Vec<String> = detection
+            .leftovers
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        return Check::warn(
+            NAME,
+            format!(
+                "{method}; no package owns {} (shadowed by the units in {UNIT_DIR})",
+                leftovers.join(" and ")
+            ),
+        )
+        .hint(format!(
+            "remove the leftover /usr/lib unit: `sudo rm {}`",
+            leftovers.join(" ")
+        ));
+    }
+    check
 }
 
 fn check_criu(sys: &dyn System, configured: &Path) -> Check {
@@ -888,7 +954,7 @@ fn check_helper_binary(sys: &dyn System) -> Check {
     let exe = exec.program;
     if let Err(err) = std::fs::metadata(sys.path(&exe)) {
         return Check::fail(NAME, format!("{}: {err}", exe.display()))
-            .hint("sudo puzuz service install --bin-dir /usr/local/bin");
+            .hint("sudo puzuz service install");
     }
     match check_root_owned_chain(sys, &exe) {
         Ok(()) => Check::ok(NAME, exe.display().to_string()),
@@ -901,7 +967,8 @@ fn check_helper_binary(sys: &dyn System) -> Check {
         )
         .hint(format!(
             "sudo chown root:root {0}; sudo chmod 755 {0}, and the same for each directory \
-             above it; or `sudo puzuz service install --bin-dir /usr/local/bin`",
+             above it; or re-run `sudo puzuz service install` with a directory only root can \
+             write to",
             exe.display()
         )),
     }

@@ -5,6 +5,9 @@ command on their `PATH`.
 
 - [Requirements](#requirements)
 - [Installing with install.sh](#installing-with-installsh)
+- [Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)
+- [Installing the Fedora/RHEL/Rocky package](#installing-the-fedorarhelrocky-package)
+- [Installing with Nix](#installing-with-nix)
 - [Arch Linux (AUR)](#arch-linux-aur)
 - [Building](#building)
 - [Installing](#installing)
@@ -21,7 +24,7 @@ command on their `PATH`.
 
 | Component | Requirement | Tested with |
 | --- | --- | --- |
-| OS | Linux with systemd as init | Ubuntu (Docker image with systemd as PID 1), x86_64 |
+| OS | Linux with systemd as init, x86_64 or aarch64 (releases are built for both) | Ubuntu (Docker image with systemd as PID 1), x86_64 |
 | systemd | 240 or newer (`puzuz doctor` checks this) | 259 |
 | Kernel | `CONFIG_CHECKPOINT_RESTORE=y` (`/proc/sys/kernel/ns_last_pid` must exist), PID and mount namespaces, 5.5 or newer recommended (`clone3` with `set_tid`, used by CRIU to restore PIDs), 5.2 or newer for `open_tree`/`move_mount` (used to clean up hidden mounts), 5.8 or newer to restore (`openat2`, `faccessat2` and `statx` mount ids, used to check what a restore opens) | 7.0 |
 | CRIU | 4.2 or newer | 4.2 (distribution package), 4.2.1 |
@@ -34,8 +37,15 @@ Without an NVIDIA driver puzuz still runs CPU-only jobs, and checkpoints them as
 
 ### CRIU
 
-Install the distribution's package (for example `sudo apt install criu`) or build it from
-<https://criu.org/Installation>. In the default **manual** mode
+puzuz needs CRIU 4.2 or newer to checkpoint; jobs run without it. `puzuz doctor` reports a
+missing or older CRIU. The distribution's package is new enough on Ubuntu 26.04
+(`sudo apt install criu`, universe), Fedora (`sudo dnf install criu`, 4.2) and Arch
+(`sudo pacman -S criu`). Ubuntu 22.04 (3.16), Ubuntu 24.04 (no package), Debian 12 (3.17),
+Debian 13 (4.1) and RHEL/Rocky/Alma 9 (3.19) do not have it: build CRIU from source following
+<https://criu.org/Installation> (the upstream release tarball, `make` and `sudo make install`
+into `/usr/local/sbin`), or point `criu_path` in `/etc/puzuz/config.toml` at a root-owned build.
+The `.deb` and the `.rpm` only recommend `criu`, so on those releases apt or dnf installs the old
+package or none; a CRIU in `/usr/local/sbin` comes first in the helper's `PATH`. In the default **manual** mode
 (`cuda_checkpoint_mode = "manual"`) the helper calls cuda-checkpoint itself and runs CRIU without
 plugins. The distribution package works for this, even though it ships without CRIU's CUDA plugin.
 
@@ -46,7 +56,8 @@ CRIU 4.0 or newer) drive cuda-checkpoint instead. It is optional; see
 ### cuda-checkpoint
 
 NVIDIA distributes cuda-checkpoint as a prebuilt binary in
-<https://github.com/NVIDIA/cuda-checkpoint>, under `bin/x86_64_Linux/cuda-checkpoint`. Put it
+<https://github.com/NVIDIA/cuda-checkpoint>, under `bin/x86_64_Linux/cuda-checkpoint` (or
+`bin/aarch64_Linux/` on arm64). Put it
 where root's `PATH` finds it, owned by root and not writable by others:
 
 ```sh
@@ -61,17 +72,17 @@ paths like `/run/current-system/sw/bin/criu` on NixOS work.
 
 ## Installing with install.sh
 
-`scripts/install.sh` is the usual way to install puzuz on x86_64 Linux. It is attached to every
+`scripts/install.sh` is the usual way to install puzuz on x86_64 and aarch64 Linux (on Debian and
+Ubuntu, the [package](#installing-the-debianubuntu-package) is an alternative). It is attached to every
 release. It downloads a release tarball, checks it, and runs that release's
-`puzuz service install --bin-dir /usr/local/bin` (see [Installing](#installing) for what that
-does).
+`puzuz service install`, which copies the binaries into `/usr/local/bin` (see
+[Installing](#installing) for what that does).
 
-### A token for the private repository
+### GitHub token (optional)
 
-The repository is private, so every download goes through the GitHub API with a token that can
-read it. Use a fine-grained personal access token limited to this repository with the
-"Contents: Read-only" permission and an expiry date. `install.sh` takes the token from, in this
-order:
+Downloads need no GitHub token. A token only raises the GitHub API rate limit for anonymous
+requests (60 an hour per IP address, which a shared NAT can use up). Any token works; a
+fine-grained one needs no permissions. `install.sh` uses one when it finds one, in this order:
 
 1. the `GH_TOKEN` or `GITHUB_TOKEN` environment variable,
 2. `--token-file FILE` (the first line of FILE),
@@ -79,25 +90,13 @@ order:
 4. `/etc/puzuz/github-token`, which `--save-token` writes (owned by root, mode 0600).
 
 The token is passed to `curl` in a header file, so it does not show up in `ps` or in the output.
-Without any token, `install.sh` tries without authentication, which works only once the
-repository is public. A missing or insufficient token fails with a message that says so (GitHub
-answers 404, not 403, when a token cannot read a private repository).
+A rejected token fails with a message that says so; a 404 for `--version X` means that release
+does not exist.
 
 ### Installing
 
-With the GitHub CLI logged in:
-
 ```sh
-gh release download -R kaito4681/puzuz -p install.sh -O - | sudo bash
-```
-
-Without the GitHub CLI, fetch the script through the API with your token:
-
-```sh
-curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-  -H "Accept: application/vnd.github.raw" \
-  https://api.github.com/repos/kaito4681/puzuz/contents/scripts/install.sh \
-  | sudo GH_TOKEN="$GH_TOKEN" bash
+curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
 ```
 
 Options go after `bash -s --` when the script comes from a pipe (for example
@@ -107,29 +106,35 @@ Options go after `bash -s --` when the script comes from a pipe (for example
 | Option | Meaning |
 | --- | --- |
 | `--version X` | install version X instead of the latest release |
-| `--bin-dir DIR` | where to put `puzuz` and `puzuz-helper` (default: the directory of the current `service install` installation, else `/usr/local/bin`) |
+| `--bin-dir DIR` | install somewhere else than the default (the current installation's directory, else `/usr/local/bin`) |
 | `--token-file FILE` | read the token from FILE |
 | `--save-token` | save the token to `/etc/puzuz/github-token` (root, 0600) for `puzuz update` and later runs |
-| `--uninstall` | remove puzuz (see [Uninstalling](#uninstalling)) |
+| `--uninstall` | remove puzuz with the installed `puzuz uninstall` (see [Uninstalling](#uninstalling)) |
 | `--purge` | with `--uninstall`, also delete `/etc/puzuz` and `/var/lib/puzuz` |
 | `-y`, `--yes` | do not ask before purging |
 
-The token is saved only with `--save-token`. Without it, an expired or revoked token cannot break
+A token is saved only with `--save-token`. Without it, an expired or revoked token cannot break
 a later run without you noticing which token was used.
 
 `install.sh` checks, before downloading anything, that it runs as root, that systemd is PID 1, that
-the machine is x86_64 with glibc 2.34 or newer, and that puzuz is not installed by a package
-manager or NixOS (see [Install method](#install-method)). It then:
+the machine is x86_64 or aarch64 with glibc 2.34 or newer, and that puzuz is not installed by a
+package manager or Nix (see [Install method](#install-method)). For the last check it asks an
+installed puzuz (the one the unit runs, else the one in `PATH`) with
+`puzuz service install-method`; without one it refuses only the obvious cases itself (NixOS by
+`/etc/os-release`, a unit a package owns, a unit linked into `/nix/store`), and the downloaded
+binary decides the rest before it installs anything. It then:
 
 1. looks up the release (`/repos/kaito4681/puzuz/releases/latest`, or `/releases/tags/v<X>`),
-2. downloads `puzuz-v<X>-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256` file into a
+2. downloads `puzuz-v<X>-<target>.tar.gz` (`x86_64-unknown-linux-gnu` or
+   `aarch64-unknown-linux-gnu`) and its `.sha256` file into a
    temporary directory and checks the checksum,
 3. if `minisign` is installed, also checks the `.minisig` signature against the release key built
    into the script (`packaging/minisign.pub`). Without `minisign` it says that the signature was
    not checked,
 4. extracts the tarball (refusing links and paths outside it), runs the new
-   `puzuz service install --bin-dir <DIR>` (`--bin-dir`, else the directory the installed units
-   run puzuz from, else `/usr/local/bin`), and prints its `puzuz doctor` report,
+   `puzuz service install` (which keeps the directory of the current installation, else uses
+   `/usr/local/bin`; `--bin-dir` is passed on only if you gave it), and prints its
+   `puzuz doctor` report,
 5. prints how to install CRIU and cuda-checkpoint if they are missing. It never installs them.
 
 If only some `puzuz doctor` checks fail (for example CRIU is missing) but the services run,
@@ -139,14 +144,18 @@ Afterwards, update with `sudo puzuz update` (see [Upgrading](#upgrading)). Runni
 again also installs the latest (or the given) version over the installed one. Running jobs keep
 running either way.
 
-On Arch Linux, use the AUR package instead (see [Arch Linux (AUR)](#arch-linux-aur)). Other
-ways to install (apt, rpm, Nix) are coming later. Until then, build from source as described
-below.
+On Debian and Ubuntu you can use the [.deb](#installing-the-debianubuntu-package) instead, on
+Fedora, RHEL, Rocky and Alma Linux the [.rpm](#installing-the-fedorarhelrocky-package), or
+[Nix](#installing-with-nix) anywhere, and on Arch Linux the [AUR package](#arch-linux-aur). You
+can also build from source as described below.
 
 ### Verifying a release by hand
 
-Each release has `puzuz-v<X>-x86_64-unknown-linux-gnu.tar.gz`, `.sha256` and `.minisig` files
-and `install.sh`. To check a tarball yourself:
+Each release has, for each target (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`),
+`puzuz-v<X>-<target>.tar.gz` with `.sha256` and `.minisig` files, the packages
+`puzuz_<X>_amd64.deb`, `puzuz_<X>_arm64.deb`, `puzuz-<X>-1.x86_64.rpm` and
+`puzuz-<X>-1.aarch64.rpm` with the same two files each, and `install.sh`. To check a tarball (or a
+package) yourself:
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
@@ -171,6 +180,266 @@ git commit packaging/minisign.pub scripts/install.sh
 Back up the secret key and its password. A new key needs a new release of `puzuz` before
 `puzuz update` accepts releases signed with it. Releases are created as drafts: publish the
 draft on GitHub, or `install.sh` (which asks for the latest published release) does not see it.
+
+## Installing the Debian/Ubuntu package
+
+Each release has a `.deb` for amd64 and arm64 (`dpkg --print-architecture` tells which), for
+Debian 12 and Ubuntu 22.04, 24.04 and 26.04. Download `puzuz_<version>_<arch>.deb` from the
+release and install it with apt, which also pulls in what it depends on:
+
+```sh
+sudo apt install ./puzuz_0.1.0_amd64.deb
+```
+
+The package contains:
+
+| Path | |
+| --- | --- |
+| `/usr/bin/puzuz`, `/usr/bin/puzuz-helper` | the binaries |
+| `/usr/lib/systemd/system/puzuz.service`, `puzuz-helper.service` | the units (`ExecStart=/usr/bin/...`) |
+| `/usr/lib/sysusers.d/puzuz.conf`, `/usr/lib/tmpfiles.d/puzuz.conf` | the `puzuz` user, the `puzuz-admin` group, the directories |
+| `/etc/puzuz/config.toml` | the default configuration (a conffile: your edits are kept on upgrades) |
+| `/etc/apt/sources.list.d/puzuz.sources`, `/etc/apt/keyrings/puzuz.gpg` | the puzuz APT repository and its signing key (conffiles, see below) |
+| `/usr/share/bash-completion`, `zsh/vendor-completions`, `fish/vendor_completions.d` | shell completions |
+| `/usr/share/doc/puzuz` | README, this guide, the architecture notes, the license |
+
+On the first installation it creates the user, the group and the directories, then enables and
+starts `puzuz-helper.service` and `puzuz.service`; check the result with `puzuz doctor`. Without
+systemd as PID 1 (a container image being built, a chroot) the services are only enabled, so they
+start on the next boot. Unlike `install.sh`, the package does not add `[[gpus]]` entries to the
+configuration; NVML finds the GPUs at start-up (see [GPU detection](#gpu-detection)).
+
+It depends on systemd 240 or newer and only **recommends** `criu`: on most supported releases the
+distribution's CRIU is missing or older than 4.2 (see [CRIU](#criu)). Jobs run without it, but
+checkpoints need it, and `puzuz doctor` reports a missing or old CRIU. cuda-checkpoint for GPU
+jobs is installed by hand as described in [cuda-checkpoint](#cuda-checkpoint).
+
+The package refuses to install on a machine where `puzuz service install` (or `install.sh`)
+installed puzuz: remove that first with `sudo puzuz uninstall` (with an older puzuz that lacks
+the command, `install.sh --uninstall`). Running jobs, `/etc/puzuz` and `/var/lib/puzuz` are kept. `puzuz doctor`
+and `puzuz service install-method` report the package's installation as a distribution
+`package`, and `puzuz service install`, `install.sh` and `puzuz update` refuse to touch it.
+
+**Updates.** The package registers the puzuz APT repository, a flat repository in the GitHub
+release `apt` (`https://github.com/kaito4681/puzuz/releases/download/apt/`, signed with the key in
+`/etc/apt/keyrings/puzuz.gpg`). So the `.deb` is installed by hand only once;
+later versions come with the rest of the system:
+
+```sh
+sudo apt update && sudo apt upgrade
+```
+
+The repository has the stable releases (not pre-releases) for amd64 and arm64, the newest five
+versions of each. An upgrade restarts the running services. Running jobs keep running, as with
+`puzuz update` (see [Upgrading](#upgrading)). Your edits to `/etc/puzuz/config.toml` and
+`/etc/apt/sources.list.d/puzuz.sources` are kept; `/etc/apt/keyrings/puzuz.gpg` is replaced by a
+new version's keyring when you have not changed it (that is how a new signing key arrives). While a new release is being uploaded,
+`apt update` may briefly fail with a hash mismatch or a missing file; running it again a minute
+later fixes it.
+
+**Adding the repository by hand.** Instead of installing the first `.deb` from the release page,
+you can add the repository and install from it. Use these exact file names and contents (they are
+what the package installs, so the package does not ask about them later):
+
+```sh
+sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
+sudo apt update && sudo apt install puzuz
+```
+
+**Removing.**
+
+```sh
+sudo apt remove puzuz    # stop and disable the services, remove the binaries and units
+sudo apt purge puzuz     # also delete /etc/puzuz and the APT repository entry and key
+```
+
+`remove` keeps the repository entry and its key (both conffiles), so `apt update` keeps working
+and `sudo apt install puzuz` brings puzuz back. Both keep `/var/lib/puzuz` (state, job logs, checkpoint images), the `puzuz` user and the
+`puzuz-admin` group, and never touch running jobs: they keep running in their own
+`puzuz-job-*` units. `purge` prints how to delete `/var/lib/puzuz`
+(`sudo systemctl stop 'puzuz-job-*'` first if jobs still run, then `sudo rm -rf /var/lib/puzuz`).
+
+### The APT repository (maintainers)
+
+The repository is the set of assets of the release `apt` (a pre-release, so it never becomes the
+"latest" release that `install.sh` and `puzuz update` follow): the `.deb` files, `Packages`,
+`Packages.gz`, `Release`, `InRelease` and `Release.gpg`, the public key `puzuz.gpg` and
+`puzuz.sources`. `.github/workflows/release-apt.yml` updates it with
+`scripts/dist/apt-repo.sh github <tag>` when a release is **published as a stable release** (the
+`released` event: publishing a stable release, or turning a pre-release into one): it adds the release's
+`.deb` files (after checking their checksums and their minisign signatures, with the public key
+of the tag's commit), deletes all but the newest
+five versions per architecture (in Debian version order), regenerates and signs the index (and
+copies `puzuz.gpg` and `puzuz.sources` out of the newest package it keeps), and uploads the
+packages first and the index last, `InRelease` at the very end; old `.deb` files are deleted after
+that. It creates the `apt` release when it is missing. `apt-repo.sh` decides what is published:
+drafts, pre-releases and tags other than `v*` are skipped with a notice. The index has no
+`by-hash` files (they need a subdirectory, and release asset names cannot contain `/`), hence the
+short window described above.
+
+`release.yml` only creates drafts, so the repository is updated when a person publishes the draft
+on GitHub (or a tool does so with a personal access token). A release published with a workflow's
+`GITHUB_TOKEN` does not start other workflows; then run it by hand, which is also how to retry a
+failed upload:
+
+```sh
+gh workflow run release-apt.yml -R kaito4681/puzuz -f tag=v0.1.0
+```
+
+To try it without a real release, use a fork: create a key there with
+`scripts/dist/gen-apt-key.sh` (and the minisign key, for `release.yml`), commit the public keys,
+set the secrets, push a tag, publish the draft, and run `apt update` against the fork's `apt`
+release. Or run the local test, `scripts/apt-repo-test.sh` (`PUZUZ_APT_BASES="debian:12
+ubuntu:22.04 ubuntu:24.04 ubuntu:26.04"`), which builds a repository with
+`apt-repo.sh update DIR DEB...` and a throwaway key and upgrades through it in containers.
+
+**The archive key.** `packaging/apt/puzuz-archive-keyring.gpg` is a test key until the real one
+is created (its user ID says "TEST KEY"; `release.yml` and `apt-repo.sh` refuse it). To create
+the real key once:
+
+```sh
+scripts/dist/gen-apt-key.sh     # asks for a passphrase; writes the secret key under ~
+gh secret set APT_GPG_PRIVATE_KEY -R kaito4681/puzuz < ~/puzuz-apt-key-*/apt-signing-key.asc
+gh secret set APT_GPG_PASSPHRASE -R kaito4681/puzuz
+# then commit packaging/apt/puzuz-archive-keyring.gpg
+```
+
+Without the two secrets, `release-apt.yml` skips the repository (with a notice). The index is
+signed only with a key that the newest package in the repository ships (`apt-repo.sh` reads
+`/etc/apt/keyrings/puzuz.gpg` out of the `.deb`), so a mismatch between the secret and the committed public key fails
+the run instead of breaking `apt update` for everyone.
+
+Back up the secret key and its passphrase. Every installed package trusts this key, so a new key
+can only be rolled out by a package version that ships it, through the repository signed with the
+old key:
+
+1. Create the new key (`scripts/dist/gen-apt-key.sh` in a scratch checkout) and append its public
+   key to `packaging/apt/puzuz-archive-keyring.gpg`, so the keyring holds both keys
+   (`cat old.gpg new.gpg >packaging/apt/puzuz-archive-keyring.gpg`). Keep the secrets on the old
+   key and release a version with the combined keyring.
+2. Wait until users have upgraded to it (at least one more release cycle).
+3. Switch the secrets `APT_GPG_PRIVATE_KEY` and `APT_GPG_PASSPHRASE` to the new key, and in the
+   same release remove the old key from the keyring. The keyring is a conffile: dpkg replaces it
+   on upgrade unless a user changed it (then dpkg asks). Users who skipped step 1's version get
+   `NO_PUBKEY` from `apt update` and install the next `.deb` by hand once, as on a first
+   installation.
+
+If the secret key leaks, do the same at once and tell users to install the new `.deb` by hand.
+
+The packages are built with [nfpm](https://nfpm.goreleaser.com) from `packaging/nfpm.yaml`
+(`scripts/dist/build-package.sh BIN_DIR OUT_DIR [deb|rpm]` builds a `.deb` or an `.rpm` from built
+binaries; `scripts/deb-test.sh` and `scripts/rpm-test.sh` check them in containers).
+
+## Installing the Fedora/RHEL/Rocky package
+
+Each release has an `.rpm` for x86_64 and aarch64 (`uname -m` tells which), for Fedora and
+RHEL-compatible 9 or newer (RHEL, Rocky Linux, AlmaLinux; glibc 2.34 or newer). Install it with
+dnf, from a downloaded file or straight from the release URL; dnf pulls in what it depends on:
+
+```sh
+sudo dnf install ./puzuz-0.1.0-1.x86_64.rpm
+# or
+sudo dnf install https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz-0.1.0-1.x86_64.rpm
+```
+
+(A pre-release such as `v0.2.0-rc.1` is `puzuz-0.2.0-rc.1-1.<arch>.rpm`; inside the package its
+version is `0.2.0~rc.1`, which sorts before `0.2.0`.)
+
+It installs the same files as the `.deb` (binaries, units in `/usr/lib/systemd/system`,
+sysusers.d and tmpfiles.d entries, `/etc/puzuz/config.toml`, shell completions, documentation,
+and the license in `/usr/share/licenses/puzuz`), but no repository configuration. The
+configuration is `%config(noreplace)`: your edits are kept on upgrades. The first installation
+sets up and starts the services exactly like the `.deb` (only enables them without systemd as
+PID 1), and refuses to install next to an installation made by `puzuz service install` or
+`install.sh`. It requires systemd and glibc 2.34 and only **recommends** `criu` (a weak
+dependency, which dnf installs by default when the distribution has it): Fedora's CRIU (4.2) is
+new enough, the 3.19 of RHEL/Rocky/Alma 9 is not, so checkpointing there needs a newer CRIU (see
+[CRIU](#criu)). Running jobs works without it.
+
+**Verifying.** Like every release asset, the `.rpm` has `.sha256` and `.minisig` files (see
+[Verifying a release by hand](#verifying-a-release-by-hand)). Releases built with the GPG key also
+sign the `.rpm` itself, and attach that key as `RPM-GPG-KEY-puzuz` (the APT repository's key):
+
+```sh
+sudo rpm --import https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz
+rpm -K puzuz-0.1.0-1.x86_64.rpm                     # "digests signatures OK"
+# or let dnf refuse an unsigned or badly signed file:
+sudo dnf install --setopt=localpkg_gpgcheck=1 ./puzuz-0.1.0-1.x86_64.rpm
+```
+
+**Updates.** There is no dnf repository yet (it is planned, see
+[issue #23](https://github.com/kaito4681/puzuz/issues/23)), so `dnf upgrade` alone does not see new
+versions. Install the newer `.rpm` of the release instead; dnf takes the URL directly:
+
+```sh
+sudo dnf upgrade https://github.com/kaito4681/puzuz/releases/download/v<new version>/puzuz-<new version>-1.x86_64.rpm
+```
+
+When a newer release exists, the "update" line of `puzuz doctor` (and `puzuz update --check`)
+prints this command with the release's URL for the machine's architecture, and how to check the
+signature first. An upgrade restarts the running services. Running jobs keep running.
+
+**Removing.**
+
+```sh
+sudo dnf remove puzuz
+```
+
+It stops and disables the services and removes the binaries and units. It keeps `/var/lib/puzuz`
+(state, job logs, checkpoint images), the `puzuz` user and the `puzuz-admin` group, and never
+touches running jobs. rpm has no purge: an edited `config.toml` is kept as
+`/etc/puzuz/config.toml.rpmsave`; delete `/etc/puzuz` and `/var/lib/puzuz` by hand if you no
+longer need them (`sudo systemctl stop 'puzuz-job-*'` first if jobs still run).
+
+## Installing with Nix
+
+The repository is a Nix flake (`flake.nix`). It builds puzuz from source for x86_64 and aarch64
+Linux; nothing is downloaded from the GitHub releases. Its outputs:
+
+| Output | Contents |
+| --- | --- |
+| `packages.<system>.default` (also `puzuz`) | `bin/puzuz`, `bin/puzuz-helper`, bash/zsh/fish completions, the docs |
+| `packages.<system>.criu` | CRIU 4.2.1 (nixpkgs has an older version), for the NixOS module |
+| `devShells.<system>.default` | a development shell with the Rust toolchain (`nix develop`) |
+
+Use `github:kaito4681/puzuz/stable` to follow releases: the `stable` branch moves to every
+release tag (not to pre-releases). Plain `github:kaito4681/puzuz` is the development head
+(`main`).
+
+### NixOS
+
+A NixOS module (`services.puzuz`) is coming soon. `puzuz service install` refuses to run on
+NixOS (`ID=nixos` in `/etc/os-release`) and points to the module (see
+[Install method](#install-method)).
+
+### Other distributions
+
+Build the flake, then install the service from the result like a tarball:
+
+```sh
+nix build github:kaito4681/puzuz/stable
+sudo ./result/bin/puzuz service install
+```
+
+`service install` copies the binaries to `/usr/local/bin` and, because they still load their
+libraries from the Nix store, registers the build as a garbage-collector root
+(`/nix/var/nix/gcroots/puzuz`; see [Installing](#installing)). If `nix-store` is not in root's
+`PATH` (sudo's `secure_path` often leaves out the Nix profile), install warns and prints the
+command to register it yourself. With the root registered you can delete `./result`. The units run the copies in `/usr/local/bin`, so the install method is
+`service-install`, not `nix` (which means units that resolve into `/nix/store`, such as the NixOS
+module's). Install CRIU as described in [CRIU](#criu).
+
+To update, run the same two commands again (Nix fetches the current `stable`; add `--refresh` if
+it was fetched less than an hour ago); running jobs keep running. `sudo puzuz update` works too,
+but replaces the Nix build with the release tarball's binaries. Remove puzuz with
+`sudo puzuz uninstall` (see [Uninstalling](#uninstalling)), which also removes the GC root.
+
+`nix profile install github:kaito4681/puzuz/stable` gives a user the `puzuz` command (with
+completions) only. The helper runs as root and cannot run from a user profile, so the service
+must be installed as above.
 
 ## Arch Linux (AUR)
 
@@ -265,30 +534,53 @@ scripts/test-in-docker.sh build --release -p puzuz -p puzuz-helper
 # -> target/docker/release/puzuz, target/docker/release/puzuz-helper
 ```
 
-Tagged versions also come as prebuilt binaries for x86_64 Linux (built on Debian bookworm, glibc
-2.34 or newer) on the GitHub releases page: `puzuz-v<version>-x86_64-unknown-linux-gnu.tar.gz`
+Tagged versions also come as prebuilt binaries for x86_64 and aarch64 Linux (built natively on
+Debian bookworm, glibc 2.34 or newer) on the GitHub releases page:
+`puzuz-v<version>-<target>.tar.gz` (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`)
 holds `puzuz`, `puzuz-helper` and the documentation, with `.sha256` and `.minisig` files next to
 it. `install.sh` installs them (see above). By hand:
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 tar xzf puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-sudo puzuz-v0.1.0-x86_64-unknown-linux-gnu/puzuz service install --bin-dir /usr/local/bin
+sudo puzuz-v0.1.0-x86_64-unknown-linux-gnu/puzuz service install
 ```
 
 ## Installing
 
 ```sh
-sudo target/release/puzuz service install --bin-dir /usr/local/bin
+sudo target/release/puzuz service install
 ```
 
-The units run the binaries from the directory the `puzuz` binary is in, but only if that is
-`/usr/bin` or `/usr/local/bin`. Otherwise pass `--bin-dir <DIR>` to copy `puzuz` and
-`puzuz-helper` there. `puzuz-helper` must sit next to `puzuz`. Because `puzuz-helper` runs as
-root, the directory and every parent must be owned by root and not group- or world-writable
-(directories that do not exist yet are created with mode 0755); install refuses anything else.
-`--no-start` enables the services without starting or restarting them. `--force` overwrites unit,
-sysusers.d and tmpfiles.d files that `puzuz service install` did not write (see step 2).
+`puzuz-helper` must sit next to `puzuz`. The units run the binaries from:
+
+1. the directory of the current `service install` installation, when re-installing or updating,
+2. else the directory the `puzuz` binary is in, if that is `/usr/bin` or `/usr/local/bin`
+   (used in place, nothing is copied),
+3. else `/usr/local/bin`, where `puzuz` and `puzuz-helper` are copied (it says so). That is the
+   usual place for software the administrator installs: package managers leave it alone, and it
+   is in systemd's and every user's default `PATH`.
+
+`--bin-dir DIR` installs somewhere else. Because `puzuz-helper` runs as root, the directory and
+every parent must be owned by root and not group- or world-writable (directories that do not
+exist yet are created with mode 0755); install refuses anything else. `--no-start` enables the
+services without starting or restarting them. `--force` overwrites unit, sysusers.d and
+tmpfiles.d files that `puzuz service install` did not write (see step 2).
+
+On RHEL, CentOS, Rocky, Alma and Fedora, sudo's `secure_path` does not include `/usr/local/bin`,
+so `sudo puzuz ...` says "command not found". Run `sudo /usr/local/bin/puzuz ...`, or add
+`/usr/local/bin` to `secure_path` with `sudo visudo`; `puzuz doctor` (run as root) points this
+out. Scripts with a minimal `PATH` (such as cron's `/usr/bin:/bin`) need the full path too.
+
+Built with Nix outside NixOS (`nix build`, then `sudo ./result/bin/puzuz service install`), the
+binaries are copied to `/usr/local/bin` like any other build. They still load their libraries
+from the Nix store, so install also registers the store path as a garbage-collector root,
+`/nix/var/nix/gcroots/puzuz` (with `nix-store --add-root /nix/var/nix/gcroots/puzuz --realise
+<store path>`). If `nix-store` is not found or fails, install warns and prints that command, and
+a root recorded earlier is kept. Whether the root is still needed is decided from the installed
+binaries themselves (their dynamic loader is in `/nix/store`), so moving a Nix-built copy with
+`--bin-dir` keeps it. `puzuz uninstall` removes the root, and so does installing binaries that
+do not use the store (for example `puzuz update`).
 
 `puzuz service install` exits non-zero when the final `puzuz doctor` report has a FAIL. After
 `--no-start`, the failures that only mean "not running yet" (both units, both sockets, the
@@ -297,8 +589,14 @@ daemon and the helper connection) are ignored.
 `puzuz service install` is safe to run again (for example after an upgrade). It does the
 following:
 
-1. Copies `puzuz` and `puzuz-helper` into `--bin-dir`, if given (mode 0755, replaced
-   atomically).
+1. Copies `puzuz` and `puzuz-helper` into the directory chosen above unless they are already
+   there (mode 0755, replaced atomically), registers the Nix GC root if they come from the
+   store, and writes `/var/lib/puzuz/install-receipt` (root, 0644). The receipt records the
+   directory, the binaries it copied (none when they are used in place), the version and the GC
+   root, so that `puzuz uninstall` removes exactly those. A re-install into another directory
+   (with `--bin-dir`) removes the copies the previous one made. If the receipt exists but cannot
+   be used (not owned by root, writable by others, or not valid), install stops without
+   changing anything: fix the file, or delete it after checking what it lists.
 2. Writes these files from the packaging templates built into the binary. Each file starts with
    an "Installed by `puzuz service install`" marker line and is overwritten on the next install.
    If one of them exists without the marker (written by an administrator or a package), install
@@ -342,28 +640,65 @@ the units with drop-ins (`sudo systemctl edit puzuz-helper.service`). Edits to t
 
 ### Install method
 
-`puzuz service install` must not share a machine with a package manager or NixOS: its units in
+`puzuz service install` must not share a machine with a package manager or Nix: its units in
 `/etc/systemd/system` would shadow the packaged ones, and both would use `/etc/puzuz` and
-`/var/lib/puzuz`. puzuz tells the ways apart by their files:
+`/var/lib/puzuz`. puzuz tells the ways apart by the unit files, `puzuz.service` and
+`puzuz-helper.service` each:
 
 | Install method | Recognized by |
 | --- | --- |
-| `puzuz service install` | `/etc/systemd/system/puzuz.service` starting with the install marker line |
-| distribution package | `/usr/lib/systemd/system/puzuz.service` (or `/lib/systemd/system/...`) |
-| NixOS | `/etc/NIXOS`, or a unit whose `ExecStart=` is below `/nix/store` |
-| by hand | `/etc/systemd/system/puzuz.service` without the marker, and no packaged unit |
+| `puzuz service install` | `/etc/systemd/system/<unit>` starting with the install marker line |
+| distribution package | `/usr/lib/systemd/system/<unit>` (or `/lib/systemd/system/...`) that `dpkg-query -S`, `rpm -qf` or `pacman -Qo` names an owner for (asked under both paths, since dpkg may have registered the `/lib` one on merged-`/usr` systems; the first tool with a definite answer decides). If no tool can answer (none installed, or each fails, e.g. with a locked database), the unit counts as a package of unknown origin |
+| unowned unit | such a unit that a package manager definitely reports as not owned (`no path found matching pattern`, `is not owned by any package`, `No package owns`): left over from a removed package, or copied there by hand (`make install`) |
+| Nix | `/etc/systemd/system/<unit>` resolving into `/nix/store` (the NixOS `services.puzuz` module, system-manager), or a packaged unit that resolves into or runs a binary from `/nix/store` |
+| by hand | `/etc/systemd/system/<unit>` without the marker, and no packaged unit (also when its `ExecStart=` is below `/nix/store`) |
 
-Next to a packaged unit, a `/etc/systemd/system/puzuz.service` without the marker is the
-administrator's replacement of it (`systemctl edit --full puzuz`), and a symlink to `/dev/null`
-there is a mask (`systemctl mask puzuz`). Neither is a second install method: puzuz reports the
-package as "overridden" or "masked". A mask without a package is ignored.
+Next to a packaged (or unowned) unit, a `/etc/systemd/system/puzuz.service` without the marker is
+the administrator's replacement of it (`systemctl edit --full puzuz`), and a symlink to
+`/dev/null` there is a mask (`systemctl mask puzuz`). Neither is a second install method: puzuz
+reports the package as "overridden" or "masked". A mask without a package is ignored.
 
-`puzuz service install` refuses to run on a machine where puzuz comes from a package or from
-NixOS, even with `--force`, and names the package manager's way to update it instead.
-`puzuz service uninstall` refuses such a machine too. When both a package and `service install`
-are present ("mixed"), `uninstall` removes only the files that `service install` wrote, and
-refuses `--purge` (the package still uses `/etc/puzuz` and `/var/lib/puzuz`). `puzuz doctor`
-reports the install method and fails on a mixed setup. `puzuz service status` shows it too.
+The operating system is read from `/etc/os-release` (else `/usr/lib/os-release`), `ID` and
+`ID_LIKE`. It only decides the wording of hints and that NixOS (`ID=nixos`) uses its module; it
+never decides the install method (the same distribution can have puzuz from a package or from
+`install.sh`). `/etc/NIXOS` is not looked at.
+
+What each command does (the hidden `puzuz service install-method` prints the keyword, for
+`install.sh`):
+
+| Install method | `service install` | `uninstall` | `update` | `doctor` | keyword |
+| --- | --- | --- | --- | --- | --- |
+| not installed | installs | says so | refuses: use `install.sh` | INFO | `none` |
+| not installed, NixOS | refuses: use the `services.puzuz` module | says so | refuses: use the module | INFO "not installed (NixOS: use the services.puzuz module)" | `none` |
+| `puzuz service install` | re-installs | uninstalls | updates | OK | `service-install` |
+| distribution package (dpkg, rpm, pacman, or unknown) | refuses, even with `--force` | refuses | refuses | OK (INFO when masked) | `package` |
+| unowned unit | only with `--force`; delete the file first instead | refuses | refuses | WARN | `unowned` |
+| Nix | refuses, even with `--force` | refuses | refuses | OK | `nix` |
+| by hand | only with `--force` | refuses | refuses | INFO | `manual` |
+| mixed | refuses: uninstall the `service install` copy first | removes only what `service install` wrote (no `--purge`) | refuses | FAIL | `mixed` |
+
+"Mixed" is `service install` together with a package or Nix, on one unit or across
+`puzuz.service` and `puzuz-helper.service` (e.g. the daemon unit from `service install`, the
+helper unit from a package): `doctor` fails, `service status` reports it as unhealthy, and the
+keyword is `mixed`. A `service install` next to an unowned unit in `/usr/lib` stays a
+`service install` (its units in `/etc` win), and re-running `service install` needs no
+`--force`; `doctor` warns and tells you to delete the leftover. When the two units are installed
+in other different ways (for example, one of them is missing, or they come from different
+packages of different package managers), `doctor` warns and `service status` says so;
+`service install` installs both and so fixes it. `service install` also refuses when `/etc/systemd/system` itself
+resolves into `/nix/store`, since it cannot write there.
+
+The refusals name the way to update or remove puzuz that fits the install method:
+
+| Install method | Update | Remove |
+| --- | --- | --- |
+| dpkg | `sudo apt update && sudo apt upgrade` | `sudo apt remove <package>` |
+| rpm | `sudo dnf upgrade` | `sudo dnf remove <package>` |
+| pacman | `yay -Syu` (AUR) or `sudo pacman -Syu` | `sudo pacman -R <package>` |
+| package of unknown origin | your package manager (named after `ID`/`ID_LIKE` when known) | the same |
+| Nix on NixOS | `nix flake update && sudo nixos-rebuild switch` | `services.puzuz.enable = false`, then `sudo nixos-rebuild switch` |
+| Nix elsewhere | the Nix configuration that created the unit | the same |
+| `puzuz service install` | `sudo puzuz update` | `sudo puzuz uninstall` |
 
 The daemon runs with `ProtectSystem=strict`: it can only write below the unit's
 `ReadWritePaths=/var/lib/puzuz/daemon /var/lib/puzuz/logs /run/puzuz`. If you move `data_dir`,
@@ -464,8 +799,7 @@ drop-ins included), whether the daemon's directories are inside its `ReadWritePa
 sockets, the daemon and helper versions and their connection, the checkpoint
 directory (exists, not tmpfs, free space) and the total checkpoint size, whether you are an
 administrator, and (unless `update_check = false`) whether a newer release exists. That last
-check is at most INFO, and so is not being able to reach GitHub (a user without a token cannot
-read the private repository). It does not run `criu check`. Run `sudo criu check` yourself to see what CRIU
+check is at most INFO, and so is not being able to reach GitHub. It does not run `criu check`. Run `sudo criu check` yourself to see what CRIU
 supports on this kernel.
 
 Try a job:
@@ -766,9 +1100,12 @@ and its "update" line says when a newer release exists):
 | Installed with | Update with |
 | --- | --- |
 | `install.sh` (or `puzuz service install` of a release) | `sudo puzuz update` |
-| built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install --bin-dir /usr/local/bin` |
+| the `.deb` | `sudo apt update && sudo apt upgrade` (or install a newer `.deb` from a release with `sudo apt install ./puzuz_<new version>_<arch>.deb`) |
+| the `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>` (no dnf repository yet) |
+| built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install` |
+| `puzuz service install` from a Nix build (not NixOS) | the same `nix build` and `service install` again (see [Installing with Nix](#installing-with-nix)) |
 | the AUR package `puzuz-bin` | `yay -Syu` (any AUR helper), then `sudo systemctl restart puzuz-helper.service puzuz.service`; `puzuz update` refuses |
-| a distribution package or NixOS (later) | the package manager; `puzuz update` refuses |
+| another distribution package or Nix (later) | the package manager or Nix (see [Install method](#install-method)); `puzuz update` refuses and names the command |
 
 ### puzuz update
 
@@ -778,11 +1115,12 @@ sudo puzuz update             # install the latest release
 sudo puzuz update --version 0.2.0 --yes
 ```
 
-`puzuz update` needs a GitHub token that can read the repository, like `install.sh`: `GH_TOKEN`
-or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or `/etc/puzuz/github-token` (root, 0600),
-which `install.sh --save-token` writes. It then:
+`puzuz update` needs no GitHub token. Like `install.sh`, it uses one when given (it raises the API
+rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or
+`/etc/puzuz/github-token` (root, 0600), which `install.sh --save-token` writes. It then:
 
-1. checks that puzuz was installed by `puzuz service install` (not by a package or NixOS) and
+1. checks that puzuz was installed by `puzuz service install` (not by a package, Nix or by
+   hand, and that both units belong to it) and
    that it runs as the installed binary (the directory in `puzuz.service`'s `ExecStart=`),
 2. looks up the latest release (or `--version`) and compares it with its own version. Nothing
    happens when it is up to date. An older version is installed only when asked for with
@@ -793,7 +1131,8 @@ which `install.sh --save-token` writes. It then:
 5. extracts the tarball (regular files and directories only) and asks the new `puzuz` which
    database schema it supports. A release that cannot open the daemon's database (an older one,
    from before a schema change) is refused before anything changes,
-6. runs the new `puzuz service install --bin-dir <the installed directory>`, waits until the
+6. runs the new `puzuz service install` for the installed directory, removes the Nix GC root of
+   a Nix-built installation (the release's binaries do not need the store), waits until the
    daemon runs the new version and is connected to the helper, and deletes the download.
 
 `install.sh` (run again, optionally with `--version`) works too and does the same, except that it
@@ -822,31 +1161,40 @@ services if anything changed. The configuration file is kept.
 
 ## Uninstalling
 
-For the AUR package, see [Arch Linux (AUR)](#arch-linux-aur) (`sudo pacman -R puzuz-bin`).
-The commands below are for installations made with `install.sh` or `puzuz service install`.
+For the `.deb`, use `sudo apt remove puzuz` or `sudo apt purge puzuz` (see
+[Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)); for the `.rpm`,
+`sudo dnf remove puzuz` (see
+[Installing the Fedora/RHEL/Rocky package](#installing-the-fedorarhelrocky-package)); for the AUR
+package, `sudo pacman -R puzuz-bin` (see [Arch Linux (AUR)](#arch-linux-aur)). For an installation
+made by `install.sh` or `puzuz service install`:
 
 ```sh
-sudo puzuz service uninstall            # stop, disable and remove the units and snippets
-sudo puzuz service uninstall --purge    # also delete /etc/puzuz, /var/lib/puzuz, /run/puzuz, /run/puzuz-helper
+sudo puzuz uninstall            # stop, disable and remove the units, snippets and copied binaries
+sudo puzuz uninstall --purge    # also delete /etc/puzuz, /var/lib/puzuz, /run/puzuz, /run/puzuz-helper
 ```
 
-`install.sh --uninstall [--purge] [--yes]` runs the same command and then also deletes the
-`puzuz` and `puzuz-helper` binaries from the directory the units ran them from:
-
-```sh
-gh release download -R kaito4681/puzuz -p install.sh -O - | sudo bash -s -- --uninstall
-```
-
-`--purge` asks for confirmation on the terminal. When there is no terminal, pass `--yes`.
+`puzuz service uninstall` is the same command, and `install.sh --uninstall [--purge] [--yes]`
+runs it. `--purge` asks for confirmation on the terminal. When there is no terminal, pass
+`--yes`.
 
 - Only files that start with the install marker are removed. Others are reported and kept.
+- The binaries are removed only if `/var/lib/puzuz/install-receipt` lists them as copied by
+  `puzuz service install` (only `puzuz` and `puzuz-helper` in the recorded directory). Binaries
+  that were used in place, for example in `/usr/bin`, are kept. An installation made before the
+  receipt existed keeps its binaries, and `uninstall` prints which to remove by hand; so does an
+  unusable receipt. A listed binary that a package owns by now (asked of dpkg, rpm and pacman)
+  is kept, and so is one whose owner a package manager could not tell. The Nix GC root and the
+  receipt are removed as well; if a binary could not be removed, the receipt is kept listing it
+  (re-run `sudo puzuz uninstall` later).
+- `install.sh --uninstall` with an installed `puzuz` older than `puzuz uninstall` runs its
+  `service uninstall` and then deletes `puzuz` and `puzuz-helper` from the units' directory.
 - Running jobs keep running in their own units. `uninstall` warns about them, and `--purge`
   refuses to run while any `puzuz-job-*` unit is active. Stop them first with
   `sudo systemctl stop 'puzuz-job-*'`, or checkpoint/kill them before uninstalling.
 - `--purge` asks for confirmation (`-y/--yes` skips it). It does not descend into mount points
   (for example the bind mount of `/` below `/run/puzuz-helper`). Those are reported for you to
   unmount and delete by hand.
-- The system user `puzuz`, the group `puzuz-admin` and the binaries are always kept.
+- The system user `puzuz` and the group `puzuz-admin` are always kept.
 
 ## Troubleshooting
 
@@ -884,9 +1232,11 @@ stopped until `sudo systemctl start puzuz` or the next boot.
 | `gpus` | nvidia-smi lists N GPU(s), the configuration M | update `[[gpus]]` (see [GPU detection](#gpu-detection)) |
 | `kernel` | lacks `/proc/sys/kernel/ns_last_pid` | use a kernel with `CONFIG_CHECKPOINT_RESTORE=y` |
 | `update` | puzuz X is available (INFO) | `sudo puzuz update`; `update_check = false` turns the check off |
-| `install method` | mixed: two install methods at once | remove all but one, as the `fix:` lines say (e.g. `sudo puzuz service uninstall` to keep the package) |
+| `install method` | mixed: two install methods at once | remove all but one, as the `fix:` lines say (e.g. `sudo puzuz uninstall` to keep the package) |
+| `install method` | WARN: a unit no package owns, a leftover unit, or units installed in different ways | delete the unowned `/usr/lib` unit (`sudo rm ...`), or re-run the installation that should own both units, as the `fix:` line says |
 | `puzuz.service`, `puzuz-helper.service` | not installed / not active | `sudo puzuz service install`, or `sudo systemctl start <unit>` and read `journalctl -u <unit>` |
-| `helper binary` | the binary or a directory above it is not owned by root or is writable by others | `sudo chown root:root <path>; sudo chmod 755 <path>` (and its directories), or reinstall with `--bin-dir /usr/local/bin` |
+| `helper binary` | the binary or a directory above it is not owned by root or is writable by others | `sudo chown root:root <path>; sudo chmod 755 <path>` (and its directories), or reinstall into another directory |
+| `sudo PATH` | sudo's secure_path does not include /usr/local/bin (INFO, RHEL family) | `sudo /usr/local/bin/puzuz ...`, or add `/usr/local/bin` to `secure_path` with `sudo visudo` |
 | `daemon write paths` | cannot write to a configured directory: not below its ReadWritePaths= | add a `ReadWritePaths=` drop-in for `puzuz.service` (see [Installing](#installing)) |
 | `helper` | the daemon is not connected to the helper | `journalctl -u puzuz-helper`. Often an ownership problem with the configuration or a data directory. |
 | `daemon` | runs version X while this puzuz is Y | `sudo systemctl restart puzuz-helper.service puzuz.service` after upgrading, or update the CLI |

@@ -1,0 +1,39 @@
+#!/bin/sh
+# After the puzuz package is removed: forget its units; on purge also delete
+# the configuration. The state, logs and checkpoint images in /var/lib/puzuz
+# are always kept (they may belong to jobs that are still running or that
+# can still be restored); this prints how to delete them.
+#
+# Arguments: deb `remove` / `purge` / `upgrade <new-version>` /
+# `failed-upgrade|abort-install|abort-upgrade|disappear ...`; rpm %postun `0`
+# (erase) / `1` (upgrade). rpm has no purge.
+set -e
+
+case "$1" in
+remove | 0)
+    action=remove
+    ;;
+purge)
+    action=purge
+    ;;
+*) exit 0 ;;
+esac
+
+if [ "$action" = purge ]; then
+    # dpkg has already deleted the conffiles; this removes what was added
+    # next to them (e.g. github-token) and the directory itself.
+    rm -rf /etc/puzuz
+    rm -f /var/lib/puzuz/package-removed
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+
+if [ "$action" = purge ] && [ -d /var/lib/puzuz ]; then
+    echo "puzuz: kept /var/lib/puzuz (state, job logs, checkpoint images). To delete it:"
+    echo "  sudo systemctl stop 'puzuz-job-*'   # if jobs are still running"
+    echo "  sudo rm -rf /var/lib/puzuz"
+fi
+
+exit 0

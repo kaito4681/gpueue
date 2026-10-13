@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use puzuz_protocol::api::{HelperStatus, VersionResponse};
 
-use super::{CmdOutput, FsUsage, HttpResponse, System};
+use super::{CmdOutput, FsUsage, HttpError, HttpResponse, System};
 
 /// Request headers, as sent.
 pub type Headers = Vec<(String, String)>;
@@ -37,7 +37,12 @@ pub struct FakeSystem {
     pub env: RefCell<HashMap<String, String>>,
     /// `(url, answer)`: a GET of exactly `url` gets `answer` (`Err` is a network failure);
     /// other URLs fail with "offline". The last matching entry wins.
-    pub http: RefCell<Vec<(String, Result<HttpResponse, String>)>>,
+    pub http: RefCell<Vec<(String, Result<HttpResponse, HttpError>)>>,
+    /// `(url, error)`: the next GET of `url` fails with `error` (used up in order, before
+    /// `http` is consulted).
+    pub http_failures: RefCell<Vec<(String, HttpError)>>,
+    /// Every duration slept, in order.
+    pub sleeps: RefCell<Vec<Duration>>,
     /// Every URL fetched, with the headers sent.
     pub http_log: RefCell<Vec<(String, Headers)>>,
 }
@@ -61,6 +66,8 @@ impl FakeSystem {
             prompts: RefCell::default(),
             env: RefCell::default(),
             http: RefCell::default(),
+            http_failures: RefCell::default(),
+            sleeps: RefCell::default(),
             http_log: RefCell::default(),
         }
     }
@@ -82,6 +89,13 @@ impl FakeSystem {
         ));
     }
 
+    /// Makes the next GET of `url` fail with `error`, before the answers of [`Self::serve`].
+    pub fn fail_next(&self, url: &str, error: HttpError) {
+        self.http_failures
+            .borrow_mut()
+            .push((url.to_owned(), error));
+    }
+
     pub fn respond(&self, prefix: &str, output: CmdOutput) {
         self.responses
             .borrow_mut()
@@ -90,6 +104,26 @@ impl FakeSystem {
 
     pub fn missing(&self, prefix: &str) {
         self.responses.borrow_mut().push((prefix.to_owned(), None));
+    }
+
+    /// Makes `dpkg-query -S <path>` report that `package` owns the system path `path`.
+    pub fn dpkg_owns(&self, path: &str, package: &str) {
+        self.respond(
+            &format!("dpkg-query -S {path}"),
+            CmdOutput::ok(format!("{package}: {path}\n")),
+        );
+    }
+
+    /// Commands run so far, without the package-owner queries of install method detection.
+    pub fn commands_without_queries(&self) -> Vec<String> {
+        self.commands()
+            .into_iter()
+            .filter(|line| {
+                !["dpkg-query ", "rpm ", "pacman "]
+                    .iter()
+                    .any(|query| line.starts_with(query))
+            })
+            .collect()
     }
 
     /// Writes a file at a system path, creating parent directories.
@@ -209,7 +243,9 @@ impl System for FakeSystem {
         self.confirm_answer
     }
 
-    fn sleep(&self, _duration: Duration) {}
+    fn sleep(&self, duration: Duration) {
+        self.sleeps.borrow_mut().push(duration);
+    }
 
     fn env_var(&self, name: &str) -> Option<String> {
         self.env.borrow().get(name).cloned()
@@ -220,7 +256,7 @@ impl System for FakeSystem {
         url: &str,
         headers: &[(&str, &str)],
         _timeout: Duration,
-    ) -> Result<HttpResponse, String> {
+    ) -> Result<HttpResponse, HttpError> {
         self.http_log.borrow_mut().push((
             url.to_owned(),
             headers
@@ -228,12 +264,17 @@ impl System for FakeSystem {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
         ));
+        let mut failures = self.http_failures.borrow_mut();
+        if let Some(index) = failures.iter().position(|(failing, _)| failing == url) {
+            return Err(failures.remove(index).1);
+        }
+        drop(failures);
         self.http
             .borrow()
             .iter()
             .rev()
             .find(|(served, _)| served == url)
             .map(|(_, answer)| answer.clone())
-            .unwrap_or_else(|| Err("offline".to_owned()))
+            .unwrap_or_else(|| Err(HttpError::new("offline")))
     }
 }

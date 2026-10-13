@@ -9,6 +9,20 @@
   where apt is offline; `PUZUZ_E2E_GPU=1` with a CUDA base image adds a GPU scenario).
 - Real OS reboot/poweroff in a QEMU/KVM VM (Ubuntu 26.04, CPU jobs; needs /dev/kvm, image cached in
   the `puzuz-vm-cache` volume): `scripts/vm-reboot-test.sh [reboot|poweroff|inflight]`.
+- The `.deb` (nfpm, `packaging/nfpm.yaml`): `scripts/dist/build-package.sh BIN_DIR OUT_DIR` builds
+  it, `scripts/deb-test.sh [DEB]` installs/removes/purges it in a container (`PUZUZ_DEB_BASE`,
+  `PUZUZ_DEB_HTTPS=1` where plain-HTTP apt is blocked).
+- The `.rpm` (same nfpm definition): `scripts/dist/build-package.sh BIN_DIR OUT_DIR rpm` builds it,
+  `scripts/rpm-test.sh [OLD_RPM NEW_RPM]` installs/upgrades/removes it in a container
+  (`PUZUZ_RPM_BASE`, default `rockylinux/rockylinux:9`; also `fedora:latest`).
+- The APT repository (a flat repository in the release `apt`): `scripts/dist/apt-repo.sh`
+  (`update DIR DEB...` locally, `github TAG` from `.github/workflows/release-apt.yml` when a
+  release is published); `scripts/apt-repo-test.sh [DEB]` upgrades v1 to v2 through a local copy
+  in containers (`PUZUZ_APT_BASES`, `PUZUZ_DEB_HTTPS=1`).
+- Nix flake: `flake.nix` and `nix/` (package, CRIU override). Without Nix on the host, run
+  `nix flake check` / `nix build .#default` in a pinned `nixos/nix` Docker image. Tests that cannot
+  pass in the Nix sandbox are listed in `nix/package.nix`. Release tags move the `stable` branch
+  (`.github/workflows/release-nix.yml`).
 - CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, an MSRV check (`rust-version`),
   shellcheck and the CPU e2e on pull requests; pushing a `v<version>` tag builds the release
   tarball and a draft GitHub release (`.github/workflows/release.yml`).

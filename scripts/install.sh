@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs, re-installs (updates) or uninstalls puzuz from its GitHub releases.
 #
-#   gh release download -R kaito4681/puzuz -p install.sh -O - | sudo bash
+#   curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
 #   sudo bash install.sh [--version X] [--bin-dir DIR] [--save-token] [--token-file F]
 #   sudo bash install.sh --uninstall [--purge] [--yes]
 #
@@ -10,7 +10,8 @@
 set -euo pipefail
 
 REPO="kaito4681/puzuz"
-TARGET="x86_64-unknown-linux-gnu"
+# Set by check_arch: x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu.
+TARGET=""
 MIN_GLIBC="2.34"
 DEFAULT_BIN_DIR="/usr/local/bin"
 TOKEN_FILE_SAVED="/etc/puzuz/github-token"
@@ -31,21 +32,22 @@ Usage:
 Options:
   --version X        install version X (default: the latest release); re-running
                      with a newer version updates puzuz, running jobs keep running
-  --bin-dir DIR      where to put puzuz and puzuz-helper (default: the directory
-                     of the current installation, else $DEFAULT_BIN_DIR)
+  --bin-dir DIR      install somewhere else than the default (the current
+                     installation's directory, else $DEFAULT_BIN_DIR)
   --token-file FILE  read the GitHub token from FILE
   --save-token       save the token to $TOKEN_FILE_SAVED (root, 0600) for
                      \`puzuz update\`
-  --uninstall        stop and remove the services and the binaries; keeps
-                     /etc/puzuz and /var/lib/puzuz (state, logs, checkpoints)
+  --uninstall        stop and remove the services and the binaries (runs
+                     \`puzuz uninstall\`); keeps /etc/puzuz and /var/lib/puzuz
+                     (state, logs, checkpoints)
   --purge            with --uninstall: also delete /etc/puzuz and /var/lib/puzuz
   -y, --yes          do not ask before purging
   -h, --help         show this help
 
-The repository is private: downloads need a GitHub token that can read it,
-taken from (in this order) GH_TOKEN or GITHUB_TOKEN, --token-file, \`gh auth token\`
-of the user who ran sudo, or $TOKEN_FILE_SAVED. A fine-grained personal access
-token with read-only "Contents" access to $REPO is enough.
+Releases are downloaded through the GitHub API. A GitHub token is optional (it
+raises the API rate limit); one is taken from, in this order, GH_TOKEN or
+GITHUB_TOKEN, --token-file, \`gh auth token\` of the user who ran sudo, or
+$TOKEN_FILE_SAVED. Any token works; a fine-grained one needs no permissions.
 EOF
 }
 
@@ -60,8 +62,7 @@ die() {
 
 parse_args() {
     VERSION=""
-    BIN_DIR="$DEFAULT_BIN_DIR"
-    BIN_DIR_GIVEN=0
+    BIN_DIR=""
     UNINSTALL=0
     PURGE=0
     YES=0
@@ -82,12 +83,10 @@ parse_args() {
         --bin-dir)
             [ "$#" -ge 2 ] || die "--bin-dir needs a value"
             BIN_DIR="$2"
-            BIN_DIR_GIVEN=1
             shift 2
             ;;
         --bin-dir=*)
             BIN_DIR="${1#--bin-dir=}"
-            BIN_DIR_GIVEN=1
             shift
             ;;
         --token-file)
@@ -123,7 +122,7 @@ parse_args() {
         esac
     done
     case "$BIN_DIR" in
-    /*) ;;
+    "" | /*) ;;
     *) die "--bin-dir must be an absolute path" ;;
     esac
     if [ "$PURGE" = 1 ] && [ "$UNINSTALL" = 0 ]; then
@@ -144,10 +143,16 @@ check_systemd() {
     [ -d /run/systemd/system ] || die "systemd is not the init system (PID 1); puzuz runs as systemd services"
 }
 
+# Same mapping as dist_arch in scripts/dist/lib.sh (this script is downloaded
+# alone, so it keeps its own copy).
 check_arch() {
     local arch
     arch="$(uname -m)"
-    [ "$arch" = x86_64 ] || die "only x86_64 is supported for now (this machine is $arch)"
+    case "$arch" in
+    x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+    aarch64 | arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+    *) die "releases exist for x86_64 and aarch64 only (this machine is $arch); build puzuz from source (see docs/install.md)" ;;
+    esac
 }
 
 # version_ge A B: whether version A >= version B (dotted numbers).
@@ -162,52 +167,175 @@ check_glibc() {
     version_ge "$version" "$MIN_GLIBC" || die "glibc $version is too old; puzuz needs $MIN_GLIBC or newer (e.g. Ubuntu 22.04, Debian 12, RHEL 9)"
 }
 
-# The install method as `puzuz service install-method` reports it, decided
-# from the same files, for before anything is downloaded. A symlink to
-# /dev/null in /etc (`systemctl mask`) is never an installation, and next to
-# a packaged unit a marker-less /etc unit is its override (`systemctl edit
-# --full`); neither adds a method of its own.
-install_method() {
-    local methods=() etc=/etc/systemd/system/puzuz.service package=0
-    [ -e /etc/NIXOS ] && methods+=(nixos)
-    if [ -f /usr/lib/systemd/system/puzuz.service ] || [ -f /lib/systemd/system/puzuz.service ]; then
-        if grep -q '^ExecStart=/nix/store/' /usr/lib/systemd/system/puzuz.service /lib/systemd/system/puzuz.service 2>/dev/null; then
-            methods+=(nixos)
-        else
-            methods+=(package)
-            package=1
+# os_release FIELD: a field of os-release(5) (/etc/os-release, else
+# /usr/lib/os-release), or nothing.
+os_release() {
+    local file
+    for file in /etc/os-release /usr/lib/os-release; do
+        if [ -r "$file" ]; then
+            # shellcheck disable=SC1090
+            (. "$file" && eval "printf '%s\n' \"\${$1:-}\"")
+            return
         fi
-    fi
-    if [ -L "$etc" ] && [ "$(readlink "$etc")" = /dev/null ]; then
-        : # masked
-    elif [ -f "$etc" ]; then
-        if [ "$(head -n1 "$etc")" = "$INSTALL_MARKER" ]; then
-            methods+=(service-install)
-        elif grep -q '^ExecStart=/nix/store/' "$etc"; then
-            methods+=(nixos)
-        elif [ "$package" -eq 0 ]; then
-            methods+=(manual)
-        fi
-    fi
-    mapfile -t methods < <(printf '%s\n' "${methods[@]}" | awk 'NF && !seen[$0]++')
-    case "${#methods[@]}" in
-    0) echo none ;;
-    1) echo "${methods[0]}" ;;
-    *) echo mixed ;;
-    esac
+    done
+}
+
+# The distribution family (debian, rhel, arch, suse) from ID and ID_LIKE, or
+# nothing. Used for wording only, never to decide how puzuz is installed.
+os_family() {
+    local id
+    for id in $(os_release ID) $(os_release ID_LIKE); do
+        case "$id" in
+        debian | ubuntu) echo debian && return ;;
+        fedora | rhel | centos) echo rhel && return ;;
+        arch) echo arch && return ;;
+        suse | opensuse*) echo suse && return ;;
+        esac
+    done
+}
+
+# unit_puzuz UNIT: the puzuz binary that UNIT's ExecStart= runs (after any
+# of systemd's -@:+! prefixes), or nothing.
+unit_puzuz() {
+    sed -n 's|^ExecStart=[-@:+!]*\(/[^ ]*/puzuz\) daemon.*|\1|p' "$1" 2>/dev/null | head -n1
 }
 
 # The directory of the binaries the `service install` unit runs, or nothing.
 installed_bin_dir() {
-    sed -n 's|^ExecStart=\(/.*\)/puzuz daemon.*|\1|p' /etc/systemd/system/puzuz.service 2>/dev/null | head -n1
+    local exe
+    exe="$(unit_puzuz /etc/systemd/system/puzuz.service)"
+    [ -z "$exe" ] || dirname "$exe"
+}
+
+# The `puzuz` of an existing installation: the one the daemon unit runs, else
+# the one in PATH; nothing if there is none.
+installed_puzuz() {
+    local unit exe
+    for unit in /etc/systemd/system/puzuz.service /usr/lib/systemd/system/puzuz.service /lib/systemd/system/puzuz.service; do
+        exe="$(unit_puzuz "$unit")"
+        if [ -n "$exe" ] && [ -x "$exe" ]; then
+            echo "$exe"
+            return
+        fi
+    done
+    command -v puzuz 2>/dev/null || true
+}
+
+# Whether /etc/systemd/system/puzuz.service was written by `puzuz service install`.
+marker_unit_installed() {
+    [ "$(head -n1 /etc/systemd/system/puzuz.service 2>/dev/null)" = "$INSTALL_MARKER" ]
+}
+
+# installed_method: how an installed puzuz says it is installed (`puzuz
+# service install-method`), or nothing if no puzuz can tell (none installed,
+# or one too old to know the command, or failing).
+installed_method() {
+    local puzuz
+    puzuz="$(installed_puzuz)"
+    [ -n "$puzuz" ] || return 0
+    "$puzuz" service install-method 2>/dev/null || true
+}
+
+# package_owner FILE: prints "NAME MANAGER" for the package that owns FILE
+# (asking dpkg-query, rpm and pacman, under /usr/lib and /lib), or fails.
+package_owner() {
+    local file="$1" paths=("$1") path out
+    case "$file" in
+    /usr/lib/*) paths+=("/lib/${file#/usr/lib/}") ;;
+    /lib/*) paths+=("/usr/lib/${file#/lib/}") ;;
+    esac
+    for path in "${paths[@]}"; do
+        if command -v dpkg-query >/dev/null 2>&1 && out="$(dpkg-query -S "$path" 2>/dev/null)"; then
+            # Diversion lines (`diversion by ...`, `local diversion ...`) name no owner.
+            out="$(grep -v 'diversion' <<<"$out" | grep ': ' | head -n1)" || true
+            if [ -n "$out" ]; then
+                out="${out%%: *}"
+                out="${out%%, *}"
+                echo "${out%%:*} dpkg"
+                return 0
+            fi
+        fi
+        if command -v rpm >/dev/null 2>&1 && out="$(rpm -qf --queryformat '%{NAME}\n' "$path" 2>/dev/null)"; then
+            echo "$(head -n1 <<<"$out") rpm"
+            return 0
+        fi
+        if command -v pacman >/dev/null 2>&1 && out="$(pacman -Qqo "$path" 2>/dev/null)"; then
+            echo "$(head -n1 <<<"$out") pacman"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# package_hint NAME MANAGER: how to update or remove that package.
+package_hint() {
+    case "$2" in
+    dpkg) echo "update it with \`sudo apt update && sudo apt upgrade\`, or remove it with \`sudo apt remove $1\`" ;;
+    rpm) echo "update it with \`sudo dnf upgrade\`, or remove it with \`sudo dnf remove $1\`" ;;
+    pacman) echo "update it with \`yay -Syu\` (AUR) or \`sudo pacman -Syu\`, or remove it with \`sudo pacman -R $1\`" ;;
+    esac
+}
+
+nix_message() {
+    if [ "$(os_release ID)" = nixos ]; then
+        echo "this is NixOS: install puzuz with the \`services.puzuz\` NixOS module instead"
+    else
+        echo "the puzuz units come from /nix/store: change the Nix configuration that created them instead"
+    fi
+}
+
+# Without an installed puzuz to ask: refuses only what is clearly not ours to
+# change (NixOS, units from /nix/store, units a package owns). The new binary
+# decides the rest after the download.
+check_obvious_conflicts() {
+    local unit file owner
+    [ "$(os_release ID)" != nixos ] || die "$(nix_message)"
+    case "$(readlink -m /etc/systemd/system)" in
+    /nix/store/*) die "/etc/systemd/system resolves into /nix/store (managed by Nix); install puzuz through that Nix configuration instead" ;;
+    esac
+    for unit in puzuz.service puzuz-helper.service; do
+        if [ -L "/etc/systemd/system/$unit" ]; then
+            case "$(readlink -m "/etc/systemd/system/$unit")" in
+            /nix/store/*) die "$(nix_message)" ;;
+            esac
+        fi
+        for file in "/usr/lib/systemd/system/$unit" "/lib/systemd/system/$unit"; do
+            [ -e "$file" ] || continue
+            if owner="$(package_owner "$file")"; then
+                # shellcheck disable=SC2086
+                die "puzuz is installed by the distribution package ${owner% *} (${owner#* }: $file); $(package_hint $owner)"
+            fi
+        done
+    done
+}
+
+# Packaged-looking units no package owns.
+unowned_units() {
+    local file found=()
+    for file in /usr/lib/systemd/system/puzuz.service /usr/lib/systemd/system/puzuz-helper.service \
+        /lib/systemd/system/puzuz.service /lib/systemd/system/puzuz-helper.service; do
+        # On merged-/usr systems /lib is /usr/lib.
+        case "$file" in /lib/*) [ /lib -ef /usr/lib ] && continue ;; esac
+        [ -e "$file" ] && found+=("$file")
+    done
+    echo "${found[*]}"
 }
 
 # check_install_method METHOD: refuses everything but `service install` or nothing.
 check_install_method() {
+    local family
     case "$1" in
     none | service-install) ;;
-    package) die "puzuz is installed by a distribution package (/usr/lib/systemd/system/puzuz.service); update or remove it with your package manager instead" ;;
-    nixos) die "this is NixOS (or puzuz comes from /nix/store); use the NixOS module instead" ;;
+    package)
+        family="$(os_family)"
+        case "$family" in
+        debian) die "puzuz is installed by a distribution package; update it with \`sudo apt update && sudo apt upgrade\`, or remove it with apt, instead (\`puzuz doctor\` names the package)" ;;
+        *) die "puzuz is installed by a distribution package; update or remove it with your package manager instead (\`puzuz doctor\` names the package)" ;;
+        esac
+        ;;
+    unowned) die "no package owns $(unowned_units) (left over from a removed package, or copied there by hand); delete it and re-run this script" ;;
+    # nixos: what `install-method` printed before it said nix.
+    nix | nixos) die "$(nix_message)" ;;
     manual) die "/etc/systemd/system/puzuz.service was not written by \`puzuz service install\`; remove it (or run \`sudo puzuz service install --force\` once) and re-run this script" ;;
     mixed) die "puzuz is installed in more than one way; run \`puzuz doctor\` and remove all but one first" ;;
     *) die "unknown install method: $1" ;;
@@ -270,12 +398,17 @@ write_headers() {
     return 0
 }
 
+# GitHub answers 401 for a bad token, 403 when the API rate limit is used up,
+# and 404 for a release or repository that does not exist.
 no_access() {
     local what="$1" code="$2"
     if [ "$HAVE_TOKEN" = 1 ]; then
-        die "$what: HTTP $code. The token cannot read $REPO (expired, revoked, or without \"Contents: Read-only\" access to it)"
+        die "$what: HTTP $code with the GitHub token: it may be expired or revoked, or $REPO has no published release. A token is optional; unset GH_TOKEN/GITHUB_TOKEN (and --token-file, $TOKEN_FILE_SAVED) to download anonymously"
     fi
-    die "$what: HTTP $code. A GitHub token that can read $REPO is needed: set GH_TOKEN (\`sudo GH_TOKEN=... bash install.sh\`), pass --token-file, or run \`gh auth login\` as the user that runs sudo"
+    if [ "$code" = 404 ]; then
+        die "$what: HTTP 404. $REPO has no published release (or does not exist)"
+    fi
+    die "$what: HTTP $code. GitHub refused the anonymous request, usually because of its API rate limit; try again later, or use a GitHub token: set GH_TOKEN (\`sudo GH_TOKEN=... bash install.sh\`), pass --token-file, or run \`gh auth login\` as the user that runs sudo"
 }
 
 # api_get PATH OUT ACCEPT: GET $API_URL$PATH into OUT.
@@ -287,7 +420,7 @@ api_get() {
     case "$code" in
     200) ;;
     401 | 403 | 404)
-        if [ "$code" = 404 ] && [ -n "$VERSION" ] && [ "$HAVE_TOKEN" = 1 ] && [[ "$path" == */releases/tags/* ]]; then
+        if [ "$code" = 404 ] && [ -n "$VERSION" ] && [[ "$path" == */releases/tags/* ]]; then
             die "release v$VERSION not found in $REPO"
         fi
         no_access "GET $path" "$code"
@@ -405,14 +538,13 @@ have_program() {
 
 # Prints how to install what puzuz needs but this script does not install.
 print_missing_deps() {
-    local id="" hints=()
-    # shellcheck disable=SC1091
-    [ -r /etc/os-release ] && id="$(. /etc/os-release && echo "${ID:-}")"
+    local hints=()
     if ! have_program criu; then
-        case "$id" in
-        ubuntu | debian) hints+=("criu (checkpointing): \`sudo apt install criu\`; puzuz needs CRIU 4.2 or newer, so on older releases build it from source (see docs/install.md, \"CRIU\")") ;;
-        fedora | rhel | rocky | almalinux | centos) hints+=("criu (checkpointing): \`sudo dnf install criu\` (4.2 or newer)") ;;
+        case "$(os_family)" in
+        debian) hints+=("criu (checkpointing): \`sudo apt install criu\`; puzuz needs CRIU 4.2 or newer, so on older releases build it from source (see docs/install.md, \"CRIU\")") ;;
+        rhel) hints+=("criu (checkpointing): \`sudo dnf install criu\` (4.2 or newer)") ;;
         arch) hints+=("criu (checkpointing): \`sudo pacman -S criu\`") ;;
+        suse) hints+=("criu (checkpointing): \`sudo zypper install criu\` (4.2 or newer)") ;;
         *) hints+=("criu 4.2 or newer (checkpointing), from your distribution or https://criu.org") ;;
         esac
     fi
@@ -432,14 +564,18 @@ do_install() {
     check_arch
     check_glibc
     local method
-    method="$(install_method)"
-    check_install_method "$method"
-    # An update stays where the current installation is, unless --bin-dir says otherwise.
-    if [ "$BIN_DIR_GIVEN" = 0 ] && [ "$method" = service-install ]; then
-        local current
-        current="$(installed_bin_dir)"
-        [ -z "$current" ] || BIN_DIR="$current"
+    # An installed puzuz knows best; without one, only the obvious conflicts
+    # are refused here, and the downloaded binary decides below.
+    method="$(installed_method)"
+    if [ -z "$method" ]; then
+        check_obvious_conflicts
+        if marker_unit_installed; then
+            method=service-install
+        else
+            method=none
+        fi
     fi
+    check_install_method "$method"
 
     local token
     token="$(resolve_token)"
@@ -464,10 +600,15 @@ do_install() {
 
     [ "$SAVE_TOKEN" = 1 ] && save_token "$token"
 
-    local status=0
-    "$new" service install --bin-dir "$BIN_DIR" || status=$?
+    # `service install` chooses the directory (the current installation's, else
+    # /usr/local/bin) unless --bin-dir was given.
+    local args=(service install) status=0 bin_dir
+    [ -z "$BIN_DIR" ] || args+=(--bin-dir "$BIN_DIR")
+    "$new" "${args[@]}" || status=$?
+    bin_dir="$(installed_bin_dir)"
+    [ -n "$bin_dir" ] || bin_dir="${BIN_DIR:-$DEFAULT_BIN_DIR}"
     if [ "$status" -ne 0 ]; then
-        if "$BIN_DIR/puzuz" service status >/dev/null 2>&1; then
+        if "$bin_dir/puzuz" service status >/dev/null 2>&1; then
             warn "puzuz $version is installed and running, but some checks above failed; fix them and re-run \`puzuz doctor\`"
         else
             print_missing_deps
@@ -476,25 +617,33 @@ do_install() {
     fi
     print_missing_deps
     info ""
-    info "puzuz $version is installed in $BIN_DIR."
+    info "puzuz $version is installed in $bin_dir."
 }
 
 # --- uninstall -------------------------------------------------------------
 
 do_uninstall() {
-    local method puzuz bin_dir=""
-    method="$(install_method)"
+    local method puzuz bin_dir
+    method="$(installed_method)"
+    if [ -z "$method" ] && marker_unit_installed; then
+        method=service-install
+    fi
     case "$method" in
     service-install) ;;
-    none) die "puzuz is not installed by \`puzuz service install\`; nothing to uninstall" ;;
+    "" | none) die "puzuz is not installed by \`puzuz service install\`; nothing to uninstall" ;;
     *) check_install_method "$method" ;;
     esac
     bin_dir="$(installed_bin_dir)"
-    [ -n "$bin_dir" ] || bin_dir="$BIN_DIR"
+    [ -n "$bin_dir" ] || bin_dir="${BIN_DIR:-$DEFAULT_BIN_DIR}"
     puzuz="$bin_dir/puzuz"
     [ -x "$puzuz" ] || die "$puzuz not found"
-
-    local args=(service uninstall)
+    # `puzuz uninstall` also removes the binaries `service install` copied. A
+    # puzuz from before it has only `service uninstall`, which keeps them.
+    local args=(uninstall) legacy=0
+    if ! "$puzuz" uninstall --help >/dev/null 2>&1; then
+        legacy=1
+        args=(service uninstall)
+    fi
     if [ "$PURGE" = 1 ]; then
         args+=(--purge)
         if [ "$YES" = 1 ]; then
@@ -509,13 +658,16 @@ do_uninstall() {
     else
         "$puzuz" "${args[@]}" </dev/null
     fi
-    local file
-    for file in "$bin_dir/puzuz" "$bin_dir/puzuz-helper"; do
-        if [ -e "$file" ]; then
-            rm -f "$file"
-            info "removed $file"
-        fi
-    done
+    if [ "$legacy" = 1 ]; then
+        # What install.sh installed before the receipt existed.
+        local file
+        for file in "$bin_dir/puzuz" "$bin_dir/puzuz-helper"; do
+            if [ -e "$file" ]; then
+                rm -f "$file"
+                info "removed $file"
+            fi
+        done
+    fi
 }
 
 main() {

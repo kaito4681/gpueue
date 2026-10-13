@@ -14,8 +14,15 @@ use std::time::Duration;
 use puzuz_daemon::config::DEFAULT_CONFIG_PATH;
 
 use crate::doctor::{self, Report};
-use crate::install_method::{self, InstallMethod};
+use crate::install_method::{self, Detection, Method};
 use crate::system::{System, check_root_owned_chain, run_checked};
+
+mod gc_root;
+mod receipt;
+
+pub use gc_root::GC_ROOT;
+use receipt::ReceiptState;
+pub use receipt::{RECEIPT_PATH, Receipt};
 
 pub const DAEMON_UNIT: &str = "puzuz.service";
 pub const HELPER_UNIT: &str = "puzuz-helper.service";
@@ -63,7 +70,7 @@ fn require_root(sys: &dyn System, what: &str) -> Result<()> {
         Ok(())
     } else {
         Err(format!(
-            "`puzuz service {what}` must run as root; try `sudo puzuz service {what}`"
+            "`puzuz {what}` must run as root; try `sudo puzuz {what}`"
         ))
     }
 }
@@ -190,13 +197,40 @@ fn valid_bin_dir(dir: &Path) -> Result<()> {
     }
 }
 
-/// Decides where the units run the binaries from, copying them there if asked to.
-/// Returns the directory and whether a binary changed.
+/// Where the binaries are installed when neither `--bin-dir` nor an existing installation
+/// says otherwise: the standard place for software the administrator installs (FHS), which
+/// package managers leave alone and which is in systemd's and every user's default `PATH`.
+pub const DEFAULT_BIN_DIR: &str = "/usr/local/bin";
+
+/// The binaries the units run, as installed by [`install_binaries`].
+struct Binaries {
+    bin_dir: PathBuf,
+    /// Whether a binary in `bin_dir` changed.
+    changed: bool,
+    /// The binaries copied into `bin_dir` (empty: used in place).
+    copied: Vec<PathBuf>,
+    /// The Nix store path the running binary belongs to, if it runs from the store.
+    store_path: Option<PathBuf>,
+}
+
+/// The directory of the binaries an existing `service install` installation runs.
+fn installed_bin_dir(detection: &Detection) -> Option<&Path> {
+    detection.methods().find_map(|m| match m {
+        Method::ServiceInstall { bin_dir: Some(dir) } => Some(dir.as_path()),
+        _ => None,
+    })
+}
+
+/// Decides where the units run the binaries from and copies them there unless they already
+/// are: `--bin-dir` if given; else the directory of an existing `service install`
+/// installation; else the directory of this binary if it is /usr/bin or /usr/local/bin (used
+/// in place); else [`DEFAULT_BIN_DIR`].
 fn install_binaries(
     sys: &dyn System,
-    bin_dir: Option<&Path>,
+    explicit: Option<&Path>,
+    detection: &Detection,
     out: &mut dyn Write,
-) -> Result<(PathBuf, bool)> {
+) -> Result<Binaries> {
     let exe = sys
         .current_exe()
         .map_err(io_err("cannot locate the running puzuz binary"))?;
@@ -211,33 +245,40 @@ fn install_binaries(
             helper.display()
         ));
     }
-    let Some(bin_dir) = bin_dir else {
-        if SYSTEM_BIN_DIRS.iter().any(|dir| exe_dir == Path::new(dir)) {
-            check_root_owned_chain(sys, &exe_dir).map_err(|err| {
-                format!(
-                    "the helper would run as root from {}, but {err}",
-                    exe_dir.display()
-                )
-            })?;
-            return Ok((exe_dir, false));
-        }
-        return Err(format!(
-            "puzuz runs from {}, which is not a system directory; re-run with \
-             `--bin-dir /usr/local/bin` to install copies of puzuz and puzuz-helper there",
-            exe_dir.display()
-        ));
+    let bin_dir = if let Some(dir) = explicit {
+        dir.to_owned()
+    } else if let Some(dir) = installed_bin_dir(detection) {
+        dir.to_owned()
+    } else if SYSTEM_BIN_DIRS.iter().any(|dir| exe_dir == Path::new(dir)) {
+        exe_dir.clone()
+    } else {
+        writeln!(
+            out,
+            "installing into {DEFAULT_BIN_DIR} (use --bin-dir to choose another directory)"
+        )
+        .ok();
+        PathBuf::from(DEFAULT_BIN_DIR)
     };
-    valid_bin_dir(bin_dir)?;
+    valid_bin_dir(&bin_dir)?;
     // puzuz-helper runs as root from here: whoever can replace it, or rename a parent
     // directory, gets root.
-    check_root_owned_chain(sys, bin_dir).map_err(|err| {
-        format!(
-            "--bin-dir {}: {err}; choose a directory only root can write to, such as \
-             /usr/local/bin",
-            bin_dir.display()
-        )
+    check_root_owned_chain(sys, &bin_dir).map_err(|err| {
+        if explicit.is_some() {
+            format!(
+                "--bin-dir {}: {err}; choose a directory only root can write to, such as \
+                 {DEFAULT_BIN_DIR}",
+                bin_dir.display()
+            )
+        } else {
+            format!(
+                "the helper would run as root from {}, but {err}; fix that, or choose a \
+                 directory only root can write to with --bin-dir",
+                bin_dir.display()
+            )
+        }
     })?;
     let mut changed = false;
+    let mut copied = Vec::new();
     for (source, name) in [(&exe, "puzuz"), (&helper, "puzuz-helper")] {
         let target = bin_dir.join(name);
         if sys.path(source) == sys.path(&target) {
@@ -249,8 +290,71 @@ fn install_binaries(
             writeln!(out, "installed {}", target.display()).ok();
             changed = true;
         }
+        copied.push(target);
     }
-    Ok((bin_dir.to_owned(), changed))
+    Ok(Binaries {
+        bin_dir,
+        changed,
+        copied,
+        store_path: gc_root::store_path_of(sys, &exe),
+    })
+}
+
+/// Writes the install receipt for `binaries`. A re-install into the same directory keeps the
+/// copies recorded before (re-running the installed copy uses it in place); copies the
+/// previous installation left in another directory are returned for removal.
+fn write_receipt(
+    sys: &dyn System,
+    previous: Option<&Receipt>,
+    binaries: &Binaries,
+    (gc_root, gc_root_target): gc_root::GcRoot,
+) -> Result<Vec<PathBuf>> {
+    let mut copied = binaries.copied.clone();
+    let mut stale = Vec::new();
+    if let Some(previous) = previous {
+        for path in previous.removable_copies() {
+            if previous.bin_dir == binaries.bin_dir {
+                if !copied.contains(&path) {
+                    copied.push(path);
+                }
+            } else {
+                stale.push(path);
+            }
+        }
+    }
+    copied.sort();
+    receipt::write(
+        sys,
+        &Receipt {
+            version: puzuz_protocol::BINARY_VERSION.to_owned(),
+            bin_dir: binaries.bin_dir.clone(),
+            copied,
+            gc_root,
+            gc_root_target,
+        },
+    )?;
+    Ok(stale)
+}
+
+/// After `puzuz update` installed the binaries of a release tarball over an installation from
+/// the Nix store: once the installed binaries no longer use the store, the GC root recorded in
+/// the receipt is removed and the receipt updated. (The new `service install` does this
+/// itself; this also covers a release that predates the receipt.)
+pub fn release_gc_root(sys: &dyn System, version: &str, out: &mut dyn Write) -> Result<()> {
+    let ReceiptState::Valid(mut receipt) = receipt::read_or_warn(sys, out) else {
+        return Ok(());
+    };
+    let Some(root) = receipt.gc_root.clone() else {
+        return Ok(());
+    };
+    if gc_root::binaries_need_store(sys, &receipt.bin_dir) {
+        return Ok(());
+    }
+    gc_root::remove_gc_root(sys, &root, out);
+    receipt.gc_root = None;
+    receipt.gc_root_target = None;
+    receipt.version = version.to_owned();
+    receipt::write(sys, &receipt)
 }
 
 /// GPUs reported by nvidia-smi as `[[gpus]]` entries for a new configuration file.
@@ -347,36 +451,75 @@ fn check_foreign_files(sys: &dyn System, files: &[InstallFile], force: bool) -> 
     ))
 }
 
-/// Refuses to touch a machine where a package manager or NixOS manages puzuz: the units in
-/// /etc would shadow the packaged ones, and both would share /etc/puzuz and /var/lib/puzuz.
-/// `--force` does not override this.
-fn check_install_method(method: &InstallMethod) -> Result<()> {
-    let Some(managed) = method.managed_elsewhere() else {
-        return Ok(());
-    };
-    let mut message = format!(
-        "puzuz is installed as {managed}; `puzuz service install` would conflict with it \
-         (--force does not change this). To update it, {}.",
-        managed.update_hint()
-    );
-    if method.has_service_install() {
-        message.push_str(
-            " It is also installed by `puzuz service install`; remove that copy with \
-             `sudo puzuz service uninstall`.",
+/// Refuses to touch a machine where a package manager or Nix manages puzuz: the units in /etc
+/// would shadow the packaged ones, and both would share /etc/puzuz and /var/lib/puzuz.
+/// `--force` does not override this. A unit in /usr/lib that no package owns is refused
+/// without `--force`. Returns warnings to print before installing.
+fn check_install_method(detection: &Detection, force: bool) -> Result<Vec<String>> {
+    if let Some(managed) = detection.managed_elsewhere() {
+        let mut message = format!(
+            "puzuz is installed as {managed}; `puzuz service install` would conflict with it \
+             (--force does not change this). To update it, {}.",
+            detection.update_hint(managed)
         );
-    } else {
-        message.push_str(&format!(
-            " To switch to `puzuz service install`, first {}.",
-            managed.removal_hint()
+        if detection.has_service_install() {
+            message.push_str(
+                " It is also installed by `puzuz service install`; remove that copy with \
+                 `sudo puzuz uninstall`.",
+            );
+        } else {
+            message.push_str(&format!(
+                " To switch to `puzuz service install`, first {}.",
+                detection.removal_hint(managed)
+            ));
+        }
+        return Err(message);
+    }
+    if detection.os.is_nixos() {
+        return Err(
+            "this is NixOS: install puzuz with the `services.puzuz` NixOS module instead of \
+             `puzuz service install` (--force does not change this)"
+                .to_owned(),
+        );
+    }
+    if detection.unit_dir_in_store {
+        return Err(format!(
+            "{UNIT_DIR} resolves into /nix/store: Nix manages it, and it cannot be written. \
+             Install puzuz through the Nix configuration that manages it (--force does not \
+             change this)"
         ));
     }
-    Err(message)
+    let mut warnings = Vec::new();
+    for method in detection.methods() {
+        if let Method::Unowned { unit, .. } = method {
+            let unit = unit.display();
+            let note = format!(
+                "no package owns {unit} (left over from a removed package, or copied there by \
+                 hand); delete it (`sudo rm {unit}`)"
+            );
+            if !force && detection.unowned_needs_force() {
+                return Err(format!(
+                    "{note} and re-run, or re-run with --force to install next to it"
+                ));
+            }
+            warnings.push(format!("{note}: the units in {UNIT_DIR} shadow it"));
+        }
+    }
+    for leftover in &detection.leftovers {
+        let leftover = leftover.display();
+        warnings.push(format!(
+            "no package owns {leftover}, which the units in {UNIT_DIR} shadow; delete it \
+             (`sudo rm {leftover}`)"
+        ));
+    }
+    Ok(warnings)
 }
 
 /// `puzuz service install`. Prints progress and finally the doctor report to `out`.
 pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) -> Result<Report> {
-    require_root(sys, "install")?;
-    check_install_method(&install_method::detect(sys))?;
+    require_root(sys, "service install")?;
+    let detection = install_method::detect(sys);
+    let warnings = check_install_method(&detection, options.force)?;
     if let Some(bin_dir) = &options.bin_dir {
         // Validated before anything is copied; the files below then name it.
         valid_bin_dir(bin_dir)?;
@@ -386,7 +529,36 @@ pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) 
         &packaged_files(options.bin_dir.as_deref().unwrap_or(Path::new("/usr/bin"))),
         options.force,
     )?;
-    let (bin_dir, binaries_changed) = install_binaries(sys, options.bin_dir.as_deref(), out)?;
+    for warning in warnings {
+        writeln!(out, "warning: {warning}").ok();
+    }
+    // A receipt that cannot be used is neither built upon nor overwritten: it may be the only
+    // record of copies and a GC root that would otherwise be forgotten.
+    let previous = match receipt::read_or_warn(sys, out) {
+        ReceiptState::Valid(receipt) => Some(receipt),
+        ReceiptState::Missing => None,
+        ReceiptState::Invalid(_) => {
+            return Err(format!(
+                "refusing to replace {RECEIPT_PATH} (see the warning above): it records which \
+                 binaries puzuz copied and its Nix GC root. Fix it, or delete it (`sudo rm \
+                 {RECEIPT_PATH}`) after checking what it lists, and re-run"
+            ));
+        }
+    };
+    let binaries = install_binaries(sys, options.bin_dir.as_deref(), &detection, out)?;
+    let previous_root = previous.as_ref().map_or((None, None), |p| {
+        (p.gc_root.clone(), p.gc_root_target.clone())
+    });
+    let gc_root = gc_root::decide_gc_root(
+        sys,
+        &binaries.bin_dir,
+        binaries.store_path.as_deref(),
+        previous_root,
+        out,
+    );
+    let stale = write_receipt(sys, previous.as_ref(), &binaries, gc_root)?;
+    let bin_dir = binaries.bin_dir.clone();
+    let binaries_changed = binaries.changed;
 
     let mut units_changed = false;
     for file in packaged_files(&bin_dir) {
@@ -394,6 +566,18 @@ pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) 
         let verb = if changed { "installed" } else { "unchanged" };
         writeln!(out, "{verb} {}", file.path.display()).ok();
         units_changed |= changed && file.path.starts_with(UNIT_DIR);
+    }
+    let left = receipt::remove_copies(sys, &stale, " (copied by the previous install)", out);
+    if !left.is_empty() {
+        writeln!(
+            out,
+            "warning: remove {} by hand",
+            left.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+        .ok();
     }
 
     // The user first: tmpfiles.d hands directories to it.
@@ -491,24 +675,128 @@ fn active_job_units(sys: &dyn System) -> Vec<String> {
         .collect()
 }
 
-/// `puzuz service uninstall`.
+/// Removes what the install receipt lists: the binaries `service install` copied (never
+/// binaries it used in place, nor files a package owns, nor anything else), the Nix GC root and
+/// the receipt itself. Without a usable receipt the binaries are kept. A receipt is kept (with
+/// what is left) when a binary could not be removed, unless `purge` deletes it anyway.
+fn remove_binaries(
+    sys: &dyn System,
+    state: &ReceiptState,
+    detection: &Detection,
+    purge: bool,
+    out: &mut dyn Write,
+) {
+    let kept = || {
+        installed_bin_dir(detection)
+            .map_or_else(|| "puzuz and puzuz-helper".to_owned(), Receipt::binaries_in)
+    };
+    let receipt =
+        match state {
+            ReceiptState::Valid(receipt) => receipt,
+            ReceiptState::Missing => {
+                if detection.has_service_install() {
+                    writeln!(
+                    out,
+                    "kept the binaries: {RECEIPT_PATH} is missing (installed by an older puzuz), \
+                     so what was copied is unknown; remove {} by hand unless something else \
+                     uses them",
+                    kept()
+                )
+                .ok();
+                }
+                return;
+            }
+            ReceiptState::Invalid(_) => {
+                writeln!(
+                out,
+                "kept the binaries and any Nix GC root, since {RECEIPT_PATH} cannot be used (see \
+                 the warning above); remove {} (and {GC_ROOT}, if present) by hand unless \
+                 something else uses them{}",
+                kept(),
+                if purge { "" } else { ", then delete the receipt" }
+            )
+            .ok();
+                return;
+            }
+        };
+    let removable = receipt.removable_copies();
+    for path in receipt.copied.iter().filter(|p| !removable.contains(p)) {
+        writeln!(
+            out,
+            "warning: ignoring {} in {RECEIPT_PATH} (not a puzuz binary in {})",
+            path.display(),
+            receipt.bin_dir.display()
+        )
+        .ok();
+    }
+    let left = receipt::remove_copies(sys, &removable, "", out);
+    if receipt.copied.is_empty() {
+        writeln!(
+            out,
+            "kept {} (used in place, not copied by `puzuz service install`)",
+            Receipt::binaries_in(&receipt.bin_dir).replace(' ', " and ")
+        )
+        .ok();
+    }
+    if let Some(root) = &receipt.gc_root {
+        gc_root::remove_gc_root(sys, root, out);
+    }
+    if left.is_empty() {
+        receipt::remove(sys, out);
+        return;
+    }
+    let list = left
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if purge {
+        writeln!(out, "warning: could not remove {list}; remove them by hand").ok();
+        return;
+    }
+    let rest = Receipt {
+        copied: left,
+        gc_root: None,
+        gc_root_target: None,
+        ..receipt.clone()
+    };
+    match receipt::write(sys, &rest) {
+        Ok(()) => writeln!(
+            out,
+            "warning: could not remove {list}; kept {RECEIPT_PATH} listing them (re-run \
+             `sudo puzuz uninstall`, or remove them by hand)"
+        ),
+        Err(err) => writeln!(out, "warning: could not remove {list}; {err}"),
+    }
+    .ok();
+}
+
+/// `puzuz uninstall` (also `puzuz service uninstall`).
 pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Write) -> Result<()> {
     require_root(sys, "uninstall")?;
     let method = install_method::detect(sys);
-    if let Some(managed) = method.managed_elsewhere() {
-        if !method.has_service_install() {
-            return Err(format!(
-                "puzuz is installed as {managed}, not by `puzuz service install`; {}",
-                managed.removal_hint()
-            ));
+    if !method.has_service_install() {
+        match method.methods().next() {
+            // Removes what may be left of an earlier installation (and the data with --purge).
+            None => {
+                writeln!(out, "puzuz is not installed (no units found)").ok();
+            }
+            Some(other) => {
+                return Err(format!(
+                    "puzuz is installed as {other}, not by `puzuz service install`; {}",
+                    method.removal_hint(other)
+                ));
+            }
         }
-        if options.purge {
-            return Err(format!(
-                "puzuz is also installed as {managed}, which uses {CONFIG_DIR} and \
-                 /var/lib/puzuz too; refusing to purge them. `sudo puzuz service uninstall` \
-                 (without --purge) removes only what `puzuz service install` wrote"
-            ));
-        }
+    }
+    if let Some(managed) = method.managed_elsewhere()
+        && options.purge
+    {
+        return Err(format!(
+            "puzuz is also installed as {managed}, which uses {CONFIG_DIR} and \
+             /var/lib/puzuz too; refusing to purge them. `sudo puzuz uninstall` \
+             (without --purge) removes only what `puzuz service install` wrote"
+        ));
     }
     let jobs = active_job_units(sys);
     if !jobs.is_empty() {
@@ -535,6 +823,9 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
             return Err("aborted; nothing was changed".to_owned());
         }
     }
+
+    // Read before anything is removed (and before --purge deletes it).
+    let receipt = receipt::read_or_warn(sys, out);
 
     // Daemon first, then the helper (it would otherwise be restarted by Wants=).
     let units_present = [DAEMON_UNIT, HELPER_UNIT]
@@ -577,6 +868,8 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
         writeln!(out, "warning: {err}").ok();
     }
 
+    remove_binaries(sys, &receipt, &method, options.purge, out);
+
     if let Some(managed) = method.managed_elsewhere() {
         writeln!(
             out,
@@ -608,14 +901,14 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
         }
         writeln!(
             out,
-            "The system user puzuz, the group {ADMIN_GROUP} and the binaries are kept."
+            "The system user puzuz and the group {ADMIN_GROUP} are kept."
         )
         .ok();
     } else {
         writeln!(
             out,
             "Kept {CONFIG_DIR} and /var/lib/puzuz (state, logs, checkpoints); \
-             `sudo puzuz service uninstall --purge` deletes them."
+             `sudo puzuz uninstall --purge` deletes them."
         )
         .ok();
     }
@@ -700,9 +993,12 @@ fn remove_tree_inner(
 /// `puzuz service status`. Returns whether both services run and are connected.
 pub fn status(sys: &dyn System, socket: Option<&Path>, out: &mut dyn Write) -> io::Result<bool> {
     let mut healthy = true;
-    let method = install_method::detect(sys);
-    healthy &= !matches!(method, InstallMethod::Mixed(_));
-    writeln!(out, "{:<22} {method}", "installed")?;
+    let detection = install_method::detect(sys);
+    healthy &= !detection.is_conflicting();
+    writeln!(out, "{:<22} {}", "installed", detection.install)?;
+    if let Some(partial) = &detection.partial {
+        writeln!(out, "{:<22} {partial}", "")?;
+    }
     for unit in [HELPER_UNIT, DAEMON_UNIT] {
         let (enabled, active) = doctor::unit_state(sys, unit);
         healthy &= active == "active";

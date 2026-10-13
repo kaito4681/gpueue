@@ -1,3 +1,7 @@
 /target
 /.agents/plans/
 /.claude/worktrees/
+
+# nix build
+/result
+/result-*
