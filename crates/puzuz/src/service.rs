@@ -17,6 +17,10 @@ use crate::doctor::{self, Report};
 use crate::install_method::{self, Detection, Method};
 use crate::system::{System, check_root_owned_chain, run_checked};
 
+mod receipt;
+
+pub use receipt::{RECEIPT_PATH, Receipt};
+
 pub const DAEMON_UNIT: &str = "puzuz.service";
 pub const HELPER_UNIT: &str = "puzuz-helper.service";
 pub const ADMIN_GROUP: &str = "puzuz-admin";
@@ -63,7 +67,7 @@ fn require_root(sys: &dyn System, what: &str) -> Result<()> {
         Ok(())
     } else {
         Err(format!(
-            "`puzuz service {what}` must run as root; try `sudo puzuz service {what}`"
+            "`puzuz {what}` must run as root; try `sudo puzuz {what}`"
         ))
     }
 }
@@ -190,13 +194,38 @@ fn valid_bin_dir(dir: &Path) -> Result<()> {
     }
 }
 
-/// Decides where the units run the binaries from, copying them there if asked to.
-/// Returns the directory and whether a binary changed.
+/// Where the binaries are installed when neither `--bin-dir` nor an existing installation
+/// says otherwise: the standard place for software the administrator installs (FHS), which
+/// package managers leave alone and which is in systemd's and every user's default `PATH`.
+pub const DEFAULT_BIN_DIR: &str = "/usr/local/bin";
+
+/// The binaries the units run, as installed by [`install_binaries`].
+struct Binaries {
+    bin_dir: PathBuf,
+    /// Whether a binary in `bin_dir` changed.
+    changed: bool,
+    /// The binaries copied into `bin_dir` (empty: used in place).
+    copied: Vec<PathBuf>,
+}
+
+/// The directory of the binaries an existing `service install` installation runs.
+fn installed_bin_dir(detection: &Detection) -> Option<&Path> {
+    detection.methods().find_map(|m| match m {
+        Method::ServiceInstall { bin_dir: Some(dir) } => Some(dir.as_path()),
+        _ => None,
+    })
+}
+
+/// Decides where the units run the binaries from and copies them there unless they already
+/// are: `--bin-dir` if given; else the directory of an existing `service install`
+/// installation; else the directory of this binary if it is /usr/bin or /usr/local/bin (used
+/// in place); else [`DEFAULT_BIN_DIR`].
 fn install_binaries(
     sys: &dyn System,
-    bin_dir: Option<&Path>,
+    explicit: Option<&Path>,
+    detection: &Detection,
     out: &mut dyn Write,
-) -> Result<(PathBuf, bool)> {
+) -> Result<Binaries> {
     let exe = sys
         .current_exe()
         .map_err(io_err("cannot locate the running puzuz binary"))?;
@@ -211,33 +240,40 @@ fn install_binaries(
             helper.display()
         ));
     }
-    let Some(bin_dir) = bin_dir else {
-        if SYSTEM_BIN_DIRS.iter().any(|dir| exe_dir == Path::new(dir)) {
-            check_root_owned_chain(sys, &exe_dir).map_err(|err| {
-                format!(
-                    "the helper would run as root from {}, but {err}",
-                    exe_dir.display()
-                )
-            })?;
-            return Ok((exe_dir, false));
-        }
-        return Err(format!(
-            "puzuz runs from {}, which is not a system directory; re-run with \
-             `--bin-dir /usr/local/bin` to install copies of puzuz and puzuz-helper there",
-            exe_dir.display()
-        ));
+    let bin_dir = if let Some(dir) = explicit {
+        dir.to_owned()
+    } else if let Some(dir) = installed_bin_dir(detection) {
+        dir.to_owned()
+    } else if SYSTEM_BIN_DIRS.iter().any(|dir| exe_dir == Path::new(dir)) {
+        exe_dir.clone()
+    } else {
+        writeln!(
+            out,
+            "installing into {DEFAULT_BIN_DIR} (use --bin-dir to choose another directory)"
+        )
+        .ok();
+        PathBuf::from(DEFAULT_BIN_DIR)
     };
-    valid_bin_dir(bin_dir)?;
+    valid_bin_dir(&bin_dir)?;
     // puzuz-helper runs as root from here: whoever can replace it, or rename a parent
     // directory, gets root.
-    check_root_owned_chain(sys, bin_dir).map_err(|err| {
-        format!(
-            "--bin-dir {}: {err}; choose a directory only root can write to, such as \
-             /usr/local/bin",
-            bin_dir.display()
-        )
+    check_root_owned_chain(sys, &bin_dir).map_err(|err| {
+        if explicit.is_some() {
+            format!(
+                "--bin-dir {}: {err}; choose a directory only root can write to, such as \
+                 {DEFAULT_BIN_DIR}",
+                bin_dir.display()
+            )
+        } else {
+            format!(
+                "the helper would run as root from {}, but {err}; fix that, or choose a \
+                 directory only root can write to with --bin-dir",
+                bin_dir.display()
+            )
+        }
     })?;
     let mut changed = false;
+    let mut copied = Vec::new();
     for (source, name) in [(&exe, "puzuz"), (&helper, "puzuz-helper")] {
         let target = bin_dir.join(name);
         if sys.path(source) == sys.path(&target) {
@@ -249,8 +285,69 @@ fn install_binaries(
             writeln!(out, "installed {}", target.display()).ok();
             changed = true;
         }
+        copied.push(target);
     }
-    Ok((bin_dir.to_owned(), changed))
+    Ok(Binaries {
+        bin_dir,
+        changed,
+        copied,
+    })
+}
+
+/// Writes the install receipt for `binaries`. A re-install into the same directory keeps the
+/// copies recorded before (re-running the installed copy uses it in place); copies the
+/// previous installation left in another directory are returned for removal.
+fn write_receipt(
+    sys: &dyn System,
+    previous: Option<&Receipt>,
+    binaries: &Binaries,
+) -> Result<Vec<PathBuf>> {
+    let mut copied = binaries.copied.clone();
+    let mut stale = Vec::new();
+    if let Some(previous) = previous {
+        for path in previous.removable_copies() {
+            if previous.bin_dir == binaries.bin_dir {
+                if !copied.contains(&path) {
+                    copied.push(path);
+                }
+            } else {
+                stale.push(path);
+            }
+        }
+    }
+    copied.sort();
+    let new = Receipt {
+        version: puzuz_protocol::BINARY_VERSION.to_owned(),
+        bin_dir: binaries.bin_dir.clone(),
+        copied,
+    };
+    write_file(
+        sys,
+        Path::new(RECEIPT_PATH),
+        new.to_toml().as_bytes(),
+        0o644,
+    )?;
+    Ok(stale)
+}
+
+/// Removes copies a previous installation left in a directory the units no longer use.
+fn remove_stale_copies(sys: &dyn System, stale: &[PathBuf], out: &mut dyn Write) {
+    for path in stale {
+        match std::fs::remove_file(sys.path(path)) {
+            Ok(()) => {
+                writeln!(
+                    out,
+                    "removed {} (copied by the previous install)",
+                    path.display()
+                )
+                .ok();
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                writeln!(out, "warning: removing {}: {err}", path.display()).ok();
+            }
+        }
+    }
 }
 
 /// GPUs reported by nvidia-smi as `[[gpus]]` entries for a new configuration file.
@@ -413,8 +510,9 @@ fn check_install_method(detection: &Detection, force: bool) -> Result<Vec<String
 
 /// `puzuz service install`. Prints progress and finally the doctor report to `out`.
 pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) -> Result<Report> {
-    require_root(sys, "install")?;
-    let warnings = check_install_method(&install_method::detect(sys), options.force)?;
+    require_root(sys, "service install")?;
+    let detection = install_method::detect(sys);
+    let warnings = check_install_method(&detection, options.force)?;
     if let Some(bin_dir) = &options.bin_dir {
         // Validated before anything is copied; the files below then name it.
         valid_bin_dir(bin_dir)?;
@@ -427,7 +525,15 @@ pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) 
     for warning in warnings {
         writeln!(out, "warning: {warning}").ok();
     }
-    let (bin_dir, binaries_changed) = install_binaries(sys, options.bin_dir.as_deref(), out)?;
+    // A receipt that cannot be trusted is not built upon (nor are the files it lists).
+    let previous = receipt::read(sys).unwrap_or_else(|err| {
+        writeln!(out, "warning: {err}").ok();
+        None
+    });
+    let binaries = install_binaries(sys, options.bin_dir.as_deref(), &detection, out)?;
+    let stale = write_receipt(sys, previous.as_ref(), &binaries)?;
+    let bin_dir = binaries.bin_dir.clone();
+    let binaries_changed = binaries.changed;
 
     let mut units_changed = false;
     for file in packaged_files(&bin_dir) {
@@ -436,6 +542,7 @@ pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) 
         writeln!(out, "{verb} {}", file.path.display()).ok();
         units_changed |= changed && file.path.starts_with(UNIT_DIR);
     }
+    remove_stale_copies(sys, &stale, out);
 
     // The user first: tmpfiles.d hands directories to it.
     let sysusers = sys.path(Path::new(SYSUSERS_PATH));
@@ -534,7 +641,7 @@ fn active_job_units(sys: &dyn System) -> Vec<String> {
 
 /// `puzuz service uninstall`.
 pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Write) -> Result<()> {
-    require_root(sys, "uninstall")?;
+    require_root(sys, "service uninstall")?;
     let method = install_method::detect(sys);
     if !method.has_service_install() {
         match method.methods().next() {

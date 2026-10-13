@@ -786,17 +786,19 @@ pub enum ServiceCommand {
     /// configuration, then enable and start the services (requires root). Safe to re-run, e.g.
     /// after upgrading the binaries.
     ///
-    /// The units run `puzuz` and `puzuz-helper` from the directory this `puzuz` binary is in
-    /// when that is /usr/bin or /usr/local/bin. Otherwise pass --bin-dir to install copies of
-    /// both binaries (`puzuz-helper` must be next to `puzuz`) into a system directory.
+    /// Where the units run `puzuz` and `puzuz-helper` from (`puzuz-helper` must be next to
+    /// `puzuz`): the directory of the current installation; else the directory this `puzuz`
+    /// binary is in, when that is /usr/bin or /usr/local/bin; else copies of both binaries in
+    /// /usr/local/bin. What was copied is recorded in /var/lib/puzuz/install-receipt for
+    /// `puzuz service uninstall`.
     Install {
         /// Enable the services but do not start (or restart) them now.
         #[arg(long)]
         no_start: bool,
 
-        /// Copy `puzuz` and `puzuz-helper` into this directory (e.g. /usr/local/bin) and run
-        /// them from there. It and its parents must be owned by root and not group/world-
-        /// writable (puzuz-helper runs as root).
+        /// Install somewhere else than the default: copy `puzuz` and `puzuz-helper` into this
+        /// directory and run them from there. It and its parents must be owned by root and not
+        /// group/world-writable (puzuz-helper runs as root).
         #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
         bin_dir: Option<PathBuf>,
 

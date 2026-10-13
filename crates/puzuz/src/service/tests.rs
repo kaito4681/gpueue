@@ -167,15 +167,164 @@ fn install_waits_for_the_daemon() {
     assert!(out.contains("OK    helper: connected"), "{out}");
 }
 
+/// A root-run system with both binaries in a build directory.
+fn build_dir_system() -> FakeSystem {
+    let mut sys = FakeSystem::new();
+    sys.exe = PathBuf::from("/home/u/target/release/puzuz");
+    sys.write_exe("/home/u/target/release/puzuz", "new puzuz");
+    sys.write_exe("/home/u/target/release/puzuz-helper", "new helper");
+    sys
+}
+
+fn receipt(sys: &FakeSystem) -> Receipt {
+    toml::from_str(&sys.read(RECEIPT_PATH).expect("no receipt")).unwrap()
+}
+
+fn paths(list: &[&str]) -> Vec<PathBuf> {
+    list.iter().map(PathBuf::from).collect()
+}
+
 #[test]
-fn binaries_outside_system_dirs_need_bin_dir() {
-    let mut sys = system();
-    sys.exe = PathBuf::from("/home/u/.cargo/bin/puzuz");
-    sys.write_exe("/home/u/.cargo/bin/puzuz", "new puzuz");
-    sys.write_exe("/home/u/.cargo/bin/puzuz-helper", "new helper");
-    let err = run_install(&sys, &opts()).unwrap_err();
-    assert!(err.contains("--bin-dir /usr/local/bin"), "{err}");
-    assert!(!sys.exists("/etc/systemd/system/puzuz.service"));
+fn binaries_outside_system_dirs_are_copied_to_usr_local_bin() {
+    let sys = build_dir_system();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(
+        out.contains("installing into /usr/local/bin (use --bin-dir to choose another directory)"),
+        "{out}"
+    );
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "new puzuz");
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "new helper"
+    );
+    let unit = sys.read("/etc/systemd/system/puzuz.service").unwrap();
+    assert!(unit.contains("\nExecStart=/usr/local/bin/puzuz daemon\n"));
+    assert_eq!(
+        receipt(&sys),
+        Receipt {
+            version: puzuz_protocol::BINARY_VERSION.to_owned(),
+            bin_dir: PathBuf::from("/usr/local/bin"),
+            copied: paths(&["/usr/local/bin/puzuz", "/usr/local/bin/puzuz-helper"]),
+        }
+    );
+    assert_eq!(mode(&sys, RECEIPT_PATH), 0o644);
+
+    // Re-running the installed copy uses it in place and keeps it recorded as copied.
+    let mut sys = sys;
+    sys.exe = PathBuf::from("/usr/local/bin/puzuz");
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(!out.contains("installing into"), "{out}");
+    assert_eq!(
+        receipt(&sys).copied,
+        paths(&["/usr/local/bin/puzuz", "/usr/local/bin/puzuz-helper"])
+    );
+}
+
+#[test]
+fn binaries_in_a_system_dir_are_used_in_place() {
+    let sys = system();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(!out.contains("installing into"), "{out}");
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    let unit = sys.read("/etc/systemd/system/puzuz.service").unwrap();
+    assert!(unit.contains("\nExecStart=/usr/bin/puzuz daemon\n"));
+    let receipt = receipt(&sys);
+    assert_eq!(receipt.bin_dir, PathBuf::from("/usr/bin"));
+    assert!(receipt.copied.is_empty());
+}
+
+#[test]
+fn a_reinstall_stays_in_the_installed_directory() {
+    let mut sys = build_dir_system();
+    sys.mkdir("/opt/tools/bin");
+    let options = InstallOptions {
+        bin_dir: Some(PathBuf::from("/opt/tools/bin")),
+        ..opts()
+    };
+    run_install(&sys, &options).unwrap();
+    sys.write_exe("/home/u/target/release/puzuz", "newer puzuz");
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(!out.contains("installing into"), "{out}");
+    assert_eq!(sys.read("/opt/tools/bin/puzuz").unwrap(), "newer puzuz");
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    let unit = sys.read("/etc/systemd/system/puzuz.service").unwrap();
+    assert!(unit.contains("\nExecStart=/opt/tools/bin/puzuz daemon\n"));
+
+    // Even a binary in /usr/bin installs there (copied), not in place.
+    sys.exe = PathBuf::from("/usr/bin/puzuz");
+    sys.write_exe("/usr/bin/puzuz", "other puzuz");
+    sys.write_exe("/usr/bin/puzuz-helper", "other helper");
+    run_install(&sys, &opts()).unwrap();
+    assert_eq!(sys.read("/opt/tools/bin/puzuz").unwrap(), "other puzuz");
+}
+
+#[test]
+fn moving_the_installation_removes_the_previous_copies() {
+    let sys = build_dir_system();
+    run_install(&sys, &opts()).unwrap();
+    sys.mkdir("/opt/tools/bin");
+    let options = InstallOptions {
+        bin_dir: Some(PathBuf::from("/opt/tools/bin")),
+        ..opts()
+    };
+    let out = run_install(&sys, &options).unwrap();
+    assert!(
+        out.contains("removed /usr/local/bin/puzuz-helper (copied by the previous install)"),
+        "{out}"
+    );
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    assert_eq!(
+        receipt(&sys).copied,
+        paths(&["/opt/tools/bin/puzuz", "/opt/tools/bin/puzuz-helper"])
+    );
+
+    // An in-place installation's binaries were never copied and are never removed.
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.mkdir("/opt/tools/bin");
+    run_install(&sys, &options).unwrap();
+    assert!(sys.exists("/usr/bin/puzuz"));
+    assert!(sys.exists("/usr/bin/puzuz-helper"));
+}
+
+#[test]
+fn an_untrusted_receipt_is_ignored() {
+    let sys = build_dir_system();
+    sys.write(
+        RECEIPT_PATH,
+        "version = \"0.0.1\"\nbin_dir = \"/usr/sbin\"\ncopied = [\"/usr/sbin/puzuz\"]\n",
+    );
+    sys.write_exe("/usr/sbin/puzuz", "someone else's");
+    std::fs::set_permissions(
+        sys.path(Path::new(RECEIPT_PATH)),
+        std::fs::Permissions::from_mode(0o666),
+    )
+    .unwrap();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(out.contains("writable by others; ignoring it"), "{out}");
+    assert!(sys.exists("/usr/sbin/puzuz"));
+    assert_eq!(receipt(&sys).bin_dir, PathBuf::from("/usr/local/bin"));
+    assert_eq!(mode(&sys, RECEIPT_PATH), 0o644);
+}
+
+#[test]
+fn receipt_lists_only_binaries_in_its_directory_as_removable() {
+    let receipt = Receipt {
+        version: "0.1.0".to_owned(),
+        bin_dir: PathBuf::from("/usr/local/bin"),
+        copied: paths(&[
+            "/usr/local/bin/puzuz",
+            "/usr/local/bin/../sbin/puzuz",
+            "/etc/passwd",
+            "/usr/local/bin/puzuz-helper",
+        ]),
+    };
+    assert_eq!(
+        receipt.removable_copies(),
+        paths(&["/usr/local/bin/puzuz", "/usr/local/bin/puzuz-helper"])
+    );
+    let parsed: Receipt = toml::from_str(&receipt.to_toml()).unwrap();
+    assert_eq!(parsed, receipt);
 }
 
 #[test]
