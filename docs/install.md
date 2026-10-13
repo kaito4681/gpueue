@@ -529,7 +529,7 @@ The module sets `criu_path`, `cuda_checkpoint_path`, `nvidia_smi_path`, `nvml_li
 - **Root-owned paths.** Programs in `/nix/store` pass the helper's and `puzuz doctor`'s ownership
   checks (see [cuda-checkpoint](#cuda-checkpoint)). In a VM without a GPU, `puzuz doctor` reports
   no failure: the install method is "Nix", and only the NVIDIA driver and cuda-checkpoint checks
-  warn (the latter's hint names `/usr/local/bin`; on NixOS use `cudaCheckpointPackage`).
+  warn (the latter's hint names `services.puzuz.cudaCheckpointPackage`).
 
 #### cuda-checkpoint on NixOS
 
@@ -1458,6 +1458,15 @@ stopped until `sudo systemctl start puzuz` or the next boot.
 | `daemon` | runs version X while this puzuz is Y | `sudo systemctl restart puzuz-helper.service puzuz.service` after upgrading, or update the CLI |
 | `checkpoint dir` | on tmpfs, or little free space | move `checkpoints_dir` to a disk with room for RAM + VRAM of your jobs |
 | `helper settings` | ExecStart= passes flags | move the settings into `config.toml` and drop the flags |
+
+On NixOS (`ID=nixos` in `/etc/os-release`), the `fix:` lines name the [module options](#nixos)
+instead of steps that do not apply there, each followed by `sudo nixos-rebuild switch`:
+`services.puzuz.settings` instead of editing `/etc/puzuz/config.toml` (which the module
+rewrites), `services.puzuz.criuPackage` and `services.puzuz.cudaCheckpointPackage` instead of
+installing CRIU or cuda-checkpoint into `/usr/local/bin`, `services.puzuz.nvidiaSmiPath` and
+`services.puzuz.nvmlLibrary` for nvidia-smi and NVML, `services.puzuz.enable = true` instead of
+`sudo puzuz service install` or `systemctl enable`, `services.puzuz.admins` instead of `usermod`,
+and `systemd.services.puzuz.serviceConfig.ReadWritePaths` instead of a `systemctl edit` drop-in.
 
 ### Checkpoint failures
 

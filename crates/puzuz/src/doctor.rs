@@ -11,7 +11,7 @@ use puzuz_checkpoint::probe::{Version, parse_criu_version, parse_cuda_checkpoint
 use puzuz_daemon::config::{Config, CudaCheckpointMode, DEFAULT_CONFIG_PATH, GpuDetection};
 use puzuz_protocol::api::{CheckpointStorage, GpuDetectionStatus, GpuSource, VersionResponse};
 
-use crate::install_method::{self, Detection, InstallMethod, LocalUnit, Method};
+use crate::install_method::{self, Detection, InstallMethod, LocalUnit, Method, OsRelease};
 use crate::service::{ADMIN_GROUP, DAEMON_UNIT, HELPER_UNIT, TMPFILES_PATH, UNIT_DIR};
 use crate::system::{System, check_root_owned_chain, find_program, is_root_owned_and_protected};
 
@@ -25,6 +25,11 @@ const MIN_SYSTEMD: u32 = 240;
 const CLONE3_SET_TID_KERNEL: (u32, u32, u32) = (5, 5, 0);
 /// Below this much free space for checkpoint images, warn.
 const LOW_SPACE_BYTES: u64 = 20 << 30;
+/// Applies a change to the NixOS configuration (`services.puzuz`).
+const REBUILD: &str = "sudo nixos-rebuild switch";
+/// What enables the NixOS module; it installs the units, the configuration file and the groups.
+const ENABLE_MODULE: &str = "set `services.puzuz.enable = true` in your NixOS configuration and run `sudo nixos-rebuild \
+     switch`";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -139,36 +144,69 @@ pub struct LoadedConfig {
 }
 
 pub fn load_config(sys: &dyn System) -> LoadedConfig {
+    load_config_on(sys, OsRelease::read(sys).is_nixos())
+}
+
+/// [`load_config`], with hints for NixOS (where the module writes the file) if `nixos`.
+fn load_config_on(sys: &dyn System, nixos: bool) -> LoadedConfig {
     let path = sys.path(Path::new(DEFAULT_CONFIG_PATH));
     if !path.exists() {
+        let hint = if nixos {
+            format!(
+                "{ENABLE_MODULE}; the module writes {DEFAULT_CONFIG_PATH} from \
+                 `services.puzuz.settings`"
+            )
+        } else {
+            "sudo puzuz service install   (creates a commented default configuration)".to_owned()
+        };
         return LoadedConfig {
             config: Config::default(),
             check: Check::warn(
                 "config",
                 format!("{DEFAULT_CONFIG_PATH} does not exist; the defaults apply"),
             )
-            .hint("sudo puzuz service install   (creates a commented default configuration)"),
+            .hint(hint),
         };
     }
     match Config::load(&path) {
         Ok(config) => {
-            let mut check = check_config_trust(sys);
+            let mut check = check_config_trust(sys, nixos);
             if check.level == Level::Ok {
-                check = check_config_readable(sys);
+                check = check_config_readable(sys, nixos);
             }
             LoadedConfig { config, check }
         }
-        Err(err) => LoadedConfig {
-            config: Config::default(),
-            check: Check::fail("config", err.to_string()).hint(format!(
-                "fix {DEFAULT_CONFIG_PATH}; the daemon does not start with it"
-            )),
-        },
+        Err(err) => {
+            let hint = if nixos {
+                format!(
+                    "fix `services.puzuz.settings` (the module writes {DEFAULT_CONFIG_PATH} from \
+                     it) and run `{REBUILD}`; the daemon does not start with it"
+                )
+            } else {
+                format!("fix {DEFAULT_CONFIG_PATH}; the daemon does not start with it")
+            };
+            LoadedConfig {
+                config: Config::default(),
+                check: Check::fail("config", err.to_string()).hint(hint),
+            }
+        }
+    }
+}
+
+/// On NixOS, `fix` comes after what rewrites the configuration file owned by root, mode 0644.
+fn rewrite_config_first(nixos: bool, fix: String) -> String {
+    if nixos {
+        format!(
+            "`{REBUILD}` rewrites {DEFAULT_CONFIG_PATH} from `services.puzuz.settings` (owned by \
+             root, mode 0644); if that does not help: {fix}"
+        )
+    } else {
+        fix
     }
 }
 
 /// The helper (root) reads the same file and refuses it unless only root can change it.
-fn check_config_trust(sys: &dyn System) -> Check {
+fn check_config_trust(sys: &dyn System, nixos: bool) -> Check {
     let file = Path::new(DEFAULT_CONFIG_PATH);
     for path in [file, file.parent().unwrap_or(file)] {
         match is_root_owned_and_protected(sys, path) {
@@ -182,9 +220,12 @@ fn check_config_trust(sys: &dyn System) -> Check {
                         path.display()
                     ),
                 )
-                .hint(format!(
-                    "sudo chown root:root {0}; sudo chmod go-w {0}",
-                    path.display()
+                .hint(rewrite_config_first(
+                    nixos,
+                    format!(
+                        "sudo chown root:root {0}; sudo chmod go-w {0}",
+                        path.display()
+                    ),
                 ));
             }
             Err(err) => return Check::fail("config", format!("{}: {err}", path.display())),
@@ -197,7 +238,7 @@ fn check_config_trust(sys: &dyn System) -> Check {
 /// the directories above it to be searchable (`doctor` itself may run as root and read it
 /// anyway). A file readable through its group only is reported too, as that cannot be verified
 /// here.
-fn check_config_readable(sys: &dyn System) -> Check {
+fn check_config_readable(sys: &dyn System, nixos: bool) -> Check {
     let file = Path::new(DEFAULT_CONFIG_PATH);
     let mut problems = Vec::new();
     match std::fs::metadata(sys.path(file)) {
@@ -225,14 +266,17 @@ fn check_config_readable(sys: &dyn System) -> Check {
             problems.join(", ")
         ),
     )
-    .hint(format!(
-        "sudo chmod 755 {}; sudo chmod 644 {DEFAULT_CONFIG_PATH}",
-        file.parent().unwrap_or(file).display()
+    .hint(rewrite_config_first(
+        nixos,
+        format!(
+            "sudo chmod 755 {}; sudo chmod 644 {DEFAULT_CONFIG_PATH}",
+            file.parent().unwrap_or(file).display()
+        ),
     ))
 }
 
 /// What the helper uses: `config.toml`, unless its unit passes flags that override it.
-fn check_helper_settings(sys: &dyn System, config: &Config) -> Check {
+fn check_helper_settings(sys: &dyn System, config: &Config, nixos: bool) -> Check {
     const NAME: &str = "helper settings";
     let summary = format!(
         "cuda mode {}, criu {}, cuda-checkpoint {}, checkpoints {}, logs {}",
@@ -256,10 +300,17 @@ fn check_helper_settings(sys: &dyn System, config: &Config) -> Check {
             flags.join(" ")
         ),
     )
-    .hint(format!(
-        "set the keys in {DEFAULT_CONFIG_PATH} and remove the flags \
-         (`sudo systemctl edit {HELPER_UNIT}` or `sudo puzuz service install`)"
-    ))
+    .hint(if nixos {
+        format!(
+            "set the keys in `services.puzuz.settings` and remove the flags from \
+             `systemd.services.puzuz-helper` in your NixOS configuration, then `{REBUILD}`"
+        )
+    } else {
+        format!(
+            "set the keys in {DEFAULT_CONFIG_PATH} and remove the flags \
+             (`sudo systemctl edit {HELPER_UNIT}` or `sudo puzuz service install`)"
+        )
+    })
 }
 
 /// The `--flags` (without values) of a command line.
@@ -325,37 +376,40 @@ pub fn parse_show_exec_start(text: &str) -> Option<ExecStart> {
 
 /// Runs every check. `socket` overrides the daemon socket from the configuration.
 pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
-    let LoadedConfig { config, check } = load_config(sys);
-    // Detected once, for the install method, sudo's PATH and the update hint.
+    // Detected once, for the install method, sudo's PATH, the update hint and whether the hints
+    // name the NixOS module.
     let detection = install_method::detect(sys);
+    let nixos = detection.os.is_nixos();
+    let LoadedConfig { config, check } = load_config_on(sys, nixos);
     let mut checks = vec![check, check_install_method(&detection)];
     checks.extend(sudo_path::check(sys, &detection));
     let api_socket = socket.map_or_else(|| config.api_socket.clone(), Path::to_owned);
     let daemon = sys.daemon_version(&api_socket);
 
-    checks.push(check_criu(sys, &config.criu_path));
+    checks.push(check_criu(sys, &config.criu_path, nixos));
     let driver = driver_version(sys);
-    checks.push(check_driver(&driver));
+    checks.push(check_driver(&driver, nixos));
     checks.push(check_cuda_checkpoint(
         sys,
         &config.cuda_checkpoint_path,
         driver.as_ref().ok(),
+        nixos,
     ));
     if config.cuda_checkpoint_mode == CudaCheckpointMode::Plugin {
-        checks.push(check_cuda_plugin(sys, driver.is_ok()));
+        checks.push(check_cuda_plugin(sys, driver.is_ok(), nixos));
     }
     if driver.is_ok() {
         let detection = daemon.as_ref().ok().and_then(|v| v.gpu_detection.as_ref());
-        checks.push(check_gpus(sys, &config, detection));
+        checks.push(check_gpus(sys, &config, detection, nixos));
     }
     checks.push(check_kernel(sys));
     checks.push(check_systemd(sys));
     for unit in [HELPER_UNIT, DAEMON_UNIT] {
-        checks.push(check_unit(sys, unit));
+        checks.push(check_unit(sys, unit, nixos));
     }
-    checks.push(check_helper_binary(sys));
-    checks.push(check_helper_settings(sys, &config));
-    if let Some(check) = check_daemon_write_paths(sys, &config) {
+    checks.push(check_helper_binary(sys, nixos));
+    checks.push(check_helper_settings(sys, &config, nixos));
+    if let Some(check) = check_daemon_write_paths(sys, &config, nixos) {
         checks.push(check);
     }
     checks.push(check_socket(sys, "daemon socket", &api_socket, DAEMON_UNIT));
@@ -367,11 +421,11 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     ));
     checks.extend(check_daemon(&daemon));
     let storage = daemon.as_ref().ok().and_then(|v| v.checkpoints.as_ref());
-    checks.push(check_checkpoint_dir(sys, &config, storage));
+    checks.push(check_checkpoint_dir(sys, &config, storage, nixos));
     if let Some(storage) = storage {
-        checks.push(check_checkpoint_usage(storage));
+        checks.push(check_checkpoint_usage(storage, nixos));
     }
-    checks.push(check_admin(sys));
+    checks.push(check_admin(sys, nixos));
     if let Some(check) = check_update(sys, &config, &detection) {
         checks.push(check);
     }
@@ -406,6 +460,12 @@ fn check_install_method(detection: &Detection) -> Check {
             Check::info(NAME, "not installed (NixOS: use the services.puzuz module)")
         }
         InstallMethod::None => Check::info(NAME, "not installed"),
+        InstallMethod::One(Method::Manual { unit }) if detection.os.is_nixos() => {
+            Check::info(NAME, method.to_string()).hint(format!(
+                "on NixOS, use the services.puzuz module instead: remove {} and {ENABLE_MODULE}",
+                unit.display()
+            ))
+        }
         InstallMethod::One(Method::Manual { unit }) => {
             Check::info(NAME, method.to_string()).hint(format!(
                 "`sudo puzuz service install --force` replaces {} with the packaged units",
@@ -419,6 +479,13 @@ fn check_install_method(detection: &Detection) -> Check {
             "`sudo systemctl unmask {}` lets the packaged unit run again",
             crate::service::DAEMON_UNIT
         )),
+        InstallMethod::One(Method::Unowned { unit, .. }) if detection.os.is_nixos() => {
+            Check::warn(NAME, method.to_string()).hint(format!(
+                "if it is left over, delete it (`sudo rm {}`); on NixOS, install puzuz with the \
+                 services.puzuz module: {ENABLE_MODULE}",
+                unit.display()
+            ))
+        }
         InstallMethod::One(Method::Unowned { unit, .. }) => {
             let unit = unit.display();
             Check::warn(NAME, method.to_string()).hint(format!(
@@ -473,6 +540,10 @@ fn check_install_method(detection: &Detection) -> Check {
                  {}",
                 detection.removal_hint(managed)
             ),
+            None if detection.os.is_nixos() => format!(
+                "both units must come from the same installation: delete the stray unit; the \
+                 services.puzuz module installs both ({ENABLE_MODULE})"
+            ),
             None => "both units must come from the same installation: re-run it (e.g. `sudo \
                      puzuz service install`) or delete the stray unit"
                 .to_owned(),
@@ -500,12 +571,21 @@ fn check_install_method(detection: &Detection) -> Check {
     check
 }
 
-fn check_criu(sys: &dyn System, configured: &Path) -> Check {
+fn check_criu(sys: &dyn System, configured: &Path, nixos: bool) -> Check {
     const NAME: &str = "criu";
-    let install = format!(
-        "install CRIU {}.{} or newer (https://criu.org/Installation), or set `criu_path` in {}",
-        MIN_CRIU.0, MIN_CRIU.1, DEFAULT_CONFIG_PATH
-    );
+    let install = if nixos {
+        format!(
+            "set `services.puzuz.criuPackage` to CRIU {}.{} or newer (its default, the puzuz \
+             flake's CRIU 4.2, is) and remove any `criu_path` from `services.puzuz.settings`, \
+             then `{REBUILD}`",
+            MIN_CRIU.0, MIN_CRIU.1
+        )
+    } else {
+        format!(
+            "install CRIU {}.{} or newer (https://criu.org/Installation), or set `criu_path` in {}",
+            MIN_CRIU.0, MIN_CRIU.1, DEFAULT_CONFIG_PATH
+        )
+    };
     let Some(path) = find_program(sys, configured) else {
         return Check::fail(NAME, format!("{} not found", configured.display())).hint(install);
     };
@@ -560,18 +640,25 @@ fn driver_version(sys: &dyn System) -> Result<Version, String> {
         .ok_or_else(|| "cannot parse the driver version from nvidia-smi".to_owned())
 }
 
-fn check_driver(driver: &Result<Version, String>) -> Check {
+fn check_driver(driver: &Result<Version, String>, nixos: bool) -> Check {
     match driver {
         Ok(version) => Check::ok("nvidia driver", version.to_string()),
         Err(err) => Check::warn("nvidia driver", format!("{err}; only CPU jobs can run")).hint(
-            "install the NVIDIA driver (r570 or newer for cuda-checkpoint) if this host has GPUs",
+            if nixos {
+                "enable the NVIDIA driver (r570 or newer for cuda-checkpoint) if this host has \
+                 GPUs: `services.xserver.videoDrivers = [ \"nvidia\" ]` (also on headless \
+                 machines) or `hardware.nvidia.datacenter.enable = true`, then `sudo \
+                 nixos-rebuild switch`"
+            } else {
+                "install the NVIDIA driver (r570 or newer for cuda-checkpoint) if this host has GPUs"
+            },
         ),
     }
 }
 
 /// `cuda_checkpoint_mode = "plugin"`: CRIU needs its CUDA plugin in its
 /// built-in plugin directory (the helper passes no `-L` then).
-fn check_cuda_plugin(sys: &dyn System, have_driver: bool) -> Check {
+fn check_cuda_plugin(sys: &dyn System, have_driver: bool, nixos: bool) -> Check {
     const NAME: &str = "cuda plugin";
     let path = Path::new(DEFAULT_CRIU_PLUGIN_DIR).join(CUDA_PLUGIN_FILE);
     if sys.path(&path).is_file() {
@@ -591,14 +678,27 @@ fn check_cuda_plugin(sys: &dyn System, have_driver: bool) -> Check {
             path.display()
         ),
     )
-    .hint(format!(
-        "build CRIU with `make criu cuda_plugin` and install plugins/cuda/{CUDA_PLUGIN_FILE} \
-         into {DEFAULT_CRIU_PLUGIN_DIR}, or set cuda_checkpoint_mode = \"manual\" in \
-         {DEFAULT_CONFIG_PATH}"
-    ))
+    .hint(if nixos {
+        format!(
+            "set cuda_checkpoint_mode = \"manual\" in `services.puzuz.settings` (with \
+             `services.puzuz.cudaCheckpointPackage`), then `{REBUILD}`: NixOS has no \
+             {DEFAULT_CRIU_PLUGIN_DIR}"
+        )
+    } else {
+        format!(
+            "build CRIU with `make criu cuda_plugin` and install plugins/cuda/{CUDA_PLUGIN_FILE} \
+             into {DEFAULT_CRIU_PLUGIN_DIR}, or set cuda_checkpoint_mode = \"manual\" in \
+             {DEFAULT_CONFIG_PATH}"
+        )
+    })
 }
 
-fn check_cuda_checkpoint(sys: &dyn System, configured: &Path, driver: Option<&Version>) -> Check {
+fn check_cuda_checkpoint(
+    sys: &dyn System,
+    configured: &Path,
+    driver: Option<&Version>,
+    nixos: bool,
+) -> Check {
     const NAME: &str = "cuda-checkpoint";
     // Without a driver there is nothing to checkpoint on a GPU.
     let missing = if driver.is_some() {
@@ -606,10 +706,18 @@ fn check_cuda_checkpoint(sys: &dyn System, configured: &Path, driver: Option<&Ve
     } else {
         Level::Warn
     };
-    let install = format!(
-        "install cuda-checkpoint matching the driver (https://github.com/NVIDIA/cuda-checkpoint) \
-         into /usr/local/bin, or set `cuda_checkpoint_path` in {DEFAULT_CONFIG_PATH}"
-    );
+    let install = if nixos {
+        format!(
+            "set `services.puzuz.cudaCheckpointPackage` to a package with bin/cuda-checkpoint \
+             matching the driver (https://github.com/NVIDIA/cuda-checkpoint; docs/install.md, \
+             \"cuda-checkpoint on NixOS\", has a derivation), then `{REBUILD}`"
+        )
+    } else {
+        format!(
+            "install cuda-checkpoint matching the driver (https://github.com/NVIDIA/cuda-checkpoint) \
+             into /usr/local/bin, or set `cuda_checkpoint_path` in {DEFAULT_CONFIG_PATH}"
+        )
+    };
     let Some(path) = find_program(sys, configured) else {
         return Check::new(
             missing,
@@ -633,8 +741,15 @@ fn check_cuda_checkpoint(sys: &dyn System, configured: &Path, driver: Option<&Ve
     if !output.success && features.version.is_none() && !features.actions {
         // E.g. "error while loading shared libraries: libcuda.so.1".
         let reason = output.stderr.lines().next().unwrap_or("no output").trim();
-        return Check::new(missing, NAME, format!("`{shown} --help` failed: {reason}"))
-            .hint("check that the NVIDIA driver (libcuda.so.1) is installed and matches it");
+        return Check::new(missing, NAME, format!("`{shown} --help` failed: {reason}")).hint(
+            if nixos {
+                "check that the NVIDIA driver is enabled (`hardware.nvidia`) and matches it, and \
+                 that the package of `services.puzuz.cudaCheckpointPackage` finds libcuda.so.1 \
+                 in /run/opengl-driver/lib (autoAddDriverRunpath)"
+            } else {
+                "check that the NVIDIA driver (libcuda.so.1) is installed and matches it"
+            },
+        );
     }
     let version = features
         .version
@@ -646,7 +761,12 @@ fn check_cuda_checkpoint(sys: &dyn System, configured: &Path, driver: Option<&Ve
             NAME,
             format!("{shown} ({version}) lacks --action lock/checkpoint/restore/unlock"),
         )
-        .hint("install the cuda-checkpoint of driver r570 or newer");
+        .hint(if nixos {
+            "set `services.puzuz.cudaCheckpointPackage` to the cuda-checkpoint of driver r570 or \
+             newer, then `sudo nixos-rebuild switch`"
+        } else {
+            "install the cuda-checkpoint of driver r570 or newer"
+        });
     }
     if let (Some(tool), Some(driver)) = (&features.version, driver)
         && tool.major() != driver.major()
@@ -692,14 +812,24 @@ fn gpu_differences(ours: &[GpuId], listed: &[GpuId]) -> Vec<String> {
 /// failing in auto mode, no GPUs while nvidia-smi sees some, or a list that
 /// disagrees with nvidia-smi. Without the daemon's report, `[[gpus]]` stands
 /// in for it in static mode.
-fn check_gpus(sys: &dyn System, config: &Config, detection: Option<&GpuDetectionStatus>) -> Check {
+fn check_gpus(
+    sys: &dyn System,
+    config: &Config,
+    detection: Option<&GpuDetectionStatus>,
+    nixos: bool,
+) -> Check {
     const NAME: &str = "gpus";
     let Some(smi) = find_program(sys, &config.nvidia_smi_path) else {
         return Check::warn(
             NAME,
             "nvidia-smi not found; the helper needs it to find CUDA processes",
         )
-        .hint("install nvidia-smi (part of the NVIDIA driver utilities)");
+        .hint(if nixos {
+            "set `services.puzuz.nvidiaSmiPath` (the default, with the NVIDIA driver enabled \
+             through `hardware.nvidia`, is its nvidia-smi), then `sudo nixos-rebuild switch`"
+        } else {
+            "install nvidia-smi (part of the NVIDIA driver utilities)"
+        });
     };
     let listed: Vec<GpuId> = match sys.run(
         &smi.to_string_lossy(),
@@ -728,11 +858,19 @@ fn check_gpus(sys: &dyn System, config: &Config, detection: Option<&GpuDetection
             uuid: gpu.uuid.clone(),
         })
         .collect();
-    let update_list = format!(
-        "update [[gpus]] in {DEFAULT_CONFIG_PATH} \
-         (`nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv`), then \
-         `sudo systemctl restart {DAEMON_UNIT}`"
-    );
+    let update_list = if nixos {
+        format!(
+            "update `gpus` in `services.puzuz.settings` \
+             (`nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv`), then \
+             `{REBUILD}` (it restarts {DAEMON_UNIT})"
+        )
+    } else {
+        format!(
+            "update [[gpus]] in {DEFAULT_CONFIG_PATH} \
+             (`nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv`), then \
+             `sudo systemctl restart {DAEMON_UNIT}`"
+        )
+    };
 
     let Some(detection) = detection else {
         // The daemon is not reachable (reported below) or predates the report.
@@ -789,12 +927,22 @@ fn check_gpus(sys: &dyn System, config: &Config, detection: Option<&GpuDetection
             NAME,
             format!("the daemon could not detect GPUs with NVML ({error}); {fallback}"),
         )
-        .hint(format!(
-            "the daemon (user puzuz) must be able to open /dev/nvidiactl and /dev/nvidia<N>: keep \
-             the DevicePolicy=/DeviceAllow= lines of the packaged {DAEMON_UNIT} \
-             (`sudo puzuz service install` rewrites it) and do not add PrivateDevices=yes; \
-             then `sudo systemctl restart {DAEMON_UNIT}` and see `journalctl -u {DAEMON_UNIT}`"
-        ));
+        .hint(if nixos {
+            format!(
+                "the daemon loads NVML from `services.puzuz.nvmlLibrary` (the default, with the \
+                 NVIDIA driver enabled through `hardware.nvidia`, is its libnvidia-ml.so.1) and \
+                 must be able to open /dev/nvidiactl and /dev/nvidia<N>: do not override \
+                 DevicePolicy=/DeviceAllow= or add PrivateDevices=yes in \
+                 `systemd.services.puzuz`; then `{REBUILD}` and see `journalctl -u {DAEMON_UNIT}`"
+            )
+        } else {
+            format!(
+                "the daemon (user puzuz) must be able to open /dev/nvidiactl and /dev/nvidia<N>: \
+                 keep the DevicePolicy=/DeviceAllow= lines of the packaged {DAEMON_UNIT} \
+                 (`sudo puzuz service install` rewrites it) and do not add PrivateDevices=yes; \
+                 then `sudo systemctl restart {DAEMON_UNIT}` and see `journalctl -u {DAEMON_UNIT}`"
+            )
+        });
     }
     let from_nvml = detection.source == GpuSource::Nvml;
     let fix = if from_nvml {
@@ -833,9 +981,11 @@ fn check_gpus(sys: &dyn System, config: &Config, detection: Option<&GpuDetection
                     stale.join("; ")
                 ),
             )
-            .hint(format!(
-                "update or remove [[gpus]] in {DEFAULT_CONFIG_PATH}"
-            ));
+            .hint(if nixos {
+                format!("update or remove `gpus` in `services.puzuz.settings`, then `{REBUILD}`")
+            } else {
+                format!("update or remove [[gpus]] in {DEFAULT_CONFIG_PATH}")
+            });
         }
     }
     let how = if from_nvml {
@@ -922,15 +1072,33 @@ pub fn unit_state(sys: &dyn System, unit: &str) -> (String, String) {
     )
 }
 
-fn check_unit(sys: &dyn System, unit: &'static str) -> Check {
+/// How to install the units: `service install`, or on NixOS the module.
+fn install_hint(nixos: bool) -> String {
+    if nixos {
+        ENABLE_MODULE.to_owned()
+    } else {
+        "sudo puzuz service install".to_owned()
+    }
+}
+
+fn check_unit(sys: &dyn System, unit: &'static str, nixos: bool) -> Check {
     let (enabled, active) = unit_state(sys, unit);
     let message = format!("{enabled}, {active}");
     if enabled == "not-found" || enabled == "unknown" {
-        return Check::fail(unit, format!("not installed ({message})"))
-            .hint("sudo puzuz service install");
+        return Check::fail(unit, format!("not installed ({message})")).hint(install_hint(nixos));
     }
     if enabled != "enabled" {
-        return Check::fail(unit, message).hint(format!("sudo systemctl enable --now {unit}"));
+        // NixOS links the units from the store; `systemctl enable` cannot write there.
+        let hint = if nixos {
+            format!(
+                "the services.puzuz module enables {unit} (`services.puzuz.enable = true`, then \
+                 `{REBUILD}`); do not disable it with `systemd.services.{}.enable = false`",
+                unit.trim_end_matches(".service")
+            )
+        } else {
+            format!("sudo systemctl enable --now {unit}")
+        };
+        return Check::fail(unit, message).hint(hint);
     }
     if active != "active" {
         return Check::fail(unit, message).hint(format!(
@@ -942,19 +1110,18 @@ fn check_unit(sys: &dyn System, unit: &'static str) -> Check {
 
 /// The helper runs as root: its binary, and every directory above it, must not be replaceable
 /// by anyone else.
-fn check_helper_binary(sys: &dyn System) -> Check {
+fn check_helper_binary(sys: &dyn System, nixos: bool) -> Check {
     const NAME: &str = "helper binary";
     let Some(exec) = exec_start(sys, HELPER_UNIT) else {
         return Check::fail(
             NAME,
             format!("no ExecStart= for {HELPER_UNIT} (not installed?)"),
         )
-        .hint("sudo puzuz service install");
+        .hint(install_hint(nixos));
     };
     let exe = exec.program;
     if let Err(err) = std::fs::metadata(sys.path(&exe)) {
-        return Check::fail(NAME, format!("{}: {err}", exe.display()))
-            .hint("sudo puzuz service install");
+        return Check::fail(NAME, format!("{}: {err}", exe.display())).hint(install_hint(nixos));
     }
     match check_root_owned_chain(sys, &exe) {
         Ok(()) => Check::ok(NAME, exe.display().to_string()),
@@ -965,19 +1132,27 @@ fn check_helper_binary(sys: &dyn System) -> Check {
                 exe.display()
             ),
         )
-        .hint(format!(
-            "sudo chown root:root {0}; sudo chmod 755 {0}, and the same for each directory \
-             above it; or re-run `sudo puzuz service install` with a directory only root can \
-             write to",
-            exe.display()
-        )),
+        .hint(if nixos {
+            format!(
+                "let {HELPER_UNIT} run the helper of `services.puzuz.package` from /nix/store: \
+                 remove any ExecStart= override of `systemd.services.puzuz-helper`, then \
+                 `{REBUILD}`"
+            )
+        } else {
+            format!(
+                "sudo chown root:root {0}; sudo chmod 755 {0}, and the same for each directory \
+                 above it; or re-run `sudo puzuz service install` with a directory only root can \
+                 write to",
+                exe.display()
+            )
+        }),
     }
 }
 
 /// With `ProtectSystem=strict` (as packaged), the daemon can only write below the unit's
 /// effective `ReadWritePaths=` (drop-ins included); configured locations elsewhere fail with
 /// EROFS. `None` when systemd does not report the unit's sandboxing.
-fn check_daemon_write_paths(sys: &dyn System, config: &Config) -> Option<Check> {
+fn check_daemon_write_paths(sys: &dyn System, config: &Config, nixos: bool) -> Option<Check> {
     const NAME: &str = "daemon write paths";
     let output = sys
         .run(
@@ -1042,11 +1217,20 @@ fn check_daemon_write_paths(sys: &dyn System, config: &Config) -> Option<Check> 
                 listed(&|key, dir| format!("{} ({key})", dir.display()))
             ),
         )
-        .hint(format!(
-            "add a drop-in with `sudo systemctl edit {DAEMON_UNIT}`:\n[Service]\n\
-             ReadWritePaths={}\nthen `sudo systemctl restart {DAEMON_UNIT}`",
-            listed(&|_, dir| dir.display().to_string()).replace(", ", " ")
-        )),
+        .hint(if nixos {
+            format!(
+                "add to your NixOS configuration:\n\
+                 systemd.services.puzuz.serviceConfig.ReadWritePaths = [ {} ];\n\
+                 then `{REBUILD}`",
+                listed(&|_, dir| format!("\"{}\"", dir.display())).replace(", ", " ")
+            )
+        } else {
+            format!(
+                "add a drop-in with `sudo systemctl edit {DAEMON_UNIT}`:\n[Service]\n\
+                 ReadWritePaths={}\nthen `sudo systemctl restart {DAEMON_UNIT}`",
+                listed(&|_, dir| dir.display().to_string()).replace(", ", " ")
+            )
+        }),
     )
 }
 
@@ -1129,13 +1313,21 @@ fn check_checkpoint_dir(
     sys: &dyn System,
     config: &Config,
     storage: Option<&CheckpointStorage>,
+    nixos: bool,
 ) -> Check {
     const NAME: &str = "checkpoint dir";
     let dir = config.checkpoints_dir();
     let shown = dir.display();
     if !sys.path(&dir).is_dir() {
-        return Check::fail(NAME, format!("{shown} does not exist"))
-            .hint(format!("sudo systemd-tmpfiles --create {TMPFILES_PATH}"));
+        // NixOS has the module's tmpfiles.d entries elsewhere than TMPFILES_PATH.
+        let hint = if nixos {
+            "sudo systemd-tmpfiles --create   (the services.puzuz module installs puzuz's \
+             tmpfiles.d entries)"
+                .to_owned()
+        } else {
+            format!("sudo systemd-tmpfiles --create {TMPFILES_PATH}")
+        };
+        return Check::fail(NAME, format!("{shown} does not exist")).hint(hint);
     }
     let local = sys.fs_usage(&dir);
     if let Ok(usage) = &local
@@ -1145,9 +1337,14 @@ fn check_checkpoint_dir(
             NAME,
             format!("{shown} is on tmpfs; images would compete with jobs for RAM"),
         )
-        .hint(format!(
-            "mount a disk at {shown} or set `checkpoints_dir` in {DEFAULT_CONFIG_PATH}"
-        ));
+        .hint(if nixos {
+            format!(
+                "mount a disk at {shown} (`fileSystems`) or set `checkpoints_dir` in \
+                 `services.puzuz.settings`, then `{REBUILD}`"
+            )
+        } else {
+            format!("mount a disk at {shown} or set `checkpoints_dir` in {DEFAULT_CONFIG_PATH}")
+        });
     }
     let available = match (storage.and_then(|s| s.available_bytes), &local) {
         (Some(bytes), _) => bytes,
@@ -1177,7 +1374,7 @@ fn check_checkpoint_dir(
 
 /// The total size of the images versus `checkpoint_size_limit_bytes`, as
 /// the daemon accounts for it (the image directory is root-only).
-fn check_checkpoint_usage(storage: &CheckpointStorage) -> Check {
+fn check_checkpoint_usage(storage: &CheckpointStorage, nixos: bool) -> Check {
     const NAME: &str = "checkpoint usage";
     let used = format!(
         "{} image(s) take {}",
@@ -1197,7 +1394,12 @@ fn check_checkpoint_usage(storage: &CheckpointStorage) -> Check {
         .hint(format!(
             "find large checkpoints with `puzuz status` (administrators see every job), then \
              restore them or `puzuz remove <id>` jobs that are no longer needed; or raise \
-             `checkpoint_size_limit_bytes` in {DEFAULT_CONFIG_PATH}"
+             `checkpoint_size_limit_bytes` in {}",
+            if nixos {
+                "`services.puzuz.settings`"
+            } else {
+                DEFAULT_CONFIG_PATH
+            }
         )),
         Some(limit) => Check::ok(
             NAME,
@@ -1209,19 +1411,26 @@ fn check_checkpoint_usage(storage: &CheckpointStorage) -> Check {
     }
 }
 
-fn check_admin(sys: &dyn System) -> Check {
+fn check_admin(sys: &dyn System, nixos: bool) -> Check {
     const NAME: &str = "admin";
     if sys.euid() == 0 {
         if !sys.group_exists(ADMIN_GROUP) {
             return Check::warn(NAME, format!("group {ADMIN_GROUP} does not exist"))
-                .hint("sudo puzuz service install");
+                .hint(install_hint(nixos));
         }
         return Check::info(NAME, "running as root (administrator)");
     }
     match sys.user_in_group(ADMIN_GROUP) {
         None => Check::warn(NAME, format!("group {ADMIN_GROUP} does not exist"))
-            .hint("sudo puzuz service install"),
+            .hint(install_hint(nixos)),
         Some(true) => Check::info(NAME, format!("you are in {ADMIN_GROUP} (administrator)")),
+        Some(false) if nixos => Check::info(
+            NAME,
+            format!(
+                "you are not in {ADMIN_GROUP}; administrators are listed in \
+                 `services.puzuz.admins` (then `{REBUILD}`)"
+            ),
+        ),
         Some(false) => Check::info(
             NAME,
             format!(
