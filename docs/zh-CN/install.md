@@ -70,7 +70,10 @@ sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpo
 也可以放在其他位置，并在 `/etc/puzuz/config.toml` 中设置 `cuda_checkpoint_path`。`criu`、`cuda-checkpoint`
 和 `nvidia-smi` 的绝对路径必须属于 root，因为 helper 以 root 身份运行它们。属于 root 的符号链接会被跟随，
 其目标以同样方式检查；`/nix/store`（属于 root、设置了 sticky 位、组为 `nixbld`）虽然组可写，也会被接受，
-因此 NixOS 上类似 `/run/current-system/sw/bin/criu` 的路径可以正常使用。
+因此 NixOS 上类似 `/run/current-system/sw/bin/criu` 的路径可以正常使用。以 root 身份运行的
+`puzuz doctor` 在运行这些程序之前也应用同样的规则：不满足规则的程序不会被运行，而是报告为 FAIL
+（不含路径的名称在 systemd 的默认 `PATH` 中查找）；如果配置文件本身未通过所有者检查，它指定的
+程序一个也不会运行。
 
 <a id="installing-with-installsh"></a>
 ## 使用 install.sh 安装
@@ -720,7 +723,8 @@ sudo target/release/puzuz service install
    `PATH` 中。
 
 `--bin-dir DIR` 可安装到其他位置。由于 `puzuz-helper` 以 root 身份运行，该目录及其所有父目录都
-必须归 root 所有，且不能被组或其他用户写入（尚不存在的目录会以 0755 权限创建）；否则安装会拒绝。
+必须归 root 所有，且不能被组或其他用户写入（尚不存在的目录会以 0755 权限创建）；否则安装会拒绝，
+包含 `.` 或 `..` 组成部分的路径也会被拒绝。
 `--no-start` 会启用服务，但不启动或重启它们。`--force` 会覆盖并非由 `puzuz service install`
 写入的单元文件、sysusers.d 和 tmpfiles.d 文件（见第 2 步）。
 
@@ -743,11 +747,12 @@ store 路径注册为垃圾回收根 `/nix/var/nix/gcroots/puzuz`（通过 `nix-
 
 `puzuz service install` 可以安全地重复运行（例如在升级之后）。它执行以下操作：
 
-1. 将 `puzuz` 和 `puzuz-helper` 复制到上面选定的目录（如果它们已在那里则不复制；权限 0755，
-   原子替换）；如果它们来自 store，则注册 Nix GC 根；并写入 `/var/lib/puzuz/install-receipt`
+1. 将 `puzuz` 和 `puzuz-helper` 复制到上面选定的目录（如果那里已有内容相同、属于 root 的普通文件
+   则不复制；其他情况，例如指向构建目录的符号链接，会被替换；权限 0755，原子替换）；如果它们来自 store，则注册 Nix GC 根；并写入 `/var/lib/puzuz/install-receipt`
    （root，0644）。该回执记录目录、复制的二进制文件（就地使用时为空）、版本和 GC 根，以便
    `puzuz uninstall` 准确删除这些内容。重新安装到另一个目录（使用 `--bin-dir`）时，会删除上一次
-   安装复制的副本。如果回执存在但无法使用（不归 root 所有、可被他人写入或内容无效），安装会
+   安装复制的副本；同一目录的另一个名称（例如在 `/usr` 合并的系统上 `/bin` 之于 `/usr/bin`）视为
+   同一目录，与新二进制文件是同一文件的副本永远不会被删除。如果回执存在但无法使用（不归 root 所有、可被他人写入或内容无效），安装会
    停止且不做任何更改：请修复该文件，或在检查其列出的内容后删除它。
 2. 根据二进制文件内置的打包模板写入以下文件。每个文件都以一行
    "Installed by `puzuz service install`" 标记开头，并会在下次安装时被覆盖。如果其中某个文件
@@ -797,7 +802,7 @@ store 路径注册为垃圾回收根 `/nix/var/nix/gcroots/puzuz`（通过 `nix-
 | 安装方式 | 识别依据 |
 | --- | --- |
 | `puzuz service install` | 以安装标记行开头的 `/etc/systemd/system/<unit>` |
-| 发行版软件包 | `dpkg-query -S`、`rpm -qf` 或 `pacman -Qo` 能给出所有者的 `/usr/lib/systemd/system/<unit>`（或 `/lib/systemd/system/...`）（两个路径都会查询，因为在 `/usr` 合并的系统上 dpkg 可能登记的是 `/lib` 路径；第一个给出明确答案的工具起决定作用）。如果没有工具能回答（均未安装，或都失败，例如数据库被锁定），该单元视为来源未知的软件包 |
+| 发行版软件包 | `dpkg-query -S`、`rpm -qf` 或 `pacman -Qo` 能给出所有者的 `/usr/lib/systemd/system/<unit>`（或 `/lib/systemd/system/...`）（两个路径都存在时都会查询，因为在 `/usr` 合并的系统上 dpkg 可能登记的是 `/lib` 路径；先询问发行版自己的包管理器）。只要有工具给出所有者，就以它为准；只有当所有已安装的工具都表示没有软件包拥有它时，该单元才视为无主。如果没有工具能回答（均未安装，或其中之一失败，例如数据库被锁定），该单元视为来源未知的软件包 |
 | 无主单元 | 包管理器明确报告不属于任何软件包的此类单元（`no path found matching pattern`、`is not owned by any package`、`No package owns`）：已删除软件包的残留，或手工复制到那里的文件（`make install`） |
 | Nix | 解析到 `/nix/store` 内的 `/etc/systemd/system/<unit>`（NixOS 的 `services.puzuz` 模块、system-manager），或解析到 `/nix/store` 内、或运行 `/nix/store` 中二进制文件的软件包单元 |
 | 手工安装 | 没有标记的 `/etc/systemd/system/<unit>`，且没有软件包单元（其 `ExecStart=` 位于 `/nix/store` 下时也算此类） |
@@ -1215,7 +1220,7 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 | --- | --- |
 | `install.sh`（或发布版本的 `puzuz service install`） | `sudo puzuz update` |
 | `.deb` | `sudo apt update && sudo apt upgrade`（或用 `sudo apt install ./puzuz_<new version>_<arch>.deb` 安装发布版本中更新的 `.deb`） |
-| `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>`（尚无 dnf 仓库） |
+| `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>`（openSUSE 上为 `sudo zypper install <URL>`；尚无 dnf 仓库） |
 | 从源码构建 | `cargo build --release -p puzuz -p puzuz-helper`，然后 `sudo target/release/puzuz service install` |
 | 来自 Nix 构建的 `puzuz service install`（非 NixOS） | 再次执行相同的 `nix build` 和 `service install`（见 [使用 Nix 安装](#installing-with-nix)） |
 | AUR 软件包 `puzuz-bin`（发布之后；在此之前 Arch 使用 `install.sh` 和 `sudo puzuz update`） | `yay -Syu`（任意 AUR helper），然后 `sudo systemctl restart puzuz-helper.service puzuz.service`；`puzuz update` 会拒绝 |
@@ -1236,7 +1241,8 @@ sudo puzuz update --version 0.2.0 --yes
 `install.sh --save-token` 写入的 `/etc/puzuz/github-token`（root，0600）。然后它会：
 
 1. 检查 puzuz 是否由 `puzuz service install` 安装（而不是由软件包、Nix 或手工安装，且两个单元都
-   属于它），以及它是否作为已安装的二进制文件运行（`puzuz.service` 的 `ExecStart=` 中的目录），
+   属于它：以其他方式安装的 helper 单元会在下载任何内容之前被拒绝，缺失的 helper 单元由安装写入），
+   以及它是否作为已安装的二进制文件运行（`puzuz.service` 的 `ExecStart=` 中的目录），
 2. 查找最新的发布版本（或 `--version` 指定的版本）并与自身版本比较。已是最新时什么也不做。
    只有通过 `--version` 明确指定时才会安装较旧的版本，
 3. 请求确认（`-y/--yes` 跳过确认），
@@ -1245,7 +1251,9 @@ sudo puzuz update --version 0.2.0 --yes
 5. 解压 tarball（仅限普通文件和目录），并询问新的 `puzuz` 支持哪个数据库模式（schema）。无法
    打开守护进程数据库的发布版本（模式变更之前的旧版本）会在任何更改之前被拒绝，
 6. 针对已安装的目录运行新的 `puzuz service install`，删除 Nix 构建安装的 Nix GC 根（发布版本的
-   二进制文件不需要 store），等待守护进程运行新版本并连接到 helper，然后删除下载的文件。
+   二进制文件不需要 store），等待守护进程运行新版本并连接到 helper，然后删除下载的文件。如果
+   `service install` 失败，`puzuz update` 会检查已安装的二进制文件：若它们不是该发布版本的文件，
+   就以该错误停止；若是（只有最后的检查失败），就发出警告并继续。
 
 `install.sh`（再次运行，可选 `--version`）同样可用，效果相同，只是它仅在安装了 `minisign` 时
 才验证签名。
@@ -1300,10 +1308,12 @@ sudo puzuz uninstall --purge    # also delete /etc/puzuz, /var/lib/puzuz, /run/p
 - 如果已安装的 `puzuz` 版本早于 `puzuz uninstall` 出现的版本，`install.sh --uninstall` 会运行其
   `service uninstall`，然后从单元所在的目录中删除 `puzuz` 和 `puzuz-helper`。
 - 正在运行的作业会在各自的单元中继续运行。`uninstall` 会就此发出警告，而只要有任何
-  `puzuz-job-*` 单元处于活动状态，`--purge` 就会拒绝运行。请先用
+  `puzuz-job-*` 单元处于活动状态，或 systemd 无法列出它们，`--purge` 就会拒绝运行。请先用
   `sudo systemctl stop 'puzuz-job-*'` 停止它们，或在卸载前为它们创建检查点或终止它们。
 - `--purge` 会请求确认（`-y/--yes` 跳过确认）。它不会进入挂载点（例如 `/run/puzuz-helper` 下
-  `/` 的绑定挂载）。这些挂载点会被报告，由你手工卸载并删除。
+  `/` 的绑定挂载）。这些挂载点会被报告，由你手工卸载并删除。本身就是挂载点的待删除目录（例如位于
+  独立文件系统上的 `/var/lib/puzuz`）会被清空并保留。删除过程从不跟随符号链接（包括用户放在自己
+  日志目录中的符号链接）。
 - 系统用户 `puzuz` 和组 `puzuz-admin` 始终会被保留。
 
 <a id="troubleshooting"></a>
@@ -1339,6 +1349,7 @@ sudo ls /var/lib/puzuz/checkpoints/failed-logs/   # dump.log of failed dumps (ne
 | `config` | invalid configuration | 修正 TOML。配置无效时守护进程不会启动。 |
 | `config` | not readable by others / not searchable by others (WARN) | `sudo chmod 755 /etc/puzuz; sudo chmod 644 /etc/puzuz/config.toml`：守护进程以 `puzuz` 身份运行 |
 | `criu` | not found, or too old | 安装 CRIU 4.2 或更新版本，或设置 `criu_path` |
+| `criu`、`cuda-checkpoint`、`gpus` | was not run as root（root 以外的用户可以替换它，或配置文件未通过所有者检查） | 让程序及其目录归 root 所有且不可被组或其他用户写入，或先修复 `config` 检查的问题 |
 | `cuda-checkpoint` | not found, or lacks `--action lock/checkpoint/restore/unlock` | 将适用于 r570 或更新驱动的二进制文件安装到 `/usr/local/bin` |
 | `cuda-checkpoint` | version X but the driver is Y | 使用与驱动主版本匹配的 cuda-checkpoint |
 | `cuda plugin` | `cuda_checkpoint_mode` is `"plugin"` but `/usr/lib/criu/cuda_plugin.so` is missing | 安装插件（见 [CUDA 插件模式](#cuda-plugin-mode)）或使用手动模式 |
