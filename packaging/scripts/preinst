@@ -1,0 +1,27 @@
+#!/bin/sh
+# Before the puzuz package is installed: refuse to install next to an
+# installation made by `puzuz service install` (install.sh, `puzuz update`).
+# Its units in /etc/systemd/system would override the package's units in
+# /usr/lib/systemd/system, so the package's binaries would never run.
+#
+# Arguments: deb `install [<old-version>]` / `upgrade <old-version>` /
+# `abort-upgrade <new-version>`; rpm %pre `1` (install) / `2` (upgrade).
+set -e
+
+MARKER='# Installed by `puzuz service install`; re-running it overwrites this file.'
+
+case "$1" in
+install | 1)
+    for unit in /etc/systemd/system/puzuz.service /etc/systemd/system/puzuz-helper.service; do
+        if [ -f "$unit" ] && [ "$(head -n 1 "$unit")" = "$MARKER" ]; then
+            echo "puzuz is already installed with \`puzuz service install\` (install.sh) ($unit)." >&2
+            echo "Remove that installation first (running jobs, /etc/puzuz and /var/lib/puzuz are kept):" >&2
+            echo "  sudo puzuz service uninstall, and delete the puzuz and puzuz-helper it ran" >&2
+            echo "  (or: sudo bash install.sh --uninstall), then install this package again." >&2
+            exit 1
+        fi
+    done
+    ;;
+esac
+
+exit 0
