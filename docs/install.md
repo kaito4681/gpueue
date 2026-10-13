@@ -118,7 +118,11 @@ a later run without you noticing which token was used.
 
 `install.sh` checks, before downloading anything, that it runs as root, that systemd is PID 1, that
 the machine is x86_64 with glibc 2.34 or newer, and that puzuz is not installed by a package
-manager or NixOS (see [Install method](#install-method)). It then:
+manager or Nix (see [Install method](#install-method)). For the last check it asks an installed
+puzuz (the one the unit runs, else the one in `PATH`) with `puzuz service install-method`;
+without one it refuses only the obvious cases itself (NixOS by `/etc/os-release`, a unit a package
+owns, a unit linked into `/nix/store`), and the downloaded binary decides the rest before it
+installs anything. It then:
 
 1. looks up the release (`/repos/kaito4681/puzuz/releases/latest`, or `/releases/tags/v<X>`),
 2. downloads `puzuz-v<X>-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256` file into a
@@ -265,28 +269,65 @@ the units with drop-ins (`sudo systemctl edit puzuz-helper.service`). Edits to t
 
 ### Install method
 
-`puzuz service install` must not share a machine with a package manager or NixOS: its units in
+`puzuz service install` must not share a machine with a package manager or Nix: its units in
 `/etc/systemd/system` would shadow the packaged ones, and both would use `/etc/puzuz` and
-`/var/lib/puzuz`. puzuz tells the ways apart by their files:
+`/var/lib/puzuz`. puzuz tells the ways apart by the unit files, `puzuz.service` and
+`puzuz-helper.service` each:
 
 | Install method | Recognized by |
 | --- | --- |
-| `puzuz service install` | `/etc/systemd/system/puzuz.service` starting with the install marker line |
-| distribution package | `/usr/lib/systemd/system/puzuz.service` (or `/lib/systemd/system/...`) |
-| NixOS | `/etc/NIXOS`, or a unit whose `ExecStart=` is below `/nix/store` |
-| by hand | `/etc/systemd/system/puzuz.service` without the marker, and no packaged unit |
+| `puzuz service install` | `/etc/systemd/system/<unit>` starting with the install marker line |
+| distribution package | `/usr/lib/systemd/system/<unit>` (or `/lib/systemd/system/...`) that `dpkg-query -S`, `rpm -qf` or `pacman -Qo` names an owner for (asked under both paths, since dpkg may have registered the `/lib` one on merged-`/usr` systems; the first tool with a definite answer decides). If no tool can answer (none installed, or each fails, e.g. with a locked database), the unit counts as a package of unknown origin |
+| unowned unit | such a unit that a package manager definitely reports as not owned (`no path found matching pattern`, `is not owned by any package`, `No package owns`): left over from a removed package, or copied there by hand (`make install`) |
+| Nix | `/etc/systemd/system/<unit>` resolving into `/nix/store` (the NixOS `services.puzuz` module, system-manager), or a packaged unit that resolves into or runs a binary from `/nix/store` |
+| by hand | `/etc/systemd/system/<unit>` without the marker, and no packaged unit (also when its `ExecStart=` is below `/nix/store`) |
 
-Next to a packaged unit, a `/etc/systemd/system/puzuz.service` without the marker is the
-administrator's replacement of it (`systemctl edit --full puzuz`), and a symlink to `/dev/null`
-there is a mask (`systemctl mask puzuz`). Neither is a second install method: puzuz reports the
-package as "overridden" or "masked". A mask without a package is ignored.
+Next to a packaged (or unowned) unit, a `/etc/systemd/system/puzuz.service` without the marker is
+the administrator's replacement of it (`systemctl edit --full puzuz`), and a symlink to
+`/dev/null` there is a mask (`systemctl mask puzuz`). Neither is a second install method: puzuz
+reports the package as "overridden" or "masked". A mask without a package is ignored.
 
-`puzuz service install` refuses to run on a machine where puzuz comes from a package or from
-NixOS, even with `--force`, and names the package manager's way to update it instead.
-`puzuz service uninstall` refuses such a machine too. When both a package and `service install`
-are present ("mixed"), `uninstall` removes only the files that `service install` wrote, and
-refuses `--purge` (the package still uses `/etc/puzuz` and `/var/lib/puzuz`). `puzuz doctor`
-reports the install method and fails on a mixed setup. `puzuz service status` shows it too.
+The operating system is read from `/etc/os-release` (else `/usr/lib/os-release`), `ID` and
+`ID_LIKE`. It only decides the wording of hints and that NixOS (`ID=nixos`) uses its module; it
+never decides the install method (the same distribution can have puzuz from a package or from
+`install.sh`). `/etc/NIXOS` is not looked at.
+
+What each command does (the hidden `puzuz service install-method` prints the keyword, for
+`install.sh`):
+
+| Install method | `service install` | `service uninstall` | `update` | `doctor` | keyword |
+| --- | --- | --- | --- | --- | --- |
+| not installed | installs | says so | refuses: use `install.sh` | INFO | `none` |
+| not installed, NixOS | refuses: use the `services.puzuz` module | says so | refuses: use the module | INFO "not installed (NixOS: use the services.puzuz module)" | `none` |
+| `puzuz service install` | re-installs | uninstalls | updates | OK | `service-install` |
+| distribution package (dpkg, rpm, pacman, or unknown) | refuses, even with `--force` | refuses | refuses | OK (INFO when masked) | `package` |
+| unowned unit | only with `--force`; delete the file first instead | refuses | refuses | WARN | `unowned` |
+| Nix | refuses, even with `--force` | refuses | refuses | OK | `nix` |
+| by hand | only with `--force` | refuses | refuses | INFO | `manual` |
+| mixed | refuses: uninstall the `service install` copy first | removes only what `service install` wrote (no `--purge`) | refuses | FAIL | `mixed` |
+
+"Mixed" is `service install` together with a package or Nix, on one unit or across
+`puzuz.service` and `puzuz-helper.service` (e.g. the daemon unit from `service install`, the
+helper unit from a package): `doctor` fails, `service status` reports it as unhealthy, and the
+keyword is `mixed`. A `service install` next to an unowned unit in `/usr/lib` stays a
+`service install` (its units in `/etc` win), and re-running `service install` needs no
+`--force`; `doctor` warns and tells you to delete the leftover. When the two units are installed
+in other different ways (for example, one of them is missing, or they come from different
+packages of different package managers), `doctor` warns and `service status` says so;
+`service install` installs both and so fixes it. `service install` also refuses when `/etc/systemd/system` itself
+resolves into `/nix/store`, since it cannot write there.
+
+The refusals name the way to update or remove puzuz that fits the install method:
+
+| Install method | Update | Remove |
+| --- | --- | --- |
+| dpkg | `sudo apt update && sudo apt upgrade` | `sudo apt remove <package>` |
+| rpm | `sudo dnf upgrade` | `sudo dnf remove <package>` |
+| pacman | `yay -Syu` (AUR) or `sudo pacman -Syu` | `sudo pacman -R <package>` |
+| package of unknown origin | your package manager (named after `ID`/`ID_LIKE` when known) | the same |
+| Nix on NixOS | `nix flake update && sudo nixos-rebuild switch` | `services.puzuz.enable = false`, then `sudo nixos-rebuild switch` |
+| Nix elsewhere | the Nix configuration that created the unit | the same |
+| `puzuz service install` | `sudo puzuz update` | `sudo puzuz service uninstall` |
 
 The daemon runs with `ProtectSystem=strict`: it can only write below the unit's
 `ReadWritePaths=/var/lib/puzuz/daemon /var/lib/puzuz/logs /run/puzuz`. If you move `data_dir`,
@@ -690,7 +731,7 @@ and its "update" line says when a newer release exists):
 | --- | --- |
 | `install.sh` (or `puzuz service install` of a release) | `sudo puzuz update` |
 | built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install --bin-dir /usr/local/bin` |
-| a distribution package or NixOS (later) | the package manager; `puzuz update` refuses |
+| a distribution package or Nix (later) | the package manager or Nix (see [Install method](#install-method)); `puzuz update` refuses and names the command |
 
 ### puzuz update
 
@@ -704,7 +745,8 @@ sudo puzuz update --version 0.2.0 --yes
 or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or `/etc/puzuz/github-token` (root, 0600),
 which `install.sh --save-token` writes. It then:
 
-1. checks that puzuz was installed by `puzuz service install` (not by a package or NixOS) and
+1. checks that puzuz was installed by `puzuz service install` (not by a package, Nix or by
+   hand, and that both units belong to it) and
    that it runs as the installed binary (the directory in `puzuz.service`'s `ExecStart=`),
 2. looks up the latest release (or `--version`) and compares it with its own version. Nothing
    happens when it is up to date. An older version is installed only when asked for with
@@ -804,6 +846,7 @@ stopped until `sudo systemctl start puzuz` or the next boot.
 | `kernel` | lacks `/proc/sys/kernel/ns_last_pid` | use a kernel with `CONFIG_CHECKPOINT_RESTORE=y` |
 | `update` | puzuz X is available (INFO) | `sudo puzuz update`; `update_check = false` turns the check off |
 | `install method` | mixed: two install methods at once | remove all but one, as the `fix:` lines say (e.g. `sudo puzuz service uninstall` to keep the package) |
+| `install method` | WARN: a unit no package owns, a leftover unit, or units installed in different ways | delete the unowned `/usr/lib` unit (`sudo rm ...`), or re-run the installation that should own both units, as the `fix:` line says |
 | `puzuz.service`, `puzuz-helper.service` | not installed / not active | `sudo puzuz service install`, or `sudo systemctl start <unit>` and read `journalctl -u <unit>` |
 | `helper binary` | the binary or a directory above it is not owned by root or is writable by others | `sudo chown root:root <path>; sudo chmod 755 <path>` (and its directories), or reinstall with `--bin-dir /usr/local/bin` |
 | `daemon write paths` | cannot write to a configured directory: not below its ReadWritePaths= | add a `ReadWritePaths=` drop-in for `puzuz.service` (see [Installing](#installing)) |

@@ -20,6 +20,8 @@ pub mod fake;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CmdOutput {
     pub success: bool,
+    /// Exit code; `None` if a signal ended the command.
+    pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -29,14 +31,21 @@ impl CmdOutput {
     pub fn ok(stdout: impl Into<String>) -> Self {
         Self {
             success: true,
+            code: Some(0),
             stdout: stdout.into(),
             stderr: String::new(),
         }
     }
 
+    /// Exit code 1.
     pub fn failed(stdout: impl Into<String>, stderr: impl Into<String>) -> Self {
+        Self::exited(1, stdout, stderr)
+    }
+
+    pub fn exited(code: i32, stdout: impl Into<String>, stderr: impl Into<String>) -> Self {
         Self {
-            success: false,
+            success: code == 0,
+            code: Some(code),
             stdout: stdout.into(),
             stderr: stderr.into(),
         }
@@ -133,6 +142,7 @@ impl System for RealSystem {
             .output()?;
         Ok(CmdOutput {
             success: output.status.success(),
+            code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })

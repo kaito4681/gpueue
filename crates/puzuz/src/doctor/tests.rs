@@ -59,6 +59,10 @@ fn healthy() -> (FakeSystem, Vec<UnixListener>) {
         "/etc/systemd/system/puzuz-helper.service",
         "[Service]\nExecStart=/usr/bin/puzuz-helper serve\n",
     );
+    sys.write(
+        "/etc/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
     sys.write_exe("/usr/bin/puzuz-helper", "");
     sys.mkdir("/run/puzuz");
     let listeners = ["/run/puzuz/puzuz.sock", "/run/puzuz/helper.sock"]
@@ -893,13 +897,32 @@ fn marker_unit(bin_dir: &str) -> String {
     )
 }
 
+fn write_both(sys: &FakeSystem, dir: &str, contents: &str) {
+    for unit in ["puzuz.service", "puzuz-helper.service"] {
+        sys.write(&format!("{dir}/{unit}"), contents);
+    }
+}
+
+/// Both units from the dpkg package `puzuz`.
+fn install_package(sys: &FakeSystem) {
+    for unit in ["puzuz.service", "puzuz-helper.service"] {
+        let unit = format!("/usr/lib/systemd/system/{unit}");
+        sys.write(&unit, "[Service]\nExecStart=/usr/bin/puzuz daemon\n");
+        sys.dpkg_owns(&unit, "puzuz");
+    }
+}
+
 #[test]
 fn install_method_is_reported() {
     let (sys, _sockets) = healthy();
+    for unit in ["puzuz.service", "puzuz-helper.service"] {
+        std::fs::remove_file(sys.path(&Path::new("/etc/systemd/system").join(unit))).unwrap();
+    }
     assert_eq!(message(&run(&sys, None), "install method"), "not installed");
 
-    sys.write(
-        "/etc/systemd/system/puzuz.service",
+    write_both(
+        &sys,
+        "/etc/systemd/system",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
     );
     let report = run(&sys, None);
@@ -907,10 +930,7 @@ fn install_method_is_reported() {
     assert!(message(&report, "install method").starts_with("by hand"));
     assert!(hint(&report, "install method").contains("--force"));
 
-    sys.write(
-        "/etc/systemd/system/puzuz.service",
-        &marker_unit("/usr/local/bin"),
-    );
+    write_both(&sys, "/etc/systemd/system", &marker_unit("/usr/local/bin"));
     let report = run(&sys, None);
     assert_eq!(level(&report, "install method"), Level::Ok);
     assert_eq!(
@@ -922,10 +942,7 @@ fn install_method_is_reported() {
 #[test]
 fn a_masked_or_overridden_package_does_not_fail() {
     let (sys, _sockets) = healthy();
-    sys.write(
-        "/usr/lib/systemd/system/puzuz.service",
-        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
-    );
+    install_package(&sys);
     sys.write(
         "/etc/systemd/system/puzuz.service",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
@@ -950,18 +967,113 @@ fn a_masked_or_overridden_package_does_not_fail() {
 #[test]
 fn mixed_install_methods_fail() {
     let (sys, _sockets) = healthy();
-    sys.write(
-        "/etc/systemd/system/puzuz.service",
-        &marker_unit("/usr/local/bin"),
-    );
-    sys.write(
-        "/usr/lib/systemd/system/puzuz.service",
-        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
-    );
+    write_both(&sys, "/etc/systemd/system", &marker_unit("/usr/local/bin"));
+    install_package(&sys);
     let report = run(&sys, None);
     assert_eq!(level(&report, "install method"), Level::Fail);
     assert!(message(&report, "install method").starts_with("mixed: "));
     let hint = hint(&report, "install method");
     assert!(hint.contains("sudo puzuz service uninstall"), "{hint}");
-    assert!(hint.contains("apt remove"), "{hint}");
+    assert!(hint.contains("sudo apt remove puzuz"), "{hint}");
+}
+
+fn remove_etc_units(sys: &FakeSystem) {
+    for unit in ["puzuz.service", "puzuz-helper.service"] {
+        let _ = std::fs::remove_file(sys.path(&Path::new("/etc/systemd/system").join(unit)));
+    }
+}
+
+fn not_owned(sys: &FakeSystem) {
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
+}
+
+#[test]
+fn an_unowned_unit_warns() {
+    let (sys, _sockets) = healthy();
+    remove_etc_units(&sys);
+    write_both(
+        &sys,
+        "/usr/lib/systemd/system",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    not_owned(&sys);
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "install method"), Level::Warn);
+    assert!(
+        message(&report, "install method").starts_with("a unit no package owns"),
+        "{}",
+        message(&report, "install method")
+    );
+    assert!(hint(&report, "install method").contains("sudo rm /usr/lib/systemd/system/puzuz"));
+}
+
+#[test]
+fn a_leftover_next_to_service_install_warns() {
+    let (sys, _sockets) = healthy();
+    write_both(&sys, "/etc/systemd/system", &marker_unit("/usr/local/bin"));
+    write_both(
+        &sys,
+        "/usr/lib/systemd/system",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    not_owned(&sys);
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "install method"), Level::Warn);
+    let shown = message(&report, "install method");
+    assert!(shown.starts_with("puzuz service install"), "{shown}");
+    assert!(shown.contains("no package owns"), "{shown}");
+    assert!(hint(&report, "install method").contains("remove the leftover /usr/lib unit"));
+}
+
+#[test]
+fn units_installed_in_different_ways_warn() {
+    let (sys, _sockets) = healthy();
+    remove_etc_units(&sys);
+    sys.write(
+        "/etc/systemd/system/puzuz.service",
+        &marker_unit("/usr/local/bin"),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "install method"), Level::Warn);
+    assert!(
+        message(&report, "install method").starts_with("puzuz-helper.service is missing"),
+        "{}",
+        message(&report, "install method")
+    );
+    assert!(hint(&report, "install method").contains("sudo puzuz service install"));
+
+    // A packaged helper unit next to it conflicts: FAIL, like a mixed setup.
+    let unit = "/usr/lib/systemd/system/puzuz-helper.service";
+    sys.write(unit, "[Service]\nExecStart=/usr/bin/puzuz-helper serve\n");
+    sys.dpkg_owns(unit, "puzuz");
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "install method"), Level::Fail);
+    assert!(message(&report, "install method").contains("conflict"));
+    let hint = hint(&report, "install method");
+    assert!(hint.contains("sudo puzuz service uninstall"), "{hint}");
+    assert!(hint.contains("sudo apt remove puzuz"), "{hint}");
+}
+
+#[test]
+fn nixos_is_reported() {
+    let (sys, _sockets) = healthy();
+    remove_etc_units(&sys);
+    sys.write("/etc/os-release", "ID=nixos\n");
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "install method"), Level::Info);
+    assert_eq!(
+        message(&report, "install method"),
+        "not installed (NixOS: use the services.puzuz module)"
+    );
+
+    for unit in ["puzuz.service", "puzuz-helper.service"] {
+        let link = sys.path(&Path::new("/etc/systemd/system").join(unit));
+        std::os::unix::fs::symlink(format!("/nix/store/abc-{unit}"), link).unwrap();
+    }
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "install method"), Level::Ok);
+    assert!(message(&report, "install method").starts_with("Nix ("));
 }
