@@ -128,6 +128,31 @@ jobs:
             PUZUZ_DEB_BASE="$base" scripts/deb-test.sh target/deb/puzuz_*.deb
           done
 
+  # The .rpm of each architecture (built like release.yml does, but from a
+  # debug build), installed, upgraded from an older pre-release package and
+  # removed in plain Rocky Linux 9 and Fedora containers without systemd
+  # (scripts/rpm-test.sh).
+  rpm:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/test-in-docker.sh build --locked -p puzuz -p puzuz-helper
+      - name: Build the .rpm, and a pre-release of it to upgrade from
+        run: |
+          . scripts/dist/lib.sh
+          version="$(workspace_version .)"
+          PUZUZ_PKG_VERSION="$version-rc.1" scripts/dist/build-package.sh target/docker/debug target/rpm-old rpm
+          scripts/dist/build-package.sh target/docker/debug target/rpm rpm
+      - run: |
+          for base in rockylinux/rockylinux:9 fedora:latest; do
+            PUZUZ_RPM_BASE="$base" scripts/rpm-test.sh target/rpm-old/puzuz-*.rpm target/rpm/puzuz-*.rpm
+          done
+
   # Daemon + helper + CLI under systemd in a privileged container, including
   # a simulated reboot (CPU-only; the GPU scenarios need an NVIDIA GPU).
   e2e:
