@@ -10,23 +10,10 @@
 let
   cargoToml = builtins.fromTOML (builtins.readFile ../Cargo.toml);
 
-  skippedTests = [
-    # Uses /etc/passwd as "a root-owned system file"; in the sandbox it is a
-    # file that Nix generates for the build user.
-    "access::tests::restored_objects_must_be_the_owners_to_open"
-    # Check the test process's own open files; under nix-daemon its stdout is
-    # the builder's pseudo-terminal (/dev/pts/N), which does not exist in the
-    # sandbox's /dev.
-    "access::tests::checks_every_object_of_a_process_tree"
-    "access::tests::zombies_are_not_checked"
-    # Expects `/` to be owned by root; in the sandbox of nix-daemon builds it
-    # is not ("/ is not a directory that only root can change").
-    "shim::tests::mount_surgery_only_walks_root_controlled_directories"
-  ]
   # puzuz-helper/tests/protocol.rs: these spawn a job, and the helper makes
   # the job's log directory setgid (mode 2770). Nix's sandbox refuses setuid
   # and setgid modes (its seccomp filter fails chmod with EPERM).
-  ++ [
+  skippedTests = [
     "a_dump_past_its_deadline_is_killed_and_the_job_resumed"
     "a_restored_job_holding_files_its_owner_may_not_open_is_killed"
     "a_stopping_helper_abandons_queued_launches_and_refuses_new_ones"

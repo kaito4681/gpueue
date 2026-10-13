@@ -847,6 +847,7 @@ fn raise_nofile_limit() {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
 
     fn pinned(path: &Path, want: Want) -> Pinned {
         Pinned {
@@ -875,9 +876,17 @@ mod tests {
             return;
         }
         // `sleep` never reaps the `true` its shell started.
+        // Its stdio and working directory are set here, not inherited from
+        // the test runner (whose terminal may be unreachable, e.g. a
+        // `/dev/pts/N` outside a Nix build sandbox).
+        let tmp = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new("sh")
             .arg("-c")
             .arg("true & exec sleep 30")
+            .current_dir(tmp.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
         let parent = child.id();
@@ -989,14 +998,25 @@ VmFlags: rd ex mr mw me
         let f = dir.join("passwd");
         fs::write(&f, b"x").unwrap();
         assert_eq!(check_pinned(&pinned(&f, Want::ReadWrite)), Ok(()));
-        // A root file opened read-write (the exploit: CRIU followed a
-        // symlink to /etc): the owner may not write it.
-        let e = check_pinned(&pinned(Path::new("/etc/passwd"), Want::ReadWrite)).unwrap_err();
+        // A system file opened read-write (the exploit: CRIU followed a
+        // symlink to /etc/passwd): the owner may not write it. A fixture
+        // the owner may read but not write stands in for it (in a Nix build
+        // sandbox, /etc/passwd is the build user's).
+        let sys = tmp.path().join("etc-passwd");
+        fs::write(&sys, b"root:x:0:0::/root:/bin/sh\n").unwrap();
+        fs::set_permissions(&sys, fs::Permissions::from_mode(0o444)).unwrap();
+        let e = check_pinned(&pinned(&sys, Want::ReadWrite)).unwrap_err();
         assert!(e.contains("may not read and write"), "{e}");
-        assert_eq!(
-            check_pinned(&pinned(Path::new("/etc/passwd"), Want::Read)),
-            Ok(())
-        );
+        assert_eq!(check_pinned(&pinned(&sys, Want::Read)), Ok(()));
+        // The real one, where it is root's.
+        if fs::metadata("/etc/passwd").is_ok_and(|m| {
+            std::os::unix::fs::MetadataExt::uid(&m) == 0 && m.permissions().mode() & 0o002 == 0
+        }) {
+            let etc = Path::new("/etc/passwd");
+            let e = check_pinned(&pinned(etc, Want::ReadWrite)).unwrap_err();
+            assert!(e.contains("may not read and write"), "{e}");
+            assert_eq!(check_pinned(&pinned(etc, Want::Read)), Ok(()));
+        }
         // Lost write permission since.
         fs::set_permissions(&f, fs::Permissions::from_mode(0o444)).unwrap();
         assert!(check_pinned(&pinned(&f, Want::Write)).is_err());
@@ -1020,7 +1040,14 @@ VmFlags: rd ex mr mw me
         assert_eq!(check_pinned(&gone), Ok(()));
         // Directories: entering.
         assert_eq!(check_pinned(&pinned(tmp.path(), Want::Search)), Ok(()));
-        if fs::metadata("/root").is_ok_and(|m| m.permissions().mode() & 0o001 == 0) {
+        // One the owner may not enter (like /root).
+        let closed = tmp.path().join("closed");
+        fs::create_dir(&closed).unwrap();
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(check_pinned(&pinned(&closed, Want::Search)).is_err());
+        if fs::metadata("/root").is_ok_and(|m| {
+            std::os::unix::fs::MetadataExt::uid(&m) == 0 && m.permissions().mode() & 0o001 == 0
+        }) {
             assert!(check_pinned(&pinned(Path::new("/root"), Want::Search)).is_err());
         }
     }
@@ -1044,6 +1071,12 @@ VmFlags: rd ex mr mw me
             .arg("exec 3<>\"$1\"; exec sleep 30")
             .arg("sh")
             .arg(dir.join("data"))
+            // Not the test runner's stdio and working directory (see
+            // `zombies_are_not_checked`).
+            .current_dir(tmp.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
         // Wait for the exec.
