@@ -10,8 +10,8 @@
 #
 # Without systemd as PID 1 (a container or a chroot) nothing is started; the
 # services are only enabled, so they start when the system boots.
-set -e
 # shellcheck disable=SC2086 # $UNITS is split into the unit names on purpose.
+set -e
 
 UNITS="puzuz-helper.service puzuz.service"
 # Left by prerm when the package was removed but not purged: dpkg then still
