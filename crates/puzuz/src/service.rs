@@ -17,8 +17,11 @@ use crate::doctor::{self, Report};
 use crate::install_method::{self, Detection, Method};
 use crate::system::{System, check_root_owned_chain, run_checked};
 
+mod gc_root;
 mod receipt;
 
+pub use gc_root::GC_ROOT;
+use receipt::ReceiptState;
 pub use receipt::{RECEIPT_PATH, Receipt};
 
 pub const DAEMON_UNIT: &str = "puzuz.service";
@@ -210,129 +213,6 @@ struct Binaries {
     store_path: Option<PathBuf>,
 }
 
-pub const NIX_STORE: &str = "/nix/store";
-/// The garbage-collector root `service install` registers for binaries from the Nix store.
-pub const GC_ROOT: &str = "/nix/var/nix/gcroots/puzuz";
-/// Where `nix-store` is when it is not in systemd's default `PATH` (sudo's `secure_path` hides
-/// the profile of a multi-user Nix installation).
-const NIX_STORE_BINARIES: &[&str] = &[
-    "/nix/var/nix/profiles/default/bin/nix-store",
-    "/run/current-system/sw/bin/nix-store",
-];
-
-/// The store path (`/nix/store/<hash>-<name>`) the system path `exe` resolves into, if any.
-fn nix_store_path(sys: &dyn System, exe: &Path) -> Option<PathBuf> {
-    let root = std::fs::canonicalize(sys.root()).ok()?;
-    let resolved = std::fs::canonicalize(sys.path(exe)).ok()?;
-    let system = Path::new("/").join(resolved.strip_prefix(&root).ok()?);
-    let entry = system.strip_prefix(NIX_STORE).ok()?.components().next()?;
-    Some(Path::new(NIX_STORE).join(entry))
-}
-
-/// Registers [`GC_ROOT`] for `store_path` with `nix-store`, so that `nix-collect-garbage` keeps
-/// what the copied binaries use (their libraries and loader). Returns whether it worked; a
-/// failure is only a warning.
-fn add_gc_root(sys: &dyn System, store_path: &Path, out: &mut dyn Write) -> bool {
-    let program = crate::system::find_program(sys, Path::new("nix-store")).or_else(|| {
-        NIX_STORE_BINARIES
-            .iter()
-            .map(PathBuf::from)
-            .find(|path| sys.path(path).is_file())
-    });
-    let manual = format!(
-        "register it yourself so that garbage collection keeps what the binaries use: \
-         `sudo nix-store --add-root {GC_ROOT} --realise {}`",
-        store_path.display()
-    );
-    let Some(program) = program else {
-        writeln!(
-            out,
-            "warning: nix-store not found; the binaries come from {} but no GC root was \
-             registered; {manual}",
-            store_path.display()
-        )
-        .ok();
-        return false;
-    };
-    let store_path_text = store_path.to_string_lossy();
-    match run_checked(
-        sys,
-        &program.to_string_lossy(),
-        &["--add-root", GC_ROOT, "--realise", &store_path_text],
-    ) {
-        Ok(_) => {
-            writeln!(
-                out,
-                "registered the Nix GC root {GC_ROOT} for {}",
-                store_path.display()
-            )
-            .ok();
-            true
-        }
-        Err(err) => {
-            writeln!(out, "warning: {err}; {manual}").ok();
-            false
-        }
-    }
-}
-
-/// Removes the GC root `root` (only ever [`GC_ROOT`], and only a symlink).
-fn remove_gc_root(sys: &dyn System, root: &Path, out: &mut dyn Write) {
-    if root != Path::new(GC_ROOT) {
-        writeln!(
-            out,
-            "warning: ignoring the GC root {} in {RECEIPT_PATH} (expected {GC_ROOT})",
-            root.display()
-        )
-        .ok();
-        return;
-    }
-    let local = sys.path(root);
-    match std::fs::symlink_metadata(&local) {
-        Ok(meta) if meta.file_type().is_symlink() => match std::fs::remove_file(&local) {
-            Ok(()) => {
-                writeln!(out, "removed the Nix GC root {GC_ROOT}").ok();
-            }
-            Err(err) => {
-                writeln!(out, "warning: removing {GC_ROOT}: {err}").ok();
-            }
-        },
-        Ok(_) => {
-            writeln!(out, "warning: kept {GC_ROOT} (not a symlink)").ok();
-        }
-        Err(_) => {}
-    }
-}
-
-/// A GC root and the store path it keeps, as recorded in the receipt.
-type GcRoot = (Option<PathBuf>, Option<PathBuf>);
-
-/// The GC root of the new installation: registered when the binaries come from the Nix store;
-/// otherwise the previous one stays while the installed binaries are unchanged and is removed
-/// once they are replaced (by binaries that do not need the store).
-fn update_gc_root(
-    sys: &dyn System,
-    previous: Option<&Receipt>,
-    binaries: &Binaries,
-    out: &mut dyn Write,
-) -> GcRoot {
-    if let Some(store_path) = &binaries.store_path {
-        return if add_gc_root(sys, store_path, out) {
-            (Some(PathBuf::from(GC_ROOT)), Some(store_path.clone()))
-        } else {
-            (None, None)
-        };
-    }
-    let Some((previous, root)) = previous.and_then(|p| Some((p, p.gc_root.clone()?))) else {
-        return (None, None);
-    };
-    if previous.bin_dir == binaries.bin_dir && !binaries.changed {
-        return (Some(root), previous.gc_root_target.clone());
-    }
-    remove_gc_root(sys, &root, out);
-    (None, None)
-}
-
 /// The directory of the binaries an existing `service install` installation runs.
 fn installed_bin_dir(detection: &Detection) -> Option<&Path> {
     detection.methods().find_map(|m| match m {
@@ -416,7 +296,7 @@ fn install_binaries(
         bin_dir,
         changed,
         copied,
-        store_path: nix_store_path(sys, &exe),
+        store_path: gc_root::store_path_of(sys, &exe),
     })
 }
 
@@ -427,7 +307,7 @@ fn write_receipt(
     sys: &dyn System,
     previous: Option<&Receipt>,
     binaries: &Binaries,
-    (gc_root, gc_root_target): GcRoot,
+    (gc_root, gc_root_target): gc_root::GcRoot,
 ) -> Result<Vec<PathBuf>> {
     let mut copied = binaries.copied.clone();
     let mut stale = Vec::new();
@@ -443,68 +323,38 @@ fn write_receipt(
         }
     }
     copied.sort();
-    let new = Receipt {
-        version: puzuz_protocol::BINARY_VERSION.to_owned(),
-        bin_dir: binaries.bin_dir.clone(),
-        copied,
-        gc_root,
-        gc_root_target,
-    };
-    write_file(
+    receipt::write(
         sys,
-        Path::new(RECEIPT_PATH),
-        new.to_toml().as_bytes(),
-        0o644,
+        &Receipt {
+            version: puzuz_protocol::BINARY_VERSION.to_owned(),
+            bin_dir: binaries.bin_dir.clone(),
+            copied,
+            gc_root,
+            gc_root_target,
+        },
     )?;
     Ok(stale)
 }
 
 /// After `puzuz update` installed the binaries of a release tarball over an installation from
-/// the Nix store: the new binaries do not use the store, so the GC root recorded in the receipt
-/// is removed and the receipt updated. (The new `service install` does this itself; this also
-/// covers a release that predates the receipt.)
+/// the Nix store: once the installed binaries no longer use the store, the GC root recorded in
+/// the receipt is removed and the receipt updated. (The new `service install` does this
+/// itself; this also covers a release that predates the receipt.)
 pub fn release_gc_root(sys: &dyn System, version: &str, out: &mut dyn Write) -> Result<()> {
-    let mut receipt = match receipt::read(sys) {
-        Ok(Some(receipt)) => receipt,
-        Ok(None) => return Ok(()),
-        Err(err) => {
-            writeln!(out, "warning: {err}").ok();
-            return Ok(());
-        }
-    };
-    let Some(root) = receipt.gc_root.take() else {
+    let ReceiptState::Valid(mut receipt) = receipt::read_or_warn(sys, out) else {
         return Ok(());
     };
-    remove_gc_root(sys, &root, out);
+    let Some(root) = receipt.gc_root.clone() else {
+        return Ok(());
+    };
+    if gc_root::binaries_need_store(sys, &receipt.bin_dir) {
+        return Ok(());
+    }
+    gc_root::remove_gc_root(sys, &root, out);
+    receipt.gc_root = None;
     receipt.gc_root_target = None;
     receipt.version = version.to_owned();
-    write_file(
-        sys,
-        Path::new(RECEIPT_PATH),
-        receipt.to_toml().as_bytes(),
-        0o644,
-    )?;
-    Ok(())
-}
-
-/// Removes copies a previous installation left in a directory the units no longer use.
-fn remove_stale_copies(sys: &dyn System, stale: &[PathBuf], out: &mut dyn Write) {
-    for path in stale {
-        match std::fs::remove_file(sys.path(path)) {
-            Ok(()) => {
-                writeln!(
-                    out,
-                    "removed {} (copied by the previous install)",
-                    path.display()
-                )
-                .ok();
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                writeln!(out, "warning: removing {}: {err}", path.display()).ok();
-            }
-        }
-    }
+    receipt::write(sys, &receipt)
 }
 
 /// GPUs reported by nvidia-smi as `[[gpus]]` entries for a new configuration file.
@@ -682,13 +532,30 @@ pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) 
     for warning in warnings {
         writeln!(out, "warning: {warning}").ok();
     }
-    // A receipt that cannot be trusted is not built upon (nor are the files it lists).
-    let previous = receipt::read(sys).unwrap_or_else(|err| {
-        writeln!(out, "warning: {err}").ok();
-        None
-    });
+    // A receipt that cannot be used is neither built upon nor overwritten: it may be the only
+    // record of copies and a GC root that would otherwise be forgotten.
+    let previous = match receipt::read_or_warn(sys, out) {
+        ReceiptState::Valid(receipt) => Some(receipt),
+        ReceiptState::Missing => None,
+        ReceiptState::Invalid(_) => {
+            return Err(format!(
+                "refusing to replace {RECEIPT_PATH} (see the warning above): it records which \
+                 binaries puzuz copied and its Nix GC root. Fix it, or delete it (`sudo rm \
+                 {RECEIPT_PATH}`) after checking what it lists, and re-run"
+            ));
+        }
+    };
     let binaries = install_binaries(sys, options.bin_dir.as_deref(), &detection, out)?;
-    let gc_root = update_gc_root(sys, previous.as_ref(), &binaries, out);
+    let previous_root = previous.as_ref().map_or((None, None), |p| {
+        (p.gc_root.clone(), p.gc_root_target.clone())
+    });
+    let gc_root = gc_root::decide_gc_root(
+        sys,
+        &binaries.bin_dir,
+        binaries.store_path.as_deref(),
+        previous_root,
+        out,
+    );
     let stale = write_receipt(sys, previous.as_ref(), &binaries, gc_root)?;
     let bin_dir = binaries.bin_dir.clone();
     let binaries_changed = binaries.changed;
@@ -700,7 +567,18 @@ pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) 
         writeln!(out, "{verb} {}", file.path.display()).ok();
         units_changed |= changed && file.path.starts_with(UNIT_DIR);
     }
-    remove_stale_copies(sys, &stale, out);
+    let left = receipt::remove_copies(sys, &stale, " (copied by the previous install)", out);
+    if !left.is_empty() {
+        writeln!(
+            out,
+            "warning: remove {} by hand",
+            left.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+        .ok();
+    }
 
     // The user first: tmpfiles.d hands directories to it.
     let sysusers = sys.path(Path::new(SYSUSERS_PATH));
@@ -798,34 +676,49 @@ fn active_job_units(sys: &dyn System) -> Vec<String> {
 }
 
 /// Removes what the install receipt lists: the binaries `service install` copied (never
-/// binaries it used in place, nor anything else), the Nix GC root and the receipt itself.
-/// Without a receipt (an installation by an older puzuz) the binaries are kept.
+/// binaries it used in place, nor files a package owns, nor anything else), the Nix GC root and
+/// the receipt itself. Without a usable receipt the binaries are kept. A receipt is kept (with
+/// what is left) when a binary could not be removed, unless `purge` deletes it anyway.
 fn remove_binaries(
     sys: &dyn System,
-    receipt: Option<&Receipt>,
-    method: &Detection,
+    state: &ReceiptState,
+    detection: &Detection,
+    purge: bool,
     out: &mut dyn Write,
-) -> Result<()> {
-    let Some(receipt) = receipt else {
-        if method.has_service_install() {
-            let kept = match installed_bin_dir(method) {
-                Some(dir) => receipt::BINARIES
-                    .iter()
-                    .map(|name| dir.join(name).display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                None => "puzuz and puzuz-helper".to_owned(),
-            };
-            writeln!(
+) {
+    let kept = || {
+        installed_bin_dir(detection)
+            .map_or_else(|| "puzuz and puzuz-helper".to_owned(), Receipt::binaries_in)
+    };
+    let receipt =
+        match state {
+            ReceiptState::Valid(receipt) => receipt,
+            ReceiptState::Missing => {
+                if detection.has_service_install() {
+                    writeln!(
+                    out,
+                    "kept the binaries: {RECEIPT_PATH} is missing (installed by an older puzuz), \
+                     so what was copied is unknown; remove {} by hand unless something else \
+                     uses them",
+                    kept()
+                )
+                .ok();
+                }
+                return;
+            }
+            ReceiptState::Invalid(_) => {
+                writeln!(
                 out,
-                "kept the binaries: {RECEIPT_PATH} is missing (installed by an older puzuz), so \
-                 what was copied is unknown; remove {kept} by hand unless something else uses \
-                 them"
+                "kept the binaries and any Nix GC root, since {RECEIPT_PATH} cannot be used (see \
+                 the warning above); remove {} (and {GC_ROOT}, if present) by hand unless \
+                 something else uses them{}",
+                kept(),
+                if purge { "" } else { ", then delete the receipt" }
             )
             .ok();
-        }
-        return Ok(());
-    };
+                return;
+            }
+        };
     let removable = receipt.removable_copies();
     for path in receipt.copied.iter().filter(|p| !removable.contains(p)) {
         writeln!(
@@ -836,37 +729,46 @@ fn remove_binaries(
         )
         .ok();
     }
-    // The running binary may be one of them; unlinking it is fine.
-    for path in &removable {
-        let local = sys.path(path);
-        match std::fs::symlink_metadata(&local) {
-            Ok(meta) if !meta.is_dir() => {
-                std::fs::remove_file(&local)
-                    .map_err(io_err(format!("removing {}", path.display())))?;
-                writeln!(out, "removed {}", path.display()).ok();
-            }
-            _ => {}
-        }
-    }
+    let left = receipt::remove_copies(sys, &removable, "", out);
     if receipt.copied.is_empty() {
         writeln!(
             out,
-            "kept {} and {} (used in place, not copied by `puzuz service install`)",
-            receipt.bin_dir.join("puzuz").display(),
-            receipt.bin_dir.join("puzuz-helper").display()
+            "kept {} (used in place, not copied by `puzuz service install`)",
+            Receipt::binaries_in(&receipt.bin_dir).replace(' ', " and ")
         )
         .ok();
     }
     if let Some(root) = &receipt.gc_root {
-        remove_gc_root(sys, root, out);
+        gc_root::remove_gc_root(sys, root, out);
     }
-    match std::fs::remove_file(sys.path(Path::new(RECEIPT_PATH))) {
-        Err(err) if err.kind() != io::ErrorKind::NotFound => {
-            writeln!(out, "warning: removing {RECEIPT_PATH}: {err}").ok();
-        }
-        _ => {}
+    if left.is_empty() {
+        receipt::remove(sys, out);
+        return;
     }
-    Ok(())
+    let list = left
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if purge {
+        writeln!(out, "warning: could not remove {list}; remove them by hand").ok();
+        return;
+    }
+    let rest = Receipt {
+        copied: left,
+        gc_root: None,
+        gc_root_target: None,
+        ..receipt.clone()
+    };
+    match receipt::write(sys, &rest) {
+        Ok(()) => writeln!(
+            out,
+            "warning: could not remove {list}; kept {RECEIPT_PATH} listing them (re-run \
+             `sudo puzuz uninstall`, or remove them by hand)"
+        ),
+        Err(err) => writeln!(out, "warning: could not remove {list}; {err}"),
+    }
+    .ok();
 }
 
 /// `puzuz uninstall` (also `puzuz service uninstall`).
@@ -923,10 +825,7 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
     }
 
     // Read before anything is removed (and before --purge deletes it).
-    let receipt = receipt::read(sys).unwrap_or_else(|err| {
-        writeln!(out, "warning: {err}").ok();
-        None
-    });
+    let receipt = receipt::read_or_warn(sys, out);
 
     // Daemon first, then the helper (it would otherwise be restarted by Wants=).
     let units_present = [DAEMON_UNIT, HELPER_UNIT]
@@ -969,7 +868,7 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
         writeln!(out, "warning: {err}").ok();
     }
 
-    remove_binaries(sys, receipt.as_ref(), &method, out)?;
+    remove_binaries(sys, &receipt, &method, options.purge, out);
 
     if let Some(managed) = method.managed_elsewhere() {
         writeln!(
