@@ -849,6 +849,19 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Stdio;
 
+    /// Polls `cond` until it holds. The deadline only matters when it never
+    /// does: a loaded machine may take a while to schedule a child.
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn pinned(path: &Path, want: Want) -> Pinned {
         Pinned {
             what: "test".into(),
@@ -875,37 +888,33 @@ mod tests {
             eprintln!("skipped: needs an unprivileged user");
             return;
         }
-        // `sleep` never reaps the `true` its shell started.
-        // Its stdio and working directory are set here, not inherited from
-        // the test runner (whose terminal may be unreachable, e.g. a
-        // `/dev/pts/N` outside a Nix build sandbox).
+        // The job's init: a process that is just running. `spawn` returns
+        // once `sleep` has been exec'd. Its stdio and working directory are
+        // set here, not inherited from the test runner (whose terminal may
+        // be unreachable, e.g. a `/dev/pts/N` outside a Nix build sandbox).
         let tmp = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("true & exec sleep 30")
-            .current_dir(tmp.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let parent = child.id();
-        let mut zombie = None;
-        for _ in 0..200 {
-            zombie = crate::host::children_of(Path::new("/proc"), parent)
+        let spawn = |program: &str, args: &[&str]| {
+            std::process::Command::new(program)
+                .args(args)
+                .current_dir(tmp.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
                 .unwrap()
-                .into_iter()
-                .find(|p| {
-                    fs::read_to_string(format!("/proc/{p}/status")).is_ok_and(|s| is_dead(&s))
-                });
-            let execd = fs::read_link(format!("/proc/{parent}/exe"))
-                .is_ok_and(|e| e.to_string_lossy().contains("sleep"));
-            if zombie.is_some() && execd {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let zombie = zombie.expect("no zombie");
+        };
+        let mut child = spawn("sleep", &["30"]);
+        let parent = child.id();
+        // The zombie: a child of the test that exits and that the test does
+        // not reap until the end (`Child` only reaps in `wait`/`try_wait`).
+        // Its parent does not matter to the check, which is given the
+        // processes; a shell (`sh -c 'true & exec sleep 30'`) does not
+        // reliably leave one, as it may reap `true` before the `exec`.
+        let mut exited = spawn("true", &[]);
+        let zombie = exited.id();
+        wait_until("the child to become a zombie", || {
+            fs::read_to_string(format!("/proc/{zombie}/status")).is_ok_and(|s| is_dead(&s))
+        });
         // What made the check fail: a zombie has no mount namespace.
         assert!(fs::read_link(format!("/proc/{zombie}/ns/mnt")).is_err());
         let gid = nix::unistd::getegid().as_raw();
@@ -925,6 +934,7 @@ mod tests {
         assert_eq!(check_restored_procs(&req, &[parent, zombie]), Ok(vec![]));
         child.kill().unwrap();
         child.wait().unwrap();
+        assert!(exited.wait().unwrap().success());
     }
 
     #[test]
@@ -1079,16 +1089,11 @@ VmFlags: rd ex mr mw me
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        // Wait for the exec.
-        for _ in 0..100 {
-            if fs::read_link(format!("/proc/{}/fd/3", child.id())).is_ok()
+        wait_until("the shell to exec `sleep` with fd 3 open", || {
+            fs::read_link(format!("/proc/{}/fd/3", child.id())).is_ok()
                 && fs::read_link(format!("/proc/{}/exe", child.id()))
                     .is_ok_and(|e| e.to_string_lossy().contains("sleep"))
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        });
         let gid = nix::unistd::getegid().as_raw();
         let groups: Vec<u32> = nix::unistd::getgroups()
             .unwrap()
