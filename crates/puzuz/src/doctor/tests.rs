@@ -940,6 +940,61 @@ fn install_method_is_reported() {
 }
 
 #[test]
+fn rhel_sudo_secure_path_without_usr_local_bin_is_explained() {
+    let (sys, _sockets) = healthy();
+    sys.write(
+        "/etc/systemd/system/puzuz.service",
+        &marker_unit("/usr/local/bin"),
+    );
+    sys.write(
+        "/etc/os-release",
+        "NAME=\"Rocky Linux\"\nID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n",
+    );
+    // Not readable (doctor without root): nothing to report.
+    assert!(run(&sys, None).find("sudo PATH").is_none());
+
+    sys.write(
+        "/etc/sudoers",
+        "Defaults   !visiblepw\n\
+         Defaults    secure_path = /sbin:/bin:/usr/sbin:/usr/bin\n\
+         Defaults:alice secure_path=/usr/local/bin\n\
+         #includedir /etc/sudoers.d\n",
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "sudo PATH"), Level::Info);
+    assert!(
+        message(&report, "sudo PATH").contains("(in /etc/sudoers) does not include /usr/local/bin"),
+        "{}",
+        message(&report, "sudo PATH")
+    );
+    assert!(hint(&report, "sudo PATH").contains("sudo /usr/local/bin/puzuz"));
+
+    // A drop-in that adds it (sudoers.d files with a dot are ignored, as by sudo).
+    sys.write(
+        "/etc/sudoers.d/ignored.conf",
+        "Defaults secure_path=\"/usr/local/bin:/usr/bin\"\n",
+    );
+    assert!(run(&sys, None).find("sudo PATH").is_some());
+    sys.write(
+        "/etc/sudoers.d/path",
+        "Defaults env_reset, secure_path=\"/usr/local/sbin:/usr/local/bin:/usr/bin\"\n",
+    );
+    assert!(run(&sys, None).find("sudo PATH").is_none());
+
+    // Not RHEL, or not in /usr/local/bin: nothing to report.
+    std::fs::remove_file(sys.path(Path::new("/etc/sudoers.d/path"))).unwrap();
+    sys.write("/etc/os-release", "ID=ubuntu\nID_LIKE=debian\n");
+    assert!(run(&sys, None).find("sudo PATH").is_none());
+    sys.write("/etc/os-release", "ID=fedora\n");
+    assert!(run(&sys, None).find("sudo PATH").is_some());
+    sys.write(
+        "/etc/systemd/system/puzuz.service",
+        &marker_unit("/usr/bin"),
+    );
+    assert!(run(&sys, None).find("sudo PATH").is_none());
+}
+
+#[test]
 fn a_masked_or_overridden_package_does_not_fail() {
     let (sys, _sockets) = healthy();
     install_package(&sys);

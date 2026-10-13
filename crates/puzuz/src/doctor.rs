@@ -15,6 +15,8 @@ use crate::install_method::{self, Detection, InstallMethod, LocalUnit, Method};
 use crate::service::{ADMIN_GROUP, DAEMON_UNIT, HELPER_UNIT, TMPFILES_PATH, UNIT_DIR};
 use crate::system::{System, check_root_owned_chain, find_program, is_root_owned_and_protected};
 
+mod sudo_path;
+
 /// Oldest CRIU that works with the helper (restoring into systemd units, CUDA support).
 const MIN_CRIU: (u32, u32, u32) = (4, 2, 0);
 /// `Type=exec` in the units.
@@ -324,9 +326,10 @@ pub fn parse_show_exec_start(text: &str) -> Option<ExecStart> {
 /// Runs every check. `socket` overrides the daemon socket from the configuration.
 pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     let LoadedConfig { config, check } = load_config(sys);
-    // Detected once, for the install method and the update hint.
+    // Detected once, for the install method, sudo's PATH and the update hint.
     let detection = install_method::detect(sys);
     let mut checks = vec![check, check_install_method(&detection)];
+    checks.extend(sudo_path::check(sys, &detection));
     let api_socket = socket.map_or_else(|| config.api_socket.clone(), Path::to_owned);
     let daemon = sys.daemon_version(&api_socket);
 
