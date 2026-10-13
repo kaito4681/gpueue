@@ -10,6 +10,10 @@
 //!   `/lib/systemd/system` where that is not the same directory), which only a package writes,
 //! - `/etc/NIXOS`, and an `ExecStart=` below `/nix/store`.
 //!
+//! Next to a packaged unit, a marker-less `/etc/systemd/system/puzuz.service` is the
+//! administrator's override of it (`systemctl edit --full`), not a second installation, and a
+//! symlink to `/dev/null` there (`systemctl mask`) is never an installation.
+//!
 //! Extension point: once puzuz ships .deb/.rpm/AUR packages, [`package_manager`] asks
 //! `dpkg-query -S`, `rpm -qf` and `pacman -Qo` who owns the packaged unit, so that messages can
 //! name the exact update and removal commands.
@@ -33,13 +37,27 @@ pub enum Method {
     /// `puzuz service install`; the units run the binaries in `bin_dir` (when it can be read
     /// from the unit).
     ServiceInstall { bin_dir: Option<PathBuf> },
-    /// A distribution package: its unit file is at `unit`.
-    Package { unit: PathBuf },
+    /// A distribution package: its unit file is at `unit`, possibly masked or replaced by the
+    /// administrator in /etc/systemd/system (`local`).
+    Package {
+        unit: PathBuf,
+        local: Option<LocalUnit>,
+    },
     /// NixOS (`services.puzuz` module); its units point into /nix/store.
     NixOs,
     /// `/etc/systemd/system/puzuz.service` written by someone else (an administrator, or
     /// `service install` before the marker existed).
     Manual { unit: PathBuf },
+}
+
+/// What the administrator did to a packaged unit in /etc/systemd/system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalUnit {
+    /// `systemctl mask`: the unit is a symlink to /dev/null.
+    Masked(PathBuf),
+    /// `systemctl edit --full`, or a copy: a unit without the `service install` marker that
+    /// replaces the packaged one.
+    Overridden(PathBuf),
 }
 
 impl Method {
@@ -96,8 +114,16 @@ impl fmt::Display for Method {
                 write!(f, "puzuz service install (binaries in {})", dir.display())
             }
             Method::ServiceInstall { bin_dir: None } => f.write_str("puzuz service install"),
-            Method::Package { unit } => {
-                write!(f, "distribution package ({})", unit.display())
+            Method::Package { unit, local } => {
+                write!(f, "distribution package ({}", unit.display())?;
+                match local {
+                    None => {}
+                    Some(LocalUnit::Masked(etc)) => write!(f, "; masked by {}", etc.display())?,
+                    Some(LocalUnit::Overridden(etc)) => {
+                        write!(f, "; overridden by {}", etc.display())?
+                    }
+                }
+                f.write_str(")")
             }
             Method::NixOs => f.write_str("NixOS module"),
             Method::Manual { unit } => write!(
@@ -193,7 +219,15 @@ fn package_unit(sys: &dyn System) -> Option<PathBuf> {
 fn package_manager(_sys: &dyn System, unit: &Path) -> Method {
     Method::Package {
         unit: unit.to_owned(),
+        local: None,
     }
+}
+
+/// Whether the unit file is a symlink to /dev/null, i.e. masked with `systemctl mask`.
+fn is_masked(sys: &dyn System, unit: &Path) -> bool {
+    let local = sys.path(unit);
+    std::fs::symlink_metadata(&local).is_ok_and(|meta| meta.file_type().is_symlink())
+        && std::fs::read_link(&local).is_ok_and(|target| target == Path::new("/dev/null"))
 }
 
 /// Detects how puzuz is installed.
@@ -209,25 +243,48 @@ pub fn detect(sys: &dyn System) -> InstallMethod {
         add(Method::NixOs);
     }
 
+    let etc_unit = Path::new(UNIT_DIR).join(DAEMON_UNIT);
+    // Read through symlinks: NixOS links /etc/systemd/system into the store. A mask (a
+    // symlink to /dev/null) is no installation and is not read.
+    let masked = is_masked(sys, &etc_unit);
+    let etc_text = if masked {
+        None
+    } else {
+        std::fs::read_to_string(sys.path(&etc_unit)).ok()
+    };
+    // A unit in /etc that neither `service install` nor NixOS wrote.
+    let foreign_etc_unit = etc_text
+        .as_deref()
+        .is_some_and(|text| !text.starts_with(MARKER) && !runs_from_nix_store(text));
+    let mut package_found = false;
+
     if let Some(unit) = package_unit(sys) {
         let text = std::fs::read_to_string(sys.path(&unit)).unwrap_or_default();
         if runs_from_nix_store(&text) {
             add(Method::NixOs);
         } else {
-            add(package_manager(sys, &unit));
+            package_found = true;
+            let mut method = package_manager(sys, &unit);
+            if let Method::Package { local, .. } = &mut method {
+                if masked {
+                    *local = Some(LocalUnit::Masked(etc_unit.clone()));
+                } else if foreign_etc_unit {
+                    // The administrator's replacement of the packaged unit.
+                    *local = Some(LocalUnit::Overridden(etc_unit.clone()));
+                }
+            }
+            add(method);
         }
     }
 
-    let etc_unit = Path::new(UNIT_DIR).join(DAEMON_UNIT);
-    // Read through symlinks: NixOS links /etc/systemd/system into the store.
-    if let Ok(text) = std::fs::read_to_string(sys.path(&etc_unit)) {
+    if let Some(text) = etc_text {
         if text.starts_with(MARKER) {
             add(Method::ServiceInstall {
                 bin_dir: exec_start_binary(&text).and_then(|exe| exe.parent().map(Path::to_owned)),
             });
         } else if runs_from_nix_store(&text) {
             add(Method::NixOs);
-        } else {
+        } else if !package_found {
             add(Method::Manual { unit: etc_unit });
         }
     }

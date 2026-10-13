@@ -824,6 +824,37 @@ fn install_refuses_a_package_managed_machine_even_with_force() {
 }
 
 #[test]
+fn install_refuses_a_masked_or_overridden_package_even_with_force() {
+    for masked in [true, false] {
+        let sys = system();
+        sys.write(
+            PACKAGED_UNIT,
+            "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+        );
+        if masked {
+            let local = sys.path(Path::new("/etc/systemd/system/puzuz.service"));
+            std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("/dev/null", local).unwrap();
+        } else {
+            sys.write(
+                "/etc/systemd/system/puzuz.service",
+                "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+            );
+        }
+        for force in [false, true] {
+            let options = InstallOptions { force, ..opts() };
+            let err = run_install(&sys, &options).unwrap_err();
+            assert!(err.contains("distribution package"), "{err}");
+            assert!(err.contains("--force does not change this"), "{err}");
+            assert!(!err.contains("mixed"), "{err}");
+        }
+        let err = run_uninstall(&sys, false, true).unwrap_err();
+        assert!(err.contains("not by `puzuz service install`"), "{err}");
+        assert!(sys.commands().is_empty());
+    }
+}
+
+#[test]
 fn install_refuses_nixos() {
     let sys = system();
     sys.write("/etc/NIXOS", "");

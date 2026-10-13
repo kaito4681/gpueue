@@ -19,7 +19,21 @@ fn service_install(bin_dir: &str) -> Method {
 fn package(unit: &str) -> Method {
     Method::Package {
         unit: PathBuf::from(unit),
+        local: None,
     }
+}
+
+fn package_with(unit: &str, local: LocalUnit) -> Method {
+    Method::Package {
+        unit: PathBuf::from(unit),
+        local: Some(local),
+    }
+}
+
+fn mask(sys: &FakeSystem, unit: &str) {
+    let local = sys.path(Path::new(unit));
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/dev/null", local).unwrap();
 }
 
 #[test]
@@ -145,6 +159,64 @@ fn service_install_on_nixos_is_mixed() {
         detect(&sys),
         InstallMethod::Mixed(vec![Method::NixOs, service_install("/usr/local/bin")])
     );
+}
+
+#[test]
+fn a_masked_package_unit_is_still_the_package() {
+    let sys = FakeSystem::new();
+    sys.write(LIB_UNIT, "[Service]\nExecStart=/usr/bin/puzuz daemon\n");
+    mask(&sys, ETC_UNIT);
+    let method = detect(&sys);
+    assert_eq!(
+        method,
+        InstallMethod::One(package_with(
+            LIB_UNIT,
+            LocalUnit::Masked(PathBuf::from(ETC_UNIT))
+        ))
+    );
+    assert_eq!(method.keyword(), "package");
+    assert!(method.managed_elsewhere().is_some());
+    assert_eq!(
+        method.to_string(),
+        "distribution package (/usr/lib/systemd/system/puzuz.service; masked by \
+         /etc/systemd/system/puzuz.service)"
+    );
+}
+
+#[test]
+fn an_overridden_package_unit_is_still_the_package() {
+    let sys = FakeSystem::new();
+    sys.write(LIB_UNIT, "[Service]\nExecStart=/usr/bin/puzuz daemon\n");
+    // `systemctl edit --full`: a marker-less copy in /etc.
+    sys.write(
+        ETC_UNIT,
+        "[Service]\nExecStart=/usr/bin/puzuz daemon --verbose\n",
+    );
+    let method = detect(&sys);
+    assert_eq!(
+        method,
+        InstallMethod::One(package_with(
+            LIB_UNIT,
+            LocalUnit::Overridden(PathBuf::from(ETC_UNIT))
+        ))
+    );
+    assert_eq!(method.keyword(), "package");
+    assert_eq!(
+        method.to_string(),
+        "distribution package (/usr/lib/systemd/system/puzuz.service; overridden by \
+         /etc/systemd/system/puzuz.service)"
+    );
+}
+
+#[test]
+fn a_mask_alone_is_not_an_installation() {
+    let sys = FakeSystem::new();
+    mask(&sys, ETC_UNIT);
+    assert_eq!(detect(&sys), InstallMethod::None);
+
+    // Nor next to NixOS.
+    sys.write("/etc/NIXOS", "");
+    assert_eq!(detect(&sys), InstallMethod::One(Method::NixOs));
 }
 
 #[test]

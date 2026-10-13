@@ -920,6 +920,34 @@ fn install_method_is_reported() {
 }
 
 #[test]
+fn a_masked_or_overridden_package_does_not_fail() {
+    let (sys, _sockets) = healthy();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.write(
+        "/etc/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "install method"), Level::Ok);
+    assert!(
+        message(&report, "install method").contains("overridden by"),
+        "{}",
+        message(&report, "install method")
+    );
+
+    let etc = sys.path(Path::new("/etc/systemd/system/puzuz.service"));
+    std::fs::remove_file(&etc).unwrap();
+    std::os::unix::fs::symlink("/dev/null", &etc).unwrap();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "install method"), Level::Info);
+    assert!(message(&report, "install method").contains("masked by"));
+    assert!(hint(&report, "install method").contains("systemctl unmask"));
+}
+
+#[test]
 fn mixed_install_methods_fail() {
     let (sys, _sockets) = healthy();
     sys.write(

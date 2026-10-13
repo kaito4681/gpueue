@@ -11,7 +11,7 @@ use puzuz_checkpoint::probe::{Version, parse_criu_version, parse_cuda_checkpoint
 use puzuz_daemon::config::{Config, CudaCheckpointMode, DEFAULT_CONFIG_PATH, GpuDetection};
 use puzuz_protocol::api::{CheckpointStorage, GpuDetectionStatus, GpuSource, VersionResponse};
 
-use crate::install_method::{self, InstallMethod, Method};
+use crate::install_method::{self, InstallMethod, LocalUnit, Method};
 use crate::service::{ADMIN_GROUP, DAEMON_UNIT, HELPER_UNIT, TMPFILES_PATH, UNIT_DIR};
 use crate::system::{System, check_root_owned_chain, find_program, is_root_owned_and_protected};
 
@@ -382,6 +382,13 @@ fn check_install_method(sys: &dyn System) -> Check {
                 unit.display()
             ))
         }
+        InstallMethod::One(Method::Package {
+            local: Some(LocalUnit::Masked(_)),
+            ..
+        }) => Check::info(NAME, method.to_string()).hint(format!(
+            "`sudo systemctl unmask {}` lets the packaged unit run again",
+            crate::service::DAEMON_UNIT
+        )),
         InstallMethod::One(_) => Check::ok(NAME, method.to_string()),
         InstallMethod::Mixed(methods) => {
             let fixes: Vec<String> = methods

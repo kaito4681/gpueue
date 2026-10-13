@@ -158,7 +158,12 @@ the units with drop-ins (`sudo systemctl edit puzuz-helper.service`). Edits to t
 | `puzuz service install` | `/etc/systemd/system/puzuz.service` starting with the install marker line |
 | distribution package | `/usr/lib/systemd/system/puzuz.service` (or `/lib/systemd/system/...`) |
 | NixOS | `/etc/NIXOS`, or a unit whose `ExecStart=` is below `/nix/store` |
-| by hand | `/etc/systemd/system/puzuz.service` without the marker |
+| by hand | `/etc/systemd/system/puzuz.service` without the marker, and no packaged unit |
+
+Next to a packaged unit, a `/etc/systemd/system/puzuz.service` without the marker is the
+administrator's replacement of it (`systemctl edit --full puzuz`), and a symlink to `/dev/null`
+there is a mask (`systemctl mask puzuz`). Neither is a second install method: puzuz reports the
+package as "overridden" or "masked". A mask without a package is ignored.
 
 `puzuz service install` refuses to run on a machine where puzuz comes from a package or from
 NixOS, even with `--force`, and names the package manager's way to update it instead.
