@@ -3,14 +3,14 @@
 # Built by scripts/dist/build-package.sh, which lays out a staging directory
 # (bin/, completions/ and copies of packaging/, docs/, README.md and LICENSE)
 # and runs nfpm in it, so every `src:` below is relative to that directory.
-# It sets PUZUZ_PKG_ARCH (nfpm's GOARCH-style name: amd64 or arm64) and
-# PUZUZ_PKG_VERSION (the workspace version; a pre-release such as 0.2.0-rc.1
-# becomes 0.2.0~rc.1 in the .deb).
+# It sets PUZUZ_PKG_ARCH (nfpm's GOARCH-style name: amd64 or arm64; nfpm
+# writes x86_64 / aarch64 into an .rpm) and PUZUZ_PKG_VERSION (the workspace
+# version; a pre-release such as 0.2.0-rc.1 becomes 0.2.0~rc.1 inside both
+# the .deb and the .rpm, so that it sorts before 0.2.0).
 #
-# Shared by every package format: the .deb now, the .rpm later. Bits that only
-# make sense for one format are marked `packager: deb` (contents) or live
-# under `overrides.deb` / the `deb:` section; an .rpm adds its own the same
-# way.
+# Shared by the .deb and the .rpm. Bits that only make sense for one format
+# are marked `packager: deb` / `packager: rpm` (contents) or live under
+# `overrides.<format>` / the `rpm:` section.
 name: puzuz
 arch: ${PUZUZ_PKG_ARCH}
 platform: linux
@@ -75,6 +75,10 @@ contents:
     dst: /usr/share/zsh/vendor-completions/_puzuz
     packager: deb
     file_info: { mode: 0644 }
+  - src: completions/_puzuz
+    dst: /usr/share/zsh/site-functions/_puzuz
+    packager: rpm
+    file_info: { mode: 0644 }
 
   # Documentation.
   - src: README.md
@@ -90,10 +94,18 @@ contents:
     dst: /usr/share/doc/puzuz/copyright
     packager: deb
     file_info: { mode: 0644 }
+  - src: LICENSE
+    dst: /usr/share/licenses/puzuz/LICENSE
+    type: license
+    packager: rpm
+    file_info: { mode: 0644 }
 
   # The APT repository (a flat repository in the GitHub release "apt") and
   # the key its index is signed with, so that installing one .deb by hand is
-  # enough to get later versions from `apt upgrade`.
+  # enough to get later versions from `apt upgrade`. The .rpm ships no
+  # .repo file (and no key) until a dnf repository exists (issue #23): with
+  # dnf's default skip_if_unavailable=False, a configured repository that
+  # cannot be fetched makes every dnf command fail.
   - src: packaging/apt/puzuz.sources
     dst: /etc/apt/sources.list.d/puzuz.sources
     type: config|noreplace
@@ -127,3 +139,24 @@ overrides:
       - systemd (>= 240)
     recommends:
       - criu
+  rpm:
+    depends:
+      # nfpm does not generate rpm's automatic library dependencies either:
+      # the same baseline as the .deb (libgcc_s.so.1 is in libgcc).
+      - glibc >= 2.34
+      - libgcc
+      - systemd
+    # A weak dependency (dnf installs it by default when available). Rocky 9
+    # ships CRIU 3.19, older than what checkpointing needs; doctor says so.
+    recommends:
+      - criu
+
+rpm:
+  group: System Environment/Daemons
+  summary: Multi-user GPU job queue with checkpoint/restore
+  # Optional signature of the .rpm itself (rpm -K): build-package.sh sets
+  # PUZUZ_RPM_SIGNING_KEY to an ASCII-armored GPG secret key file (and
+  # NFPM_RPM_PASSPHRASE to its passphrase) when one is available; empty
+  # means unsigned. Every release asset is signed with minisign anyway.
+  signature:
+    key_file: ${PUZUZ_RPM_SIGNING_KEY}
