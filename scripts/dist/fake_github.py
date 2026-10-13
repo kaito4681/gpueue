@@ -51,6 +51,14 @@ def find_asset(asset_id):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Speak HTTP/1.1 with persistent connections, like GitHub. With the default HTTP/1.0 the
+    # server closes the connection after every response but does not say so with
+    # `Connection: close`; a client that pools the connection (ureq does, as the response has
+    # a Content-Length) then sends the next request, e.g. the one following the 302 of an
+    # asset download, on a socket the server is closing, and fails with "Peer disconnected".
+    # Every response below carries a Content-Length, as HTTP/1.1 keep-alive requires.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):  # quiet; see requests.log
         pass
 

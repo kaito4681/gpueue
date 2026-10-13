@@ -50,7 +50,7 @@ step "installing next to \`puzuz service install\` is refused"
 mkdir -p /etc/systemd/system
 printf '%s\n[Service]\nExecStart=/usr/local/bin/puzuz daemon\n' "$MARKER" >/etc/systemd/system/puzuz.service
 if dpkg -i "$deb" >/tmp/refused 2>&1; then fail "installed next to service install"; fi
-grep -q 'puzuz service uninstall' /tmp/refused || { cat /tmp/refused; fail "no hint"; }
+grep -q 'sudo puzuz uninstall' /tmp/refused || { cat /tmp/refused; fail "no hint"; }
 rm -f /etc/systemd/system/puzuz.service
 dpkg -r puzuz >/dev/null 2>&1 || true
 

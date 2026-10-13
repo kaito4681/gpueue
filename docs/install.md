@@ -73,8 +73,8 @@ paths like `/run/current-system/sw/bin/criu` on NixOS work.
 `scripts/install.sh` is the usual way to install puzuz on x86_64 and aarch64 Linux (on Debian and
 Ubuntu, the [package](#installing-the-debianubuntu-package) is an alternative). It is attached to every
 release. It downloads a release tarball, checks it, and runs that release's
-`puzuz service install --bin-dir /usr/local/bin` (see [Installing](#installing) for what that
-does).
+`puzuz service install`, which copies the binaries into `/usr/local/bin` (see
+[Installing](#installing) for what that does).
 
 ### GitHub token (optional)
 
@@ -104,10 +104,10 @@ Options go after `bash -s --` when the script comes from a pipe (for example
 | Option | Meaning |
 | --- | --- |
 | `--version X` | install version X instead of the latest release |
-| `--bin-dir DIR` | where to put `puzuz` and `puzuz-helper` (default: the directory of the current `service install` installation, else `/usr/local/bin`) |
+| `--bin-dir DIR` | install somewhere else than the default (the current installation's directory, else `/usr/local/bin`) |
 | `--token-file FILE` | read the token from FILE |
 | `--save-token` | save the token to `/etc/puzuz/github-token` (root, 0600) for `puzuz update` and later runs |
-| `--uninstall` | remove puzuz (see [Uninstalling](#uninstalling)) |
+| `--uninstall` | remove puzuz with the installed `puzuz uninstall` (see [Uninstalling](#uninstalling)) |
 | `--purge` | with `--uninstall`, also delete `/etc/puzuz` and `/var/lib/puzuz` |
 | `-y`, `--yes` | do not ask before purging |
 
@@ -130,8 +130,9 @@ binary decides the rest before it installs anything. It then:
    into the script (`packaging/minisign.pub`). Without `minisign` it says that the signature was
    not checked,
 4. extracts the tarball (refusing links and paths outside it), runs the new
-   `puzuz service install --bin-dir <DIR>` (`--bin-dir`, else the directory the installed units
-   run puzuz from, else `/usr/local/bin`), and prints its `puzuz doctor` report,
+   `puzuz service install` (which keeps the directory of the current installation, else uses
+   `/usr/local/bin`; `--bin-dir` is passed on only if you gave it), and prints its
+   `puzuz doctor` report,
 5. prints how to install CRIU and cuda-checkpoint if they are missing. It never installs them.
 
 If only some `puzuz doctor` checks fail (for example CRIU is missing) but the services run,
@@ -211,8 +212,8 @@ checkpoints need it, and `puzuz doctor` reports a missing or old CRIU. cuda-chec
 jobs is installed by hand as described in [cuda-checkpoint](#cuda-checkpoint).
 
 The package refuses to install on a machine where `puzuz service install` (or `install.sh`)
-installed puzuz: remove that first with `sudo puzuz service uninstall` (or
-`install.sh --uninstall`). Running jobs, `/etc/puzuz` and `/var/lib/puzuz` are kept. `puzuz doctor`
+installed puzuz: remove that first with `sudo puzuz uninstall` (with an older puzuz that lacks
+the command, `install.sh --uninstall`). Running jobs, `/etc/puzuz` and `/var/lib/puzuz` are kept. `puzuz doctor`
 and `puzuz service install-method` report the package's installation as a distribution
 `package`, and `puzuz service install`, `install.sh` and `puzuz update` refuse to touch it.
 
@@ -417,22 +418,44 @@ it. `install.sh` installs them (see above). By hand:
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 tar xzf puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-sudo puzuz-v0.1.0-x86_64-unknown-linux-gnu/puzuz service install --bin-dir /usr/local/bin
+sudo puzuz-v0.1.0-x86_64-unknown-linux-gnu/puzuz service install
 ```
 
 ## Installing
 
 ```sh
-sudo target/release/puzuz service install --bin-dir /usr/local/bin
+sudo target/release/puzuz service install
 ```
 
-The units run the binaries from the directory the `puzuz` binary is in, but only if that is
-`/usr/bin` or `/usr/local/bin`. Otherwise pass `--bin-dir <DIR>` to copy `puzuz` and
-`puzuz-helper` there. `puzuz-helper` must sit next to `puzuz`. Because `puzuz-helper` runs as
-root, the directory and every parent must be owned by root and not group- or world-writable
-(directories that do not exist yet are created with mode 0755); install refuses anything else.
-`--no-start` enables the services without starting or restarting them. `--force` overwrites unit,
-sysusers.d and tmpfiles.d files that `puzuz service install` did not write (see step 2).
+`puzuz-helper` must sit next to `puzuz`. The units run the binaries from:
+
+1. the directory of the current `service install` installation, when re-installing or updating,
+2. else the directory the `puzuz` binary is in, if that is `/usr/bin` or `/usr/local/bin`
+   (used in place, nothing is copied),
+3. else `/usr/local/bin`, where `puzuz` and `puzuz-helper` are copied (it says so). That is the
+   usual place for software the administrator installs: package managers leave it alone, and it
+   is in systemd's and every user's default `PATH`.
+
+`--bin-dir DIR` installs somewhere else. Because `puzuz-helper` runs as root, the directory and
+every parent must be owned by root and not group- or world-writable (directories that do not
+exist yet are created with mode 0755); install refuses anything else. `--no-start` enables the
+services without starting or restarting them. `--force` overwrites unit, sysusers.d and
+tmpfiles.d files that `puzuz service install` did not write (see step 2).
+
+On RHEL, CentOS, Rocky, Alma and Fedora, sudo's `secure_path` does not include `/usr/local/bin`,
+so `sudo puzuz ...` says "command not found". Run `sudo /usr/local/bin/puzuz ...`, or add
+`/usr/local/bin` to `secure_path` with `sudo visudo`; `puzuz doctor` (run as root) points this
+out. Scripts with a minimal `PATH` (such as cron's `/usr/bin:/bin`) need the full path too.
+
+Built with Nix outside NixOS (`nix build`, then `sudo ./result/bin/puzuz service install`), the
+binaries are copied to `/usr/local/bin` like any other build. They still load their libraries
+from the Nix store, so install also registers the store path as a garbage-collector root,
+`/nix/var/nix/gcroots/puzuz` (with `nix-store --add-root /nix/var/nix/gcroots/puzuz --realise
+<store path>`). If `nix-store` is not found or fails, install warns and prints that command, and
+a root recorded earlier is kept. Whether the root is still needed is decided from the installed
+binaries themselves (their dynamic loader is in `/nix/store`), so moving a Nix-built copy with
+`--bin-dir` keeps it. `puzuz uninstall` removes the root, and so does installing binaries that
+do not use the store (for example `puzuz update`).
 
 `puzuz service install` exits non-zero when the final `puzuz doctor` report has a FAIL. After
 `--no-start`, the failures that only mean "not running yet" (both units, both sockets, the
@@ -441,8 +464,14 @@ daemon and the helper connection) are ignored.
 `puzuz service install` is safe to run again (for example after an upgrade). It does the
 following:
 
-1. Copies `puzuz` and `puzuz-helper` into `--bin-dir`, if given (mode 0755, replaced
-   atomically).
+1. Copies `puzuz` and `puzuz-helper` into the directory chosen above unless they are already
+   there (mode 0755, replaced atomically), registers the Nix GC root if they come from the
+   store, and writes `/var/lib/puzuz/install-receipt` (root, 0644). The receipt records the
+   directory, the binaries it copied (none when they are used in place), the version and the GC
+   root, so that `puzuz uninstall` removes exactly those. A re-install into another directory
+   (with `--bin-dir`) removes the copies the previous one made. If the receipt exists but cannot
+   be used (not owned by root, writable by others, or not valid), install stops without
+   changing anything: fix the file, or delete it after checking what it lists.
 2. Writes these files from the packaging templates built into the binary. Each file starts with
    an "Installed by `puzuz service install`" marker line and is overwritten on the next install.
    If one of them exists without the marker (written by an administrator or a package), install
@@ -512,7 +541,7 @@ never decides the install method (the same distribution can have puzuz from a pa
 What each command does (the hidden `puzuz service install-method` prints the keyword, for
 `install.sh`):
 
-| Install method | `service install` | `service uninstall` | `update` | `doctor` | keyword |
+| Install method | `service install` | `uninstall` | `update` | `doctor` | keyword |
 | --- | --- | --- | --- | --- | --- |
 | not installed | installs | says so | refuses: use `install.sh` | INFO | `none` |
 | not installed, NixOS | refuses: use the `services.puzuz` module | says so | refuses: use the module | INFO "not installed (NixOS: use the services.puzuz module)" | `none` |
@@ -544,7 +573,7 @@ The refusals name the way to update or remove puzuz that fits the install method
 | package of unknown origin | your package manager (named after `ID`/`ID_LIKE` when known) | the same |
 | Nix on NixOS | `nix flake update && sudo nixos-rebuild switch` | `services.puzuz.enable = false`, then `sudo nixos-rebuild switch` |
 | Nix elsewhere | the Nix configuration that created the unit | the same |
-| `puzuz service install` | `sudo puzuz update` | `sudo puzuz service uninstall` |
+| `puzuz service install` | `sudo puzuz update` | `sudo puzuz uninstall` |
 
 The daemon runs with `ProtectSystem=strict`: it can only write below the unit's
 `ReadWritePaths=/var/lib/puzuz/daemon /var/lib/puzuz/logs /run/puzuz`. If you move `data_dir`,
@@ -948,7 +977,7 @@ and its "update" line says when a newer release exists):
 | `install.sh` (or `puzuz service install` of a release) | `sudo puzuz update` |
 | the `.deb` | `sudo apt update && sudo apt upgrade` (or install a newer `.deb` from a release with `sudo apt install ./puzuz_<new version>_<arch>.deb`) |
 | the `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>` (no dnf repository yet) |
-| built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install --bin-dir /usr/local/bin` |
+| built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install` |
 | another distribution package or Nix (later) | the package manager or Nix (see [Install method](#install-method)); `puzuz update` refuses and names the command |
 
 ### puzuz update
@@ -975,7 +1004,8 @@ rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or
 5. extracts the tarball (regular files and directories only) and asks the new `puzuz` which
    database schema it supports. A release that cannot open the daemon's database (an older one,
    from before a schema change) is refused before anything changes,
-6. runs the new `puzuz service install --bin-dir <the installed directory>`, waits until the
+6. runs the new `puzuz service install` for the installed directory, removes the Nix GC root of
+   a Nix-built installation (the release's binaries do not need the store), waits until the
    daemon runs the new version and is connected to the helper, and deletes the download.
 
 `install.sh` (run again, optionally with `--version`) works too and does the same, except that it
@@ -1011,27 +1041,32 @@ For the `.deb`, use `sudo apt remove puzuz` or `sudo apt purge puzuz` (see
 made by `install.sh` or `puzuz service install`:
 
 ```sh
-sudo puzuz service uninstall            # stop, disable and remove the units and snippets
-sudo puzuz service uninstall --purge    # also delete /etc/puzuz, /var/lib/puzuz, /run/puzuz, /run/puzuz-helper
+sudo puzuz uninstall            # stop, disable and remove the units, snippets and copied binaries
+sudo puzuz uninstall --purge    # also delete /etc/puzuz, /var/lib/puzuz, /run/puzuz, /run/puzuz-helper
 ```
 
-`install.sh --uninstall [--purge] [--yes]` runs the same command and then also deletes the
-`puzuz` and `puzuz-helper` binaries from the directory the units ran them from:
-
-```sh
-curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash -s -- --uninstall
-```
-
-`--purge` asks for confirmation on the terminal. When there is no terminal, pass `--yes`.
+`puzuz service uninstall` is the same command, and `install.sh --uninstall [--purge] [--yes]`
+runs it. `--purge` asks for confirmation on the terminal. When there is no terminal, pass
+`--yes`.
 
 - Only files that start with the install marker are removed. Others are reported and kept.
+- The binaries are removed only if `/var/lib/puzuz/install-receipt` lists them as copied by
+  `puzuz service install` (only `puzuz` and `puzuz-helper` in the recorded directory). Binaries
+  that were used in place, for example in `/usr/bin`, are kept. An installation made before the
+  receipt existed keeps its binaries, and `uninstall` prints which to remove by hand; so does an
+  unusable receipt. A listed binary that a package owns by now (asked of dpkg, rpm and pacman)
+  is kept, and so is one whose owner a package manager could not tell. The Nix GC root and the
+  receipt are removed as well; if a binary could not be removed, the receipt is kept listing it
+  (re-run `sudo puzuz uninstall` later).
+- `install.sh --uninstall` with an installed `puzuz` older than `puzuz uninstall` runs its
+  `service uninstall` and then deletes `puzuz` and `puzuz-helper` from the units' directory.
 - Running jobs keep running in their own units. `uninstall` warns about them, and `--purge`
   refuses to run while any `puzuz-job-*` unit is active. Stop them first with
   `sudo systemctl stop 'puzuz-job-*'`, or checkpoint/kill them before uninstalling.
 - `--purge` asks for confirmation (`-y/--yes` skips it). It does not descend into mount points
   (for example the bind mount of `/` below `/run/puzuz-helper`). Those are reported for you to
   unmount and delete by hand.
-- The system user `puzuz`, the group `puzuz-admin` and the binaries are always kept.
+- The system user `puzuz` and the group `puzuz-admin` are always kept.
 
 ## Troubleshooting
 
@@ -1069,10 +1104,11 @@ stopped until `sudo systemctl start puzuz` or the next boot.
 | `gpus` | nvidia-smi lists N GPU(s), the configuration M | update `[[gpus]]` (see [GPU detection](#gpu-detection)) |
 | `kernel` | lacks `/proc/sys/kernel/ns_last_pid` | use a kernel with `CONFIG_CHECKPOINT_RESTORE=y` |
 | `update` | puzuz X is available (INFO) | `sudo puzuz update`; `update_check = false` turns the check off |
-| `install method` | mixed: two install methods at once | remove all but one, as the `fix:` lines say (e.g. `sudo puzuz service uninstall` to keep the package) |
+| `install method` | mixed: two install methods at once | remove all but one, as the `fix:` lines say (e.g. `sudo puzuz uninstall` to keep the package) |
 | `install method` | WARN: a unit no package owns, a leftover unit, or units installed in different ways | delete the unowned `/usr/lib` unit (`sudo rm ...`), or re-run the installation that should own both units, as the `fix:` line says |
 | `puzuz.service`, `puzuz-helper.service` | not installed / not active | `sudo puzuz service install`, or `sudo systemctl start <unit>` and read `journalctl -u <unit>` |
-| `helper binary` | the binary or a directory above it is not owned by root or is writable by others | `sudo chown root:root <path>; sudo chmod 755 <path>` (and its directories), or reinstall with `--bin-dir /usr/local/bin` |
+| `helper binary` | the binary or a directory above it is not owned by root or is writable by others | `sudo chown root:root <path>; sudo chmod 755 <path>` (and its directories), or reinstall into another directory |
+| `sudo PATH` | sudo's secure_path does not include /usr/local/bin (INFO, RHEL family) | `sudo /usr/local/bin/puzuz ...`, or add `/usr/local/bin` to `secure_path` with `sudo visudo` |
 | `daemon write paths` | cannot write to a configured directory: not below its ReadWritePaths= | add a `ReadWritePaths=` drop-in for `puzuz.service` (see [Installing](#installing)) |
 | `helper` | the daemon is not connected to the helper | `journalctl -u puzuz-helper`. Often an ownership problem with the configuration or a data directory. |
 | `daemon` | runs version X while this puzuz is Y | `sudo systemctl restart puzuz-helper.service puzuz.service` after upgrading, or update the CLI |

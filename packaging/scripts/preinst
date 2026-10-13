@@ -17,8 +17,8 @@ install | 1)
         if [ -f "$unit" ] && [ "$(head -n 1 "$unit")" = "$MARKER" ]; then
             echo "puzuz is already installed with \`puzuz service install\` (install.sh) ($unit)." >&2
             echo "Remove that installation first (running jobs, /etc/puzuz and /var/lib/puzuz are kept):" >&2
-            echo "  sudo puzuz service uninstall, and delete the puzuz and puzuz-helper it ran" >&2
-            echo "  (or: sudo bash install.sh --uninstall), then install this package again." >&2
+            echo "  sudo puzuz uninstall   (a puzuz without that command: sudo bash install.sh --uninstall)" >&2
+            echo "then install this package again." >&2
             exit 1
         fi
     done

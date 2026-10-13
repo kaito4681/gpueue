@@ -60,7 +60,7 @@ step "installing next to \`puzuz service install\` is refused"
 mkdir -p /etc/systemd/system
 printf '%s\n[Service]\nExecStart=/usr/local/bin/puzuz daemon\n' "$MARKER" >/etc/systemd/system/puzuz.service
 if rpm -i --nodeps "$old" >/tmp/refused 2>&1; then fail "installed next to service install"; fi
-grep -q 'puzuz service uninstall' /tmp/refused || { cat /tmp/refused; fail "no hint"; }
+grep -q 'sudo puzuz uninstall' /tmp/refused || { cat /tmp/refused; fail "no hint"; }
 rpm -q puzuz >/dev/null 2>&1 && fail "installed after a failed %pre"
 rm -f /etc/systemd/system/puzuz.service
 
