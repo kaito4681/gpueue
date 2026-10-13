@@ -248,6 +248,17 @@ sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
 sudo apt update && sudo apt install puzuz
 ```
 
+**The repository key.** The packages, the repository and the `.rpm` files are signed with one
+GPG key (`packaging/apt/puzuz-archive-keyring.gpg` in the source tree), fingerprint
+`E539 7032 5A39 7378 537B C776 20B6 B72F 9F55 85C2`. To check a downloaded key before trusting it:
+
+```console
+$ gpg --show-keys /etc/apt/keyrings/puzuz.gpg
+pub   rsa4096 2026-10-13 [SC]
+      E53970325A397378537BC77620B6B72F9F5585C2
+uid                      puzuz APT repository <https://github.com/kaito4681/puzuz>
+```
+
 **Removing.**
 
 ```sh
@@ -295,9 +306,12 @@ release. Or run the local test, `scripts/apt-repo-test.sh` (`PUZUZ_APT_BASES="de
 ubuntu:22.04 ubuntu:24.04 ubuntu:26.04"`), which builds a repository with
 `apt-repo.sh update DIR DEB...` and a throwaway key and upgrades through it in containers.
 
-**The archive key.** `packaging/apt/puzuz-archive-keyring.gpg` is a test key until the real one
-is created (its user ID says "TEST KEY"; `release.yml` and `apt-repo.sh` refuse it). To create
-the real key once:
+**The archive key.** `packaging/apt/puzuz-archive-keyring.gpg` is the real key, fingerprint
+`E539 7032 5A39 7378 537B C776 20B6 B72F 9F55 85C2` (see "The repository key" in
+[Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)); its secret key and
+passphrase are the repository secrets `APT_GPG_PRIVATE_KEY` and `APT_GPG_PASSPHRASE`.
+`release.yml` and `apt-repo.sh` refuse a keyring whose user ID says "TEST KEY" (written by
+`scripts/dist/gen-apt-key.sh --test`). A key is created with:
 
 ```sh
 scripts/dist/gen-apt-key.sh     # asks for a passphrase; writes the secret key under ~
@@ -363,7 +377,9 @@ new enough, the 3.19 of RHEL/Rocky/Alma 9 is not, so checkpointing there needs a
 sign the `.rpm` itself, and attach that key as `RPM-GPG-KEY-puzuz` (the APT repository's key):
 
 ```sh
-sudo rpm --import https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz
+gpg --show-keys RPM-GPG-KEY-puzuz                   # E53970325A397378537BC77620B6B72F9F5585C2
+sudo rpm --import RPM-GPG-KEY-puzuz
 rpm -K puzuz-0.1.0-1.x86_64.rpm                     # "digests signatures OK"
 # or let dnf refuse an unsigned or badly signed file:
 sudo dnf install --setopt=localpkg_gpgcheck=1 ./puzuz-0.1.0-1.x86_64.rpm
