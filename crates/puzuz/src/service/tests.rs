@@ -574,6 +574,42 @@ fn bin_dir_installs_copies() {
 }
 
 #[test]
+fn an_identical_binary_behind_a_symlink_is_replaced() {
+    let mut sys = FakeSystem::new();
+    sys.exe = PathBuf::from("/home/u/target/release/puzuz");
+    sys.write_exe("/home/u/target/release/puzuz", "new puzuz");
+    sys.write_exe("/home/u/target/release/puzuz-helper", "new helper");
+    sys.mkdir("/usr/local/bin");
+    // Same contents, but the user can change what root's helper runs.
+    std::os::unix::fs::symlink(
+        sys.path(Path::new("/home/u/target/release/puzuz-helper")),
+        sys.path(Path::new("/usr/local/bin/puzuz-helper")),
+    )
+    .unwrap();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(
+        out.contains("installed /usr/local/bin/puzuz-helper"),
+        "{out}"
+    );
+    let meta = std::fs::symlink_metadata(sys.path(Path::new("/usr/local/bin/puzuz-helper")))
+        .unwrap();
+    assert!(meta.file_type().is_file());
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "new helper"
+    );
+    // The user's build was not written through the symlink.
+    assert_eq!(
+        sys.read("/home/u/target/release/puzuz-helper").unwrap(),
+        "new helper"
+    );
+
+    // A root-owned regular file with the same contents and mode is kept.
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(!out.contains("installed /usr/local/bin"), "{out}");
+}
+
+#[test]
 fn bin_dir_equal_to_the_binary_location_copies_nothing() {
     let sys = system();
     let options = InstallOptions {

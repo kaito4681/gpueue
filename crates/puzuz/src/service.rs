@@ -138,14 +138,37 @@ fn create_dirs(sys: &dyn System, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether the system path already is what [`write_file`] would write: a regular file (not a
+/// symlink, which may point at a file its owner can change), owned by root, with exactly
+/// `mode` (never group- or world-writable) and `contents`.
+fn already_written(sys: &dyn System, path: &Path, contents: &[u8], mode: u32) -> bool {
+    let local = sys.path(path);
+    let Ok(meta) = std::fs::symlink_metadata(&local) else {
+        return false;
+    };
+    meta.file_type().is_file()
+        && meta.uid() == sys.root_uid()
+        && meta.mode() & 0o7777 == mode
+        && meta.mode() & 0o022 == 0
+        && meta.len() == contents.len() as u64
+        // Opened without following a symlink that took its place since.
+        && std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&local)
+            .and_then(|mut file| {
+                let mut existing = Vec::with_capacity(contents.len());
+                io::Read::read_to_end(&mut file, &mut existing)?;
+                Ok(existing)
+            })
+            .is_ok_and(|existing| existing == contents)
+}
+
 /// Writes `contents` to the system path atomically unless it is already there.
 /// Returns whether anything changed.
 fn write_file(sys: &dyn System, path: &Path, contents: &[u8], mode: u32) -> Result<bool> {
     let local = sys.path(path);
-    if let (Ok(existing), Ok(meta)) = (std::fs::read(&local), std::fs::metadata(&local))
-        && existing == contents
-        && meta.mode() & 0o7777 == mode
-    {
+    if already_written(sys, path, contents, mode) {
         return Ok(false);
     }
     let parent = path
