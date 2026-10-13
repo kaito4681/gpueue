@@ -5,8 +5,8 @@ use puzuz_protocol::api::{HelperStatus, VersionResponse};
 
 use super::*;
 use crate::service::MARKER;
-use crate::system::CmdOutput;
 use crate::system::fake::FakeSystem;
+use crate::system::{CmdOutput, HttpError};
 
 // A throwaway key pair (its secret key was not kept), another key, and data signed with the first.
 const TEST_PUB: &str = include_str!("testdata/test.pub");
@@ -290,6 +290,63 @@ fn check_reports_a_newer_release() {
     assert_eq!(url, &format!("{REPO_API}/releases/latest"));
     assert!(headers.contains(&("Authorization".to_owned(), "Bearer secret-token".to_owned())));
     assert!(!out.contains("secret-token"));
+}
+
+fn dropped() -> HttpError {
+    HttpError {
+        message: "io: Peer disconnected".to_owned(),
+        connection_lost: true,
+    }
+}
+
+#[test]
+fn gets_are_retried_when_the_server_drops_the_connection() {
+    let latest = format!("{REPO_API}/releases/latest");
+    let sha256 = format!("{REPO_API}/releases/assets/12");
+
+    // Once on the API, twice on a download: the update still goes through.
+    let sys = system();
+    sys.fail_next(&latest, dropped());
+    sys.fail_next(&sha256, dropped());
+    sys.fail_next(&sha256, dropped());
+    run(&sys, &opts(false, None)).unwrap();
+    assert!(installed(&sys));
+    let log = sys.http_log.borrow();
+    assert_eq!(log.iter().filter(|(url, _)| *url == latest).count(), 2);
+    assert_eq!(log.iter().filter(|(url, _)| *url == sha256).count(), 3);
+    assert!(
+        log.iter()
+            .filter(|(url, _)| *url == latest)
+            .all(|(_, headers)| headers
+                .contains(&("Authorization".to_owned(), "Bearer secret-token".to_owned())))
+    );
+    let sleeps = sys.sleeps.borrow();
+    assert_eq!(
+        &sleeps[..3],
+        &[RETRY_DELAYS[0], RETRY_DELAYS[0], RETRY_DELAYS[1]]
+    );
+    drop((log, sleeps));
+
+    // Three dropped connections in a row: give up.
+    let sys = system();
+    for _ in 0..3 {
+        sys.fail_next(&latest, dropped());
+    }
+    let err = run(&sys, &opts(true, None)).unwrap_err();
+    assert_eq!(err, format!("cannot reach {API}: io: Peer disconnected"));
+    assert_eq!(sys.http_log.borrow().len(), 3);
+    assert!(!err.contains("secret-token"));
+
+    // Other network failures and HTTP errors are not retried.
+    let sys = system();
+    sys.fail_next(&latest, HttpError::new("connection refused"));
+    let err = run(&sys, &opts(true, None)).unwrap_err();
+    assert_eq!(err, format!("cannot reach {API}: connection refused"));
+    sys.serve(&latest, 502, "bad gateway");
+    let err = run(&sys, &opts(true, None)).unwrap_err();
+    assert!(err.contains("HTTP 502"), "{err}");
+    assert_eq!(sys.http_log.borrow().len(), 2);
+    assert!(sys.sleeps.borrow().is_empty());
 }
 
 #[test]

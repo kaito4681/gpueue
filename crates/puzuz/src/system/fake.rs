@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use puzuz_protocol::api::{HelperStatus, VersionResponse};
 
-use super::{CmdOutput, FsUsage, HttpResponse, System};
+use super::{CmdOutput, FsUsage, HttpError, HttpResponse, System};
 
 /// Request headers, as sent.
 pub type Headers = Vec<(String, String)>;
@@ -37,7 +37,12 @@ pub struct FakeSystem {
     pub env: RefCell<HashMap<String, String>>,
     /// `(url, answer)`: a GET of exactly `url` gets `answer` (`Err` is a network failure);
     /// other URLs fail with "offline". The last matching entry wins.
-    pub http: RefCell<Vec<(String, Result<HttpResponse, String>)>>,
+    pub http: RefCell<Vec<(String, Result<HttpResponse, HttpError>)>>,
+    /// `(url, error)`: the next GET of `url` fails with `error` (used up in order, before
+    /// `http` is consulted).
+    pub http_failures: RefCell<Vec<(String, HttpError)>>,
+    /// Every duration slept, in order.
+    pub sleeps: RefCell<Vec<Duration>>,
     /// Every URL fetched, with the headers sent.
     pub http_log: RefCell<Vec<(String, Headers)>>,
 }
@@ -61,6 +66,8 @@ impl FakeSystem {
             prompts: RefCell::default(),
             env: RefCell::default(),
             http: RefCell::default(),
+            http_failures: RefCell::default(),
+            sleeps: RefCell::default(),
             http_log: RefCell::default(),
         }
     }
@@ -80,6 +87,13 @@ impl FakeSystem {
                 body: body.into(),
             }),
         ));
+    }
+
+    /// Makes the next GET of `url` fail with `error`, before the answers of [`Self::serve`].
+    pub fn fail_next(&self, url: &str, error: HttpError) {
+        self.http_failures
+            .borrow_mut()
+            .push((url.to_owned(), error));
     }
 
     pub fn respond(&self, prefix: &str, output: CmdOutput) {
@@ -209,7 +223,9 @@ impl System for FakeSystem {
         self.confirm_answer
     }
 
-    fn sleep(&self, _duration: Duration) {}
+    fn sleep(&self, duration: Duration) {
+        self.sleeps.borrow_mut().push(duration);
+    }
 
     fn env_var(&self, name: &str) -> Option<String> {
         self.env.borrow().get(name).cloned()
@@ -220,7 +236,7 @@ impl System for FakeSystem {
         url: &str,
         headers: &[(&str, &str)],
         _timeout: Duration,
-    ) -> Result<HttpResponse, String> {
+    ) -> Result<HttpResponse, HttpError> {
         self.http_log.borrow_mut().push((
             url.to_owned(),
             headers
@@ -228,12 +244,17 @@ impl System for FakeSystem {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
         ));
+        let mut failures = self.http_failures.borrow_mut();
+        if let Some(index) = failures.iter().position(|(failing, _)| failing == url) {
+            return Err(failures.remove(index).1);
+        }
+        drop(failures);
         self.http
             .borrow()
             .iter()
             .rev()
             .find(|(served, _)| served == url)
             .map(|(_, answer)| answer.clone())
-            .unwrap_or_else(|| Err("offline".to_owned()))
+            .unwrap_or_else(|| Err(HttpError::new("offline")))
     }
 }

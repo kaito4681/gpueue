@@ -103,7 +103,49 @@ pub trait System {
         url: &str,
         headers: &[(&str, &str)],
         timeout: Duration,
-    ) -> Result<HttpResponse, String>;
+    ) -> Result<HttpResponse, HttpError>;
+}
+
+/// A network failure of [`System::http_get`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpError {
+    pub message: String,
+    /// The server closed or reset the connection (e.g. a pooled keep-alive connection it had
+    /// already dropped): sending the request again on a new connection may well succeed.
+    pub connection_lost: bool,
+}
+
+impl HttpError {
+    #[cfg(test)]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            connection_lost: false,
+        }
+    }
+
+    fn from_ureq(err: ureq::Error) -> Self {
+        let connection_lost = matches!(
+            &err,
+            ureq::Error::Io(io) if matches!(
+                io.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+            )
+        );
+        Self {
+            message: err.to_string(),
+            connection_lost,
+        }
+    }
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 /// The answer to [`System::http_get`].
@@ -211,7 +253,7 @@ impl System for RealSystem {
         url: &str,
         headers: &[(&str, &str)],
         timeout: Duration,
-    ) -> Result<HttpResponse, String> {
+    ) -> Result<HttpResponse, HttpError> {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
             .http_status_as_error(false)
@@ -224,14 +266,14 @@ impl System for RealSystem {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        let mut response = request.call().map_err(|err| err.to_string())?;
+        let mut response = request.call().map_err(HttpError::from_ureq)?;
         let status = response.status().as_u16();
         let body = response
             .body_mut()
             .with_config()
             .limit(MAX_HTTP_BODY)
             .read_to_vec()
-            .map_err(|err| err.to_string())?;
+            .map_err(HttpError::from_ureq)?;
         Ok(HttpResponse { status, body })
     }
 }
@@ -361,6 +403,23 @@ mod tests {
             .gid();
         sys.write("/etc/group", &format!("root:x:0:\n{}\n", group_line(gid)));
         sys
+    }
+
+    #[test]
+    fn dropped_connections_are_told_apart_from_other_http_failures() {
+        let io_error = |kind, message: &str| {
+            HttpError::from_ureq(ureq::Error::Io(io::Error::new(kind, message)))
+        };
+        // What ureq reports when a pooled connection was closed by the server.
+        let err = io_error(io::ErrorKind::UnexpectedEof, "Peer disconnected");
+        assert!(err.connection_lost);
+        assert_eq!(err.to_string(), "io: Peer disconnected");
+        assert!(io_error(io::ErrorKind::ConnectionReset, "reset").connection_lost);
+        assert!(io_error(io::ErrorKind::BrokenPipe, "broken pipe").connection_lost);
+
+        assert!(!io_error(io::ErrorKind::ConnectionRefused, "refused").connection_lost);
+        assert!(!HttpError::from_ureq(ureq::Error::Timeout(ureq::Timeout::Global)).connection_lost);
+        assert!(!HttpError::from_ureq(ureq::Error::HostNotFound).connection_lost);
     }
 
     #[test]
