@@ -72,8 +72,17 @@ directories and a default /etc/puzuz/config.toml, starts the services and prints
 `puzuz doctor` report. It does not install CRIU or cuda-checkpoint; it tells you if they are
 missing. Update later with `sudo puzuz update` (running jobs keep running; pass `--save-token`
 to the installer once, or `GH_TOKEN` each time). Remove it with `sudo puzuz uninstall`, which
-keeps the data (`--purge` deletes it too). Other ways to install (apt, rpm, AUR, Nix) are coming later; until then you can
+keeps the data (`--purge` deletes it too). Other ways to install (apt, rpm, AUR) are coming later; until then you can
 also build from source (see [docs/install.md](docs/install.md)).
+
+With Nix (x86_64 or aarch64), build the flake and install the service from the result (it is
+copied to /usr/local/bin and kept from Nix's garbage collection; see
+[Installing with Nix](docs/install.md#installing-with-nix); a NixOS module is coming soon):
+
+```sh
+nix build github:kaito4681/puzuz/stable
+sudo ./result/bin/puzuz service install
+```
 
 ```sh
 # Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.

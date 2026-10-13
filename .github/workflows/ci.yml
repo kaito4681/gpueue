@@ -60,6 +60,27 @@ jobs:
           docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:v0.10.0 \
             -S warning $(git ls-files '*.sh')
 
+  # flake.nix: evaluate the outputs, then build puzuz (which runs the tests
+  # that work in the Nix sandbox) and CRIU on both architectures.
+  nix:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31.11.1
+      - run: nix flake check -L
+      - run: nix build -L .#default
+      - run: |
+          ./result/bin/puzuz --version
+          ./result/bin/puzuz-helper --help >/dev/null
+          test -s result/share/bash-completion/completions/puzuz.bash
+      - run: nix build -L .#criu -o result-criu
+      - run: ./result-criu/bin/criu --version
+
   # `puzuz service install|uninstall|status` and the install method checks
   # under systemd in a privileged container.
   service-install:
