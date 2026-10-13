@@ -3,4 +3,4 @@
 Types: deb
 URIs: https://github.com/kaito4681/puzuz/releases/download/apt/
 Suites: ./
-Signed-By: /usr/share/keyrings/puzuz-archive-keyring.gpg
+Signed-By: /etc/apt/keyrings/puzuz.gpg
