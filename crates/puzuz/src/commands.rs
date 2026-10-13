@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -1202,12 +1203,8 @@ pub async fn describe_error(err: CliError, client: &Client) -> String {
             Ok(version) => format!("daemon {}", version.daemon_version),
             Err(_) => "the daemon".to_owned(),
         };
-        // A CLI from the Nix store that is not the NixOS system's own.
-        let exe = std::env::current_exe().ok().filter(|exe| {
-            exe.starts_with("/nix/store")
-                && std::fs::canonicalize(NIXOS_SYSTEM_CLI).ok().as_ref() != Some(exe)
-        });
-        return version_mismatch_message(&err, client.version(), &daemon, exe.as_deref());
+        let nix = nix_client(std::env::current_exe().ok());
+        return version_mismatch_message(&err, client.version(), &daemon, nix.as_ref());
     }
     err.to_string()
 }
@@ -1215,30 +1212,65 @@ pub async fn describe_error(err: CliError, client: &Client) -> String {
 /// The CLI of the NixOS system (`services.puzuz`), whose version follows the daemon's.
 const NIXOS_SYSTEM_CLI: &str = "/run/current-system/sw/bin/puzuz";
 
-/// The hint for a CLI whose version differs from the daemon's. `nix_exe` is set for a CLI run
-/// from the Nix store other than the NixOS system's (home-manager, `nix profile`, `nix run`):
-/// it usually comes from another flake revision than the daemon, so it is told how to use the
-/// system's CLI instead.
+/// A CLI run from the Nix store that is not the NixOS system's own (`nix profile`, `nix run`,
+/// home-manager). It usually comes from another flake revision than the daemon.
+struct NixClient {
+    exe: PathBuf,
+    /// The host is NixOS, or the CLI is a home-manager or per-user profile's: the hint may
+    /// mention `programs.puzuz.package`.
+    home_manager: bool,
+}
+
+fn nix_client(exe: Option<PathBuf>) -> Option<NixClient> {
+    let exe = exe.filter(|exe| exe.starts_with("/nix/store"))?;
+    let same = |path: &Path| std::fs::canonicalize(path).ok().as_ref() == Some(&exe);
+    if same(Path::new(NIXOS_SYSTEM_CLI)) {
+        return None;
+    }
+    let mut profiles = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        profiles.push(home.join(".nix-profile/bin/puzuz"));
+        profiles.push(home.join(".local/state/nix/profiles/home-manager/home-path/bin/puzuz"));
+    }
+    if let Some(user) = std::env::var_os("USER") {
+        profiles.push(
+            Path::new("/etc/profiles/per-user")
+                .join(user)
+                .join("bin/puzuz"),
+        );
+    }
+    let home_manager =
+        Path::new("/run/current-system").exists() || profiles.iter().any(|p| same(p));
+    Some(NixClient { exe, home_manager })
+}
+
+/// The hint for a CLI whose version differs from the daemon's, with a note for a CLI from the
+/// Nix store (see [`NixClient`]).
 fn version_mismatch_message(
     err: &ClientError,
     ours: &str,
     daemon: &str,
-    nix_exe: Option<&std::path::Path>,
+    nix: Option<&NixClient>,
 ) -> String {
-    match nix_exe {
-        Some(exe) => format!(
-            "{err}\nThis puzuz is {ours} from {} but talks to {daemon}. A puzuz from \
-             home-manager or `nix profile` must have the daemon's version: pin it to the \
-             system's version, or set `programs.puzuz.package = null` (home-manager) to use \
-             the system's puzuz.",
-            exe.display()
-        ),
-        None => format!(
-            "{err}\nThis client is puzuz {ours} but talks to {daemon}. If the daemon is \
-             outdated, an administrator can restart it with `sudo systemctl restart puzuz` \
-             (running jobs keep running); otherwise update this client."
-        ),
+    let mut message = format!(
+        "{err}\nThis client is puzuz {ours} but talks to {daemon}. If the daemon is outdated, \
+         an administrator can restart it with `sudo systemctl restart puzuz` (running jobs keep \
+         running); otherwise update this client."
+    );
+    if let Some(nix) = nix {
+        message.push_str(&format!(
+            "\nThis puzuz runs from {}. A puzuz from the Nix store must have the daemon's \
+             version: pin it to the system's version",
+            nix.exe.display()
+        ));
+        if nix.home_manager {
+            message.push_str(
+                ", or set `programs.puzuz.package = null` (home-manager) to use the system's puzuz",
+            );
+        }
+        message.push('.');
     }
+    message
 }
 
 #[cfg(test)]
@@ -1255,16 +1287,36 @@ mod tests {
             status: 409,
             error: ApiError::new(ErrorCode::VersionMismatch, "version mismatch"),
         };
-        let exe = std::path::Path::new("/nix/store/abc-puzuz-0.3.0/bin/puzuz");
-        let nix = version_mismatch_message(&err, "0.3.0", "daemon 0.2.0", Some(exe));
+        let plain = version_mismatch_message(&err, "0.3.0", "daemon 0.2.0", None);
+        assert!(plain.contains("sudo systemctl restart puzuz"), "{plain}");
+        assert!(!plain.contains("Nix store"), "{plain}");
+
+        let mut nix = NixClient {
+            exe: "/nix/store/abc-puzuz-0.3.0/bin/puzuz".into(),
+            home_manager: false,
+        };
+        let profile = version_mismatch_message(&err, "0.3.0", "daemon 0.2.0", Some(&nix));
         assert!(
-            nix.contains("0.3.0 from /nix/store/abc-puzuz-0.3.0/bin/puzuz"),
-            "{nix}"
+            profile.contains("sudo systemctl restart puzuz"),
+            "{profile}"
         );
-        assert!(nix.contains("programs.puzuz.package = null"), "{nix}");
-        let other = version_mismatch_message(&err, "0.3.0", "daemon 0.2.0", None);
-        assert!(other.contains("sudo systemctl restart puzuz"), "{other}");
-        assert!(!other.contains("home-manager"), "{other}");
+        assert!(
+            profile.contains("runs from /nix/store/abc-puzuz-0.3.0/bin/puzuz"),
+            "{profile}"
+        );
+        assert!(!profile.contains("home-manager"), "{profile}");
+
+        nix.home_manager = true;
+        let hm = version_mismatch_message(&err, "0.3.0", "daemon 0.2.0", Some(&nix));
+        assert!(hm.contains("sudo systemctl restart puzuz"), "{hm}");
+        assert!(hm.contains("programs.puzuz.package = null"), "{hm}");
+    }
+
+    #[test]
+    fn only_nix_store_clients_get_the_nix_hint() {
+        assert!(nix_client(None).is_none());
+        assert!(nix_client(Some("/usr/bin/puzuz".into())).is_none());
+        assert!(nix_client(Some("/nix/store/abc-puzuz-0.3.0/bin/puzuz".into())).is_some());
     }
 
     #[test]
