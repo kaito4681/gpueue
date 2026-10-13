@@ -1089,10 +1089,11 @@ VmFlags: rd ex mr mw me
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        // By its name: `exe` may be a multicall binary (`coreutils` in Nix).
         wait_until("the shell to exec `sleep` with fd 3 open", || {
             fs::read_link(format!("/proc/{}/fd/3", child.id())).is_ok()
-                && fs::read_link(format!("/proc/{}/exe", child.id()))
-                    .is_ok_and(|e| e.to_string_lossy().contains("sleep"))
+                && fs::read_to_string(format!("/proc/{}/comm", child.id()))
+                    .is_ok_and(|c| c.trim_end() == "sleep")
         });
         let gid = nix::unistd::getegid().as_raw();
         let groups: Vec<u32> = nix::unistd::getgroups()
