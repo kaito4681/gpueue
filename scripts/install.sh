@@ -14,6 +14,7 @@ TARGET="x86_64-unknown-linux-gnu"
 MIN_GLIBC="2.34"
 DEFAULT_BIN_DIR="/usr/local/bin"
 TOKEN_FILE_SAVED="/etc/puzuz/github-token"
+INSTALL_MARKER='# Installed by `puzuz service install`; re-running it overwrites this file.'
 # The release signing key; must match packaging/minisign.pub (checked by the
 # release workflow and a unit test).
 MINISIGN_PUBKEY="RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv"
@@ -188,9 +189,17 @@ os_family() {
     done
 }
 
+# unit_puzuz UNIT: the puzuz binary that UNIT's ExecStart= runs (after any
+# of systemd's -@:+! prefixes), or nothing.
+unit_puzuz() {
+    sed -n 's|^ExecStart=[-@:+!]*\(/[^ ]*/puzuz\) daemon.*|\1|p' "$1" 2>/dev/null | head -n1
+}
+
 # The directory of the binaries the `service install` unit runs, or nothing.
 installed_bin_dir() {
-    sed -n 's|^ExecStart=\(/.*\)/puzuz daemon.*|\1|p' /etc/systemd/system/puzuz.service 2>/dev/null | head -n1
+    local exe
+    exe="$(unit_puzuz /etc/systemd/system/puzuz.service)"
+    [ -z "$exe" ] || dirname "$exe"
 }
 
 # The `puzuz` of an existing installation: the one the daemon unit runs, else
@@ -198,7 +207,7 @@ installed_bin_dir() {
 installed_puzuz() {
     local unit exe
     for unit in /etc/systemd/system/puzuz.service /usr/lib/systemd/system/puzuz.service /lib/systemd/system/puzuz.service; do
-        exe="$(sed -n 's|^ExecStart=[-@:+!]*\(/[^ ]*/puzuz\) daemon.*|\1|p' "$unit" 2>/dev/null | head -n1)"
+        exe="$(unit_puzuz "$unit")"
         if [ -n "$exe" ] && [ -x "$exe" ]; then
             echo "$exe"
             return
@@ -207,8 +216,14 @@ installed_puzuz() {
     command -v puzuz 2>/dev/null || true
 }
 
+# Whether /etc/systemd/system/puzuz.service was written by `puzuz service install`.
+marker_unit_installed() {
+    [ "$(head -n1 /etc/systemd/system/puzuz.service 2>/dev/null)" = "$INSTALL_MARKER" ]
+}
+
 # installed_method: how an installed puzuz says it is installed (`puzuz
-# service install-method`), or nothing if no puzuz can tell.
+# service install-method`), or nothing if no puzuz can tell (none installed,
+# or one too old to know the command, or failing).
 installed_method() {
     local puzuz
     puzuz="$(installed_puzuz)"
@@ -226,11 +241,14 @@ package_owner() {
     esac
     for path in "${paths[@]}"; do
         if command -v dpkg-query >/dev/null 2>&1 && out="$(dpkg-query -S "$path" 2>/dev/null)"; then
-            out="$(grep -v '^diversion ' <<<"$out" | head -n1)"
-            out="${out%%: *}"
-            out="${out%%, *}"
-            echo "${out%%:*} dpkg"
-            return 0
+            # Diversion lines (`diversion by ...`, `local diversion ...`) name no owner.
+            out="$(grep -v 'diversion' <<<"$out" | grep ': ' | head -n1)" || true
+            if [ -n "$out" ]; then
+                out="${out%%: *}"
+                out="${out%%, *}"
+                echo "${out%%:*} dpkg"
+                return 0
+            fi
         fi
         if command -v rpm >/dev/null 2>&1 && out="$(rpm -qf --queryformat '%{NAME}\n' "$path" 2>/dev/null)"; then
             echo "$(head -n1 <<<"$out") rpm"
@@ -539,11 +557,16 @@ do_install() {
     # An installed puzuz knows best; without one, only the obvious conflicts
     # are refused here, and the downloaded binary decides below.
     method="$(installed_method)"
-    if [ -n "$method" ]; then
-        check_install_method "$method"
-    else
+    if [ -z "$method" ]; then
         check_obvious_conflicts
+        # A `service install` whose binary cannot answer: keep its bin dir.
+        if marker_unit_installed; then
+            method=service-install
+        else
+            method=none
+        fi
     fi
+    check_install_method "$method"
     # An update stays where the current installation is, unless --bin-dir says otherwise.
     if [ "$BIN_DIR_GIVEN" = 0 ] && [ "$method" = service-install ]; then
         local current
@@ -594,6 +617,9 @@ do_install() {
 do_uninstall() {
     local method puzuz bin_dir=""
     method="$(installed_method)"
+    if [ -z "$method" ] && marker_unit_installed; then
+        method=service-install
+    fi
     case "$method" in
     service-install) ;;
     "" | none) die "puzuz is not installed by \`puzuz service install\`; nothing to uninstall" ;;

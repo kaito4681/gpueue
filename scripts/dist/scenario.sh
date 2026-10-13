@@ -201,6 +201,11 @@ scenario_17() {
 
     step "17: re-running without --bin-dir keeps the installed bin dir"
     GH_TOKEN="$TOKEN" bash "$install" --bin-dir /opt/puzuz/bin >/dev/null
+    # Even when the installed binary cannot answer `service install-method`
+    # (e.g. too old), the marker unit keeps the bin dir.
+    rm /opt/puzuz/bin/puzuz
+    printf '#!/bin/sh\nexit 1\n' >/opt/puzuz/bin/puzuz
+    chmod 0755 /opt/puzuz/bin/puzuz
     GH_TOKEN="$TOKEN" bash "$install" >/dev/null
     grep -q '^ExecStart=/opt/puzuz/bin/puzuz daemon' /etc/systemd/system/puzuz.service ||
         fail "the units no longer run /opt/puzuz/bin/puzuz"
