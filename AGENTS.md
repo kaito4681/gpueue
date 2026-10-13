@@ -9,6 +9,9 @@
   where apt is offline; `PUZUZ_E2E_GPU=1` with a CUDA base image adds a GPU scenario).
 - Real OS reboot/poweroff in a QEMU/KVM VM (Ubuntu 26.04, CPU jobs; needs /dev/kvm, image cached in
   the `puzuz-vm-cache` volume): `scripts/vm-reboot-test.sh [reboot|poweroff|inflight]`.
+- The `.deb` (nfpm, `packaging/nfpm.yaml`): `scripts/dist/build-package.sh BIN_DIR OUT_DIR` builds
+  it, `scripts/deb-test.sh [DEB]` installs/removes/purges it in a container (`PUZUZ_DEB_BASE`,
+  `PUZUZ_DEB_HTTPS=1` where plain-HTTP apt is blocked).
 - CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, an MSRV check (`rust-version`),
   shellcheck and the CPU e2e on pull requests; pushing a `v<version>` tag builds the release
   tarball and a draft GitHub release (`.github/workflows/release.yml`).
