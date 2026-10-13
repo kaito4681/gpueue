@@ -10,7 +10,8 @@
 //! binary ([`crate::release_key`]) and the checksum, extracts the tarball (regular files and
 //! directories only), asks the new binary which database schema it supports, refuses a release
 //! that would not open the database, and runs the new binary's `service install --bin-dir <the
-//! installed directory>`. Running jobs are not affected (see `service install`).
+//! installed directory>`. A Nix GC root left from binaries built with Nix is removed afterwards
+//! (see `service install`). Running jobs are not affected.
 //!
 //! Test-only overrides, not shown in `--help`: `PUZUZ_RELEASE_API_URL` (a fake API) and
 //! `PUZUZ_UPDATE_PUBKEY_FILE` (another public key).
@@ -636,6 +637,10 @@ fn install_release(sys: &dyn System, plan: &InstallPlan<'_>, out: &mut dyn Write
              `puzuz doctor`"
         )
         .ok();
+    }
+    // The release's binaries do not need a Nix store path the previous ones came from.
+    if let Err(err) = crate::service::release_gc_root(sys, &plan.target.to_string(), out) {
+        writeln!(out, "warning: {err}").ok();
     }
 
     wait_for_daemon(sys, plan)?;

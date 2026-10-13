@@ -393,6 +393,51 @@ fn update_installs_the_verified_release() {
 }
 
 #[test]
+fn update_over_a_nix_built_installation_removes_the_gc_root() {
+    let sys = system();
+    let receipt = crate::service::Receipt {
+        version: "0.0.1".to_owned(),
+        bin_dir: PathBuf::from("/usr/local/bin"),
+        copied: vec![
+            PathBuf::from("/usr/local/bin/puzuz"),
+            PathBuf::from("/usr/local/bin/puzuz-helper"),
+        ],
+        gc_root: Some(PathBuf::from(crate::service::GC_ROOT)),
+        gc_root_target: Some(PathBuf::from("/nix/store/abc-puzuz-0.0.1")),
+    };
+    sys.write(crate::service::RECEIPT_PATH, &receipt.to_toml());
+    sys.mkdir("/nix/var/nix/gcroots");
+    std::os::unix::fs::symlink(
+        "/nix/store/abc-puzuz-0.0.1",
+        sys.path(Path::new(crate::service::GC_ROOT)),
+    )
+    .unwrap();
+
+    let out = run(&sys, &opts(false, None)).unwrap();
+    assert!(
+        out.contains("removed the Nix GC root /nix/var/nix/gcroots/puzuz"),
+        "{out}"
+    );
+    assert!(!sys.exists(crate::service::GC_ROOT));
+    let updated: crate::service::Receipt =
+        toml::from_str(&sys.read(crate::service::RECEIPT_PATH).unwrap()).unwrap();
+    assert_eq!(
+        updated,
+        crate::service::Receipt {
+            version: "9.0.0".to_owned(),
+            gc_root: None,
+            gc_root_target: None,
+            ..receipt
+        }
+    );
+
+    // Without a GC root the receipt is left to `service install`.
+    let sys = system();
+    run(&sys, &opts(false, None)).unwrap();
+    assert!(!sys.exists(crate::service::RECEIPT_PATH));
+}
+
+#[test]
 fn update_asks_first() {
     let sys = system();
     let options = UpdateOptions {

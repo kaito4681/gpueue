@@ -459,6 +459,34 @@ fn write_receipt(
     Ok(stale)
 }
 
+/// After `puzuz update` installed the binaries of a release tarball over an installation from
+/// the Nix store: the new binaries do not use the store, so the GC root recorded in the receipt
+/// is removed and the receipt updated. (The new `service install` does this itself; this also
+/// covers a release that predates the receipt.)
+pub fn release_gc_root(sys: &dyn System, version: &str, out: &mut dyn Write) -> Result<()> {
+    let mut receipt = match receipt::read(sys) {
+        Ok(Some(receipt)) => receipt,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            writeln!(out, "warning: {err}").ok();
+            return Ok(());
+        }
+    };
+    let Some(root) = receipt.gc_root.take() else {
+        return Ok(());
+    };
+    remove_gc_root(sys, &root, out);
+    receipt.gc_root_target = None;
+    receipt.version = version.to_owned();
+    write_file(
+        sys,
+        Path::new(RECEIPT_PATH),
+        receipt.to_toml().as_bytes(),
+        0o644,
+    )?;
+    Ok(())
+}
+
 /// Removes copies a previous installation left in a directory the units no longer use.
 fn remove_stale_copies(sys: &dyn System, stale: &[PathBuf], out: &mut dyn Write) {
     for path in stale {
