@@ -31,7 +31,8 @@ Usage:
 Options:
   --version X        install version X (default: the latest release); re-running
                      with a newer version updates puzuz, running jobs keep running
-  --bin-dir DIR      where to put puzuz and puzuz-helper (default: $DEFAULT_BIN_DIR)
+  --bin-dir DIR      where to put puzuz and puzuz-helper (default: the directory
+                     of the current installation, else $DEFAULT_BIN_DIR)
   --token-file FILE  read the GitHub token from FILE
   --save-token       save the token to $TOKEN_FILE_SAVED (root, 0600) for
                      \`puzuz update\`
@@ -60,6 +61,7 @@ die() {
 parse_args() {
     VERSION=""
     BIN_DIR="$DEFAULT_BIN_DIR"
+    BIN_DIR_GIVEN=0
     UNINSTALL=0
     PURGE=0
     YES=0
@@ -80,10 +82,12 @@ parse_args() {
         --bin-dir)
             [ "$#" -ge 2 ] || die "--bin-dir needs a value"
             BIN_DIR="$2"
+            BIN_DIR_GIVEN=1
             shift 2
             ;;
         --bin-dir=*)
             BIN_DIR="${1#--bin-dir=}"
+            BIN_DIR_GIVEN=1
             shift
             ;;
         --token-file)
@@ -191,6 +195,11 @@ install_method() {
     1) echo "${methods[0]}" ;;
     *) echo mixed ;;
     esac
+}
+
+# The directory of the binaries the `service install` unit runs, or nothing.
+installed_bin_dir() {
+    sed -n 's|^ExecStart=\(/.*\)/puzuz daemon.*|\1|p' /etc/systemd/system/puzuz.service 2>/dev/null | head -n1
 }
 
 # check_install_method METHOD: refuses everything but `service install` or nothing.
@@ -422,7 +431,15 @@ do_install() {
     check_systemd
     check_arch
     check_glibc
-    check_install_method "$(install_method)"
+    local method
+    method="$(install_method)"
+    check_install_method "$method"
+    # An update stays where the current installation is, unless --bin-dir says otherwise.
+    if [ "$BIN_DIR_GIVEN" = 0 ] && [ "$method" = service-install ]; then
+        local current
+        current="$(installed_bin_dir)"
+        [ -z "$current" ] || BIN_DIR="$current"
+    fi
 
     local token
     token="$(resolve_token)"
@@ -472,7 +489,7 @@ do_uninstall() {
     none) die "puzuz is not installed by \`puzuz service install\`; nothing to uninstall" ;;
     *) check_install_method "$method" ;;
     esac
-    bin_dir="$(sed -n 's|^ExecStart=\(/.*\)/puzuz daemon.*|\1|p' /etc/systemd/system/puzuz.service | head -n1)"
+    bin_dir="$(installed_bin_dir)"
     [ -n "$bin_dir" ] || bin_dir="$BIN_DIR"
     puzuz="$bin_dir/puzuz"
     [ -x "$puzuz" ] || die "$puzuz not found"

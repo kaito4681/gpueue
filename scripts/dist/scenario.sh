@@ -166,6 +166,16 @@ scenario_17() {
     expect_fail "pass --yes" setsid bash "$install" --uninstall --purge </dev/null
     bash "$install" --uninstall --purge --yes >/dev/null
     [ ! -e /var/lib/puzuz ] || fail "/var/lib/puzuz left after --purge"
+
+    step "17: re-running without --bin-dir keeps the installed bin dir"
+    GH_TOKEN="$TOKEN" bash "$install" --bin-dir /opt/puzuz/bin >/dev/null
+    GH_TOKEN="$TOKEN" bash "$install" >/dev/null
+    grep -q '^ExecStart=/opt/puzuz/bin/puzuz daemon' /etc/systemd/system/puzuz.service ||
+        fail "the units no longer run /opt/puzuz/bin/puzuz"
+    [ ! -e /usr/local/bin/puzuz ] || fail "a re-run installed /usr/local/bin/puzuz"
+    [ ! -e /usr/local/bin/puzuz-helper ] || fail "a re-run installed /usr/local/bin/puzuz-helper"
+    bash "$install" --uninstall --purge --yes >/dev/null
+    [ ! -e /opt/puzuz/bin/puzuz ] || fail "/opt/puzuz/bin/puzuz left after --uninstall"
     echo
     echo "PASS 17"
 }

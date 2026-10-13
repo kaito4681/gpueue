@@ -104,7 +104,7 @@ Options go after `bash -s --` when the script comes from a pipe (for example
 | Option | Meaning |
 | --- | --- |
 | `--version X` | install version X instead of the latest release |
-| `--bin-dir DIR` | where to put `puzuz` and `puzuz-helper` (default `/usr/local/bin`) |
+| `--bin-dir DIR` | where to put `puzuz` and `puzuz-helper` (default: the directory of the current `service install` installation, else `/usr/local/bin`) |
 | `--token-file FILE` | read the token from FILE |
 | `--save-token` | save the token to `/etc/puzuz/github-token` (root, 0600) for later runs |
 | `--uninstall` | remove puzuz (see [Uninstalling](#uninstalling)) |
@@ -125,7 +125,8 @@ manager or NixOS (see [Install method](#install-method)). It then:
    into the script (`packaging/minisign.pub`). Without `minisign` it says that the signature was
    not checked,
 4. extracts the tarball (refusing links and paths outside it), runs the new
-   `puzuz service install --bin-dir /usr/local/bin`, and prints its `puzuz doctor` report,
+   `puzuz service install --bin-dir <DIR>` (`--bin-dir`, else the directory the installed units
+   run puzuz from, else `/usr/local/bin`), and prints its `puzuz doctor` report,
 5. prints how to install CRIU and cuda-checkpoint if they are missing. It never installs them.
 
 If only some `puzuz doctor` checks fail (for example CRIU is missing) but the services run,
