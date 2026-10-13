@@ -277,8 +277,8 @@ the units with drop-ins (`sudo systemctl edit puzuz-helper.service`). Edits to t
 | Install method | Recognized by |
 | --- | --- |
 | `puzuz service install` | `/etc/systemd/system/<unit>` starting with the install marker line |
-| distribution package | `/usr/lib/systemd/system/<unit>` (or `/lib/systemd/system/...`) that `dpkg-query -S`, `rpm -qf` or `pacman -Qo` names an owner for (asked under both paths, since dpkg may have registered the `/lib` one on merged-`/usr` systems). If none of these tools exists, the unit counts as a package of unknown origin |
-| unowned unit | such a unit that no package owns: left over from a removed package, or copied there by hand (`make install`) |
+| distribution package | `/usr/lib/systemd/system/<unit>` (or `/lib/systemd/system/...`) that `dpkg-query -S`, `rpm -qf` or `pacman -Qo` names an owner for (asked under both paths, since dpkg may have registered the `/lib` one on merged-`/usr` systems; the first tool with a definite answer decides). If no tool can answer (none installed, or each fails, e.g. with a locked database), the unit counts as a package of unknown origin |
+| unowned unit | such a unit that a package manager definitely reports as not owned (`no path found matching pattern`, `is not owned by any package`, `No package owns`): left over from a removed package, or copied there by hand (`make install`) |
 | Nix | `/etc/systemd/system/<unit>` resolving into `/nix/store` (the NixOS `services.puzuz` module, system-manager), or a packaged unit that resolves into or runs a binary from `/nix/store` |
 | by hand | `/etc/systemd/system/<unit>` without the marker, and no packaged unit (also when its `ExecStart=` is below `/nix/store`) |
 
@@ -306,12 +306,15 @@ What each command does (the hidden `puzuz service install-method` prints the key
 | by hand | only with `--force` | refuses | refuses | INFO | `manual` |
 | mixed | refuses: uninstall the `service install` copy first | removes only what `service install` wrote (no `--purge`) | refuses | FAIL | `mixed` |
 
-"Mixed" is `service install` together with a package or Nix. A `service install` next to an
-unowned leftover in `/usr/lib` stays a `service install` (its units in `/etc` win); `doctor`
-warns and tells you to delete the leftover. When `puzuz.service` and `puzuz-helper.service` are
-installed in different ways, or only one of them exists, `doctor` warns, `service status` says
-so, and `service install` refuses if either unit belongs to a package or Nix (otherwise it
-installs both and so fixes it). `service install` also refuses when `/etc/systemd/system` itself
+"Mixed" is `service install` together with a package or Nix, on one unit or across
+`puzuz.service` and `puzuz-helper.service` (e.g. the daemon unit from `service install`, the
+helper unit from a package): `doctor` fails, `service status` reports it as unhealthy, and the
+keyword is `mixed`. A `service install` next to an unowned unit in `/usr/lib` stays a
+`service install` (its units in `/etc` win), and re-running `service install` needs no
+`--force`; `doctor` warns and tells you to delete the leftover. When the two units are installed
+in other different ways (for example, one of them is missing, or they come from different
+packages of different package managers), `doctor` warns and `service status` says so;
+`service install` installs both and so fixes it. `service install` also refuses when `/etc/systemd/system` itself
 resolves into `/nix/store`, since it cannot write there.
 
 The refusals name the way to update or remove puzuz that fits the install method:
