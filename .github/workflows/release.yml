@@ -15,7 +15,8 @@ permissions:
 jobs:
   # Fails fast, before the build, when releases cannot be signed: the
   # committed public key is the test key, install.sh embeds another key, or
-  # the secrets are missing (see scripts/dist/gen-signing-key.sh).
+  # the secrets are missing (see scripts/dist/gen-signing-key.sh); or when
+  # the .deb would ship the test APT archive key (scripts/dist/gen-apt-key.sh).
   check-signing:
     runs-on: ubuntu-24.04
     env:
@@ -42,15 +43,29 @@ jobs:
             echo "::error::the repository secrets MINISIGN_SECRET_KEY and MINISIGN_PASSWORD must be set (scripts/dist/gen-signing-key.sh prints the commands)"
             exit 1
           fi
+          if grep -aq 'TEST KEY' packaging/apt/puzuz-archive-keyring.gpg; then
+            echo "::error::packaging/apt/puzuz-archive-keyring.gpg is the test key; create the APT archive key with scripts/dist/gen-apt-key.sh"
+            exit 1
+          fi
 
+  # Native builds per architecture (the helper embeds C code, so no cross
+  # compiling): the tarball, its checksum, and the .deb.
   build:
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
     # Build on Debian bookworm, as scripts/test-in-docker.sh does, so the
-    # binaries need only glibc 2.34 (see docs/install.md).
+    # binaries need only glibc 2.34 (see docs/install.md). The image is
+    # multi-arch, so the arm64 runner gets the arm64 toolchain.
     container: rust:1.98.1-bookworm
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
-      TARGET: x86_64-unknown-linux-gnu
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,6 +74,8 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
           [ "$TAG" = "v$version" ] || { echo "tag $TAG != v$version"; exit 1; }
+      - name: Check the runner's architecture matches the target
+        run: '[ "$(uname -m)" = "${TARGET%%-*}" ] || { echo "$(uname -m) cannot build $TARGET natively"; exit 1; }'
       # The job runs as root in the container; the helper's tests refuse
       # root, so they run as an unprivileged user.
       - name: Test
@@ -77,10 +94,17 @@ jobs:
           cp -r README.md LICENSE docs "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
+      # dist/puzuz_<version>_<amd64|arm64>.deb (packaging/nfpm.yaml).
+      - name: Build the .deb
+        run: |
+          deb="$(scripts/dist/build-package.sh target/release dist deb)"
+          (cd dist && sha256sum "$(basename "$deb")" >"$(basename "$deb").sha256")
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
-          path: dist/*.tar.gz*
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz*
+            dist/*.deb*
 
   release:
     needs: [check-signing, build]
@@ -94,10 +118,12 @@ jobs:
           ref: ${{ env.TAG }}
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist
-      # dist/<name>.tar.gz.minisig, checked against packaging/minisign.pub
-      # (the key built into `puzuz`), and install.sh as a release asset.
+      # dist/<name>.tar.gz.minisig and dist/<name>.deb.minisig, checked
+      # against packaging/minisign.pub (the key built into `puzuz`), and
+      # install.sh as a release asset.
       - name: Sign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -110,10 +136,10 @@ jobs:
           minisign="$(scripts/dist/get-minisign.sh "$RUNNER_TEMP/minisign")"
           key="$RUNNER_TEMP/minisign.key"
           (umask 077; printf '%s\n' "$MINISIGN_SECRET_KEY" >"$key")
-          for tarball in dist/*.tar.gz; do
+          for file in dist/*.tar.gz dist/*.deb; do
             printf '%s\n' "$MINISIGN_PASSWORD" |
-              "$minisign" -S -s "$key" -m "$tarball" -t "puzuz $TAG $(basename "$tarball")"
-            "$minisign" -V -p packaging/minisign.pub -m "$tarball"
+              "$minisign" -S -s "$key" -m "$file" -t "puzuz $TAG $(basename "$file")"
+            "$minisign" -V -p packaging/minisign.pub -m "$file"
           done
           rm -f "$key"
           install -m 0644 scripts/install.sh dist/install.sh

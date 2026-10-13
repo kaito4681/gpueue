@@ -30,8 +30,16 @@ use crate::install_method::{self, InstallMethod, Method};
 use crate::release_key::RELEASE_PUBKEY;
 use crate::system::System;
 
-/// The only target releases are built for.
-pub const TARGET: &str = "x86_64-unknown-linux-gnu";
+/// The release target of this build: releases are built for x86_64 and aarch64. Unit tests use
+/// their x86_64 test release on every architecture.
+pub const TARGET: &str = if cfg!(all(target_arch = "aarch64", not(test))) {
+    "aarch64-unknown-linux-gnu"
+} else if cfg!(any(target_arch = "x86_64", test)) {
+    "x86_64-unknown-linux-gnu"
+} else {
+    // No release exists; `puzuz update` then reports the missing asset.
+    "unsupported-architecture"
+};
 /// Where `install.sh --save-token` saves the token (root, 0600).
 pub const TOKEN_FILE: &str = "/etc/puzuz/github-token";
 /// Where releases are downloaded and extracted; removed afterwards.
