@@ -105,6 +105,18 @@ gpg --batch --quiet --pinentry-mode loopback --passphrase test-passphrase \
 gpg --batch --pinentry-mode loopback --passphrase test-passphrase --armor --export-secret-keys >/w/key.asc
 gpg --batch --export >/w/test-keyring.gpg
 gpgconf --kill all
+# Two more throwaway keys: another one, which apt-get and apt-repo.sh refuse
+# to verify the index with, and one whose user ID marks it as a TEST key,
+# which apt-repo.sh refuses to publish packages with.
+for k in other test-marked; do
+    export GNUPGHOME="/w/gnupg-$k"
+    mkdir -m 700 "$GNUPGHOME"
+    uid="puzuz APT repository (apt-repo-test $k key)"
+    [ "$k" = test-marked ] && uid="puzuz APT repository TEST KEY (apt-repo-test)"
+    gpg --batch --quiet --pinentry-mode loopback --passphrase '' --quick-gen-key "$uid" rsa3072 sign never
+    gpg --batch --export >"/w/$k-keyring.gpg"
+    gpgconf --kill all
+done
 unset GNUPGHOME
 . /w/env.sh
 
@@ -138,7 +150,7 @@ mkpkg() { # VERSION(tag) ARCH [OUT_DIR]
     x="$(mktemp -d)"
     mkdir -p "$x/DEBIAN" "$x/etc/apt/sources.list.d" "$x/etc/apt/keyrings"
     cp /src/packaging/apt/puzuz.sources "$x/etc/apt/sources.list.d/"
-    cp /w/test-keyring.gpg "$x/etc/apt/keyrings/puzuz.gpg"
+    cp "${MKPKG_KEYRING:-/w/test-keyring.gpg}" "$x/etc/apt/keyrings/puzuz.gpg"
     printf 'Package: puzuz\nVersion: %s\nArchitecture: %s\nMaintainer: test <t@example.com>\nDescription: test\n' \
         "${1/-/\~}" "$2" >"$x/DEBIAN/control"
     mkdir -p "${3:-fake}"
@@ -189,7 +201,7 @@ refused() { # DESCRIPTION, then the command
     echo "refused ($what): $(tail -n 1 /tmp/refused.err)"
 }
 refused "wrong passphrase" env APT_GPG_PASSPHRASE=wrong "$repo" update prune
-refused "signing key not in the keyring" env APT_KEYRING=/src/packaging/apt/puzuz-archive-keyring.gpg "$repo" update prune
+refused "signing key not in the keyring" env APT_KEYRING=/w/other-keyring.gpg "$repo" update prune
 mkdir -p bad
 cp fake/puzuz_1.0.0_arm64.deb bad/puzuz_1.0.1_amd64.deb
 refused "same name, other contents" "$repo" update prune bad/puzuz_1.0.1_amd64.deb
@@ -202,10 +214,10 @@ truncate -s "$(($(stat -c %s bad/puzuz_3.0.0_amd64.deb) - 100))" bad/puzuz_3.0.0
 refused "truncated .deb" "$repo" update prune bad/puzuz_3.0.0_amd64.deb
 mkpkg 1.0.01 amd64 bad
 refused "duplicate version (1.0.01 = 1.0.1)" "$repo" update prune bad/puzuz_1.0.01_amd64.deb
-# The package as built from the tree ships the committed TEST key.
-testkey="bad/puzuz_$(dpkg-deb --field pkg/orig.deb Version | tr '~' '-')_$arch.deb"
-cp pkg/orig.deb "$testkey"
-if "$repo" update testkey "$testkey" 2>/tmp/refused.err; then fail "accepted: packages with the TEST key"; fi
+# A package that ships a TEST key (scripts/dist/gen-apt-key.sh --test).
+MKPKG_KEYRING=/w/test-marked-keyring.gpg mkpkg 4.0.0 amd64 testkey-debs
+if "$repo" update testkey testkey-debs/puzuz_4.0.0_amd64.deb 2>/tmp/refused.err; then fail "accepted: packages with the TEST key"; fi
+grep -q 'ships the TEST archive key' /tmp/refused.err || fail "packages with the TEST key refused for another reason"
 [ ! -e testkey ] || fail "wrote testkey/ for packages with the TEST key"
 echo "refused (TEST key): $(tail -n 1 /tmp/refused.err)"
 echo "refusals: ok"
@@ -231,7 +243,7 @@ for base in "${bases[@]}"; do
     echo "=== $base"
     docker rm -f "$client" >/dev/null 2>&1 || true
     docker run -d --name "$client" --network "$net" "${mounts[@]}" \
-        -v "$work/debs:/debs:ro" -v "$root/packaging/apt/puzuz-archive-keyring.gpg:/other-keyring.gpg:ro" \
+        -v "$work/debs:/debs:ro" -v "$work/other-keyring.gpg:/other-keyring.gpg:ro" \
         "$base" sleep infinity >/dev/null
     docker exec -i "$client" bash -euo pipefail <<EOF
 $setup
