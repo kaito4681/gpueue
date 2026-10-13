@@ -382,9 +382,7 @@ pub struct UpdateOptions {
 /// How to update puzuz installed as `detection` says, for messages.
 fn how_to_update(detection: &Detection, version: Option<&Version>) -> String {
     match &detection.install {
-        InstallMethod::One(Method::ServiceInstall { .. })
-            if detection.managed_elsewhere().is_none() =>
-        {
+        InstallMethod::One(Method::ServiceInstall { .. }) if !detection.is_conflicting() => {
             match version {
                 Some(version) => format!("sudo puzuz update --version {version}"),
                 None => "sudo puzuz update".to_owned(),
@@ -733,8 +731,8 @@ pub fn newer_release(sys: &dyn System, config: &Config) -> Result<Option<Version
 }
 
 /// For `puzuz doctor`: how to update to a newer release.
-pub fn update_hint(sys: &dyn System) -> String {
-    how_to_update(&install_method::detect(sys), None)
+pub fn update_hint(detection: &Detection) -> String {
+    how_to_update(detection, None)
 }
 
 #[cfg(test)]

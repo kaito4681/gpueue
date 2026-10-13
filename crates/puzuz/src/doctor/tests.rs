@@ -984,7 +984,10 @@ fn remove_etc_units(sys: &FakeSystem) {
 }
 
 fn not_owned(sys: &FakeSystem) {
-    sys.respond("dpkg-query -S", CmdOutput::failed("", "no path found\n"));
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
 }
 
 #[test]
@@ -1041,6 +1044,17 @@ fn units_installed_in_different_ways_warn() {
         message(&report, "install method")
     );
     assert!(hint(&report, "install method").contains("sudo puzuz service install"));
+
+    // A packaged helper unit next to it conflicts: FAIL, like a mixed setup.
+    let unit = "/usr/lib/systemd/system/puzuz-helper.service";
+    sys.write(unit, "[Service]\nExecStart=/usr/bin/puzuz-helper serve\n");
+    sys.dpkg_owns(unit, "puzuz");
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "install method"), Level::Fail);
+    assert!(message(&report, "install method").contains("conflict"));
+    let hint = hint(&report, "install method");
+    assert!(hint.contains("sudo puzuz service uninstall"), "{hint}");
+    assert!(hint.contains("sudo apt remove puzuz"), "{hint}");
 }
 
 #[test]

@@ -209,9 +209,73 @@ fn a_unit_nobody_owns_is_unowned() {
         detection.install.to_string(),
         "a unit no package owns (/usr/lib/systemd/system/puzuz.service)"
     );
-    // Both paths were asked, of every package manager that exists.
+    // Both paths were asked; dpkg answered definitely, so rpm was not asked.
     assert!(sys.ran("dpkg-query -S /lib/systemd/system/puzuz.service"));
-    assert!(sys.ran("rpm -qf"));
+    assert!(!sys.ran("rpm"));
+
+    // rpm and pacman say "not owned" in their own words.
+    let sys = FakeSystem::new();
+    write_plain(&sys, LIB);
+    sys.missing("dpkg-query");
+    sys.respond(
+        "rpm",
+        CmdOutput::failed(
+            "file /usr/lib/systemd/system/puzuz.service is not owned by any package\n",
+            "",
+        ),
+    );
+    assert_eq!(detect(&sys).keyword(), "unowned");
+    assert!(!sys.ran("pacman"));
+    let sys = FakeSystem::new();
+    write_plain(&sys, LIB);
+    sys.missing("dpkg-query");
+    sys.missing("rpm");
+    sys.respond(
+        "pacman",
+        CmdOutput::failed(
+            "",
+            "error: No package owns /usr/lib/systemd/system/puzuz.service\n",
+        ),
+    );
+    assert_eq!(detect(&sys).keyword(), "unowned");
+}
+
+#[test]
+fn a_failing_package_manager_is_no_answer() {
+    // A locked database, another exit code, or unexpected output: not "not owned".
+    for answer in [
+        CmdOutput::exited(2, "", "dpkg-query: error: database is locked\n"),
+        CmdOutput::failed("", "dpkg-query: error: cannot read the status file\n"),
+        CmdOutput::exited(2, "", "dpkg-query: no path found matching pattern x\n"),
+        CmdOutput::ok("diversion by other from: /usr/lib/systemd/system/puzuz.service\n"),
+    ] {
+        let sys = FakeSystem::new();
+        write_plain(&sys, LIB);
+        sys.respond("dpkg-query", answer.clone());
+        sys.missing("rpm");
+        sys.missing("pacman");
+        let detection = detect(&sys);
+        assert_eq!(
+            detection.install.methods()[0],
+            package(&path(LIB, DAEMON_UNIT), Owner::Unknown, None),
+            "{answer:?}"
+        );
+        assert!(detection.managed_elsewhere().is_some());
+    }
+
+    // Another package manager can still answer.
+    let sys = FakeSystem::new();
+    write_plain(&sys, LIB);
+    sys.respond("dpkg-query", CmdOutput::exited(2, "", "locked\n"));
+    sys.respond("rpm -qf", CmdOutput::ok("puzuz\n"));
+    assert_eq!(
+        detect(&sys).install.methods()[0],
+        package(
+            &path(LIB, DAEMON_UNIT),
+            Owner::Rpm("puzuz".to_owned()),
+            None
+        )
+    );
 }
 
 #[test]
@@ -287,6 +351,16 @@ fn a_dpkg_owner_with_an_architecture_is_its_name() {
              a, b: /usr/lib/x\n"
         ),
         Some("a".to_owned())
+    );
+    assert_eq!(
+        parse_dpkg_owner(
+            "local diversion from: /usr/lib/x\nlocal diversion to: /usr/lib/x.local\n"
+        ),
+        None
+    );
+    assert_eq!(
+        parse_dpkg_owner("local diversion from: /usr/lib/x\npuzuz: /usr/lib/x\n"),
+        Some("puzuz".to_owned())
     );
     assert_eq!(parse_dpkg_owner(""), None);
 }
@@ -705,4 +779,63 @@ fn resolve_follows_relative_and_absolute_links() {
     // A loop ends.
     symlink(&sys, "/loop", "/loop");
     let _ = resolve(&sys, Path::new("/loop/x"));
+}
+
+#[test]
+fn packaged_units_of_one_package_manager_belong_together() {
+    let sys = FakeSystem::new();
+    write_plain(&sys, LIB);
+    sys.dpkg_owns(&path(LIB, DAEMON_UNIT), "puzuz");
+    sys.dpkg_owns(&path(LIB, HELPER_UNIT), "puzuz-helper");
+    let detection = detect(&sys);
+    assert_eq!(detection.partial, None);
+    assert!(!detection.is_conflicting());
+}
+
+#[test]
+fn a_partial_service_install_next_to_a_package_conflicts() {
+    let sys = FakeSystem::new();
+    sys.write(
+        &path(ETC, DAEMON_UNIT),
+        &marker_unit("/usr/local/bin", DAEMON_UNIT),
+    );
+    let helper = path(LIB, HELPER_UNIT);
+    sys.write(&helper, &plain_unit("/usr/bin/puzuz-helper"));
+    sys.dpkg_owns(&helper, "puzuz");
+    assert!(detect(&sys).is_conflicting());
+
+    // A missing helper unit is partial but no conflict.
+    let sys = FakeSystem::new();
+    sys.write(
+        &path(ETC, DAEMON_UNIT),
+        &marker_unit("/usr/local/bin", DAEMON_UNIT),
+    );
+    let detection = detect(&sys);
+    assert!(detection.partial.is_some());
+    assert!(!detection.is_conflicting());
+}
+
+#[test]
+fn an_unowned_unit_next_to_service_install_needs_no_force() {
+    // The daemon's /usr/lib unit nobody owns, the helper from `service install`.
+    let sys = FakeSystem::new();
+    sys.write(&path(LIB, DAEMON_UNIT), &plain_unit("/usr/bin/puzuz"));
+    not_owned(&sys);
+    sys.write(
+        &path(ETC, HELPER_UNIT),
+        &marker_unit("/usr/local/bin", HELPER_UNIT),
+    );
+    let detection = detect(&sys);
+    assert_eq!(detection.install.keyword(), "unowned");
+    assert!(detection.partial.is_some());
+    assert!(!detection.unowned_needs_force());
+    assert_eq!(detection.keyword(), "service-install");
+
+    // Alone, it does.
+    let sys = FakeSystem::new();
+    sys.write(&path(LIB, DAEMON_UNIT), &plain_unit("/usr/bin/puzuz"));
+    not_owned(&sys);
+    let detection = detect(&sys);
+    assert!(detection.unowned_needs_force());
+    assert_eq!(detection.keyword(), "unowned");
 }

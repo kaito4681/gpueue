@@ -539,7 +539,10 @@ fn doctor_reports_a_newer_release_as_info() {
         newer_release(&sys, &config).unwrap(),
         Some(Version::new(9, 0, 0))
     );
-    assert_eq!(update_hint(&sys), "sudo puzuz update");
+    assert_eq!(
+        update_hint(&install_method::detect(&sys)),
+        "sudo puzuz update"
+    );
     sys.serve(&format!("{REPO_API}/releases/latest"), 500, "");
     assert!(newer_release(&sys, &config).is_err());
 }
@@ -565,7 +568,10 @@ fn other_install_methods_get_their_own_hint() {
         "/usr/lib/systemd/system/puzuz.service",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
     );
-    sys.respond("dpkg-query -S", CmdOutput::failed("", "no path found\n"));
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
     let err = run(&sys, &opts(false, None)).unwrap_err();
     assert!(err.contains("installed as a unit no package owns"), "{err}");
     assert!(
@@ -606,7 +612,7 @@ fn other_install_methods_get_their_own_hint() {
     let err = run(&sys, &opts(false, None)).unwrap_err();
     assert!(err.contains("`services.puzuz` NixOS module"), "{err}");
     assert_eq!(
-        update_hint(&sys),
+        update_hint(&install_method::detect(&sys)),
         "install it with the `services.puzuz` NixOS module (see docs/install.md)"
     );
 
@@ -635,7 +641,7 @@ fn a_packaged_helper_unit_blocks_the_update() {
         "{err}"
     );
     assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
-    assert!(update_hint(&sys).contains("run `puzuz doctor` first"));
+    assert!(update_hint(&install_method::detect(&sys)).contains("run `puzuz doctor` first"));
 }
 
 #[test]
@@ -645,7 +651,10 @@ fn a_leftover_unit_does_not_block_the_update() {
         "/usr/lib/systemd/system/puzuz.service",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
     );
-    sys.respond("dpkg-query -S", CmdOutput::failed("", "no path found\n"));
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
     run(&sys, &opts(false, None)).unwrap();
     assert!(installed(&sys));
 }

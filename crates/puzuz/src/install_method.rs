@@ -253,7 +253,10 @@ impl Method {
             (Method::ServiceInstall { bin_dir: a }, Method::ServiceInstall { bin_dir: b }) => {
                 a == b
             }
-            (Method::Package { owner: a, .. }, Method::Package { owner: b, .. }) => a == b,
+            // The same package manager; the units may come from different packages.
+            (Method::Package { owner: a, .. }, Method::Package { owner: b, .. }) => {
+                std::mem::discriminant(a) == std::mem::discriminant(b)
+            }
             (Method::Unowned { .. }, Method::Unowned { .. })
             | (Method::Nix { .. }, Method::Nix { .. })
             | (Method::Manual { .. }, Method::Manual { .. }) => true,
@@ -396,14 +399,36 @@ pub struct Detection {
 
 impl Detection {
     /// The machine-readable name of the installation (`puzuz service install-method`): that of
-    /// [`Detection::install`], except that a `service install` unit next to a packaged or Nix
-    /// unit of the other service is `mixed` too.
+    /// [`Detection::install`], except that a conflicting setup is `mixed`, and an unowned unit
+    /// next to a `service install` unit is `service-install` (see
+    /// [`Detection::unowned_needs_force`]).
     pub fn keyword(&self) -> &'static str {
-        if self.has_service_install() && self.managed_elsewhere().is_some() {
+        if self.is_conflicting() {
             "mixed"
+        } else if self.has_service_install()
+            && matches!(self.install, InstallMethod::One(Method::Unowned { .. }))
+        {
+            "service-install"
         } else {
             self.install.keyword()
         }
+    }
+
+    /// `service install` together with a package or Nix, on one unit ([`InstallMethod::Mixed`])
+    /// or across the two units: their units and data directories conflict.
+    pub fn is_conflicting(&self) -> bool {
+        matches!(self.install, InstallMethod::Mixed(_))
+            || (self.has_service_install() && self.managed_elsewhere().is_some())
+    }
+
+    /// Whether `service install` needs `--force` because of an unowned unit. Not next to a
+    /// `service install` unit: an unowned unit of the other service is then a leftover that
+    /// the new /etc unit shadows, like [`Detection::leftovers`].
+    pub fn unowned_needs_force(&self) -> bool {
+        !self.has_service_install()
+            && self
+                .methods()
+                .any(|method| matches!(method, Method::Unowned { .. }))
     }
 
     /// The methods of both units (each once).
@@ -536,11 +561,12 @@ fn other_package_path(unit: &Path) -> Option<PathBuf> {
     }
 }
 
-/// The package name in `dpkg-query -S` output (`pkg[:arch][, other]: /path`).
+/// The package name in `dpkg-query -S` output (`pkg[:arch][, other]: /path`), ignoring
+/// diversion lines (`diversion by ...`, `local diversion from: ...`).
 fn parse_dpkg_owner(stdout: &str) -> Option<String> {
     stdout
         .lines()
-        .filter(|line| !line.starts_with("diversion "))
+        .filter(|line| !line.contains("diversion"))
         .find_map(|line| line.split_once(": "))
         .and_then(|(packages, _)| packages.split(", ").next())
         .map(|package| {
@@ -564,48 +590,98 @@ fn parse_name(stdout: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Who owns the packaged unit: `Some(owner)`, or `None` if the package managers that exist
-/// say nobody does. Without any of them the owner is [`Owner::Unknown`].
+/// What one package manager said about one path.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    Owned(String),
+    /// Definitely owned by no package of this package manager.
+    NotOwned,
+    /// Missing, failed in another way (e.g. a locked database) or said something unexpected.
+    Undecided,
+}
+
+/// A package manager's owner query: the program, its arguments before the path, how to read
+/// the owner from stdout, and the message of its definite "not owned" (with exit code 1).
+struct Query {
+    program: &'static str,
+    args: &'static [&'static str],
+    parse: fn(&str) -> Option<String>,
+    not_owned: &'static str,
+    owner: fn(String) -> Owner,
+}
+
+const QUERIES: &[Query] = &[
+    Query {
+        program: "dpkg-query",
+        args: &["-S"],
+        parse: parse_dpkg_owner,
+        not_owned: "no path found matching pattern",
+        owner: Owner::Dpkg,
+    },
+    Query {
+        program: "rpm",
+        args: &["-qf", "--queryformat", "%{NAME}\\n"],
+        parse: parse_name,
+        not_owned: "is not owned by any package",
+        owner: Owner::Rpm,
+    },
+    Query {
+        program: "pacman",
+        args: &["-Qqo"],
+        parse: parse_name,
+        not_owned: "No package owns",
+        owner: Owner::Pacman,
+    },
+];
+
+impl Query {
+    fn ask(&self, sys: &dyn System, path: &Path) -> Answer {
+        let path = path.to_string_lossy();
+        let mut argv = self.args.to_vec();
+        argv.push(&path);
+        let Ok(output) = sys.run(self.program, &argv) else {
+            return Answer::Undecided;
+        };
+        if output.success {
+            return (self.parse)(&output.stdout).map_or(Answer::Undecided, Answer::Owned);
+        }
+        let said_not_owned =
+            output.stdout.contains(self.not_owned) || output.stderr.contains(self.not_owned);
+        if output.code == Some(1) && said_not_owned {
+            Answer::NotOwned
+        } else {
+            Answer::Undecided
+        }
+    }
+}
+
+/// Who owns the packaged unit: `Some(owner)`, or `None` if a package manager definitely says
+/// nobody does. If none can answer (missing, or failing), the owner is [`Owner::Unknown`].
+///
+/// Each path (the unit, and the same file under the other of /usr/lib and /lib) is asked of
+/// the package managers in turn until one answers definitely.
 fn query_owner(sys: &dyn System, unit: &Path) -> Option<Owner> {
-    type Query = (
-        &'static str,
-        &'static [&'static str],
-        fn(&str) -> Option<String>,
-    );
-    const QUERIES: &[Query] = &[
-        ("dpkg-query", &["-S"], parse_dpkg_owner),
-        ("rpm", &["-qf", "--queryformat", "%{NAME}\\n"], parse_name),
-        ("pacman", &["-Qqo"], parse_name),
-    ];
     let paths: Vec<PathBuf> = std::iter::once(unit.to_owned())
         .chain(other_package_path(unit))
         .collect();
-    let mut asked = false;
-    for (index, (program, args, parse)) in QUERIES.iter().enumerate() {
-        for path in &paths {
-            let path = path.to_string_lossy();
-            let mut argv = args.to_vec();
-            argv.push(&path);
-            match sys.run(program, &argv) {
-                Ok(output) => {
-                    asked = true;
-                    if !output.success {
-                        continue;
-                    }
-                    if let Some(name) = parse(&output.stdout) {
-                        return Some(match index {
-                            0 => Owner::Dpkg(name),
-                            1 => Owner::Rpm(name),
-                            _ => Owner::Pacman(name),
-                        });
-                    }
+    let mut not_owned = false;
+    for path in &paths {
+        for query in QUERIES {
+            match query.ask(sys, path) {
+                Answer::Owned(name) => return Some((query.owner)(name)),
+                Answer::NotOwned => {
+                    not_owned = true;
+                    break;
                 }
-                // Not installed (`NotFound`) or not runnable: try the next package manager.
-                Err(_) => break,
+                Answer::Undecided => {}
             }
         }
     }
-    if asked { None } else { Some(Owner::Unknown) }
+    if not_owned {
+        None
+    } else {
+        Some(Owner::Unknown)
+    }
 }
 
 /// The result for one unit.

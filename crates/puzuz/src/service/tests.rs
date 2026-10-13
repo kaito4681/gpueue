@@ -937,7 +937,10 @@ fn unowned_units(sys: &FakeSystem) {
     for unit in [PACKAGED_UNIT, PACKAGED_HELPER_UNIT] {
         sys.write(unit, "[Service]\nExecStart=/usr/bin/puzuz daemon\n");
     }
-    sys.respond("dpkg-query -S", CmdOutput::failed("", "no path found\n"));
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
     sys.missing("rpm");
     sys.missing("pacman");
 }
@@ -1094,6 +1097,14 @@ fn a_packaged_helper_next_to_installed_units_is_refused() {
     );
     sys.dpkg_owns(PACKAGED_HELPER_UNIT, "puzuz");
     assert!(install_method::detect(&sys).partial.is_some());
+    // Unhealthy, like a mixed setup.
+    let mut out = Vec::new();
+    assert!(!status(&sys, None, &mut out).unwrap());
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains("but puzuz-helper.service as distribution package")
+    );
 
     let forced = InstallOptions {
         force: true,
@@ -1107,4 +1118,24 @@ fn a_packaged_helper_next_to_installed_units_is_refused() {
     run_uninstall(&sys, false, true).unwrap();
     assert!(!sys.exists("/etc/systemd/system/puzuz.service"));
     assert!(sys.exists(PACKAGED_HELPER_UNIT));
+}
+
+#[test]
+fn an_unowned_unit_next_to_installed_units_needs_no_force() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    // The daemon's /etc unit is gone; an unowned /usr/lib one is left.
+    std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
+    sys.write(
+        PACKAGED_UNIT,
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
+    assert_eq!(install_method::detect(&sys).keyword(), "service-install");
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(out.contains("warning: no package owns"), "{out}");
+    assert!(sys.exists("/etc/systemd/system/puzuz.service"));
 }

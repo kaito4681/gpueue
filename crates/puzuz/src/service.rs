@@ -14,7 +14,7 @@ use std::time::Duration;
 use puzuz_daemon::config::DEFAULT_CONFIG_PATH;
 
 use crate::doctor::{self, Report};
-use crate::install_method::{self, Detection, InstallMethod, Method};
+use crate::install_method::{self, Detection, Method};
 use crate::system::{System, check_root_owned_chain, run_checked};
 
 pub const DAEMON_UNIT: &str = "puzuz.service";
@@ -393,7 +393,7 @@ fn check_install_method(detection: &Detection, force: bool) -> Result<Vec<String
                 "no package owns {unit} (left over from a removed package, or copied there by \
                  hand); delete it (`sudo rm {unit}`)"
             );
-            if !force {
+            if !force && detection.unowned_needs_force() {
                 return Err(format!(
                     "{note} and re-run, or re-run with --force to install next to it"
                 ));
@@ -750,7 +750,7 @@ fn remove_tree_inner(
 pub fn status(sys: &dyn System, socket: Option<&Path>, out: &mut dyn Write) -> io::Result<bool> {
     let mut healthy = true;
     let detection = install_method::detect(sys);
-    healthy &= !matches!(detection.install, InstallMethod::Mixed(_));
+    healthy &= !detection.is_conflicting();
     writeln!(out, "{:<22} {}", "installed", detection.install)?;
     if let Some(partial) = &detection.partial {
         writeln!(out, "{:<22} {partial}", "")?;
