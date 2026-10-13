@@ -103,7 +103,8 @@ curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.s
 
 Options go after `bash -s --` when the script comes from a pipe (for example
 `... | sudo bash -s -- --version 0.2.0`), or after the file name with a downloaded copy
-(`sudo bash install.sh --version 0.2.0`):
+(`sudo bash install.sh --version 0.2.0`; to check its signature before it runs as root, see
+[Verifying a release by hand](#verifying-a-release-by-hand)):
 
 | Option | Meaning |
 | --- | --- |
@@ -129,7 +130,8 @@ binary decides the rest before it installs anything. It then:
 1. looks up the release (`/repos/kaito4681/puzuz/releases/latest`, or `/releases/tags/v<X>`),
 2. downloads `puzuz-v<X>-<target>.tar.gz` (`x86_64-unknown-linux-gnu` or
    `aarch64-unknown-linux-gnu`) and its `.sha256` file into a
-   temporary directory and checks the checksum,
+   temporary directory (over HTTPS only, also for redirects), checks that the `.sha256` file is
+   the checksum of that tarball by name, and checks the checksum,
 3. if `minisign` is installed, also checks the `.minisig` signature against the release key built
    into the script (`packaging/minisign.pub`). Without `minisign` it says that the signature was
    not checked,
@@ -157,12 +159,23 @@ below.
 Each release has, for each target (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`),
 `puzuz-v<X>-<target>.tar.gz` with `.sha256` and `.minisig` files, the packages
 `puzuz_<X>_amd64.deb`, `puzuz_<X>_arm64.deb`, `puzuz-<X>-1.x86_64.rpm` and
-`puzuz-<X>-1.aarch64.rpm` with the same two files each, and `install.sh`. To check a tarball (or a
-package) yourself:
+`puzuz-<X>-1.aarch64.rpm` with the same two files each, and `install.sh` with `install.sh.minisig`.
+To check a tarball (or a package) yourself:
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.pub
+```
+
+`curl ... | sudo bash` runs whatever the download contains. To check `install.sh` first, download
+it with its signature, verify it with the release key (`packaging/minisign.pub`), and run the
+checked copy:
+
+```sh
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh.minisig
+minisign -Vm install.sh -p packaging/minisign.pub
+sudo bash install.sh
 ```
 
 ### The release signing key (maintainers)
@@ -285,11 +298,15 @@ The repository is the set of assets of the release `apt` (a pre-release, so it n
 `scripts/dist/apt-repo.sh github <tag>` when a release is **published as a stable release** (the
 `released` event: publishing a stable release, or turning a pre-release into one): it adds the release's
 `.deb` files (after checking their checksums and their minisign signatures, with the public key
-of the tag's commit), deletes all but the newest
+of the tag's commit), checks the packages already in the repository against its signed index
+(`InRelease` must verify with `packaging/apt/puzuz-archive-keyring.gpg`, and each `.deb` must
+have the SHA256 the signed `Packages` lists; on a mismatch the job fails and changes nothing, and a
+`.deb` the index does not list, left by an interrupted run, is dropped), deletes all but the newest
 five versions per architecture (in Debian version order), regenerates and signs the index (and
 copies `puzuz.gpg` and `puzuz.sources` out of the newest package it keeps), and uploads the
 packages first and the index last, `InRelease` at the very end; old `.deb` files are deleted after
-that. It creates the `apt` release when it is missing. `apt-repo.sh` decides what is published:
+that. Each upload is tried three times; when the index still cannot be uploaded, the previous
+index files are put back and the job fails, saying to run it again. It creates the `apt` release when it is missing. `apt-repo.sh` decides what is published:
 drafts, pre-releases and tags other than `v*` are skipped with a notice. The index has no
 `by-hash` files (they need a subdirectory, and release asset names cannot contain `/`), hence the
 short window described above.
@@ -428,9 +445,10 @@ Linux; nothing is downloaded from the GitHub releases. Its outputs:
 | `packages.<system>.helper-tests` | the puzuz-helper test executables (built, not run), for the `helper-tests` check |
 | `checks.<system>.*` | `home-manager` (module evaluation) and, on x86_64, two NixOS VM tests that need KVM: `nixos` (the module) and `helper-tests` (every puzuz-helper test, including those the sandboxed package build skips) |
 
-Use `github:kaito4681/puzuz/stable` to follow releases: the `stable` branch moves to every
-release tag (not to pre-releases). Plain `github:kaito4681/puzuz` is the development head
-(`main`).
+Use `github:kaito4681/puzuz/stable` to follow releases: the `stable` branch moves to a release's
+tag when the release is published as a stable release, if it is the highest version (never to a
+draft, a pre-release, or a patch release of an older line; `.github/workflows/release-nix.yml`).
+Plain `github:kaito4681/puzuz` is the development head (`main`).
 
 ### NixOS
 
@@ -697,7 +715,8 @@ Checkpoints need CRIU 4.2 or newer, which is in the official repositories
 
 ### The AUR package (maintainers)
 
-The PKGBUILD lives in `packaging/aur/puzuz-bin`. When a release is published (not a prerelease),
+The PKGBUILD lives in `packaging/aur/puzuz-bin`. When a release is published as a stable release
+(the `released` event, like the APT repository; never for a draft or a pre-release),
 `.github/workflows/release-aur.yml` runs `scripts/dist/update-aur.sh <version>`, which takes the
 tarballs' checksums from the release's `.sha256` files, computes the checksum of the tag's source
 archive (for the units and snippets), and regenerates `.SRCINFO` in an Arch Linux container.

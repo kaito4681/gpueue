@@ -122,7 +122,8 @@ curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.s
 
 スクリプトをパイプで渡す場合、オプションは `bash -s --` のあとに書きます（たとえば
 `... | sudo bash -s -- --version 0.2.0`）。ダウンロードしたファイルを使う場合はファイル名のあとに書きます
-（`sudo bash install.sh --version 0.2.0`）。
+（`sudo bash install.sh --version 0.2.0`。root で実行する前に署名を確認する方法は
+[リリースを手動で検証する](#verifying-a-release-by-hand)を参照）。
 
 | オプション | 意味 |
 | --- | --- |
@@ -148,7 +149,8 @@ curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.s
 
 1. リリースを調べます（`/repos/kaito4681/puzuz/releases/latest` または `/releases/tags/v<X>`）。
 2. `puzuz-v<X>-<target>.tar.gz`（`x86_64-unknown-linux-gnu` または `aarch64-unknown-linux-gnu`）と
-   その `.sha256` ファイルを一時ディレクトリにダウンロードし、チェックサムを確認します。
+   その `.sha256` ファイルを一時ディレクトリに（リダイレクト先も含めて HTTPS だけで）ダウンロードし、
+   `.sha256` ファイルがその tarball の名前でのチェックサムであることを確かめてから、チェックサムを確認します。
 3. `minisign` がインストールされていれば、スクリプトに組み込まれたリリース鍵（`packaging/minisign.pub`）で
    `.minisig` の署名も確認します。`minisign` がなければ、署名を確認しなかったことを伝えます。
 4. tarball を展開し（リンクや tarball の外を指すパスは拒否します）、新しい `puzuz service install` を実行し
@@ -175,12 +177,22 @@ Arch Linux では公開後に [AUR パッケージ](#arch-linux-aur) を使え�
 各リリースには、ターゲット（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`）ごとに
 `.sha256` と `.minisig` ファイル付きの `puzuz-v<X>-<target>.tar.gz`、同じ 2 つのファイルがそれぞれに付いた
 パッケージ `puzuz_<X>_amd64.deb`、`puzuz_<X>_arm64.deb`、`puzuz-<X>-1.x86_64.rpm`、
-`puzuz-<X>-1.aarch64.rpm`、そして `install.sh` があります。tarball（またはパッケージ）を自分で確認するには
-次のようにします。
+`puzuz-<X>-1.aarch64.rpm`、そして `install.sh.minisig` 付きの `install.sh` があります。tarball（または
+パッケージ）を自分で確認するには次のようにします。
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.pub
+```
+
+`curl ... | sudo bash` はダウンロードした内容をそのまま実行します。先に `install.sh` を確認するには、署名と
+一緒にダウンロードし、リリース鍵（`packaging/minisign.pub`）で検証してから、確認したファイルを実行します。
+
+```sh
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh.minisig
+minisign -Vm install.sh -p packaging/minisign.pub
+sudo bash install.sh
 ```
 
 <a id="the-release-signing-key-maintainers"></a>
@@ -306,9 +318,14 @@ sudo apt purge puzuz     # also delete /etc/puzuz and the APT repository entry a
 公開されたとき**（`released` イベント：安定版リリースの公開、またはプレリリースの安定版への変更）、
 `.github/workflows/release-apt.yml` が `scripts/dist/apt-repo.sh github <tag>` でリポジトリを更新します。
 リリースの `.deb` ファイルを（チェックサムと、タグのコミットの公開鍵による minisign の署名を確認したあとで）
-追加し、アーキテクチャごとに最新の 5 バージョン（Debian のバージョン順）以外を削除し、インデックスを再生成
+追加し、リポジトリにすでにあるパッケージを署名済みのインデックスと照合し（`InRelease` が
+`packaging/apt/puzuz-archive-keyring.gpg` で検証でき、各 `.deb` が署名済みの `Packages` にある SHA256 と
+一致すること。一致しなければジョブは何も変えずに失敗します。中断した実行が残した、インデックスにない `.deb` は
+取り除きます）、アーキテクチャごとに最新の 5 バージョン（Debian のバージョン順）以外を削除し、インデックスを再生成
 して署名し（保持する最新のパッケージから `puzuz.gpg` と `puzuz.sources` をコピーし）、パッケージを先に、
 インデックスを最後に、`InRelease` を一番最後にアップロードします。古い `.deb` ファイルはその後で削除されます。
+各アップロードは 3 回まで試します。それでもインデックスをアップロードできなければ、以前のインデックスファイルを
+元に戻し、もう一度実行するよう伝えてジョブは失敗します。
 `apt` リリースがなければ作成します。何を公開するかは `apt-repo.sh` が決めます。ドラフト、プレリリース、`v*`
 以外のタグは通知を出してスキップされます。インデックスには `by-hash` ファイルがありません（サブディレクトリが
 必要ですが、リリースアセットの名前には `/` を含められないため）。上で述べた短い時間帯があるのはこのためです。
@@ -448,8 +465,10 @@ GitHub リリースからは何もダウンロードしません。出力は次�
 | `packages.<system>.helper-tests` | `helper-tests` チェック用の puzuz-helper のテスト実行ファイル（ビルドのみで実行はしない） |
 | `checks.<system>.*` | `home-manager`（モジュールの評価）と、x86_64 では KVM が必要な 2 つの NixOS VM テスト：`nixos`（モジュール）と `helper-tests`（サンドボックス内のパッケージビルドでスキップされるものも含む、puzuz-helper のすべてのテスト） |
 
-リリースに追従するには `github:kaito4681/puzuz/stable` を使います。`stable` ブランチはリリースのタグごとに
-（プレリリースを除いて）移動します。単なる `github:kaito4681/puzuz` は開発の先端（`main`）です。
+リリースに追従するには `github:kaito4681/puzuz/stable` を使います。`stable` ブランチは、リリースが安定版
+リリースとして公開されたとき、それが最も高いバージョンであれば、そのタグに移動します（ドラフト、プレリリース、
+古い系列のパッチリリースには移動しません。`.github/workflows/release-nix.yml`）。単なる
+`github:kaito4681/puzuz` は開発の先端（`main`）です。
 
 <a id="nixos"></a>
 ### NixOS
@@ -716,7 +735,8 @@ puzuz doctor
 <a id="the-aur-package-maintainers"></a>
 ### AUR パッケージ（メンテナー向け）
 
-PKGBUILD は `packaging/aur/puzuz-bin` にあります。リリースが公開されると（プレリリースを除く）、
+PKGBUILD は `packaging/aur/puzuz-bin` にあります。リリースが安定版リリースとして公開されると（APT
+リポジトリと同じ `released` イベント。ドラフトやプレリリースでは動きません）、
 `.github/workflows/release-aur.yml` が `scripts/dist/update-aur.sh <version>` を実行します。これは
 リリースの `.sha256` ファイルから tarball のチェックサムを取り、タグのソースアーカイブ（ユニットと断片用）の
 チェックサムを計算し、Arch Linux のコンテナで `.SRCINFO` を再生成します。そして `PKGBUILD`、`.SRCINFO`、

@@ -14,7 +14,8 @@
   `PUZUZ_DEB_HTTPS=1` where plain-HTTP apt is blocked).
 - The `.rpm` (same nfpm definition): `scripts/dist/build-package.sh BIN_DIR OUT_DIR rpm` builds it,
   `scripts/rpm-test.sh [OLD_RPM NEW_RPM]` installs/upgrades/removes it in a container
-  (`PUZUZ_RPM_BASE`, default `rockylinux/rockylinux:9`; also `fedora:latest`).
+  (`PUZUZ_RPM_BASE`, default `rockylinux/rockylinux:9`; also `fedora:latest`); `scripts/rpm-sign-test.sh RPM`
+  tests the GPG signing of the release workflow (`scripts/dist/sign-rpm.sh`).
 - The APT repository (a flat repository in the release `apt`): `scripts/dist/apt-repo.sh`
   (`update DIR DEB...` locally, `github TAG` from `.github/workflows/release-apt.yml` when a
   release is published); `scripts/apt-repo-test.sh [DEB]` upgrades v1 to v2 through a local copy
@@ -26,7 +27,7 @@
   `.#checks.x86_64-linux.helper-tests`, which runs every puzuz-helper test including those the
   sandboxed build skips) need `--device /dev/kvm` and
   `--option system-features "kvm nixos-test"`. Tests that cannot
-  pass in the Nix sandbox are listed in `nix/package.nix`. Release tags move the `stable` branch
+  pass in the Nix sandbox are listed in `nix/package.nix`. Published stable releases move the `stable` branch
   (`.github/workflows/release-nix.yml`). The module generates its units from `packaging/`.
 - CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, an MSRV check (`rust-version`),
   shellcheck and the CPU e2e on pull requests; pushing a `v<version>` tag builds the release
