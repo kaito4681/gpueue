@@ -122,8 +122,10 @@ pub fn check_spawn<H: HostProbe + ?Sized>(
     Ok(creds)
 }
 
-/// Every existing ancestor of a path must be owned by root and not writable
-/// by group or others (shared with the configuration loader).
+/// Every existing component of a path must be owned by root and not
+/// writable by group or others (the sticky Nix store excepted); root-owned
+/// symlinks are followed (the rule of the configuration loader, which
+/// refuses symlinks).
 pub use puzuz_config::trust::check_root_owned_path;
 
 /// The image directory must be exactly `<base>/<job id>`; the daemon cannot

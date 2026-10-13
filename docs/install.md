@@ -54,7 +54,9 @@ sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpo
 
 You can put it somewhere else and set `cuda_checkpoint_path` in `/etc/puzuz/config.toml`. Absolute
 paths of `criu`, `cuda-checkpoint` and `nvidia-smi` must be owned by root, because the helper runs
-them as root.
+them as root. Symlinks owned by root are followed and their targets checked the same way, and
+`/nix/store` (owned by root, sticky, group `nixbld`) is accepted although it is group-writable, so
+paths like `/run/current-system/sw/bin/criu` on NixOS work.
 
 ## Installing with install.sh
 
@@ -415,7 +417,8 @@ The helper runs as root and **refuses to start** unless the file and every paren
 The same rule applies to the directories it writes to or loads code from: `data_dir`,
 `helper_state_dir`, `logs_dir`, `checkpoints_dir`, `<data_dir>/criu-no-plugins` (passed to
 `criu -L`, and it must be empty), `<data_dir>/lib` (the fork guard) and all their parents must be
-owned by root and not group- or world-writable; the helper checks them before it creates
+owned by root and not group- or world-writable (symlinks owned by root are followed and their
+targets checked, unlike for the configuration file); the helper checks them before it creates
 anything there. Keep the layout that
 tmpfiles.d creates. The daemon stores its database in the `daemon/` subdirectory because
 `data_dir` itself must belong to root.

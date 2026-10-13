@@ -269,56 +269,27 @@ pub fn is_root_owned_and_protected(sys: &dyn System, path: &Path) -> io::Result<
 /// (if it exists) and every existing parent directory must be owned by root and not writable by
 /// group or others. Missing components are skipped (they are created by root). Symlinks are
 /// allowed when root owns them, since replacing one needs write access to its (checked)
-/// directory; the path they resolve to is then checked the same way.
+/// directory; the path they resolve to is then checked the same way. `/nix/store` may be
+/// group-writable when it is sticky and its group is `nixbld`. This is the helper's rule
+/// ([`puzuz_config::trust::OwnershipCheck`]), applied below [`System::root`].
 pub fn check_root_owned_chain(sys: &dyn System, path: &Path) -> Result<(), String> {
-    let local = sys.path(path);
+    use puzuz_config::trust::{GROUP_FILE, NIX_BUILD_GROUP, NIX_STORE, OwnershipCheck, group_gid};
+
     let root = sys.root();
+    // The check walks resolved paths.
+    let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    let store = sys.path(Path::new(NIX_STORE));
+    let store = std::fs::canonicalize(&store).unwrap_or(store);
+    let nixbld = group_gid(&sys.path(Path::new(GROUP_FILE)), NIX_BUILD_GROUP);
     let to_system = |p: &Path| -> PathBuf {
-        p.strip_prefix(root)
-            .map_or_else(|_| p.to_owned(), |rest| Path::new("/").join(rest))
+        [root, real_root.as_path()]
+            .iter()
+            .find_map(|r| p.strip_prefix(r).ok())
+            .map_or_else(|| p.to_owned(), |rest| Path::new("/").join(rest))
     };
-    let mut saw_symlink = false;
-    for p in local.ancestors() {
-        let meta = match std::fs::symlink_metadata(p) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(format!("{}: {err}", to_system(p).display())),
-        };
-        let symlink = meta.file_type().is_symlink();
-        saw_symlink |= symlink;
-        let writable = !symlink && meta.mode() & 0o022 != 0;
-        if meta.uid() != sys.root_uid() || writable {
-            return Err(format!(
-                "{} must be owned by root and not group/world-writable",
-                to_system(p).display()
-            ));
-        }
-        if p == root {
-            break;
-        }
-    }
-    if saw_symlink {
-        // The parents of a missing path cannot be resolved; check the longest existing prefix.
-        let existing = local.ancestors().find(|p| p.exists()).unwrap_or(root);
-        let resolved = std::fs::canonicalize(existing)
-            .map_err(|err| format!("{}: {err}", to_system(existing).display()))?;
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
-        for p in resolved.ancestors() {
-            let meta = std::fs::metadata(p).map_err(|err| format!("{}: {err}", p.display()))?;
-            if meta.uid() != sys.root_uid() || meta.mode() & 0o022 != 0 {
-                return Err(format!(
-                    "{} (which {} resolves to) must be owned by root and not \
-                     group/world-writable",
-                    p.display(),
-                    path.display()
-                ));
-            }
-            if p == root {
-                break;
-            }
-        }
-    }
-    Ok(())
+    OwnershipCheck::new(sys.root_uid(), Some(real_root.clone()), store, nixbld)
+        .check(&sys.path(path))
+        .map_err(|err| err.map_paths(to_system).to_string())
 }
 
 /// Runs a command and turns a failure into an error message.
@@ -339,5 +310,90 @@ pub fn run_checked(sys: &dyn System, program: &str, args: &[&str]) -> Result<Cmd
             output.stderr.trim()
         };
         Err(format!("`{shown}` failed: {detail}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::fake::FakeSystem;
+    use super::*;
+
+    fn chmod(sys: &FakeSystem, path: &str, mode: u32) {
+        let local = sys.path(Path::new(path));
+        std::fs::set_permissions(local, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A NixOS-like system: `/nix/store` (1775) with criu in it, reached through
+    /// `/run/current-system`, and `/etc/group` with the line `group_line(gid of the store)`.
+    fn nixos(group_line: impl FnOnce(u32) -> String) -> FakeSystem {
+        let sys = FakeSystem::new();
+        for dir in ["/nix", "/run", "/etc"] {
+            sys.mkdir(dir);
+            chmod(&sys, dir, 0o755);
+        }
+        sys.mkdir("/nix/store/abc-criu/bin");
+        sys.write_exe("/nix/store/abc-criu/bin/criu", "");
+        sys.mkdir("/nix/store/xyz-system/sw/bin");
+        for dir in [
+            "/nix/store/abc-criu",
+            "/nix/store/abc-criu/bin",
+            "/nix/store/xyz-system",
+            "/nix/store/xyz-system/sw",
+            "/nix/store/xyz-system/sw/bin",
+        ] {
+            chmod(&sys, dir, 0o755);
+        }
+        chmod(&sys, "/nix/store", 0o1775);
+        std::os::unix::fs::symlink(
+            "../../../abc-criu/bin/criu",
+            sys.path(Path::new("/nix/store/xyz-system/sw/bin/criu")),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            sys.path(Path::new("/nix/store/xyz-system")),
+            sys.path(Path::new("/run/current-system")),
+        )
+        .unwrap();
+        let gid = std::fs::metadata(sys.path(Path::new("/nix/store")))
+            .unwrap()
+            .gid();
+        sys.write("/etc/group", &format!("root:x:0:\n{}\n", group_line(gid)));
+        sys
+    }
+
+    #[test]
+    fn root_owned_chain_trusts_the_nix_store_and_follows_symlinks() {
+        let sys = nixos(|gid| format!("nixbld:x:{gid}:nixbld1"));
+        check_root_owned_chain(&sys, Path::new("/run/current-system/sw/bin/criu")).unwrap();
+        check_root_owned_chain(&sys, Path::new("/nix/store/abc-criu/bin")).unwrap();
+
+        chmod(&sys, "/nix/store/abc-criu", 0o775);
+        let err =
+            check_root_owned_chain(&sys, Path::new("/run/current-system/sw/bin/criu")).unwrap_err();
+        assert!(
+            err.starts_with("/nix/store/abc-criu (which /run/current-system/sw/bin/criu"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn root_owned_chain_refuses_a_store_without_sticky_bit_or_nixbld() {
+        let sys = nixos(|gid| format!("nixbld:x:{}:", gid + 1));
+        let err = check_root_owned_chain(&sys, Path::new("/nix/store/abc-criu/bin")).unwrap_err();
+        assert!(err.starts_with("/nix/store must be owned by root"), "{err}");
+
+        let sys = nixos(|gid| format!("nixbld:x:{gid}:"));
+        chmod(&sys, "/nix/store", 0o775);
+        assert!(check_root_owned_chain(&sys, Path::new("/nix/store/abc-criu/bin")).is_err());
+
+        // Other sticky, group-writable directories are refused.
+        let sys = nixos(|gid| format!("nixbld:x:{gid}:"));
+        sys.mkdir("/opt/bin");
+        chmod(&sys, "/opt/bin", 0o755);
+        chmod(&sys, "/opt", 0o1775);
+        let err = check_root_owned_chain(&sys, Path::new("/opt/bin")).unwrap_err();
+        assert!(err.starts_with("/opt must be owned by root"), "{err}");
     }
 }
