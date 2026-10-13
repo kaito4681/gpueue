@@ -8,6 +8,7 @@
 # `abort-upgrade <new-version>`; rpm %pre `1` (install) / `2` (upgrade).
 set -e
 
+# Must equal service::MARKER (checked by a unit test in crates/puzuz).
 MARKER='# Installed by `puzuz service install`; re-running it overwrites this file.'
 
 case "$1" in

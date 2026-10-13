@@ -923,3 +923,30 @@ fn status_reports_the_install_method() {
     let out = String::from_utf8(out).unwrap();
     assert!(out.contains("installed              mixed: "), "{out}");
 }
+
+/// The shell scripts that recognize a `service install` installation by its marker line keep
+/// their own copy of [`MARKER`] (they run without this binary); they must not drift from it.
+#[test]
+fn shell_copies_of_the_marker_match() {
+    let copies = [
+        (
+            "packaging/scripts/preinst",
+            include_str!("../../../../packaging/scripts/preinst"),
+        ),
+        (
+            "scripts/dist/deb-check.sh",
+            include_str!("../../../../scripts/dist/deb-check.sh"),
+        ),
+        (
+            "scripts/install.sh",
+            include_str!("../../../../scripts/install.sh"),
+        ),
+    ];
+    let quoted = format!("'{MARKER}'");
+    for (path, text) in copies {
+        assert!(
+            text.lines().any(|line| line.ends_with(&quoted)),
+            "{path} has no line ending with {quoted}"
+        );
+    }
+}
