@@ -71,8 +71,22 @@ The installer sets up the systemd units, the `puzuz` user, the `puzuz-admin` gro
 directories and a default /etc/puzuz/config.toml, starts the services and prints the
 `puzuz doctor` report. It does not install CRIU or cuda-checkpoint; it tells you if they are
 missing. Update later with `sudo puzuz update` (running jobs keep running; pass `--save-token`
-to the installer once, or `GH_TOKEN` each time). `--uninstall` removes it and keeps the data. Other ways to install (apt, rpm, AUR, Nix) are coming later; until then you can
+to the installer once, or `GH_TOKEN` each time). `--uninstall` removes it and keeps the data. Other ways to install (apt, rpm, Nix) are coming later; until then you can
 also build from source (see [docs/install.md](docs/install.md)).
+
+On Arch Linux (x86_64, aarch64), install the AUR package
+[`puzuz-bin`](https://aur.archlinux.org/packages/puzuz-bin) with any AUR helper instead, and
+enable the services yourself:
+
+```sh
+yay -S puzuz-bin
+sudo systemctl enable --now puzuz-helper.service puzuz.service
+sudo pacman -S criu   # for checkpoints (4.2 or newer)
+```
+
+Update with `yay -Syu` (then `sudo systemctl restart puzuz-helper.service puzuz.service`; jobs
+keep running) and remove with `sudo pacman -R puzuz-bin` (see
+[docs/install.md](docs/install.md#arch-linux-aur)).
 
 ```sh
 # Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.
