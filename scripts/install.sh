@@ -159,23 +159,29 @@ check_glibc() {
 }
 
 # The install method as `puzuz service install-method` reports it, decided
-# from the same files, for before anything is downloaded.
+# from the same files, for before anything is downloaded. A symlink to
+# /dev/null in /etc (`systemctl mask`) is never an installation, and next to
+# a packaged unit a marker-less /etc unit is its override (`systemctl edit
+# --full`); neither adds a method of its own.
 install_method() {
-    local methods=() etc=/etc/systemd/system/puzuz.service
+    local methods=() etc=/etc/systemd/system/puzuz.service package=0
     [ -e /etc/NIXOS ] && methods+=(nixos)
     if [ -f /usr/lib/systemd/system/puzuz.service ] || [ -f /lib/systemd/system/puzuz.service ]; then
         if grep -q '^ExecStart=/nix/store/' /usr/lib/systemd/system/puzuz.service /lib/systemd/system/puzuz.service 2>/dev/null; then
             methods+=(nixos)
         else
             methods+=(package)
+            package=1
         fi
     fi
-    if [ -f "$etc" ]; then
+    if [ -L "$etc" ] && [ "$(readlink "$etc")" = /dev/null ]; then
+        : # masked
+    elif [ -f "$etc" ]; then
         if [ "$(head -n1 "$etc")" = "$INSTALL_MARKER" ]; then
             methods+=(service-install)
         elif grep -q '^ExecStart=/nix/store/' "$etc"; then
             methods+=(nixos)
-        else
+        elif [ "$package" -eq 0 ]; then
             methods+=(manual)
         fi
     fi

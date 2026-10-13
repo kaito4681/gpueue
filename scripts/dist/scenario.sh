@@ -98,7 +98,17 @@ scenario_17() {
     GH_TOKEN="$TOKEN" expect_fail "checksum mismatch" bash "$install" --version "$VERSION-test.badsha"
     printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' >/usr/lib/systemd/system/puzuz.service
     GH_TOKEN="$TOKEN" expect_fail "distribution package" bash "$install"
-    rm /usr/lib/systemd/system/puzuz.service
+    # A masked or overridden package unit is still the package, not "mixed".
+    ln -s /dev/null /etc/systemd/system/puzuz.service
+    GH_TOKEN="$TOKEN" expect_fail "distribution package" bash "$install"
+    rm /etc/systemd/system/puzuz.service
+    printf '[Service]\nExecStart=/usr/bin/puzuz daemon --verbose\n' >/etc/systemd/system/puzuz.service
+    GH_TOKEN="$TOKEN" expect_fail "distribution package" bash "$install"
+    rm /etc/systemd/system/puzuz.service /usr/lib/systemd/system/puzuz.service
+    # A mask alone is no installation: the pre-download check lets it through.
+    ln -s /dev/null /etc/systemd/system/puzuz.service
+    GH_TOKEN="$TOKEN" expect_fail "release v9.9.9 not found" bash "$install" --version 9.9.9
+    rm /etc/systemd/system/puzuz.service
     touch /etc/NIXOS
     GH_TOKEN="$TOKEN" expect_fail "NixOS" bash "$install"
     rm /etc/NIXOS
