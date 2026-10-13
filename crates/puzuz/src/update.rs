@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::doctor;
-use crate::install_method::{self, InstallMethod, Method};
+use crate::install_method::{self, Detection, InstallMethod, Method};
 use crate::release_key::RELEASE_PUBKEY;
 use crate::system::System;
 
@@ -380,13 +380,13 @@ pub struct UpdateOptions {
 }
 
 /// How to update puzuz installed with `method`, for messages.
-fn how_to_update(method: &InstallMethod, version: Option<&Version>) -> String {
-    match method {
+fn how_to_update(detection: &Detection, version: Option<&Version>) -> String {
+    match &detection.install {
         InstallMethod::One(Method::ServiceInstall { .. }) => match version {
             Some(version) => format!("sudo puzuz update --version {version}"),
             None => "sudo puzuz update".to_owned(),
         },
-        InstallMethod::One(method) => method.update_hint(),
+        InstallMethod::One(method) => detection.update_hint(method),
         InstallMethod::None => "install it with install.sh (see docs/install.md)".to_owned(),
         InstallMethod::Mixed(_) => {
             "puzuz is installed in more than one way; run `puzuz doctor` first".to_owned()
@@ -396,7 +396,8 @@ fn how_to_update(method: &InstallMethod, version: Option<&Version>) -> String {
 
 /// Where the binaries of a `service install` installation are, or why `puzuz update` must not
 /// install over this one.
-fn service_install_bin_dir(method: &InstallMethod) -> Result<PathBuf> {
+fn service_install_bin_dir(detection: &Detection) -> Result<PathBuf> {
+    let method = &detection.install;
     match method {
         InstallMethod::One(Method::ServiceInstall { bin_dir: Some(dir) }) => Ok(dir.clone()),
         InstallMethod::One(Method::ServiceInstall { bin_dir: None }) => Err(
@@ -412,7 +413,7 @@ fn service_install_bin_dir(method: &InstallMethod) -> Result<PathBuf> {
         InstallMethod::One(other) => Err(format!(
             "puzuz is installed as {other}; `puzuz update` only updates what \
                  `puzuz service install` installed. To update it, {}.",
-            other.update_hint()
+            detection.update_hint(other)
         )),
         InstallMethod::Mixed(_) => Err(format!(
             "puzuz is installed in more than one way ({method}); run `puzuz doctor` and \

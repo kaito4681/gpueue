@@ -804,33 +804,37 @@ fn install_success_ignores_only_expected_no_start_failures() {
 }
 
 const PACKAGED_UNIT: &str = "/usr/lib/systemd/system/puzuz.service";
+const PACKAGED_HELPER_UNIT: &str = "/usr/lib/systemd/system/puzuz-helper.service";
+
+/// Both units from the dpkg package `puzuz`.
+fn install_package(sys: &FakeSystem) {
+    for unit in [PACKAGED_UNIT, PACKAGED_HELPER_UNIT] {
+        sys.write(unit, "[Service]\nExecStart=/usr/bin/puzuz daemon\n");
+        sys.dpkg_owns(unit, "puzuz");
+    }
+}
 
 #[test]
 fn install_refuses_a_package_managed_machine_even_with_force() {
     let sys = system();
-    sys.write(
-        PACKAGED_UNIT,
-        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
-    );
+    install_package(&sys);
     for force in [false, true] {
         let options = InstallOptions { force, ..opts() };
         let err = run_install(&sys, &options).unwrap_err();
-        assert!(err.contains("distribution package"), "{err}");
-        assert!(err.contains("package manager"), "{err}");
+        assert!(err.contains("distribution package (puzuz, dpkg"), "{err}");
+        assert!(err.contains("sudo apt update && sudo apt upgrade"), "{err}");
+        assert!(err.contains("first run `sudo apt remove puzuz`"), "{err}");
         assert!(err.contains("--force does not change this"), "{err}");
     }
     assert!(!sys.exists("/etc/systemd/system/puzuz.service"));
-    assert!(sys.commands().is_empty());
+    assert!(sys.commands_without_queries().is_empty());
 }
 
 #[test]
 fn install_refuses_a_masked_or_overridden_package_even_with_force() {
     for masked in [true, false] {
         let sys = system();
-        sys.write(
-            PACKAGED_UNIT,
-            "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
-        );
+        install_package(&sys);
         if masked {
             let local = sys.path(Path::new("/etc/systemd/system/puzuz.service"));
             std::fs::create_dir_all(local.parent().unwrap()).unwrap();
@@ -850,42 +854,43 @@ fn install_refuses_a_masked_or_overridden_package_even_with_force() {
         }
         let err = run_uninstall(&sys, false, true).unwrap_err();
         assert!(err.contains("not by `puzuz service install`"), "{err}");
-        assert!(sys.commands().is_empty());
+        assert!(sys.commands_without_queries().is_empty());
     }
 }
 
 #[test]
-fn install_refuses_nixos() {
+fn install_refuses_units_from_the_nix_store() {
     let sys = system();
-    sys.write("/etc/NIXOS", "");
-    let err = run_install(&sys, &opts()).unwrap_err();
-    assert!(err.contains("installed as NixOS"), "{err}");
-    assert!(err.contains("nixos-rebuild"), "{err}");
+    for unit in ["puzuz.service", "puzuz-helper.service"] {
+        let local = sys.path(Path::new(UNIT_DIR).join(unit).as_path());
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(format!("/nix/store/abc-{unit}"), local).unwrap();
+    }
+    for force in [false, true] {
+        let options = InstallOptions { force, ..opts() };
+        let err = run_install(&sys, &options).unwrap_err();
+        assert!(err.contains("installed as Nix"), "{err}");
+        assert!(err.contains("Nix configuration"), "{err}");
+    }
     assert!(sys.commands().is_empty());
 }
 
 #[test]
 fn uninstall_refuses_a_package_managed_machine() {
     let sys = system();
-    sys.write(
-        PACKAGED_UNIT,
-        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
-    );
+    install_package(&sys);
     let err = run_uninstall(&sys, false, true).unwrap_err();
     assert!(err.contains("not by `puzuz service install`"), "{err}");
-    assert!(err.contains("apt remove"), "{err}");
+    assert!(err.contains("sudo apt remove puzuz"), "{err}");
     assert!(sys.exists(PACKAGED_UNIT));
-    assert!(sys.commands().is_empty());
+    assert!(sys.commands_without_queries().is_empty());
 }
 
 #[test]
 fn uninstall_of_a_mixed_setup_removes_only_its_own_files() {
     let sys = system();
     run_install(&sys, &opts()).unwrap();
-    sys.write(
-        PACKAGED_UNIT,
-        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
-    );
+    install_package(&sys);
     sys.mkdir("/var/lib/puzuz/daemon");
 
     let err = run_uninstall(&sys, true, true).unwrap_err();
@@ -914,10 +919,7 @@ fn status_reports_the_install_method() {
     );
 
     run_install(&sys, &opts()).unwrap();
-    sys.write(
-        PACKAGED_UNIT,
-        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
-    );
+    install_package(&sys);
     let mut out = Vec::new();
     assert!(!status(&sys, None, &mut out).unwrap());
     let out = String::from_utf8(out).unwrap();

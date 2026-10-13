@@ -395,8 +395,9 @@ fn check_update(sys: &dyn System, config: &Config) -> Option<Check> {
 /// How puzuz is installed; two ways at once shadow each other's units.
 fn check_install_method(sys: &dyn System) -> Check {
     const NAME: &str = "install method";
-    let method = install_method::detect(sys);
-    match &method {
+    let detection = install_method::detect(sys);
+    let method = &detection.install;
+    match method {
         InstallMethod::None => Check::info(NAME, "not installed"),
         InstallMethod::One(Method::Manual { unit }) => {
             Check::info(NAME, method.to_string()).hint(format!(
@@ -422,7 +423,7 @@ fn check_install_method(sys: &dyn System) -> Check {
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(" and ");
-                    format!("to keep {kept}: {}", m.removal_hint())
+                    format!("to keep {kept}: {}", detection.removal_hint(m))
                 })
                 .collect();
             Check::fail(

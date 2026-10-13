@@ -893,13 +893,30 @@ fn marker_unit(bin_dir: &str) -> String {
     )
 }
 
+fn write_both(sys: &FakeSystem, dir: &str, contents: &str) {
+    for unit in ["puzuz.service", "puzuz-helper.service"] {
+        sys.write(&format!("{dir}/{unit}"), contents);
+    }
+}
+
+/// Both units from the dpkg package `puzuz`.
+fn install_package(sys: &FakeSystem) {
+    for unit in ["puzuz.service", "puzuz-helper.service"] {
+        let unit = format!("/usr/lib/systemd/system/{unit}");
+        sys.write(&unit, "[Service]\nExecStart=/usr/bin/puzuz daemon\n");
+        sys.dpkg_owns(&unit, "puzuz");
+    }
+}
+
 #[test]
 fn install_method_is_reported() {
     let (sys, _sockets) = healthy();
+    std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz-helper.service"))).unwrap();
     assert_eq!(message(&run(&sys, None), "install method"), "not installed");
 
-    sys.write(
-        "/etc/systemd/system/puzuz.service",
+    write_both(
+        &sys,
+        "/etc/systemd/system",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
     );
     let report = run(&sys, None);
@@ -907,10 +924,7 @@ fn install_method_is_reported() {
     assert!(message(&report, "install method").starts_with("by hand"));
     assert!(hint(&report, "install method").contains("--force"));
 
-    sys.write(
-        "/etc/systemd/system/puzuz.service",
-        &marker_unit("/usr/local/bin"),
-    );
+    write_both(&sys, "/etc/systemd/system", &marker_unit("/usr/local/bin"));
     let report = run(&sys, None);
     assert_eq!(level(&report, "install method"), Level::Ok);
     assert_eq!(
@@ -922,10 +936,7 @@ fn install_method_is_reported() {
 #[test]
 fn a_masked_or_overridden_package_does_not_fail() {
     let (sys, _sockets) = healthy();
-    sys.write(
-        "/usr/lib/systemd/system/puzuz.service",
-        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
-    );
+    install_package(&sys);
     sys.write(
         "/etc/systemd/system/puzuz.service",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
@@ -950,18 +961,12 @@ fn a_masked_or_overridden_package_does_not_fail() {
 #[test]
 fn mixed_install_methods_fail() {
     let (sys, _sockets) = healthy();
-    sys.write(
-        "/etc/systemd/system/puzuz.service",
-        &marker_unit("/usr/local/bin"),
-    );
-    sys.write(
-        "/usr/lib/systemd/system/puzuz.service",
-        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
-    );
+    write_both(&sys, "/etc/systemd/system", &marker_unit("/usr/local/bin"));
+    install_package(&sys);
     let report = run(&sys, None);
     assert_eq!(level(&report, "install method"), Level::Fail);
     assert!(message(&report, "install method").starts_with("mixed: "));
     let hint = hint(&report, "install method");
     assert!(hint.contains("sudo puzuz service uninstall"), "{hint}");
-    assert!(hint.contains("apt remove"), "{hint}");
+    assert!(hint.contains("sudo apt remove puzuz"), "{hint}");
 }

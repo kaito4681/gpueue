@@ -92,6 +92,26 @@ impl FakeSystem {
         self.responses.borrow_mut().push((prefix.to_owned(), None));
     }
 
+    /// Makes `dpkg-query -S <path>` report that `package` owns the system path `path`.
+    pub fn dpkg_owns(&self, path: &str, package: &str) {
+        self.respond(
+            &format!("dpkg-query -S {path}"),
+            CmdOutput::ok(format!("{package}: {path}\n")),
+        );
+    }
+
+    /// Commands run so far, without the package-owner queries of install method detection.
+    pub fn commands_without_queries(&self) -> Vec<String> {
+        self.commands()
+            .into_iter()
+            .filter(|line| {
+                !["dpkg-query ", "rpm ", "pacman "]
+                    .iter()
+                    .any(|query| line.starts_with(query))
+            })
+            .collect()
+    }
+
     /// Writes a file at a system path, creating parent directories.
     pub fn write(&self, path: &str, contents: &str) {
         let path = self.path(Path::new(path));

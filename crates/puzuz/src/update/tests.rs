@@ -469,13 +469,14 @@ fn only_service_install_is_updated() {
         "/usr/lib/systemd/system/puzuz.service",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
     );
+    sys.dpkg_owns("/usr/lib/systemd/system/puzuz.service", "puzuz");
     std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
     let err = run(&sys, &opts(false, None)).unwrap_err();
     assert!(err.contains("installed as distribution package"), "{err}");
-    assert!(err.contains("package manager"), "{err}");
+    assert!(err.contains("sudo apt update && sudo apt upgrade"), "{err}");
     // Checking still works and names the right tool.
     let out = run(&sys, &opts(true, None)).unwrap();
-    assert!(out.contains("package manager"), "{out}");
+    assert!(out.contains("sudo apt update && sudo apt upgrade"), "{out}");
 
     let sys = system();
     std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
@@ -492,6 +493,7 @@ fn the_install_method_is_checked_before_contacting_github() {
         "/usr/lib/systemd/system/puzuz.service",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
     );
+    sys.dpkg_owns("/usr/lib/systemd/system/puzuz.service", "puzuz");
     std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
     sys.env.borrow_mut().remove("GH_TOKEN");
     sys.serve(&format!("{REPO_API}/releases/latest"), 404, "{}");

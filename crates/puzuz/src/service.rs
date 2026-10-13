@@ -14,7 +14,7 @@ use std::time::Duration;
 use puzuz_daemon::config::DEFAULT_CONFIG_PATH;
 
 use crate::doctor::{self, Report};
-use crate::install_method::{self, InstallMethod};
+use crate::install_method::{self, Detection, InstallMethod};
 use crate::system::{System, check_root_owned_chain, run_checked};
 
 pub const DAEMON_UNIT: &str = "puzuz.service";
@@ -350,14 +350,14 @@ fn check_foreign_files(sys: &dyn System, files: &[InstallFile], force: bool) -> 
 /// Refuses to touch a machine where a package manager or NixOS manages puzuz: the units in
 /// /etc would shadow the packaged ones, and both would share /etc/puzuz and /var/lib/puzuz.
 /// `--force` does not override this.
-fn check_install_method(method: &InstallMethod) -> Result<()> {
+fn check_install_method(method: &Detection) -> Result<()> {
     let Some(managed) = method.managed_elsewhere() else {
         return Ok(());
     };
     let mut message = format!(
         "puzuz is installed as {managed}; `puzuz service install` would conflict with it \
          (--force does not change this). To update it, {}.",
-        managed.update_hint()
+        method.update_hint(managed)
     );
     if method.has_service_install() {
         message.push_str(
@@ -367,7 +367,7 @@ fn check_install_method(method: &InstallMethod) -> Result<()> {
     } else {
         message.push_str(&format!(
             " To switch to `puzuz service install`, first {}.",
-            managed.removal_hint()
+            method.removal_hint(managed)
         ));
     }
     Err(message)
@@ -499,7 +499,7 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
         if !method.has_service_install() {
             return Err(format!(
                 "puzuz is installed as {managed}, not by `puzuz service install`; {}",
-                managed.removal_hint()
+                method.removal_hint(managed)
             ));
         }
         if options.purge {
@@ -700,7 +700,7 @@ fn remove_tree_inner(
 /// `puzuz service status`. Returns whether both services run and are connected.
 pub fn status(sys: &dyn System, socket: Option<&Path>, out: &mut dyn Write) -> io::Result<bool> {
     let mut healthy = true;
-    let method = install_method::detect(sys);
+    let method = install_method::detect(sys).install;
     healthy &= !matches!(method, InstallMethod::Mixed(_));
     writeln!(out, "{:<22} {method}", "installed")?;
     for unit in [HELPER_UNIT, DAEMON_UNIT] {
