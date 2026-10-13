@@ -60,18 +60,31 @@ jobs:
           docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:v0.10.0 \
             -S warning $(git ls-files '*.sh' 'packaging/scripts/*')
 
-  # flake.nix: evaluate the outputs, then build puzuz (which runs the tests
-  # that work in the Nix sandbox) and CRIU on both architectures.
+  # flake.nix: evaluate the outputs and run the checks (the home-manager
+  # module evaluation; on x86_64 also the NixOS VM test of the module, which
+  # needs KVM), then build puzuz (which runs the tests that work in the Nix
+  # sandbox) and CRIU on both architectures.
   nix:
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      # GitHub's x86_64 Linux runners have /dev/kvm, but only for root.
+      - name: Enable KVM
+        if: matrix.runner == 'ubuntu-24.04'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
       - run: nix flake check -L
       - run: nix build -L .#default
       - run: |

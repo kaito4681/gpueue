@@ -37,5 +37,13 @@
 
       # services.puzuz: the daemon, the root helper and the CLI.
       nixosModules.default = import ./nix/nixos-module.nix { inherit self; };
+
+      checks = forAllSystems (
+        pkgs:
+        # A NixOS VM test of the module; it needs KVM.
+        nixpkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
+          nixos = import ./nix/tests/nixos.nix { inherit self pkgs; };
+        }
+      );
     };
 }
