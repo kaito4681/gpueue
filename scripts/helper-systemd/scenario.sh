@@ -148,6 +148,72 @@ EOF
 )"
 grep -q 'got TERM' /var/lib/puzuz/logs/1000/2.log || fail "SIGTERM did not reach the job"
 
+say "TSTP, ALRM and WINCH reach the job, not the root shim; unforwardable signals are refused"
+client "$(steps <<'EOF'
+[
+ {"send": {"op": "spawn", "job": 60, "uid": 1000, "gid": 1000, "cwd": "/home/alice",
+           "command": "trap 'echo got ALRM' ALRM; trap 'echo got WINCH' WINCH; while :; do sleep 0.1; done",
+           "shell": ["sh", "-c"], "envs": {"PATH": "/usr/bin:/bin"}, "gpus": [],
+           "log_path": "/var/lib/puzuz/logs/1000/60.log"},
+  "expect": {"result": "spawned"}},
+ {"sleep": 0.5},
+ {"send": {"op": "signal", "job": 60, "signal": 14}, "expect": {"result": "ok"}},
+ {"send": {"op": "signal", "job": 60, "signal": 28}, "expect": {"result": "ok"}},
+ {"sleep": 0.5},
+ {"send": {"op": "signal", "job": 60, "signal": 20}, "expect": {"result": "ok"}},
+ {"sleep": 0.5},
+ {"send": {"op": "signal", "job": 60, "signal": 11}, "expect": {"result": "error", "code": "invalid_request"}},
+ {"send": {"op": "signal", "job": 60, "signal": 34}, "expect": {"result": "error", "code": "invalid_request"}}
+]
+EOF
+)"
+grep -q 'got ALRM' /var/lib/puzuz/logs/1000/60.log || fail "SIGALRM did not reach the job"
+grep -q 'got WINCH' /var/lib/puzuz/logs/1000/60.log || fail "SIGWINCH did not reach the job"
+systemctl is-active puzuz-job-60.service >/dev/null || fail "SIGALRM ended the job's unit"
+job_sh=$(pgrep -u alice -f 'got ALRM' | head -1)
+shim=$(systemctl show -p MainPID --value puzuz-job-60.service)
+echo "job shell $job_sh: $(ps -o stat= -p "$job_sh"); outer shim $shim: $(ps -o stat= -p "$shim")"
+ps -o stat= -p "$job_sh" | grep -q T || fail "SIGTSTP did not stop the job"
+ps -o stat= -p "$shim" | grep -q T && fail "SIGTSTP stopped the root shim"
+client "$(steps <<'EOF'
+[
+ {"send": {"op": "signal", "job": 60, "signal": 18}, "expect": {"result": "ok"}},
+ {"send": {"op": "signal", "job": 60, "signal": 9}, "expect": {"result": "ok"}},
+ {"event": {"event": "job_exited", "job": 60, "status": {"kind": "signaled", "signal": 9}}, "ack": true}
+]
+EOF
+)"
+
+say "dumps of jobs with a relatively bound Unix socket or a SO_REUSEPORT socket are refused"
+client "$(steps <<'EOF'
+[
+ {"send": {"op": "spawn", "job": 62, "uid": 1000, "gid": 1000, "cwd": "/home/alice",
+           "command": "exec python3 -c \"import socket, time; s = socket.socket(socket.AF_UNIX); s.bind('ctl.sock'); s.listen(1); time.sleep(600)\"",
+           "shell": ["sh", "-c"], "envs": {"PATH": "/usr/bin:/bin"}, "gpus": [],
+           "log_path": "/var/lib/puzuz/logs/1000/62.log"},
+  "expect": {"result": "spawned"}},
+ {"send": {"op": "spawn", "job": 64, "uid": 1000, "gid": 1000, "cwd": "/home/alice",
+           "command": "exec python3 -c \"import socket, time; s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1); s.bind(('127.0.0.1', 0)); s.listen(1); time.sleep(600)\"",
+           "shell": ["sh", "-c"], "envs": {"PATH": "/usr/bin:/bin"}, "gpus": [],
+           "log_path": "/var/lib/puzuz/logs/1000/64.log"},
+  "expect": {"result": "spawned"}},
+ {"sleep": 1.5},
+ {"send": {"op": "checkpoint", "job": 62, "image_dir": "/var/lib/puzuz/checkpoints/62"},
+  "expect": {"result": "error", "code": "checkpoint_refused"}},
+ {"send": {"op": "checkpoint", "job": 64, "image_dir": "/var/lib/puzuz/checkpoints/64"},
+  "expect": {"result": "error", "code": "checkpoint_refused"}},
+ {"send": {"op": "list_running"}, "expect": {"result": "running", "jobs": [{"job": 62, "phase": "running"}, {"job": 64, "phase": "running"}]}},
+ {"batch": [{"op": "signal", "job": 62, "signal": 9}, {"op": "signal", "job": 64, "signal": 9}], "expect": {"result": "ok"}},
+ {"events": {"event": "job_exited", "status": {"kind": "signaled", "signal": 9}}, "count": 2, "ack": true}
+]
+EOF
+)"
+journalctl -u puzuz-helper.service --no-pager | grep -q 'relative names' \
+    || fail "no refusal of the relatively bound socket in the helper's log"
+journalctl -u puzuz-helper.service --no-pager | grep -q 'SO_REUSEPORT (127.0.0.1:' \
+    || fail "no refusal of the SO_REUSEPORT socket in the helper's log"
+rm -f /home/alice/ctl.sock
+
 say "many spawns at once (bob's log directory does not exist yet)"
 client "$(steps <<EOF
 [
@@ -237,6 +303,20 @@ EOF
   "expect": {"result": "accepted"}},
  {"event": {"event": "restore_finished", "job": 3, "outcome": {"result": "success"}}, "timeout": 120, "ack": true},
  {"sleep": 1.5},
+ {"send": {"op": "signal", "job": 3, "signal": 20}, "expect": {"result": "ok"}}
+]
+EOF
+)"
+    # The restored init forwards TSTP too: the counter stops.
+    sleep 0.5
+    stopped=$(tail -n1 /var/lib/puzuz/logs/1000/3.log)
+    sleep 1
+    [ "$(tail -n1 /var/lib/puzuz/logs/1000/3.log)" = "$stopped" ] \
+        || fail "SIGTSTP did not stop the restored job"
+    client "$(steps <<'EOF'
+[
+ {"send": {"op": "signal", "job": 3, "signal": 18}, "expect": {"result": "ok"}},
+ {"sleep": 1},
  {"send": {"op": "signal", "job": 3, "signal": 15}, "expect": {"result": "ok"}},
  {"event": {"event": "job_exited", "job": 3, "status": {"kind": "signaled", "signal": 15}}, "ack": true}
 ]
