@@ -1,0 +1,1526 @@
+<a id="installing-and-operating-puzuz"></a>
+# puzuz のインストールと運用
+
+[English](../install.md) | 日本語 | [简体中文](../zh-CN/install.md)
+
+<!--
+Anchor convention for translations (docs/ja/, docs/zh-CN/, README.ja.md, README.zh-CN.md):
+every heading is preceded by an explicit anchor whose id is the GitHub slug of the matching
+English heading (including the "-1" suffix GitHub adds to duplicates), e.g.
+
+  <a id="install-method"></a>
+  ### インストール方法
+
+Links within and between the translated pages use these English ids and point to the page of
+the same language (README.ja.md -> docs/ja/install.md#criu). Links to repository files from
+docs/<lang>/ go up two levels (../../packaging/...). Code blocks are copied unchanged.
+-->
+
+このガイドはマシンの管理者向けです。一般ユーザーに必要なのは、`PATH` 上の `puzuz` コマンドだけです。
+
+- [要件](#requirements)
+- [install.sh でのインストール](#installing-with-installsh)
+- [Debian/Ubuntu パッケージのインストール](#installing-the-debianubuntu-package)
+- [Fedora/RHEL/Rocky パッケージのインストール](#installing-the-fedorarhelrocky-package)
+- [Nix でのインストール](#installing-with-nix)
+- [Arch Linux (AUR)](#arch-linux-aur)
+- [ビルド](#building)
+- [インストール](#installing)
+- [確認](#verifying)
+- [設定](#configuration)
+- [管理者](#administrators)
+- [GPU の検出](#gpu-detection)
+- [チェックポイントの保存先](#checkpoint-storage)
+- [アップグレード](#upgrading)
+- [アンインストール](#uninstalling)
+- [トラブルシューティング](#troubleshooting)
+
+<a id="requirements"></a>
+## 要件
+
+| コンポーネント | 要件 | テスト環境 |
+| --- | --- | --- |
+| OS | init が systemd の Linux、x86_64 または aarch64（リリースは両方向けにビルド） | Ubuntu（PID 1 が systemd の Docker イメージ）、x86_64 |
+| systemd | 240 以降（`puzuz doctor` が確認します） | 259 |
+| カーネル | `CONFIG_CHECKPOINT_RESTORE=y`（`/proc/sys/kernel/ns_last_pid` が存在すること）、PID 名前空間とマウント名前空間。5.5 以降を推奨（`set_tid` 付きの `clone3`。CRIU が PID のリストアに使用）、`open_tree`/`move_mount` には 5.2 以降（隠れたマウントの整理に使用）、リストアには 5.8 以降（`openat2`、`faccessat2`、`statx` のマウント ID。リストアが開くものの確認に使用） | 7.0 |
+| CRIU | 4.2 以降 | 4.2（ディストリビューションのパッケージ）、4.2.1 |
+| NVIDIA ドライバー（GPU ジョブ） | `cuda-checkpoint` が `--action lock/checkpoint/restore/unlock` と `--timeout` に対応したドライバー：r570 以降（cuda-checkpoint 自体は r550 に対応していますが、`--toggle` のみで、puzuz はこれを使いません） | 595 |
+| cuda-checkpoint（GPU ジョブ） | NVIDIA のバイナリ。メジャーバージョンがドライバーと同じもの | 595 |
+| nvidia-smi（GPU ジョブ） | ヘルパーが CUDA プロセスと GPU メモリを調べるのに使います | ドライバー付属 |
+| Rust（ビルド時のみ） | 1.88 以降と、ヘルパーの fork ガードライブラリ用の C コンパイラー（`cc`） | 1.98.1 |
+
+NVIDIA ドライバーがなくても、puzuz は CPU のみのジョブを実行でき、それらのチェックポイントも取れます。
+
+<a id="criu"></a>
+### CRIU
+
+チェックポイントには CRIU 4.2 以降が必要です。CRIU がなくてもジョブは実行できます。`puzuz doctor` は CRIU が
+ない場合や古い場合に報告します。ディストリビューションのパッケージが十分に新しいのは Ubuntu 26.04
+（`sudo apt install criu`、universe）、Fedora（`sudo dnf install criu`、4.2）、Arch
+（`sudo pacman -S criu`）です。Ubuntu 22.04（3.16）、Ubuntu 24.04（パッケージなし）、Debian 12（3.17）、
+Debian 13（4.1）、RHEL/Rocky/Alma 9（3.19）では足りません。<https://criu.org/Installation> に従って CRIU を
+ソースからビルドする（上流のリリース tarball を `make` し、`sudo make install` で `/usr/local/sbin` に
+インストール）か、`/etc/puzuz/config.toml` の `criu_path` で root が所有するビルドを指定してください。
+`.deb` と `.rpm` は `criu` を推奨するだけなので、これらのリリースでは apt や dnf は古いパッケージを
+インストールするか、何もインストールしません。ヘルパーの `PATH` では `/usr/local/sbin` の CRIU が優先されます。
+デフォルトの **manual** モード（`cuda_checkpoint_mode = "manual"`）では、ヘルパーが自分で cuda-checkpoint を
+呼び出し、CRIU をプラグインなしで実行します。ディストリビューションのパッケージは CRIU の CUDA プラグインを
+含んでいませんが、この用途には使えます。
+
+**plugin** モード（`cuda_checkpoint_mode = "plugin"`）では、代わりに CRIU の CUDA プラグイン
+（`cuda_plugin.so`、CRIU 4.0 以降）が cuda-checkpoint を操作します。これは任意です。
+[CUDA プラグインモード](#cuda-plugin-mode) を参照してください。
+
+<a id="cuda-checkpoint"></a>
+### cuda-checkpoint
+
+NVIDIA は cuda-checkpoint をビルド済みのバイナリとして <https://github.com/NVIDIA/cuda-checkpoint> の
+`bin/x86_64_Linux/cuda-checkpoint`（arm64 では `bin/aarch64_Linux/`）で配布しています。root の `PATH` で
+見つかる場所に、root の所有で、他のユーザーが書き込めない状態で置いてください。
+
+```sh
+sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpoint
+```
+
+別の場所に置いて、`/etc/puzuz/config.toml` で `cuda_checkpoint_path` を設定することもできます。ヘルパーは
+`criu`、`cuda-checkpoint`、`nvidia-smi` を root として実行するので、それらの絶対パスは root の所有でなければ
+なりません。root が所有するシンボリックリンクはたどられ、リンク先も同じように確認されます。また
+`/nix/store`（root の所有、sticky、グループ `nixbld`）はグループ書き込み可能ですが受け入れられるので、NixOS の
+`/run/current-system/sw/bin/criu` のようなパスも使えます。
+
+<a id="installing-with-installsh"></a>
+## install.sh でのインストール
+
+`scripts/install.sh` は、x86_64 と aarch64 の Linux に puzuz をインストールする通常の方法です（Debian と
+Ubuntu では [パッケージ](#installing-the-debianubuntu-package) も選べます）。すべてのリリースに添付されて
+います。リリースの tarball をダウンロードして検証し、そのリリースの `puzuz service install` を実行します。
+これはバイナリを `/usr/local/bin` にコピーします（何をするかは [インストール](#installing) を参照）。
+
+<a id="github-token-optional"></a>
+### GitHub のトークン（任意）
+
+ダウンロードに GitHub のトークンは不要です。トークンは、匿名リクエストに対する GitHub API のレート制限
+（IP アドレスごとに 1 時間あたり 60 回。共有の NAT では使い切ることがあります）を上げるだけです。どんな
+トークンでも使えます。fine-grained のトークンには権限は必要ありません。`install.sh` は次の順序でトークンを
+探し、見つかれば使います。
+
+1. 環境変数 `GH_TOKEN` または `GITHUB_TOKEN`
+2. `--token-file FILE`（FILE の 1 行目）
+3. `sudo` を実行したユーザーとして実行する `gh auth token`（GitHub CLI がインストールされ、ログイン済みの場合）
+4. `--save-token` が書き込む `/etc/puzuz/github-token`（root の所有、モード 0600）
+
+トークンはヘッダーファイルで `curl` に渡されるので、`ps` や出力には現れません。トークンが拒否された場合は
+そう伝えるメッセージで失敗します。`--version X` で 404 になった場合は、そのリリースが存在しないという
+意味です。
+
+<a id="running-the-installer"></a>
+### インストーラーの実行
+
+```sh
+curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
+```
+
+スクリプトをパイプで渡す場合、オプションは `bash -s --` のあとに書きます（たとえば
+`... | sudo bash -s -- --version 0.2.0`）。ダウンロードしたファイルを使う場合はファイル名のあとに書きます
+（`sudo bash install.sh --version 0.2.0`）。
+
+| オプション | 意味 |
+| --- | --- |
+| `--version X` | 最新のリリースではなくバージョン X をインストールします |
+| `--bin-dir DIR` | デフォルト（現在のインストール先のディレクトリ、なければ `/usr/local/bin`）以外の場所にインストールします |
+| `--token-file FILE` | トークンを FILE から読み込みます |
+| `--save-token` | `puzuz update` や以降の実行のために、トークンを `/etc/puzuz/github-token`（root、0600）に保存します |
+| `--uninstall` | インストール済みの `puzuz uninstall` で puzuz を削除します（[アンインストール](#uninstalling) を参照） |
+| `--purge` | `--uninstall` と一緒に使い、`/etc/puzuz` と `/var/lib/puzuz` も削除します |
+| `-y`、`--yes` | purge の前に確認しません |
+
+トークンが保存されるのは `--save-token` を付けたときだけです。そうしておけば、期限切れや失効したトークンが、
+どのトークンが使われたのか気づかないうちに以降の実行を失敗させることはありません。
+
+`install.sh` は何かをダウンロードする前に、root として実行されていること、systemd が PID 1 であること、
+マシンが glibc 2.34 以降の x86_64 または aarch64 であること、puzuz がパッケージマネージャーや Nix で
+インストールされていないこと（[インストール方法](#install-method) を参照）を確認します。最後の確認では、
+インストール済みの puzuz（ユニットが実行するもの、なければ `PATH` にあるもの）に
+`puzuz service install-method` で問い合わせます。インストール済みの puzuz がなければ、明らかな場合
+（`/etc/os-release` による NixOS、パッケージが所有するユニット、`/nix/store` にリンクされたユニット）だけを
+自分で拒否し、残りはダウンロードしたバイナリが何かをインストールする前に判断します。その後、次のことを
+行います。
+
+1. リリースを調べます（`/repos/kaito4681/puzuz/releases/latest` または `/releases/tags/v<X>`）。
+2. `puzuz-v<X>-<target>.tar.gz`（`x86_64-unknown-linux-gnu` または `aarch64-unknown-linux-gnu`）と
+   その `.sha256` ファイルを一時ディレクトリにダウンロードし、チェックサムを確認します。
+3. `minisign` がインストールされていれば、スクリプトに組み込まれたリリース鍵（`packaging/minisign.pub`）で
+   `.minisig` の署名も確認します。`minisign` がなければ、署名を確認しなかったことを伝えます。
+4. tarball を展開し（リンクや tarball の外を指すパスは拒否します）、新しい `puzuz service install` を実行し
+   （現在のインストール先のディレクトリを維持し、なければ `/usr/local/bin` を使います。`--bin-dir` は指定
+   した場合にだけ渡されます）、その `puzuz doctor` のレポートを表示します。
+5. CRIU と cuda-checkpoint がなければ、そのインストール方法を表示します。それらを自分でインストールする
+   ことはありません。
+
+`puzuz doctor` のチェックの一部だけが失敗し（たとえば CRIU がない）、サービスは動いている場合、
+`install.sh` は警告付きで成功します。
+
+以後は `sudo puzuz update` で更新します（[アップグレード](#upgrading) を参照）。`install.sh` を再度実行しても、
+最新の（または指定した）バージョンがインストール済みのものの上にインストールされます。どちらの方法でも
+実行中のジョブは動き続けます。
+
+Debian と Ubuntu では代わりに [.deb](#installing-the-debianubuntu-package) を、Fedora、RHEL、Rocky、
+Alma Linux では [.rpm](#installing-the-fedorarhelrocky-package) を、どこでも [Nix](#installing-with-nix) を、
+Arch Linux では公開後に [AUR パッケージ](#arch-linux-aur) を使えます（それまでは上記のように `install.sh` を
+使ってください）。以下で説明するようにソースからビルドすることもできます。
+
+<a id="verifying-a-release-by-hand"></a>
+### リリースを手動で検証する
+
+各リリースには、ターゲット（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`）ごとに
+`.sha256` と `.minisig` ファイル付きの `puzuz-v<X>-<target>.tar.gz`、同じ 2 つのファイルがそれぞれに付いた
+パッケージ `puzuz_<X>_amd64.deb`、`puzuz_<X>_arm64.deb`、`puzuz-<X>-1.x86_64.rpm`、
+`puzuz-<X>-1.aarch64.rpm`、そして `install.sh` があります。tarball（またはパッケージ）を自分で確認するには
+次のようにします。
+
+```sh
+sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.pub
+```
+
+<a id="the-release-signing-key-maintainers"></a>
+### リリースの署名鍵（メンテナー向け）
+
+リリースは `.github/workflows/release.yml` で、リポジトリのシークレット `MINISIGN_SECRET_KEY` と
+`MINISIGN_PASSWORD` に保存された minisign の秘密鍵で署名されます。公開鍵は `puzuz` に組み込まれる
+`packaging/minisign.pub` と、`scripts/install.sh` の `MINISIGN_PUBKEY` です。本物の鍵が作られるまで
+リポジトリにはテスト用の鍵が入っており、リリースのワークフローはその鍵では実行を拒否します。本物の鍵を一度
+だけ作るには次のようにします。
+
+```sh
+scripts/dist/gen-signing-key.sh        # asks for a password; writes the secret key under ~
+gh secret set MINISIGN_SECRET_KEY -R kaito4681/puzuz < ~/puzuz-release-key-*/minisign.key
+gh secret set MINISIGN_PASSWORD -R kaito4681/puzuz
+git commit packaging/minisign.pub scripts/install.sh
+```
+
+秘密鍵とそのパスワードはバックアップしてください。新しい鍵で署名されたリリースを `puzuz update` が受け入れる
+には、その前に `puzuz` の新しいリリースが必要です。リリースはドラフトとして作成されます。GitHub でドラフトを
+公開してください。公開しないと、`install.sh`（公開済みの最新リリースを問い合わせる）からは見えません。
+
+<a id="installing-the-debianubuntu-package"></a>
+## Debian/Ubuntu パッケージのインストール
+
+各リリースには、Debian 12 と Ubuntu 22.04、24.04、26.04 向けに、amd64 と arm64 の `.deb` があります
+（どちらかは `dpkg --print-architecture` で分かります）。リリースから `puzuz_<version>_<arch>.deb` を
+ダウンロードし、apt でインストールします。apt は依存するものも一緒に入れます。
+
+```sh
+sudo apt install ./puzuz_0.1.0_amd64.deb
+```
+
+パッケージの内容：
+
+| パス | |
+| --- | --- |
+| `/usr/bin/puzuz`、`/usr/bin/puzuz-helper` | バイナリ |
+| `/usr/lib/systemd/system/puzuz.service`、`puzuz-helper.service` | ユニット（`ExecStart=/usr/bin/...`） |
+| `/usr/lib/sysusers.d/puzuz.conf`、`/usr/lib/tmpfiles.d/puzuz.conf` | `puzuz` ユーザー、`puzuz-admin` グループ、ディレクトリ |
+| `/etc/puzuz/config.toml` | デフォルトの設定（conffile：アップグレードしても編集内容は保持されます） |
+| `/etc/apt/sources.list.d/puzuz.sources`、`/etc/apt/keyrings/puzuz.gpg` | puzuz の APT リポジトリとその署名鍵（conffile、後述） |
+| `/usr/share/bash-completion`、`zsh/vendor-completions`、`fish/vendor_completions.d` | シェルの補完 |
+| `/usr/share/doc/puzuz` | README、このガイド、アーキテクチャの説明、ライセンス |
+
+初回のインストールでは、ユーザー、グループ、ディレクトリを作成し、`puzuz-helper.service` と
+`puzuz.service` を有効化して起動します。結果は `puzuz doctor` で確認してください。systemd が PID 1 でない
+場合（ビルド中のコンテナイメージ、chroot）は、サービスは有効化されるだけで、次の起動時に開始します。
+`install.sh` と異なり、パッケージは設定に `[[gpus]]` のエントリーを追加しません。GPU は起動時に NVML が
+見つけます（[GPU の検出](#gpu-detection) を参照）。
+
+systemd 240 以降に依存し、`criu` は**推奨**するだけです。サポート対象のほとんどのリリースでは、
+ディストリビューションの CRIU はないか 4.2 より古いためです（[CRIU](#criu) を参照）。CRIU がなくてもジョブは
+実行できますが、チェックポイントには必要で、`puzuz doctor` は CRIU がない場合や古い場合に報告します。GPU
+ジョブ用の cuda-checkpoint は [cuda-checkpoint](#cuda-checkpoint) で説明したように手動でインストールします。
+
+`puzuz service install`（または `install.sh`）で puzuz をインストールしたマシンには、パッケージは
+インストールを拒否します。まず `sudo puzuz uninstall` でそれを削除してください（このコマンドのない古い
+puzuz では `install.sh --uninstall`）。実行中のジョブ、`/etc/puzuz`、`/var/lib/puzuz` は残ります。
+`puzuz doctor` と `puzuz service install-method` はパッケージによるインストールをディストリビューションの
+`package` として報告し、`puzuz service install`、`install.sh`、`puzuz update` はそれに手を出しません。
+
+**更新。** パッケージは puzuz の APT リポジトリを登録します。これは GitHub リリース `apt`
+（`https://github.com/kaito4681/puzuz/releases/download/apt/`、`/etc/apt/keyrings/puzuz.gpg` の鍵で署名）
+にあるフラットリポジトリです。そのため `.deb` を手動でインストールするのは 1 回だけで、以降のバージョンは
+システムの他の部分と一緒に入ります。
+
+```sh
+sudo apt update && sudo apt upgrade
+```
+
+リポジトリには amd64 と arm64 の安定版リリース（プレリリースは含みません）が、それぞれ最新の 5 バージョン
+あります。アップグレードは動作中のサービスを再起動します。`puzuz update` と同様に、実行中のジョブは動き
+続けます（[アップグレード](#upgrading) を参照）。`/etc/puzuz/config.toml` と
+`/etc/apt/sources.list.d/puzuz.sources` の編集内容は保持されます。`/etc/apt/keyrings/puzuz.gpg` は、変更して
+いなければ新しいバージョンの keyring で置き換えられます（新しい署名鍵はこうして届きます）。新しいリリースの
+アップロード中は、`apt update` がハッシュの不一致やファイルの欠落で一時的に失敗することがあります。1 分ほど
+して再実行すれば直ります。
+
+**リポジトリを手動で追加する。** リリースページから最初の `.deb` をインストールする代わりに、リポジトリを
+追加してそこからインストールすることもできます。ファイル名と内容は次のとおり正確にしてください（パッケージが
+インストールするものと同じなので、あとでパッケージがそれらについて尋ねることはありません）。
+
+```sh
+sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
+sudo apt update && sudo apt install puzuz
+```
+
+**リポジトリの鍵。** パッケージ、リポジトリ、`.rpm` ファイルは 1 つの GPG 鍵（ソースツリーの
+`packaging/apt/puzuz-archive-keyring.gpg`）で署名されています。フィンガープリントは
+`E539 7032 5A39 7378 537B C776 20B6 B72F 9F55 85C2` です。ダウンロードした鍵を信頼する前に確認するには
+次のようにします。
+
+```console
+$ gpg --show-keys /etc/apt/keyrings/puzuz.gpg
+pub   rsa4096 2026-10-13 [SC]
+      E53970325A397378537BC77620B6B72F9F5585C2
+uid                      puzuz APT repository <https://github.com/kaito4681/puzuz>
+```
+
+**削除。**
+
+```sh
+sudo apt remove puzuz    # stop and disable the services, remove the binaries and units
+sudo apt purge puzuz     # also delete /etc/puzuz and the APT repository entry and key
+```
+
+`remove` はリポジトリのエントリーとその鍵（どちらも conffile）を残すので、`apt update` は引き続き動作し、
+`sudo apt install puzuz` で puzuz を戻せます。どちらも `/var/lib/puzuz`（状態、ジョブのログ、チェック
+ポイントのイメージ）、`puzuz` ユーザー、`puzuz-admin` グループを残し、実行中のジョブには決して触れません。
+ジョブはそれぞれの `puzuz-job-*` ユニットで動き続けます。`purge` は `/var/lib/puzuz` の削除方法を表示します
+（ジョブがまだ動いていればまず `sudo systemctl stop 'puzuz-job-*'`、その後 `sudo rm -rf /var/lib/puzuz`）。
+
+<a id="the-apt-repository-maintainers"></a>
+### APT リポジトリ（メンテナー向け）
+
+リポジトリは、リリース `apt`（プレリリースなので、`install.sh` と `puzuz update` がたどる「最新」リリース
+になることはありません）のアセットの集まりです。`.deb` ファイル、`Packages`、`Packages.gz`、`Release`、
+`InRelease`、`Release.gpg`、公開鍵 `puzuz.gpg`、`puzuz.sources` です。リリースが**安定版リリースとして
+公開されたとき**（`released` イベント：安定版リリースの公開、またはプレリリースの安定版への変更）、
+`.github/workflows/release-apt.yml` が `scripts/dist/apt-repo.sh github <tag>` でリポジトリを更新します。
+リリースの `.deb` ファイルを（チェックサムと、タグのコミットの公開鍵による minisign の署名を確認したあとで）
+追加し、アーキテクチャごとに最新の 5 バージョン（Debian のバージョン順）以外を削除し、インデックスを再生成
+して署名し（保持する最新のパッケージから `puzuz.gpg` と `puzuz.sources` をコピーし）、パッケージを先に、
+インデックスを最後に、`InRelease` を一番最後にアップロードします。古い `.deb` ファイルはその後で削除されます。
+`apt` リリースがなければ作成します。何を公開するかは `apt-repo.sh` が決めます。ドラフト、プレリリース、`v*`
+以外のタグは通知を出してスキップされます。インデックスには `by-hash` ファイルがありません（サブディレクトリが
+必要ですが、リリースアセットの名前には `/` を含められないため）。上で述べた短い時間帯があるのはこのためです。
+
+`release.yml` はドラフトを作るだけなので、リポジトリが更新されるのは、人が GitHub でドラフトを公開したとき
+（またはツールが personal access token で公開したとき）です。ワークフローの `GITHUB_TOKEN` で公開された
+リリースは他のワークフローを開始しません。その場合は手動で実行してください。失敗したアップロードを再試行する
+方法も同じです。
+
+```sh
+gh workflow run release-apt.yml -R kaito4681/puzuz -f tag=v0.1.0
+```
+
+本物のリリースなしで試すには、フォークを使います。そこで `scripts/dist/gen-apt-key.sh` で鍵を作り
+（`release.yml` 用に minisign の鍵も）、公開鍵をコミットし、シークレットを設定し、タグを push し、ドラフトを
+公開して、フォークの `apt` リリースに対して `apt update` を実行します。あるいはローカルのテスト
+`scripts/apt-repo-test.sh`（`PUZUZ_APT_BASES="debian:12 ubuntu:22.04 ubuntu:24.04 ubuntu:26.04"`）を
+実行します。これは `apt-repo.sh update DIR DEB...` と使い捨ての鍵でリポジトリを作り、コンテナ内でそれを
+通してアップグレードします。
+
+**アーカイブ鍵。** `packaging/apt/puzuz-archive-keyring.gpg` が本物の鍵で、フィンガープリントは
+`E539 7032 5A39 7378 537B C776 20B6 B72F 9F55 85C2` です（[Debian/Ubuntu パッケージのインストール](#installing-the-debianubuntu-package)
+の「リポジトリの鍵」を参照）。その秘密鍵とパスフレーズはリポジトリのシークレット `APT_GPG_PRIVATE_KEY` と
+`APT_GPG_PASSPHRASE` です。`release.yml` と `apt-repo.sh` は、ユーザー ID に "TEST KEY" とある keyring
+（`scripts/dist/gen-apt-key.sh --test` が書き込むもの）を拒否します。鍵は次のように作ります。
+
+```sh
+scripts/dist/gen-apt-key.sh     # asks for a passphrase; writes the secret key under ~
+gh secret set APT_GPG_PRIVATE_KEY -R kaito4681/puzuz < ~/puzuz-apt-key-*/apt-signing-key.asc
+gh secret set APT_GPG_PASSPHRASE -R kaito4681/puzuz
+# then commit packaging/apt/puzuz-archive-keyring.gpg
+```
+
+2 つのシークレットがなければ、`release-apt.yml` は（通知を出して）リポジトリをスキップします。インデックスは、
+リポジトリ内の最新のパッケージが含む鍵でのみ署名されます（`apt-repo.sh` は `.deb` から
+`/etc/apt/keyrings/puzuz.gpg` を読み取ります）。そのため、シークレットとコミットされた公開鍵が一致しない場合は、
+全員の `apt update` を壊す代わりに実行が失敗します。
+
+秘密鍵とそのパスフレーズはバックアップしてください。インストール済みのすべてのパッケージがこの鍵を信頼して
+いるので、新しい鍵は、それを含むパッケージのバージョンを、古い鍵で署名されたリポジトリを通して配ることで
+しか展開できません。
+
+1. 新しい鍵を作り（作業用のチェックアウトで `scripts/dist/gen-apt-key.sh`）、その公開鍵を
+   `packaging/apt/puzuz-archive-keyring.gpg` に追記して、keyring が両方の鍵を持つようにします
+   （`cat old.gpg new.gpg >packaging/apt/puzuz-archive-keyring.gpg`）。シークレットは古い鍵のままにして、
+   結合した keyring を含むバージョンをリリースします。
+2. ユーザーがそのバージョンにアップグレードするまで待ちます（少なくとももう 1 回のリリースサイクル）。
+3. シークレット `APT_GPG_PRIVATE_KEY` と `APT_GPG_PASSPHRASE` を新しい鍵に切り替え、同じリリースで keyring
+   から古い鍵を削除します。keyring は conffile です。ユーザーが変更していなければ dpkg はアップグレード時に
+   それを置き換えます（変更していれば dpkg が尋ねます）。手順 1 のバージョンを飛ばしたユーザーは
+   `apt update` で `NO_PUBKEY` になるので、初回のインストールと同じように次の `.deb` を一度だけ手動で
+   インストールします。
+
+秘密鍵が漏洩した場合は、すぐに同じことを行い、ユーザーに新しい `.deb` を手動でインストールするよう伝えて
+ください。
+
+パッケージは `packaging/nfpm.yaml` から [nfpm](https://nfpm.goreleaser.com) でビルドされます
+（`scripts/dist/build-package.sh BIN_DIR OUT_DIR [deb|rpm]` がビルド済みのバイナリから `.deb` か `.rpm` を
+作り、`scripts/deb-test.sh` と `scripts/rpm-test.sh` がコンテナ内でそれらを確認します）。
+
+<a id="installing-the-fedorarhelrocky-package"></a>
+## Fedora/RHEL/Rocky パッケージのインストール
+
+各リリースには、Fedora と RHEL 互換の 9 以降（RHEL、Rocky Linux、AlmaLinux。glibc 2.34 以降）向けに、
+x86_64 と aarch64 の `.rpm` があります（どちらかは `uname -m` で分かります）。ダウンロードしたファイルから、
+またはリリースの URL から直接、dnf でインストールします。dnf は依存するものも一緒に入れます。
+
+```sh
+sudo dnf install ./puzuz-0.1.0-1.x86_64.rpm
+# or
+sudo dnf install https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz-0.1.0-1.x86_64.rpm
+```
+
+（`v0.2.0-rc.1` のようなプレリリースは `puzuz-0.2.0-rc.1-1.<arch>.rpm` です。パッケージ内のバージョンは
+`0.2.0~rc.1` で、これは `0.2.0` より前に並びます。）
+
+`.deb` と同じファイル（バイナリ、`/usr/lib/systemd/system` のユニット、sysusers.d と tmpfiles.d の
+エントリー、`/etc/puzuz/config.toml`、シェルの補完、ドキュメント、`/usr/share/licenses/puzuz` のライセンス）
+をインストールしますが、リポジトリの設定は含みません。設定は `%config(noreplace)` なので、アップグレード
+しても編集内容は保持されます。初回のインストールでは `.deb` とまったく同じようにサービスを設定して起動し
+（systemd が PID 1 でなければ有効化だけ行います）、`puzuz service install` や `install.sh` によるインストールと
+並べてのインストールは拒否します。systemd と glibc 2.34 を必要とし、`criu` は**推奨**するだけです（弱い
+依存関係で、ディストリビューションにあれば dnf がデフォルトでインストールします）。Fedora の CRIU（4.2）は
+十分に新しいですが、RHEL/Rocky/Alma 9 の 3.19 は足りないので、そこでチェックポイントを取るにはより新しい
+CRIU が必要です（[CRIU](#criu) を参照）。ジョブの実行は CRIU なしでもできます。
+
+**検証。** 他のリリースアセットと同様に、`.rpm` にも `.sha256` と `.minisig` ファイルがあります
+（[リリースを手動で検証する](#verifying-a-release-by-hand) を参照）。GPG 鍵でビルドされたリリースでは
+`.rpm` 自体にも署名され、その鍵（APT リポジトリの鍵）が `RPM-GPG-KEY-puzuz` として添付されます。
+
+```sh
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz
+gpg --show-keys RPM-GPG-KEY-puzuz                   # E53970325A397378537BC77620B6B72F9F5585C2
+sudo rpm --import RPM-GPG-KEY-puzuz
+rpm -K puzuz-0.1.0-1.x86_64.rpm                     # "digests signatures OK"
+# or let dnf refuse an unsigned or badly signed file:
+sudo dnf install --setopt=localpkg_gpgcheck=1 ./puzuz-0.1.0-1.x86_64.rpm
+```
+
+**更新。** dnf リポジトリはまだありません（予定されています。[issue #23](https://github.com/kaito4681/puzuz/issues/23)
+を参照）。そのため `dnf upgrade` だけでは新しいバージョンは見えません。代わりにリリースの新しい `.rpm` を
+インストールしてください。dnf は URL を直接受け取れます。
+
+```sh
+sudo dnf upgrade https://github.com/kaito4681/puzuz/releases/download/v<new version>/puzuz-<new version>-1.x86_64.rpm
+```
+
+新しいリリースがあると、`puzuz doctor`（と `puzuz update --check`）の "update" の行に、マシンの
+アーキテクチャに合ったリリースの URL を使ったこのコマンドと、先に署名を確認する方法が表示されます。
+アップグレードは動作中のサービスを再起動します。実行中のジョブは動き続けます。
+
+**削除。**
+
+```sh
+sudo dnf remove puzuz
+```
+
+サービスを停止・無効化し、バイナリとユニットを削除します。`/var/lib/puzuz`（状態、ジョブのログ、チェック
+ポイントのイメージ）、`puzuz` ユーザー、`puzuz-admin` グループは残し、実行中のジョブには決して触れません。
+rpm には purge がありません。編集した `config.toml` は `/etc/puzuz/config.toml.rpmsave` として残ります。
+不要になったら `/etc/puzuz` と `/var/lib/puzuz` を手動で削除してください（ジョブがまだ動いていれば、まず
+`sudo systemctl stop 'puzuz-job-*'`）。
+
+<a id="installing-with-nix"></a>
+## Nix でのインストール
+
+リポジトリは Nix flake（`flake.nix`）です。x86_64 と aarch64 の Linux 向けに puzuz をソースからビルドし、
+GitHub リリースからは何もダウンロードしません。出力は次のとおりです。
+
+| 出力 | 内容 |
+| --- | --- |
+| `packages.<system>.default`（`puzuz` も同じ） | `bin/puzuz`、`bin/puzuz-helper`、bash/zsh/fish の補完、ドキュメント |
+| `packages.<system>.criu` | NixOS モジュール用の CRIU 4.2.1（nixpkgs のものは古いバージョン） |
+| `devShells.<system>.default` | Rust ツールチェーン入りの開発用シェル（`nix develop`） |
+| `nixosModules.default` | NixOS モジュール `services.puzuz`（[NixOS](#nixos) を参照） |
+| `homeManagerModules.default` | home-manager モジュール `programs.puzuz`（[home-manager](#home-manager) を参照） |
+| `packages.<system>.helper-tests` | `helper-tests` チェック用の puzuz-helper のテスト実行ファイル（ビルドのみで実行はしない） |
+| `checks.<system>.*` | `home-manager`（モジュールの評価）と、x86_64 では KVM が必要な 2 つの NixOS VM テスト：`nixos`（モジュール）と `helper-tests`（サンドボックス内のパッケージビルドでスキップされるものも含む、puzuz-helper のすべてのテスト） |
+
+リリースに追従するには `github:kaito4681/puzuz/stable` を使います。`stable` ブランチはリリースのタグごとに
+（プレリリースを除いて）移動します。単なる `github:kaito4681/puzuz` は開発の先端（`main`）です。
+
+<a id="nixos"></a>
+### NixOS
+
+flake の NixOS モジュール（`nixosModules.default`、ファイル `nix/nixos-module.nix`）は、デーモン、root
+ヘルパー、CLI、`puzuz` システムユーザー、`puzuz-admin` グループ、`/etc/puzuz/config.toml`、
+`/var/lib/puzuz` 以下のディレクトリを用意します。NixOS では `puzuz service install` や `puzuz update` を
+実行しないでください。どちらも実行を拒否します（NixOS は `/etc/os-release` の `ID=nixos` で判別します。
+[インストール方法](#install-method) を参照）。
+
+システムの flake にこの flake を追加し（`stable` ブランチは最新のリリースに追従します）、サービスを有効に
+します。
+
+```nix
+# flake.nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  inputs.puzuz.url = "github:kaito4681/puzuz/stable";
+  inputs.puzuz.inputs.nixpkgs.follows = "nixpkgs";
+
+  outputs = { nixpkgs, puzuz, ... }: {
+    nixosConfigurations.gpu-server = nixpkgs.lib.nixosSystem {
+      modules = [
+        puzuz.nixosModules.default
+        ./configuration.nix
+      ];
+    };
+  };
+}
+```
+
+```nix
+# configuration.nix
+{
+  services.puzuz = {
+    enable = true;
+    admins = [ "alice" ];
+    settings = {
+      grace_secs = 60;
+      checkpoint_size_limit_bytes = 500000000000;
+    };
+  };
+}
+```
+
+その後 `sudo nixos-rebuild switch` を実行します。結果は `puzuz doctor` で確認できます。
+
+| オプション | デフォルト | 意味 |
+| --- | --- | --- |
+| `services.puzuz.enable` | `false` | puzuz をインストールして起動します。 |
+| `services.puzuz.package` | flake の `puzuz` | デーモン（`bin/puzuz`）とヘルパー（`bin/puzuz-helper`）を実行するパッケージ。`environment.systemPackages` にも追加されます。 |
+| `services.puzuz.admins` | `[ ]` | `puzuz-admin` グループに追加するユーザー（[管理者](#administrators) を参照）。 |
+| `services.puzuz.settings` | `{ }` | 属性セットで表した `/etc/puzuz/config.toml` の内容（キーについては [設定](#configuration) を参照）。 |
+| `services.puzuz.criuPackage` | flake の `criu`（4.2.1） | ヘルパー用の CRIU。`criu_path` を設定します。nixpkgs 自体の `criu` は 4.2 より古いです。 |
+| `services.puzuz.cudaCheckpointPackage` | `null` | `bin/cuda-checkpoint` を含むパッケージ。`cuda_checkpoint_path` を設定します。`null` の場合、GPU ジョブはチェックポイントできません。 |
+| `services.puzuz.nvidiaSmiPath` | `hardware.nvidia.enabled` のときは `hardware.nvidia.package` の `nvidia-smi`、それ以外は `null` | `nvidia_smi_path` を設定します（ヘルパーはこれでジョブの CUDA プロセスを見つけます）。 |
+| `services.puzuz.nvmlLibrary` | `hardware.nvidia.enabled` のときは `hardware.nvidia.package` の `libnvidia-ml.so.1`、それ以外は `null` | `nvml_library` を設定します。デーモンが GPU を検出するために読み込みます。 |
+
+モジュールは `criu_path`、`cuda_checkpoint_path`、`nvidia_smi_path`、`nvml_library`、`shell` を
+`lib.mkDefault` で設定するので、`settings` に書いた値が優先されます。NixOS での注意点：
+
+- **ユニット。** `puzuz.service` と `puzuz-helper.service` は、モジュールの flake のリビジョンにある
+  `packaging/systemd` のファイルで、`ExecStart=` はストアを指します。tmpfiles.d のエントリーは
+  `packaging/tmpfiles.d/puzuz.conf` です。`package` を別のリビジョンにしても、ユニットはモジュールの
+  リビジョンのものになります。2 つは揃えておいてください。
+- **設定ファイル。** ヘルパーは root として動き、root 以外の誰も変更できない通常ファイルだけを読み、
+  シンボリックリンクは決して読みません。そのためモジュールは、ファイルをストアにリンクする代わりに、NixOS に
+  `/etc/puzuz/config.toml`（モード 0644、root の所有）へコピーさせます。
+- **`nixos-rebuild switch` での再起動。** `settings`（またはパッケージ）を変更すると、デーモンとヘルパーの
+  両方が再起動します。実行中のジョブは止まりません。ジョブは自分のユニットで動いているからです。再起動する
+  ヘルパーはまず新しい起動を拒否し、処理中の操作を終わらせるので、チェックポイントやリストアの最中の switch は
+  それを待ちます（ヘルパーの `TimeoutStopSec=`、30 分まで）。その間にデーモンが開始やリストアを試みたジョブは、
+  失敗にはならずキューに戻され、新しいヘルパーが起動したら開始します。
+- **更新と Nix のガベージコレクション。** ジョブのユニットは、そのジョブを開始したヘルパーのバイナリを実行し、
+  チェックポイントのイメージにもそのバイナリが含まれます（リストアに必要です）。更新後、古いストアパスは
+  もうシステムの一部ではないので、ヘルパーは、ジョブが動いている間、またはそのチェックポイントのイメージが
+  残っている間、GC ルート `/nix/var/nix/gcroots/puzuz/job-<id>` でそれを保持します。ルートはジョブが終わるか、
+  そのチェックポイントが削除されると取り除かれます。その後 `nix-collect-garbage` が古いバージョンを解放します。
+  この機能より古いヘルパーが開始したジョブや取ったチェックポイントにはルートがありません。古いバージョンが
+  回収されたあとにそれをリストアすると失敗するので、ガベージコレクションの前にそうしたジョブをリストアするか
+  終わらせてください。
+- **ジョブの環境。** ジョブはそれを投入した `puzuz add` の環境変数で動くので、`PATH` はユーザーのもの
+  （`/run/wrappers/bin`、`/run/current-system/sw/bin`、`~/.nix-profile/bin` など）です。NixOS は
+  `/usr/bin` に何も置かず、`/bin` には `sh` しかありません。モジュールは `shell = [ "/bin/sh" "-c" ]` を
+  設定するので、ジョブの開始は `PATH` にまったく依存しません。
+- **CRIU。** モジュールは flake の CRIU 4.2.1 をそのストアパスで使います。NixOS のカーネルは
+  `CONFIG_CHECKPOINT_RESTORE=y` です。
+- **NVIDIA。** NVIDIA ドライバーを NixOS の通常の方法で有効にしている場合
+  （`services.xserver.videoDrivers = [ "nvidia" ]`、ヘッドレスのマシンでも同じ、または
+  `hardware.nvidia.datacenter.enable`）、`nvidia-smi` と NVML は `hardware.nvidia.package` から取られます。
+  NixOS では動的ローダーがドライバーのディレクトリを探さないためです。そうでない場合は `nvidiaSmiPath` と
+  `nvmlLibrary`（または `settings.gpus`。[GPU の検出](#gpu-detection) を参照）を設定してください。
+  ドライバーを更新すると、新しいストアパスによってデーモンが再起動します。
+- **root が所有するパス。** `/nix/store` にあるプログラムは、ヘルパーと `puzuz doctor` の所有者チェックを
+  通ります（[cuda-checkpoint](#cuda-checkpoint) を参照）。GPU のない VM では、`puzuz doctor` は失敗を報告
+  しません。インストール方法は "Nix" で、警告が出るのは NVIDIA ドライバーと cuda-checkpoint のチェック
+  だけです（後者のヒントは `/usr/local/bin` を挙げますが、NixOS では `cudaCheckpointPackage` を使って
+  ください）。
+
+<a id="cuda-checkpoint-on-nixos"></a>
+#### NixOS での cuda-checkpoint
+
+cuda-checkpoint は nixpkgs になく、puzuz もパッケージ化していません（NVIDIA のバイナリです）。
+derivation は次のように書けます。メジャーバージョンがドライバーと一致するリリースを使い、最初のビルドが
+報告するハッシュを埋めてください。
+
+```nix
+# cuda-checkpoint.nix
+{ lib, stdenv, fetchFromGitHub, autoPatchelfHook, autoAddDriverRunpath }:
+stdenv.mkDerivation {
+  pname = "cuda-checkpoint";
+  version = "595";  # match the driver's major version
+  src = fetchFromGitHub {
+    owner = "NVIDIA";
+    repo = "cuda-checkpoint";
+    rev = "<commit>";
+    hash = lib.fakeHash;
+  };
+  # Sets the ELF interpreter, and adds /run/opengl-driver/lib so that libcuda.so.1 is found.
+  nativeBuildInputs = [ autoPatchelfHook autoAddDriverRunpath ];
+  dontBuild = true;
+  installPhase = ''
+    install -Dm755 bin/x86_64_Linux/cuda-checkpoint $out/bin/cuda-checkpoint
+  '';
+  meta.license = lib.licenses.unfree;
+}
+```
+
+```nix
+services.puzuz.cudaCheckpointPackage = pkgs.callPackage ./cuda-checkpoint.nix { };
+```
+
+（`lib.licenses.unfree` には `nixpkgs.config.allowUnfree = true` か `allowUnfreePredicate` が必要です。）
+
+<a id="updating-and-removing-on-nixos"></a>
+#### NixOS での更新と削除
+
+- 更新：`nix flake update puzuz && sudo nixos-rebuild switch`。変更されたユニットがデーモンとヘルパーを
+  再起動します（上の「`nixos-rebuild switch` での再起動」を参照）。実行中のジョブは古いヘルパーのバイナリの
+  まま動き続け、更新前に取ったチェックポイントは、`nix-collect-garbage` のあとでもリストアできます
+  （「更新と Nix のガベージコレクション」を参照）。
+- ロールバック：`sudo nixos-rebuild switch --rollback`（または古い世代での起動）は古いバイナリを戻しますが、
+  古いデータベースは戻しません。データベースを移行した更新のあとでは、古いデーモンは新しいデータベースでの
+  起動を拒否します。
+- 削除：`services.puzuz.enable = false` を設定して `sudo nixos-rebuild switch` を実行します。ユニット、
+  `/etc/puzuz/config.toml`、CLI はなくなりますが、`/var/lib/puzuz`（状態、ログ、チェックポイントの
+  イメージ）と `puzuz` ユーザーのファイルは残ります。先に実行中のジョブを kill するか終わらせてください。
+  ヘルパーは停止しますが、まだ動いているジョブのユニットはそのまま残されます。
+
+<a id="home-manager"></a>
+### home-manager
+
+home-manager は 1 人のユーザーの環境を管理するものなので、デーモンやヘルパー（root とシステムの systemd が
+必要）はインストールできません。そのモジュール（`homeManagerModules.default`）は、管理者が puzuz を
+インストールしたマシン向けに CLI のシェル補完を用意します（`homeManagerModules.default`、ファイル
+`nix/home-manager-module.nix`）。
+
+```nix
+{
+  imports = [ inputs.puzuz.homeManagerModules.default ];
+  programs.puzuz = {
+    enable = true;
+    # package = null;  # the default: use the system's puzuz
+  };
+}
+```
+
+| オプション | デフォルト | 意味 |
+| --- | --- | --- |
+| `programs.puzuz.enable` | `false` | モジュールを有効にします。 |
+| `programs.puzuz.package` | `null` | `null`：何もインストールせず、シェルの起動時にシステムの `puzuz`（`PATH` にあるもの）の補完を読み込みます。その隣にインストールされた補完ファイル（NixOS やパッケージと同じく `<prefix>/share/...`）、それがなければ `puzuz completions <shell>` の出力です。パッケージ（例：`inputs.puzuz.packages.${pkgs.stdenv.hostPlatform.system}.default`）を指定すると、補完ファイルとともにプロファイルにインストールされます。 |
+| `programs.puzuz.enableBashIntegration` | `true` | `package = null` のとき、Bash（`programs.bash.enable`）で補完を読み込みます。 |
+| `programs.puzuz.enableZshIntegration` | `true` | Zsh についての同じ設定です（`programs.zsh.enable` と、`compinit` を実行する `programs.zsh.enableCompletion`。home-manager 25.05 以降）。 |
+| `programs.puzuz.enableFishIntegration` | `true` | Fish についての同じ設定です（`programs.fish.enable`）。 |
+
+CLI とデーモンは同じバージョンでなければなりません。`package = null` を推奨します。システムの `puzuz` は常に
+デーモンと一致するからです。home-manager（または `nix profile`）の `puzuz` は、home-manager の flake が
+ロックしているリビジョンのものなので、異なることがあります。その場合コマンドはバージョンの不一致で失敗し、
+ストアパスを示したうえで、NixOS や home-manager のプロファイルでは `programs.puzuz.package = null` を
+勧めます。更新は `nix flake update && home-manager switch` で行います。デーモンを更新するのは管理者です。
+
+<a id="other-distributions"></a>
+### その他のディストリビューション
+
+flake をビルドし、その結果から tarball と同じようにサービスをインストールします。
+
+```sh
+nix build github:kaito4681/puzuz/stable
+sudo ./result/bin/puzuz service install
+```
+
+`service install` はバイナリを `/usr/local/bin` にコピーし、それらはまだ Nix ストアからライブラリを読み込む
+ので、ビルドをガベージコレクターのルートとして登録します（`/nix/var/nix/gcroots/puzuz`。
+[インストール](#installing) を参照）。root の `PATH` に `nix-store` がない場合（sudo の `secure_path` は Nix の
+プロファイルを含まないことがよくあります）、install は警告を出し、自分で登録するためのコマンドを表示します。
+ルートが登録されていれば `./result` は削除してかまいません。ユニットは `/usr/local/bin` のコピーを実行するので、
+インストール方法は `nix`（NixOS モジュールのように、`/nix/store` を指すユニットを意味します）ではなく
+`service-install` です。CRIU は [CRIU](#criu) の説明に従ってインストールしてください。
+
+更新するには、同じ 2 つのコマンドをもう一度実行します（Nix は現在の `stable` を取得します。1 時間以内に取得
+していた場合は `--refresh` を付けてください）。実行中のジョブは動き続けます。`sudo puzuz update` も使えますが、
+Nix のビルドをリリースの tarball のバイナリで置き換えます。puzuz の削除は `sudo puzuz uninstall` で行います
+（[アンインストール](#uninstalling) を参照）。これは GC ルートも削除します。
+
+`nix profile install github:kaito4681/puzuz/stable` でユーザーに入るのは `puzuz` コマンド（補完付き）だけ
+です（[home-manager](#home-manager) も参照）。ヘルパーは root として動くのでユーザーのプロファイルからは実行
+できず、サービスは上記のようにインストールする必要があります。
+
+<a id="arch-linux-aur"></a>
+## Arch Linux (AUR)
+
+**AUR パッケージはまだ公開されていません。** 公開されるまでは、Arch Linux には `install.sh` で puzuz を
+インストールしてください（Arch でも動作します。glibc 2.34 以降、systemd、x86_64 または aarch64 で、
+minisign の署名も検証します）。CRIU 4.2 以降は公式リポジトリから入れます。
+
+```sh
+sudo pacman -S criu
+curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
+```
+
+`sudo puzuz update` で更新し、`sudo puzuz uninstall` で削除します（[アップグレード](#upgrading) と
+[アンインストール](#uninstalling) を参照）。この節の残りは、AUR に公開されたあとの AUR パッケージについての
+説明です（メンテナー向けの設定は後述）。
+
+AUR パッケージ [`puzuz-bin`](https://aur.archlinux.org/packages/puzuz-bin)（x86_64 と aarch64）は、
+リリースの tarball をパッケージ化し直したものです。公開されたら、任意の AUR ヘルパー、たとえば yay で
+インストールします。
+
+```sh
+yay -S puzuz-bin
+```
+
+または手動で：
+
+```sh
+git clone https://aur.archlinux.org/puzuz-bin.git
+cd puzuz-bin
+makepkg -si
+```
+
+`/usr/bin/puzuz` と `/usr/bin/puzuz-helper`、`/usr/lib/systemd/system` のユニット、`/usr/lib` の
+`sysusers.d` と `tmpfiles.d` の断片、デフォルトの `/etc/puzuz/config.toml`（変更した場合はアップグレードや
+削除のときも保持されます）、bash、zsh、fish の補完をインストールします。pacman の systemd フックが
+`puzuz` ユーザー、`puzuz-admin` グループ、ディレクトリを作成します。Arch の慣例どおり、サービスは自動では
+有効化も起動もされません。
+
+```sh
+sudo systemctl enable --now puzuz-helper.service puzuz.service
+puzuz doctor
+```
+
+チェックポイントには CRIU 4.2 以降が必要で、これは公式リポジトリにあります（`sudo pacman -S criu`）。GPU
+ジョブには NVIDIA の cuda-checkpoint も必要です（[cuda-checkpoint](#cuda-checkpoint) を参照）。どちらも
+パッケージの任意の依存関係です。
+
+- **更新：** `yay -Syu`（または `git pull && makepkg -si` でリビルド）。パッケージはサービスを再起動しない
+  ので、その後 `sudo systemctl restart puzuz-helper.service puzuz.service` を実行して、デーモンと `puzuz`
+  コマンドのバージョンを再び揃えてください。実行中のジョブは動き続けます（[アップグレード](#upgrading) を
+  参照）。`puzuz update` と `puzuz service install` はパッケージによるインストールを拒否します。
+- **削除：** `sudo systemctl disable --now puzuz.service puzuz-helper.service` のあと
+  `sudo pacman -R puzuz-bin`。`puzuz-job-*` ユニットでまだ動いているジョブは、停止するまで動き続けます。
+  `/var/lib/puzuz`（状態、ログ、チェックポイントのイメージ）と、変更した `/etc/puzuz/config.toml`
+  （`config.toml.pacsave` として保存）は残ります。すべてを削除するには手動で削除してください。
+
+<a id="the-aur-package-maintainers"></a>
+### AUR パッケージ（メンテナー向け）
+
+PKGBUILD は `packaging/aur/puzuz-bin` にあります。リリースが公開されると（プレリリースを除く）、
+`.github/workflows/release-aur.yml` が `scripts/dist/update-aur.sh <version>` を実行します。これは
+リリースの `.sha256` ファイルから tarball のチェックサムを取り、タグのソースアーカイブ（ユニットと断片用）の
+チェックサムを計算し、Arch Linux のコンテナで `.SRCINFO` を再生成します。そして `PKGBUILD`、`.SRCINFO`、
+`puzuz-bin.install` を `ssh://aur@aur.archlinux.org/puzuz-bin.git` に push します。リリースには x86_64 と
+aarch64 の両方の tarball が必要です。新しいリリースなしでパッケージングを変更するには、PKGBUILD の
+`pkgrel` を上げてワークフローを手動で実行します（`gh workflow run release-aur.yml -f version=<X.Y.Z>`）。
+
+最初に一度だけ行う設定：
+
+1. <https://aur.archlinux.org> でアカウントを作ります。
+2. 専用の SSH 鍵を作り、その公開鍵をアカウントに追加します（"My Account"、"SSH Public Key"）。
+
+   ```sh
+   ssh-keygen -t ed25519 -N '' -C puzuz-aur -f aur_puzuz
+   ```
+
+3. 秘密鍵をリポジトリのシークレット `AUR_SSH_PRIVATE_KEY` として保存し、ローカルのコピーは削除します
+   （または安全な場所に保管します）。
+
+   ```sh
+   gh secret set AUR_SSH_PRIVATE_KEY -R kaito4681/puzuz < aur_puzuz
+   ```
+
+最初の push で AUR にパッケージが作られます。シークレットがなければ、ワークフローは通知を表示するだけです。
+パッケージをローカルでテストするには（systemd の動く Arch Linux のコンテナで、makepkg、pacman、サービス、
+ジョブ、アップグレードと削除）：`scripts/dist/aur-test.sh`。
+
+<a id="building"></a>
+## ビルド
+
+2 つのバイナリが必要です。`puzuz`（CLI とデーモン）と `puzuz-helper`（root ヘルパー）です。単なる
+`cargo build` では `puzuz` しかビルドされないので、両方のパッケージを指定します。
+
+```sh
+cargo build --release -p puzuz -p puzuz-helper
+# -> target/release/puzuz, target/release/puzuz-helper
+```
+
+ローカルに Rust のツールチェーンがなければ、プロジェクトの Docker イメージ（Debian bookworm 上の Rust 1.98.1。
+バイナリには glibc 2.34 以降が必要）でビルドできます。
+
+```sh
+scripts/test-in-docker.sh build --release -p puzuz -p puzuz-helper
+# -> target/docker/release/puzuz, target/docker/release/puzuz-helper
+```
+
+タグ付きのバージョンは、x86_64 と aarch64 の Linux 向けのビルド済みバイナリ（Debian bookworm でネイティブに
+ビルド、glibc 2.34 以降）としても GitHub のリリースページで配布されます。
+`puzuz-v<version>-<target>.tar.gz`（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`）に
+`puzuz`、`puzuz-helper`、ドキュメントが入っており、隣に `.sha256` と `.minisig` ファイルがあります。
+`install.sh` がこれらをインストールします（上記を参照）。手動では次のようにします。
+
+```sh
+sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar xzf puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+sudo puzuz-v0.1.0-x86_64-unknown-linux-gnu/puzuz service install
+```
+
+<a id="installing"></a>
+## インストール
+
+```sh
+sudo target/release/puzuz service install
+```
+
+`puzuz-helper` は `puzuz` の隣に置く必要があります。ユニットは次の場所のバイナリを実行します。
+
+1. 再インストールや更新のときは、現在の `service install` によるインストール先のディレクトリ
+2. そうでなければ、`puzuz` バイナリのあるディレクトリが `/usr/bin` か `/usr/local/bin` ならそのディレクトリ
+   （その場で使い、何もコピーしません）
+3. それ以外は `/usr/local/bin`。`puzuz` と `puzuz-helper` をここにコピーします（その旨を表示します）。ここは
+   管理者がインストールするソフトウェアの通常の置き場所です。パッケージマネージャーは手を出さず、systemd と
+   全ユーザーのデフォルトの `PATH` に含まれています。
+
+`--bin-dir DIR` で別の場所にインストールできます。`puzuz-helper` は root として動くので、そのディレクトリと
+すべての親は root の所有で、グループやその他のユーザーが書き込めない必要があります（まだ存在しない
+ディレクトリはモード 0755 で作成されます）。それ以外は install が拒否します。`--no-start` はサービスを開始も
+再起動もせずに有効化します。`--force` は、`puzuz service install` が書いたのではないユニット、sysusers.d、
+tmpfiles.d のファイルを上書きします（手順 2 を参照）。
+
+RHEL、CentOS、Rocky、Alma、Fedora では、sudo の `secure_path` に `/usr/local/bin` が含まれないので、
+`sudo puzuz ...` は "command not found" になります。`sudo /usr/local/bin/puzuz ...` を実行するか、
+`sudo visudo` で `secure_path` に `/usr/local/bin` を追加してください。`puzuz doctor`（root で実行）がこれを
+指摘します。最小限の `PATH`（cron の `/usr/bin:/bin` など）で動くスクリプトでもフルパスが必要です。
+
+NixOS 以外で Nix でビルドした場合（`nix build` のあと `sudo ./result/bin/puzuz service install`）も、
+バイナリは他のビルドと同じく `/usr/local/bin` にコピーされます。それらはまだ Nix ストアからライブラリを
+読み込むので、install はストアパスをガベージコレクターのルート `/nix/var/nix/gcroots/puzuz` としても登録します
+（`nix-store --add-root /nix/var/nix/gcroots/puzuz --realise <store path>` で）。`nix-store` が見つからないか
+失敗した場合、install は警告を出してそのコマンドを表示し、以前に記録したルートは残します。ルートがまだ必要か
+どうかはインストールされたバイナリそのもの（動的ローダーが `/nix/store` にあるか）から判断されるので、Nix で
+ビルドしたコピーを `--bin-dir` で移動してもルートは保持されます。`puzuz uninstall` はルートを削除し、ストアを
+使わないバイナリ（たとえば `puzuz update`）をインストールしたときも削除されます。
+
+`puzuz service install` は、最後の `puzuz doctor` のレポートに FAIL があると 0 以外で終了します。
+`--no-start` のあとは、「まだ動いていない」ことを意味するだけの失敗（両方のユニット、両方のソケット、
+デーモンとヘルパーの接続）は無視されます。
+
+`puzuz service install` は何度実行しても安全です（たとえばアップグレードのあと）。次のことを行います。
+
+1. `puzuz` と `puzuz-helper` が上で選んだディレクトリにまだなければコピーし（モード 0755、アトミックに置き換え）、
+   それらがストアから来たものなら Nix の GC ルートを登録し、`/var/lib/puzuz/install-receipt`（root、0644）を
+   書き込みます。レシートにはディレクトリ、コピーしたバイナリ（その場で使う場合はなし）、バージョン、GC
+   ルートが記録され、`puzuz uninstall` はまさにそれらを削除します。（`--bin-dir` で）別のディレクトリに
+   再インストールすると、前回作ったコピーは削除されます。レシートが存在するのに使えない場合（root の所有で
+   ない、他のユーザーが書き込める、内容が不正）、install は何も変更せずに止まります。ファイルを直すか、
+   記載内容を確認してから削除してください。
+2. バイナリに組み込まれたパッケージングのテンプレートから次のファイルを書き込みます。各ファイルは
+   "Installed by `puzuz service install`" というマーカー行で始まり、次回のインストールで上書きされます。
+   マーカーのないファイル（管理者やパッケージが書いたもの）が既にあると、`--force` を指定しない限り、install は
+   何かを変更する前に止まります。作成するディレクトリ（`/etc/puzuz` など）は umask にかかわらずモード 0755 に
+   なります。
+   - `/etc/systemd/system/puzuz-helper.service`：root ヘルパー（
+     [packaging/systemd/puzuz-helper.service](../../packaging/systemd/puzuz-helper.service) から）
+   - `/etc/systemd/system/puzuz.service`：デーモン。ユーザー `puzuz` として、NVML が必要とする NVIDIA の
+     デバイスだけを許可する厳格なサンドボックスで動きます（
+     [packaging/systemd/puzuz.service](../../packaging/systemd/puzuz.service) から）
+   - `/etc/sysusers.d/puzuz.conf`：システムユーザー `puzuz` とグループ `puzuz-admin` を定義します
+   - `/etc/tmpfiles.d/puzuz.conf`：下に挙げるディレクトリ
+3. そのファイルについて `systemd-sysusers` を実行し、必要なら `groupadd --system puzuz-admin` を実行します。
+4. そのファイルについて `systemd-tmpfiles --create` を実行し、次のものを作成します。
+
+   | パス | モード、所有者 | 内容 |
+   | --- | --- | --- |
+   | `/var/lib/puzuz` | 0755 root | ベースディレクトリ（`data_dir`） |
+   | `/var/lib/puzuz/daemon` | 0700 puzuz | デーモンのデータベース `state.sqlite` |
+   | `/var/lib/puzuz/helper` | 0711 root | ヘルパーのジョブの記録とイベントキュー |
+   | `/var/lib/puzuz/checkpoints` | 0700 root | チェックポイントのイメージ、ジョブごとに `<id>/` |
+   | `/var/lib/puzuz/logs` | 0755 root | ジョブの出力、`<uid>/<id>.log`（ヘルパーが `<uid>/` をモード 2770、ユーザーの所有、グループ `puzuz` で作成） |
+   | `/var/lib/puzuz/lib` | 0755 root | fork ガードのライブラリ（`puzuz-forkguard-<hash>.so`） |
+   | `/var/lib/puzuz/criu-no-plugins` | 0755 root | manual モード用の空の CRIU プラグインディレクトリ |
+   | `/run/puzuz` | 0755 puzuz | `puzuz.sock`（デーモン、モード 0666）と `helper.sock`（ヘルパー、`puzuz` の所有、モード 0600） |
+   | `/run/puzuz-helper` | 0700 root | `criu restore --root` が使う `/` のバインドマウント |
+
+5. `/etc/puzuz/config.toml` を [packaging/config.toml](../../packaging/config.toml) から作成します。ただし
+   **まだ存在しない場合だけ**です。`nvidia-smi` が動けば、表示される各 GPU について `[[gpus]]` のエントリーを
+   追記します（NVML が失敗したときのフォールバック。[GPU の検出](#gpu-detection) を参照）。
+6. `systemctl daemon-reload` を実行します。ユニットかバイナリが変わっていれば、両方のサービスに
+   `systemctl try-restart` を実行します。その後 `systemctl enable --now puzuz-helper.service puzuz.service`
+   を実行し、デーモンがヘルパーに接続するまで最大 10 秒待って、`puzuz doctor` のレポートを表示します。
+
+ディストリビューションのパッケージが所有するユニットファイル（`/usr/lib/systemd/...`）には決して触れません。
+ユニットのカスタマイズはドロップイン（`sudo systemctl edit puzuz-helper.service`）で行ってください。
+`/etc/systemd/system` のファイルを編集しても、次のインストールで失われます。
+
+<a id="install-method"></a>
+### インストール方法
+
+`puzuz service install` は、パッケージマネージャーや Nix とマシンを共有してはいけません。`/etc/systemd/system`
+のユニットがパッケージのユニットを覆い隠し、両方が `/etc/puzuz` と `/var/lib/puzuz` を使うことになるからです。
+puzuz は、`puzuz.service` と `puzuz-helper.service` それぞれのユニットファイルで方法を見分けます。
+
+| インストール方法 | 判別方法 |
+| --- | --- |
+| `puzuz service install` | インストールのマーカー行で始まる `/etc/systemd/system/<unit>` |
+| ディストリビューションのパッケージ | `dpkg-query -S`、`rpm -qf`、`pacman -Qo` が所有者を示す `/usr/lib/systemd/system/<unit>`（または `/lib/systemd/system/...`）（`/usr` が統合されたシステムでは dpkg が `/lib` のほうを登録していることがあるので、両方のパスで問い合わせます。最初に確定的な答えを返したツールで決まります）。どのツールも答えられない場合（インストールされていない、またはロックされたデータベースなどでどれも失敗した場合）、そのユニットは出所不明のパッケージとみなされます |
+| 所有者のないユニット | パッケージマネージャーが所有されていないと確定的に報告する（`no path found matching pattern`、`is not owned by any package`、`No package owns`）そうしたユニット。削除したパッケージの残りか、手動で（`make install`）そこにコピーされたもの |
+| Nix | `/nix/store` を指す `/etc/systemd/system/<unit>`（NixOS の `services.puzuz` モジュール、system-manager）、または `/nix/store` を指すか `/nix/store` のバイナリを実行するパッケージのユニット |
+| 手動 | マーカーのない `/etc/systemd/system/<unit>` で、パッケージのユニットがないもの（`ExecStart=` が `/nix/store` 以下の場合も含む） |
+
+パッケージの（または所有者のない）ユニットの隣にあるマーカーのない `/etc/systemd/system/puzuz.service` は、
+管理者がそれを置き換えたもの（`systemctl edit --full puzuz`）で、そこにある `/dev/null` へのシンボリック
+リンクはマスク（`systemctl mask puzuz`）です。どちらも 2 つ目のインストール方法ではありません。puzuz は
+パッケージを "overridden" や "masked" として報告します。パッケージのないマスクは無視されます。
+
+オペレーティングシステムは `/etc/os-release`（なければ `/usr/lib/os-release`）の `ID` と `ID_LIKE` から読み
+取ります。これはヒントの文言と、NixOS（`ID=nixos`）ではモジュールを使うことを決めるだけで、インストール方法を
+決めることはありません（同じディストリビューションでも、puzuz がパッケージから入っていることも `install.sh`
+から入っていることもあります）。`/etc/NIXOS` は見ません。
+
+各コマンドの動作（隠しコマンド `puzuz service install-method` が `install.sh` のためにキーワードを出力します）：
+
+| インストール方法 | `service install` | `uninstall` | `update` | `doctor` | キーワード |
+| --- | --- | --- | --- | --- | --- |
+| 未インストール | インストールする | その旨を表示 | 拒否：`install.sh` を使う | INFO | `none` |
+| 未インストール、NixOS | 拒否：`services.puzuz` モジュールを使う | その旨を表示 | 拒否：モジュールを使う | INFO "not installed (NixOS: use the services.puzuz module)" | `none` |
+| `puzuz service install` | 再インストールする | アンインストールする | 更新する | OK | `service-install` |
+| ディストリビューションのパッケージ（dpkg、rpm、pacman、または不明） | `--force` でも拒否 | 拒否 | 拒否 | OK（マスク時は INFO） | `package` |
+| 所有者のないユニット | `--force` のときだけ。代わりに先にファイルを削除する | 拒否 | 拒否 | WARN | `unowned` |
+| Nix | `--force` でも拒否 | 拒否 | 拒否 | OK | `nix` |
+| 手動 | `--force` のときだけ | 拒否 | 拒否 | INFO | `manual` |
+| 混在 | 拒否：先に `service install` のコピーをアンインストールする | `service install` が書いたものだけを削除（`--purge` なし） | 拒否 | FAIL | `mixed` |
+
+「混在」とは、1 つのユニットで、または `puzuz.service` と `puzuz-helper.service` にまたがって（たとえば
+デーモンのユニットは `service install`、ヘルパーのユニットはパッケージ）、`service install` がパッケージや Nix
+と同時に使われている状態です。`doctor` は失敗し、`service status` は unhealthy と報告し、キーワードは `mixed`
+です。`/usr/lib` の所有者のないユニットの隣にある `service install` は `service install` のままで（`/etc` の
+ユニットが優先されます）、`service install` を再実行するのに `--force` は不要です。`doctor` は警告し、残骸を
+削除するよう伝えます。2 つのユニットがそれ以外の異なる方法でインストールされている場合（たとえば片方が
+ない、異なるパッケージマネージャーの異なるパッケージから来ている）、`doctor` は警告し、`service status` も
+そう表示します。`service install` は両方をインストールするので、これで直ります。`/etc/systemd/system` 自体が
+`/nix/store` を指している場合も、そこには書き込めないので `service install` は拒否します。
+
+拒否するときは、インストール方法に合った puzuz の更新・削除の方法を示します。
+
+| インストール方法 | 更新 | 削除 |
+| --- | --- | --- |
+| dpkg | `sudo apt update && sudo apt upgrade` | `sudo apt remove <package>` |
+| rpm | `sudo dnf upgrade` | `sudo dnf remove <package>` |
+| pacman | `yay -Syu`（AUR）または `sudo pacman -Syu` | `sudo pacman -R <package>` |
+| 出所不明のパッケージ | お使いのパッケージマネージャー（分かれば `ID`/`ID_LIKE` から名前を示します） | 同じ |
+| NixOS 上の Nix | `nix flake update && sudo nixos-rebuild switch` | `services.puzuz.enable = false` のあと `sudo nixos-rebuild switch` |
+| それ以外の Nix | ユニットを作成した Nix の設定 | 同じ |
+| `puzuz service install` | `sudo puzuz update` | `sudo puzuz uninstall` |
+
+デーモンは `ProtectSystem=strict` で動くので、書き込めるのはユニットの
+`ReadWritePaths=/var/lib/puzuz/daemon /var/lib/puzuz/logs /run/puzuz` 以下だけです。`config.toml` で
+`data_dir`、`state_db`、`logs_dir`、`api_socket` を別の場所に移す場合は、新しいディレクトリをドロップインで
+追加してください。そうしないとデーモンは "Read-only file system" で失敗します。
+
+```sh
+sudo systemctl edit puzuz.service
+# [Service]
+# ReadWritePaths=/srv/puzuz/daemon /srv/puzuz/logs
+sudo systemctl restart puzuz.service
+```
+
+設定したディレクトリがユニットの実効的な `ReadWritePaths=` の外にあると、`puzuz doctor` が警告します
+（`daemon write paths`）。
+
+ヘルパーの `TimeoutStopSec=30min` は、システムのシャットダウン時にすべてのジョブをチェックポイントするための
+初期の持ち時間です。ダンプの間、ヘルパーは systemd に時間の延長を求め続けます（`EXTEND_TIMEOUT_USEC`）が、
+それは実行中のダンプの期限とそのロールバックの終わりまでなので（[チェックポイントのタイムアウト](#checkpoint-timeouts)
+を参照）、止まったダンプがシャットダウンを永遠に引き止めることはありません。ジョブは 1 つずつダンプされます。
+延長を無視する systemd のバージョンでは、30 分で、期限が許す速度（30 s/GiB）なら合計約 50 GiB の RSS + VRAM、
+NVMe ディスクで測定した速度（約 2.5 s/GiB）なら数百 GiB をカバーします。ジョブがもっと大きいかディスクが
+もっと遅い場合は、ドロップインで延ばしてください。
+
+<a id="checkpoint-timeouts"></a>
+### チェックポイントのタイムアウト
+
+チェックポイント全体（すべての CUDA プロセスの CUDA のロックとチェックポイント、続いて `criu dump`）や
+リストア全体（`criu restore`、続いて CUDA のリストアとアンロック）は、ジョブのサイズに応じた期限内に終わる
+必要があります。
+
+```
+deadline = checkpoint_deadline_base_secs + checkpoint_deadline_secs_per_gib * GiB
+         = 180 s + 30 s * GiB            (defaults)
+```
+
+GiB は、チェックポイントではジョブの RSS + VRAM を切り上げたもの、リストアではイメージのサイズです。14 GiB の
+ジョブなら 180 + 30 * 14 = 600 s になります。各ステップにもそれぞれのタイムアウトがあり（ロック：ロックの
+`--timeout` 30 s + 15 s、CUDA のチェックポイントやリストア：300 s、アンロック：60 s）、
+`criu_dump_timeout_secs` / `criu_restore_timeout_secs` で `criu` 単体に上限を設けることもできます。ステップには
+先に終わるほうが適用されます。
+
+期限を過ぎると、実行中のツールはそのプロセスグループ全体と fork したすべてのプロセスとともに kill されます。
+その後：
+
+- **チェックポイント**：ジョブは再開されます。停止したタスクに SIGCONT を送り、ジョブの cgroup 内で凍結された
+  cgroup を解凍し、チェックポイントされた（またはされた可能性のある）CUDA プロセスをリストアし、ロックされた
+  ものをすべてアンロックします。そしてチェックポイントは "the checkpoint did not finish within its deadline of
+  ... s for ... GiB of memory; the job was resumed" で失敗します。途中までのイメージは削除されます。`criu` が
+  外部から kill された場合（`kill -9`、OOM killer など）も同じロールバックが実行されます。各 CUDA プロセスは
+  個別にロールバックされます。その間に終了したものはスキップされ、停止中や凍結中のものは（報告したうえで）
+  そのままにされ、他のプロセスを妨げません。plugin モードでは、CRIU の CUDA プラグインが `criu dump` の中で
+  CUDA プロセスをロックしてチェックポイントし、CRIU が kill されるとそれを元に戻せないので、ヘルパーが各
+  プロセスに `cuda-checkpoint --get-state` で問い合わせ、必要に応じてリストアとアンロックを行います。期限を
+  過ぎたその瞬間に終わった `criu dump` は、終わったものとして扱われます。
+
+  注意：`criu dump` の kill は常に元に戻せるわけではありません。プロセスの状態を収集する間、CRIU はそのプロセスの
+  中でパラサイトコードを実行します。その瞬間に CRIU が kill されると、プロセスはそのコードの途中で解放され、
+  クラッシュすることがあります。したがって "the job was resumed" は、ロールバックが成功した（ジョブが解凍され、
+  CUDA の状態が再開された）ことを意味し、ジョブのすべてのプロセスが生き残ったことは意味しません。`criu` が
+  kill された場合は、メッセージにそう書かれます。
+- **リストア**：リストアされたプロセスは kill され、リストアは失敗します。イメージは残ります。
+
+NVMe ディスク（RTX 5070 Ti、38 GB RAM）で、ページキャッシュがコールドとウォームの場合の測定値：
+
+| ステップ | 時間 |
+| --- | --- |
+| CUDA のロック / アンロック | 0.01〜0.04 s |
+| CUDA のチェックポイント（VRAM からホストメモリへ） | 0.6〜1.0 s/GiB（VRAM 1.3〜11.8 GiB。11.8 GiB で 8〜10 s） |
+| CUDA のリストア | 0.5〜0.9 s/GiB（11.8 GiB で 6〜8 s） |
+| `criu dump` | 0.3〜1.8 s/GiB（RSS 1〜14 GiB。14 GiB で 18〜25 s、メモリ逼迫時はより遅い） |
+| `criu restore` | 0.3〜0.7 s/GiB（14 GiB でウォーム 8.6 s、コールド 9.2 s） |
+
+VRAM 11.8 GiB、RSS 1.2 GiB（13 GiB、期限 600 s）の GPU ジョブは、manual モードでも plugin モードでも同様に、
+チェックポイントに 19〜20 s、リストアに 14〜16 s かかりました（plugin モード：`criu dump` 20〜21 s、
+`criu restore` 16 s、CUDA のステップを含む）。つまりジョブは全体で RSS + VRAM 1 GiB あたり約 1.5〜2.5 s を
+必要とし、デフォルトの期限には 10 倍以上の余裕があります（このジョブでは約 30 倍。約 35 MB/s のディスクでも
+足ります）。より遅いストレージ（ネットワークファイルシステム、HDD）では `checkpoint_deadline_secs_per_gib` を
+上げてください。CUDA のチェックポイントとリストアの固定の 300 s のタイムアウトは、測定した速度なら、プロセス
+あたり VRAM 約 30 GiB までで 10 倍の余裕があります（同じ速度の 80 GB の GPU でも、その約 4 分の 1 の時間で
+終わります）。
+
+<a id="verifying"></a>
+## 確認
+
+```sh
+puzuz doctor           # every check, with a `fix:` line for each problem; exits non-zero on FAIL
+puzuz service status   # both units, and whether the daemon is reachable and connected to the helper
+```
+
+`puzuz doctor` は次のものを確認します。設定ファイルとその所有者、インストール方法（[インストール方法](#install-method)
+を参照）、`criu`（バージョン 4.2 以降）、NVIDIA ドライバー、`cuda-checkpoint`（manual モードへの対応、
+ドライバーと一致するバージョン）、デーモンが（NVML で、または `[[gpus]]` から）検出した GPU と `nvidia-smi` の
+比較（[GPU の検出](#gpu-detection) を参照）、カーネル、systemd のバージョン、両方のユニット、ヘルパーの
+バイナリとその上のすべてのディレクトリの所有者（ドロップインを含むユニットの実効的な `ExecStart=` から取得）、
+デーモンのディレクトリが `ReadWritePaths=` の中にあるか、両方のソケット、デーモンとヘルパーのバージョンと
+その接続、チェックポイントのディレクトリ（存在するか、tmpfs でないか、空き容量）とチェックポイントの合計
+サイズ、あなたが管理者かどうか、そして（`update_check = false` でなければ）新しいリリースがあるかどうかです。
+最後のチェックは最大でも INFO で、GitHub に接続できない場合も同様です。`criu check` は実行しません。この
+カーネルで CRIU が何に対応しているかは、自分で `sudo criu check` を実行して確認してください。
+
+ジョブを試してみます。
+
+```sh
+puzuz add -- 'for i in $(seq 1000); do echo $i; sleep 1; done'
+puzuz checkpoint 0 && puzuz status
+puzuz restore -i 0 && puzuz follow 0
+```
+
+<a id="configuration"></a>
+## 設定
+
+デーモンとヘルパーは `/etc/puzuz/config.toml` を読みます。キーはすべて任意です。未知のキーは無視されます。
+ファイルがなければすべてデフォルトになります。インストールされるファイル
+（[packaging/config.toml](../../packaging/config.toml)）にはすべてのキーがコメント付きで並んでいます。
+コメントアウトされた `# key = value` の行はデフォルトを示し、`# Example:` の下でインデントされた行は、
+デフォルトでは未設定のキー（`checkpoint_size_limit_bytes` など）と `[[gpus]]` の例です。変更したら、その
+キーを使うものを再起動してください。ヘルパーを再起動しても実行中のジョブには影響しません。
+
+```sh
+sudo systemctl restart puzuz-helper.service puzuz.service
+```
+
+ヘルパーは root として動き、ファイルとすべての親ディレクトリ（`/etc/puzuz`、`/etc`、`/`）が root の所有で、
+グループやその他のユーザーが書き込めず、シンボリックリンクでない場合でなければ**起動を拒否します**。書き
+込み先やコードの読み込み元のディレクトリにも同じ規則が適用されます。`data_dir`、`helper_state_dir`、
+`logs_dir`、`checkpoints_dir`、`<data_dir>/criu-no-plugins`（`criu -L` に渡され、空でなければなりません）、
+`<data_dir>/lib`（fork ガード）とそれらのすべての親は、root の所有で、グループやその他のユーザーが書き
+込めない必要があります（設定ファイルと異なり、root が所有するシンボリックリンクはたどられ、リンク先も確認
+されます）。ヘルパーはそこに何かを作る前にそれらを確認します。tmpfiles.d が作る配置を保ってください。
+`data_dir` 自体は root のものでなければならないので、デーモンはデータベースを `daemon/` サブディレクトリに
+保存します。
+
+グループと GPU スロットの上限はここでは設定しません。それらはデーモンのデータベースに保存され、
+`puzuz group`、`puzuz parallel`、`puzuz gpu parallel` で変更します。
+
+ファイル、ディレクトリ、ソケットのパスは絶対パスでなければなりません。プログラム（`criu_path`、
+`cuda_checkpoint_path`、`nvidia_smi_path`、`nvml_library`、`shell` の最初の単語）は、`PATH` から探される
+名前だけか、絶対パスのどちらかです。`bin/criu` のような相対パスは拒否されます。`*_secs` のキーはすべて最大
+1 年（31536000）です。
+
+| キー | デフォルト | 使用者 | 意味 |
+| --- | --- | --- | --- |
+| `data_dir` | `"/var/lib/puzuz"` | 両方 | `daemon/state.sqlite`、`helper/`、`logs/`、`checkpoints/`、`lib/`、`criu-no-plugins/` のベース |
+| `state_db` | `<data_dir>/daemon/state.sqlite` | デーモン | SQLite のデータベース |
+| `helper_state_dir` | `<data_dir>/helper` | ヘルパー | ジョブの記録とイベントキュー（root の所有） |
+| `logs_dir` | `<data_dir>/logs` | 両方 | ジョブの出力、`<uid>/<id>.log`（root の所有） |
+| `checkpoints_dir` | `<data_dir>/checkpoints` | 両方 | チェックポイントのイメージ（root の所有、tmpfs 不可） |
+| `api_socket` | `"/run/puzuz/puzuz.sock"` | デーモン | クライアントが接続するソケット（クライアント側では `puzuz --socket` / `PUZUZ_SOCKET`） |
+| `helper_socket` | `"/run/puzuz/helper.sock"` | 両方 | ヘルパーのソケット |
+| `daemon_user` | `"puzuz"` | ヘルパー | ヘルパーへの接続を許可される唯一のユーザー |
+| `grace_secs` | `30` | 両方 | ジョブを停止するときの SIGTERM から SIGKILL までの秒数 |
+| `shell` | `["sh", "-c"]` | デーモン | ジョブのコマンドラインを後ろに付け加えるコマンドの接頭辞 |
+| `checkpoint_size_limit_bytes` | 未設定（制限なし） | デーモン | 全イメージの合計がこのサイズを超えたら警告します（イメージが自動で削除されることはありません） |
+| `checkpoint_size_warning_interval_secs` | `3600` | デーモン | 上限を超えている間、各管理者に通知する間隔 |
+| `checkpoint_tcp_close` | `true` | 両方 | チェックポイント時に TCP 接続を閉じます（`criu --tcp-close`） |
+| `criu_path` | `"criu"` | ヘルパー | 名前（`PATH` から探す）または root が所有する絶対パス |
+| `cuda_checkpoint_path` | `"cuda-checkpoint"` | ヘルパー | 同上 |
+| `nvidia_smi_path` | `"nvidia-smi"` | ヘルパー | 同上 |
+| `cuda_checkpoint_mode` | `"manual"` | ヘルパー | `"manual"`：ヘルパーが criu の前後で cuda-checkpoint を呼び出します。`"plugin"`：CRIU の CUDA プラグインがそれを行います。 |
+| `checkpoint_deadline_base_secs` | `180` | ヘルパー | チェックポイント全体やリストア全体の期限の固定部分（[チェックポイントのタイムアウト](#checkpoint-timeouts) を参照） |
+| `checkpoint_deadline_secs_per_gib` | `30` | ヘルパー | その期限のうち、RSS + VRAM（チェックポイント）またはイメージ（リストア）1 GiB あたりの部分 |
+| `criu_dump_timeout_secs` | 未設定 | ヘルパー | `criu dump` 単体の任意の上限。未設定なら期限だけが適用されます |
+| `criu_restore_timeout_secs` | 未設定 | ヘルパー | `criu restore` 単体の任意の上限。未設定なら期限だけが適用されます |
+| `fork_guard` | `true` | ヘルパー | ジョブに fork ガードをプリロードします（README の制限事項を参照） |
+| `gpu_detection` | `"auto"` | デーモン | `"auto"`：NVML、失敗したら `[[gpus]]`。`"static"`：`[[gpus]]` のみ。 |
+| `nvml_library` | 未設定 | デーモン | NVML ライブラリのパスまたは名前。デフォルトでは `libnvidia-ml.so.1`、次に `libnvidia-ml.so` |
+| `update_source` | `"github:kaito4681/puzuz"` | CLI | `puzuz update` と `puzuz doctor` がリリースを探す場所：`github:<owner>/<repo>` |
+| `update_check` | `true` | CLI | `puzuz doctor` が `update_source` に新しいリリースを問い合わせるかどうか |
+| `[[gpus]]` | 空 | デーモン | 静的な GPU のリスト：`index`（必須）、`uuid`、`name`、`memory_total_bytes`（[GPU の検出](#gpu-detection) を参照） |
+
+`puzuz-helper serve` はコマンドラインのフラグも受け付けます（`puzuz-helper serve --help`）。フラグはファイルより
+優先されます。ファイルを使うことを推奨します。`puzuz doctor` はファイルの値を報告し、ユニットの `ExecStart=`
+がフラグを渡していると警告します。
+
+<a id="administrators"></a>
+## 管理者
+
+管理者は root と `puzuz-admin` のメンバー（プライマリまたは補助グループ）です。全ユーザーのジョブを操作でき、
+管理者専用のコマンド（`group add/remove`、`parallel`、`gpu parallel`、`pause/start/kill -g` や `-a` による
+グループの一時停止/再開、`shutdown`、全ジョブの `reset`）を実行できます。
+
+```sh
+sudo usermod -aG puzuz-admin alice
+```
+
+デーモンはリクエストごとに（NSS を通して）グループを調べるので、変更はログインし直さなくてもすぐに反映
+されます。
+
+<a id="gpu-detection"></a>
+## GPU の検出
+
+デーモンは起動時に一度だけ GPU を検出します。GPU を追加、取り外し、交換したら `puzuz.service` を再起動して
+ください。
+
+- `gpu_detection = "auto"`（デフォルト）では、実行時に NVML（`libnvidia-ml.so.1`）を読み込み、`[[gpus]]` は
+  無視します。NVML を読み込めないか初期化できない場合は、その理由をログに記録し（`journalctl -u
+  puzuz.service`、"GPU detection with NVML failed" で始まる警告）、代わりに設定の `[[gpus]]` のリストを使います。
+  リストがなければ GPU なしで動きます。
+- `gpu_detection = "static"` では、常に `[[gpus]]` のリストを使います。
+
+NVML には `/dev/nvidiactl` と `/dev/nvidia<N>` への読み書きのアクセスが必要です。これらのノードは通常モード
+0666 なので、`puzuz` ユーザーに追加のグループは要りません。そのためパッケージの `puzuz.service` は
+`PrivateDevices=yes` を使いません（その専用の `/dev` には NVIDIA のノードがありません）。代わりに
+`DevicePolicy=closed` と、NVIDIA の制御デバイスと GPU デバイスに対する `DeviceAllow=` を使うので、デーモンが
+開けるのはそれらと標準の疑似デバイスだけです。ユニットをカスタマイズする場合はこれらの行を残してください。
+そうしないと NVML は "NVIDIA driver is not loaded"（ノードが隠れている）や "internal driver error"（ノードが
+許可されていない）で失敗します。どちらなのかはログのメッセージで分かります。
+
+`puzuz service install` は、設定ファイルを作成するとき、フォールバックとして `nvidia-smi` から `[[gpus]]` の
+リストも書き込みます。`puzuz doctor` は、デーモンがどの GPU をどうやって検出したかを問い合わせ、`nvidia-smi`
+と比較します。auto モードで NVML が失敗したとき、`nvidia-smi` には GPU があるのにデーモンにはないとき、
+デーモンの GPU（または `[[gpus]]` のフォールバックのリスト）が `nvidia-smi` と異なるとき、
+`gpu_detection = "static"` で `[[gpus]]` が空のときに警告します。NVML が動いている間は `[[gpus]]` が空でも
+問題ありません。リストは次のようになります。
+
+```toml
+[[gpus]]
+index = 0                 # PCI bus order, as nvidia-smi and CUDA_DEVICE_ORDER=PCI_BUS_ID
+uuid = "GPU-..."          # nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv
+name = "NVIDIA GeForce RTX 4090"
+memory_total_bytes = 25757220864
+```
+
+| フィールド | デフォルト | 意味 |
+| --- | --- | --- |
+| `index` | 必須 | nvidia-smi の番号付けと同じ、PCI バス順での GPU の番号。一意。`puzuz add --gpu` はこれを受け取り、ジョブからは `CUDA_VISIBLE_DEVICES` で見えます（`CUDA_DEVICE_ORDER=PCI_BUS_ID` 付き）。 |
+| `uuid` | `""` | GPU の UUID。ある番号で以前と異なる UUID の GPU が見つかると、デーモンは起動時に警告します。 |
+| `name` | `""` | モデル。`puzuz gpu` で表示され、各チェックポイントとともに記録されます。リストアには同じモデルが必要です。 |
+| `memory_total_bytes` | 未設定 | GPU のメモリ（バイト）。`puzuz gpu` で表示されます |
+
+`puzuz gpu` はデーモンが使っているものを表示します。NVML では、各 GPU の名前、メモリ、ドライバーの
+バージョンです。GPU のエンドツーエンドテストは、パッケージのユニット内での NVML による検出を確認します。
+
+デーモンが以前は知っていたのにもう見つからない GPU は、利用不可として一覧に残り、スロットの上限も保たれます。
+それを必要とするジョブはキューに留まり、それを要求する新しいジョブは拒否されます。各 GPU は 1 ジョブの上限で
+始まります。`puzuz gpu parallel <N> [--gpu LIST]` で変更します（`0` は無制限）。
+
+<a id="checkpoint-storage"></a>
+## チェックポイントの保存先
+
+- イメージは `checkpoints_dir`（デフォルトは `/var/lib/puzuz/checkpoints/<job id>/`）に保存され、root だけが
+  読めます。各ディレクトリには `images/`（CRIU のイメージファイル）、`dump.log`、`restore.log`、`meta.json`
+  （GPU、ドライバー、サイズ、時刻）、最後に書き込まれる `COMPLETE` マーカーがあります。マーカーのない
+  ディレクトリは不完全なもので、ヘルパーの起動時に片付けられます。ヘルパーはシステムのシャットダウン時の
+  ダンプのあと、そこに `shutdown-manifest.json` も書き込みます。
+- 各ジョブのイメージは最大 1 つです。リストアが成功したとき、ジョブが削除されたとき（`remove`、`clean`、
+  `reset`）、またはダンプが失敗したときに削除されます。リストアが失敗してもイメージは残ります。
+- ダンプが失敗すると、ヘルパーはその `dump.log` を同じディレクトリの `failed-logs/<job id>-<unix ms>.log`
+  （root のみ）に移し、最新の 20 個を残します。ジョブの最後のエラーにそのファイル名が示されます。
+- 容量：各ダンプの前に、ヘルパーは少なくとも（ジョブの RSS + VRAM）× 1.2 の空き容量を要求します。足りなければ
+  チェックポイントは拒否され、ジョブは動き続けます。イメージは圧縮されません。テストでは、7 GB の VRAM を使う
+  ジョブで 8.1 GB のイメージができました。tmpfs は使わないでください（`puzuz doctor` は失敗します）。空きが
+  20 GiB 未満のとき、または `checkpoint_size_limit_bytes` までの残りより少ないときも警告します。
+- 上限：`checkpoint_size_limit_bytes` を設定すると、合計が上限を超える原因となったチェックポイントの所有者に
+  一度警告が出ます。管理者は、コマンドを実行したときに、最大で `checkpoint_size_warning_interval_secs` ごとに
+  警告を受け、`puzuz doctor` もそれを報告します。ダンプは拒否されず、何も自動では削除されません。管理者は
+  `puzuz status` で全ジョブのイメージのサイズを見られます。
+- 別のディスクを使うには、root が所有するディレクトリ（モード 0700、すべての親が root の所有で、グループや
+  その他のユーザーが書き込めない）を作り、`checkpoints_dir` を設定し、シャットダウン時にそのファイルシステムが
+  アンマウントされる前にヘルパーが停止するようにします。
+
+  ```sh
+  sudo install -d -o root -g root -m 0700 /data/puzuz-checkpoints
+  sudo systemctl edit puzuz-helper.service
+  #   [Unit]
+  #   RequiresMountsFor=/data/puzuz-checkpoints
+  sudo systemctl restart puzuz-helper.service puzuz.service
+  ```
+
+  パスを変更する前に、既存のチェックポイントを移すかリストアしてください。
+
+<a id="cuda-plugin-mode"></a>
+## CUDA プラグインモード
+
+デフォルト（`cuda_checkpoint_mode = "manual"`）では、ヘルパーが自分で cuda-checkpoint を実行し（`lock`、
+`checkpoint`、続いて `criu dump`。`criu restore`、続いて `restore` と `unlock`）、CRIU には空のプラグイン
+ディレクトリを指定します。plugin モードでは `criu` だけを実行し、CRIU の CUDA プラグインがダンプとリストアの
+適切なタイミングで cuda-checkpoint を呼び出します。有効にするには：
+
+1. プラグイン付きで CRIU 4.0 以降をビルドし（puzuz は 4.2.1 でテストしています）、プラグインを CRIU の組み込みの
+   プラグインディレクトリ `/usr/lib/criu` にインストールします。plugin モードではヘルパーは `-L` を渡さないので、
+   CRIU はそこを探します。
+
+   ```sh
+   git clone --branch v4.2.1 https://github.com/checkpoint-restore/criu && cd criu
+   make -j criu cuda_plugin
+   sudo install -m 0755 criu/criu /usr/local/sbin/criu
+   sudo install -D -m 0755 plugins/cuda/cuda_plugin.so /usr/lib/criu/cuda_plugin.so
+   ```
+
+2. cuda-checkpoint を `/usr/local/bin`（または systemd サービスのデフォルトの `PATH` 上の別の場所）に置きます。
+   プラグインは `cuda-checkpoint` を名前で実行し、`cuda_checkpoint_path` は無視します。
+3. `/etc/puzuz/config.toml` で `cuda_checkpoint_mode = "plugin"` を設定し、
+   `sudo systemctl restart puzuz-helper.service` を実行して、`puzuz doctor`（`cuda plugin` の行）で確認します。
+
+各イメージは `meta.json` に自分のモードを記録し、そのモードでリストアされるので、`cuda_checkpoint_mode` を変更
+しても既存のチェックポイントは使えます。plugin モードのイメージのリストアにはプラグインが必要なので、それらの
+イメージをリストアするまではインストールしたままにしてください。プラグインがなければ、ヘルパーは plugin モードで
+CUDA ジョブのダンプを失敗させる代わりに拒否します（ジョブは動き続けます）。CPU のみのジョブには不要です。
+
+トレードオフ：
+
+| | manual（デフォルト） | plugin |
+| --- | --- | --- |
+| CRIU | プラグインのないディストリビューションのパッケージを含む、任意の CRIU 4.2 以降 | `cuda_plugin.so` 付きでビルドした CRIU |
+| リストア時の GPU | 同じモデルとドライバー。同じモデルの別のカードは再マップされます（`--device-map`） | 同じモデルとドライバー、かつ同じ GPU の UUID（CRIU 4.2.1 のプラグインは再マップできません） |
+| タイムアウト | 操作全体の期限と、cuda-checkpoint の各ステップ（lock、checkpoint、restore、unlock）のタイムアウト | 操作全体の期限のみ（`criu` の中のプラグインによる cuda-checkpoint の呼び出しもカバーします） |
+| 失敗時の処理 | ヘルパーが自分で行った CUDA のステップをロールバック（リストアとアンロック）します | ダンプが失敗すると CRIU のプラグインがプロセスを再開します |
+
+ユーザーから見るとどちらのモードも同じように動作します。どちらでも、CUDA プロセスから fork された PyTorch
+DataLoader のワーカーをチェックポイントできるようにしているのは fork ガードです。ガードがなければ plugin
+モードでもそれらで失敗します（`handle_device_vma plugin failed`、`Can't handle non-regular mapping`）。ガードは
+モードにかかわらずすべてのジョブにプリロードされます。cuda-checkpoint は停止中のプロセスに対してハングするので、
+どちらのモードでも一時停止中のジョブはダンプのために再開されます。
+
+<a id="filesystems-and-mounts"></a>
+## ファイルシステムとマウント
+
+各ジョブはそれぞれ専用のマウント名前空間で動きます。ジョブの開始時に shim はホストのマウントをそこにコピーし、
+ジョブから見えるものが CRIU がダンプしてリストア時に再作成するものと一致するように修正します。
+
+- automount ポイント（`x-systemd.automount`、autofs の直接マップ）は、ジョブが動き出す前に一度トリガーされ、
+  ジョブの名前空間は automount ポイントではなくマウントされたファイルシステムそのものを得ます。20 秒以内に
+  ファイルシステムが現れない automount（応答しない NFS サーバー）はそのまま残され、ジョブはそのパスを使え
+  ません。
+- 名前空間はその時点から private です。管理者があとからマウントやアンマウントしたファイルシステムは、実行中の
+  ジョブには現れません。それらを使うには新しいジョブを開始してください。
+- `/run` と `/media` 以下のマウントと、他のマウントの下に隠れたマウントは取り除かれます。各ジョブは `/tmp` と
+  `/dev/shm` に専用の tmpfs を持ち、それはチェックポイントに保存されます。
+
+CRIU はリストア時に、ジョブの名前空間のすべてのマウントを、同じホストのパスをバインドマウントすることで再作成
+します。そのため、**ジョブの開始時にマウントされていたすべてのファイルシステムが、同じパスに同じタイプで
+再びマウントされていなければ、ジョブはリストアできません**。ジョブがそれを一度も使っていなくても同じです。
+ファイルシステムは新しいマウント（別のデバイス番号、新しいループデバイス、新しい NFS マウント）として戻って
+きてもかまいません。ダンプ時に、ヘルパーはこれらの各パスのファイルシステムのタイプとマウントポイント、および
+ジョブが開いているファイルと作業ディレクトリを記録します。リストアの前に、それらがまだあることを（途中の
+automount ポイントをトリガーしながら）確認し、なければ分かりやすいエラーで拒否します（[リストアの失敗](#restore-failures)
+を参照）。イメージは残るので、ファイルシステムをマウントしてもう一度 `puzuz restore` を実行できます。
+
+リストアされたジョブが動き出す前に、ヘルパーは、その所有者がジョブの各ファイルを、ジョブが開いているのと同じ
+方法で、同じパスから、シンボリックリンクなしで開けることを確認します（[リストアとパス](architecture.md#restores-and-paths)
+を参照）。ダンプ時にジョブが既に開いていたファイルは、今は所有者がその方法で開けなくても（ジョブが読み取り
+専用で作成したファイルや、すべてのファイルが root のものとして見える sshfs マウント）、それがまさにそのファイル
+であれば通ります。
+
+- 同じマウント済みのファイルシステム上（間に再起動や再マウントがない）：同じデバイスと inode であること。または
+- ファイルシステムが再びマウントされたあと：ダンプ直後と同じ所有者、グループ、モード、サイズ、更新時刻、
+  変更時刻であること。デバイス番号は新しいマウントで変わり、inode 番号はすべてのファイルシステムで安定している
+  わけではありません。sshfs のような FUSE ファイルシステムは inode を検索された順に番号付けするので、再起動後は
+  ジョブのファイルは通常別の番号になります（そして別のファイルが古い番号を持つこともあります）。変更時刻は
+  カーネル（sshfs ではサーバー）が設定するもので、ジョブの所有者は自分のものでないファイルにそれを設定でき
+  ません。
+
+ですから、チェックポイントしたジョブのファイルには、リストアするまで触れないでください。時刻が変わった
+ファイルは、他のファイルと同じように所有者の権限で確認され、ファイルを root のものとして見せる sshfs マウント
+（`root@server:`、`allow_other,default_permissions`）ではリストアが拒否されます。所有者がジョブと同じように
+ファイルを開けるファイルシステム（通常の場合）では、変更は問題になりません。
+
+擬似的な再起動をまたいで（`scripts/e2e-test.sh`、シナリオ 15 と 16）、ジョブの作業ディレクトリと開いている
+ファイルを次のそれぞれに置いてテストしました。
+
+| マウント | 再起動後のリストア |
+|---|---|
+| 固定のパスにマウントした別のローカルファイルシステム（ループデバイス上の ext4）。再起動後は別のデバイス | 動作する |
+| バインドマウント（別のファイルシステムからの `/home/<user>`）、読み取り専用のバインドマウント、private な伝播のバインドマウント、shared な伝播の `/`（systemd のデフォルト） | 動作する |
+| overlayfs | 動作する |
+| `x-systemd.automount`（トリガーの前と後に開始したジョブ。リストア時にはまだトリガーされていない） | 動作する：リストアの事前チェックがトリガーする |
+| FUSE のネットワークファイルシステム（ファイルが root のものとして見えるように、root が `allow_other,default_permissions` でマウントした sshfs）。ジョブがそこで自分のファイルを書き込み・リネームし、再起動後は inode 番号が変わる | リストアの前に FUSE デーモンが再び動いていれば動作する |
+| 再起動後にマウントされていないファイルシステム（fstab のエントリーがない、NFS サーバーが停止している） | 拒否：`<path> needs <type> on <mount point>` |
+| 管理者がマウントした tmpfs（例：`/scratch`）にジョブのファイルや作業ディレクトリがある | 拒否：再起動後は中身が消えています。tmpfs は再起動を生き延びる必要のないジョブにだけ使ってください。同じブート中のリストアは動作します。 |
+
+テストしていないもの、または対応していないもの：
+
+- **カーネルの NFS**（NFSv3/v4）はテストしていません。Docker のテスト環境ではホストの `nfs` モジュールを読み
+  込めないためです。上記のチェックでは、NFS は他のファイルシステムと同じように扱われます。ヘルパーの開始前に
+  マウントされ、シャットダウン時にヘルパーがジョブをダンプしたあとでアンマウントされるように、`/etc/fstab`
+  （`_netdev` または `x-systemd.automount`）からマウントしてください（`puzuz-helper.service` は
+  `remote-fs.target` のあとに順序付けられています）。ジョブが開いていたファイルはパスで開き直されるので、
+  サーバー上にまだ存在している必要があります。
+- **autofs の間接マップ**（autofs デーモンが `/net/<host>` や `/home/<user>` を必要に応じてマウントするもの）：
+  ジョブの開始時にマウントされていたキーはジョブから見えますが、あとで初めてアクセスされたキーは見えません
+  （名前空間は private です）。そうした名前空間のリストアはテストしていません。
+- **リムーバブルメディアと `/run`：** ジョブからはまったく見えません。
+- 再起動後に同じパスに再びマウントできないファイルシステム（ブート ID やランダムな名前を含むパス）は、それが
+  マウントされていた間に開始したすべてのジョブをリストア不能にします。
+
+<a id="upgrading"></a>
+## アップグレード
+
+更新の方法は puzuz のインストール方法によります（`puzuz doctor` が "install method" として表示し、その
+"update" の行で新しいリリースがあるかどうかが分かります）。
+
+| インストール方法 | 更新方法 |
+| --- | --- |
+| `install.sh`（またはリリースの `puzuz service install`） | `sudo puzuz update` |
+| `.deb` | `sudo apt update && sudo apt upgrade`（またはリリースの新しい `.deb` を `sudo apt install ./puzuz_<new version>_<arch>.deb` でインストール） |
+| `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>`（dnf リポジトリはまだありません） |
+| ソースからビルド | `cargo build --release -p puzuz -p puzuz-helper` のあと `sudo target/release/puzuz service install` |
+| Nix ビルドからの `puzuz service install`（NixOS 以外） | 同じ `nix build` と `service install` をもう一度（[Nix でのインストール](#installing-with-nix) を参照） |
+| AUR パッケージ `puzuz-bin`（公開後。それまで Arch は `install.sh` と `sudo puzuz update` を使います） | `yay -Syu`（任意の AUR ヘルパー）のあと `sudo systemctl restart puzuz-helper.service puzuz.service`。`puzuz update` は拒否します |
+| NixOS（`services.puzuz`） | `nix flake update puzuz && sudo nixos-rebuild switch`（[NixOS](#nixos) を参照）。`puzuz update` は拒否します |
+| その他のディストリビューションのパッケージ | パッケージマネージャー（[インストール方法](#install-method) を参照）。`puzuz update` は拒否し、使うべきコマンドを示します |
+
+<a id="puzuz-update"></a>
+### puzuz update
+
+```sh
+puzuz update --check          # is there a newer release? (any user; without root, update only checks)
+sudo puzuz update             # install the latest release
+sudo puzuz update --version 0.2.0 --yes
+```
+
+`puzuz update` に GitHub のトークンは不要です。`install.sh` と同様に、与えられればそれを使います（API の
+レート制限が上がります）。`GH_TOKEN` か `GITHUB_TOKEN`（`sudo GH_TOKEN=... puzuz update`）、または
+`install.sh --save-token` が書き込む `/etc/puzuz/github-token`（root、0600）です。その後、次のことを行います。
+
+1. puzuz が `puzuz service install` でインストールされたこと（パッケージ、Nix、手動ではなく、両方のユニットが
+   それに属していること）と、インストールされたバイナリ（`puzuz.service` の `ExecStart=` にあるディレクトリ）
+   として実行されていることを確認します。
+2. 最新のリリース（または `--version`）を調べ、自分のバージョンと比較します。最新であれば何もしません。古い
+   バージョンは `--version` で指定されたときだけインストールします。
+3. 確認を求めます（`-y/--yes` で省略できます）。
+4. tarball、`.sha256`、`.minisig` を `/var/lib/puzuz/update`（root、0700）にダウンロードし、`puzuz` に組み込まれた
+   リリース鍵で minisign の署名を、そしてチェックサムを確認します。
+5. tarball を展開し（通常ファイルとディレクトリのみ）、新しい `puzuz` に対応するデータベースのスキーマを
+   問い合わせます。デーモンのデータベースを開けないリリース（スキーマ変更より前の古いもの）は、何かを変更する
+   前に拒否されます。
+6. インストール先のディレクトリに対して新しい `puzuz service install` を実行し、Nix でビルドしたインストールの
+   Nix GC ルートを削除し（リリースのバイナリはストアを必要としません）、デーモンが新しいバージョンで動いて
+   ヘルパーに接続するまで待ってから、ダウンロードしたものを削除します。
+
+`install.sh`（必要なら `--version` を付けて再実行）でも同じことができます。ただし署名を確認するのは `minisign`
+がインストールされている場合だけです。
+
+`service install`（したがって上記のどちらの方法も）は、バイナリとユニットを置き換え、何か変わっていれば両方の
+サービスを再起動します。設定ファイルは保持されます。
+
+- **実行中のジョブには影響しません。** ジョブはそれぞれの systemd ユニット（`puzuz-job-<id>.service`、
+  リストア後は `puzuz-job-<id>-r<n>.service`）で動いています。新しいデーモンはデータベースから状態を引き継ぎ、
+  新しいヘルパーは実行中のジョブを再び見つけます。
+- **ヘルパーの再起動：** 単なる `systemctl stop/restart puzuz-helper`（システムのシャットダウンではない）で
+  何かがチェックポイントされることはありません。停止するヘルパーは新しい起動とリストアを拒否し、処理中の
+  操作を先に終わらせます。処理中のダンプには時間がかかることがあり、2 回目の SIGTERM ですぐに終了させられます。
+  拒否されたり中断されたりした起動はデーモンが再びキューに入れ、ヘルパーが戻ってきたら再試行します。ヘルパーが
+  停止している間、`pause`、`kill`、`checkpoint`、一時停止中のジョブの再開は "helper unavailable" で失敗します。
+  `add -i`、`start`、`restore -i`、`restart -i` は受け付けられ、ヘルパーが再接続したときにジョブが起動されます。
+- **バージョン：** CLI とデーモンは同じバージョンでなければなりません。バージョンの合わないクライアントには、
+  どちら側を更新すべきかを示すエラーが返り、`puzuz doctor` もそれを警告します。ユーザーが実行する `puzuz`
+  バイナリも同時に更新してください。
+- `/var/lib/puzuz/lib` の古い fork ガードのライブラリは意図的に残されます。アップグレード前にチェックポイント
+  したジョブのリストアには、まさにそのファイルが必要だからです。
+- NVIDIA ドライバーをアップグレードする前に、チェックポイント済みのジョブをリストアするか削除してください。
+  異なるドライバーバージョンでのリストアは拒否されます。
+
+<a id="uninstalling"></a>
+## アンインストール
+
+NixOS では、代わりに `services.puzuz.enable = false` を設定して `sudo nixos-rebuild switch` を実行します
+（[NixOS での更新と削除](#updating-and-removing-on-nixos) を参照）。
+
+`.deb` には `sudo apt remove puzuz` か `sudo apt purge puzuz`（[Debian/Ubuntu パッケージのインストール](#installing-the-debianubuntu-package)
+を参照）、`.rpm` には `sudo dnf remove puzuz`（[Fedora/RHEL/Rocky パッケージのインストール](#installing-the-fedorarhelrocky-package)
+を参照）、AUR パッケージ（公開後）には `sudo pacman -R puzuz-bin`（[Arch Linux (AUR)](#arch-linux-aur) を参照）を
+使います。当面の Arch Linux と、`install.sh` や `puzuz service install` によるインストールでは次のようにします。
+
+```sh
+sudo puzuz uninstall            # stop, disable and remove the units, snippets and copied binaries
+sudo puzuz uninstall --purge    # also delete /etc/puzuz, /var/lib/puzuz, /run/puzuz, /run/puzuz-helper
+```
+
+`puzuz service uninstall` は同じコマンドで、`install.sh --uninstall [--purge] [--yes]` はこれを実行します。
+`--purge` は端末で確認を求めます。端末がない場合は `--yes` を渡してください。
+
+- 削除されるのは、インストールのマーカーで始まるファイルだけです。それ以外は報告されて残ります。
+- バイナリが削除されるのは、`/var/lib/puzuz/install-receipt` に `puzuz service install` がコピーしたものとして
+  記載されている場合だけです（記録されたディレクトリの `puzuz` と `puzuz-helper` のみ）。`/usr/bin` などで
+  その場で使われたバイナリは残ります。レシートができる前に行ったインストールではバイナリは残り、`uninstall` は
+  手動で削除すべきものを表示します。使えないレシートの場合も同様です。記載されたバイナリのうち、今では
+  パッケージが所有しているもの（dpkg、rpm、pacman に問い合わせます）は残り、パッケージマネージャーが所有者を
+  判断できなかったものも残ります。Nix の GC ルートとレシートも削除されます。削除できなかったバイナリがあれば、
+  それを記載したままレシートは残ります（あとで `sudo puzuz uninstall` を再実行してください）。
+- インストール済みの `puzuz` が `puzuz uninstall` より古い場合、`install.sh --uninstall` はその
+  `service uninstall` を実行してから、ユニットのディレクトリにある `puzuz` と `puzuz-helper` を削除します。
+- 実行中のジョブはそれぞれのユニットで動き続けます。`uninstall` はそれについて警告し、`--purge` は
+  `puzuz-job-*` ユニットがアクティブな間は実行を拒否します。先に `sudo systemctl stop 'puzuz-job-*'` で停止
+  するか、アンインストールの前にチェックポイントか kill してください。
+- `--purge` は確認を求めます（`-y/--yes` で省略できます）。マウントポイント（たとえば `/run/puzuz-helper` 以下の
+  `/` のバインドマウント）の中には降りていきません。それらは報告されるので、手動でアンマウントして削除して
+  ください。
+- システムユーザー `puzuz` とグループ `puzuz-admin` は常に残ります。
+
+<a id="troubleshooting"></a>
+## トラブルシューティング
+
+<a id="where-to-look"></a>
+### どこを見るか
+
+```sh
+journalctl -u puzuz -u puzuz-helper          # daemon and helper
+journalctl -u 'puzuz-job-*'                  # job units (start/stop, OOM kills)
+puzuz status; puzuz log <id>                 # job state, last error, output
+sudo ls /var/lib/puzuz/checkpoints/<id>/     # dump.log, restore.log (CRIU logs, root only)
+sudo ls /var/lib/puzuz/checkpoints/failed-logs/   # dump.log of failed dumps (newest 20)
+```
+
+ジョブの出力は `/var/lib/puzuz/logs/<uid>/<id>.log` に書き込まれます。チェックポイントやリストアが失敗すると、
+ジョブの最後のエラー（所有者と管理者には `puzuz status` と `puzuz log` のヘッダーに表示されます）に CRIU の
+ログの短い要約が含まれます。ダンプが失敗した場合は、完全なログの場所も示されます。例：
+`(CRIU log: /var/lib/puzuz/checkpoints/failed-logs/12-1760000000000.log)`。デーモンは `info` レベルでログを
+出力します。詳しく見るには、`puzuz.service` のドロップインで `Environment=RUST_LOG=debug` を設定してください。
+
+デーモンが動いていなければ、すべてのコマンドが "cannot connect to the daemon socket" で失敗します。
+`puzuz service status` と `systemctl status puzuz` を確認してください。`puzuz shutdown` のあとは、
+`sudo systemctl start puzuz` を実行するか次に起動するまで、デーモンは停止したままです。
+
+<a id="common-puzuz-doctor-failures"></a>
+### よくある `puzuz doctor` の失敗
+
+| チェック | メッセージ | 対処 |
+| --- | --- | --- |
+| `config` | not owned by root or group/world-writable | `sudo chown root:root /etc/puzuz/config.toml /etc/puzuz; sudo chmod go-w /etc/puzuz/config.toml /etc/puzuz` |
+| `config` | invalid configuration | TOML を直してください。この状態ではデーモンは起動しません。 |
+| `config` | not readable by others / not searchable by others (WARN) | `sudo chmod 755 /etc/puzuz; sudo chmod 644 /etc/puzuz/config.toml`：デーモンは `puzuz` として動きます |
+| `criu` | not found, or too old | CRIU 4.2 以降をインストールするか、`criu_path` を設定します |
+| `cuda-checkpoint` | not found, or lacks `--action lock/checkpoint/restore/unlock` | r570 以降のドライバー用のバイナリを `/usr/local/bin` にインストールします |
+| `cuda-checkpoint` | version X but the driver is Y | ドライバーのメジャーバージョンに合った cuda-checkpoint を使います |
+| `cuda plugin` | `cuda_checkpoint_mode` is `"plugin"` but `/usr/lib/criu/cuda_plugin.so` is missing | プラグインをインストールする（[CUDA プラグインモード](#cuda-plugin-mode) を参照）か、manual モードを使います |
+| `gpus` | nvidia-smi lists N GPU(s), the configuration M | `[[gpus]]` を更新します（[GPU の検出](#gpu-detection) を参照） |
+| `kernel` | lacks `/proc/sys/kernel/ns_last_pid` | `CONFIG_CHECKPOINT_RESTORE=y` のカーネルを使います |
+| `update` | puzuz X is available (INFO) | `sudo puzuz update`。`update_check = false` でチェックを無効にできます |
+| `install method` | mixed: two install methods at once | `fix:` の行のとおり、1 つを残して削除します（例：パッケージを残すなら `sudo puzuz uninstall`） |
+| `install method` | WARN: a unit no package owns, a leftover unit, or units installed in different ways | `fix:` の行のとおり、所有者のない `/usr/lib` のユニットを削除する（`sudo rm ...`）か、両方のユニットを所有すべきインストールを再実行します |
+| `puzuz.service`、`puzuz-helper.service` | not installed / not active | `sudo puzuz service install`、または `sudo systemctl start <unit>` を実行して `journalctl -u <unit>` を読みます |
+| `helper binary` | the binary or a directory above it is not owned by root or is writable by others | `sudo chown root:root <path>; sudo chmod 755 <path>`（とそのディレクトリ）、または別のディレクトリに再インストールします |
+| `sudo PATH` | sudo's secure_path does not include /usr/local/bin (INFO, RHEL family) | `sudo /usr/local/bin/puzuz ...`、または `sudo visudo` で `secure_path` に `/usr/local/bin` を追加します |
+| `daemon write paths` | cannot write to a configured directory: not below its ReadWritePaths= | `puzuz.service` に `ReadWritePaths=` のドロップインを追加します（[インストール](#installing) を参照） |
+| `helper` | the daemon is not connected to the helper | `journalctl -u puzuz-helper`。設定やデータディレクトリの所有者の問題であることが多いです。 |
+| `daemon` | runs version X while this puzuz is Y | アップグレード後に `sudo systemctl restart puzuz-helper.service puzuz.service` を実行するか、CLI を更新します |
+| `checkpoint dir` | on tmpfs, or little free space | `checkpoints_dir` を、ジョブの RAM + VRAM を収められるディスクに移します |
+| `helper settings` | ExecStart= passes flags | 設定を `config.toml` に移し、フラグを削除します |
+
+<a id="checkpoint-failures"></a>
+### チェックポイントの失敗
+
+ヘルパーはダンプの前にジョブを確認します。チェックが失敗すると、ダンプは**拒否**されます。ジョブには触れず、
+ジョブは動き続け、`puzuz checkpoint` は `checkpoint refused: <reason>; the job keeps running` で失敗し、その
+理由がジョブの最後のエラーになります。ダンプを行う時点になって初めて拒否された場合（たとえば
+`puzuz shutdown` の最中。この場合ジョブは動いたまま残されます）、所有者は次にコマンドを実行したときに警告を
+受けます。拒否の理由：
+
+- `not enough free space for the checkpoint: need N bytes, M available`：空き容量を作るか
+  `checkpoints_dir` を移してから、もう一度チェックポイントします。
+- `the job's mounts [...] are only reachable through mounts hidden under other mounts`：ジョブのマウント
+  名前空間が別のマウントの下に隠れたマウントに依存しているので、決してリストアできません。ジョブを実行し直して
+  ください（`puzuz restart`）。新しいジョブには整理された名前空間が与えられます。
+- `/` 自体を覆うマウントは扱えません。puzuz はそうしたダンプを拒否します。
+- `<dir> is on tmpfs`：`checkpoints_dir` をディスクに移します。
+- `cuda_checkpoint_mode is "plugin" but CRIU's CUDA plugin ... is missing`：プラグインをインストールする
+  （[CUDA プラグインモード](#cuda-plugin-mode) を参照）か、manual モードに切り替えます。
+
+チェックポイントされる一時停止中のジョブは、ダンプのために再開されます。ダンプが拒否されると、再び一時停止
+されます。
+
+試みたダンプが**失敗**すると、CRIU と cuda-checkpoint が既にジョブを凍結しているため、ジョブは停止されます
+（SIGTERM、`grace_secs` 後に SIGKILL）。ジョブは CRIU のログの要約と完全なログのパスとともに
+`Checkpoint failed` とされます。よくある理由：
+
+- CRIU の要約に `Can't handle non-regular mapping` や `handle_device_vma plugin failed` がある：CUDA プロセスが
+  `exec` せずに fork したプロセスが、まだ `/dev/nvidia*` をマップしています。通常は fork ガードがこれを防ぎ
+  ます。`fork_guard` が `false` でないこと、プログラムが静的リンクでないこと、ガードがインストールされたあとに
+  ジョブが開始されたことを確認してください。それでもだめなら、`spawn` か `forkserver` の開始方式を使います
+  （PyTorch の DataLoader なら `multiprocessing_context="forkserver"`）。
+- `checkpoint_tcp_close = false` の場合、CRIU は確立済みの TCP 接続を持つジョブのダンプを拒否します。
+
+OS のシャットダウンや再起動の間に、ダンプが失敗したか拒否されたジョブは systemd によって停止されます。起動後は
+理由とともに `Checkpoint failed` と表示され（拒否の場合は `checkpoint refused:` で始まります）、所有者に警告が
+出ます。
+
+<a id="restore-failures"></a>
+### リストアの失敗
+
+リストアが失敗してもジョブは `Checkpointed` のままで、イメージも残るので、原因を直してもう一度
+`puzuz restore` を実行できます。所有者は次にコマンドを実行したときに警告を受けます。
+
+- `paths the checkpoint's mounts depend on are missing on this host: [...]`：CRIU は `Can't stat mountpoint`
+  や `Failed to open_tree <path>` で失敗するはずの状態です。ジョブの名前空間に、今は存在しないマウントポイント、
+  またはホストのパスからのバインドマウントがありました（たとえば再起動後にマウントされていないファイル
+  システム）。それをマウントするかパスを作成して、もう一度リストアしてください。
+- `filesystems the checkpoint depends on are not mounted as at the dump (mount them and restore
+  again): /data needs ext4 on /data (found overlay on /)`：ジョブの開始時にマウントされていたファイルシステムが
+  今はマウントされていないか、そこに別のタイプのファイルシステムがマウントされています。CRIU は代わりに空の
+  マウントポイントのディレクトリをバインドし、ジョブはその下のファイルシステムに書き込み続けることになります。
+  マウントして（`systemctl start data.mount`、`mount -a`、NFS サーバーを起動する、など）もう一度リストアして
+  ください。[ファイルシステムとマウント](#filesystems-and-mounts) を参照してください。
+- `files or directories the job used are missing on this host: [...]`：ジョブが開いていたファイルや作業
+  ディレクトリがなくなっています。典型的には、それらが再起動後に空になる tmpfs（`/scratch`）上にあった場合です。
+  ジョブはリストアできません。削除してください（`puzuz remove`）。
+- `checkpoint is not compatible with this host`：GPU のモデルやドライバーのバージョンが異なるか、GPU がありま
+  せん。元のドライバーと GPU でリストアしてください。plugin モードでは GPU の UUID も一致する必要があります。
+  manual モードでは同じモデルの別のカードは再マップされます。
+- `not enough free GPU memory`：他のジョブが GPU を使っています。待つか、GPU を空けてください。

@@ -50,6 +50,12 @@
   - `crates/puzuz-helper` — the root helper binary (spawns jobs as their owner, checkpoints)
 - User documentation: `README.md`, `docs/install.md`, `docs/architecture.md`. Update them when
   commands, flags, configuration keys, packaging files or behavior change.
+- The English documentation is canonical. It is translated into Japanese (`README.ja.md`,
+  `docs/ja/`) and Simplified Chinese (`README.zh-CN.md`, `docs/zh-CN/`). A PR that changes
+  `README.md`, `docs/install.md` or `docs/architecture.md` must update both translations in the
+  same PR. Translations keep commands, code blocks, configuration keys and paths untranslated,
+  link to pages of the same language, and keep the English anchor ids (see the HTML comment at
+  the top of `docs/ja/install.md`).
 - Shared dependencies are declared once in the root `[workspace.dependencies]`.
 - Keep `puzuz-core` free of I/O other than its storage module, and keep `puzuz-helper`'s
   dependency tree minimal (no HTTP server, no SQLite).
