@@ -73,7 +73,20 @@ It installs and starts the same services and recommends `criu`. It also register
 repository, so once that repository is published (with the first release that has it), later
 versions come with `sudo apt update && sudo apt upgrade`. `sudo apt remove puzuz` stops the
 services; `sudo apt purge puzuz` also deletes /etc/puzuz. Both keep /var/lib/puzuz and running
-jobs. Other ways to install (rpm, AUR, Nix) are coming later; you can also build from source (see
+jobs.
+
+On Fedora, RHEL, Rocky and Alma Linux 9+ (x86_64 or aarch64), install the .rpm from the release
+(a file or its URL):
+
+```sh
+sudo dnf install ./puzuz-<version>-1.x86_64.rpm   # or -1.aarch64.rpm, or the release URL
+```
+
+There is no dnf repository yet (planned, issue #23): update by installing the newer release's
+.rpm with `sudo dnf upgrade <its URL>`. `sudo dnf remove puzuz` stops the services and keeps
+/var/lib/puzuz and running jobs. It recommends `criu`; Fedora's is new enough, Rocky/RHEL 9 ship
+only 3.19, so checkpointing there needs a newer CRIU (jobs run without it). Other ways to install
+(AUR, Nix) are coming later; you can also build from source (see
 [docs/install.md](docs/install.md)).
 
 ```sh
@@ -343,8 +356,9 @@ Not tested yet:
 - Installing with `install.sh` from the real GitHub releases (tested against a fake release
   server, `scripts/dist-test.sh`, on Ubuntu 22.04/24.04/26.04 and Debian 12 containers).
 - The `.deb` under a running systemd (its install, reinstall, remove and purge are tested in
-  plain Debian 12 and Ubuntu containers without systemd, `scripts/deb-test.sh`), and arm64 on
-  real hardware.
+  plain Debian 12 and Ubuntu containers without systemd, `scripts/deb-test.sh`), the same for the
+  `.rpm` (install, upgrade and remove are tested in plain Rocky Linux 9 and Fedora containers,
+  `scripts/rpm-test.sh`), and arm64 on real hardware.
 - Kernel NFS and autofs indirect maps (FUSE network filesystems and `x-systemd.automount` are
   tested).
 - Multi-GPU and NCCL jobs, and GPU models other than the one used for testing.

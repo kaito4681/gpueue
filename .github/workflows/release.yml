@@ -49,7 +49,7 @@ jobs:
           fi
 
   # Native builds per architecture (the helper embeds C code, so no cross
-  # compiling): the tarball, its checksum, and the .deb.
+  # compiling): the tarball, the .deb and the .rpm, with their checksums.
   build:
     strategy:
       matrix:
@@ -99,12 +99,41 @@ jobs:
         run: |
           deb="$(scripts/dist/build-package.sh target/release dist deb)"
           (cd dist && sha256sum "$(basename "$deb")" >"$(basename "$deb").sha256")
+      # dist/puzuz-<version>-1.<x86_64|aarch64>.rpm (packaging/nfpm.yaml).
+      # The .rpm itself is GPG-signed (rpm -K) with the APT repository's key
+      # when that key is available (the release job then attaches its public
+      # half as RPM-GPG-KEY-puzuz); otherwise it stays unsigned and, like
+      # every asset, is covered by its .minisig and .sha256.
+      - name: Build the .rpm
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          NFPM_RPM_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          keyring=packaging/apt/puzuz-archive-keyring.gpg
+          key=""
+          if [ -n "$APT_GPG_PRIVATE_KEY" ] && ! grep -aq 'TEST KEY' "$keyring"; then
+            key="$RUNNER_TEMP/rpm-signing.asc"
+            (umask 077; printf '%s\n' "$APT_GPG_PRIVATE_KEY" >"$key")
+            GNUPGHOME="$(mktemp -d)"
+            export GNUPGHOME
+            fpr() { gpg --show-keys --with-colons "$1" | awk -F: '$1 == "fpr" { print $10; exit }'; }
+            if [ "$(fpr "$key")" != "$(fpr "$keyring")" ]; then
+              echo "::error::APT_GPG_PRIVATE_KEY is not the key of $keyring"
+              exit 1
+            fi
+          else
+            echo "::warning::APT_GPG_PRIVATE_KEY is not set (or the APT key is the test key); the .rpm is not GPG-signed"
+          fi
+          rpm="$(PUZUZ_RPM_SIGNING_KEY="$key" scripts/dist/build-package.sh target/release dist rpm)"
+          rm -f "$key"
+          (cd dist && sha256sum "$(basename "$rpm")" >"$(basename "$rpm").sha256")
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
           path: |
             dist/*.tar.gz*
             dist/*.deb*
+            dist/*.rpm*
 
   release:
     needs: [check-signing, build]
@@ -121,9 +150,9 @@ jobs:
           pattern: dist-*
           merge-multiple: true
           path: dist
-      # dist/<name>.tar.gz.minisig and dist/<name>.deb.minisig, checked
-      # against packaging/minisign.pub (the key built into `puzuz`), and
-      # install.sh as a release asset.
+      # dist/<name>.{tar.gz,deb,rpm}.minisig, checked against
+      # packaging/minisign.pub (the key built into `puzuz`), and install.sh
+      # as a release asset.
       - name: Sign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -136,13 +165,26 @@ jobs:
           minisign="$(scripts/dist/get-minisign.sh "$RUNNER_TEMP/minisign")"
           key="$RUNNER_TEMP/minisign.key"
           (umask 077; printf '%s\n' "$MINISIGN_SECRET_KEY" >"$key")
-          for file in dist/*.tar.gz dist/*.deb; do
+          for file in dist/*.tar.gz dist/*.deb dist/*.rpm; do
             printf '%s\n' "$MINISIGN_PASSWORD" |
               "$minisign" -S -s "$key" -m "$file" -t "puzuz $TAG $(basename "$file")"
             "$minisign" -V -p packaging/minisign.pub -m "$file"
           done
           rm -f "$key"
           install -m 0644 scripts/install.sh dist/install.sh
+      # The public key the .rpm files are signed with, ASCII-armored as
+      # `rpm --import` needs it (the same key as the APT repository's).
+      - name: Attach the .rpm signing key
+        env:
+          HAVE_RPM_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY != '' }}
+        run: |
+          keyring=packaging/apt/puzuz-archive-keyring.gpg
+          if [ "$HAVE_RPM_KEY" = true ] && ! grep -aq 'TEST KEY' "$keyring"; then
+            GNUPGHOME="$(mktemp -d)"
+            export GNUPGHOME
+            gpg --batch --quiet --import "$keyring"
+            gpg --batch --armor --export >dist/RPM-GPG-KEY-puzuz
+          fi
       - name: Write the release notes
         run: |
           cat >"$RUNNER_TEMP/notes.md" <<EOF
@@ -161,9 +203,17 @@ jobs:
           sudo apt install ./puzuz_${TAG#v}_arm64.deb    # aarch64
           \`\`\`
 
-          Running jobs keep running. The tarballs (\`puzuz-$TAG-<target>.tar.gz\`) and the
-          \`.deb\` files are signed with minisign (\`.minisig\`, public key in
-          \`packaging/minisign.pub\`); see docs/install.md for manual installation and
+          On Fedora, RHEL, Rocky and Alma Linux, the .rpm (there is no dnf repository yet:
+          update an older .rpm installation with \`sudo dnf upgrade\` and the same URL):
+
+          \`\`\`sh
+          sudo dnf install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/puzuz-${TAG#v}-1.x86_64.rpm    # x86_64
+          sudo dnf install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/puzuz-${TAG#v}-1.aarch64.rpm   # aarch64
+          \`\`\`
+
+          Running jobs keep running. The tarballs (\`puzuz-$TAG-<target>.tar.gz\`), the
+          \`.deb\` and the \`.rpm\` files are signed with minisign (\`.minisig\`, public key
+          in \`packaging/minisign.pub\`); see docs/install.md for manual installation and
           uninstalling.
           EOF
       - name: Create or update the GitHub release
