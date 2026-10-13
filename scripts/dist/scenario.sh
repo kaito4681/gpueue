@@ -44,6 +44,22 @@ wait_for() {
     done
 }
 
+# A dummy .deb named puzuz that ships both units in /usr/lib/systemd/system.
+make_deb() {
+    local root=/tmp/puzuz-deb
+    [ -f /tmp/puzuz.deb ] && return
+    rm -rf "$root"
+    mkdir -p "$root/DEBIAN" "$root/usr/lib/systemd/system"
+    printf 'Package: puzuz\nVersion: 0.0.1\nArchitecture: all\nMaintainer: test <test@example.com>\nDescription: dummy puzuz package for the distribution test\n' >"$root/DEBIAN/control"
+    printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' >"$root/usr/lib/systemd/system/puzuz.service"
+    printf '[Service]\nExecStart=/usr/bin/puzuz-helper serve\n' >"$root/usr/lib/systemd/system/puzuz-helper.service"
+    dpkg-deb --build --root-owner-group "$root" /tmp/puzuz.deb >/dev/null
+}
+install_deb() {
+    make_deb
+    dpkg -i /tmp/puzuz.deb >/dev/null
+}
+
 start_server() {
     [ -d /srv/releases ] && return
     mkdir -p /srv
@@ -99,22 +115,35 @@ scenario_17() {
     chmod +x /tmp/oldglibc/getconf
     PATH="/tmp/oldglibc:$PATH" GH_TOKEN="$TOKEN" expect_fail "glibc 2.31 is too old" bash "$install"
     GH_TOKEN="$TOKEN" expect_fail "checksum mismatch" bash "$install" --version "$VERSION-test.badsha"
-    printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' >/usr/lib/systemd/system/puzuz.service
-    GH_TOKEN="$TOKEN" expect_fail "distribution package" bash "$install"
+    # A unit a package owns is refused before anything is downloaded.
+    install_deb
+    GH_TOKEN="$TOKEN" expect_fail "distribution package puzuz (dpkg" bash "$install" --version 9.9.9
     # A masked or overridden package unit is still the package, not "mixed".
     ln -s /dev/null /etc/systemd/system/puzuz.service
-    GH_TOKEN="$TOKEN" expect_fail "distribution package" bash "$install"
+    GH_TOKEN="$TOKEN" expect_fail "distribution package puzuz (dpkg" bash "$install" --version 9.9.9
     rm /etc/systemd/system/puzuz.service
     printf '[Service]\nExecStart=/usr/bin/puzuz daemon --verbose\n' >/etc/systemd/system/puzuz.service
-    GH_TOKEN="$TOKEN" expect_fail "distribution package" bash "$install"
-    rm /etc/systemd/system/puzuz.service /usr/lib/systemd/system/puzuz.service
+    GH_TOKEN="$TOKEN" expect_fail "distribution package puzuz (dpkg" bash "$install" --version 9.9.9
+    rm /etc/systemd/system/puzuz.service
+    dpkg -r puzuz >/dev/null
+    # A unit nobody owns: the downloaded binary refuses it.
+    printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' >/usr/lib/systemd/system/puzuz.service
+    GH_TOKEN="$TOKEN" expect_fail "no package owns /usr/lib/systemd/system/puzuz.service" bash "$install"
+    rm /usr/lib/systemd/system/puzuz.service
     # A mask alone is no installation: the pre-download check lets it through.
     ln -s /dev/null /etc/systemd/system/puzuz.service
     GH_TOKEN="$TOKEN" expect_fail "release v9.9.9 not found" bash "$install" --version 9.9.9
     rm /etc/systemd/system/puzuz.service
-    touch /etc/NIXOS
-    GH_TOKEN="$TOKEN" expect_fail "NixOS" bash "$install"
-    rm /etc/NIXOS
+    # Units from /nix/store, and NixOS (by os-release only).
+    ln -s /nix/store/abc-puzuz.service /etc/systemd/system/puzuz.service
+    GH_TOKEN="$TOKEN" expect_fail "come from /nix/store" bash "$install" --version 9.9.9
+    rm /etc/systemd/system/puzuz.service
+    cp -P /etc/os-release /tmp/os-release.saved
+    rm /etc/os-release
+    printf 'NAME=NixOS\nID=nixos\n' >/etc/os-release
+    GH_TOKEN="$TOKEN" expect_fail "this is NixOS" bash "$install" --version 9.9.9
+    rm /etc/os-release
+    mv /tmp/os-release.saved /etc/os-release
     [ ! -e /usr/local/bin/puzuz ] || fail "a refused install left /usr/local/bin/puzuz"
 
     step "17: install v1 (token from a file, saved for puzuz update)"
@@ -236,10 +265,10 @@ scenario_18() {
     job_alive "$id" || fail "job $id stopped"
 
     step "18: update refuses a package-managed machine"
-    printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' >/usr/lib/systemd/system/puzuz.service
+    install_deb
     set_latest "$VERSION-test.badsig"
     expect_fail "installed in more than one way" "$puzuz" update --yes
-    rm /usr/lib/systemd/system/puzuz.service
+    dpkg -r puzuz >/dev/null
 
     systemctl stop 'puzuz-job-*' || true
     bash "$install" --uninstall --purge --yes >/dev/null
