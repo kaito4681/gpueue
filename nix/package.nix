@@ -79,6 +79,26 @@ rustPlatform.buildRustPackage {
   # `--exact`: skip these names only, not every test whose name contains one.
   checkFlags = [ "--exact" ] ++ map (t: "--skip=${t}") skippedTests;
 
+  # stdenv adds `-rpath $out/lib` to every link, including the helper's fork
+  # guard library, which the helper embeds. A check build (`--rebuild`) runs
+  # with a temporary output path that Nix rewrites in the result afterwards,
+  # but not in the ThinLTO symbol suffixes derived from the hash of the module
+  # that holds the library's bytes, so the helper differed between identical
+  # builds. Nothing is installed in $out/lib anyway.
+  NIX_NO_SELF_RPATH = true;
+
+  # Panic messages embed the absolute source paths of the dependencies, which
+  # are vendored under the build directory. In the sandbox that is always
+  # /build, but without it (e.g. in the nixos/nix Docker image) it is
+  # /nix/var/nix/builds/nix-<pid>-<random>, so the binaries differed between
+  # identical builds. Map it to /build so that every build gives the same
+  # output (a no-op in the sandbox). NIX_RUSTFLAGS is appended by nixpkgs'
+  # rustc wrapper; RUSTFLAGS would replace the target's rustflags that
+  # cargoSetupHook writes into the cargo configuration.
+  preConfigure = ''
+    export NIX_RUSTFLAGS="''${NIX_RUSTFLAGS:-} --remap-path-prefix=$NIX_BUILD_TOP=/build"
+  '';
+
   postInstall = ''
     install -Dm644 -t $out/share/doc/puzuz README.md docs/*.md
     install -Dm644 -t $out/share/licenses/puzuz LICENSE
