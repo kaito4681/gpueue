@@ -14,6 +14,9 @@ set -euo pipefail
 # shellcheck disable=SC1091
 . /dist/versions
 TOKEN="$(cat /dist/token)"
+# install.sh honours the two overrides only with PUZUZ_TEST_HOOKS=1; the test
+# versions of puzuz are built with the test-hooks feature.
+export PUZUZ_TEST_HOOKS=1
 export PUZUZ_RELEASE_API_URL=http://127.0.0.1:8080
 export PUZUZ_UPDATE_PUBKEY_FILE=/dist/release.pub
 

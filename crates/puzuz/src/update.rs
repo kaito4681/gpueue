@@ -13,8 +13,9 @@
 //! installed directory>`. A Nix GC root left from binaries built with Nix is removed afterwards
 //! (see `service install`). Running jobs are not affected.
 //!
-//! Test-only overrides, not shown in `--help`: `PUZUZ_RELEASE_API_URL` (a fake API) and
-//! `PUZUZ_UPDATE_PUBKEY_FILE` (another public key).
+//! Test-only overrides, compiled only into unit tests and builds with the `test-hooks` cargo
+//! feature (the test versions of scripts/dist/build-test-versions.sh, never a release):
+//! `PUZUZ_RELEASE_API_URL` (a fake API) and `PUZUZ_UPDATE_PUBKEY_FILE` (another public key).
 
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -204,17 +205,49 @@ pub struct Client<'a> {
     token: Option<Token>,
 }
 
+/// A test-only override from the environment; always `None` in release builds, so that an
+/// environment passed through `sudo -E` cannot replace the release key or the API.
+#[cfg(any(test, feature = "test-hooks"))]
+fn test_override(sys: &dyn System, name: &str) -> Option<String> {
+    sys.env_var(name).filter(|value| !value.is_empty())
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn test_override(_sys: &dyn System, _name: &str) -> Option<String> {
+    None
+}
+
+/// Whether the API URL is on this machine (`http://127.0.0.1:8080`, `http://localhost`, ...).
+fn is_loopback_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 impl<'a> Client<'a> {
     pub fn new(sys: &'a dyn System, config: &Config) -> Result<Self> {
-        let api = sys
-            .env_var(API_URL_ENV)
-            .filter(|url| !url.is_empty())
+        let api = test_override(sys, API_URL_ENV)
+            .map(|url| url.trim_end_matches('/').to_owned())
             .unwrap_or_else(|| DEFAULT_API_URL.to_owned());
+        // The token is for GitHub: never sent to another host (a test API runs locally).
+        let token = find_token(sys)?.filter(|_| api == DEFAULT_API_URL || is_loopback_url(&api));
         Ok(Self {
             sys,
-            api: api.trim_end_matches('/').to_owned(),
+            api,
             repo: source_repo(config)?,
-            token: find_token(sys)?,
+            token,
         })
     }
 
@@ -300,7 +333,7 @@ impl<'a> Client<'a> {
 
 /// The public key releases must be signed with.
 fn public_key(sys: &dyn System) -> Result<String> {
-    match sys.env_var(PUBKEY_FILE_ENV).filter(|p| !p.is_empty()) {
+    match test_override(sys, PUBKEY_FILE_ENV) {
         Some(path) => {
             std::fs::read_to_string(&path).map_err(|err| format!("{PUBKEY_FILE_ENV}={path}: {err}"))
         }

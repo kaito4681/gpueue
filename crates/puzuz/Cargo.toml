@@ -11,6 +11,12 @@ repository.workspace = true
 name = "puzuz"
 path = "src/main.rs"
 
+[features]
+# Test builds only (scripts/dist/build-test-versions.sh): `puzuz update` honours
+# PUZUZ_RELEASE_API_URL (a fake GitHub API) and PUZUZ_UPDATE_PUBKEY_FILE (another release key).
+# Never enabled in releases.
+test-hooks = []
+
 [dependencies]
 puzuz-core.workspace = true
 puzuz-protocol = { workspace = true, features = ["client"] }

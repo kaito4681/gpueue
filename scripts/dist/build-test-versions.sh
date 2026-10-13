@@ -8,6 +8,8 @@
 # Signing is left to the caller. A SUFFIX written as SUFFIX:migration also
 # gets one more (no-op) database migration, i.e. a newer schema version, so
 # that a later downgrade to an older test version must be refused.
+# The binaries are built with the `test-hooks` feature, which makes `puzuz
+# update` honour PUZUZ_RELEASE_API_URL and PUZUZ_UPDATE_PUBKEY_FILE.
 #
 # Usage: scripts/dist/build-test-versions.sh OUT SUFFIX[:migration]...
 #        (e.g. OUT test.1 test.2:migration)
@@ -64,7 +66,7 @@ for arg in "$@"; do
         -v "$src":/work \
         -w /work \
         "$image" \
-        cargo build --profile "$profile" -p puzuz -p puzuz-helper
+        cargo build --profile "$profile" -p puzuz -p puzuz-helper --features puzuz/test-hooks
 
     dir="$( [ "$profile" = dev ] && echo debug || echo "$profile")"
     name="puzuz-$tag-$target"

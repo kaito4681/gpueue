@@ -24,8 +24,8 @@ const TARBALL: &[u8] = include_bytes!("testdata/puzuz-v9.0.0-x86_64-unknown-linu
 const TARBALL_SIG: &[u8] =
     include_bytes!("testdata/puzuz-v9.0.0-x86_64-unknown-linux-gnu.tar.gz.minisig");
 
-const API: &str = "http://fake-api";
-const REPO_API: &str = "http://fake-api/repos/kaito4681/puzuz";
+const API: &str = "http://127.0.0.1:8080";
+const REPO_API: &str = "http://127.0.0.1:8080/repos/kaito4681/puzuz";
 
 fn sha256_line(data: &[u8], name: &str) -> String {
     let hex: String = Sha256::digest(data)
@@ -290,6 +290,38 @@ fn check_reports_a_newer_release() {
     assert_eq!(url, &format!("{REPO_API}/releases/latest"));
     assert!(headers.contains(&("Authorization".to_owned(), "Bearer secret-token".to_owned())));
     assert!(!out.contains("secret-token"));
+}
+
+#[test]
+fn the_token_is_never_sent_to_another_host() {
+    let sys = system();
+    let elsewhere = "https://attacker.example";
+    sys.set_env("PUZUZ_RELEASE_API_URL", elsewhere);
+    sys.serve(
+        &format!("{elsewhere}/repos/kaito4681/puzuz/releases/latest"),
+        200,
+        release_json("v9.0.0"),
+    );
+    run(&sys, &opts(true, None)).unwrap();
+    let log = sys.http_log.borrow();
+    assert!(!log.is_empty());
+    assert!(
+        log.iter()
+            .all(|(_, headers)| headers.iter().all(|(name, _)| name != "Authorization")),
+        "{log:?}"
+    );
+
+    for (url, local) in [
+        ("http://127.0.0.1:8080", true),
+        ("http://localhost/", true),
+        ("http://[::1]:80", true),
+        ("https://api.github.com", false),
+        ("http://127.0.0.1.example.com", false),
+        ("http://127.0.0.1@example.com", false),
+        ("ftp://localhost", false),
+    ] {
+        assert_eq!(is_loopback_url(url), local, "{url}");
+    }
 }
 
 fn dropped() -> HttpError {
