@@ -27,7 +27,8 @@ scenarios="${PUZUZ_DIST_SCENARIOS:-17 18}"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$root/Cargo.toml")"
 v1="$version-test.1"
 v2="$version-test.2"
-target=x86_64-unknown-linux-gnu
+# The release target of this machine (x86_64 or aarch64), as install.sh picks it.
+target="$(uname -m)-unknown-linux-gnu"
 
 if [ "${PUZUZ_DIST_SKIP_BUILD:-}" != 1 ] || [ ! -d "$releases/v$v2" ]; then
     rm -rf "$releases"

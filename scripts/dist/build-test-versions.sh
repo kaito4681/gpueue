@@ -4,7 +4,7 @@
 # <version>-<SUFFIX> is built in the toolchain container (as
 # scripts/test-in-docker.sh does) and packaged like .github/workflows/release.yml
 # does, into OUT/v<version>-<SUFFIX>/:
-#   puzuz-v<v>-x86_64-unknown-linux-gnu.tar.gz and .tar.gz.sha256
+#   puzuz-v<v>-<this machine's target>.tar.gz and .tar.gz.sha256
 # Signing is left to the caller. A SUFFIX written as SUFFIX:migration also
 # gets one more (no-op) database migration, i.e. a newer schema version, so
 # that a later downgrade to an older test version must be refused.
@@ -20,7 +20,8 @@ shift
 [ "$#" -gt 0 ] || { echo "usage: $0 OUT SUFFIX..." >&2; exit 2; }
 image="${PUZUZ_TEST_IMAGE:-puzuz-test:1.98.1}"
 profile="${PUZUZ_DIST_PROFILE:-dev}"
-target=x86_64-unknown-linux-gnu
+# The release target of this machine (x86_64 or aarch64), as install.sh picks it.
+target="$(uname -m)-unknown-linux-gnu"
 base="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$root/Cargo.toml")"
 [ -n "$base" ] || { echo "cannot read the workspace version" >&2; exit 1; }
 

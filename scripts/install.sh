@@ -10,7 +10,8 @@
 set -euo pipefail
 
 REPO="kaito4681/puzuz"
-TARGET="x86_64-unknown-linux-gnu"
+# Set by check_arch: x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu.
+TARGET=""
 MIN_GLIBC="2.34"
 DEFAULT_BIN_DIR="/usr/local/bin"
 TOKEN_FILE_SAVED="/etc/puzuz/github-token"
@@ -147,7 +148,11 @@ check_systemd() {
 check_arch() {
     local arch
     arch="$(uname -m)"
-    [ "$arch" = x86_64 ] || die "only x86_64 is supported for now (this machine is $arch)"
+    case "$arch" in
+    x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+    aarch64 | arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+    *) die "releases exist for x86_64 and aarch64 only (this machine is $arch); build puzuz from source (see docs/install.md)" ;;
+    esac
 }
 
 # version_ge A B: whether version A >= version B (dotted numbers).
