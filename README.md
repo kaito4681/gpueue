@@ -85,9 +85,18 @@ sudo dnf install ./puzuz-<version>-1.x86_64.rpm   # or -1.aarch64.rpm, or the re
 There is no dnf repository yet (planned, issue #23): update by installing the newer release's
 .rpm with `sudo dnf upgrade <its URL>`. `sudo dnf remove puzuz` stops the services and keeps
 /var/lib/puzuz and running jobs. It recommends `criu`; Fedora's is new enough, Rocky/RHEL 9 ship
-only 3.19, so checkpointing there needs a newer CRIU (jobs run without it). Other ways to install
-(AUR, Nix) are coming later; you can also build from source (see
+only 3.19, so checkpointing there needs a newer CRIU (jobs run without it). An AUR package is
+coming later; you can also build from source or use the Nix flake (see
 [docs/install.md](docs/install.md)).
+
+With Nix (x86_64 or aarch64), build the flake and install the service from the result (it is
+copied to /usr/local/bin and kept from Nix's garbage collection; see
+[Installing with Nix](docs/install.md#installing-with-nix); a NixOS module is coming soon):
+
+```sh
+nix build github:kaito4681/puzuz/stable
+sudo ./result/bin/puzuz service install
+```
 
 ```sh
 # Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.

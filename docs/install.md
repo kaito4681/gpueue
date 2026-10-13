@@ -7,6 +7,7 @@ command on their `PATH`.
 - [Installing with install.sh](#installing-with-installsh)
 - [Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)
 - [Installing the Fedora/RHEL/Rocky package](#installing-the-fedorarhelrocky-package)
+- [Installing with Nix](#installing-with-nix)
 - [Building](#building)
 - [Installing](#installing)
 - [Verifying](#verifying)
@@ -143,8 +144,9 @@ again also installs the latest (or the given) version over the installed one. Ru
 running either way.
 
 On Debian and Ubuntu you can use the [.deb](#installing-the-debianubuntu-package) instead, on
-Fedora, RHEL, Rocky and Alma Linux the [.rpm](#installing-the-fedorarhelrocky-package). Other ways
-to install (AUR, Nix) are coming later. Until then, build from source as described below.
+Fedora, RHEL, Rocky and Alma Linux the [.rpm](#installing-the-fedorarhelrocky-package), or
+[Nix](#installing-with-nix) anywhere. An AUR package is coming later. You can also build from
+source as described below.
 
 ### Verifying a release by hand
 
@@ -390,6 +392,53 @@ It stops and disables the services and removes the binaries and units. It keeps 
 touches running jobs. rpm has no purge: an edited `config.toml` is kept as
 `/etc/puzuz/config.toml.rpmsave`; delete `/etc/puzuz` and `/var/lib/puzuz` by hand if you no
 longer need them (`sudo systemctl stop 'puzuz-job-*'` first if jobs still run).
+
+## Installing with Nix
+
+The repository is a Nix flake (`flake.nix`). It builds puzuz from source for x86_64 and aarch64
+Linux; nothing is downloaded from the GitHub releases. Its outputs:
+
+| Output | Contents |
+| --- | --- |
+| `packages.<system>.default` (also `puzuz`) | `bin/puzuz`, `bin/puzuz-helper`, bash/zsh/fish completions, the docs |
+| `packages.<system>.criu` | CRIU 4.2.1 (nixpkgs has an older version), for the NixOS module |
+| `devShells.<system>.default` | a development shell with the Rust toolchain (`nix develop`) |
+
+Use `github:kaito4681/puzuz/stable` to follow releases: the `stable` branch moves to every
+release tag (not to pre-releases). Plain `github:kaito4681/puzuz` is the development head
+(`main`).
+
+### NixOS
+
+A NixOS module (`services.puzuz`) is coming soon. `puzuz service install` refuses to run on
+NixOS (`ID=nixos` in `/etc/os-release`) and points to the module (see
+[Install method](#install-method)).
+
+### Other distributions
+
+Build the flake, then install the service from the result like a tarball:
+
+```sh
+nix build github:kaito4681/puzuz/stable
+sudo ./result/bin/puzuz service install
+```
+
+`service install` copies the binaries to `/usr/local/bin` and, because they still load their
+libraries from the Nix store, registers the build as a garbage-collector root
+(`/nix/var/nix/gcroots/puzuz`; see [Installing](#installing)). If `nix-store` is not in root's
+`PATH` (sudo's `secure_path` often leaves out the Nix profile), install warns and prints the
+command to register it yourself. With the root registered you can delete `./result`. The units run the copies in `/usr/local/bin`, so the install method is
+`service-install`, not `nix` (which means units that resolve into `/nix/store`, such as the NixOS
+module's). Install CRIU as described in [CRIU](#criu).
+
+To update, run the same two commands again (Nix fetches the current `stable`; add `--refresh` if
+it was fetched less than an hour ago); running jobs keep running. `sudo puzuz update` works too,
+but replaces the Nix build with the release tarball's binaries. Remove puzuz with
+`sudo puzuz uninstall` (see [Uninstalling](#uninstalling)), which also removes the GC root.
+
+`nix profile install github:kaito4681/puzuz/stable` gives a user the `puzuz` command (with
+completions) only. The helper runs as root and cannot run from a user profile, so the service
+must be installed as above.
 
 ## Building
 
@@ -978,6 +1027,7 @@ and its "update" line says when a newer release exists):
 | the `.deb` | `sudo apt update && sudo apt upgrade` (or install a newer `.deb` from a release with `sudo apt install ./puzuz_<new version>_<arch>.deb`) |
 | the `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>` (no dnf repository yet) |
 | built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install` |
+| `puzuz service install` from a Nix build (not NixOS) | the same `nix build` and `service install` again (see [Installing with Nix](#installing-with-nix)) |
 | another distribution package or Nix (later) | the package manager or Nix (see [Install method](#install-method)); `puzuz update` refuses and names the command |
 
 ### puzuz update
