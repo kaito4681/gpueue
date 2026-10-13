@@ -930,6 +930,90 @@ fn uninstall_warns_about_running_jobs() {
 }
 
 #[test]
+fn purge_refuses_when_running_jobs_cannot_be_listed() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write("/var/lib/puzuz/logs/1000/7.log", "log");
+    sys.respond(
+        "systemctl list-units",
+        CmdOutput::failed("", "Failed to connect to bus"),
+    );
+    let err = run_uninstall(&sys, true, true).unwrap_err();
+    assert!(err.contains("cannot tell whether jobs are still running"), "{err}");
+    assert!(err.contains("Failed to connect to bus"), "{err}");
+    assert!(sys.exists("/var/lib/puzuz/logs/1000/7.log"));
+    assert!(sys.exists("/etc/systemd/system/puzuz.service"));
+
+    // Without --purge nothing of the jobs is deleted: a warning is enough.
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(
+        out.contains("warning: cannot tell whether jobs are still running"),
+        "{out}"
+    );
+    assert!(sys.exists("/var/lib/puzuz/logs/1000/7.log"));
+}
+
+#[test]
+fn purge_never_follows_symlinks_in_user_directories() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    // What a user can plant in their own log directory.
+    sys.write("/etc/passwd", "root:x:0:0");
+    sys.write("/srv/secret/file", "kept");
+    sys.write("/var/lib/puzuz/logs/1000/7.log", "log");
+    sys.mkdir("/var/lib/puzuz/logs/1000/nested/deeper");
+    let link = |target: &str, at: &str| {
+        std::os::unix::fs::symlink(sys.path(Path::new(target)), sys.path(Path::new(at))).unwrap();
+    };
+    link("/etc", "/var/lib/puzuz/logs/1000/d");
+    link("/etc/passwd", "/var/lib/puzuz/logs/1000/passwd");
+    link("/srv/secret", "/var/lib/puzuz/logs/1000/nested/deeper/s");
+    link("/does/not/exist", "/var/lib/puzuz/logs/1000/dangling");
+    // A purge directory that is itself a symlink is removed, not followed.
+    std::fs::remove_dir_all(sys.path(Path::new("/run/puzuz"))).ok();
+    sys.mkdir("/run");
+    link("/srv/secret", "/run/puzuz");
+
+    let out = run_uninstall(&sys, true, true).unwrap();
+    assert!(!sys.exists("/var/lib/puzuz"), "{out}");
+    assert!(sys.path(Path::new("/run/puzuz")).symlink_metadata().is_err());
+    assert_eq!(sys.read("/etc/passwd").unwrap(), "root:x:0:0");
+    assert_eq!(sys.read("/srv/secret/file").unwrap(), "kept");
+    assert!(out.contains("removed /var/lib/puzuz\n"), "{out}");
+}
+
+#[test]
+fn purge_reports_a_purge_directory_that_is_a_mount_point_as_kept() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write("/var/lib/puzuz/daemon/state.sqlite", "db");
+    sys.write("/var/lib/puzuz/checkpoints/mnt/image", "on another mount");
+    sys.write(
+        "/proc/self/mountinfo",
+        "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+         91 22 8:2 / /var/lib/puzuz rw - ext4 /dev/sda2 rw\n\
+         92 91 8:3 / /var/lib/puzuz/checkpoints/mnt rw - ext4 /dev/sda3 rw\n",
+    );
+    let out = run_uninstall(&sys, true, true).unwrap();
+    assert!(
+        out.contains("kept /var/lib/puzuz (a mount point; deleted what was in it)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("kept /var/lib/puzuz/checkpoints/mnt (a mount point"),
+        "{out}"
+    );
+    assert!(!out.contains("removed /var/lib/puzuz\n"), "{out}");
+    assert!(sys.exists("/var/lib/puzuz"));
+    assert!(!sys.exists("/var/lib/puzuz/daemon"));
+    assert_eq!(
+        sys.read("/var/lib/puzuz/checkpoints/mnt/image").unwrap(),
+        "on another mount"
+    );
+    assert!(out.contains("removed /etc/puzuz\n"), "{out}");
+}
+
+#[test]
 fn purge_asks_for_confirmation() {
     let sys = system();
     run_install(&sys, &opts()).unwrap();

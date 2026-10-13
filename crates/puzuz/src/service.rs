@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -652,9 +653,11 @@ pub struct UninstallOptions {
     pub yes: bool,
 }
 
-/// Loaded job units (`puzuz-job-<id>[-r<n>].service`) that are not inactive.
-fn active_job_units(sys: &dyn System) -> Vec<String> {
-    let Ok(output) = sys.run(
+/// Loaded job units (`puzuz-job-<id>[-r<n>].service`) that are not inactive. An error if
+/// systemd cannot be asked: that is not the same as "no jobs".
+fn active_job_units(sys: &dyn System) -> Result<Vec<String>> {
+    let output = run_checked(
+        sys,
         "systemctl",
         &[
             "list-units",
@@ -663,16 +666,14 @@ fn active_job_units(sys: &dyn System) -> Vec<String> {
             "--state=active,activating,deactivating,reloading",
             "puzuz-job-*",
         ],
-    ) else {
-        return Vec::new();
-    };
-    output
+    )?;
+    Ok(output
         .stdout
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .filter(|unit| unit.starts_with("puzuz-job-"))
         .map(str::to_owned)
-        .collect()
+        .collect())
 }
 
 /// Removes what the install receipt lists: the binaries `service install` copied (never
@@ -798,7 +799,24 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
              (without --purge) removes only what `puzuz service install` wrote"
         ));
     }
-    let jobs = active_job_units(sys);
+    let jobs = match active_job_units(sys) {
+        Ok(jobs) => jobs,
+        Err(err) if options.purge => {
+            return Err(format!(
+                "cannot tell whether jobs are still running ({err}); refusing to purge, which \
+                 would delete their logs and checkpoints"
+            ));
+        }
+        Err(err) => {
+            writeln!(
+                out,
+                "warning: cannot tell whether jobs are still running ({err}); jobs keep \
+                 running in their own units"
+            )
+            .ok();
+            Vec::new()
+        }
+    };
     if !jobs.is_empty() {
         let list = jobs.join(" ");
         if options.purge {
@@ -886,8 +904,8 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
             if sys.path(path).symlink_metadata().is_err() {
                 continue;
             }
-            let skipped = remove_tree(sys, path, &mounts)?;
-            for skipped in &skipped {
+            let purged = remove_tree(sys, path, &mounts)?;
+            for skipped in &purged.kept_mounts {
                 writeln!(
                     out,
                     "kept {} (a mount point; unmount it and delete it by hand)",
@@ -895,8 +913,10 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
                 )
                 .ok();
             }
-            if skipped.is_empty() {
+            if purged.removed {
                 writeln!(out, "removed {dir}").ok();
+            } else if purged.is_mount {
+                writeln!(out, "kept {dir} (a mount point; deleted what was in it)").ok();
             }
         }
         writeln!(
@@ -948,43 +968,126 @@ fn unescape_mountinfo(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Deletes the system path `path` recursively without following symlinks and without entering
-/// mount points (a bind mount of `/` below /run/puzuz-helper must never be descended into).
-/// Returns the mount points that were left in place.
-fn remove_tree(sys: &dyn System, path: &Path, mounts: &BTreeSet<PathBuf>) -> Result<Vec<PathBuf>> {
-    let mut skipped = Vec::new();
-    remove_tree_inner(sys, path, mounts, None, &mut skipped)?;
-    Ok(skipped)
+/// What [`remove_tree`] did with a purge directory.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Purged {
+    /// The directory itself is gone.
+    removed: bool,
+    /// Mount points below it that were left in place (system paths).
+    kept_mounts: Vec<PathBuf>,
+    /// The directory itself is a mount point: its contents were deleted, the directory kept.
+    is_mount: bool,
 }
 
-fn remove_tree_inner(
-    sys: &dyn System,
-    path: &Path,
-    mounts: &BTreeSet<PathBuf>,
-    parent_dev: Option<u64>,
-    skipped: &mut Vec<PathBuf>,
-) -> Result<bool> {
+/// Deletes the system path `path` recursively without following symlinks and without entering
+/// mount points (a bind mount of `/` below /run/puzuz-helper must never be descended into).
+///
+/// Users own directories inside the purged trees (`/var/lib/puzuz/logs/<uid>/`), so the walk
+/// works on directory file descriptors (`openat(O_NOFOLLOW)`, `unlinkat`), never on path names
+/// that could be swapped for a symlink between a check and its use (CVE-2022-21658).
+fn remove_tree(sys: &dyn System, path: &Path, mounts: &BTreeSet<PathBuf>) -> Result<Purged> {
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::Mode;
+
     let local = sys.path(path);
-    let meta = std::fs::symlink_metadata(&local).map_err(io_err(path.display()))?;
-    if !meta.is_dir() {
-        std::fs::remove_file(&local).map_err(io_err(format!("removing {}", path.display())))?;
-        return Ok(true);
+    let (Some(parent), Some(name)) = (local.parent(), local.file_name()) else {
+        return Err(format!("refusing to remove {}", path.display()));
+    };
+    // The parents (/var/lib, /etc, /run) are root's; only what is below them is walked by fd.
+    let parent_fd = open(
+        parent,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|err| format!("opening {}: {err}", parent.display()))?;
+    let parent_dev = nix::sys::stat::fstat(&parent_fd)
+        .map_err(|err| format!("reading {}: {err}", parent.display()))?
+        .st_dev;
+    let mut purged = Purged::default();
+    let at = Location {
+        parent: &parent_fd,
+        name,
+        path,
+        parent_dev,
+    };
+    purged.removed = remove_entry(&at, mounts, true, &mut purged)?;
+    Ok(purged)
+}
+
+/// An entry [`remove_entry`] removes: `name` in the directory `parent` (on the device
+/// `parent_dev`), the system path `path`.
+struct Location<'a> {
+    parent: &'a std::os::fd::OwnedFd,
+    name: &'a std::ffi::OsStr,
+    path: &'a Path,
+    parent_dev: u64,
+}
+
+/// Removes the entry; returns whether it is gone. `top` is the purge directory itself, which
+/// is emptied even if it is a mount point.
+fn remove_entry(
+    at: &Location<'_>,
+    mounts: &BTreeSet<PathBuf>,
+    top: bool,
+    purged: &mut Purged,
+) -> Result<bool> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+    use nix::unistd::{UnlinkatFlags, unlinkat};
+
+    let path = at.path;
+    let removing = |err: Errno| format!("removing {}: {err}", path.display());
+    let reading = |err: Errno| format!("reading {}: {err}", path.display());
+    let dir = match openat(
+        at.parent,
+        at.name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(dir) => dir,
+        // Not a directory (a symlink is never followed): unlink the entry itself. unlinkat
+        // does not follow symlinks either, and fails if a directory took its place.
+        Err(Errno::ENOTDIR | Errno::ELOOP) => {
+            unlinkat(at.parent, at.name, UnlinkatFlags::NoRemoveDir).map_err(removing)?;
+            return Ok(true);
+        }
+        Err(Errno::ENOENT) => return Ok(true),
+        Err(err) => return Err(format!("opening {}: {err}", path.display())),
+    };
+    let dev = nix::sys::stat::fstat(&dir).map_err(reading)?.st_dev;
+    let is_mount = mounts.contains(path) || dev != at.parent_dev;
+    if is_mount {
+        if !top {
+            purged.kept_mounts.push(path.to_owned());
+            return Ok(false);
+        }
+        purged.is_mount = true;
     }
-    let is_mount = mounts.contains(path) || parent_dev.is_some_and(|dev| dev != meta.dev());
-    if is_mount && parent_dev.is_some() {
-        skipped.push(path.to_owned());
-        return Ok(false);
+    let mut names = Vec::new();
+    let listing = dir
+        .try_clone()
+        .map_err(|err| format!("reading {}: {err}", path.display()))?;
+    for entry in nix::dir::Dir::from_fd(listing).map_err(reading)?.into_iter() {
+        let entry = entry.map_err(reading)?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(std::ffi::OsString::from_vec(bytes.to_vec()));
+        }
     }
     let mut empty = true;
-    let entries =
-        std::fs::read_dir(&local).map_err(io_err(format!("reading {}", path.display())))?;
-    for entry in entries {
-        let entry = entry.map_err(io_err(format!("reading {}", path.display())))?;
-        let child = path.join(entry.file_name());
-        empty &= remove_tree_inner(sys, &child, mounts, Some(meta.dev()), skipped)?;
+    for name in &names {
+        let child = Location {
+            parent: &dir,
+            name,
+            path: &path.join(name),
+            parent_dev: dev,
+        };
+        empty &= remove_entry(&child, mounts, false, purged)?;
     }
+    drop(dir);
     if empty && !is_mount {
-        std::fs::remove_dir(&local).map_err(io_err(format!("removing {}", path.display())))?;
+        unlinkat(at.parent, at.name, UnlinkatFlags::RemoveDir).map_err(removing)?;
         return Ok(true);
     }
     Ok(false)
