@@ -1143,6 +1143,9 @@ fn not_owned(sys: &FakeSystem) {
         "dpkg-query -S",
         CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
     );
+    // A Debian system: no other package manager could own it.
+    sys.missing("rpm");
+    sys.missing("pacman");
 }
 
 #[test]

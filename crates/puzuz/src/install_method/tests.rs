@@ -58,6 +58,9 @@ fn not_owned(sys: &FakeSystem) {
         "dpkg-query -S",
         CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
     );
+    // A Debian system: no other package manager could own it.
+    sys.missing("rpm");
+    sys.missing("pacman");
 }
 
 fn service_install(bin_dir: &str) -> Method {
@@ -185,6 +188,53 @@ fn a_pacman_package_is_named() {
 }
 
 #[test]
+fn any_owner_beats_another_package_managers_not_owned() {
+    // Fedora with dpkg installed: dpkg's database does not list the unit, rpm's does.
+    let sys = FakeSystem::new();
+    write_plain(&sys, LIB);
+    sys.write("/etc/os-release", "ID=fedora\n");
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
+    sys.respond("rpm -qf", CmdOutput::ok("puzuz\n"));
+    sys.missing("pacman");
+    let detection = detect(&sys);
+    assert_eq!(
+        detection.install.methods()[0],
+        package(&path(LIB, DAEMON_UNIT), Owner::Rpm("puzuz".to_owned()), None)
+    );
+    // The native package manager is asked first, and answers.
+    assert!(sys.commands()[0].starts_with("rpm -qf"), "{:?}", sys.commands());
+    assert!(!sys.ran("dpkg-query"));
+
+    // Without os-release, every package manager is asked until one reports an owner.
+    let sys = FakeSystem::new();
+    write_plain(&sys, LIB);
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
+    sys.respond("rpm -qf", CmdOutput::ok("puzuz\n"));
+    sys.missing("pacman");
+    assert_eq!(detect(&sys).keyword(), "package");
+
+    // One "not owned" and one failure: nobody can tell.
+    let sys = FakeSystem::new();
+    write_plain(&sys, LIB);
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
+    sys.respond("rpm -qf", CmdOutput::exited(2, "", "error: rpmdb locked\n"));
+    sys.missing("pacman");
+    assert_eq!(
+        detect(&sys).install.methods()[0],
+        package(&path(LIB, DAEMON_UNIT), Owner::Unknown, None)
+    );
+}
+
+#[test]
 fn a_unit_nobody_owns_is_unowned() {
     let sys = FakeSystem::new();
     write_plain(&sys, LIB);
@@ -209,9 +259,9 @@ fn a_unit_nobody_owns_is_unowned() {
         detection.install.to_string(),
         "a unit no package owns (/usr/lib/systemd/system/puzuz.service)"
     );
-    // Both paths were asked; dpkg answered definitely, so rpm was not asked.
-    assert!(sys.ran("dpkg-query -S /lib/systemd/system/puzuz.service"));
-    assert!(!sys.ran("rpm"));
+    // Every package manager was asked: "not owned" from one of them does not settle it.
+    assert!(sys.ran("dpkg-query -S /usr/lib/systemd/system/puzuz.service"));
+    assert!(sys.ran("rpm -qf"));
 
     // rpm and pacman say "not owned" in their own words.
     let sys = FakeSystem::new();
@@ -224,8 +274,8 @@ fn a_unit_nobody_owns_is_unowned() {
             "",
         ),
     );
+    sys.missing("pacman");
     assert_eq!(detect(&sys).keyword(), "unowned");
-    assert!(!sys.ran("pacman"));
     let sys = FakeSystem::new();
     write_plain(&sys, LIB);
     sys.missing("dpkg-query");

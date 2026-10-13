@@ -739,6 +739,8 @@ fn other_install_methods_get_their_own_hint() {
         "dpkg-query -S",
         CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
     );
+    sys.missing("rpm");
+    sys.missing("pacman");
     let err = run(&sys, &opts(false, None)).unwrap_err();
     assert!(err.contains("installed as a unit no package owns"), "{err}");
     assert!(
@@ -825,6 +827,8 @@ fn a_leftover_unit_does_not_block_the_update() {
         "dpkg-query -S",
         CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
     );
+    sys.missing("rpm");
+    sys.missing("pacman");
     run(&sys, &opts(false, None)).unwrap();
     assert!(installed(&sys));
 }

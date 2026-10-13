@@ -1885,6 +1885,8 @@ fn an_unowned_unit_next_to_installed_units_needs_no_force() {
         "dpkg-query -S",
         CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
     );
+    sys.missing("rpm");
+    sys.missing("pacman");
     assert_eq!(install_method::detect(&sys).keyword(), "service-install");
     let out = run_install(&sys, &opts()).unwrap();
     assert!(out.contains("warning: no package owns"), "{out}");
