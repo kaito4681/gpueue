@@ -148,17 +148,22 @@ jobs:
           cat >"$RUNNER_TEMP/notes.md" <<EOF
           ## Install or update (administrators)
 
-          The repository is private: a GitHub token that can read it is needed (with \`gh\`
-          logged in, nothing else; otherwise a fine-grained token with read-only "Contents"
-          access in \`GH_TOKEN\`).
+          With install.sh (x86_64 and aarch64; later updates with \`sudo puzuz update\`):
 
           \`\`\`sh
-          gh release download $TAG -R $GITHUB_REPOSITORY -p install.sh -O - | sudo bash -s -- --version ${TAG#v}
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | sudo bash -s -- --version ${TAG#v}
           \`\`\`
 
-          Running jobs keep running. \`puzuz-$TAG-x86_64-unknown-linux-gnu.tar.gz\` is signed
-          with minisign (\`.minisig\`, public key in \`packaging/minisign.pub\`); see
-          docs/install.md for manual installation and uninstalling.
+          On Debian and Ubuntu, the package instead (\`amd64\` or \`arm64\`):
+
+          \`\`\`sh
+          sudo apt install ./puzuz_${TAG#v}_amd64.deb
+          \`\`\`
+
+          Running jobs keep running. The tarballs (\`puzuz-$TAG-<target>.tar.gz\`) and the
+          \`.deb\` files are signed with minisign (\`.minisig\`, public key in
+          \`packaging/minisign.pub\`); see docs/install.md for manual installation and
+          uninstalling.
           EOF
       - name: Create or update the GitHub release
         run: |

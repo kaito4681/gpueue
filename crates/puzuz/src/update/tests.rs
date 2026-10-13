@@ -330,7 +330,7 @@ fn missing_or_bad_tokens_are_explained() {
     sys.serve(&format!("{REPO_API}/releases/latest"), 404, "{}");
     let err = run(&sys, &opts(true, None)).unwrap_err();
     assert!(
-        err.contains("A GitHub token that can read kaito4681/puzuz"),
+        err.contains("kaito4681/puzuz has no published release"),
         "{err}"
     );
     assert!(
@@ -343,7 +343,7 @@ fn missing_or_bad_tokens_are_explained() {
     sys.set_env("GITHUB_TOKEN", "expired");
     let err = run(&sys, &opts(true, None)).unwrap_err();
     assert!(
-        err.contains("The token from GITHUB_TOKEN cannot read"),
+        err.contains("with the token from GITHUB_TOKEN: it may be expired or revoked"),
         "{err}"
     );
     assert!(!err.contains("expired\""), "{err}");

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs, re-installs (updates) or uninstalls puzuz from its GitHub releases.
 #
-#   gh release download -R kaito4681/puzuz -p install.sh -O - | sudo bash
+#   curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
 #   sudo bash install.sh [--version X] [--bin-dir DIR] [--save-token] [--token-file F]
 #   sudo bash install.sh --uninstall [--purge] [--yes]
 #
@@ -43,10 +43,10 @@ Options:
   -y, --yes          do not ask before purging
   -h, --help         show this help
 
-The repository is private: downloads need a GitHub token that can read it,
-taken from (in this order) GH_TOKEN or GITHUB_TOKEN, --token-file, \`gh auth token\`
-of the user who ran sudo, or $TOKEN_FILE_SAVED. A fine-grained personal access
-token with read-only "Contents" access to $REPO is enough.
+Releases are downloaded through the GitHub API. A GitHub token is optional (it
+raises the API rate limit); one is taken from, in this order, GH_TOKEN or
+GITHUB_TOKEN, --token-file, \`gh auth token\` of the user who ran sudo, or
+$TOKEN_FILE_SAVED. Any token works; a fine-grained one needs no permissions.
 EOF
 }
 
@@ -275,12 +275,17 @@ write_headers() {
     return 0
 }
 
+# GitHub answers 401 for a bad token, 403 when the API rate limit is used up,
+# and 404 for a release or repository that does not exist.
 no_access() {
     local what="$1" code="$2"
     if [ "$HAVE_TOKEN" = 1 ]; then
-        die "$what: HTTP $code. The token cannot read $REPO (expired, revoked, or without \"Contents: Read-only\" access to it)"
+        die "$what: HTTP $code with the GitHub token: it may be expired or revoked, or $REPO has no published release. A token is optional; unset GH_TOKEN/GITHUB_TOKEN (and --token-file, $TOKEN_FILE_SAVED) to download anonymously"
     fi
-    die "$what: HTTP $code. A GitHub token that can read $REPO is needed: set GH_TOKEN (\`sudo GH_TOKEN=... bash install.sh\`), pass --token-file, or run \`gh auth login\` as the user that runs sudo"
+    if [ "$code" = 404 ]; then
+        die "$what: HTTP 404. $REPO has no published release (or does not exist)"
+    fi
+    die "$what: HTTP $code. GitHub refused the anonymous request, usually because of its API rate limit; try again later, or use a GitHub token: set GH_TOKEN (\`sudo GH_TOKEN=... bash install.sh\`), pass --token-file, or run \`gh auth login\` as the user that runs sudo"
 }
 
 # api_get PATH OUT ACCEPT: GET $API_URL$PATH into OUT.
@@ -292,7 +297,7 @@ api_get() {
     case "$code" in
     200) ;;
     401 | 403 | 404)
-        if [ "$code" = 404 ] && [ -n "$VERSION" ] && [ "$HAVE_TOKEN" = 1 ] && [[ "$path" == */releases/tags/* ]]; then
+        if [ "$code" = 404 ] && [ -n "$VERSION" ] && [[ "$path" == */releases/tags/* ]]; then
             die "release v$VERSION not found in $REPO"
         fi
         no_access "GET $path" "$code"

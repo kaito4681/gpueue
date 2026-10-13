@@ -1,9 +1,9 @@
 //! `puzuz update`: replaces an installation made by `puzuz service install` with a release from
 //! GitHub, and the "update" check of `puzuz doctor`.
 //!
-//! The repository is private, so releases are read through the GitHub API with a token
-//! (`GH_TOKEN`/`GITHUB_TOKEN`, or `/etc/puzuz/github-token` saved by `install.sh --save-token`);
-//! without one the API is asked anonymously, which works once the repository is public.
+//! Releases are read through the GitHub API, anonymously or, when one is given, with a token
+//! (`GH_TOKEN`/`GITHUB_TOKEN`, or `/etc/puzuz/github-token` saved by `install.sh --save-token`).
+//! The repository is public, so the token is optional; it raises the API rate limit.
 //!
 //! An update downloads the release tarball, its `.sha256` and its `.minisig` into
 //! `/var/lib/puzuz/update` (root, 0700), checks the signature with the key built into this
@@ -228,19 +228,26 @@ impl<'a> Client<'a> {
         }
     }
 
-    /// Explains a 401/403/404: GitHub answers 404 when a token cannot read a private repository.
+    /// Explains a 401/403/404. GitHub answers 401 for a bad token, 403 when the API rate limit is
+    /// used up, and 404 for a release or repository that does not exist (or that a token cannot
+    /// read).
     fn no_access(&self, path: &str, status: u16) -> String {
-        match &self.token {
-            Some(token) => format!(
-                "GET {path}: HTTP {status}. The token from {} cannot read {} (expired, revoked, \
-                 or without \"Contents: Read-only\" access to it)",
+        match (&self.token, status) {
+            (Some(token), _) => format!(
+                "GET {path}: HTTP {status} with the token from {}: it may be expired or revoked, \
+                 or {} has no published release. A token is optional; without it the release is \
+                 downloaded anonymously",
                 token.source, self.repo
             ),
-            None => format!(
-                "GET {path}: HTTP {status}. A GitHub token that can read {} is needed: set \
-                 GH_TOKEN (`sudo GH_TOKEN=... puzuz update`), or save one in {TOKEN_FILE} with \
-                 `install.sh --save-token`",
+            (None, 404) => format!(
+                "GET {path}: HTTP 404. {} has no published release (or does not exist)",
                 self.repo
+            ),
+            (None, _) => format!(
+                "GET {path}: HTTP {status}. GitHub refused the anonymous request, usually because \
+                 of its API rate limit; try again later, or use a GitHub token: set GH_TOKEN \
+                 (`sudo GH_TOKEN=... puzuz update`), or save one in {TOKEN_FILE} with \
+                 `install.sh --save-token`"
             ),
         }
     }
@@ -254,7 +261,7 @@ impl<'a> Client<'a> {
         let body = self
             .get(&path, "application/vnd.github+json", timeout)
             .map_err(|(status, err)| match version {
-                Some(version) if status == 404 && self.token.is_some() => {
+                Some(version) if status == 404 => {
                     format!("release v{version} not found in {}", self.repo)
                 }
                 _ => err,
