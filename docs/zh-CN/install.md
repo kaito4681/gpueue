@@ -972,7 +972,10 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/puzu
 
 文件、目录和套接字的路径必须是绝对路径。程序（`criu_path`、`cuda_checkpoint_path`、
 `nvidia_smi_path`、`nvml_library`、`shell` 的第一个词）要么是在 `PATH` 中查找的裸名称，要么是
-绝对路径；`bin/criu` 这样的相对路径会被拒绝。所有 `*_secs` 键最大为一年（31536000）。
+绝对路径；`bin/criu` 这样的相对路径会被拒绝。helper 在启动时会在其服务的 `PATH` 中查找一次
+`criu_path`、`cuda_checkpoint_path` 和 `nvidia_smi_path`，像检查绝对路径一样检查找到的文件（属于 root，
+且只能经由只有 root 能修改的目录到达），此后一直使用该路径。未找到的程序在 helper 重启之前一直不可用
+（其日志会说明这一点）。所有 `*_secs` 键最大为一年（31536000）。
 
 | 键 | 默认值 | 使用者 | 含义 |
 | --- | --- | --- | --- |
@@ -989,7 +992,7 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/puzu
 | `checkpoint_size_limit_bytes` | 未设置（无上限） | 守护进程 | 所有镜像的总大小超过该值时发出警告（镜像永远不会被自动删除） |
 | `checkpoint_size_warning_interval_secs` | `3600` | 守护进程 | 超出上限期间，每位管理员收到提醒的间隔 |
 | `checkpoint_tcp_close` | `true` | 两者 | 创建检查点时关闭 TCP 连接（`criu --tcp-close`） |
-| `criu_path` | `"criu"` | helper | 名称（在 `PATH` 中查找）或归 root 所有的绝对路径 |
+| `criu_path` | `"criu"` | helper | 名称（在 helper 启动时于 `PATH` 中查找）或归 root 所有的绝对路径 |
 | `cuda_checkpoint_path` | `"cuda-checkpoint"` | helper | 同上 |
 | `nvidia_smi_path` | `"nvidia-smi"` | helper | 同上 |
 | `cuda_checkpoint_mode` | `"manual"` | helper | `"manual"`：helper 在 criu 前后调用 cuda-checkpoint。`"plugin"`：由 CRIU 的 CUDA 插件完成。 |
@@ -1072,12 +1075,17 @@ memory_total_bytes = 25757220864
 - 镜像保存在 `checkpoints_dir`（默认 `/var/lib/puzuz/checkpoints/<job id>/`）中，只有 root 能读取。
   每个目录包含 `images/`（CRIU 镜像文件）、`dump.log`、`restore.log`、`meta.json`（GPU、驱动、
   大小、时间）以及最后写入的 `COMPLETE` 标记。没有该标记的目录是不完整的，会在 helper 启动时
-  被清理。helper 在系统关机时完成转储后，还会在那里写入 `shutdown-manifest.json`。
+  被清理，但转储已成功的目录除外（有 `DUMPED` 标记，或 CRIU 的日志表明如此）：此时作业的进程已经不在，
+  镜像是它仅存的部分。helper 会在启动时或作业恢复前完成这样的目录，并且永远不会删除它。如果在转储成功后
+  紧接着写入元数据失败（磁盘已满或出现故障），作业会被视为已创建检查点，helper 会记录原因，守护进程会记录
+  一条警告；在元数据能够写入之前，恢复会失败，但镜像会被保留。
+  helper 在系统关机时完成转储后，还会在那里写入 `shutdown-manifest.json`。
 - 每个作业最多有一个镜像。恢复成功、作业被删除（`remove`、`clean`、`reset`）或转储失败时，
   镜像会被删除。恢复失败时镜像会被保留。
 - 转储失败后，helper 会把其 `dump.log` 移到同一目录下的 `failed-logs/<job id>-<unix ms>.log`
   （仅限 root），并保留最新的 20 个。作业的最后错误会给出该文件名。
-- 空间：每次转储前，helper 要求可用空间至少为（作业的 RSS + VRAM）× 1.2。否则检查点会被拒绝，
+- 空间：每次转储前，helper 要求可用空间至少为（作业的 RSS + VRAM + 其私有 `/tmp` 和 `/dev/shm` 中
+  存储的内容）× 1.2。否则检查点会被拒绝，
   作业继续运行。镜像不压缩。测试中，一个 VRAM 为 7 GB 的作业生成了 8.1 GB 的镜像。不要使用
   tmpfs（`puzuz doctor` 会对其报告失败）。当可用空间低于 20 GiB，或低于
   `checkpoint_size_limit_bytes` 下的剩余空间时，它也会发出警告。
@@ -1374,7 +1382,14 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
 `puzuz shutdown` 期间，此时作业会继续运行），所有者会在下次执行命令时收到警告。拒绝的原因：
 
 - `not enough free space for the checkpoint: need N bytes, M available`：释放空间或移动
-  `checkpoints_dir`，然后再次创建检查点。
+  `checkpoints_dir`，然后再次创建检查点。所需空间包括作业存储在其自己的 `/tmp` 和 `/dev/shm` 中的内容
+  （此时消息会给出具体大小）。
+- `the job has Unix sockets bound to [...] on the host's filesystems (or to relative names ...)`：
+  恢复会让 CRIU 以 root 身份创建、unlink 和 chown 这些路径。请把套接字绑定到 `/tmp` 下的绝对路径或
+  抽象名称。相对名称会被视为主机路径，因为无法得知它是在哪个目录中绑定的。
+- `the job has internet sockets with SO_REUSEPORT (...)`：CRIU 在把凭据交还给作业之前以 root 身份重建
+  套接字，因此恢复后的 `SO_REUSEPORT` 套接字将属于 root，并可能加入同一端口上某个 root 服务的组（并接收其
+  部分连接）。请在程序中关闭 `SO_REUSEPORT`，或用 `--no-checkpoint` 运行该作业。
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`：作业的
   挂载命名空间依赖一个被另一个挂载遮盖的挂载，因此永远无法恢复。请重新运行该作业
   （`puzuz restart`）。新作业会得到清理过的命名空间。
@@ -1405,6 +1420,10 @@ refused:` 开头），其所有者会收到警告。
 
 恢复失败时，作业保持 `Checkpointed` 状态并保留其镜像，因此你可以修复原因后再次运行
 `puzuz restore`。所有者会在下次执行命令时收到警告。
+
+- `the checkpoint of job N was dumped but not finalized, and finalizing it failed again: ...`：转储
+  已成功，但 helper 无法写入检查点的元数据（见 [检查点存储](#checkpoint-storage)），通常是因为
+  `checkpoints_dir` 所在的磁盘已满或出现故障。修复后再次恢复。
 
 - `paths the checkpoint's mounts depend on are missing on this host: [...]`：CRIU 会以
   `Can't stat mountpoint` 或 `Failed to open_tree <path>` 失败。作业的命名空间中包含一个现在不
