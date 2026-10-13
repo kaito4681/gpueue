@@ -30,6 +30,9 @@
   tree): `scripts/dist-test.sh` (`PUZUZ_DIST_BASE=ubuntu:22.04|ubuntu:24.04|debian:12`, default
   ubuntu:26.04). The release signing key is created once with `scripts/dist/gen-signing-key.sh`;
   `packaging/minisign.pub` is a test key until then.
+- AUR package (`packaging/aur/puzuz-bin`): `scripts/dist/aur-test.sh` builds and installs it in
+  an Arch Linux container with systemd; `scripts/dist/update-aur.sh <version>` points it at a
+  release (run by `.github/workflows/release-aur.yml`).
 - Workspace layout:
   - `crates/puzuz` — the `puzuz` binary (pueue-compatible CLI, `puzuz daemon` entry point)
   - `crates/puzuz-core` — domain model, scheduling decisions, authorization, SQLite storage

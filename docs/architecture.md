@@ -204,3 +204,4 @@ Only the daemon writes the database. The CLI always goes through the daemon.
 
 The systemd units, sysusers.d and tmpfiles.d snippets and the default configuration live in
 [`packaging/`](../packaging) and are embedded in the `puzuz` binary for `puzuz service install`.
+The AUR package (`packaging/aur/puzuz-bin`) installs the same files unchanged.

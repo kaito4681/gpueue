@@ -8,6 +8,7 @@ command on their `PATH`.
 - [Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)
 - [Installing the Fedora/RHEL/Rocky package](#installing-the-fedorarhelrocky-package)
 - [Installing with Nix](#installing-with-nix)
+- [Arch Linux (AUR)](#arch-linux-aur)
 - [Building](#building)
 - [Installing](#installing)
 - [Verifying](#verifying)
@@ -145,8 +146,8 @@ running either way.
 
 On Debian and Ubuntu you can use the [.deb](#installing-the-debianubuntu-package) instead, on
 Fedora, RHEL, Rocky and Alma Linux the [.rpm](#installing-the-fedorarhelrocky-package), or
-[Nix](#installing-with-nix) anywhere. An AUR package is coming later. You can also build from
-source as described below.
+[Nix](#installing-with-nix) anywhere, and on Arch Linux the [AUR package](#arch-linux-aur). You
+can also build from source as described below.
 
 ### Verifying a release by hand
 
@@ -439,6 +440,81 @@ but replaces the Nix build with the release tarball's binaries. Remove puzuz wit
 `nix profile install github:kaito4681/puzuz/stable` gives a user the `puzuz` command (with
 completions) only. The helper runs as root and cannot run from a user profile, so the service
 must be installed as above.
+
+## Arch Linux (AUR)
+
+The AUR package [`puzuz-bin`](https://aur.archlinux.org/packages/puzuz-bin) (x86_64 and aarch64)
+repackages the release tarballs. Install it with any AUR helper, for example yay:
+
+```sh
+yay -S puzuz-bin
+```
+
+or by hand:
+
+```sh
+git clone https://aur.archlinux.org/puzuz-bin.git
+cd puzuz-bin
+makepkg -si
+```
+
+It installs `/usr/bin/puzuz` and `/usr/bin/puzuz-helper`, the units in
+`/usr/lib/systemd/system`, the `sysusers.d` and `tmpfiles.d` snippets in `/usr/lib`, the default
+`/etc/puzuz/config.toml` (kept on upgrades and removal when you changed it), and completions for
+bash, zsh and fish. pacman's systemd hooks create the `puzuz` user, the `puzuz-admin` group and
+the directories. As usual on Arch, the services are not enabled or started for you:
+
+```sh
+sudo systemctl enable --now puzuz-helper.service puzuz.service
+puzuz doctor
+```
+
+Checkpoints need CRIU 4.2 or newer, which is in the official repositories
+(`sudo pacman -S criu`). GPU jobs also need NVIDIA's cuda-checkpoint (see
+[cuda-checkpoint](#cuda-checkpoint)). Both are optional dependencies of the package.
+
+- **Update:** `yay -Syu` (or rebuild with `git pull && makepkg -si`). The package does not
+  restart the services: run `sudo systemctl restart puzuz-helper.service puzuz.service`
+  afterwards, so that the daemon and the `puzuz` command are the same version again. Running jobs
+  keep running (see [Upgrading](#upgrading)). `puzuz update` and `puzuz service install` refuse a
+  package installation.
+- **Remove:** `sudo systemctl disable --now puzuz.service puzuz-helper.service`, then
+  `sudo pacman -R puzuz-bin`. Jobs still running in `puzuz-job-*` units keep running until you
+  stop them. `/var/lib/puzuz` (state, logs, checkpoint images) and a changed
+  `/etc/puzuz/config.toml` (saved as `config.toml.pacsave`) are kept; delete them by hand to
+  remove everything.
+
+### The AUR package (maintainers)
+
+The PKGBUILD lives in `packaging/aur/puzuz-bin`. When a release is published (not a prerelease),
+`.github/workflows/release-aur.yml` runs `scripts/dist/update-aur.sh <version>`, which takes the
+tarballs' checksums from the release's `.sha256` files, computes the checksum of the tag's source
+archive (for the units and snippets), and regenerates `.SRCINFO` in an Arch Linux container.
+It then pushes `PKGBUILD`, `.SRCINFO` and `puzuz-bin.install` to
+`ssh://aur@aur.archlinux.org/puzuz-bin.git`. The release must have both the x86_64 and the aarch64
+tarball. To change the packaging without a new release, bump `pkgrel` in the PKGBUILD and run the
+workflow by hand (`gh workflow run release-aur.yml -f version=<X.Y.Z>`).
+
+One-time setup:
+
+1. Create an account on <https://aur.archlinux.org>.
+2. Create a dedicated SSH key and add its public half to the account ("My Account", "SSH Public
+   Key"):
+
+   ```sh
+   ssh-keygen -t ed25519 -N '' -C puzuz-aur -f aur_puzuz
+   ```
+
+3. Store the private half as the repository secret `AUR_SSH_PRIVATE_KEY`, then delete the local
+   copy (or keep it somewhere safe):
+
+   ```sh
+   gh secret set AUR_SSH_PRIVATE_KEY -R kaito4681/puzuz < aur_puzuz
+   ```
+
+The first push creates the package on the AUR. Without the secret the workflow only prints a
+notice. To test the package locally (makepkg, pacman, the services, a job, an upgrade and
+removal in an Arch Linux container with systemd): `scripts/dist/aur-test.sh`.
 
 ## Building
 
@@ -1028,6 +1104,7 @@ and its "update" line says when a newer release exists):
 | the `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>` (no dnf repository yet) |
 | built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install` |
 | `puzuz service install` from a Nix build (not NixOS) | the same `nix build` and `service install` again (see [Installing with Nix](#installing-with-nix)) |
+| the AUR package `puzuz-bin` | `yay -Syu` (any AUR helper), then `sudo systemctl restart puzuz-helper.service puzuz.service`; `puzuz update` refuses |
 | another distribution package or Nix (later) | the package manager or Nix (see [Install method](#install-method)); `puzuz update` refuses and names the command |
 
 ### puzuz update
@@ -1087,7 +1164,8 @@ services if anything changed. The configuration file is kept.
 For the `.deb`, use `sudo apt remove puzuz` or `sudo apt purge puzuz` (see
 [Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)); for the `.rpm`,
 `sudo dnf remove puzuz` (see
-[Installing the Fedora/RHEL/Rocky package](#installing-the-fedorarhelrocky-package)). For an installation
+[Installing the Fedora/RHEL/Rocky package](#installing-the-fedorarhelrocky-package)); for the AUR
+package, `sudo pacman -R puzuz-bin` (see [Arch Linux (AUR)](#arch-linux-aur)). For an installation
 made by `install.sh` or `puzuz service install`:
 
 ```sh
