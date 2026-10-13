@@ -154,10 +154,11 @@ jobs:
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | sudo bash -s -- --version ${TAG#v}
           \`\`\`
 
-          On Debian and Ubuntu, the package instead (\`amd64\` or \`arm64\`):
+          On Debian and Ubuntu, the package instead (download the file for your architecture):
 
           \`\`\`sh
-          sudo apt install ./puzuz_${TAG#v}_amd64.deb
+          sudo apt install ./puzuz_${TAG#v}_amd64.deb    # x86_64
+          sudo apt install ./puzuz_${TAG#v}_arm64.deb    # aarch64
           \`\`\`
 
           Running jobs keep running. The tarballs (\`puzuz-$TAG-<target>.tar.gz\`) and the
