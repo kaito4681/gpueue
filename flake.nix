@@ -17,6 +17,8 @@
       packages = forAllSystems (pkgs: rec {
         puzuz = pkgs.callPackage ./nix/package.nix { };
         default = puzuz;
+        # CRIU 4.2.x (nixpkgs has 4.1.1); not a dependency of puzuz.
+        criu = pkgs.callPackage ./nix/criu.nix { };
       });
 
       devShells = forAllSystems (pkgs: {
