@@ -163,8 +163,9 @@ minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.
 
 发布版本在 `.github/workflows/release.yml` 中使用 minisign 私钥签名，该私钥存放在仓库 secrets
 `MINISIGN_SECRET_KEY` 和 `MINISIGN_PASSWORD` 中。公钥是 `packaging/minisign.pub`（它被内置到 `puzuz` 中），
-以及 `scripts/install.sh` 中的 `MINISIGN_PUBKEY`。在创建真正的密钥之前，仓库中带的是测试密钥，
-发布工作流会拒绝使用它运行。创建真正密钥的一次性步骤如下：
+以及 `scripts/install.sh` 中的 `MINISIGN_PUBKEY`。当前使用的是真正的发布密钥
+（ID `21E8F80CBA3FE3CA`）。轮换密钥（密钥泄露或维护者更换）时，按下面的步骤创建新的密钥对，在同一次提交中替换
+两处公钥，并更新这两个 secrets。已安装的 `puzuz` 内置的是旧公钥，无法验证用新密钥签名的发布版本，因此需要用 `install.sh` 手动重新安装：
 
 ```sh
 scripts/dist/gen-signing-key.sh        # asks for a password; writes the secret key under ~

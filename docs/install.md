@@ -170,8 +170,11 @@ minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.
 Releases are signed in `.github/workflows/release.yml` with the minisign secret key stored in the
 repository secrets `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD`. The public key is
 `packaging/minisign.pub`, which is built into `puzuz`, and `MINISIGN_PUBKEY` in
-`scripts/install.sh`. The repository carries a test key until the real one is created, and the
-release workflow refuses to run with it. To create the real key once:
+`scripts/install.sh`. The key in use is the real release key (id `21E8F80CBA3FE3CA`). To rotate
+it (a leaked key, or a new maintainer), create a new key pair as follows, replace the public key
+in both places in the same commit, and update the two secrets. Installed copies of
+`puzuz` carry the old public key and cannot verify releases signed with the new one, so they need
+a manual reinstall with `install.sh`:
 
 ```sh
 scripts/dist/gen-signing-key.sh        # asks for a password; writes the secret key under ~
