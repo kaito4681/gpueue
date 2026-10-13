@@ -671,8 +671,8 @@ pub enum SubCommand {
 
     /// (puzuz) Update puzuz itself (administrators).
     ///
-    /// Downloads a release from GitHub, checks its signature and checksum, and installs it with
-    /// its own `puzuz service install --bin-dir <the installed directory>`. Running jobs keep
+    /// Downloads a release from GitHub, checks its signature and checksum, and installs it into
+    /// the installed directory with its own `puzuz service install`. Running jobs keep
     /// running. Only for an installation made by `puzuz service install` (or install.sh);
     /// packages are updated with their package manager. Without root it only checks, like
     /// --check. The repository is private: set GH_TOKEN to a token that can read it, or save one

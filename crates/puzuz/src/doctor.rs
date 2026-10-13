@@ -954,7 +954,7 @@ fn check_helper_binary(sys: &dyn System) -> Check {
     let exe = exec.program;
     if let Err(err) = std::fs::metadata(sys.path(&exe)) {
         return Check::fail(NAME, format!("{}: {err}", exe.display()))
-            .hint("sudo puzuz service install --bin-dir /usr/local/bin");
+            .hint("sudo puzuz service install");
     }
     match check_root_owned_chain(sys, &exe) {
         Ok(()) => Check::ok(NAME, exe.display().to_string()),
@@ -967,7 +967,8 @@ fn check_helper_binary(sys: &dyn System) -> Check {
         )
         .hint(format!(
             "sudo chown root:root {0}; sudo chmod 755 {0}, and the same for each directory \
-             above it; or `sudo puzuz service install --bin-dir /usr/local/bin`",
+             above it; or re-run `sudo puzuz service install` with a directory only root can \
+             write to",
             exe.display()
         )),
     }

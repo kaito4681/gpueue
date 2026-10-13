@@ -1347,11 +1347,10 @@ fn value_examples_in_help_parse() {
 #[test]
 fn commands_and_options_in_help_texts_exist() {
     // Options of other programs that help texts mention on purpose.
-    let foreign_options: [(&[&str], &str); 5] = [
+    let foreign_options: [(&[&str], &str); 4] = [
         (&[], "config"),             // pueue's, which puzuz replaces with --socket
         (&[], "profile"),            // likewise
         (&["send"], "yes"),          // a job command's own flag
-        (&["update"], "bin-dir"),    // of `service install`
         (&["update"], "save-token"), // of install.sh
     ];
     let root = Cli::command();

@@ -417,7 +417,7 @@ fn service_install_bin_dir(detection: &Detection) -> Result<PathBuf> {
         InstallMethod::One(Method::ServiceInstall { bin_dir: Some(dir) }) => Ok(dir.clone()),
         InstallMethod::One(Method::ServiceInstall { bin_dir: None }) => Err(
             "cannot tell from /etc/systemd/system/puzuz.service where the binaries are; \
-                 re-run `sudo puzuz service install --bin-dir /usr/local/bin` first"
+                 re-run `sudo puzuz service install` first"
                 .to_owned(),
         ),
         InstallMethod::None => Err(format!(

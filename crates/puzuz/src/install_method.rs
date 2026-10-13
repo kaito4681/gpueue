@@ -205,8 +205,7 @@ impl Method {
             }
             Method::Manual { unit } => format!(
                 "{} was not written by `puzuz service install`; replace the binaries it runs \
-                 by hand, or remove it and run `sudo puzuz service install --bin-dir \
-                 /usr/local/bin`",
+                 by hand, or remove it and run `sudo puzuz service install`",
                 unit.display()
             ),
         }
