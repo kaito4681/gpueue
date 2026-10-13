@@ -95,8 +95,8 @@ tarball 并进行校验，然后运行该发布版本的 `puzuz service install`
 令牌通过头部文件传给 `curl`，因此不会出现在 `ps` 或输出中。被拒绝的令牌会以明确说明这一点的消息失败；
 `--version X` 返回 404 表示该发布版本不存在。
 
-<a id="installing"></a>
-### 安装
+<a id="running-the-installer"></a>
+### 运行安装程序
 
 ```sh
 curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
@@ -703,7 +703,7 @@ tar xzf puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
 sudo puzuz-v0.1.0-x86_64-unknown-linux-gnu/puzuz service install
 ```
 
-<a id="installing-1"></a>
+<a id="installing"></a>
 ## 安装
 
 ```sh
