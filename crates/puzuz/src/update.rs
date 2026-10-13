@@ -394,12 +394,49 @@ fn how_to_update(method: &InstallMethod, version: Option<&Version>) -> String {
     }
 }
 
+/// Where the binaries of a `service install` installation are, or why `puzuz update` must not
+/// install over this one.
+fn service_install_bin_dir(method: &InstallMethod) -> Result<PathBuf> {
+    match method {
+        InstallMethod::One(Method::ServiceInstall { bin_dir: Some(dir) }) => Ok(dir.clone()),
+        InstallMethod::One(Method::ServiceInstall { bin_dir: None }) => Err(
+            "cannot tell from /etc/systemd/system/puzuz.service where the binaries are; \
+                 re-run `sudo puzuz service install --bin-dir /usr/local/bin` first"
+                .to_owned(),
+        ),
+        InstallMethod::None => Err(
+            "puzuz is not installed as a service; install it with install.sh (see \
+                 docs/install.md)"
+                .to_owned(),
+        ),
+        InstallMethod::One(other) => Err(format!(
+            "puzuz is installed as {other}; `puzuz update` only updates what \
+                 `puzuz service install` installed. To update it, {}.",
+            other.update_hint()
+        )),
+        InstallMethod::Mixed(_) => Err(format!(
+            "puzuz is installed in more than one way ({method}); run `puzuz doctor` and \
+                 remove all but one first"
+        )),
+    }
+}
+
 /// `puzuz update`. Without root it only checks (like `--check`).
 pub fn update(sys: &dyn System, options: &UpdateOptions, out: &mut dyn Write) -> Result<()> {
     let config = doctor::load_config(sys).config;
     let wanted = options.version.as_deref().map(parse_version).transpose()?;
     let current = current_version();
     let method = install_method::detect(sys);
+    // Installing needs an installation this command may change, run from its binary: refuse
+    // anything else before contacting GitHub, so that the error names the right way to update.
+    // Checking (`--check`, or without root) only reports.
+    let bin_dir = if options.check || sys.euid() != 0 {
+        None
+    } else {
+        let bin_dir = service_install_bin_dir(&method)?;
+        check_running_installed_binary(sys, &bin_dir)?;
+        Some(bin_dir)
+    };
     let client = Client::new(sys, &config)?;
     let release = client.release(wanted.as_ref(), API_TIMEOUT)?;
     let target = release.version()?;
@@ -417,7 +454,7 @@ pub fn update(sys: &dyn System, options: &UpdateOptions, out: &mut dyn Write) ->
         return Ok(());
     }
     let downgrade = target < current;
-    if options.check || sys.euid() != 0 {
+    let Some(bin_dir) = bin_dir else {
         writeln!(
             out,
             "puzuz {target} is available (installed: {current}{}).",
@@ -431,39 +468,7 @@ pub fn update(sys: &dyn System, options: &UpdateOptions, out: &mut dyn Write) ->
         )
         .ok();
         return Ok(());
-    }
-
-    let bin_dir = match &method {
-        InstallMethod::One(Method::ServiceInstall { bin_dir: Some(dir) }) => dir.clone(),
-        InstallMethod::One(Method::ServiceInstall { bin_dir: None }) => {
-            return Err(
-                "cannot tell from /etc/systemd/system/puzuz.service where the binaries are; \
-                 re-run `sudo puzuz service install --bin-dir /usr/local/bin` first"
-                    .to_owned(),
-            );
-        }
-        InstallMethod::None => {
-            return Err(
-                "puzuz is not installed as a service; install it with install.sh (see \
-                 docs/install.md)"
-                    .to_owned(),
-            );
-        }
-        InstallMethod::One(other) => {
-            return Err(format!(
-                "puzuz is installed as {other}; `puzuz update` only updates what \
-                 `puzuz service install` installed. To update it, {}.",
-                other.update_hint()
-            ));
-        }
-        InstallMethod::Mixed(_) => {
-            return Err(format!(
-                "puzuz is installed in more than one way ({method}); run `puzuz doctor` and \
-                 remove all but one first"
-            ));
-        }
     };
-    check_running_installed_binary(sys, &bin_dir)?;
 
     if !options.yes {
         let verb = if downgrade { "Downgrade" } else { "Update" };

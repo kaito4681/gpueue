@@ -484,6 +484,40 @@ fn only_service_install_is_updated() {
 }
 
 #[test]
+fn the_install_method_is_checked_before_contacting_github() {
+    // A package-managed machine: no token and no reachable release, but the error names the
+    // package manager.
+    let sys = system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
+    sys.env.borrow_mut().remove("GH_TOKEN");
+    sys.serve(&format!("{REPO_API}/releases/latest"), 404, "{}");
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("installed as distribution package"), "{err}");
+    assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
+
+    // Not installed at all.
+    let sys = system();
+    std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("not installed as a service"), "{err}");
+    assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
+
+    // Run from another binary than the installed one.
+    let mut sys = system();
+    sys.exe = PathBuf::from("/home/u/puzuz");
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(
+        err.contains("run `sudo /usr/local/bin/puzuz update`"),
+        "{err}"
+    );
+    assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
+}
+
+#[test]
 fn update_must_run_the_installed_binary() {
     let mut sys = system();
     sys.exe = PathBuf::from("/home/u/puzuz");
