@@ -7,10 +7,14 @@
 //! version = "0.2.0"
 //! bin_dir = "/usr/local/bin"
 //! copied = ["/usr/local/bin/puzuz", "/usr/local/bin/puzuz-helper"]
+//! gc_root = "/nix/var/nix/gcroots/puzuz"
+//! gc_root_target = "/nix/store/...-puzuz-0.2.0"
 //! ```
 //!
 //! An empty `copied` means the units run binaries that were already in `bin_dir` (installed in
-//! place, e.g. by a package or by hand); those are never removed.
+//! place, e.g. by a package or by hand); those are never removed. `gc_root` is present when the
+//! binaries were installed from the Nix store: they still use libraries from it, so the store
+//! path is registered as a garbage-collector root.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,6 +38,11 @@ pub struct Receipt {
     /// The binaries `service install` copied into `bin_dir`.
     #[serde(default)]
     pub copied: Vec<PathBuf>,
+    /// The Nix GC root registered for `gc_root_target`, the store path the binaries came from.
+    #[serde(default)]
+    pub gc_root: Option<PathBuf>,
+    #[serde(default)]
+    pub gc_root_target: Option<PathBuf>,
 }
 
 /// A TOML basic string (JSON string escapes are valid in TOML basic strings).
@@ -48,7 +57,7 @@ fn quote_path(path: &Path) -> String {
 impl Receipt {
     pub fn to_toml(&self) -> String {
         let copied: Vec<String> = self.copied.iter().map(|p| quote_path(p)).collect();
-        format!(
+        let mut text = format!(
             "# Written by `puzuz service install`; `puzuz uninstall` removes the files in `copied`.\n\
              # An empty `copied` means the units run binaries that were already in bin_dir.\n\
              version = {}\n\
@@ -57,7 +66,16 @@ impl Receipt {
             quote(&self.version),
             quote_path(&self.bin_dir),
             copied.join(", "),
-        )
+        );
+        for (key, value) in [
+            ("gc_root", &self.gc_root),
+            ("gc_root_target", &self.gc_root_target),
+        ] {
+            if let Some(value) = value {
+                text.push_str(&format!("{key} = {}\n", quote_path(value)));
+            }
+        }
+        text
     }
 
     /// The copied binaries that are safe to delete: `puzuz` and `puzuz-helper` in `bin_dir`.

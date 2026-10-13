@@ -206,6 +206,131 @@ struct Binaries {
     changed: bool,
     /// The binaries copied into `bin_dir` (empty: used in place).
     copied: Vec<PathBuf>,
+    /// The Nix store path the running binary belongs to, if it runs from the store.
+    store_path: Option<PathBuf>,
+}
+
+pub const NIX_STORE: &str = "/nix/store";
+/// The garbage-collector root `service install` registers for binaries from the Nix store.
+pub const GC_ROOT: &str = "/nix/var/nix/gcroots/puzuz";
+/// Where `nix-store` is when it is not in systemd's default `PATH` (sudo's `secure_path` hides
+/// the profile of a multi-user Nix installation).
+const NIX_STORE_BINARIES: &[&str] = &[
+    "/nix/var/nix/profiles/default/bin/nix-store",
+    "/run/current-system/sw/bin/nix-store",
+];
+
+/// The store path (`/nix/store/<hash>-<name>`) the system path `exe` resolves into, if any.
+fn nix_store_path(sys: &dyn System, exe: &Path) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(sys.root()).ok()?;
+    let resolved = std::fs::canonicalize(sys.path(exe)).ok()?;
+    let system = Path::new("/").join(resolved.strip_prefix(&root).ok()?);
+    let entry = system.strip_prefix(NIX_STORE).ok()?.components().next()?;
+    Some(Path::new(NIX_STORE).join(entry))
+}
+
+/// Registers [`GC_ROOT`] for `store_path` with `nix-store`, so that `nix-collect-garbage` keeps
+/// what the copied binaries use (their libraries and loader). Returns whether it worked; a
+/// failure is only a warning.
+fn add_gc_root(sys: &dyn System, store_path: &Path, out: &mut dyn Write) -> bool {
+    let program = crate::system::find_program(sys, Path::new("nix-store")).or_else(|| {
+        NIX_STORE_BINARIES
+            .iter()
+            .map(PathBuf::from)
+            .find(|path| sys.path(path).is_file())
+    });
+    let manual = format!(
+        "register it yourself so that garbage collection keeps what the binaries use: \
+         `sudo nix-store --add-root {GC_ROOT} --realise {}`",
+        store_path.display()
+    );
+    let Some(program) = program else {
+        writeln!(
+            out,
+            "warning: nix-store not found; the binaries come from {} but no GC root was \
+             registered; {manual}",
+            store_path.display()
+        )
+        .ok();
+        return false;
+    };
+    let store_path_text = store_path.to_string_lossy();
+    match run_checked(
+        sys,
+        &program.to_string_lossy(),
+        &["--add-root", GC_ROOT, "--realise", &store_path_text],
+    ) {
+        Ok(_) => {
+            writeln!(
+                out,
+                "registered the Nix GC root {GC_ROOT} for {}",
+                store_path.display()
+            )
+            .ok();
+            true
+        }
+        Err(err) => {
+            writeln!(out, "warning: {err}; {manual}").ok();
+            false
+        }
+    }
+}
+
+/// Removes the GC root `root` (only ever [`GC_ROOT`], and only a symlink).
+fn remove_gc_root(sys: &dyn System, root: &Path, out: &mut dyn Write) {
+    if root != Path::new(GC_ROOT) {
+        writeln!(
+            out,
+            "warning: ignoring the GC root {} in {RECEIPT_PATH} (expected {GC_ROOT})",
+            root.display()
+        )
+        .ok();
+        return;
+    }
+    let local = sys.path(root);
+    match std::fs::symlink_metadata(&local) {
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::remove_file(&local) {
+            Ok(()) => {
+                writeln!(out, "removed the Nix GC root {GC_ROOT}").ok();
+            }
+            Err(err) => {
+                writeln!(out, "warning: removing {GC_ROOT}: {err}").ok();
+            }
+        },
+        Ok(_) => {
+            writeln!(out, "warning: kept {GC_ROOT} (not a symlink)").ok();
+        }
+        Err(_) => {}
+    }
+}
+
+/// A GC root and the store path it keeps, as recorded in the receipt.
+type GcRoot = (Option<PathBuf>, Option<PathBuf>);
+
+/// The GC root of the new installation: registered when the binaries come from the Nix store;
+/// otherwise the previous one stays while the installed binaries are unchanged and is removed
+/// once they are replaced (by binaries that do not need the store).
+fn update_gc_root(
+    sys: &dyn System,
+    previous: Option<&Receipt>,
+    binaries: &Binaries,
+    out: &mut dyn Write,
+) -> GcRoot {
+    if let Some(store_path) = &binaries.store_path {
+        return if add_gc_root(sys, store_path, out) {
+            (Some(PathBuf::from(GC_ROOT)), Some(store_path.clone()))
+        } else {
+            (None, None)
+        };
+    }
+    let Some((previous, root)) = previous.and_then(|p| Some((p, p.gc_root.clone()?))) else {
+        return (None, None);
+    };
+    if previous.bin_dir == binaries.bin_dir && !binaries.changed {
+        return (Some(root), previous.gc_root_target.clone());
+    }
+    remove_gc_root(sys, &root, out);
+    (None, None)
 }
 
 /// The directory of the binaries an existing `service install` installation runs.
@@ -291,6 +416,7 @@ fn install_binaries(
         bin_dir,
         changed,
         copied,
+        store_path: nix_store_path(sys, &exe),
     })
 }
 
@@ -301,6 +427,7 @@ fn write_receipt(
     sys: &dyn System,
     previous: Option<&Receipt>,
     binaries: &Binaries,
+    (gc_root, gc_root_target): GcRoot,
 ) -> Result<Vec<PathBuf>> {
     let mut copied = binaries.copied.clone();
     let mut stale = Vec::new();
@@ -320,6 +447,8 @@ fn write_receipt(
         version: puzuz_protocol::BINARY_VERSION.to_owned(),
         bin_dir: binaries.bin_dir.clone(),
         copied,
+        gc_root,
+        gc_root_target,
     };
     write_file(
         sys,
@@ -531,7 +660,8 @@ pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) 
         None
     });
     let binaries = install_binaries(sys, options.bin_dir.as_deref(), &detection, out)?;
-    let stale = write_receipt(sys, previous.as_ref(), &binaries)?;
+    let gc_root = update_gc_root(sys, previous.as_ref(), &binaries, out);
+    let stale = write_receipt(sys, previous.as_ref(), &binaries, gc_root)?;
     let bin_dir = binaries.bin_dir.clone();
     let binaries_changed = binaries.changed;
 

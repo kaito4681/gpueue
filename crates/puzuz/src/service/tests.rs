@@ -205,6 +205,7 @@ fn binaries_outside_system_dirs_are_copied_to_usr_local_bin() {
             version: puzuz_protocol::BINARY_VERSION.to_owned(),
             bin_dir: PathBuf::from("/usr/local/bin"),
             copied: paths(&["/usr/local/bin/puzuz", "/usr/local/bin/puzuz-helper"]),
+            ..Receipt::default()
         }
     );
     assert_eq!(mode(&sys, RECEIPT_PATH), 0o644);
@@ -318,6 +319,8 @@ fn receipt_lists_only_binaries_in_its_directory_as_removable() {
             "/etc/passwd",
             "/usr/local/bin/puzuz-helper",
         ]),
+        gc_root: Some(PathBuf::from(GC_ROOT)),
+        gc_root_target: Some(PathBuf::from("/nix/store/abc-puzuz-0.1.0")),
     };
     assert_eq!(
         receipt.removable_copies(),
@@ -325,6 +328,119 @@ fn receipt_lists_only_binaries_in_its_directory_as_removable() {
     );
     let parsed: Receipt = toml::from_str(&receipt.to_toml()).unwrap();
     assert_eq!(parsed, receipt);
+}
+
+const STORE_PATH: &str = "/nix/store/abc-puzuz-0.1.0";
+
+/// A root-run system running puzuz from the Nix store through `./result` (as after
+/// `nix build`).
+fn nix_build_system() -> FakeSystem {
+    let mut sys = FakeSystem::new();
+    sys.write_exe(&format!("{STORE_PATH}/bin/puzuz"), "nix puzuz");
+    sys.write_exe(&format!("{STORE_PATH}/bin/puzuz-helper"), "nix helper");
+    sys.mkdir("/home/u");
+    std::os::unix::fs::symlink(
+        sys.path(Path::new(STORE_PATH)),
+        sys.path(Path::new("/home/u/result")),
+    )
+    .unwrap();
+    sys.exe = PathBuf::from("/home/u/result/bin/puzuz");
+    sys
+}
+
+#[test]
+fn binaries_from_the_nix_store_are_copied_and_kept_by_a_gc_root() {
+    let sys = nix_build_system();
+    sys.write_exe("/nix/var/nix/profiles/default/bin/nix-store", "");
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(out.contains("installing into /usr/local/bin"), "{out}");
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "nix puzuz");
+    assert!(
+        sys.ran(&format!(
+            "nix-store --add-root /nix/var/nix/gcroots/puzuz --realise {STORE_PATH}"
+        )),
+        "{:?}",
+        sys.commands()
+    );
+    assert!(
+        out.contains(&format!(
+            "registered the Nix GC root /nix/var/nix/gcroots/puzuz for {STORE_PATH}"
+        )),
+        "{out}"
+    );
+    let receipt = receipt(&sys);
+    assert_eq!(receipt.gc_root, Some(PathBuf::from(GC_ROOT)));
+    assert_eq!(receipt.gc_root_target, Some(PathBuf::from(STORE_PATH)));
+    assert!(
+        sys.read(RECEIPT_PATH)
+            .unwrap()
+            .contains(&format!("gc_root_target = \"{STORE_PATH}\"\n"))
+    );
+}
+
+#[test]
+fn without_nix_store_the_gc_root_is_only_a_warning() {
+    let sys = nix_build_system();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(out.contains("warning: nix-store not found"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "sudo nix-store --add-root /nix/var/nix/gcroots/puzuz --realise {STORE_PATH}"
+        )),
+        "{out}"
+    );
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "nix puzuz");
+    assert_eq!(receipt(&sys).gc_root, None);
+
+    // A failing nix-store, too.
+    let sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    sys.respond("nix-store", CmdOutput::failed("", "permission denied"));
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(out.contains("warning: `"), "{out}");
+    assert!(out.contains("permission denied"), "{out}");
+    assert_eq!(receipt(&sys).gc_root, None);
+}
+
+/// Pretends `nix-store --add-root` ran: the GC root symlink exists.
+fn make_gc_root(sys: &FakeSystem) {
+    sys.mkdir("/nix/var/nix/gcroots");
+    let root = sys.path(Path::new(GC_ROOT));
+    let _ = std::fs::remove_file(&root);
+    std::os::unix::fs::symlink(STORE_PATH, root).unwrap();
+}
+
+#[test]
+fn the_gc_root_goes_once_the_binaries_no_longer_come_from_the_store() {
+    let mut sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    run_install(&sys, &opts()).unwrap();
+    make_gc_root(&sys);
+
+    // Re-running the installed copy changes nothing: the copies still need the store.
+    sys.exe = PathBuf::from("/usr/local/bin/puzuz");
+    sys.log.borrow_mut().clear();
+    run_install(&sys, &opts()).unwrap();
+    assert!(!sys.ran("nix-store"));
+    assert!(sys.exists(GC_ROOT));
+    assert_eq!(receipt(&sys).gc_root, Some(PathBuf::from(GC_ROOT)));
+    assert_eq!(
+        receipt(&sys).gc_root_target,
+        Some(PathBuf::from(STORE_PATH))
+    );
+
+    // Binaries from elsewhere replace them; the store path is no longer needed.
+    sys.exe = PathBuf::from("/home/u/target/release/puzuz");
+    sys.write_exe("/home/u/target/release/puzuz", "new puzuz");
+    sys.write_exe("/home/u/target/release/puzuz-helper", "new helper");
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(
+        out.contains("removed the Nix GC root /nix/var/nix/gcroots/puzuz"),
+        "{out}"
+    );
+    assert!(!sys.exists(GC_ROOT));
+    assert_eq!(receipt(&sys).gc_root, None);
+    assert_eq!(receipt(&sys).gc_root_target, None);
 }
 
 #[test]
