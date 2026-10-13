@@ -202,10 +202,18 @@ fn any_owner_beats_another_package_managers_not_owned() {
     let detection = detect(&sys);
     assert_eq!(
         detection.install.methods()[0],
-        package(&path(LIB, DAEMON_UNIT), Owner::Rpm("puzuz".to_owned()), None)
+        package(
+            &path(LIB, DAEMON_UNIT),
+            Owner::Rpm("puzuz".to_owned()),
+            None
+        )
     );
     // The native package manager is asked first, and answers.
-    assert!(sys.commands()[0].starts_with("rpm -qf"), "{:?}", sys.commands());
+    assert!(
+        sys.commands()[0].starts_with("rpm -qf"),
+        "{:?}",
+        sys.commands()
+    );
     assert!(!sys.ran("dpkg-query"));
 
     // Without os-release, every package manager is asked until one reports an owner.

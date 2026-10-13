@@ -235,7 +235,10 @@ fn valid_bin_dir(dir: &Path) -> Result<()> {
 /// Whether two system paths are the same file (device and inode, symlinks followed): e.g.
 /// /bin/puzuz and /usr/bin/puzuz on a merged-/usr system.
 fn same_file(sys: &dyn System, a: &Path, b: &Path) -> bool {
-    match (std::fs::metadata(sys.path(a)), std::fs::metadata(sys.path(b))) {
+    match (
+        std::fs::metadata(sys.path(a)),
+        std::fs::metadata(sys.path(b)),
+    ) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
     }
@@ -418,7 +421,10 @@ pub fn release_gc_root(sys: &dyn System, version: &str, out: &mut dyn Write) -> 
 
 /// GPUs reported by nvidia-smi as `[[gpus]]` entries for a new configuration file.
 fn detected_gpus_toml(sys: &dyn System) -> String {
-    let Some(smi) = crate::system::find_program(sys, Path::new("nvidia-smi")) else {
+    // Run as root: only an nvidia-smi nobody else can replace.
+    let crate::system::Program::Found(smi) =
+        crate::system::find_runnable_program(sys, Path::new("nvidia-smi"))
+    else {
         return String::new();
     };
     let Ok(output) = sys.run(
@@ -1126,7 +1132,10 @@ fn remove_entry(
     let listing = dir
         .try_clone()
         .map_err(|err| format!("reading {}: {err}", path.display()))?;
-    for entry in nix::dir::Dir::from_fd(listing).map_err(reading)?.into_iter() {
+    for entry in nix::dir::Dir::from_fd(listing)
+        .map_err(reading)?
+        .into_iter()
+    {
         let entry = entry.map_err(reading)?;
         let bytes = entry.file_name().to_bytes();
         if bytes != b"." && bytes != b".." {

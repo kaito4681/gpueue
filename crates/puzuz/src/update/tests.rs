@@ -671,7 +671,10 @@ fn the_puzuz_rpm_is_updated_from_the_release_url() {
     );
 
     // openSUSE uses zypper.
-    sys.write("/etc/os-release", "ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n");
+    sys.write(
+        "/etc/os-release",
+        "ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n",
+    );
     let out = run(&sys, &opts(true, None)).unwrap();
     assert!(
         out.contains(&format!(

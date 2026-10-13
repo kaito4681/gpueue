@@ -651,8 +651,8 @@ fn an_identical_binary_behind_a_symlink_is_replaced() {
         out.contains("installed /usr/local/bin/puzuz-helper"),
         "{out}"
     );
-    let meta = std::fs::symlink_metadata(sys.path(Path::new("/usr/local/bin/puzuz-helper")))
-        .unwrap();
+    let meta =
+        std::fs::symlink_metadata(sys.path(Path::new("/usr/local/bin/puzuz-helper"))).unwrap();
     assert!(meta.file_type().is_file());
     assert_eq!(
         sys.read("/usr/local/bin/puzuz-helper").unwrap(),
@@ -684,7 +684,13 @@ fn bin_dir_equal_to_the_binary_location_copies_nothing() {
 #[test]
 fn bad_bin_dirs_and_missing_helper_are_rejected() {
     let sys = system();
-    for dir in ["relative/bin", "/opt/my bin", "/opt/%h", "/usr/local/../bin", "/usr/./bin"] {
+    for dir in [
+        "relative/bin",
+        "/opt/my bin",
+        "/opt/%h",
+        "/usr/local/../bin",
+        "/usr/./bin",
+    ] {
         let options = InstallOptions {
             no_start: false,
             bin_dir: Some(PathBuf::from(dir)),
@@ -1035,7 +1041,10 @@ fn purge_refuses_when_running_jobs_cannot_be_listed() {
         CmdOutput::failed("", "Failed to connect to bus"),
     );
     let err = run_uninstall(&sys, true, true).unwrap_err();
-    assert!(err.contains("cannot tell whether jobs are still running"), "{err}");
+    assert!(
+        err.contains("cannot tell whether jobs are still running"),
+        "{err}"
+    );
     assert!(err.contains("Failed to connect to bus"), "{err}");
     assert!(sys.exists("/var/lib/puzuz/logs/1000/7.log"));
     assert!(sys.exists("/etc/systemd/system/puzuz.service"));
@@ -1072,7 +1081,11 @@ fn purge_never_follows_symlinks_in_user_directories() {
 
     let out = run_uninstall(&sys, true, true).unwrap();
     assert!(!sys.exists("/var/lib/puzuz"), "{out}");
-    assert!(sys.path(Path::new("/run/puzuz")).symlink_metadata().is_err());
+    assert!(
+        sys.path(Path::new("/run/puzuz"))
+            .symlink_metadata()
+            .is_err()
+    );
     assert_eq!(sys.read("/etc/passwd").unwrap(), "root:x:0:0");
     assert_eq!(sys.read("/srv/secret/file").unwrap(), "kept");
     assert!(out.contains("removed /var/lib/puzuz\n"), "{out}");
