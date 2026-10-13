@@ -95,7 +95,7 @@ The token is passed to `curl` in a header file, so it does not show up in `ps` o
 A rejected token fails with a message that says so; a 404 for `--version X` means that release
 does not exist.
 
-### Installing
+### Running the installer
 
 ```sh
 curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
