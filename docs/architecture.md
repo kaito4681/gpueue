@@ -194,7 +194,7 @@ Only the daemon writes the database. The CLI always goes through the daemon.
 
 | Crate | Contents |
 | --- | --- |
-| `crates/puzuz` | the `puzuz` binary: pueue-compatible CLI, `puzuz daemon`, `service`, `doctor` |
+| `crates/puzuz` | the `puzuz` binary: pueue-compatible CLI, `puzuz daemon`, `service`, `doctor`, `update` (the only crate with an HTTPS client) |
 | `crates/puzuz-core` | domain model, job lifecycle, scheduling decisions, authorization, SQLite storage (no other I/O) |
 | `crates/puzuz-protocol` | wire types: CLI ⇄ daemon (HTTP API and client), daemon ⇄ helper (NDJSON messages) |
 | `crates/puzuz-config` | the `/etc/puzuz/config.toml` schema, shared by the daemon, the helper (with root-ownership checks) and `doctor` |

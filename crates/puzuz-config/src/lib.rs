@@ -35,6 +35,8 @@
 //! checkpoint_deadline_base_secs = 180
 //! checkpoint_deadline_secs_per_gib = 30
 //! fork_guard = true
+//! update_source = "github:kaito4681/puzuz"
+//! update_check = true
 //! # GPUs are detected with NVML ("auto"). Without NVML (no driver, no
 //! # libnvidia-ml.so.1) the [[gpus]] list is used instead; "static" always
 //! # uses the list.
@@ -63,6 +65,9 @@ use serde::{Deserialize, Serialize};
 
 /// Default location of the configuration file.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/puzuz/config.toml";
+
+/// Default of [`Config::update_source`].
+pub const DEFAULT_UPDATE_SOURCE: &str = "github:kaito4681/puzuz";
 
 /// Upper bound of every `*_secs` key (one year). Larger values are surely
 /// mistakes, and would overflow deadline arithmetic in the daemon and helper.
@@ -135,6 +140,11 @@ pub struct Config {
     /// device mappings, which CRIU cannot dump. Installed into
     /// `<data_dir>/lib`.
     pub fork_guard: bool,
+    /// Where `puzuz update` and `puzuz doctor` look for releases:
+    /// `github:<owner>/<repo>` (CLI only).
+    pub update_source: String,
+    /// Whether `puzuz doctor` checks for a newer release (CLI only).
+    pub update_check: bool,
     /// How GPUs are found at start-up.
     pub gpu_detection: GpuDetection,
     /// Path (or name) of the NVML library; by default `libnvidia-ml.so.1`
@@ -219,6 +229,8 @@ impl Default for Config {
             criu_dump_timeout_secs: None,
             criu_restore_timeout_secs: None,
             fork_guard: true,
+            update_source: DEFAULT_UPDATE_SOURCE.to_owned(),
+            update_check: true,
             gpu_detection: GpuDetection::Auto,
             nvml_library: None,
             gpus: Vec::new(),

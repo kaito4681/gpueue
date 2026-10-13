@@ -106,7 +106,7 @@ Options go after `bash -s --` when the script comes from a pipe (for example
 | `--version X` | install version X instead of the latest release |
 | `--bin-dir DIR` | where to put `puzuz` and `puzuz-helper` (default: the directory of the current `service install` installation, else `/usr/local/bin`) |
 | `--token-file FILE` | read the token from FILE |
-| `--save-token` | save the token to `/etc/puzuz/github-token` (root, 0600) for later runs |
+| `--save-token` | save the token to `/etc/puzuz/github-token` (root, 0600) for `puzuz update` and later runs |
 | `--uninstall` | remove puzuz (see [Uninstalling](#uninstalling)) |
 | `--purge` | with `--uninstall`, also delete `/etc/puzuz` and `/var/lib/puzuz` |
 | `-y`, `--yes` | do not ask before purging |
@@ -132,8 +132,9 @@ manager or NixOS (see [Install method](#install-method)). It then:
 If only some `puzuz doctor` checks fail (for example CRIU is missing) but the services run,
 `install.sh` succeeds with a warning.
 
-Running `install.sh` again installs the latest (or the given) version over the installed one.
-Running jobs keep running (see [Upgrading](#upgrading)).
+Afterwards, update with `sudo puzuz update` (see [Upgrading](#upgrading)). Running `install.sh`
+again also installs the latest (or the given) version over the installed one. Running jobs keep
+running either way.
 
 Other ways to install (apt, rpm, AUR, Nix) are coming later. Until then, build from source as
 described below.
@@ -382,8 +383,10 @@ daemon detected (with NVML or from `[[gpus]]`) against `nvidia-smi` (see
 the helper binary and of every directory above it (taken from the unit's effective `ExecStart=`,
 drop-ins included), whether the daemon's directories are inside its `ReadWritePaths=`, both
 sockets, the daemon and helper versions and their connection, the checkpoint
-directory (exists, not tmpfs, free space) and the total checkpoint size, and whether you are an
-administrator. It does not run `criu check`. Run `sudo criu check` yourself to see what CRIU
+directory (exists, not tmpfs, free space) and the total checkpoint size, whether you are an
+administrator, and (unless `update_check = false`) whether a newer release exists. That last
+check is at most INFO, and so is not being able to reach GitHub (a user without a token cannot
+read the private repository). It does not run `criu check`. Run `sudo criu check` yourself to see what CRIU
 supports on this kernel.
 
 Try a job:
@@ -451,6 +454,8 @@ rejected. Every `*_secs` key is at most one year (31536000).
 | `fork_guard` | `true` | helper | preload the fork guard into jobs (see the README's limitations) |
 | `gpu_detection` | `"auto"` | daemon | `"auto"`: NVML, falling back to `[[gpus]]`. `"static"`: only `[[gpus]]`. |
 | `nvml_library` | unset | daemon | NVML library path or name; by default `libnvidia-ml.so.1`, then `libnvidia-ml.so` |
+| `update_source` | `"github:kaito4681/puzuz"` | CLI | where `puzuz update` and `puzuz doctor` look for releases: `github:<owner>/<repo>` |
+| `update_check` | `true` | CLI | whether `puzuz doctor` asks `update_source` for a newer release |
 | `[[gpus]]` | empty | daemon | static GPU list: `index` (required), `uuid`, `name`, `memory_total_bytes` (see [GPU detection](#gpu-detection)) |
 
 `puzuz-helper serve` also accepts command-line flags (`puzuz-helper serve --help`). They override
@@ -675,16 +680,46 @@ Not tested, or not supported:
 
 ## Upgrading
 
-Installed with `install.sh`: run it again (with `--version X` for a specific version). Built
-from source:
+How to update depends on how puzuz was installed (`puzuz doctor` shows it as "install method",
+and its "update" line says when a newer release exists):
+
+| Installed with | Update with |
+| --- | --- |
+| `install.sh` (or `puzuz service install` of a release) | `sudo puzuz update` |
+| built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install --bin-dir /usr/local/bin` |
+| a distribution package or NixOS (later) | the package manager; `puzuz update` refuses |
+
+### puzuz update
 
 ```sh
-cargo build --release -p puzuz -p puzuz-helper
-sudo target/release/puzuz service install --bin-dir /usr/local/bin
+puzuz update --check          # is there a newer release? (any user; without root, update only checks)
+sudo puzuz update             # install the latest release
+sudo puzuz update --version 0.2.0 --yes
 ```
 
-This replaces the binaries and units and restarts both services if anything changed. The
-configuration file is kept.
+`puzuz update` needs a GitHub token that can read the repository, like `install.sh`: `GH_TOKEN`
+or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or `/etc/puzuz/github-token` (root, 0600),
+which `install.sh --save-token` writes. It then:
+
+1. checks that puzuz was installed by `puzuz service install` (not by a package or NixOS) and
+   that it runs as the installed binary (the directory in `puzuz.service`'s `ExecStart=`),
+2. looks up the latest release (or `--version`) and compares it with its own version. Nothing
+   happens when it is up to date. An older version is installed only when asked for with
+   `--version`,
+3. asks for confirmation (`-y/--yes` skips it),
+4. downloads the tarball, `.sha256` and `.minisig` into `/var/lib/puzuz/update` (root, 0700),
+   checks the minisign signature with the release key built into `puzuz`, and the checksum,
+5. extracts the tarball (regular files and directories only) and asks the new `puzuz` which
+   database schema it supports. A release that cannot open the daemon's database (an older one,
+   from before a schema change) is refused before anything changes,
+6. runs the new `puzuz service install --bin-dir <the installed directory>`, waits until the
+   daemon runs the new version and is connected to the helper, and deletes the download.
+
+`install.sh` (run again, optionally with `--version`) works too and does the same, except that it
+checks the signature only when `minisign` is installed.
+
+`service install` (and so both ways above) replaces the binaries and units and restarts both
+services if anything changed. The configuration file is kept.
 
 - **Running jobs are not affected.** They run in their own systemd units
   (`puzuz-job-<id>.service`, or `puzuz-job-<id>-r<n>.service` after a restore). A new daemon picks
@@ -764,6 +799,7 @@ stopped until `sudo systemctl start puzuz` or the next boot.
 | `cuda plugin` | `cuda_checkpoint_mode` is `"plugin"` but `/usr/lib/criu/cuda_plugin.so` is missing | install the plugin (see [CUDA plugin mode](#cuda-plugin-mode)) or use the manual mode |
 | `gpus` | nvidia-smi lists N GPU(s), the configuration M | update `[[gpus]]` (see [GPU detection](#gpu-detection)) |
 | `kernel` | lacks `/proc/sys/kernel/ns_last_pid` | use a kernel with `CONFIG_CHECKPOINT_RESTORE=y` |
+| `update` | puzuz X is available (INFO) | `sudo puzuz update`; `update_check = false` turns the check off |
 | `install method` | mixed: two install methods at once | remove all but one, as the `fix:` lines say (e.g. `sudo puzuz service uninstall` to keep the package) |
 | `puzuz.service`, `puzuz-helper.service` | not installed / not active | `sudo puzuz service install`, or `sudo systemctl start <unit>` and read `journalctl -u <unit>` |
 | `helper binary` | the binary or a directory above it is not owned by root or is writable by others | `sudo chown root:root <path>; sudo chmod 755 <path>` (and its directories), or reinstall with `--bin-dir /usr/local/bin` |

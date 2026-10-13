@@ -78,7 +78,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - run: scripts/dist/build-test-versions.sh target/dist-releases test.1 test.2
+      - run: scripts/dist/build-test-versions.sh target/dist-releases test.1 test.2:migration
       - uses: actions/upload-artifact@v4
         with:
           name: dist-releases

@@ -128,6 +128,7 @@ async fn route(req: Request<Incoming>, log: Arc<Mutex<Vec<Recorded>>>) -> Respon
                 },
                 checkpoints: None,
                 gpu_detection: None,
+                schema_version: None,
             },
         ),
         ("GET", "/v1/groups") => json(

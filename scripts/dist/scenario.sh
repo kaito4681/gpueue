@@ -3,9 +3,12 @@
 # scripts/dist-test.sh, with /dist holding install.sh, the fake GitHub API,
 # the releases, a minisign binary, the release public key and the token.
 #
-# Usage: scenario.sh 17
+# Usage: scenario.sh 17|18
 #   17: install.sh: refusals, install v1, a job keeps running through a
 #       re-install of v2, uninstall keeps the data
+#   18: puzuz update: --check, doctor, a bad signature, v1 -> v2 with a
+#       running job, a downgrade below the database schema (v2 adds a
+#       migration), a package-managed machine
 set -euo pipefail
 
 # shellcheck disable=SC1091
@@ -180,10 +183,75 @@ scenario_17() {
     echo "PASS 17"
 }
 
+scenario_18() {
+    start_server
+    set_latest "$V1"
+    local install=/dist/install.sh puzuz=/usr/local/bin/puzuz
+
+    step "18: install v1 with a saved token; a job runs"
+    GH_TOKEN="$TOKEN" bash "$install" --save-token >/dev/null
+    wait_for 20 "the services" services_up
+    [ "$(daemon_version)" = "$V1" ] || fail "daemon runs $(daemon_version), expected $V1"
+    local id
+    id="$(start_job)"
+    wait_for 20 "job $id to run" job_alive "$id"
+
+    step "18: update --check reports v2"
+    set_latest "$V2"
+    "$puzuz" update --check | tee /tmp/check.out
+    grep -qF "puzuz $V2 is available (installed: $V1)" /tmp/check.out || fail "no newer release reported"
+    # A user cannot read the saved token, and is told what is missing.
+    expect_fail "A GitHub token that can read" \
+        runuser -u alice -- env PUZUZ_RELEASE_API_URL="$PUZUZ_RELEASE_API_URL" "$puzuz" update
+    # With a token, a user's `update` only checks.
+    runuser -u alice -- env PUZUZ_RELEASE_API_URL="$PUZUZ_RELEASE_API_URL" GH_TOKEN="$TOKEN" \
+        "$puzuz" update | grep -qF "puzuz $V2 is available" || fail "a user's update did not check"
+    "$puzuz" doctor >/tmp/doctor.out 2>&1 || true
+    grep -qF "INFO  update: puzuz $V2 is available (this is $V1)" /tmp/doctor.out ||
+        { cat /tmp/doctor.out; fail "doctor does not report v2"; }
+
+    step "18: a bad signature is refused; nothing changes"
+    local before
+    before="$(sha256sum "$puzuz")"
+    expect_fail "bad signature" "$puzuz" update --yes --version "$VERSION-test.badsig"
+    [ "$(sha256sum "$puzuz")" = "$before" ] || fail "the binary changed"
+    [ "$(daemon_version)" = "$V1" ] || fail "the daemon changed"
+    [ ! -e /var/lib/puzuz/update ] || fail "the download directory was left behind"
+
+    step "18: sudo puzuz update installs v2; the job keeps running"
+    "$puzuz" update --yes | tee /tmp/update.out
+    grep -qF "verified the signature" /tmp/update.out || fail "signature not verified"
+    grep -qF "puzuz is now $V2." /tmp/update.out || fail "no success message"
+    [ "$(daemon_version)" = "$V2" ] || fail "daemon runs $(daemon_version), expected $V2"
+    "$puzuz" --version | grep -qF "$V2" || fail "the binary is not $V2"
+    job_alive "$id" || fail "job $id stopped during the update"
+    [ "$(job_state "$id")" = running ] || fail "job $id is $(job_state "$id") after the update"
+    "$puzuz" update --yes | grep -qF "puzuz $V2 is up to date" || fail "a second update did something"
+
+    step "18: a downgrade below the database schema is refused"
+    before="$(sha256sum "$puzuz")"
+    expect_fail "the database is at schema" "$puzuz" update --yes --version "$V1"
+    [ "$(sha256sum "$puzuz")" = "$before" ] || fail "the binary changed"
+    [ "$(daemon_version)" = "$V2" ] || fail "the daemon changed"
+    job_alive "$id" || fail "job $id stopped"
+
+    step "18: update refuses a package-managed machine"
+    printf '[Service]\nExecStart=/usr/bin/puzuz daemon\n' >/usr/lib/systemd/system/puzuz.service
+    set_latest "$VERSION-test.badsig"
+    expect_fail "installed in more than one way" "$puzuz" update --yes
+    rm /usr/lib/systemd/system/puzuz.service
+
+    systemctl stop 'puzuz-job-*' || true
+    bash "$install" --uninstall --purge --yes >/dev/null
+    echo
+    echo "PASS 18"
+}
+
 case "${1:-}" in
 17) scenario_17 ;;
+18) scenario_18 ;;
 *)
-    echo "usage: $0 17" >&2
+    echo "usage: $0 17|18" >&2
     exit 2
     ;;
 esac

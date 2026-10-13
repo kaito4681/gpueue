@@ -367,7 +367,29 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
         checks.push(check_checkpoint_usage(storage));
     }
     checks.push(check_admin(sys));
+    if let Some(check) = check_update(sys, &config) {
+        checks.push(check);
+    }
     Report { checks }
+}
+
+/// Whether a newer release exists (`update_check = false` turns this off). Never more than
+/// INFO: being offline is not a problem of the installation.
+fn check_update(sys: &dyn System, config: &Config) -> Option<Check> {
+    const NAME: &str = "update";
+    if !config.update_check {
+        return None;
+    }
+    let current = crate::update::current_version();
+    Some(match crate::update::newer_release(sys, config) {
+        Ok(Some(newer)) => Check::info(
+            NAME,
+            format!("puzuz {newer} is available (this is {current})"),
+        )
+        .hint(crate::update::update_hint(sys)),
+        Ok(None) => Check::ok(NAME, format!("{current} is the latest release")),
+        Err(err) => Check::info(NAME, format!("cannot check for a newer release: {err}")),
+    })
 }
 
 /// How puzuz is installed; two ways at once shadow each other's units.

@@ -46,6 +46,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 nvml-wrapper = "0.13"
 cc = "1"
+# `puzuz update` only (never the helper): HTTPS with rustls, release
+# signatures, checksums and tarballs.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+minisign-verify = "0.2"
+sha2 = "0.10"
+semver = "1"
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

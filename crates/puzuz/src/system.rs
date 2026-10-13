@@ -92,7 +92,29 @@ pub trait System {
     fn confirm(&self, prompt: &str) -> bool;
 
     fn sleep(&self, duration: Duration);
+
+    /// An environment variable of this process.
+    fn env_var(&self, name: &str) -> Option<String>;
+
+    /// `GET url` with the given headers, following redirects (without passing `Authorization`
+    /// on). Any HTTP status is a response; only network failures are errors.
+    fn http_get(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<HttpResponse, String>;
 }
+
+/// The answer to [`System::http_get`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+/// The largest response body [`RealSystem::http_get`] reads (a release tarball is far smaller).
+const MAX_HTTP_BODY: u64 = 1 << 30;
 
 /// The real host.
 #[derive(Debug, Default)]
@@ -178,6 +200,39 @@ impl System for RealSystem {
 
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+
+    fn env_var(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+
+    fn http_get(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<HttpResponse, String> {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            // Never send the token to where GitHub redirects downloads (object storage).
+            .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
+            .user_agent(format!("puzuz/{}", puzuz_protocol::BINARY_VERSION))
+            .build()
+            .into();
+        let mut request = agent.get(url);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let mut response = request.call().map_err(|err| err.to_string())?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_HTTP_BODY)
+            .read_to_vec()
+            .map_err(|err| err.to_string())?;
+        Ok(HttpResponse { status, body })
     }
 }
 

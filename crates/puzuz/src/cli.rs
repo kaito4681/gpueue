@@ -15,7 +15,7 @@
 //!   (`{"groups": [...], "jobs": [...]}`, job views without their environment), not pueue's
 //!   state dump.
 //! - puzuz extensions: `add --gpu/--no-checkpoint`, `checkpoint`, `restore`, `gpu`, `daemon`,
-//!   `service` and `doctor`.
+//!   `service`, `doctor` and `update`.
 
 use std::{fmt, path::PathBuf, str::FromStr};
 
@@ -650,6 +650,29 @@ pub enum SubCommand {
     /// helper services and sockets, the checkpoint storage and the configuration. Exits with a
     /// non-zero status if any check fails.
     Doctor,
+
+    /// (puzuz) Update puzuz itself (administrators).
+    ///
+    /// Downloads a release from GitHub, checks its signature and checksum, and installs it with
+    /// its own `puzuz service install --bin-dir <the installed directory>`. Running jobs keep
+    /// running. Only for an installation made by `puzuz service install` (or install.sh);
+    /// packages are updated with their package manager. Without root it only checks, like
+    /// --check. The repository is private: set GH_TOKEN to a token that can read it, or save one
+    /// with `install.sh --save-token` (/etc/puzuz/github-token).
+    Update {
+        /// Only report whether a newer release exists.
+        #[arg(long)]
+        check: bool,
+
+        /// Install this version instead of the latest release (an older one only if it can
+        /// still read the database).
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+
+        /// Do not ask for confirmation.
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 impl SubCommand {
@@ -693,6 +716,7 @@ impl SubCommand {
             SubCommand::Daemon { .. } => "daemon",
             SubCommand::Service { .. } => "service",
             SubCommand::Doctor => "doctor",
+            SubCommand::Update { .. } => "update",
         }
     }
 }
@@ -802,6 +826,11 @@ pub enum ServiceCommand {
     /// or mixed (used by install.sh).
     #[command(hide = true)]
     InstallMethod,
+
+    /// Print this binary's version and database schema version as JSON (used by
+    /// `puzuz update`).
+    #[command(hide = true)]
+    VersionInfo,
 }
 
 /// When to colorize output.
