@@ -1201,6 +1201,7 @@ dependencies = [
  "minisign-verify",
  "nix",
  "puzuz-checkpoint",
+ "puzuz-config",
  "puzuz-core",
  "puzuz-daemon",
  "puzuz-protocol",
