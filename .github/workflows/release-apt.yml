@@ -5,18 +5,20 @@ name: APT repository
 # docs/install.md, "The APT repository (maintainers)").
 #
 # release.yml creates each release as a draft, and drafts never reach the
-# repository: it runs when a person publishes the release (or a tool using a
-# personal access token does). A release published with the GITHUB_TOKEN of
-# a workflow does not trigger it (GitHub does not start workflows for events
-# caused by GITHUB_TOKEN); run it by hand then. Pre-releases are skipped, so
-# `apt upgrade` only installs stable versions.
+# repository. It runs on `released`: when a person publishes a release as a
+# stable one or turns a pre-release into one (or a tool does so with a
+# personal access token). A release published with the GITHUB_TOKEN of a
+# workflow does not trigger it (GitHub does not start workflows for events
+# caused by GITHUB_TOKEN); run it by hand then. Which releases go to the
+# repository (published, not pre-releases, `v*` tags) is decided by
+# scripts/dist/apt-repo.sh, so `apt upgrade` only installs stable versions.
 #
 # Re-run for a tag (e.g. after a failed upload): Actions > APT repository >
 # Run workflow, or `gh workflow run release-apt.yml -f tag=v0.1.0`.
 
 on:
   release:
-    types: [published]
+    types: [released]
   workflow_dispatch:
     inputs:
       tag:
@@ -40,26 +42,18 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       HAVE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY != '' && secrets.APT_GPG_PASSPHRASE != '' }}
     steps:
-      - name: Decide whether to publish
+      - name: Check the signing secrets
         id: gate
         run: |
-          publish=true
-          if [[ ! "$TAG" =~ ^v[0-9] ]]; then
-            echo "::notice::$TAG is not a version tag; nothing to publish"
-            publish=false
-          elif [ "$HAVE_KEY" != true ]; then
-            echo "::notice::the repository secrets APT_GPG_PRIVATE_KEY and APT_GPG_PASSPHRASE are not set (scripts/dist/gen-apt-key.sh); skipping the APT repository"
-            publish=false
+          if [ "$HAVE_KEY" = true ]; then
+            echo "publish=true" >>"$GITHUB_OUTPUT"
           else
-            state="$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft,isPrerelease -q '"\(.isDraft) \(.isPrerelease)"')"
-            if [ "$state" != "false false" ]; then
-              echo "::notice::$TAG is a draft or a pre-release; only published stable releases go to the APT repository"
-              publish=false
-            fi
+            echo "::notice::the repository secrets APT_GPG_PRIVATE_KEY and APT_GPG_PASSPHRASE are not set (scripts/dist/gen-apt-key.sh); skipping the APT repository"
+            echo "publish=false" >>"$GITHUB_OUTPUT"
           fi
-          echo "publish=$publish" >>"$GITHUB_OUTPUT"
       # The scripts of the workflow's own commit (the tag's for a release
-      # event); the archive key is taken from the packages themselves.
+      # event). apt-repo.sh takes the archive key from the packages and the
+      # minisign key from the tag's commit.
       - if: steps.gate.outputs.publish == 'true'
         uses: actions/checkout@v4
       - if: steps.gate.outputs.publish == 'true'
