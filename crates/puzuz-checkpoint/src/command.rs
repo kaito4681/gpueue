@@ -2,8 +2,8 @@
 //!
 //! Every builder returns a [`CommandSpec`] (program + arguments) so the exact
 //! invocation can be asserted in tests and logged before it is run. The
-//! defaults mirror the flags that worked in the PoC (`criu-poc.md`,
-//! `cuda-checkpoint-only.md`).
+//! defaults mirror the flags that worked in the CRIU and cuda-checkpoint
+//! proofs of concept.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;

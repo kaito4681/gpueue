@@ -1,5 +1,4 @@
-//! Jobs as transient systemd services, started over D-Bus. Follows
-//! `docker-systemd-poc.md` (§3.1, §5, §6).
+//! Jobs as transient systemd services, started over D-Bus.
 //!
 //! Spawned job unit `puzuz-job-<id>.service`:
 //! - `ExecStart=<helper> shim <job dir>` as root; the shim creates the PID

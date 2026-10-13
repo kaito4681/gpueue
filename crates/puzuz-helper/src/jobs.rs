@@ -83,7 +83,7 @@ pub enum UnitKind {
 /// Which mounts the shim removes or replaces in the job's mount namespace,
 /// so that it only contains mounts that also exist after a reboot (CRIU
 /// recreates the namespace on restore and fails on missing mount points or
-/// bind sources). See `docker-systemd-poc.md` §8.
+/// bind sources).
 ///
 /// `/mnt` is not pruned: administrators mount persistent filesystems there
 /// (`/mnt/data`), and a job whose cwd is below a pruned mount would write
