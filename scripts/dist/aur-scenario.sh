@@ -79,9 +79,9 @@ id="$(cd /home/alice && runuser -u alice -- puzuz add -p -- echo hello-from-aur 
 runuser -u alice -- puzuz log "$id" | grep -q hello-from-aur || fail "job $id did not run"
 echo "job $id ran"
 out="$(puzuz update --yes 2>&1 || true)"
-grep -q "installed as distribution package" <<<"$out" ||
-    fail "puzuz update did not refuse a package installation: $out"
-echo "puzuz update refuses the package installation"
+grep -q "yay -Syu" <<<"$out" ||
+    fail "puzuz update did not refuse the pacman package and name yay/pacman: $out"
+echo "puzuz update refuses the package installation: $out"
 
 step "upgrade (pkgrel 2) while a job runs"
 long="$(cd /home/alice && runuser -u alice -- puzuz add -p -- \

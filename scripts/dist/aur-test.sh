@@ -17,7 +17,9 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 image="${PUZUZ_ARCH_IMAGE:-$(sed -n 's/^image="\${PUZUZ_ARCH_IMAGE:-\(.*\)}"$/\1/p' "$root/scripts/dist/update-aur.sh")}"
 [ -n "$image" ] || { echo "cannot read the image from update-aur.sh" >&2; exit 1; }
-version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$root/Cargo.toml")"
+# shellcheck source=scripts/dist/lib.sh
+. "$root/scripts/dist/lib.sh"
+version="$(workspace_version "$root")"
 target=x86_64-unknown-linux-gnu
 name="puzuz-v$version-$target"
 
