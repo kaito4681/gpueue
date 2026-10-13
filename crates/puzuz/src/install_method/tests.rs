@@ -539,7 +539,12 @@ fn units_installed_in_different_ways_are_partial() {
     sys.write(&helper, &plain_unit("/usr/bin/puzuz-helper"));
     sys.dpkg_owns(&helper, "puzuz");
     let detection = detect(&sys);
-    assert_eq!(detection.keyword(), "service-install");
+    assert_eq!(
+        detection.install,
+        InstallMethod::One(service_install("/usr/local/bin"))
+    );
+    // For install.sh this is a conflict like `mixed`.
+    assert_eq!(detection.keyword(), "mixed");
     assert_eq!(detection.helper, InstallMethod::One(dpkg(&helper)));
     assert!(detection.has_service_install());
     // The packaged helper unit counts too.

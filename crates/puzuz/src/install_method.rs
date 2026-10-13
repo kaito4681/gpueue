@@ -395,8 +395,15 @@ pub struct Detection {
 }
 
 impl Detection {
+    /// The machine-readable name of the installation (`puzuz service install-method`): that of
+    /// [`Detection::install`], except that a `service install` unit next to a packaged or Nix
+    /// unit of the other service is `mixed` too.
     pub fn keyword(&self) -> &'static str {
-        self.install.keyword()
+        if self.has_service_install() && self.managed_elsewhere().is_some() {
+            "mixed"
+        } else {
+            self.install.keyword()
+        }
     }
 
     /// The methods of both units (each once).
