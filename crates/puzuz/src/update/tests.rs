@@ -469,13 +469,14 @@ fn only_service_install_is_updated() {
         "/usr/lib/systemd/system/puzuz.service",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
     );
+    sys.dpkg_owns("/usr/lib/systemd/system/puzuz.service", "puzuz");
     std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
     let err = run(&sys, &opts(false, None)).unwrap_err();
     assert!(err.contains("installed as distribution package"), "{err}");
-    assert!(err.contains("package manager"), "{err}");
+    assert!(err.contains("sudo apt update && sudo apt upgrade"), "{err}");
     // Checking still works and names the right tool.
     let out = run(&sys, &opts(true, None)).unwrap();
-    assert!(out.contains("package manager"), "{out}");
+    assert!(out.contains("sudo apt update && sudo apt upgrade"), "{out}");
 
     let sys = system();
     std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
@@ -492,6 +493,7 @@ fn the_install_method_is_checked_before_contacting_github() {
         "/usr/lib/systemd/system/puzuz.service",
         "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
     );
+    sys.dpkg_owns("/usr/lib/systemd/system/puzuz.service", "puzuz");
     std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
     sys.env.borrow_mut().remove("GH_TOKEN");
     sys.serve(&format!("{REPO_API}/releases/latest"), 404, "{}");
@@ -537,7 +539,122 @@ fn doctor_reports_a_newer_release_as_info() {
         newer_release(&sys, &config).unwrap(),
         Some(Version::new(9, 0, 0))
     );
-    assert_eq!(update_hint(&sys), "sudo puzuz update");
+    assert_eq!(
+        update_hint(&install_method::detect(&sys)),
+        "sudo puzuz update"
+    );
     sys.serve(&format!("{REPO_API}/releases/latest"), 500, "");
     assert!(newer_release(&sys, &config).is_err());
+}
+
+/// `system()` without its units.
+fn bare_system() -> FakeSystem {
+    let sys = system();
+    std::fs::remove_file(sys.path(Path::new("/etc/systemd/system/puzuz.service"))).unwrap();
+    sys
+}
+
+fn symlink(sys: &FakeSystem, target: &str, link: &str) {
+    let local = sys.path(Path::new(link));
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(target, local).unwrap();
+}
+
+#[test]
+fn other_install_methods_get_their_own_hint() {
+    // A unit nobody owns.
+    let sys = bare_system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("installed as a unit no package owns"), "{err}");
+    assert!(
+        err.contains("delete it and install puzuz with install.sh"),
+        "{err}"
+    );
+
+    // An rpm package.
+    let sys = bare_system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.missing("dpkg-query");
+    sys.respond("rpm -qf", CmdOutput::ok("puzuz\n"));
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("run `sudo dnf upgrade`"), "{err}");
+
+    // The NixOS module.
+    let sys = bare_system();
+    sys.write("/etc/os-release", "ID=nixos\n");
+    symlink(
+        &sys,
+        "/nix/store/abc-puzuz.service",
+        "/etc/systemd/system/puzuz.service",
+    );
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("installed as Nix"), "{err}");
+    assert!(
+        err.contains("nix flake update && sudo nixos-rebuild switch"),
+        "{err}"
+    );
+    assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
+
+    // NixOS without puzuz.
+    let sys = bare_system();
+    sys.write("/etc/os-release", "ID=nixos\n");
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("`services.puzuz` NixOS module"), "{err}");
+    assert_eq!(
+        update_hint(&install_method::detect(&sys)),
+        "install it with the `services.puzuz` NixOS module (see docs/install.md)"
+    );
+
+    // A hand-written unit.
+    let sys = bare_system();
+    sys.write(
+        "/etc/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/local/bin/puzuz daemon\n",
+    );
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("installed as by hand"), "{err}");
+}
+
+#[test]
+fn a_packaged_helper_unit_blocks_the_update() {
+    let sys = system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz-helper.service",
+        "[Service]\nExecStart=/usr/bin/puzuz-helper serve\n",
+    );
+    sys.dpkg_owns("/usr/lib/systemd/system/puzuz-helper.service", "puzuz");
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("installed in more than one way"), "{err}");
+    assert!(
+        err.contains("puzuz-helper.service as distribution package"),
+        "{err}"
+    );
+    assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
+    assert!(update_hint(&install_method::detect(&sys)).contains("run `puzuz doctor` first"));
+}
+
+#[test]
+fn a_leftover_unit_does_not_block_the_update() {
+    let sys = system();
+    sys.write(
+        "/usr/lib/systemd/system/puzuz.service",
+        "[Service]\nExecStart=/usr/bin/puzuz daemon\n",
+    );
+    sys.respond(
+        "dpkg-query -S",
+        CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
+    );
+    run(&sys, &opts(false, None)).unwrap();
+    assert!(installed(&sys));
 }
