@@ -330,6 +330,66 @@ fn moving_the_installation_removes_the_previous_copies() {
 }
 
 #[test]
+fn moving_to_another_name_of_the_same_directory_keeps_the_binaries() {
+    // Merged /usr: /bin is a symlink to usr/bin.
+    let sys = build_dir_system();
+    sys.mkdir("/usr/bin");
+    std::os::unix::fs::symlink("usr/bin", sys.path(Path::new("/bin"))).unwrap();
+    let at = |dir: &str| InstallOptions {
+        bin_dir: Some(PathBuf::from(dir)),
+        ..opts()
+    };
+    run_install(&sys, &at("/usr/bin")).unwrap();
+    let out = run_install(&sys, &at("/bin")).unwrap();
+    assert!(!out.contains("removed /usr/bin"), "{out}");
+    assert_eq!(sys.read("/usr/bin/puzuz").unwrap(), "new puzuz");
+    assert_eq!(sys.read("/usr/bin/puzuz-helper").unwrap(), "new helper");
+    assert_eq!(
+        receipt(&sys).copied,
+        paths(&["/bin/puzuz", "/bin/puzuz-helper"])
+    );
+    // And back.
+    let out = run_install(&sys, &at("/usr/bin")).unwrap();
+    assert!(!out.contains("removed /bin"), "{out}");
+    assert_eq!(sys.read("/usr/bin/puzuz-helper").unwrap(), "new helper");
+
+    // Even when the previous receipt's directory is not recognised as the same one, a
+    // previous copy that is the same file as a new binary is not removed.
+    let sys = build_dir_system();
+    sys.mkdir("/usr/bin");
+    std::os::unix::fs::symlink("usr/bin", sys.path(Path::new("/bin"))).unwrap();
+    sys.write_exe("/usr/bin/puzuz", "new puzuz");
+    sys.write_exe("/usr/bin/puzuz-helper", "new helper");
+    let previous = Receipt {
+        version: "0.0.1".to_owned(),
+        bin_dir: PathBuf::from("/nonexistent/bin"),
+        copied: paths(&["/nonexistent/bin/puzuz"]),
+        ..Receipt::default()
+    };
+    let binaries = Binaries {
+        bin_dir: PathBuf::from("/bin"),
+        changed: false,
+        copied: paths(&["/bin/puzuz", "/bin/puzuz-helper"]),
+        store_path: None,
+    };
+    let stale = write_receipt(&sys, Some(&previous), &binaries, (None, None)).unwrap();
+    assert_eq!(stale, paths(&["/nonexistent/bin/puzuz"]));
+    sys.mkdir("/opt/old");
+    std::fs::hard_link(
+        sys.path(Path::new("/usr/bin/puzuz")),
+        sys.path(Path::new("/opt/old/puzuz")),
+    )
+    .unwrap();
+    let previous = Receipt {
+        bin_dir: PathBuf::from("/opt/old"),
+        copied: paths(&["/opt/old/puzuz"]),
+        ..previous
+    };
+    let stale = write_receipt(&sys, Some(&previous), &binaries, (None, None)).unwrap();
+    assert!(stale.is_empty(), "{stale:?}");
+}
+
+#[test]
 fn an_invalid_receipt_stops_the_install() {
     let sys = build_dir_system();
     let untrusted =
@@ -624,7 +684,7 @@ fn bin_dir_equal_to_the_binary_location_copies_nothing() {
 #[test]
 fn bad_bin_dirs_and_missing_helper_are_rejected() {
     let sys = system();
-    for dir in ["relative/bin", "/opt/my bin", "/opt/%h"] {
+    for dir in ["relative/bin", "/opt/my bin", "/opt/%h", "/usr/local/../bin", "/usr/./bin"] {
         let options = InstallOptions {
             no_start: false,
             bin_dir: Some(PathBuf::from(dir)),

@@ -22,7 +22,7 @@ mod gc_root;
 mod receipt;
 
 pub use gc_root::GC_ROOT;
-use receipt::ReceiptState;
+use receipt::{BINARIES as BINARY_NAMES, ReceiptState};
 pub use receipt::{RECEIPT_PATH, Receipt};
 
 pub const DAEMON_UNIT: &str = "puzuz.service";
@@ -138,6 +138,14 @@ fn create_dirs(sys: &dyn System, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether the system path is a regular file (not a symlink) owned by root and not writable by
+/// group or others.
+fn root_owned_regular_file(sys: &dyn System, path: &Path) -> bool {
+    std::fs::symlink_metadata(sys.path(path)).is_ok_and(|meta| {
+        meta.file_type().is_file() && meta.uid() == sys.root_uid() && meta.mode() & 0o022 == 0
+    })
+}
+
 /// Whether the system path already is what [`write_file`] would write: a regular file (not a
 /// symlink, which may point at a file its owner can change), owned by root, with exactly
 /// `mode` (never group- or world-writable) and `contents`.
@@ -146,10 +154,8 @@ fn already_written(sys: &dyn System, path: &Path, contents: &[u8], mode: u32) ->
     let Ok(meta) = std::fs::symlink_metadata(&local) else {
         return false;
     };
-    meta.file_type().is_file()
-        && meta.uid() == sys.root_uid()
+    root_owned_regular_file(sys, path)
         && meta.mode() & 0o7777 == mode
-        && meta.mode() & 0o022 == 0
         && meta.len() == contents.len() as u64
         // Opened without following a symlink that took its place since.
         && std::fs::OpenOptions::new()
@@ -211,13 +217,27 @@ fn valid_bin_dir(dir: &Path) -> Result<()> {
         && text
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "/._+-".contains(c));
-    if ok {
-        Ok(())
-    } else {
-        Err(format!(
+    if !ok {
+        return Err(format!(
             "--bin-dir {} must be an absolute path of letters, digits and / . _ + -",
             dir.display()
-        ))
+        ));
+    }
+    if text.split('/').any(|part| part == "." || part == "..") {
+        return Err(format!(
+            "--bin-dir {} must not contain . or .. components",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether two system paths are the same file (device and inode, symlinks followed): e.g.
+/// /bin/puzuz and /usr/bin/puzuz on a merged-/usr system.
+fn same_file(sys: &dyn System, a: &Path, b: &Path) -> bool {
+    match (std::fs::metadata(sys.path(a)), std::fs::metadata(sys.path(b))) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
     }
 }
 
@@ -305,7 +325,11 @@ fn install_binaries(
     let mut copied = Vec::new();
     for (source, name) in [(&exe, "puzuz"), (&helper, "puzuz-helper")] {
         let target = bin_dir.join(name);
-        if sys.path(source) == sys.path(&target) {
+        // Used in place, also under another name of the same directory (/bin and /usr/bin on
+        // merged /usr) — but not through a symlink or a file root does not own.
+        if sys.path(source) == sys.path(&target)
+            || (same_file(sys, source, &target) && root_owned_regular_file(sys, &target))
+        {
             continue;
         }
         let bytes = std::fs::read(sys.path(source))
@@ -336,12 +360,23 @@ fn write_receipt(
     let mut copied = binaries.copied.clone();
     let mut stale = Vec::new();
     if let Some(previous) = previous {
+        // The same directory under another name (/bin and /usr/bin on merged /usr) is the same
+        // installation: its copies are the binaries just installed, never stale ones.
+        let same_dir = previous.bin_dir == binaries.bin_dir
+            || same_file(sys, &previous.bin_dir, &binaries.bin_dir);
         for path in previous.removable_copies() {
-            if previous.bin_dir == binaries.bin_dir {
-                if !copied.contains(&path) {
-                    copied.push(path);
+            let current = path
+                .file_name()
+                .map(|name| binaries.bin_dir.join(name))
+                .unwrap_or_else(|| path.clone());
+            if same_dir {
+                if !copied.contains(&current) {
+                    copied.push(current);
                 }
-            } else {
+            } else if !BINARY_NAMES
+                .iter()
+                .any(|name| same_file(sys, &path, &binaries.bin_dir.join(name)))
+            {
                 stale.push(path);
             }
         }
