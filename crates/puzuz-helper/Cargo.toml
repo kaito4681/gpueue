@@ -33,7 +33,7 @@ tokio = { workspace = true, features = [
 ] }
 zbus.workspace = true
 nix.workspace = true
-rustix = { workspace = true, features = ["thread", "process", "mount", "fs"] }
+rustix = { workspace = true, features = ["thread", "process", "mount", "fs", "net"] }
 
 [build-dependencies]
 cc.workspace = true

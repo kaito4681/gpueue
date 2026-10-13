@@ -337,8 +337,12 @@ Details are in [docs/install.md](docs/install.md).
   same way, through the same directories, and is refused otherwise (see
   [Restores and paths](docs/architecture.md#restores-and-paths)).
 - **Unix sockets:** a job with a Unix socket bound to a path outside its own `/tmp` and
-  `/dev/shm` (e.g. in your home directory) cannot be checkpointed; the checkpoint is refused and
-  the job keeps running. Bind sockets below `/tmp`.
+  `/dev/shm` (e.g. in your home directory), or to a relative name such as `ctl.sock`, cannot be
+  checkpointed; the checkpoint is refused and the job keeps running. Bind sockets to an absolute
+  path below `/tmp`, or use an abstract name.
+- **`SO_REUSEPORT`:** a job with a TCP or UDP socket that has `SO_REUSEPORT` set cannot be
+  checkpointed either (CRIU would restore the socket as root's, and it could then share its port
+  with a root service). Some servers set it by default; turn it off or use `--no-checkpoint`.
 - **Python and PyTorch:**
   - Python 3.14 and newer default to the `forkserver` start method on Linux, so DataLoader workers
     are not forked and do not depend on the fork guard. Python 3.12 and 3.13 (or an explicit
@@ -347,7 +351,8 @@ Details are in [docs/install.md](docs/install.md).
     checkpointed with current drivers. Multi-GPU jobs that use NCCL have not been tested.
   - cuda-checkpoint waits for submitted GPU work to finish before saving, so very long kernels
     delay a checkpoint.
-  - Checkpoints take roughly RSS + VRAM of disk space per job and are written one job at a time.
+  - Checkpoints take roughly RSS + VRAM of disk space per job, plus what the job keeps in its
+    `/tmp` and `/dev/shm`, and are written one job at a time.
     In tests, a job with 7 GB of VRAM took about 10 to 20 s to dump.
 - **Mounts covering `/`:** a job whose root directory is covered by another mount cannot be
   checkpointed. puzuz refuses the dump and tells you why. The job keeps running.

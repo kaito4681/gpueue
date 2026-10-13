@@ -107,6 +107,23 @@ pub trait HostProbe: Send + Sync + 'static {
     fn verify_access(&self, _req: &VerifyRequest) -> VerifyReply {
         Ok(Vec::new())
     }
+    /// Bytes in use on the tmpfs mounts at `private` in the mount namespace
+    /// of `pid` (the job's own `/tmp` and `/dev/shm`, whose contents CRIU
+    /// saves in the image). Mount points that are not tmpfs count nothing.
+    fn private_tmpfs_bytes(&self, _pid: u32, _private: &[String]) -> io::Result<u64> {
+        Ok(0)
+    }
+    /// Which of `paths` do not exist (`lstat` fails) on this host. May
+    /// block on a filesystem that does not answer (an NFS hard mount whose
+    /// server is down), so the real host asks a child process with a
+    /// deadline.
+    fn missing_paths(&self, paths: &[String]) -> io::Result<Vec<String>> {
+        Ok(paths
+            .iter()
+            .filter(|p| fs::symlink_metadata(p).is_err())
+            .cloned()
+            .collect())
+    }
 }
 
 /// Things about a job that make CRIU work on host paths as root.
@@ -123,6 +140,12 @@ pub struct DumpHazards {
     /// Files on the host's filesystems that the job holds open or mapped
     /// (see [`HeldFile`]).
     pub held_files: Vec<HeldFile>,
+    /// Internet sockets of the job with `SO_REUSEPORT` (described for
+    /// messages). CRIU creates and binds them as root, before it restores
+    /// the job's credentials, so the restored socket belongs to root and
+    /// would join the `SO_REUSEPORT` group of a root service on the same
+    /// port (and get part of its connections).
+    pub reuseport_sockets: Vec<String>,
 }
 
 pub use crate::access::HeldFile;
@@ -136,6 +159,20 @@ pub fn is_private_path(path: &str, private: &[String]) -> bool {
         || path.starts_with("/memfd:")
         || path.starts_with("/SYSV")
         || path.starts_with("/dev/zero")
+}
+
+/// Whether a Unix socket name from `/proc/net/unix` may name a path on the
+/// host's filesystems: anything but an abstract name (`@...`) and an
+/// absolute path below `private`. A relative name (`bind("ctl.sock")`)
+/// counts too: it was resolved against the binding process's working
+/// directory at the time, which `/proc` does not record (the process may
+/// have changed directory since), and CRIU resolves it to a host path
+/// that a restore would bind as root.
+pub fn is_host_socket_name(name: &str, private: &[String]) -> bool {
+    if name.starts_with('@') {
+        return false;
+    }
+    !(name.starts_with('/') && is_private_path(name, private))
 }
 
 impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
@@ -183,6 +220,12 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     }
     fn verify_access(&self, req: &VerifyRequest) -> VerifyReply {
         (**self).verify_access(req)
+    }
+    fn private_tmpfs_bytes(&self, pid: u32, private: &[String]) -> io::Result<u64> {
+        (**self).private_tmpfs_bytes(pid, private)
+    }
+    fn missing_paths(&self, paths: &[String]) -> io::Result<Vec<String>> {
+        (**self).missing_paths(paths)
     }
 }
 
@@ -445,6 +488,7 @@ impl HostProbe for SystemHost {
     fn dump_hazards(&self, host_pids: &[u32], private: &[String]) -> io::Result<DumpHazards> {
         let mut out = DumpHazards::default();
         let mut sockets = std::collections::HashSet::new();
+        let mut socket_fds: Vec<(u32, i32)> = Vec::new();
         for pid in host_pids {
             let dir = self.proc_root.join(pid.to_string());
             let links = ["fd", "map_files"].iter().flat_map(|sub| {
@@ -463,6 +507,13 @@ impl HostProbe for SystemHost {
                     .and_then(|s| s.parse::<u64>().ok())
                 {
                     sockets.insert(ino);
+                    if let Some(fd) = link
+                        .strip_prefix(dir.join("fd"))
+                        .ok()
+                        .and_then(|n| n.to_str()?.parse::<i32>().ok())
+                    {
+                        socket_fds.push((*pid, fd));
+                    }
                     continue;
                 }
                 let Some(path) = target.strip_suffix(" (deleted)") else {
@@ -492,6 +543,13 @@ impl HostProbe for SystemHost {
                 }
             }
         }
+        for (pid, fd) in socket_fds {
+            if let Some(addr) = reuseport_inet_socket(pid, fd)
+                && !out.reuseport_sockets.contains(&addr)
+            {
+                out.reuseport_sockets.push(addr);
+            }
+        }
         if !sockets.is_empty()
             && let Some(pid) = host_pids.first()
         {
@@ -500,8 +558,7 @@ impl HostProbe for SystemHost {
             let table = fs::read_to_string(self.proc_root.join(pid.to_string()).join("net/unix"))?;
             for (ino, path) in parse_net_unix(&table) {
                 if sockets.contains(&ino)
-                    && path.starts_with('/')
-                    && !is_private_path(&path, private)
+                    && is_host_socket_name(&path, private)
                     && !out.bound_sockets.contains(&path)
                 {
                     out.bound_sockets.push(path);
@@ -533,6 +590,59 @@ impl HostProbe for SystemHost {
     fn verify_access(&self, req: &VerifyRequest) -> VerifyReply {
         self.run_verify(req)
     }
+
+    fn private_tmpfs_bytes(&self, pid: u32, private: &[String]) -> io::Result<u64> {
+        // `/proc/<pid>/root` leads into the job's mount namespace, where
+        // these paths are its own tmpfs mounts.
+        let root = self.proc_root.join(pid.to_string()).join("root");
+        let mut total = 0u64;
+        for p in private {
+            let path = root.join(p.trim_start_matches('/'));
+            match space::tmpfs_used_bytes(&path) {
+                Ok(used) => total = total.saturating_add(used.unwrap_or(0)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io::Error::other(format!("{}: {e}", path.display()))),
+            }
+        }
+        Ok(total)
+    }
+
+    fn missing_paths(&self, paths: &[String]) -> io::Result<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.run_verify(&VerifyRequest::Exist(crate::access::ExistCheck {
+            paths: paths.to_vec(),
+        }))
+        .map_err(io::Error::other)
+    }
+}
+
+/// The local address of socket `fd` of process `pid` if it is an internet
+/// socket with `SO_REUSEPORT` (looked at through a duplicate taken with
+/// `pidfd_getfd`, which leaves the job's socket alone). A process or
+/// descriptor that is gone counts as none.
+fn reuseport_inet_socket(pid: u32, fd: i32) -> Option<String> {
+    use rustix::net::{AddressFamily, sockopt};
+    let pidfd = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(i32::try_from(pid).ok()?)?,
+        rustix::process::PidfdFlags::empty(),
+    )
+    .ok()?;
+    let sock =
+        rustix::process::pidfd_getfd(&pidfd, fd, rustix::process::PidfdGetfdFlags::empty()).ok()?;
+    let family = sockopt::socket_domain(&sock).ok()?;
+    if family != AddressFamily::INET && family != AddressFamily::INET6 {
+        return None;
+    }
+    if !sockopt::socket_reuseport(&sock).ok()? {
+        return None;
+    }
+    let addr = rustix::net::getsockname(&sock)
+        .ok()
+        .and_then(|a| std::net::SocketAddr::try_from(a).ok())
+        .map_or_else(|| "an unknown address".to_owned(), |a| a.to_string());
+    Some(addr)
 }
 
 /// `(inode, path)` of each bound socket in `/proc/net/unix`.
@@ -671,6 +781,11 @@ mod tests {
             ]
         );
         let private = ["/tmp".to_owned(), "/dev/shm".to_owned()];
+        assert!(is_host_socket_name("/home/a/s ock", &private));
+        assert!(is_host_socket_name("ctl.sock", &private));
+        assert!(is_host_socket_name("run/ctl.sock", &private));
+        assert!(!is_host_socket_name("@abstract", &private));
+        assert!(!is_host_socket_name("/tmp/ctl.sock", &private));
         assert!(is_private_path("/tmp/x", &private));
         assert!(is_private_path("/proc/1/fd", &private));
         assert!(is_private_path("/memfd:buf", &private));
@@ -705,6 +820,25 @@ mod tests {
         assert!(h.bound_sockets.is_empty(), "{h:?}");
         drop(held);
         let groups = host.process_groups(&[std::process::id()]).unwrap().unwrap();
+        // An internet socket with SO_REUSEPORT (and one without).
+        use rustix::net::{AddressFamily, SocketType, sockopt};
+        let plain = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let reuse = rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
+        sockopt::set_socket_reuseport(&reuse, true).unwrap();
+        rustix::net::bind(&reuse, &std::net::SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        rustix::net::listen(&reuse, 1).unwrap();
+        let port = std::net::SocketAddr::try_from(rustix::net::getsockname(&reuse).unwrap())
+            .unwrap()
+            .port();
+        let h = host
+            .dump_hazards(&[std::process::id()], &["/tmp-private".into()])
+            .unwrap();
+        // pidfd_getfd needs ptrace access to ourselves, which a sandbox may
+        // deny; then nothing is found.
+        if !h.reuseport_sockets.is_empty() {
+            assert_eq!(h.reuseport_sockets, [format!("127.0.0.1:{port}")], "{h:?}");
+        }
+        drop((plain, reuse));
         assert!(groups.contains(&nix::unistd::getegid().as_raw()));
     }
 

@@ -107,11 +107,22 @@ pub struct RestoredCheck {
     pub held: Vec<HeldFile>,
 }
 
+/// Before a restore: which of these paths do not exist (looked up as
+/// root, without following a final symlink). In the child only so that a
+/// filesystem that does not answer cannot hold up the helper beyond the
+/// child's deadline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExistCheck {
+    pub paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "check", rename_all = "snake_case")]
 pub enum VerifyRequest {
     Paths(PathCheck),
     Restored(RestoredCheck),
+    /// The reply lists the missing paths, unlimited.
+    Exist(ExistCheck),
 }
 
 /// The problems found (empty: all is well), or why the check could not be
@@ -134,12 +145,13 @@ pub fn run_verify_access() -> i32 {
                 .map_err(|e| format!("decoding the request: {e}"))
         })
         .and_then(|req| match req {
-            VerifyRequest::Paths(c) => check_paths(&c),
-            VerifyRequest::Restored(c) => check_restored(&c),
-        })
-        .map(|mut p| {
-            p.truncate(MAX_PROBLEMS);
-            p
+            VerifyRequest::Paths(c) => check_paths(&c).map(truncate),
+            VerifyRequest::Restored(c) => check_restored(&c).map(truncate),
+            VerifyRequest::Exist(c) => Ok(c
+                .paths
+                .into_iter()
+                .filter(|p| fs::symlink_metadata(p).is_err())
+                .collect()),
         });
     match serde_json::to_vec(&reply) {
         Ok(out) => {
@@ -152,6 +164,11 @@ pub fn run_verify_access() -> i32 {
         }
         Err(_) => 1,
     }
+}
+
+fn truncate(mut problems: Vec<String>) -> Vec<String> {
+    problems.truncate(MAX_PROBLEMS);
+    problems
 }
 
 /// Runs `<exe> verify-access` with `req` on stdin and returns its reply.
@@ -436,9 +453,11 @@ impl FileAttrs {
 /// After a successful dump (nothing of the job runs any more): records the
 /// attributes of each held file that its path still leads to, without
 /// symlinks, as the same device and inode as before the dump (a file the
-/// job closed or replaced meanwhile is left without them).
+/// job closed or replaced meanwhile is left without them). Files that have
+/// their attributes already keep them (a dump finalized again later, after
+/// a reboot, must not lose what was recorded right after the dump).
 pub fn complete_held_files(files: &mut [HeldFile]) {
-    for f in files {
+    for f in files.iter_mut().filter(|f| f.attrs.is_none()) {
         f.attrs = open_no_symlinks(&f.path)
             .and_then(|fd| rustix::fs::fstat(&fd))
             .ok()
