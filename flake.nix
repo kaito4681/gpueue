@@ -34,5 +34,8 @@
       });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt);
+
+      # services.puzuz: the daemon, the root helper and the CLI.
+      nixosModules.default = import ./nix/nixos-module.nix { inherit self; };
     };
 }
