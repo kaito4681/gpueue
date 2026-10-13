@@ -423,7 +423,8 @@ Linux; nothing is downloaded from the GitHub releases. Its outputs:
 | `devShells.<system>.default` | a development shell with the Rust toolchain (`nix develop`) |
 | `nixosModules.default` | the NixOS module `services.puzuz` (see [NixOS](#nixos)) |
 | `homeManagerModules.default` | the home-manager module `programs.puzuz` (see [home-manager](#home-manager)) |
-| `checks.<system>.*` | `home-manager` (module evaluation) and, on x86_64, `nixos` (a NixOS VM test that needs KVM) |
+| `packages.<system>.helper-tests` | the puzuz-helper test executables (built, not run), for the `helper-tests` check |
+| `checks.<system>.*` | `home-manager` (module evaluation) and, on x86_64, two NixOS VM tests that need KVM: `nixos` (the module) and `helper-tests` (every puzuz-helper test, including those the sandboxed package build skips) |
 
 Use `github:kaito4681/puzuz/stable` to follow releases: the `stable` branch moves to every
 release tag (not to pre-releases). Plain `github:kaito4681/puzuz` is the development head
@@ -494,8 +495,21 @@ The module sets `criu_path`, `cuda_checkpoint_path`, `nvidia_smi_path`, `nvml_li
   units still come from the module's revision; keep the two together.
 - **Configuration file.** The helper runs as root and only reads a regular file that nobody but
   root can change, never a symlink. The module therefore has NixOS copy the file into
-  `/etc/puzuz/config.toml` (mode 0644, owned by root) instead of linking it into the store. A
-  change to `settings` restarts the daemon and the helper; running jobs keep running.
+  `/etc/puzuz/config.toml` (mode 0644, owned by root) instead of linking it into the store.
+- **Restarts on `nixos-rebuild switch`.** A change to `settings` (or to the package) restarts
+  both the daemon and the helper. Running jobs are not stopped: they run in their own units. The
+  restarting helper first refuses new launches and lets the operations in flight finish, so a
+  switch during a checkpoint or restore waits for it (up to the helper's `TimeoutStopSec=`,
+  30 minutes). Jobs the daemon tries to start or restore in that window are put back in the
+  queue, not failed, and start once the new helper is up.
+- **Updates and Nix garbage collection.** A job's unit runs the helper binary that started it,
+  and its checkpoint image contains that binary too (restoring needs it). After an update, the
+  old store path is no longer part of the system, so the helper keeps it alive with a GC root,
+  `/nix/var/nix/gcroots/puzuz/job-<id>`, for as long as the job runs or its checkpoint image is
+  kept. The root is removed when the job ends or its checkpoint is deleted. `nix-collect-garbage`
+  then frees the old version. A job started, or a checkpoint taken, by a helper older than this
+  feature has no root: restoring it after the old version was collected fails, so restore or
+  finish such jobs before collecting garbage.
 - **The job environment.** A job runs with the environment of the `puzuz add` that submitted it,
   so its `PATH` is the user's (`/run/wrappers/bin`, `/run/current-system/sw/bin`,
   `~/.nix-profile/bin`, ...). NixOS keeps nothing in `/usr/bin` and only `sh` in `/bin`; the
@@ -553,7 +567,9 @@ services.puzuz.cudaCheckpointPackage = pkgs.callPackage ./cuda-checkpoint.nix { 
 #### Updating and removing on NixOS
 
 - Update: `nix flake update puzuz && sudo nixos-rebuild switch`. The changed units restart the
-  daemon and the helper; running jobs keep running.
+  daemon and the helper (see "Restarts on `nixos-rebuild switch`" above). Running jobs keep
+  running on the old helper binary, and checkpoints taken before the update can be restored,
+  also after `nix-collect-garbage` (see "Updates and Nix garbage collection").
 - Roll back: `sudo nixos-rebuild switch --rollback` (or boot an older generation) brings back the
   older binaries, but not the older database: after an update that migrated the database, the
   older daemon refuses to start with the newer database.
@@ -582,15 +598,16 @@ CLI's shell completions for a machine where an administrator installed puzuz
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `programs.puzuz.enable` | `false` | Enable the module. |
-| `programs.puzuz.package` | `null` | `null`: install nothing, and load the completions of the system's `puzuz` (the one in `PATH`) when the shell starts. A package (e.g. `inputs.puzuz.packages.${pkgs.stdenv.hostPlatform.system}.default`) is installed into the profile with its completion files. |
+| `programs.puzuz.package` | `null` | `null`: install nothing, and load the completions of the system's `puzuz` (the one in `PATH`) when the shell starts: the completion files installed next to it (`<prefix>/share/...`, as on NixOS and in the packages), or, when there are none, the output of `puzuz completions <shell>`. A package (e.g. `inputs.puzuz.packages.${pkgs.stdenv.hostPlatform.system}.default`) is installed into the profile with its completion files. |
 | `programs.puzuz.enableBashIntegration` | `true` | Load the completions in Bash (`programs.bash.enable`), with `package = null`. |
-| `programs.puzuz.enableZshIntegration` | `true` | The same for Zsh (`programs.zsh.enable`; home-manager 25.05 or newer). |
+| `programs.puzuz.enableZshIntegration` | `true` | The same for Zsh (`programs.zsh.enable` with `programs.zsh.enableCompletion`, which runs `compinit`; home-manager 25.05 or newer). |
 | `programs.puzuz.enableFishIntegration` | `true` | The same for Fish (`programs.fish.enable`). |
 
 The CLI and the daemon must have the same version. Prefer `package = null`: the system's
 `puzuz` always matches the daemon. A `puzuz` from home-manager (or `nix profile`) comes from the
 revision your home-manager flake locks, so it can differ; commands then fail with a version
-mismatch that names the store path and suggests `programs.puzuz.package = null`. Update with
+mismatch that names the store path and, on NixOS or for a home-manager profile, suggests
+`programs.puzuz.package = null`. Update with
 `nix flake update && home-manager switch`; the daemon is the administrator's to update.
 
 ### Other distributions
