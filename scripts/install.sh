@@ -411,10 +411,13 @@ no_access() {
     die "$what: HTTP $code. GitHub refused the anonymous request, usually because of its API rate limit; try again later, or use a GitHub token: set GH_TOKEN (\`sudo GH_TOKEN=... bash install.sh\`), pass --token-file, or run \`gh auth login\` as the user that runs sudo"
 }
 
-# api_get PATH OUT ACCEPT: GET $API_URL$PATH into OUT.
+# api_get PATH OUT ACCEPT: GET $API_URL$PATH into OUT. HTTPS only, also for
+# the redirects (to GitHub's object storage), except with the test-only fake
+# release server, which speaks plain HTTP (an http:// API URL).
 api_get() {
-    local path="$1" out="$2" accept="$3" code
-    code="$(curl -sS -L --retry 3 -o "$out" -w '%{http_code}' \
+    local path="$1" out="$2" accept="$3" code proto='=https'
+    case "$API_URL" in http://*) proto='=http,https' ;; esac
+    code="$(curl --proto "$proto" --proto-redir "$proto" -sS -L --retry 3 -o "$out" -w '%{http_code}' \
         -H @"$WORK/headers" -H "Accept: $accept" "$API_URL$path")" ||
         die "cannot reach $API_URL (curl failed)"
     case "$code" in
@@ -475,14 +478,24 @@ fetch_release() {
 }
 
 verify() {
-    local tarball="$1"
-    (cd "$WORK" && sha256sum -c --quiet "$tarball.sha256") ||
+    local tarball="$1" sum actual
+    # The .sha256 must be one line: the checksum of this tarball, by its name
+    # (`sha256sum -c` accepts any file the line names, e.g. /dev/null). The
+    # checksum is compared here.
+    sum="$(cat "$WORK/$tarball.sha256")"
+    if ! [[ "$sum" =~ ^([0-9a-f]{64})\ [\ *](.+)$ ]] || [ "${BASH_REMATCH[2]}" != "$tarball" ]; then
+        die "$tarball.sha256 is not the checksum of $tarball; not installing it"
+    fi
+    actual="$(sha256sum "$WORK/$tarball")"
+    [ "${actual%% *}" = "${BASH_REMATCH[1]}" ] ||
         die "SHA-256 checksum mismatch for $tarball; not installing it"
     info "verified the SHA-256 checksum"
     if command -v minisign >/dev/null 2>&1; then
         local key=(-P "$MINISIGN_PUBKEY")
-        # Test-only: another public key file.
-        [ -n "${PUZUZ_UPDATE_PUBKEY_FILE:-}" ] && key=(-p "$PUZUZ_UPDATE_PUBKEY_FILE")
+        # Test-only: another public key file (ignored without PUZUZ_TEST_HOOKS=1).
+        if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_UPDATE_PUBKEY_FILE:-}" ]; then
+            key=(-p "$PUZUZ_UPDATE_PUBKEY_FILE")
+        fi
         minisign -V -q "${key[@]}" -m "$WORK/$tarball" -x "$WORK/$tarball.minisig" >/dev/null ||
             die "bad signature on $tarball; not installing it"
         info "verified the minisign signature"
@@ -503,7 +516,11 @@ extract() {
         */../*) die "unexpected path in $tarball: $entry" ;;
         esac
     done < <(tar -tzf "$WORK/$tarball")
-    if tar -tvzf "$WORK/$tarball" | grep -qv '^[-d]'; then
+    # Not `tar -tv | grep -qv`: grep exits on the first match, tar then dies
+    # of SIGPIPE, and pipefail turns the match into a pass.
+    local listing
+    listing="$(tar -tvzf "$WORK/$tarball")" || die "cannot list $tarball"
+    if grep -qv '^[-d]' <<<"$listing"; then
         die "$tarball contains links or special files"
     fi
     tar -C "$WORK" --no-same-owner -xzf "$WORK/$tarball"
@@ -672,8 +689,13 @@ do_uninstall() {
 
 main() {
     parse_args "$@"
-    # Test-only override of the GitHub API (a fake release server).
-    API_URL="${PUZUZ_RELEASE_API_URL:-https://api.github.com}"
+    API_URL="https://api.github.com"
+    # Test-only override of the GitHub API (a fake release server); ignored
+    # without PUZUZ_TEST_HOOKS=1, so that an inherited environment (sudo -E)
+    # cannot send the token elsewhere.
+    if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_RELEASE_API_URL:-}" ]; then
+        API_URL="$PUZUZ_RELEASE_API_URL"
+    fi
     check_root
     WORK="$(mktemp -d)"
     trap 'rm -rf "$WORK"' EXIT

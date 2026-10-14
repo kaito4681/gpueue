@@ -13,6 +13,8 @@
 > 真实的 CRIU、真实的 NVIDIA GPU）。但尚**未**在真实主机上经历真实重启的测试。
 > 参见[项目状态](#project-status)。
 
+> **尚未发布任何版本。** 下面的下载链接、APT 仓库和 `stable` 分支将从第一个版本发布起可用。
+
 <a id="why"></a>
 ## 为什么需要 puzuz
 
@@ -200,7 +202,8 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | `restore [IDS] [-g GROUP] [-a] [-i]` | 继续运行 `Checkpointed` 作业（`-i`：立即运行，忽略空闲槽位） |
 | `gpu [-j]`、`gpu parallel <N> [--gpu LIST]` | 列出 GPU，或设置每块 GPU 的作业数上限（管理员） |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | 管理 systemd 服务；如果最终检查失败，install 以非零状态退出（参见 [docs/zh-CN/install.md](docs/zh-CN/install.md)） |
-| `uninstall [--purge] [--yes]` | 删除服务以及 `service install` 复制的二进制文件（管理员） |
+| `uninstall [--purge] [--yes]` | 删除服务以及 `service install` 复制的二进制文件（需要 root） |
+| `update [--check] [--version V] [-y]` | 将 puzuz 更新到最新（或指定的）发布版本；需要 root，非 root 时只检查（参见 [docs/zh-CN/install.md](docs/zh-CN/install.md#upgrading)） |
 | `doctor` | 检查安装情况 |
 | `daemon` | 在前台运行守护进程（由 systemd 执行） |
 

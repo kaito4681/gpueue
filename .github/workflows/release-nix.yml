@@ -1,12 +1,22 @@
 name: Release (Nix stable branch)
 
 # Nix users follow releases with `github:kaito4681/puzuz/stable` (see
-# docs/install.md). Each release tag moves the `stable` branch to the tagged
-# commit; pre-releases (`v1.2.0-rc.1`: a `-` in the tag) leave it alone.
+# docs/install.md). When a release is published as a stable one
+# (`released`, like the APT repository and the AUR package: not when the tag
+# is pushed, so never before the release is built and published), the
+# `stable` branch moves to the tagged commit, if the release is published,
+# not a pre-release, and the highest published release version. A release
+# published with the GITHUB_TOKEN of a workflow does not trigger it; run it
+# by hand then (`gh workflow run release-nix.yml -f tag=v0.1.0`).
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release (tag) to move the stable branch to
+        required: true
 
 permissions:
   contents: write
@@ -17,22 +27,36 @@ concurrency:
 
 jobs:
   stable-branch:
-    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-24.04
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - name: Move the stable branch to the tag
         run: |
+          case "$TAG" in
+          v[0-9]*) ;;
+          *) echo "::error::$TAG is not a version tag"; exit 1 ;;
+          esac
+          state="$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft,isPrerelease \
+            -q '"\(.isDraft) \(.isPrerelease)"')"
+          if [ "$state" != "false false" ] || [[ "$TAG" == *-* ]]; then
+            echo "$TAG is a draft or a pre-release (draft, pre-release: $state); stable stays" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # A patch release of an older line (v0.1.5 after v0.2.0) must not
-          # move stable backwards: only the highest release version moves it.
-          latest="$(git tag -l 'v*' | grep -v -- - | sort -V | tail -n1)"
+          # move stable backwards: only the highest published stable release
+          # moves it.
+          releases="$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+            --limit 1000 --json tagName -q '.[].tagName')"
+          latest="$(grep -E '^v[0-9][^-]*$' <<<"$releases" | sort -V | tail -n1)"
           if [ "$latest" != "$TAG" ]; then
             echo "$TAG is not the latest release ($latest); stable stays" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
           git push --force origin "refs/tags/$TAG^{commit}:refs/heads/stable"
           echo "stable -> $TAG ($(git rev-parse "refs/tags/$TAG^{commit}"))" >>"$GITHUB_STEP_SUMMARY"

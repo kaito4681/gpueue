@@ -13,6 +13,9 @@ stopped. It does not start over.
 > real CRIU, a real NVIDIA GPU). It has **not** been tested on a real host across a real reboot yet.
 > See [Project status](#project-status).
 
+> **No release has been published yet.** The download links, the APT repository and the `stable`
+> branch below work from the first release on.
+
 ## Why
 
 On a shared GPU workstation people usually run jobs with `nohup`, `tmux` or a per-user pueue, and
@@ -62,8 +65,8 @@ The installer sets up the systemd units, the `puzuz` user, the `puzuz-admin` gro
 directories and a default /etc/puzuz/config.toml, starts the services and prints the
 `puzuz doctor` report. It does not install CRIU or cuda-checkpoint; it tells you if they are
 missing. Update later with `sudo puzuz update` (running jobs keep running). Remove it with
-`sudo puzuz uninstall`, which keeps the data (`--purge` deletes it too). A GitHub token is not needed (`GH_TOKEN` is used when set; it only raises
-the API rate limit).
+`sudo puzuz uninstall`, which keeps the data (`--purge` deletes it too). A GitHub token is not
+needed (`GH_TOKEN` is used when set; it only raises the API rate limit).
 
 On Debian and Ubuntu (amd64 or arm64) you can install the package from the release instead:
 
@@ -209,7 +212,8 @@ Extra commands and options:
 | `restore [IDS] [-g GROUP] [-a] [-i]` | resume `Checkpointed` jobs (`-i`: right away, ignoring free slots) |
 | `gpu [-j]`, `gpu parallel <N> [--gpu LIST]` | list GPUs, or set the per-GPU job limit (administrators) |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | manage the systemd services; install exits non-zero if the final check fails (see [docs/install.md](docs/install.md)) |
-| `uninstall [--purge] [--yes]` | remove the services and the binaries `service install` copied (administrators) |
+| `uninstall [--purge] [--yes]` | remove the services and the binaries `service install` copied (root) |
+| `update [--check] [--version V] [-y]` | update puzuz from the latest (or the given) release; needs root, without root it only checks (see [docs/install.md](docs/install.md#upgrading)) |
 | `doctor` | check the installation |
 | `daemon` | run the daemon in the foreground (systemd does this) |
 

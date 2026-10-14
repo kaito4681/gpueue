@@ -57,8 +57,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: |
+          mapfile -t files < <(git ls-files '*.sh' 'packaging/scripts/*')
           docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:v0.10.0 \
-            -S warning $(git ls-files '*.sh' 'packaging/scripts/*')
+            -S warning "${files[@]}"
+
+  # The workflows (with shellcheck on their run: scripts), by a pinned
+  # actionlint image.
+  actionlint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          docker run --rm -v "$PWD":/repo -w /repo \
+            rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
+            -color
 
   # flake.nix: evaluate the outputs and run the checks (the home-manager
   # module evaluation; on x86_64 also two NixOS VM tests, which need KVM: the
@@ -219,6 +231,28 @@ jobs:
           for base in rockylinux/rockylinux:9 fedora:latest; do
             PUZUZ_RPM_BASE="$base" scripts/rpm-test.sh target/rpm-old/puzuz-*.rpm target/rpm/puzuz-*.rpm
           done
+      # GPG-signing the .rpm as release.yml's sign-rpm job does.
+      - run: scripts/rpm-sign-test.sh target/rpm/puzuz-*.rpm
+
+  # The AUR package (packaging/aur/puzuz-bin) from a debug build, built with
+  # makepkg, installed, upgraded and removed in an Arch Linux container with
+  # systemd (scripts/dist/aur-test.sh).
+  aur:
+    runs-on: ubuntu-24.04
+    needs: [test]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/test-in-docker.sh build --locked -p puzuz -p puzuz-helper
+      - name: Package the release tarball
+        run: |
+          . scripts/dist/lib.sh
+          name="puzuz-v$(workspace_version .)-x86_64-unknown-linux-gnu"
+          mkdir -p "target/aur/$name"
+          install -m 0755 target/docker/debug/puzuz target/docker/debug/puzuz-helper "target/aur/$name/"
+          cp -r README.md LICENSE docs "target/aur/$name/"
+          tar -C target/aur -czf "target/aur/$name.tar.gz" "$name"
+      - run: scripts/dist/aur-test.sh target/aur/puzuz-v*.tar.gz
 
   # Daemon + helper + CLI under systemd in a privileged container, including
   # a simulated reboot (CPU-only; the GPU scenarios need an NVIDIA GPU).

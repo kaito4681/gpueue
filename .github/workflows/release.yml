@@ -24,7 +24,7 @@ jobs:
       HAVE_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY != '' }}
       HAVE_PASSWORD: ${{ secrets.MINISIGN_PASSWORD != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
       - name: Check the signing key and secrets
@@ -62,12 +62,12 @@ jobs:
     # Build on Debian bookworm, as scripts/test-in-docker.sh does, so the
     # binaries need only glibc 2.34 (see docs/install.md). The image is
     # multi-arch, so the arm64 runner gets the arm64 toolchain.
-    container: rust:1.98.1-bookworm
+    container: rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
       TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
       - name: Check the tag matches the crate version
@@ -99,35 +99,13 @@ jobs:
         run: |
           deb="$(scripts/dist/build-package.sh target/release dist deb)"
           (cd dist && sha256sum "$(basename "$deb")" >"$(basename "$deb").sha256")
-      # dist/puzuz-<version>-1.<x86_64|aarch64>.rpm (packaging/nfpm.yaml).
-      # The .rpm itself is GPG-signed (rpm -K) with the APT repository's key
-      # when that key is available (the release job then attaches its public
-      # half as RPM-GPG-KEY-puzuz); otherwise it stays unsigned and, like
-      # every asset, is covered by its .minisig and .sha256.
+      # dist/puzuz-<version>-1.<x86_64|aarch64>.rpm (packaging/nfpm.yaml),
+      # unsigned: the sign-rpm job GPG-signs it, so that the signing key
+      # never enters this job, where the dependencies' build scripts ran as
+      # root.
       - name: Build the .rpm
-        env:
-          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
-          NFPM_RPM_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
-        run: |
-          keyring=packaging/apt/puzuz-archive-keyring.gpg
-          key=""
-          if [ -n "$APT_GPG_PRIVATE_KEY" ] && ! grep -aq 'TEST KEY' "$keyring"; then
-            key="$RUNNER_TEMP/rpm-signing.asc"
-            (umask 077; printf '%s\n' "$APT_GPG_PRIVATE_KEY" >"$key")
-            GNUPGHOME="$(mktemp -d)"
-            export GNUPGHOME
-            fpr() { gpg --show-keys --with-colons "$1" | awk -F: '$1 == "fpr" { print $10; exit }'; }
-            if [ "$(fpr "$key")" != "$(fpr "$keyring")" ]; then
-              echo "::error::APT_GPG_PRIVATE_KEY is not the key of $keyring"
-              exit 1
-            fi
-          else
-            echo "::warning::APT_GPG_PRIVATE_KEY is not set (or the APT key is the test key); the .rpm is not GPG-signed"
-          fi
-          rpm="$(PUZUZ_RPM_SIGNING_KEY="$key" scripts/dist/build-package.sh target/release dist rpm)"
-          rm -f "$key"
-          (cd dist && sha256sum "$(basename "$rpm")" >"$(basename "$rpm").sha256")
-      - uses: actions/upload-artifact@v4
+        run: scripts/dist/build-package.sh target/release dist rpm
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-${{ matrix.target }}
           path: |
@@ -135,24 +113,73 @@ jobs:
             dist/*.deb*
             dist/*.rpm*
 
-  release:
+  # GPG-signs the .rpm files (rpm -K) with the APT repository's key, on a
+  # fresh runner that never ran the build (scripts/dist/sign-rpm.sh); the
+  # release job attaches the key's public half as RPM-GPG-KEY-puzuz. Without
+  # the key (or with the test key) they stay unsigned and, like every asset,
+  # are covered by their .minisig and .sha256.
+  sign-rpm:
     needs: [check-signing, build]
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Sign the .rpm files
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          RPM_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          keyring=packaging/apt/puzuz-archive-keyring.gpg
+          if [ -n "$APT_GPG_PRIVATE_KEY" ] && ! grep -aq 'TEST KEY' "$keyring"; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends rpm
+            key="$RUNNER_TEMP/rpm-signing.asc"
+            (umask 077; printf '%s\n' "$APT_GPG_PRIVATE_KEY" >"$key")
+            scripts/dist/sign-rpm.sh "$key" "$keyring" dist/*.rpm
+            rm -f "$key"
+            for rpm in dist/*.rpm; do
+              (cd dist && sha256sum "$(basename "$rpm")" >"$(basename "$rpm").sha256")
+            done
+          else
+            echo "::warning::APT_GPG_PRIVATE_KEY is not set (or the APT key is the test key); the .rpm files are not GPG-signed"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rpm-signed
+          path: dist/*.rpm*
+
+  release:
+    needs: [check-signing, build, sign-rpm]
     runs-on: ubuntu-24.04
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.TAG }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: dist-*
           merge-multiple: true
           path: dist
-      # dist/<name>.{tar.gz,deb,rpm}.minisig, checked against
-      # packaging/minisign.pub (the key built into `puzuz`), and install.sh
-      # as a release asset.
+      # The .rpm files of the sign-rpm job replace the unsigned ones.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rpm-signed
+          path: rpm-signed
+      - run: cp -f rpm-signed/* dist/
+      # dist/<name>.{tar.gz,deb,rpm}.minisig and install.sh with its
+      # install.sh.minisig, checked against packaging/minisign.pub (the key
+      # built into `puzuz`).
       - name: Sign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -165,13 +192,13 @@ jobs:
           minisign="$(scripts/dist/get-minisign.sh "$RUNNER_TEMP/minisign")"
           key="$RUNNER_TEMP/minisign.key"
           (umask 077; printf '%s\n' "$MINISIGN_SECRET_KEY" >"$key")
-          for file in dist/*.tar.gz dist/*.deb dist/*.rpm; do
+          install -m 0644 scripts/install.sh dist/install.sh
+          for file in dist/*.tar.gz dist/*.deb dist/*.rpm dist/install.sh; do
             printf '%s\n' "$MINISIGN_PASSWORD" |
               "$minisign" -S -s "$key" -m "$file" -t "puzuz $TAG $(basename "$file")"
             "$minisign" -V -p packaging/minisign.pub -m "$file"
           done
           rm -f "$key"
-          install -m 0644 scripts/install.sh dist/install.sh
       # The public key the .rpm files are signed with, ASCII-armored as
       # `rpm --import` needs it (the same key as the APT repository's).
       - name: Attach the .rpm signing key
@@ -212,9 +239,9 @@ jobs:
           \`\`\`
 
           Running jobs keep running. The tarballs (\`puzuz-$TAG-<target>.tar.gz\`), the
-          \`.deb\` and the \`.rpm\` files are signed with minisign (\`.minisig\`, public key
-          in \`packaging/minisign.pub\`); see docs/install.md for manual installation and
-          uninstalling.
+          \`.deb\` and the \`.rpm\` files and \`install.sh\` are signed with minisign
+          (\`.minisig\`, public key in \`packaging/minisign.pub\`); see docs/install.md for
+          checking \`install.sh\` before running it, manual installation and uninstalling.
           EOF
       - name: Create or update the GitHub release
         run: |

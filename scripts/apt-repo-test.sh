@@ -17,7 +17,10 @@
 # It also checks apt-repo.sh itself: keeping the newest versions in Debian
 # version order, Filename: being the file name (0.2.0-rc.1 in the name,
 # 0.2.0~rc.1 in the package), and its refusals, which leave the directory
-# untouched.
+# untouched, among them packages already in the repository that do not match
+# its signed index; and `apt-repo.sh github` against a fake gh: publishing,
+# refusing a tampered package in the release `apt`, and putting the previous
+# index back after a failed upload.
 #
 # v1 and v2 are the package given (or built) with the versions 9.9.9-rc.1
 # (9.9.9~rc.1 in the package) and 9.9.9 written into it, and with the
@@ -85,13 +88,74 @@ docker exec -i "$server" bash -euo pipefail <<EOF
 $setup
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q >/dev/null
-apt-get install -y -q --no-install-recommends apt-utils gnupg python3 >/dev/null
+apt-get install -y -q --no-install-recommends apt-utils gnupg python3 curl >/dev/null
 EOF
+
+# `apt-repo.sh github` runs against a fake gh (on directories /w/gh/<release>)
+# with this minisign binary.
+"$root/scripts/dist/get-minisign.sh" "$root/target/dist-tools" >/dev/null
+mkdir -p "$work/bin"
+cat >"$work/bin/gh" <<'EOF'
+#!/bin/bash
+# A fake of the gh commands scripts/dist/apt-repo.sh runs: releases are the
+# directories /w/gh/<tag>, assets their files; every release is published
+# and stable. FAKE_GH_FAIL_UPLOAD=GLOB makes every upload of a path matching GLOB fail.
+set -euo pipefail
+r=/w/gh
+all="$*"
+echo "gh $all" >>/w/gh.log
+if [ "$1" = api ]; then
+    cat /w/gh-minisign.pub
+    exit
+fi
+cmd="$1 $2" tag="$3"
+shift 3
+dir=. pats=() files=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -D) dir="$2" && shift 2 ;;
+    -p) pats+=("$2") && shift 2 ;;
+    -R | --json | -q | --title | --notes | --latest) shift 2 ;;
+    -*) shift ;;
+    *) files+=("$1") && shift ;;
+    esac
+done
+case "$cmd" in
+"release view")
+    [ -d "$r/$tag" ] || { echo "release not found" >&2; exit 1; }
+    case "$all" in
+    *isDraft*) echo "false false" ;;
+    *assets*) ls "$r/$tag" ;;
+    esac
+    ;;
+"release create") mkdir -p "$r/$tag" ;;
+"release download")
+    mkdir -p "$dir"
+    n=0
+    shopt -s nullglob
+    for p in "${pats[@]}"; do
+        for f in "$r/$tag"/$p; do cp "$f" "$dir/" && n=$((n + 1)); done
+    done
+    [ "$n" -gt 0 ] || { echo "no assets match the file pattern" >&2; exit 1; }
+    ;;
+"release upload")
+    for f in "${files[@]}"; do
+        case "$f" in ${FAKE_GH_FAIL_UPLOAD:-/nothing}) echo "HTTP 502" >&2 && exit 1 ;; esac
+    done
+    cp "${files[@]}" "$r/$tag/"
+    ;;
+"release delete-asset") rm "$r/$tag/${files[0]}" ;;
+*) echo "fake gh: unsupported: $cmd" >&2; exit 1 ;;
+esac
+EOF
+chmod +x "$work/bin/gh"
 
 # Sourced by the server-side steps.
 cat >"$work/env.sh" <<'EOF'
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 export APT_GPG_PRIVATE_KEY="$(cat /w/key.asc)" APT_GPG_PASSPHRASE=test-passphrase
+# The existing index is verified with the throwaway key, not the packaged one.
+export APT_VERIFY_KEYRING=/w/test-keyring.gpg
 repo=/src/scripts/dist/apt-repo.sh
 cd /w
 EOF
@@ -221,6 +285,100 @@ grep -q 'ships the TEST archive key' /tmp/refused.err || fail "packages with the
 [ ! -e testkey ] || fail "wrote testkey/ for packages with the TEST key"
 echo "refused (TEST key): $(tail -n 1 /tmp/refused.err)"
 echo "refusals: ok"
+
+# The packages already in the repository are verified against its signed
+# index before they are indexed and signed again.
+existing() { rm -rf "$1" && cp -r prune "$1"; }
+refused_in() { # DIR PATTERN, then the command
+    local d="$1" pattern="$2" sum
+    shift 2
+    sum="$(cd "$d" && sha256sum ./*)"
+    if "$@" 2>/tmp/refused.err; then fail "accepted: $pattern"; fi
+    grep -qF -- "$pattern" /tmp/refused.err || { cat /tmp/refused.err; fail "refused, but not with: $pattern"; }
+    [ "$(cd "$d" && sha256sum ./*)" = "$sum" ] || fail "$d changed after: $pattern"
+    echo "refused ($pattern)"
+}
+# reowned DEB: the same package with one more file (still a valid package).
+reowned() {
+    local x
+    x="$(mktemp -d)"
+    dpkg-deb -R "$1" "$x"
+    echo tampered >"$x/tampered"
+    dpkg-deb --root-owner-group -b "$x" "$1" >/dev/null
+    rm -rf "$x"
+}
+existing tampered
+reowned tampered/puzuz_1.0.0_amd64.deb
+refused_in tampered "puzuz_1.0.0_amd64.deb differs from the signed index" "$repo" update tampered
+refused_in tampered "puzuz_1.0.0_amd64.deb differs from the signed index" "$repo" update tampered fake/puzuz_0.9.0_amd64.deb
+# ... also with Packages rewritten to match it.
+h="$(sha256sum <tampered/puzuz_1.0.0_amd64.deb)"
+awk -v h="${h%% *}" '/^Filename: puzuz_1.0.0_amd64.deb$/ { f = 1 } /^SHA256: / && f { $0 = "SHA256: " h; f = 0 } { print }' \
+    tampered/Packages >tampered/Packages.new && mv tampered/Packages.new tampered/Packages
+refused_in tampered "the existing Packages does not match the signed InRelease" "$repo" update tampered
+# ... and with Release and InRelease rewritten too, signed by another key.
+existing tampered2
+GNUPGHOME=/w/gnupg-other gpg --batch --yes --quiet --pinentry-mode loopback --passphrase '' \
+    --clearsign -o tampered2/InRelease tampered2/Release
+refused_in tampered2 "the existing InRelease does not verify" "$repo" update tampered2
+existing noindex
+rm noindex/InRelease
+refused_in noindex "has packages but no InRelease" "$repo" update noindex
+# A package the signed index does not list (an interrupted run uploads the
+# packages first): dropped, not indexed.
+existing leftover
+mkpkg 2.0.0 amd64 leftover
+"$repo" update leftover 2>/tmp/leftover.err
+grep -qF "puzuz_2.0.0_amd64.deb is not in the signed index" /tmp/leftover.err || fail "no warning about the leftover"
+[ ! -e leftover/puzuz_2.0.0_amd64.deb ] || fail "the leftover was kept"
+grep -q 'puzuz_2.0.0' leftover/Packages && fail "the leftover was indexed"
+echo "verifying the existing packages: ok"
+
+# `apt-repo.sh github` with the fake gh: a release v1.0.2 (checksummed and
+# signed with a throwaway minisign key) added to the release `apt`.
+export PATH="/w/bin:$PATH" MINISIGN=/src/target/dist-tools/minisign PUZUZ_APT_RETRY_DELAY=0
+"$MINISIGN" -G -W -p /w/gh-minisign.pub -s /w/gh-minisign.key >/dev/null
+ghrelease() { # TAG_VERSION
+    mkdir -p "/w/gh/v$1"
+    mkpkg "$1" amd64 "/w/gh/v$1"
+    (cd "/w/gh/v$1" && sha256sum "puzuz_$1_amd64.deb" >"puzuz_$1_amd64.deb.sha256")
+    "$MINISIGN" -S -s /w/gh-minisign.key -m "/w/gh/v$1/puzuz_$1_amd64.deb" >/dev/null
+}
+mkdir -p /w/gh
+cp -r prune /w/gh/apt
+for v in 1.0.2 1.0.3; do ghrelease "$v"; done
+"$repo" github v1.0.2
+[ -f /w/gh/apt/puzuz_1.0.2_amd64.deb ] || fail "github: v1.0.2 not uploaded"
+[ ! -e /w/gh/apt/puzuz_0.9.0_amd64.deb ] || fail "github: the pruned package was not deleted"
+grep -qx 'Filename: puzuz_1.0.2_amd64.deb' /w/gh/apt/Packages || fail "github: v1.0.2 not indexed"
+gpgv --quiet --keyring /w/test-keyring.gpg /w/gh/apt/InRelease 2>/dev/null || fail "github: InRelease"
+ghsnapshot() { (cd /w/gh/apt && sha256sum ./*); }
+# A tampered package in the release `apt`: refused, nothing uploaded.
+cp /w/gh/apt/puzuz_1.0.0_amd64.deb /tmp/good.deb
+reowned /w/gh/apt/puzuz_1.0.0_amd64.deb
+ghsnapshot >/tmp/gh.sum
+if "$repo" github v1.0.3 2>/tmp/refused.err; then fail "github: accepted a tampered package"; fi
+grep -qF "puzuz_1.0.0_amd64.deb differs from the signed index" /tmp/refused.err || { cat /tmp/refused.err; fail "github: refused for another reason"; }
+ghsnapshot | cmp -s - /tmp/gh.sum || fail "github: the release changed after a refusal"
+echo "refused (github: tampered package)"
+cp /tmp/good.deb /w/gh/apt/puzuz_1.0.0_amd64.deb
+# The upload of InRelease fails (every attempt): the previous index is put
+# back; v1.0.3 stays as an unlisted leftover.
+cp /w/gh/apt/InRelease /w/gh/apt/Packages /tmp/
+: >/w/gh.log
+if FAKE_GH_FAIL_UPLOAD='*/repo/InRelease' "$repo" github v1.0.3 2>/tmp/refused.err; then fail "github: a failed upload passed"; fi
+grep -qF "rerun the workflow for v1.0.3" /tmp/refused.err || { cat /tmp/refused.err; fail "github: no recovery hint"; }
+[ "$(grep -c 'release upload apt.*/repo/InRelease' /w/gh.log)" = 3 ] || fail "github: InRelease upload not tried 3 times"
+grep -qF 'restored the previous index' /tmp/refused.err || { cat /tmp/refused.err; fail "github: the previous index was not restored"; }
+cmp -s /tmp/InRelease /w/gh/apt/InRelease && cmp -s /tmp/Packages /w/gh/apt/Packages || fail "github: the previous index was not restored"
+echo "github: a failed upload restores the previous index: ok"
+# The re-run publishes v1.0.3 (dropping and re-uploading the leftover).
+"$repo" github v1.0.3 2>/tmp/rerun.err
+grep -qF "puzuz_1.0.3_amd64.deb is not in the signed index" /tmp/rerun.err || fail "github: the leftover was trusted"
+grep -qx 'Filename: puzuz_1.0.3_amd64.deb' /w/gh/apt/Packages || fail "github: v1.0.3 not indexed"
+cmp -s /w/gh/apt/puzuz_1.0.3_amd64.deb /w/gh/v1.0.3/puzuz_1.0.3_amd64.deb || fail "github: v1.0.3 differs from its release"
+gpgv --quiet --keyring /w/test-keyring.gpg /w/gh/apt/InRelease 2>/dev/null || fail "github: InRelease after the re-run"
+echo "apt-repo.sh github: ok"
 
 # The test repository: v1 for now.
 "$repo" update state "debs/puzuz_9.9.9-rc.1_$arch.deb"
