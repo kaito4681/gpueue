@@ -19,21 +19,22 @@
 #                       scenario.sh, separated by spaces or commas, e.g.
 #                       PUZUZ_E2E_ONLY=1 or PUZUZ_E2E_ONLY="3,7"), e.g. to
 #                       repeat one many times. The reboot scenarios (7, 15,
-#                       16) and the container switch are skipped unless
+#                       16, 20) and the container switch are skipped unless
 #                       one of them is listed.
 #                       Unknown numbers, and GPU scenarios without
 #                       PUZUZ_E2E_GPU=1, are rejected; a run in which no
 #                       scenario executed fails.
 #   PUZUZ_E2E_ONLY_REBOOT=1 same as PUZUZ_E2E_ONLY=7
-#   Scenarios 15 and 16 need the administrator's mounts that
+#   Scenarios 15, 16 and 20 need the administrator's mounts that
 #                       scripts/e2e/mounts.sh sets up at every boot when one
 #                       of them runs (loop-mounted ext4, an automount, tmpfs,
 #                       overlayfs, bind mounts, sshfs if the image has it);
 #                       their contents live on a second volume. Without
 #                       sshfs, scenario 15 prints a SKIP line for its FUSE
-#                       part.
-#   PUZUZ_E2E_REQUIRE_SSHFS=1  fail scenario 15 instead when sshfs is
-#                       missing (set in CI)
+#                       part, and scenario 20 (a FUSE mount whose sshfs is
+#                       killed) is skipped.
+#   PUZUZ_E2E_REQUIRE_SSHFS=1  fail scenarios 15 and 20 instead when sshfs
+#                       is missing (set in CI)
 #   PUZUZ_E2E_NAME      prefix of the container and volume names
 #                       (default puzuz-e2e), to tell parallel runs apart
 #   PUZUZ_E2E_GPU=1     also run the GPU scenarios (9: GPU
@@ -81,7 +82,7 @@ only="${only//,/ }"
 # GPU scenarios without PUZUZ_E2E_GPU=1 (they would be skipped silently).
 for n in $only; do
     case "$n" in
-    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17 | 18 | 19) ;;
+    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17 | 18 | 19 | 20) ;;
     9 | 11 | 12 | 14)
         if [ "${PUZUZ_E2E_GPU:-}" != 1 ]; then
             echo "scenario $n needs PUZUZ_E2E_GPU=1" >&2
@@ -96,14 +97,14 @@ for n in $only; do
 done
 # selected <n>: whether scenario <n> runs.
 selected() { [ -z "$only" ] || [[ " $only " == *" $1 "* ]]; }
-reboot_selected() { selected 7 || selected 15 || selected 16; }
-mounts_selected() { selected 15 || selected 16; }
-# Whether a scenario of the main phase (not 7, 15 or 16) is selected.
+reboot_selected() { selected 7 || selected 15 || selected 16 || selected 20; }
+mounts_selected() { selected 15 || selected 16 || selected 20; }
+# Whether a scenario of the main phase (not 7, 15, 16 or 20) is selected.
 main_selected() {
     local n
     [ -z "$only" ] && return 0
     for n in $only; do
-        case "$n" in 7 | 15 | 16) ;; *) return 0 ;; esac
+        case "$n" in 7 | 15 | 16 | 20) ;; *) return 0 ;; esac
     done
     return 1
 }
