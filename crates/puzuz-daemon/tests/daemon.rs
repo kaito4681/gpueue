@@ -988,6 +988,51 @@ async fn lost_checkpoint_requests_do_not_leave_jobs_checkpointing() {
     h.stop().await;
 }
 
+/// A checkpoint request the helper has not read yet when it reconnects
+/// is not taken for lost: the live-job list that comes with the reconnect
+/// may predate the request, so it shows the job running. The helper then
+/// handles the request: a dump it refuses leaves the job running, instead
+/// of ending it as "checkpoint failed" as a refused dump of a running job
+/// (an OS shutdown's) does (#17).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_helper_reconnect_during_a_checkpoint_request_does_not_abandon_it() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let id = alice.add(&job_request("a", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+    h.helper
+        .set_checkpoint_outcome(FakeOutcome::Refuse("not enough free space".to_owned()));
+    h.helper.hold_checkpoints();
+    let request = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.action(id, "checkpoint", json!(null)).await }
+    });
+    h.helper.wait_held_checkpoints(1).await;
+    assert_eq!(alice.job(id).await.state, JobState::Checkpointing);
+    // The list sent with the reconnect shows the job running. Its notice
+    // is handled before the dump's outcome, which follows it.
+    h.helper.disconnect();
+    h.helper.reconnect();
+    h.helper.release_checkpoints();
+    assert_eq!(request.await.unwrap().status, StatusCode::OK);
+    alice
+        .wait_for(id, "running with the refusal", |j| {
+            j.state == JobState::Running
+                && last_error(j) == Some("checkpoint refused: not enough free space")
+        })
+        .await;
+    assert!(h.helper.is_running(id));
+    assert!(h.helper.signals().is_empty(), "{:?}", h.helper.signals());
+
+    // The next dump goes through.
+    h.helper.set_checkpoint_outcome(FakeOutcome::Succeed);
+    let reply = alice.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    alice.wait_state(id, &JobState::Checkpointed).await;
+    h.stop().await;
+}
+
 /// The helper replays the events the daemon applied but did not
 /// acknowledge (it stopped in between); they are not applied twice. A
 /// replayed refusal would otherwise end the job, which has been running

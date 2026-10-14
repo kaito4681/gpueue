@@ -198,6 +198,8 @@ pub struct Changes {
     other: bool,
     /// Jobs whose spawn or restore request is sent after the commit.
     launching: Vec<JobId>,
+    /// Jobs whose checkpoint request is sent after the commit.
+    checkpointing: Vec<JobId>,
 }
 
 impl Changes {
@@ -222,6 +224,9 @@ impl Changes {
     }
     fn launching(&mut self, id: JobId) {
         self.launching.push(id);
+    }
+    fn checkpointing(&mut self, id: JobId) {
+        self.checkpointing.push(id);
     }
     fn is_empty(&self) -> bool {
         self.added.is_empty()
@@ -472,6 +477,10 @@ pub struct Core {
     pub(crate) streams: Arc<UidLimiter>,
     /// Spawn and restore requests the helper has not answered yet.
     launches: Launches,
+    /// Checkpoint requests the helper has not answered yet (only
+    /// [`Launches::in_flight`], [`Launches::take_settled`] and
+    /// [`Launches::wait`] are used): see [`Core::reconcile`].
+    checkpoint_requests: Launches,
     /// Bounds the scheduler's concurrent spawn/restore requests.
     launch_slots: Semaphore,
     /// Jobs whose spawn or restore request went unanswered (connection
@@ -535,6 +544,7 @@ impl Core {
             tail_scans: Semaphore::new(MAX_TAIL_SCANS),
             streams: UidLimiter::new(MAX_STREAMS_PER_UID, usize::MAX),
             launches: Launches::default(),
+            checkpoint_requests: Launches::default(),
             launch_slots: Semaphore::new(MAX_CONCURRENT_LAUNCHES),
             unconfirmed_launches: Mutex::new(HashMap::new()),
             forced: Mutex::new(HashMap::new()),
@@ -972,8 +982,12 @@ impl Core {
                     for &id in &changes.launching {
                         core.launches.begin(id);
                     }
+                    for &id in &changes.checkpointing {
+                        core.checkpoint_requests.begin(id);
+                    }
                     for &id in &changes.removed {
                         core.launches.forget(id);
+                        core.checkpoint_requests.forget(id);
                     }
                     core.publish(store, &changes);
                 }
@@ -1111,6 +1125,7 @@ impl Core {
                 Effect::Checkpoint => {
                     tx.put_checkpoint(&self.new_checkpoint_record(job, was_paused, now))?;
                     changes.updated(job.id);
+                    changes.checkpointing(job.id);
                 }
                 Effect::RecordRestoreError(reason) => {
                     // Kept with the job rather than with its checkpoint
@@ -1181,7 +1196,10 @@ impl Core {
             Effect::SignalContinue => self.signal(job, signal::SIGCONT).await,
             Effect::SendSignal(sig) => self.signal(job, *sig).await,
             Effect::Kill | Effect::Terminate => self.terminate(job).await,
-            Effect::Checkpoint => self.start_checkpoint(job).await,
+            Effect::Checkpoint => {
+                let _settle = self.checkpoint_requests.settle_on_drop(job.id);
+                self.start_checkpoint(job).await
+            }
             Effect::Restore => {
                 let settle = self.launches.settle_on_drop(job.id);
                 settle_launch(settle, self.start_restore(job).await)
@@ -1971,7 +1989,12 @@ impl Core {
     /// A job whose spawn or restore request is in flight, or was answered
     /// since the previous reconciliation, may be missing from `running`
     /// only because that list was taken before the request reached the
-    /// helper; it is checked again once the request has settled.
+    /// helper; it is checked again once the request has settled. Likewise,
+    /// a `Checkpointing` job whose checkpoint request is in flight, or was
+    /// answered since, may be listed as running (or, its dump done, not at
+    /// all) only because the list predates the request (or its outcome):
+    /// it is left to [`Core::checkpoint_lost_check`] once the request has
+    /// settled.
     pub async fn reconcile(self: &Arc<Self>, running: Vec<RunningJob>) {
         let live: HashMap<JobId, hp::RunningPhase> =
             running.iter().map(|r| (r.job, r.phase)).collect();
@@ -1997,6 +2020,12 @@ impl Core {
             .filter(|id| self.launches.in_flight(*id))
             .collect();
         let recently_launched = self.launches.take_settled();
+        let checkpoint_in_flight: HashSet<JobId> = jobs
+            .iter()
+            .map(|j| j.id)
+            .filter(|id| self.checkpoint_requests.in_flight(*id))
+            .collect();
+        let recently_checkpointed = self.checkpoint_requests.take_settled();
         let mut accounted = HashSet::new();
         for job in &jobs {
             accounted.insert(job.id);
@@ -2004,6 +2033,14 @@ impl Core {
                 None if in_flight.contains(&job.id) || recently_launched.contains(&job.id) => {
                     tracing::debug!(job = %job.id, "job was launched around the reconnect; checking again");
                     self.recheck_after_launch(job.id, job.started_at);
+                }
+                None | Some(hp::RunningPhase::Running | hp::RunningPhase::Stopped)
+                    if job.state == JobState::Checkpointing
+                        && (checkpoint_in_flight.contains(&job.id)
+                            || recently_checkpointed.contains(&job.id)) =>
+                {
+                    tracing::debug!(job = %job.id, "job was asked to checkpoint around the reconnect; checking again");
+                    self.recheck_after_checkpoint_request(job.id, job.started_at);
                 }
                 None => {
                     tracing::warn!(job = %job.id, state = job.state.name(), "job is gone; marking it lost");
@@ -2082,6 +2119,23 @@ impl Core {
                 _ = core.launches.wait(id) => {}
             }
             core.spawn_lost_check(id, started_at);
+        });
+    }
+
+    /// Once the checkpoint request for `id` has settled, checks what the
+    /// helper does with the job (see [`Core::reconcile`]).
+    fn recheck_after_checkpoint_request(
+        self: &Arc<Self>,
+        id: JobId,
+        started_at: Option<Timestamp>,
+    ) {
+        let core = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = core.cancel.cancelled() => return,
+                _ = core.checkpoint_requests.wait(id) => {}
+            }
+            core.checkpoint_lost_check(id, started_at);
         });
     }
 

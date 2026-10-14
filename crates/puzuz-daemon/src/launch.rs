@@ -1,4 +1,6 @@
-//! Tracks spawn and restore requests the helper has not answered yet.
+//! Tracks spawn and restore requests the helper has not answered yet
+//! (and, in a second instance, checkpoint requests: see
+//! `Core::reconcile`).
 //!
 //! The daemon records a launched job as `Running` (or `Restoring`) in the
 //! same transaction that picks it, and only then asks the helper to start

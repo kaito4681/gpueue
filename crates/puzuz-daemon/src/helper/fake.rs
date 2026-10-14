@@ -11,7 +11,8 @@
 //! to reproduce the window in which the daemon has recorded a launch the
 //! helper does not know about yet. Combined with
 //! [`FakeHelper::refuse_launches`], it holds the daemon's retry of a launch
-//! a stopping helper refused.
+//! a stopping helper refused. [`FakeHelper::hold_checkpoints`] does the
+//! same for checkpoint requests.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -97,6 +98,9 @@ struct State {
     delivered: u64,
     /// Spawn/restore requests currently held.
     held: usize,
+    hold_checkpoints: bool,
+    /// Checkpoint requests currently held.
+    held_checkpoints: usize,
 }
 
 impl State {
@@ -183,13 +187,14 @@ impl Default for FakeHelper {
     }
 }
 
-/// Decrements the held count when a held request stops waiting (also when
-/// its future is dropped).
-struct Held<'a>(&'a FakeHelper);
+/// Decrements a held count (`held` or `held_checkpoints`) when a held
+/// request stops waiting (also when its future is dropped).
+struct Held<'a>(&'a FakeHelper, fn(&mut State) -> &mut usize);
 
 impl Drop for Held<'_> {
     fn drop(&mut self) {
-        self.0.with(|s| s.held -= 1);
+        let count = self.1;
+        self.0.with(|s| *count(s) -= 1);
         self.0.bump();
     }
 }
@@ -212,7 +217,7 @@ impl FakeHelper {
         }
         self.with(|s| s.held += 1);
         self.bump();
-        let _held = Held(self);
+        let _held = Held(self, |s| &mut s.held);
         while self.with(|s| s.hold_launches) {
             if rx.changed().await.is_err() {
                 return Ok(());
@@ -222,6 +227,23 @@ impl FakeHelper {
             return Err(HelperError::ConnectionLost);
         }
         Ok(())
+    }
+
+    /// Waits while checkpoint requests are held. A request dropped while
+    /// waiting has no effect.
+    async fn checkpoint_gate(&self) {
+        let mut rx = self.wake.subscribe();
+        if !self.with(|s| s.hold_checkpoints) {
+            return;
+        }
+        self.with(|s| s.held_checkpoints += 1);
+        self.bump();
+        let _held = Held(self, |s| &mut s.held_checkpoints);
+        while self.with(|s| s.hold_checkpoints) {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
@@ -378,6 +400,30 @@ impl FakeHelper {
                 s.held < count
             }
         }) {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Holds checkpoint requests (unanswered and without effect, as if not
+    /// read by the helper yet) until [`release_checkpoints`].
+    ///
+    /// [`release_checkpoints`]: FakeHelper::release_checkpoints
+    pub fn hold_checkpoints(&self) {
+        self.with(|s| s.hold_checkpoints = true);
+    }
+
+    /// Lets held (and later) checkpoint requests proceed.
+    pub fn release_checkpoints(&self) {
+        self.with(|s| s.hold_checkpoints = false);
+        self.bump();
+    }
+
+    /// Resolves once `count` checkpoint requests (or more) are being held.
+    pub async fn wait_held_checkpoints(&self, count: usize) {
+        let mut rx = self.wake.subscribe();
+        while self.with(|s| s.held_checkpoints < count) {
             if rx.changed().await.is_err() {
                 return;
             }
@@ -685,8 +731,11 @@ impl Helper for FakeHelper {
         _image_dir: PathBuf,
         _options: CheckpointOptions,
     ) -> BoxFuture<'_, HelperResult<()>> {
-        let result = self.do_checkpoint(job);
-        async move { result }.boxed()
+        async move {
+            self.checkpoint_gate().await;
+            self.do_checkpoint(job)
+        }
+        .boxed()
     }
 
     fn restore(&self, request: RestoreRequest) -> BoxFuture<'_, HelperResult<()>> {
