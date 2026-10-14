@@ -109,7 +109,8 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    stops the process, so from then on the image is never deleted: if finishing it fails, the
    helper retries, keeps the image and reports the checkpoint as not finalized (the daemon counts
    the job as checkpointed); it finalizes the image before restoring it or when it starts again,
-   also after a crash between the dump and the marker. If the dump fails, CRIU
+   also after a crash between the dump and the marker, even if systemd still reports the dumped
+   unit as active. If the dump fails, CRIU
    leaves the process running and the daemon then terminates it. The helper moves CRIU's
    `dump.log` to `/var/lib/puzuz/checkpoints/failed-logs/` and removes the image directory.
    A **paused** job is resumed (SIGCONT) before the dump, because cuda-checkpoint hangs on a
@@ -189,7 +190,9 @@ moment can make such a transient file appear in another directory.
 
 After a crash of the helper during a restore, its next start kills whatever the restore unit
 runs (it was not checked, and in manual mode its CUDA state may not be restored) and reports the
-restore as failed, also when the unit is already gone; the image is kept.
+restore as failed, also when the unit is already gone; the image is kept. If the helper cannot
+record that a restore succeeded, it kills the restored job right away, reports the restore as
+failed and keeps the image as well.
 
 ## Other privilege boundaries
 
