@@ -12,7 +12,8 @@
 //! A job can be launched again before the request of its previous launch
 //! has returned: a spawn or restore the helper refuses (or abandons) because
 //! it is stopping is put back in line by the request's own handler, and the
-//! scheduler may pick the job again right away. Each launch is therefore
+//! scheduler may pick the job again (once its short launch pause is over)
+//! before that handler has returned. Each launch is therefore
 //! identified by a sequence number, and settling a launch leaves a newer
 //! launch of the same job in flight.
 //!

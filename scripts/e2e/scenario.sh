@@ -70,6 +70,11 @@ if not nums or nums[0] != 0 or bad:
     sys.exit(1)
 EOF
 }
+# wait_unit <id> [timeout]: the unit of job <id> is active (the job really
+# runs, not just picked by the daemon).
+wait_unit() {
+    wait_for "${2:-30}" "puzuz-job-$1.service to be active" systemctl is-active --quiet "puzuz-job-$1.service"
+}
 wait_socket() {
     wait_for 30 "the daemon socket" pz carol status --json >/dev/null 2>&1
 }
@@ -283,15 +288,29 @@ s4_checkpoint_restore() {
 # s5/s6: stop <unit>, let one job exit while it is down, start it again.
 restart_while_running() {
     local unit=$1 a b
+    # Leave $unit running whatever happens, or every later scenario fails
+    # as well. Runs when the scenario's subshell exits (also via `fail`).
+    # shellcheck disable=SC2064 # $unit is expanded now, on purpose
+    trap "systemctl start $unit || true" EXIT
+    free_group
     a=$(add alice -g free -- 'sleep 3; exit 5')
     b=$(add bob -g free -- 'sleep 9; echo finished')
+    # The daemon shows a job as running as soon as it asks the helper to
+    # start it; wait for the units, so that the restart below finds both
+    # jobs started rather than racing their spawns (scenario 10 restarts
+    # the helper while spawns are in flight).
     wait_state "$a" running
     wait_state "$b" running
+    wait_unit "$a"
+    wait_unit "$b"
     systemctl restart "$unit"
     wait_socket
     sleep 1
     expect_state "$a" running
     expect_state "$b" running
+    for id in "$a" "$b"; do
+        systemctl is-active --quiet "puzuz-job-$id.service" || fail "job $id died with the restart of $unit"
+    done
     systemctl stop "$unit"
     sleep 4 # job a exits while $unit is down
     systemctl is-active --quiet "puzuz-job-$b.service" || fail "job $b died with $unit"

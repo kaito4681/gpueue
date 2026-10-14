@@ -2264,6 +2264,52 @@ async fn spawns_refused_by_a_stopping_helper_are_requeued() {
     h.stop().await;
 }
 
+/// e2e scenario 6 (helper restart) flake: a spawn refused by a stopping
+/// helper left the job `Running` for another second although nothing ran,
+/// so a check of the job's state right after the restart passed while the
+/// spawn was still to be retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawn_refused_by_a_stopping_helper_is_queued_until_retried() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(2).await;
+    let alice = h.client(ALICE);
+    h.helper.hold_launches();
+    h.helper.refuse_launches(2);
+    let first = alice.add(&job_request("first", &[])).await;
+    let second = alice.add(&job_request("second", &[])).await;
+    let refused = tokio::time::Instant::now();
+
+    // Back in line right away, not shown as running while nothing runs.
+    for id in [first, second] {
+        let deadline = refused + Duration::from_millis(500);
+        loop {
+            let state = alice.job(id).await.state;
+            if matches!(state, JobState::Queued { .. }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "job {id} is still {state:?} after the helper refused it"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    // Offered again only after a pause (not in a tight loop), then started.
+    h.helper.wait_held(2).await;
+    assert!(
+        refused.elapsed() >= Duration::from_millis(900),
+        "retried after {:?}",
+        refused.elapsed()
+    );
+    h.helper.release_launches();
+    for id in [first, second] {
+        h.wait_spawned(id).await;
+        alice.wait_state(id, &JobState::Running).await;
+    }
+    assert_eq!(h.helper.spawned().len(), 2);
+    h.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawns_cut_off_by_a_helper_restart_are_resolved_not_lost() {
     let mut h = Harness::new(0).await;
