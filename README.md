@@ -36,6 +36,8 @@ puzuz provides:
   `shutdown`, `completions`, plus groups, dependencies (`--after`), priorities, delays and labels.
 - GPU slots: per-GPU limits on how many jobs run at once (`puzuz gpu parallel`). Each job gets
   `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER=PCI_BUS_ID`. GPUs are detected with NVML.
+- Fair sharing between users: Slurm-style multifactor priority (fair share with decaying usage,
+  age, nice, `top`; `puzuz prio` and `puzuz share` show the numbers).
 - Transparent checkpoint/restore of CPU and CUDA processes. This includes PyTorch jobs whose
   DataLoader workers are forked (see [fork guard](#limitations)).
 - Automatic checkpoint of all running jobs when the OS shuts down or reboots.
@@ -200,6 +202,7 @@ and does not read pueue's files. These are the differences:
 | Wording | "task" | "job". Option names such as `--print-task-id` are kept for compatibility. |
 | `--json` | pueue's internal state | puzuz's own schema, described below |
 | `edit`, `env`, `restart --edit` | supported | accepted but not implemented yet |
+| `add -o/--priority`, `switch` | order all tasks of the daemon | order only your own jobs; which user's job starts first is decided by a Slurm-style multifactor priority with fair share (see [Job priority](#job-priority)). `priority_type = "basic"` restores pueue's order. |
 | Callbacks, aliases, `pueue.yml` | supported | not available |
 
 Extra commands and options:
@@ -211,6 +214,11 @@ Extra commands and options:
 | `checkpoint [IDS] [-g GROUP] [-a]` | save running jobs and stop them |
 | `restore [IDS] [-g GROUP] [-a] [-i]` | resume `Checkpointed` jobs (`-i`: right away, ignoring free slots) |
 | `gpu [-j]`, `gpu parallel <N> [--gpu LIST]` | list GPUs, or set the per-GPU job limit (administrators) |
+| `add --nice <N>`, `nice <IDS>... <N>` | lower a job's priority by `N` (Slurm's nice; negative values for administrators only) |
+| `top <IDS>...` | move jobs to the top of your own queue (Slurm's `scontrol top`) |
+| `prio [IDS] [-j]` | pending jobs in scheduling order with their priority factors (like Slurm's `sprio`) |
+| `share [-j]`, `share set <USER> <N>` | fair-share state per user (like Slurm's `sshare`); set a user's shares (administrators) |
+| `site <IDS>... <N>`, `group priority <GROUP> <N>` | a job's site factor, a group's priority (administrators) |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | manage the systemd services; install exits non-zero if the final check fails (see [docs/install.md](docs/install.md)) |
 | `uninstall [--purge] [--yes]` | remove the services and the binaries `service install` copied (root) |
 | `update [--check] [--version V] [-y]` | update puzuz from the latest (or the given) release; needs root, without root it only checks (see [docs/install.md](docs/install.md#upgrading)) |
@@ -246,13 +254,21 @@ columns, and `Checkpointed` jobs show the image size.
   `terminating` and `done` carry `result`, which is one of `success`, `failed` (`exit_code`),
   `failed_to_spawn` (`reason`), `killed`, `dependency_failed`, `checkpoint_failed` (`reason`) and
   `lost`.
-- `checkpoint_size_bytes`, `details` and `details.last_error` are omitted when they do not apply.
+- `checkpoint_size_bytes`, `details`, `details.last_error`, a job's `nice` and a group's
+  `priority` are omitted when they do not apply (or are 0).
   For other users' jobs, `label` is null, `details` is absent and `reason` is `"<redacted>"`.
 - `puzuz log --json` prints `{"<id>": {"job": <job>, "output": "..."}}`. `puzuz group --json`
   prints `{"groups": [...]}`. `puzuz gpu --json` prints
   `{"gpus": [{"index", "uuid", "name", "memory_total_bytes", "driver_version", "parallel",
   "used", "jobs": [{"id", "owner"}]}]}`, where `"available": false` marks a GPU that has
   disappeared.
+- `puzuz prio --json` prints `{"priority_type", "weights": {"age", "fairshare", "job_size",
+  "partition", "tres"}, "jobs": [{"id", "owner", "group", "priority", "factors": {"age",
+  "fairshare", "job_size", "partition", "tres_cpu", "tres_gpu"}, "weighted": {"age", "fairshare",
+  "job_size", "partition", "tres"}, "site", "nice"}]}`, the jobs in scheduling order.
+  `puzuz share --json` prints `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
+  "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
+  "usage_reset_period", "billing_weights", "usage_calc_at"}`.
 
 ## Multi-user model and authorization
 
@@ -268,8 +284,11 @@ columns, and `Checkpointed` jobs show the image size.
   removal of the jobs it depends on, so depending on someone else's job would keep them from
   removing or cleaning it. A dependency given twice is recorded once.
 - **Everyone:** seeing that a job exists, its owner, group, GPUs, state, priority, dependencies and
-  times (`status`, `gpu`). This shows who is using which GPU.
-- **Administrators only:** `group add/remove`, `parallel`, `gpu parallel`, pausing or resuming
+  times (`status`, `gpu`), the priority factors of pending jobs (`prio`) and everyone's fair-share
+  usage (`share`). This shows who is using which GPU.
+- **Owner:** `nice` with values of 0 or more, and `top` (unless `enable_user_top = false`).
+- **Administrators only:** `share set`, `group priority`, `site`, negative `nice`, `top` of other
+  users' jobs, `group add/remove`, `parallel`, `gpu parallel`, pausing or resuming
   whole groups (`pause/start/kill -g` for one group, `pause/start/kill -a` for all groups),
   `shutdown`, `reset` of other users' jobs, and `kill <id>` of an
   [orphan](docs/architecture.md#orphans) (a process the helper runs that the daemon does not
@@ -296,6 +315,18 @@ columns, and `Checkpointed` jobs show the image size.
 - GPUs are detected with NVML when the daemon starts (the `[[gpus]]` list in the configuration is
   only a fallback). Restart `puzuz.service` after adding or removing a GPU. `puzuz doctor`
   compares what the daemon detected with `nvidia-smi`.
+
+## Job priority
+
+When jobs wait for the same slots, the one with the highest priority among those that fit starts
+first. The priority follows Slurm's multifactor plugin: by default it is the sum of a fair-share
+factor (users who used less of the machine recently, with usage decaying with a half-life of 7
+days, go first) and an age factor (time spent waiting), minus the job's nice value. Job size,
+group (partition) and per-GPU (TRES) factors can be weighted in as well. Your own `-o`
+priority, `switch` and `puzuz top` reorder only your own jobs. `puzuz prio` shows why a job is
+where it is, `puzuz share` shows everyone's usage. See
+[Priority and fair share](docs/install.md#priority-and-fair-share) for the formula and the
+settings.
 
 ## Requirements
 
@@ -406,7 +437,7 @@ Please report what works and what does not on your hardware.
 ## Documentation
 
 - [docs/install.md](docs/install.md): requirements, building, installing, configuration,
-  upgrading, uninstalling and troubleshooting
+  priority and fair share, upgrading, uninstalling and troubleshooting
 - [docs/architecture.md](docs/architecture.md): components, job flow, shutdown ordering, state
   storage and crate layout
 

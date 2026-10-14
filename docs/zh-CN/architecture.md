@@ -36,7 +36,7 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    连接必须在 20 秒内发送请求头，空闲的 keep-alive 连接会在 20 秒后关闭。`log --tail` 最多只在日志末尾
    4 MiB 内查找行首（如果这一范围内的行数不够，就从那里开始输出），并且同时只运行少量这样的扫描。
 2. **调度。** 当排队作业的组有空闲槽位，且其申请的每块 GPU 都有空闲槽位时，该作业启动。
-   守护进程随后请求 helper 创建它。
+   候选作业按优先级顺序考虑（参见[优先级与公平共享](#priority-and-fair-share)）。守护进程随后请求 helper 创建它。
 3. **守护进程 → helper。** 守护进程与 `/run/puzuz/helper.sock` 保持一个连接，交换以换行分隔的 JSON。
    首先由 Hello 消息检查协议版本。之后是带 id 的请求，以及来自 helper 的带编号的事件（作业已退出、检查点或恢复已完成）。
    事件会被持久化，并在守护进程确认之前反复重放，因此守护进程停止期间不会丢失任何内容。
@@ -172,12 +172,34 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   如有需要，请用 `puzuz kill` 或 `puzuz shutdown --no-checkpoint` 停止它。
 - 单独执行 **`systemctl stop/restart puzuz-helper` 或 `puzuz`** 时，作业会继续运行。
 
+<a id="priority-and-fair-share"></a>
+## 优先级与公平共享
+
+排队作业的顺序是 Slurm 的多因子优先级（公式和设置见
+[docs/install.md](install.md#priority-and-fair-share)）。其工作划分与调度器的其他部分相同：
+
+- `puzuz-core::priority` 是纯逻辑的：各因子、公式、所有者自己的顺序（top、`-o` 优先级、id；通过按此顺序
+  分配用户的等待时间来实现）、经典的 fair-share 因子 `2^(-U/S)`、衰减、作业的计费以及重置周期的边界
+  （根据守护进程传入的本地 UTC 偏移计算）。`scheduler::plan_prioritized` 用它对候选作业排序，然后原样应用
+  通常的槽位、暂停和依赖规则，因此放不下的高优先级作业永远不会阻塞排在它后面的作业。`plan`/`plan_with`
+  保持 pueue 的顺序（也用于 `priority_type = "basic"`）。
+- 存储中保存 `jobs.nice`、`jobs.site_factor`、`jobs.top_seq`、`groups.priority`、`user_shares` 和
+  `user_usage` 表，并在 `meta` 中保存上次计算和重置用量的时间（schema 版本 6）。
+- 守护进程在调度事务中读取份额和用量（就在它已经读取的未结束作业旁边的两个小表；不加载已结束的作业），并每隔
+  `priority_calc_period_secs` 运行一次用量任务：在一个事务中，它按自上次计算以来的时间衰减每个用户的用量，
+  加上运行中作业以及此后结束的作业（通过 `finished_at` 上的索引找到）的计费值 × 秒数，执行到期的重置，并唤醒
+  调度器。每次计算对一个作业最多计入两个周期，因此守护进程停机的时间不会被计费。
+- API 增加了 `GET /v1/priority`（等待中的作业及其因子，不含命令，所有人可用）、
+  `GET /v1/shares`、`PUT /v1/shares/{uid}` 和 `PUT /v1/groups/{name}/priority`（管理员），
+  以及 `POST /v1/jobs/nice`、`/v1/jobs/top` 和 `/v1/jobs/site`，它们像批量端点一样按作业报告结果。
+  负的 nice 值、site 因子、份额和组优先级在 `puzuz-core::authz` 中检查。
+
 <a id="state"></a>
 ## 状态
 
 | 数据 | 位置 | 所有者 |
 | --- | --- | --- |
-| 作业、组、GPU 槽位上限、检查点记录、待处理的警告 | `/var/lib/puzuz/daemon/state.sqlite`（WAL 并使用 `synchronous=FULL`，已确认的 helper 事件在断电后也不会丢失；用 `PRAGMA user_version` 管理 schema 版本） | 守护进程 |
+| 作业、组、GPU 槽位上限、检查点记录、待处理的警告、fair-share 的份额和用量 | `/var/lib/puzuz/daemon/state.sqlite`（WAL 并使用 `synchronous=FULL`，已确认的 helper 事件在断电后也不会丢失；用 `PRAGMA user_version` 管理 schema 版本） | 守护进程 |
 | 作业记录、事件队列 | `/var/lib/puzuz/helper/` | helper |
 | 作业输出 | `/var/lib/puzuz/logs/<uid>/<id>.log` | 目录由 helper 创建（归该用户所有，组为 `puzuz`，模式 2770）。shim 以所有者身份写入日志。守护进程读取和截断日志时不跟随符号链接，并且仅当它是归作业所有者所有的普通文件时才这样做。 |
 | 检查点镜像 | `/var/lib/puzuz/checkpoints/<id>/` | helper（仅 root） |

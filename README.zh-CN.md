@@ -34,6 +34,8 @@
   `shutdown`、`completions`，以及组、依赖（`--after`）、优先级、延迟和标签。
 - GPU 槽位：按 GPU 限制同时运行的作业数（`puzuz gpu parallel`）。每个作业会获得
   `CUDA_VISIBLE_DEVICES` 和 `CUDA_DEVICE_ORDER=PCI_BUS_ID`。GPU 通过 NVML 检测。
+- 用户之间的公平共享：Slurm 风格的多因子优先级（带衰减用量的 fair share、
+  等待时间、nice、`top`；`puzuz prio` 和 `puzuz share` 显示具体数值）。
 - 对 CPU 和 CUDA 进程进行透明的检查点保存与恢复，包括 DataLoader worker 通过 fork 创建的 PyTorch 作业
   （参见 [fork guard](#limitations)）。
 - 操作系统关机或重启时，自动为所有运行中的作业创建检查点。
@@ -190,6 +192,7 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | 用语 | "task" | "job"。为了兼容，保留了 `--print-task-id` 等选项名。 |
 | `--json` | pueue 的内部状态 | puzuz 自己的格式，见下文 |
 | `edit`、`env`、`restart --edit` | 支持 | 接受但尚未实现 |
+| `add -o/--priority`、`switch` | 对守护进程的所有任务排序 | 只对你自己的作业排序；哪个用户的作业先启动由带 fair share 的 Slurm 风格多因子优先级决定（参见[作业优先级](#job-priority)）。`priority_type = "basic"` 可恢复 pueue 的顺序。 |
 | 回调、别名、`pueue.yml` | 支持 | 不可用 |
 
 额外的命令和选项：
@@ -201,6 +204,11 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | `checkpoint [IDS] [-g GROUP] [-a]` | 保存运行中的作业并停止它们 |
 | `restore [IDS] [-g GROUP] [-a] [-i]` | 继续运行 `Checkpointed` 作业（`-i`：立即运行，忽略空闲槽位） |
 | `gpu [-j]`、`gpu parallel <N> [--gpu LIST]` | 列出 GPU，或设置每块 GPU 的作业数上限（管理员） |
+| `add --nice <N>`、`nice <IDS>... <N>` | 将作业的优先级降低 `N`（Slurm 的 nice；负值仅限管理员） |
+| `top <IDS>...` | 将作业移到你自己队列的最前面（Slurm 的 `scontrol top`） |
+| `prio [IDS] [-j]` | 按调度顺序列出等待中的作业及其优先级因子（类似 Slurm 的 `sprio`） |
+| `share [-j]`、`share set <USER> <N>` | 每个用户的 fair-share 状态（类似 Slurm 的 `sshare`）；设置用户的份额（管理员） |
+| `site <IDS>... <N>`、`group priority <GROUP> <N>` | 作业的 site 因子、组的优先级（管理员） |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | 管理 systemd 服务；如果最终检查失败，install 以非零状态退出（参见 [docs/zh-CN/install.md](docs/zh-CN/install.md)） |
 | `uninstall [--purge] [--yes]` | 删除服务以及 `service install` 复制的二进制文件（需要 root） |
 | `update [--check] [--version V] [-y]` | 将 puzuz 更新到最新（或指定的）发布版本；需要 root，非 root 时只检查（参见 [docs/zh-CN/install.md](docs/zh-CN/install.md#upgrading)） |
@@ -236,12 +244,20 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   `terminating` 和 `done` 带有 `result`，其值为以下之一：`success`、`failed`（`exit_code`）、
   `failed_to_spawn`（`reason`）、`killed`、`dependency_failed`、`checkpoint_failed`（`reason`）和
   `lost`。
-- `checkpoint_size_bytes`、`details` 和 `details.last_error` 在不适用时省略。
+- `checkpoint_size_bytes`、`details`、`details.last_error`、作业的 `nice` 以及组的
+  `priority` 在不适用（或为 0）时省略。
   对于其他用户的作业，`label` 为 null，`details` 不存在，`reason` 为 `"<redacted>"`。
 - `puzuz log --json` 输出 `{"<id>": {"job": <job>, "output": "..."}}`。`puzuz group --json`
   输出 `{"groups": [...]}`。`puzuz gpu --json` 输出
   `{"gpus": [{"index", "uuid", "name", "memory_total_bytes", "driver_version", "parallel",
   "used", "jobs": [{"id", "owner"}]}]}`，其中 `"available": false` 表示已消失的 GPU。
+- `puzuz prio --json` 输出 `{"priority_type", "weights": {"age", "fairshare", "job_size",
+  "partition", "tres"}, "jobs": [{"id", "owner", "group", "priority", "factors": {"age",
+  "fairshare", "job_size", "partition", "tres_cpu", "tres_gpu"}, "weighted": {"age", "fairshare",
+  "job_size", "partition", "tres"}, "site", "nice"}]}`，作业按调度顺序排列。
+  `puzuz share --json` 输出 `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
+  "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
+  "usage_reset_period", "billing_weights", "usage_calc_at"}`。
 
 <a id="multi-user-model-and-authorization"></a>
 ## 多用户模型与授权
@@ -254,9 +270,11 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   工作目录、环境变量、标签、失败原因和日志。同样，`add --after` 只接受调用者能够删除的作业
   （自己的作业；管理员则为任意作业）：一个作业会阻止删除它所依赖的作业，因此依赖他人的作业会使对方无法删除或清理该作业。
   重复给出的依赖只记录一次。
-- **所有人：** 查看作业的存在、其所有者、组、GPU、状态、优先级、依赖和时间（`status`、`gpu`）。
-  由此可以看到谁在使用哪块 GPU。
-- **仅限管理员：** `group add/remove`、`parallel`、`gpu parallel`、暂停或继续整个组
+- **所有人：** 查看作业的存在、其所有者、组、GPU、状态、优先级、依赖和时间（`status`、`gpu`），
+  等待中作业的优先级因子（`prio`）以及所有人的 fair-share 用量（`share`）。由此可以看到谁在使用哪块 GPU。
+- **所有者：** 值为 0 或以上的 `nice`，以及 `top`（除非设置了 `enable_user_top = false`）。
+- **仅限管理员：** `share set`、`group priority`、`site`、负值的 `nice`、对其他用户作业执行 `top`、
+  `group add/remove`、`parallel`、`gpu parallel`、暂停或继续整个组
   （`pause/start/kill -g` 针对一个组，`pause/start/kill -a` 针对所有组）、
   `shutdown`、对其他用户作业执行 `reset`，以及对[孤立作业](docs/zh-CN/architecture.md#orphans)（helper 正在运行、
   但守护进程并不掌握的进程；`status` 会向管理员列出它们）执行 `kill <id>`。与 pueue 一样，`pause` 和 `kill` 会暂停所选的组，
@@ -282,6 +300,16 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - 组的行为与 pueue 相同（`default` 组初始为 `parallel 1`）。两种限制同时生效。
 - GPU 在守护进程启动时通过 NVML 检测（配置中的 `[[gpus]]` 列表只是后备）。添加或移除 GPU 后请重启
   `puzuz.service`。`puzuz doctor` 会将守护进程检测到的内容与 `nvidia-smi` 进行比较。
+
+<a id="job-priority"></a>
+## 作业优先级
+
+当多个作业等待相同的槽位时，在能够放入的作业中优先级最高的那个先启动。优先级遵循 Slurm 的 multifactor
+插件：默认情况下，它是 fair-share 因子（最近使用机器较少的用户优先，用量以 7 天的半衰期衰减）与
+等待时间因子（等待的时长）之和，再减去作业的 nice 值。也可以加入作业大小、组（partition）和按 GPU（TRES）
+的因子。你自己的 `-o` 优先级、`switch` 和 `puzuz top` 只会重新排列你自己的作业。`puzuz prio` 显示作业
+为何处于当前位置，`puzuz share` 显示所有人的用量。公式和设置参见
+[优先级与公平共享](docs/zh-CN/install.md#priority-and-fair-share)。
 
 <a id="requirements"></a>
 ## 要求
@@ -378,7 +406,7 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 ## 文档
 
 - [docs/zh-CN/install.md](docs/zh-CN/install.md)：要求、构建、安装、配置、
-  升级、卸载和故障排查
+  优先级与公平共享、升级、卸载和故障排查
 - [docs/zh-CN/architecture.md](docs/zh-CN/architecture.md)：组件、作业流程、关机顺序、状态存储和
   crate 布局
 

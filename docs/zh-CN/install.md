@@ -16,6 +16,7 @@
 - [验证](#verifying)
 - [配置](#configuration)
 - [管理员](#administrators)
+- [优先级与公平共享](#priority-and-fair-share)
 - [GPU 检测](#gpu-detection)
 - [检查点存储](#checkpoint-storage)
 - [升级](#upgrading)
@@ -1031,6 +1032,7 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/puzu
 | `update_source` | `"github:kaito4681/puzuz"` | CLI | `puzuz update` 和 `puzuz doctor` 查找发布版本的位置：`github:<owner>/<repo>` |
 | `update_check` | `true` | CLI | `puzuz doctor` 是否向 `update_source` 查询更新的发布版本 |
 | `[[gpus]]` | 空 | 守护进程 | 静态 GPU 列表：`index`（必需）、`uuid`、`name`、`memory_total_bytes`（见 [GPU 检测](#gpu-detection)） |
+| `[priority]` | 带 fair share 的多因子优先级 | 守护进程 | 排队作业的排序方式（见[优先级与公平共享](#priority-and-fair-share)） |
 
 `puzuz-helper serve` 也接受命令行参数（`puzuz-helper serve --help`），它们会覆盖配置文件。请优先
 使用配置文件：`puzuz doctor` 报告的是文件中的值，并会在单元的 `ExecStart=` 传递参数时发出警告。
@@ -1040,13 +1042,111 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/puzu
 
 管理员是 root 以及 `puzuz-admin` 的成员（主组或附加组）。他们可以操作所有用户的作业，并运行
 仅限管理员的命令（`group add/remove`、`parallel`、`gpu parallel`、用 `pause/start/kill -g` 或
-`-a` 暂停/恢复组、`shutdown`、对所有作业执行 `reset`）。
+`-a` 暂停/恢复组、`shutdown`、对所有作业执行 `reset`，以及优先级设置 `share set`、`group priority`、`site` 和负值的
+`nice`）。
 
 ```sh
 sudo usermod -aG puzuz-admin alice
 ```
 
 守护进程在每次请求时（通过 NSS）查询组成员关系，因此更改立即生效，无需重新登录。
+
+<a id="priority-and-fair-share"></a>
+## 优先级与公平共享
+
+当多个排队作业等待相同的组或 GPU 槽位时，puzuz 会在能够放入的作业中启动优先级最高的那个（放不下的作业
+永远不会阻塞排在它后面的较小作业）。优先级遵循 Slurm 的
+[multifactor priority plugin](https://slurm.schedmd.com/priority_multifactor.html)：
+
+```text
+priority = site factor
+         + priority_weight_age       * age factor
+         + priority_weight_fairshare * fair-share factor
+         + priority_weight_job_size  * job size factor
+         + priority_weight_partition * partition factor
+         + priority_weight_tres      * TRES factors
+         - nice
+```
+
+每个因子都在 0 到 1 之间：
+
+- **Age（等待时间）：** 自作业变为可运行（已排队，且所有依赖都已成功结束）以来的时间除以
+  `priority_max_age_secs`，最大为 1。暂存（stashed）的作业和正在等待依赖的作业不会累计等待时间。
+- **Fair share：** Slurm 的经典公式 `F = 2^(-U/S)`。`S`（归一化份额）是该用户的份额除以所有*活跃*
+  用户份额之和，活跃用户指有未结束作业或有用量记录的用户（除非管理员设置了其他数值，每个用户的份额为 1）。
+  `U`（有效用量）是该用户的用量除以所有用户的用量（在没有人使用过任何资源时为 0）。恰好用完自己份额的用户
+  得到 0.5，用得比份额少则更高，用得多则更低；份额为 0 的用户得到 0。
+- **Job size（作业大小）：** 作业的 GPU 数除以机器的 GPU 数；对于仅使用 CPU 的作业，则为一个 CPU 除以机器的
+  CPU 数（puzuz 不分配 CPU，因此每个作业都按一个 CPU 计算）。当 `priority_favor_small = true` 时，改为
+  `(total - requested + 1) / total`，因此最小的作业得到 1。
+- **Partition：** puzuz 的组扮演 Slurm partition 的角色。管理员用 `puzuz group priority <group> <n>`
+  为组设置优先级；该因子是这个优先级除以所有组中最高的优先级（所有组的优先级都为 0 时为 0）。
+- **TRES：** 对于 `priority_weight_tres` 中加权的每种资源（`CPU`、`GRES/gpu`），作业的申请量除以机器的总量。
+
+**用量。** 每隔 `priority_calc_period_secs`（以及守护进程启动时），守护进程会针对每个运行中的作业，
+将其计费值（来自 `tres_billing_weights`，默认为每个 CPU 1 加上每块 GPU 10）乘以自上次计算以来运行的秒数，
+计入其所有者的用量，其中也包括在此期间结束的作业。暂停、已创建检查点和排队中的作业不计费，并且每次计算
+对一个作业最多计入两个周期，因此守护进程未运行的时间不会被计费。与此同时，所有用量以
+`priority_decay_half_life_secs` 为半衰期衰减（0：不衰减）。用量保存在数据库中，重启后仍然保留，并按
+`priority_usage_reset_period` 的设置重置（`"now"` 在每次守护进程启动时重置；按日历的周期在本地时间 00:00
+重置，按周的周期在周日重置）。低于 0.001 计费秒的用量会被丢弃。
+
+**用户自己的顺序。** pueue 的 `-o/--priority`、`puzuz switch` 和 `puzuz top` 只对同一个用户的作业排序，
+与 HTCondor 的 `condor_prio` 和 Slurm 的 `scontrol top` 一样：顺序是先排被移到最前面的作业（最近一次 `top`
+的在前），然后是 `-o` 优先级较高的，然后是 id 较小的。puzuz 通过按这个顺序分配该用户等待中作业的等待时间
+（最长的等待时间分给第一个作业）来实现它，因此该用户的优先级之和以及其他每个用户的位置都保持不变。剩余的
+平局先按该用户的顺序、再按 id 决定。**这是与 pueue 的不同之处，**在 pueue 中，`-o` 优先级较高的作业胜过所有
+其他作业。`priority_type = "basic"` 可恢复 pueue 的顺序（对所有作业先按 `-o` 优先级从高到低、再按 id 从小到大；
+此时 nice、site 因子、`top` 和 fair share 都被忽略）。
+
+**命令。**
+
+| 命令 | 谁可以使用 | Slurm |
+| --- | --- | --- |
+| `puzuz prio [IDS] [--json]` | 所有人 | `sprio`：按调度顺序列出每个等待中的作业及其优先级和加权后的因子（不显示命令） |
+| `puzuz share [--json]` | 所有人 | `sshare`：每个用户的份额、归一化份额、原始用量和有效用量以及 fair-share 因子 |
+| `puzuz add --nice N`、`puzuz nice <IDS>... <N>` | 所有者（`N >= 0`）、管理员（任意 `N`） | `--nice`、`scontrol update nice=` |
+| `puzuz top <IDS>...` | 所有者（需 `enable_user_top`）、管理员 | `scontrol top` |
+| `puzuz site <IDS>... <N>` | 管理员 | site 因子 |
+| `puzuz share set <USER> <N>` | 管理员 | `sacctmgr modify user set fairshare=` |
+| `puzuz group priority <GROUP> <N>` | 管理员 | partition 的 `PriorityJobFactor` |
+
+作业被 restart 后得到的副本会保留 0 或以上的 nice 值，但不会保留负的 nice 值和 site 因子。
+`puzuz status --json` 会在作业的 `nice` 和组的 `priority` 不为 0 时显示它们。
+
+从没有优先级功能的发布版本升级时，数据库会迁移到 schema 版本 6：已有作业保留其 `-o` 优先级，从此它只对
+其所有者的作业排序，用量从零开始。旧的发布版本无法打开迁移后的数据库（`puzuz update` 会拒绝安装它们）。
+
+**设置。** 位于 `/etc/puzuz/config.toml` 的 `[priority]` 表中（更改后请重启 `puzuz.service`）。
+`[priority]` 行之后的键都属于该表，因此请把其他键放在它的上方。
+
+| 键 | 默认值 | Slurm |
+| --- | --- | --- |
+| `priority_type` | `"multifactor"`（`"basic"`：pueue 的顺序） | `PriorityType` |
+| `priority_weight_age` | `1000` | `PriorityWeightAge` |
+| `priority_weight_fairshare` | `10000` | `PriorityWeightFairshare` |
+| `priority_weight_job_size` | `0` | `PriorityWeightJobSize` |
+| `priority_weight_partition` | `0` | `PriorityWeightPartition` |
+| `priority_weight_tres` | `""`（例如 `"GRES/gpu=1000"`） | `PriorityWeightTRES` |
+| `priority_max_age_secs` | `604800`（7 天） | `PriorityMaxAge` |
+| `priority_decay_half_life_secs` | `604800`（7 天；0：不衰减） | `PriorityDecayHalfLife` |
+| `priority_calc_period_secs` | `300` | `PriorityCalcPeriod` |
+| `priority_usage_reset_period` | `"none"`（`"now"`、`"daily"`、`"weekly"`、`"monthly"`、`"quarterly"`、`"yearly"`） | `PriorityUsageResetPeriod` |
+| `priority_favor_small` | `false` | `PriorityFavorSmall` |
+| `tres_billing_weights` | `"CPU=1.0,GRES/gpu=10.0"` | `TRESBillingWeights` |
+| `enable_user_top` | `true` | `SchedulerParameters=enable_user_top` |
+
+例如，要让使用更多 GPU 的作业优先，并提升 `urgent` 组的优先级：
+
+```toml
+[priority]
+priority_weight_tres = "GRES/gpu=2000"
+priority_weight_partition = 5000
+```
+
+```sh
+sudo puzuz group priority urgent 10
+```
 
 <a id="gpu-detection"></a>
 ## GPU 检测

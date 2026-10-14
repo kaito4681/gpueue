@@ -29,6 +29,7 @@ docs/<lang>/ go up two levels (../../packaging/...). Code blocks are copied unch
 - [確認](#verifying)
 - [設定](#configuration)
 - [管理者](#administrators)
+- [優先度とフェアシェア](#priority-and-fair-share)
 - [GPU の検出](#gpu-detection)
 - [チェックポイントの保存先](#checkpoint-storage)
 - [アップグレード](#upgrading)
@@ -1124,6 +1125,7 @@ sudo systemctl restart puzuz-helper.service puzuz.service
 | `update_source` | `"github:kaito4681/puzuz"` | CLI | `puzuz update` と `puzuz doctor` がリリースを探す場所：`github:<owner>/<repo>` |
 | `update_check` | `true` | CLI | `puzuz doctor` が `update_source` に新しいリリースを問い合わせるかどうか |
 | `[[gpus]]` | 空 | デーモン | 静的な GPU のリスト：`index`（必須）、`uuid`、`name`、`memory_total_bytes`（[GPU の検出](#gpu-detection) を参照） |
+| `[priority]` | フェアシェアを含むマルチファクター優先度 | デーモン | キューにあるジョブの順序の決め方（[優先度とフェアシェア](#priority-and-fair-share) を参照） |
 
 `puzuz-helper serve` はコマンドラインのフラグも受け付けます（`puzuz-helper serve --help`）。フラグはファイルより
 優先されます。ファイルを使うことを推奨します。`puzuz doctor` はファイルの値を報告し、ユニットの `ExecStart=`
@@ -1134,7 +1136,8 @@ sudo systemctl restart puzuz-helper.service puzuz.service
 
 管理者は root と `puzuz-admin` のメンバー（プライマリまたは補助グループ）です。全ユーザーのジョブを操作でき、
 管理者専用のコマンド（`group add/remove`、`parallel`、`gpu parallel`、`pause/start/kill -g` や `-a` による
-グループの一時停止/再開、`shutdown`、全ジョブの `reset`）を実行できます。
+グループの一時停止/再開、`shutdown`、全ジョブの `reset`、優先度の設定 `share set`、`group priority`、
+`site`、負の値の `nice`）を実行できます。
 
 ```sh
 sudo usermod -aG puzuz-admin alice
@@ -1142,6 +1145,115 @@ sudo usermod -aG puzuz-admin alice
 
 デーモンはリクエストごとに（NSS を通して）グループを調べるので、変更はログインし直さなくてもすぐに反映
 されます。
+
+<a id="priority-and-fair-share"></a>
+## 優先度とフェアシェア
+
+キューにある複数のジョブが同じグループや GPU のスロットを待っているとき、puzuz は収まるジョブのうち
+優先度が最も高いものを開始します（収まらないジョブが、その後ろにある小さなジョブを妨げることはありません）。
+優先度は Slurm の
+[multifactor priority プラグイン](https://slurm.schedmd.com/priority_multifactor.html) に従います。
+
+```text
+priority = site factor
+         + priority_weight_age       * age factor
+         + priority_weight_fairshare * fair-share factor
+         + priority_weight_job_size  * job size factor
+         + priority_weight_partition * partition factor
+         + priority_weight_tres      * TRES factors
+         - nice
+```
+
+各要素は 0 から 1 の値です。
+
+- **待ち時間（age）：** ジョブが実行可能になってから（キューにあり、すべての依存関係が成功で終わってから）の
+  時間を `priority_max_age_secs` で割ったもので、最大 1 です。stash されたジョブと依存関係を待っている
+  ジョブは待ち時間が増えません。
+- **フェアシェア：** Slurm の古典的な式 `F = 2^(-U/S)` です。`S`（正規化したシェア）は、そのユーザーの
+  シェアを*アクティブな*全ユーザー、つまり未完了のジョブか記録された使用量があるユーザーのシェアの合計で
+  割ったものです（管理者が別の数を設定しない限り、ユーザーのシェアは 1 です）。`U`（実効使用量）は、
+  そのユーザーの使用量を全ユーザーの使用量で割ったものです（誰も何も使っていない間は 0）。ちょうど自分の
+  シェア分だけ使ったユーザーは 0.5、シェアより少なければそれより大きく、多ければ小さくなります。
+  シェアが 0 のユーザーは 0 です。
+- **ジョブのサイズ：** ジョブの GPU 数をマシンの GPU 数で割ったものです。CPU のみのジョブでは 1 CPU を
+  マシンの CPU 数で割ったものです（puzuz は CPU を割り当てないので、どのジョブも 1 CPU として数えます）。
+  `priority_favor_small = true` では代わりに `(total - requested + 1) / total` となり、最も小さいジョブが
+  1 になります。
+- **パーティション：** puzuz のグループが Slurm のパーティションの役割を果たします。管理者は
+  `puzuz group priority <group> <n>` でグループに優先度を付けます。要素はその優先度を最も高いグループの
+  優先度で割ったものです（すべてのグループの優先度が 0 の間は 0）。
+- **TRES：** `priority_weight_tres` で重みを付けた各リソース（`CPU`、`GRES/gpu`）について、ジョブの要求量を
+  マシンの総量で割ったものです。
+
+**使用量。** `priority_calc_period_secs` ごとに（およびデーモンの起動時に）、デーモンは実行中の各ジョブに
+ついて、その課金量（`tres_billing_weights` による。デフォルトでは CPU 1 つあたり 1、GPU 1 つあたり 10）に
+前回の計算から実行した秒数を掛けたものを所有者の使用量に加えます。その間に終了したジョブも含みます。
+一時停止中、チェックポイント済み、キューにあるジョブは課金されません。また、1 回の計算でジョブに課金される
+のは最大 2 期間分なので、デーモンが動いていなかった時間は課金されません。同時に、すべての使用量が
+`priority_decay_half_life_secs` の半減期で減衰します（0：減衰なし）。使用量は再起動をまたいでデータベースに
+保存され、`priority_usage_reset_period` に従ってリセットされます（`"now"` はデーモンが起動するたびに
+リセットします。暦の期間はローカル時刻の 00:00 にリセットし、週は日曜日に始まります）。0.001
+課金秒未満の使用量は破棄されます。
+
+**ユーザー自身の順序。** pueue の `-o/--priority`、`puzuz switch`、`puzuz top` は、HTCondor の
+`condor_prio` や Slurm の `scontrol top` と同じく、1 人のユーザーのジョブだけを並べ替えます。順序は、
+先頭に移したジョブ（最も新しい `top` が先）、次に `-o` の優先度が高いもの、次に id が小さいものです。
+puzuz はこれを、ユーザーの待機中のジョブの待ち時間をこの順に割り当て直す（最も長い待ち時間を最初の
+ジョブに）ことで適用します。そのため、そのユーザーの優先度の合計も、他のユーザーの位置も変わりません。
+それでも並ぶ場合は、ユーザーの順序、次に id で決まります。**これは pueue からの変更点です。** pueue では
+`-o` の優先度が高いジョブが他のすべてのジョブより先になります。`priority_type = "basic"` で pueue の順序
+（全ジョブについて `-o` の優先度が高いもの、次に id が小さいもの。nice、サイトファクター、`top`、
+フェアシェアは無視されます）に戻ります。
+
+**コマンド。**
+
+| コマンド | 実行できるユーザー | Slurm |
+| --- | --- | --- |
+| `puzuz prio [IDS] [--json]` | 全員 | `sprio`：待機中の各ジョブをスケジュール順に、優先度と重み付けした要素とともに表示します（コマンドは表示しません） |
+| `puzuz share [--json]` | 全員 | `sshare`：ユーザーごとのシェア、正規化したシェア、生の使用量と実効使用量、フェアシェアの要素 |
+| `puzuz add --nice N`、`puzuz nice <IDS>... <N>` | 所有者（`N >= 0`）、管理者（任意の `N`） | `--nice`、`scontrol update nice=` |
+| `puzuz top <IDS>...` | 所有者（`enable_user_top` のとき）、管理者 | `scontrol top` |
+| `puzuz site <IDS>... <N>` | 管理者 | サイトファクター |
+| `puzuz share set <USER> <N>` | 管理者 | `sacctmgr modify user set fairshare=` |
+| `puzuz group priority <GROUP> <N>` | 管理者 | パーティションの `PriorityJobFactor` |
+
+ジョブを restart したコピーは、0 以上の nice 値は引き継ぎますが、負の値やサイトファクターは引き継ぎません。
+`puzuz status --json` は、ジョブの `nice` とグループの `priority` が 0 でないときに表示します。
+
+優先度のないリリースからアップグレードすると、データベースはスキーマバージョン 6 に移行します。既存の
+ジョブは `-o` の優先度を保ち、以後それはその所有者のジョブの順序だけを決めます。使用量は 0 から始まります。
+古いリリースは移行したデータベースを開けません（`puzuz update` はそれらのインストールを拒否します）。
+
+**設定。** `/etc/puzuz/config.toml` の `[priority]` テーブルです（変更したら `puzuz.service` を再起動して
+ください）。`[priority]` の行より下のキーはこのテーブルに属するので、他のキーはその上に置いてください。
+
+| キー | デフォルト | Slurm |
+| --- | --- | --- |
+| `priority_type` | `"multifactor"`（`"basic"`：pueue の順序） | `PriorityType` |
+| `priority_weight_age` | `1000` | `PriorityWeightAge` |
+| `priority_weight_fairshare` | `10000` | `PriorityWeightFairshare` |
+| `priority_weight_job_size` | `0` | `PriorityWeightJobSize` |
+| `priority_weight_partition` | `0` | `PriorityWeightPartition` |
+| `priority_weight_tres` | `""`（例：`"GRES/gpu=1000"`） | `PriorityWeightTRES` |
+| `priority_max_age_secs` | `604800`（7 日） | `PriorityMaxAge` |
+| `priority_decay_half_life_secs` | `604800`（7 日。0：減衰なし） | `PriorityDecayHalfLife` |
+| `priority_calc_period_secs` | `300` | `PriorityCalcPeriod` |
+| `priority_usage_reset_period` | `"none"`（`"now"`、`"daily"`、`"weekly"`、`"monthly"`、`"quarterly"`、`"yearly"`） | `PriorityUsageResetPeriod` |
+| `priority_favor_small` | `false` | `PriorityFavorSmall` |
+| `tres_billing_weights` | `"CPU=1.0,GRES/gpu=10.0"` | `TRESBillingWeights` |
+| `enable_user_top` | `true` | `SchedulerParameters=enable_user_top` |
+
+たとえば、GPU を多く使うジョブを優先し、`urgent` グループの優先度を上げるには次のようにします。
+
+```toml
+[priority]
+priority_weight_tres = "GRES/gpu=2000"
+priority_weight_partition = 5000
+```
+
+```sh
+sudo puzuz group priority urgent 10
+```
 
 <a id="gpu-detection"></a>
 ## GPU の検出

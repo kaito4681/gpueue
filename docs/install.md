@@ -16,6 +16,7 @@ command on their `PATH`.
 - [Verifying](#verifying)
 - [Configuration](#configuration)
 - [Administrators](#administrators)
+- [Priority and fair share](#priority-and-fair-share)
 - [GPU detection](#gpu-detection)
 - [Checkpoint storage](#checkpoint-storage)
 - [Upgrading](#upgrading)
@@ -1117,6 +1118,7 @@ Every `*_secs` key is at most one year (31536000).
 | `update_source` | `"github:kaito4681/puzuz"` | CLI | where `puzuz update` and `puzuz doctor` look for releases: `github:<owner>/<repo>` |
 | `update_check` | `true` | CLI | whether `puzuz doctor` asks `update_source` for a newer release |
 | `[[gpus]]` | empty | daemon | static GPU list: `index` (required), `uuid`, `name`, `memory_total_bytes` (see [GPU detection](#gpu-detection)) |
+| `[priority]` | multifactor priority with fair share | daemon | how queued jobs are ordered (see [Priority and fair share](#priority-and-fair-share)) |
 
 `puzuz-helper serve` also accepts command-line flags (`puzuz-helper serve --help`). They override
 the file. Prefer the file: `puzuz doctor` reports the file's values and warns when the unit's
@@ -1127,7 +1129,8 @@ the file. Prefer the file: `puzuz doctor` reports the file's values and warns wh
 Administrators are root and the members of `puzuz-admin` (primary or supplementary group). They
 can act on every user's jobs and run the admin-only commands (`group add/remove`, `parallel`,
 `gpu parallel`, pausing/resuming groups with `pause/start/kill -g` or `-a`, `shutdown`, `reset`
-of all jobs).
+of all jobs, and the priority settings `share set`, `group priority`, `site` and negative
+`nice`).
 
 ```sh
 sudo usermod -aG puzuz-admin alice
@@ -1135,6 +1138,115 @@ sudo usermod -aG puzuz-admin alice
 
 The daemon looks the group up on every request (through NSS), so the change applies at once,
 without logging in again.
+
+## Priority and fair share
+
+When several queued jobs wait for the same group or GPU slots, puzuz starts the one with the
+highest priority among those that fit (a job that does not fit never blocks smaller ones behind
+it). The priority follows Slurm's
+[multifactor priority plugin](https://slurm.schedmd.com/priority_multifactor.html):
+
+```text
+priority = site factor
+         + priority_weight_age       * age factor
+         + priority_weight_fairshare * fair-share factor
+         + priority_weight_job_size  * job size factor
+         + priority_weight_partition * partition factor
+         + priority_weight_tres      * TRES factors
+         - nice
+```
+
+Each factor is between 0 and 1:
+
+- **Age:** the time since the job became eligible (queued, with every dependency finished
+  successfully), divided by `priority_max_age_secs`, at most 1. Stashed jobs and jobs waiting for a
+  dependency do not age.
+- **Fair share:** Slurm's classic formula `F = 2^(-U/S)`. `S` (normalised shares) is the user's
+  shares divided by the sum of the shares of all *active* users, that is users with an unfinished
+  job or recorded usage (users have 1 share unless an administrator sets another number). `U`
+  (effective usage) is the user's usage divided by every user's usage (0 while nobody has used
+  anything). A user who used exactly their share gets 0.5, less than their share more, more less;
+  a user with 0 shares gets 0.
+- **Job size:** the job's GPUs divided by the machine's GPUs; for CPU-only jobs one CPU divided by
+  the machine's CPUs (puzuz does not allocate CPUs, so every job counts as one CPU). With
+  `priority_favor_small = true` it is `(total - requested + 1) / total` instead, so the smallest
+  jobs get 1.
+- **Partition:** puzuz groups play the role of Slurm partitions. An administrator gives a group a
+  priority with `puzuz group priority <group> <n>`; the factor is that priority divided by the
+  highest group priority (0 while every group has priority 0).
+- **TRES:** for each resource weighted in `priority_weight_tres` (`CPU`, `GRES/gpu`), the job's
+  request divided by the machine's total.
+
+**Usage.** Every `priority_calc_period_secs` (and when the daemon starts) the daemon adds, for
+every running job, its billing (from `tres_billing_weights`, by default 1 per CPU plus 10 per
+GPU) times the seconds it ran since the last calculation to its owner's usage, including jobs
+that finished in between. Paused, checkpointed and queued jobs are not charged, and a job is
+charged at most two periods per calculation, so time the daemon was not running is not billed.
+At the same time all usage decays with a half-life of `priority_decay_half_life_secs` (0: no
+decay). Usage is kept in the database across restarts and reset as `priority_usage_reset_period`
+says (`"now"` resets it whenever the daemon starts; the calendar periods reset at 00:00 local
+time, weeks on Sunday). Usage below 0.001 billing-seconds is dropped.
+
+**A user's own order.** pueue's `-o/--priority`, `puzuz switch` and `puzuz top` only order the
+jobs of one user, like HTCondor's `condor_prio` and Slurm's `scontrol top`: the order is jobs
+moved to the top first (the most recent `top` first), then higher `-o` priority, then lower id.
+puzuz applies it by handing out the ages of a user's pending jobs in that order (the oldest age
+to the first job), so the sum of the user's priorities, and every other user's position, stays
+the same. Remaining ties go by the user's order, then by id. **This is a change from pueue,**
+where a higher `-o` priority wins over every other job. `priority_type = "basic"` restores
+pueue's order (higher `-o` priority first, then lower id, for all jobs; nice, site factors, `top`
+and fair share are then ignored).
+
+**Commands.**
+
+| Command | Who | Slurm |
+| --- | --- | --- |
+| `puzuz prio [IDS] [--json]` | everyone | `sprio`: each pending job in scheduling order with its priority and weighted factors (no commands are shown) |
+| `puzuz share [--json]` | everyone | `sshare`: shares, normalised shares, raw and effective usage and fair-share factor per user |
+| `puzuz add --nice N`, `puzuz nice <IDS>... <N>` | owner (`N >= 0`), administrators (any `N`) | `--nice`, `scontrol update nice=` |
+| `puzuz top <IDS>...` | owner (with `enable_user_top`), administrators | `scontrol top` |
+| `puzuz site <IDS>... <N>` | administrators | the site factor |
+| `puzuz share set <USER> <N>` | administrators | `sacctmgr modify user set fairshare=` |
+| `puzuz group priority <GROUP> <N>` | administrators | partition `PriorityJobFactor` |
+
+A restarted copy of a job keeps a nice value of 0 or more, but not a negative one or the site
+factor. `puzuz status --json` shows a job's `nice` and a group's `priority` when they are not 0.
+
+Upgrading from a release without priorities migrates the database to schema version 6: existing
+jobs keep their `-o` priority, which from then on orders only their owner's jobs, and usage
+starts at zero. Older releases cannot open the migrated database (`puzuz update` refuses to
+install them).
+
+**Settings.** The `[priority]` table of `/etc/puzuz/config.toml` (restart `puzuz.service` after a
+change). Keys below the `[priority]` line belong to the table, so keep other keys above it.
+
+| Key | Default | Slurm |
+| --- | --- | --- |
+| `priority_type` | `"multifactor"` (`"basic"`: pueue's order) | `PriorityType` |
+| `priority_weight_age` | `1000` | `PriorityWeightAge` |
+| `priority_weight_fairshare` | `10000` | `PriorityWeightFairshare` |
+| `priority_weight_job_size` | `0` | `PriorityWeightJobSize` |
+| `priority_weight_partition` | `0` | `PriorityWeightPartition` |
+| `priority_weight_tres` | `""` (e.g. `"GRES/gpu=1000"`) | `PriorityWeightTRES` |
+| `priority_max_age_secs` | `604800` (7 days) | `PriorityMaxAge` |
+| `priority_decay_half_life_secs` | `604800` (7 days; 0: no decay) | `PriorityDecayHalfLife` |
+| `priority_calc_period_secs` | `300` | `PriorityCalcPeriod` |
+| `priority_usage_reset_period` | `"none"` (`"now"`, `"daily"`, `"weekly"`, `"monthly"`, `"quarterly"`, `"yearly"`) | `PriorityUsageResetPeriod` |
+| `priority_favor_small` | `false` | `PriorityFavorSmall` |
+| `tres_billing_weights` | `"CPU=1.0,GRES/gpu=10.0"` | `TRESBillingWeights` |
+| `enable_user_top` | `true` | `SchedulerParameters=enable_user_top` |
+
+For example, to favour jobs that use more GPUs and give the `urgent` group a boost:
+
+```toml
+[priority]
+priority_weight_tres = "GRES/gpu=2000"
+priority_weight_partition = 5000
+```
+
+```sh
+sudo puzuz group priority urgent 10
+```
 
 ## GPU detection
 

@@ -38,6 +38,8 @@ puzuz は次のものを提供します。
   `shutdown`、`completions`。加えて、グループ、依存関係（`--after`）、優先度、遅延実行、ラベル。
 - GPU スロット：GPU ごとに同時に実行できるジョブ数の上限（`puzuz gpu parallel`）。各ジョブには
   `CUDA_VISIBLE_DEVICES` と `CUDA_DEVICE_ORDER=PCI_BUS_ID` が設定されます。GPU は NVML で検出します。
+- ユーザー間の公平な共有：Slurm 式のマルチファクター優先度（減衰する使用量によるフェアシェア、待ち時間、
+  nice、`top`。`puzuz prio` と `puzuz share` で数値を確認できます）。
 - CPU と CUDA プロセスの透過的なチェックポイント/リストア。DataLoader のワーカーを fork する PyTorch の
   ジョブも含みます（[fork ガード](#limitations) を参照）。
 - OS のシャットダウンや再起動のときに、実行中の全ジョブを自動でチェックポイントします。
@@ -207,6 +209,7 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 | 用語 | "task" | "job"。`--print-task-id` などのオプション名は互換性のためにそのままです。 |
 | `--json` | pueue の内部状態 | puzuz 独自のスキーマ（後述） |
 | `edit`、`env`、`restart --edit` | 対応 | 受け付けますが、まだ実装されていません |
+| `add -o/--priority`、`switch` | デーモンの全タスクを並べ替える | 自分のジョブだけを並べ替えます。どのユーザーのジョブを先に開始するかは、フェアシェアを含む Slurm 式のマルチファクター優先度で決まります（[ジョブの優先度](#job-priority) を参照）。`priority_type = "basic"` で pueue の順序に戻ります。 |
 | コールバック、エイリアス、`pueue.yml` | 対応 | ありません |
 
 追加のコマンドとオプション：
@@ -218,6 +221,11 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 | `checkpoint [IDS] [-g GROUP] [-a]` | 実行中のジョブを保存して停止します |
 | `restore [IDS] [-g GROUP] [-a] [-i]` | `Checkpointed` のジョブを再開します（`-i`：空きスロットを無視してすぐに） |
 | `gpu [-j]`、`gpu parallel <N> [--gpu LIST]` | GPU の一覧を表示するか、GPU ごとのジョブ数の上限を設定します（管理者） |
+| `add --nice <N>`、`nice <IDS>... <N>` | ジョブの優先度を `N` だけ下げます（Slurm の nice。負の値は管理者のみ） |
+| `top <IDS>...` | ジョブを自分のキューの先頭に移します（Slurm の `scontrol top`） |
+| `prio [IDS] [-j]` | 待機中のジョブをスケジュール順に、優先度の要素とともに表示します（Slurm の `sprio` に相当） |
+| `share [-j]`、`share set <USER> <N>` | ユーザーごとのフェアシェアの状態を表示します（Slurm の `sshare` に相当）。ユーザーのシェアを設定します（管理者） |
+| `site <IDS>... <N>`、`group priority <GROUP> <N>` | ジョブのサイトファクター、グループの優先度を設定します（管理者） |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | systemd サービスを管理します。install は最後のチェックが失敗すると 0 以外で終了します（[docs/ja/install.md](docs/ja/install.md) を参照） |
 | `uninstall [--purge] [--yes]` | サービスと、`service install` がコピーしたバイナリを削除します（root が必要） |
 | `update [--check] [--version V] [-y]` | 最新（または指定した）リリースに puzuz を更新します。root が必要で、root でなければ確認だけを行います（[docs/ja/install.md](docs/ja/install.md#upgrading) を参照） |
@@ -254,12 +262,19 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   `terminating` と `done` は `result` を持ち、これは `success`、`failed`（`exit_code`）、
   `failed_to_spawn`（`reason`）、`killed`、`dependency_failed`、`checkpoint_failed`（`reason`）、
   `lost` のいずれかです。
-- `checkpoint_size_bytes`、`details`、`details.last_error` は該当しない場合は省略されます。他のユーザーの
-  ジョブでは、`label` は null、`details` はなく、`reason` は `"<redacted>"` です。
+- `checkpoint_size_bytes`、`details`、`details.last_error`、ジョブの `nice`、グループの `priority` は
+  該当しない場合（または 0 の場合）は省略されます。他のユーザーのジョブでは、`label` は null、`details` はなく、`reason` は `"<redacted>"` です。
 - `puzuz log --json` は `{"<id>": {"job": <job>, "output": "..."}}` を出力します。`puzuz group --json` は
   `{"groups": [...]}` を出力します。`puzuz gpu --json` は
   `{"gpus": [{"index", "uuid", "name", "memory_total_bytes", "driver_version", "parallel",
   "used", "jobs": [{"id", "owner"}]}]}` を出力し、`"available": false` は消えた GPU を示します。
+- `puzuz prio --json` は `{"priority_type", "weights": {"age", "fairshare", "job_size",
+  "partition", "tres"}, "jobs": [{"id", "owner", "group", "priority", "factors": {"age",
+  "fairshare", "job_size", "partition", "tres_cpu", "tres_gpu"}, "weighted": {"age", "fairshare",
+  "job_size", "partition", "tres"}, "site", "nice"}]}` を出力し、ジョブはスケジュール順に並びます。
+  `puzuz share --json` は `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
+  "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
+  "usage_reset_period", "billing_weights", "usage_calc_at"}` を出力します。
 
 <a id="multi-user-model-and-authorization"></a>
 ## マルチユーザーモデルと認可
@@ -276,8 +291,11 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   ジョブに依存できると、その人がジョブを削除したり clean したりできなくなるためです。同じ依存関係を 2 回
   指定しても 1 回として記録されます。
 - **全員：** ジョブが存在すること、その所有者、グループ、GPU、状態、優先度、依存関係、時刻の閲覧
-  （`status`、`gpu`）。これで誰がどの GPU を使っているかが分かります。
-- **管理者のみ：** `group add/remove`、`parallel`、`gpu parallel`、グループ全体の一時停止や再開
+  （`status`、`gpu`）、待機中のジョブの優先度の要素（`prio`）、全員のフェアシェアの使用量（`share`）。
+  これで誰がどの GPU を使っているかが分かります。
+- **所有者：** 0 以上の値での `nice` と、`top`（`enable_user_top = false` でない場合）。
+- **管理者のみ：** `share set`、`group priority`、`site`、負の値の `nice`、他のユーザーのジョブの `top`、
+  `group add/remove`、`parallel`、`gpu parallel`、グループ全体の一時停止や再開
   （1 つのグループには `pause/start/kill -g`、全グループには `pause/start/kill -a`）、`shutdown`、他の
   ユーザーのジョブの `reset`、[孤立ジョブ](docs/ja/architecture.md#orphans)（デーモンが把握していないのにヘルパーが
   実行しているプロセス。`status` が管理者に表示します）の `kill <id>`。pueue と同様に、`pause` と `kill` は選択したグループを一時停止し、`start` は
@@ -305,6 +323,17 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 - GPU はデーモンの起動時に NVML で検出されます（設定の `[[gpus]]` のリストはフォールバックにすぎません）。
   GPU を追加・取り外ししたら `puzuz.service` を再起動してください。`puzuz doctor` はデーモンが検出したものと
   `nvidia-smi` を比較します。
+
+<a id="job-priority"></a>
+## ジョブの優先度
+
+複数のジョブが同じスロットを待っているときは、収まるジョブのうち優先度が最も高いものが先に開始します。
+優先度は Slurm の multifactor プラグインに従います。デフォルトでは、フェアシェアの要素（最近マシンをあまり
+使っていないユーザーが先。使用量は半減期 7 日で減衰します）と待ち時間の要素（待っていた時間）の合計から、
+ジョブの nice 値を引いたものです。ジョブのサイズ、グループ（パーティション）、GPU ごと（TRES）の要素を
+重みに加えることもできます。自分で付けた `-o` の優先度、`switch`、`puzuz top` が並べ替えるのは自分の
+ジョブだけです。`puzuz prio` はジョブがその位置にある理由を、`puzuz share` は全員の使用量を表示します。
+計算式と設定は [優先度とフェアシェア](docs/ja/install.md#priority-and-fair-share) を参照してください。
 
 <a id="requirements"></a>
 ## 要件
@@ -418,8 +447,8 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 <a id="documentation"></a>
 ## ドキュメント
 
-- [docs/ja/install.md](docs/ja/install.md)：要件、ビルド、インストール、設定、アップグレード、アンインストール、
-  トラブルシューティング
+- [docs/ja/install.md](docs/ja/install.md)：要件、ビルド、インストール、設定、優先度とフェアシェア、アップグレード、
+  アンインストール、トラブルシューティング
 - [docs/ja/architecture.md](docs/ja/architecture.md)：コンポーネント、ジョブの流れ、シャットダウンの順序、
   状態の保存、クレートの構成
 
