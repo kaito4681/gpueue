@@ -175,7 +175,9 @@ moment can make such a transient file appear in another directory.
 
 After a crash of the helper during a restore, its next start kills whatever the restore unit
 runs (it was not checked, and in manual mode its CUDA state may not be restored) and reports the
-restore as failed, also when the unit is already gone; the image is kept.
+restore as failed, also when the unit is already gone; the image is kept. If the helper cannot
+record that a restore succeeded, it kills the restored job right away, reports the restore as
+failed and keeps the image as well.
 
 ## Other privilege boundaries
 
