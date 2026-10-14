@@ -2175,6 +2175,59 @@ async fn a_dump_interrupted_before_its_finalization_is_finished_at_start() {
     assert!(c.running().await.is_empty());
 }
 
+/// A restore that succeeded but could not record that the job runs again
+/// (e.g. a full disk) is undone: the restored job is killed and the image
+/// is kept. Otherwise the record would still say "being restored" with the
+/// image gone, and the next start of the helper would kill the job (see
+/// `Helper::recover`), leaving nothing to restore it from.
+#[tokio::test]
+async fn a_restore_that_cannot_be_recorded_is_undone_and_keeps_the_image() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 3).await;
+    // Once the restored unit runs, writes of the job record fail.
+    env.launcher.set_after_restore(Some(|spec| {
+        let script = spec.command.value_of("--action-script").unwrap();
+        let job_dir = Path::new(script).parent().unwrap();
+        std::fs::create_dir(job_dir.join("job.json.tmp")).unwrap();
+    }));
+    assert_eq!(
+        c.request(restore_req(3, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+    let ev = c.event().await;
+    let Event::RestoreFinished {
+        outcome: RestoreOutcome::Failed { reason, .. },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert!(reason.contains("image is kept"), "{reason}");
+    assert!(c.running().await.is_empty());
+    assert!(
+        env.launcher.unit(JobId(3)).is_none(),
+        "restored unit killed and released"
+    );
+    let dir = CheckpointDir::for_job(&env.base(), 3);
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    // Once the record can be written again, the job restores.
+    env.launcher.set_after_restore(None);
+    std::fs::remove_dir(env.root.join("state/jobs/3/job.json.tmp")).unwrap();
+    assert_eq!(
+        c.request(restore_req(3, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+    assert!(matches!(
+        c.event().await.event,
+        Event::RestoreFinished {
+            outcome: RestoreOutcome::Success { .. },
+            ..
+        }
+    ));
+    assert_eq!(c.running().await, [(JobId(3), RunningPhase::Running)]);
+}
+
 /// An interrupted restore whose unit is gone (the helper stopped before it
 /// started it, or systemd already cleaned it up) is reported too, once.
 #[tokio::test]

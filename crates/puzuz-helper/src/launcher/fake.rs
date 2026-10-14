@@ -37,6 +37,8 @@ struct Inner {
     max_active: usize,
     /// What the check of restored tasks finds.
     restore_check_problems: Vec<String>,
+    /// Called once a restored unit runs.
+    after_restore: Option<fn(&RestoreSpec)>,
 }
 
 /// Units live in a map; tests drive exits with [`FakeLauncher::exit`].
@@ -83,6 +85,12 @@ impl FakeLauncher {
     /// finds from now on; problems make the restore fail like criu would.
     pub fn set_restore_check_problems(&self, problems: Vec<String>) {
         self.lock().restore_check_problems = problems;
+    }
+
+    /// Call `f` with the spec of every restore once its unit runs (before
+    /// the helper goes on with the restore).
+    pub fn set_after_restore(&self, f: Option<fn(&RestoreSpec)>) {
+        self.lock().after_restore = f;
     }
 
     pub fn set_system_stopping(&self, stopping: bool) {
@@ -194,7 +202,12 @@ impl Launcher for FakeLauncher {
                 )));
             }
         }
-        self.start(&spec.unit, UnitKind::Restored)
+        let pid = self.start(&spec.unit, UnitKind::Restored)?;
+        let after = self.lock().after_restore;
+        if let Some(after) = after {
+            after(spec);
+        }
+        Ok(pid)
     }
 
     async fn init_pid(&self, unit: &str, _kind: UnitKind) -> LaunchResult<Option<u32>> {

@@ -1826,7 +1826,20 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         record.unit_kind = UnitKind::Restored;
         record.restoring = false;
         if let Err(e) = files.write_record(&record) {
+            // Without this record, the next start of the helper takes the
+            // job for an interrupted restore and kills it (see
+            // `Self::recover`): undo the restore now, while the image is
+            // still there to restore from again.
             eprintln!("puzuz-helper: recording restore of job {}: {e}", job.0);
+            let _ = self.launcher.signal(&unit, signal::SIGKILL).await;
+            let _ = self.launcher.release(&unit).await;
+            return fail(
+                self,
+                format!(
+                    "recording that the job runs again failed ({e}); the restored job was \
+                     killed and the image is kept"
+                ),
+            );
         }
         if let Some(e) = self.table().get_mut(&job) {
             e.record = record;
