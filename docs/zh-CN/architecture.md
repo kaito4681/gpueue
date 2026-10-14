@@ -171,7 +171,7 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   仅使用 CPU 的作业什么也不允许。systemd 通过 cgroup 设备程序对单元的所有进程（包括 root）强制执行，因此
   打开其他 NVIDIA 设备会以 `EPERM` 失败；`closed` 仍允许标准伪设备（`/dev/null`、`/dev/zero`、`/dev/full`、
   `/dev/random`、`/dev/urandom`、`/dev/tty`、`/dev/ptmx`、`/dev/pts/*`）。每次启动和恢复时，GPU 编号
-  （PCI 总线顺序）通过驱动的 `/proc/driver/nvidia/gpus/<PCI 地址>/information`（`Device Minor`，不含被排除的
+  （PCI 总线顺序）通过驱动的 `/proc/driver/nvidia/gpus/<PCI address>/information`（`Device Minor`，不含被排除的
   GPU）映射到设备次设备号。恢复单元获得恢复所用的 GPU：`criu restore` 以及插件模式下 CRIU 的 CUDA 插件在其中
   运行，而在手动模式下，当 helper 对被恢复的进程运行 `cuda-checkpoint --action restore` 时，驱动会在这些进程中
   重新打开设备节点。见安装指南中的 [GPU 隔离](install.md#gpu-isolation)。

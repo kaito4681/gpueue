@@ -10,7 +10,9 @@
 動いている学習はディスクに保存され、止まったところから再開します。最初からやり直すことはありません。
 
 > **状態：プレリリース。** 以下の機能はすべて実装済みで、Docker 内（PID 1 の systemd、本物の CRIU、本物の
-> NVIDIA GPU）でテストされています。実機での実際の再起動をまたいだテストは**まだ**行っていません。
+> NVIDIA GPU）と、CPU ジョブを動かした QEMU/KVM 仮想マシンの実際の再起動と電源断をまたいでテストされています。
+> 物理マシン（ベアメタル）での実際の再起動や、GPU ジョブを動かしての実際の再起動をまたいだテストは**まだ**
+> 行っていません。
 > [プロジェクトの状況](#project-status) を参照してください。
 
 > **リリースはまだ公開されていません。** 以下のダウンロードリンク、APT リポジトリ、`stable` ブランチは、最初の
@@ -459,11 +461,20 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   CUDA のカウンターと、fork された DataLoader ワーカーを使う PyTorch の学習のチェックポイント/リストア
   （結果は中断しなかった実行と同一）、およびパッケージ化されサンドボックス化された `puzuz.service` 内での
   デーモンによる NVML の GPU 検出。
+- QEMU/KVM 仮想マシンの実際の OS の再起動と電源断（`scripts/vm-reboot-test.sh`）：systemd 259 と CRIU 4.2
+  の Ubuntu 26.04 に `puzuz service install` で puzuz をインストールし、`/var/lib/puzuz` を専用の ext4
+  ディスクに置き、2 ユーザーの CPU ジョブと `--no-checkpoint` のジョブを動かします。シナリオは
+  `systemctl reboot`、`systemctl poweroff` の後の新規起動、そして 1 GiB のジョブの `puzuz checkpoint` が
+  まだ実行中の再起動です。起動のたびに、前回の起動のジャーナルが停止順序（最初にデーモンが停止し、ヘルパーは
+  自身が停止する前にジョブをダンプし、`--no-checkpoint` のジョブのユニットはヘルパーの後にだけ停止し、最後に
+  `/var/lib/puzuz` がアンマウントされる）を示し、
+  タイムアウトや SIGKILL がないこと、`--no-checkpoint` のジョブが SIGTERM を受け取ったこと、リストアした
+  ジョブが止まったところからカウントを続けることを確認します。
 
 まだテストしていないもの：
 
-- 実機での実際の OS の再起動：ドライバーの再読み込みと、ファイルシステムや `nvidia-persistenced` に対する
-  停止順序。
+- 物理マシン（ベアメタル）での実際の再起動と、実際の再起動の GPU に関わる部分：GPU ジョブのチェックポイントと
+  リストア、ドライバーの再読み込み、`nvidia-persistenced` に対する停止順序。
 - 実際の GitHub リリースからの `install.sh` によるインストール（偽のリリースサーバーに対しては、
   Ubuntu 22.04/24.04/26.04 と Debian 12 のコンテナで `scripts/dist-test.sh` によりテスト済み）。
 - 動作中の systemd の下での `.deb`（インストール、再インストール、削除、purge は systemd のない素の
@@ -496,6 +507,7 @@ scripts/test-in-docker.sh                                   # cargo test --works
 scripts/test-in-docker.sh clippy --workspace --all-targets
 scripts/test-in-docker.sh fmt --all
 scripts/e2e-test.sh               # full stack under systemd in a privileged container
+scripts/vm-reboot-test.sh         # real reboot/poweroff of a QEMU/KVM VM with CPU jobs (needs /dev/kvm)
 scripts/service-install-test.sh   # service install / status / uninstall and doctor
 scripts/helper-systemd-test.sh    # the helper alone under systemd
 scripts/dist-test.sh              # install.sh against a fake GitHub API (PUZUZ_DIST_BASE=debian:12 ...)

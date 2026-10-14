@@ -30,9 +30,11 @@
   sandbox, which refuses setgid); CI runs `nix develop -c cargo test --workspace --locked`
   instead. Published stable releases move the `stable` branch
   (`.github/workflows/release-nix.yml`). The module generates its units from `packaging/`.
-- CI (`.github/workflows/ci.yml`, on pull requests) has these jobs: `lint` (fmt, clippy), `test`,
-  `msrv` (`rust-version`), `shellcheck`, the CPU e2e, `service-install`, `dist-build` and `dist`
-  (tarball and `install.sh`), `deb`, `rpm`, `apt-repo` and `nix`. Pushing a `v<version>` tag runs
+- CI (`.github/workflows/ci.yml`, on pull requests, pushes to `main` and `workflow_dispatch`) has
+  these jobs: `lint` (fmt, clippy), `test`, `msrv` (`rust-version`), `shellcheck`, `actionlint`
+  (the workflow files), the CPU e2e (`e2e`), `service-install`, `dist-build` and `dist` (tarball
+  and `install.sh`), `deb`, `rpm`, `apt-repo`, `aur` (builds and installs the AUR package from a
+  locally built tarball with `scripts/dist/aur-test.sh`) and `nix`. Pushing a `v<version>` tag runs
   `.github/workflows/release.yml`, which builds and signs the tarballs, `.deb` and `.rpm`
   packages and attaches them, with `install.sh` and `RPM-GPG-KEY-puzuz`, to a draft GitHub
   release. Publishing the release triggers `release-apt.yml` (APT repository) and `release-aur.yml`

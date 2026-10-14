@@ -22,6 +22,8 @@ command on their `PATH`.
 - [GPU detection](#gpu-detection)
 - [GPU isolation](#gpu-isolation)
 - [Checkpoint storage](#checkpoint-storage)
+- [CUDA plugin mode](#cuda-plugin-mode)
+- [Filesystems and mounts](#filesystems-and-mounts)
 - [Upgrading](#upgrading)
 - [Uninstalling](#uninstalling)
 - [Troubleshooting](#troubleshooting)
@@ -174,7 +176,7 @@ To check a tarball (or a package) yourself:
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.pub
+minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 ```
 
 `curl ... | sudo bash` runs whatever the download contains. To check `install.sh` first, download
@@ -184,7 +186,7 @@ checked copy:
 ```sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh.minisig
-minisign -Vm install.sh -p packaging/minisign.pub
+minisign -Vm install.sh -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 sudo bash install.sh
 ```
 
@@ -1038,18 +1040,45 @@ puzuz doctor           # every check, with a `fix:` line for each problem; exits
 puzuz service status   # both units, and whether the daemon is reachable and connected to the helper
 ```
 
-`puzuz doctor` checks the configuration file and its ownership, the install method (see
-[Install method](#install-method)), `criu` (version 4.2 or newer), the
-NVIDIA driver, `cuda-checkpoint` (manual mode support, version matching the driver), the GPUs the
-daemon detected (with NVML or from `[[gpus]]`) against `nvidia-smi` (see
-[GPU detection](#gpu-detection)), the kernel, the systemd version, both units, the ownership of
-the helper binary and of every directory above it (taken from the unit's effective `ExecStart=`,
-drop-ins included), whether the daemon's directories are inside its `ReadWritePaths=`, both
-sockets, the daemon and helper versions and their connection, the checkpoint
-directory (exists, not tmpfs, free space) and the total checkpoint size, whether you are an
-administrator, and (unless `update_check = false`) whether a newer release exists. That last
-check is at most INFO, and so is not being able to reach GitHub. It does not run `criu check`. Run `sudo criu check` yourself to see what CRIU
-supports on this kernel.
+`puzuz doctor` checks, in this order (the check's name in parentheses):
+
+- the configuration file and its ownership (`config`)
+- the install method (`install method`, see [Install method](#install-method))
+- on the RHEL family, with puzuz in `/usr/local/bin`: whether sudo's `secure_path` includes that
+  directory (`sudo PATH`)
+- `criu`, version 4.2 or newer (`criu`)
+- the NVIDIA driver (`nvidia driver`)
+- `cuda-checkpoint`: manual mode support, version matching the driver (`cuda-checkpoint`)
+- in plugin mode only, CRIU's CUDA plugin (`cuda plugin`, see
+  [CUDA plugin mode](#cuda-plugin-mode))
+- with a driver, the GPUs the daemon detected (with NVML or from `[[gpus]]`) against
+  `nvidia-smi` (`gpus`, see [GPU detection](#gpu-detection))
+- the kernel (`kernel`) and the systemd version (`systemd`)
+- both units (`puzuz-helper.service`, `puzuz.service`)
+- the ownership of the helper binary and of every directory above it, taken from the unit's
+  effective `ExecStart=`, drop-ins included (`helper binary`)
+- the settings the helper uses: those of `config.toml`, with a warning when flags in its unit
+  override them (`helper settings`)
+- whether job units may open only their own GPUs' device nodes (`gpu isolation`, see
+  [GPU isolation](#gpu-isolation))
+- whether jobs can reach the system D-Bus or systemd's Varlink services, a warning when
+  `job_system_dbus` or `job_systemd_varlink` is on (`job d-bus`, see
+  [What a job can and cannot do](#what-a-job-can-and-cannot-do))
+- which users jobs may run as: the minimum uid, the denied groups and the allowed users
+  (`job policy`, see [Who jobs may run as](#who-jobs-may-run-as))
+- whether the daemon's directories are inside its `ReadWritePaths=` (`daemon write paths`)
+- the daemon and helper sockets (`daemon socket`, `helper socket`)
+- the daemon and helper versions and their connection (`daemon`, `helper`)
+- jobs the helper runs that the daemon does not account for (`orphaned jobs`, only when there
+  are some)
+- the checkpoint directory (exists, not tmpfs, free space) and the total checkpoint size
+  (`checkpoint dir`, `checkpoint usage`)
+- whether you are an administrator (`admin`)
+- unless `update_check = false`, whether a newer release exists (`update`). This check is at most
+  INFO, and so is not being able to reach GitHub.
+
+It does not run `criu check`. Run `sudo criu check` yourself to see what CRIU supports on this
+kernel.
 
 Try a job:
 
@@ -1308,9 +1337,10 @@ set. A restarted job, a copy or `restart --in-place`, keeps a nice value of 0 or
 negative one, the site factor or its `top` position. `puzuz prio` lists exactly the jobs the
 scheduler considers, in its order. `puzuz status --json` shows a job's `nice` and a group's `priority` when they are not 0.
 
-Upgrading from a release without priorities migrates the database to schema version 6: existing
+No release has been published yet, so this only matters for development builds: the database of
+a build from before priorities is migrated to schema version 6 when the daemon starts. Existing
 jobs keep their `-o` priority, which from then on orders only their owner's jobs, and usage
-starts at zero. Older releases cannot open the migrated database (`puzuz update` refuses to
+starts at zero. Older builds cannot open the migrated database (`puzuz update` refuses to
 install them).
 
 **Settings.** The `[priority]` table of `/etc/puzuz/config.toml` (restart `puzuz.service` after a
@@ -1610,7 +1640,7 @@ and its "update" line says when a newer release exists):
 | --- | --- |
 | `install.sh` (or `puzuz service install` of a release) | `sudo puzuz update` |
 | the `.deb` | `sudo apt update && sudo apt upgrade` (or install a newer `.deb` from a release with `sudo apt install ./puzuz_<new version>_<arch>.deb`) |
-| the `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>` (`sudo zypper install <URL>` on openSUSE; no dnf repository yet) |
+| the `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>` (no dnf repository yet) |
 | built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install` |
 | `puzuz service install` from a Nix build (not NixOS) | the same `nix build` and `service install` again (see [Installing with Nix](#installing-with-nix)) |
 | the AUR package `puzuz-bin` (once published; until then Arch uses `install.sh` and `sudo puzuz update`) | `yay -Syu` (any AUR helper), then `sudo systemctl restart puzuz-helper.service puzuz.service`; `puzuz update` refuses |
@@ -1765,6 +1795,8 @@ stopped until `sudo systemctl start puzuz` or the next boot.
 | `daemon` | runs version X while this puzuz is Y | `sudo systemctl restart puzuz-helper.service puzuz.service` after upgrading, or update the CLI |
 | `checkpoint dir` | on tmpfs, or little free space | move `checkpoints_dir` to a disk with room for RAM + VRAM of your jobs |
 | `helper settings` | ExecStart= passes flags | move the settings into `config.toml` and drop the flags |
+| `job d-bus` | allowed (`job_system_dbus = true` or `job_systemd_varlink = true`): jobs can ask systemd and polkit for actions (WARN) | unless jobs need it, remove the key from `/etc/puzuz/config.toml` and `sudo systemctl restart puzuz-helper.service` |
+| `orphaned jobs` | the helper runs jobs the daemon does not account for (WARN; their GPUs stay taken) | `puzuz status` shows them to administrators; an administrator can stop one with `puzuz kill <id>` |
 
 On NixOS (`ID=nixos` in `/etc/os-release`), the `fix:` lines name the [module options](#nixos)
 instead of steps that do not apply there, each followed by `sudo nixos-rebuild switch`:

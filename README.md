@@ -10,7 +10,9 @@ A training run that is still going when the machine reboots is saved to disk and
 stopped. It does not start over.
 
 > **Status: pre-release.** Everything below is implemented and tested in Docker (systemd as PID 1,
-> real CRIU, a real NVIDIA GPU). It has **not** been tested on a real host across a real reboot yet.
+> real CRIU, a real NVIDIA GPU), and across real reboots and power-offs of a QEMU/KVM virtual
+> machine with CPU jobs. It has **not** been tested across a real reboot on bare metal or with GPU
+> jobs yet.
 > See [Project status](#project-status).
 
 > **No release has been published yet.** The download links, the APT repository and the `stable`
@@ -451,11 +453,20 @@ Pre-release (version 0.1.0). Tested so far:
   checkpoint/restore of a CUDA counter and of PyTorch training with forked DataLoader workers,
   with results identical to an uninterrupted run, and NVML GPU detection by the daemon inside the
   packaged, sandboxed `puzuz.service`.
+- A real OS reboot and power-off of a QEMU/KVM virtual machine (`scripts/vm-reboot-test.sh`):
+  Ubuntu 26.04 with systemd 259 and CRIU 4.2, puzuz installed with `puzuz service install` and
+  `/var/lib/puzuz` on an ext4 disk of its own, CPU jobs of two users plus a `--no-checkpoint` job.
+  The scenarios are `systemctl reboot`, `systemctl poweroff` followed by a fresh boot, and a reboot
+  while `puzuz checkpoint` of a 1 GiB job is still running. After each boot, the previous boot's
+  journal must show the stop order (the daemon stops first, the helper dumps the jobs before it
+  stops, the `--no-checkpoint` job's unit stops only after the helper, and `/var/lib/puzuz` is
+  unmounted last) with no timeout or SIGKILL, the `--no-checkpoint` job must have received
+  SIGTERM, and the restored jobs must continue counting where they stopped.
 
 Not tested yet:
 
-- A real OS reboot on a host: driver reload, and the stop order relative to the filesystems and
-  `nvidia-persistenced`.
+- A real reboot on bare metal, and the GPU parts of a real reboot: GPU jobs checkpointed and
+  restored across it, the driver reload, and the stop order relative to `nvidia-persistenced`.
 - Installing with `install.sh` from the real GitHub releases (tested against a fake release
   server, `scripts/dist-test.sh`, on Ubuntu 22.04/24.04/26.04 and Debian 12 containers).
 - The `.deb` under a running systemd (its install, reinstall, remove and purge are tested in
@@ -486,6 +497,7 @@ scripts/test-in-docker.sh                                   # cargo test --works
 scripts/test-in-docker.sh clippy --workspace --all-targets
 scripts/test-in-docker.sh fmt --all
 scripts/e2e-test.sh               # full stack under systemd in a privileged container
+scripts/vm-reboot-test.sh         # real reboot/poweroff of a QEMU/KVM VM with CPU jobs (needs /dev/kvm)
 scripts/service-install-test.sh   # service install / status / uninstall and doctor
 scripts/helper-systemd-test.sh    # the helper alone under systemd
 scripts/dist-test.sh              # install.sh against a fake GitHub API (PUZUZ_DIST_BASE=debian:12 ...)
