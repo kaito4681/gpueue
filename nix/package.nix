@@ -16,14 +16,18 @@ let
   # checks.x86_64-linux.helper-tests (nix/tests/helper-tests.nix) runs all
   # puzuz-helper tests, these included, in a NixOS VM.
   skippedTests = [
+    "a_dump_interrupted_before_its_finalization_is_finished_at_start"
     "a_dump_past_its_deadline_is_killed_and_the_job_resumed"
+    "a_dump_that_cannot_be_finalized_keeps_its_image"
     "a_restored_job_holding_files_its_owner_may_not_open_is_killed"
     "a_stopping_helper_abandons_queued_launches_and_refuses_new_ones"
     "a_stopping_helper_reports_an_abandoned_restore_as_not_started"
     "an_interrupted_restore_is_killed_and_reported"
+    "an_interrupted_restore_without_its_unit_is_reported"
     "checkpoint_then_restore"
     "concurrent_spawns_and_restores"
     "delete_checkpoint_refuses_live_jobs"
+    "dump_counts_private_tmpfs_and_refuses_reuseport_sockets"
     "dump_refuses_a_job_that_depends_on_a_hidden_mount"
     "dump_refuses_sockets_bound_on_host_filesystems"
     "dump_refuses_without_free_space_and_keeps_a_stopped_job_stopped"
@@ -32,6 +36,7 @@ let
     "nix_gc_roots_follow_jobs_and_their_checkpoints"
     "plugin_mode_refuses_to_dump_cuda_jobs_without_the_plugin"
     "recovery_readopts_running_jobs_and_reports_exits"
+    "restore_checks_do_not_block_the_helper_and_hold_off_deletes"
     "restore_checks_the_images_paths_first"
     "restore_refuses_groups_the_owner_left_since_the_dump"
     "restore_uses_the_mode_of_the_image"

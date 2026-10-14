@@ -35,6 +35,10 @@ pub const DEFAULT_CRIU_ROOT: &str = "/run/puzuz-helper/criu-root";
 /// Default directory of the fork guard library: `<data_dir>/lib`, readable
 /// by every user and persistent (restored jobs map it again).
 pub const DEFAULT_FORK_GUARD_DIR: &str = "/var/lib/puzuz/lib";
+/// Stands in for the directory of a program that was not found in `PATH`
+/// at start-up (see [`HelperConfig::resolve_programs`]); it does not exist,
+/// so running the program fails instead of looking it up again.
+pub const MISSING_PROGRAM_DIR: &str = "/nonexistent/puzuz-helper";
 /// Name of the shutdown manifest written into the checkpoint base.
 pub const SHUTDOWN_MANIFEST: &str = "shutdown-manifest.json";
 
@@ -176,10 +180,52 @@ impl HelperConfig {
         }
     }
 
+    /// Replaces the programs given by name (`criu`, `cuda-checkpoint`,
+    /// `nvidia-smi`, the defaults) with where they are in `path_env` (the
+    /// service's `PATH`), so that they are checked like absolute ones (see
+    /// [`Self::paths_to_check`]) and never looked up again. A program that
+    /// is not found is set to [`MISSING_PROGRAM_DIR`]`/<name>`, which does
+    /// not exist (installing it later needs a restart of the helper), and
+    /// reported in the returned warnings. A relative path with a directory
+    /// is refused.
+    pub fn resolve_programs(&mut self, path_env: &std::ffi::OsStr) -> Result<Vec<String>, String> {
+        let mut warnings = Vec::new();
+        for (key, program) in [
+            ("criu_path", &mut self.checkpoint.criu.criu_path),
+            ("cuda_checkpoint_path", &mut self.checkpoint.cuda.path),
+            ("nvidia_smi_path", &mut self.nvidia_smi),
+        ] {
+            if program.is_absolute() {
+                continue;
+            }
+            if program.components().count() != 1 {
+                return Err(format!(
+                    "{key} {} must be an absolute path or a program name",
+                    program.display()
+                ));
+            }
+            match puzuz_config::trust::find_program(program, path_env) {
+                Some(found) => *program = found,
+                None => {
+                    let missing = Path::new(MISSING_PROGRAM_DIR).join(&*program);
+                    warnings.push(format!(
+                        "{key}: {} is not in PATH ({}); it is unavailable until the helper is \
+                         restarted after it was installed",
+                        program.display(),
+                        path_env.to_string_lossy()
+                    ));
+                    *program = missing;
+                }
+            }
+        }
+        Ok(warnings)
+    }
+
     /// Paths root writes to, executes or loads code from: they and their
-    /// existing ancestors must not be changeable by anyone but root
-    /// (programs given by name are looked up in `PATH`). Checked at
-    /// start-up, before anything is created there.
+    /// existing ancestors must not be changeable by anyone but root.
+    /// Programs given by name are only checked once
+    /// [`Self::resolve_programs`] made them absolute. Checked at start-up,
+    /// before anything is created there.
     pub fn paths_to_check(&self) -> Vec<&Path> {
         let mut paths = vec![
             self.state_dir.as_path(),
@@ -365,6 +411,50 @@ mod tests {
         assert!(paths.contains(&Path::new("/opt/criu")));
         assert!(paths.contains(&Path::new(DEFAULT_CHECKPOINT_BASE)));
         assert!(!paths.contains(&Path::new("cuda-checkpoint")));
+    }
+
+    #[test]
+    fn programs_given_by_name_are_resolved_once_and_then_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let criu = bin.join("criu");
+        std::fs::write(&criu, "").unwrap();
+        std::fs::set_permissions(&criu, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut c =
+            HelperConfig::resolve(&puzuz_config::Config::default(), Overrides::default()).config;
+        let warnings = c.resolve_programs(bin.as_os_str()).unwrap();
+        assert_eq!(c.checkpoint.criu.criu_path, criu);
+        assert_eq!(
+            c.checkpoint.cuda.path,
+            Path::new(MISSING_PROGRAM_DIR).join("cuda-checkpoint")
+        );
+        assert_eq!(
+            c.nvidia_smi,
+            Path::new(MISSING_PROGRAM_DIR).join("nvidia-smi")
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("cuda-checkpoint"), "{warnings:?}");
+        let paths = c.paths_to_check();
+        assert!(paths.contains(&criu.as_path()));
+        // Absolute ones stay as they are; relative paths are refused.
+        let mut c =
+            HelperConfig::resolve(&file("criu_path = \"/opt/criu\"\n"), Overrides::default())
+                .config;
+        c.resolve_programs(bin.as_os_str()).unwrap();
+        assert_eq!(c.checkpoint.criu.criu_path, Path::new("/opt/criu"));
+        // (The file refuses those; a flag is not checked before.)
+        let mut c = HelperConfig::resolve(
+            &puzuz_config::Config::default(),
+            Overrides {
+                criu: Some("bin/criu".into()),
+                ..Overrides::default()
+            },
+        )
+        .config;
+        let e = c.resolve_programs(dir.path().as_os_str()).unwrap_err();
+        assert!(e.contains("criu_path"), "{e}");
     }
 
     #[test]

@@ -559,8 +559,10 @@ impl Launcher for SystemdLauncher {
     }
 }
 
-/// `KillUnit`'s `whom`: signals the shim can forward go to the main
-/// process only; those it cannot (STOP, CONT, KILL) go to every process.
+/// `KillUnit`'s `whom`: signals the shim forwards (see
+/// [`crate::shim::FORWARDED`]) go to the main process only; those it cannot
+/// (STOP, CONT, KILL) go to every process. The helper refuses all others
+/// before they get here.
 pub fn signal_target(sig: i32) -> &'static str {
     match sig {
         signal::SIGSTOP | signal::SIGCONT | signal::SIGKILL => "all",
@@ -631,6 +633,17 @@ mod tests {
         assert_eq!(signal_target(signal::SIGINT), "main");
         assert_eq!(signal_target(signal::SIGSTOP), "all");
         assert_eq!(signal_target(signal::SIGKILL), "all");
+        // TSTP and ALRM are forwarded by the shim, which must not get them
+        // itself: TSTP would stop it, ALRM end it.
+        assert_eq!(signal_target(20), "main");
+        assert!(crate::shim::is_forwardable(20));
+        assert!(crate::shim::is_forwardable(14));
+        assert!(crate::shim::is_forwardable(28)); // WINCH
+        assert!(!crate::shim::is_forwardable(signal::SIGKILL));
+        assert!(!crate::shim::is_forwardable(signal::SIGSTOP));
+        assert!(!crate::shim::is_forwardable(17)); // CHLD
+        assert!(!crate::shim::is_forwardable(11)); // SEGV
+        assert!(!crate::shim::is_forwardable(34)); // SIGRTMIN
     }
 
     #[test]

@@ -28,6 +28,10 @@ pub struct FakeHost {
     path_problems: Mutex<Vec<String>>,
     restored_problems: Mutex<Vec<String>>,
     verified: Mutex<Vec<VerifyRequest>>,
+    tmpfs_bytes: Mutex<u64>,
+    /// While set, access checks block (see [`FakeHost::hold_access_checks`]).
+    held: Mutex<bool>,
+    released: std::sync::Condvar,
 }
 
 impl FakeHost {
@@ -63,6 +67,11 @@ impl FakeHost {
 
     pub fn set_available(&self, bytes: u64) {
         *self.available.lock().unwrap() = Some(bytes);
+    }
+
+    /// What [`HostProbe::private_tmpfs_bytes`] reports for every job.
+    pub fn set_private_tmpfs_bytes(&self, bytes: u64) {
+        *self.tmpfs_bytes.lock().unwrap() = bytes;
     }
 }
 
@@ -117,11 +126,28 @@ impl HostProbe for FakeHost {
 
     fn verify_access(&self, req: &VerifyRequest) -> VerifyReply {
         self.verified.lock().unwrap().push(req.clone());
+        let mut held = self.held.lock().unwrap();
+        while *held {
+            held = self.released.wait(held).unwrap();
+        }
+        drop(held);
         let problems = match req {
             VerifyRequest::Paths(_) => &self.path_problems,
             VerifyRequest::Restored(_) => &self.restored_problems,
+            VerifyRequest::Exist(c) => {
+                return Ok(c
+                    .paths
+                    .iter()
+                    .filter(|p| fs::symlink_metadata(p).is_err())
+                    .cloned()
+                    .collect());
+            }
         };
         Ok(problems.lock().unwrap().clone())
+    }
+
+    fn private_tmpfs_bytes(&self, _pid: u32, _private: &[String]) -> io::Result<u64> {
+        Ok(*self.tmpfs_bytes.lock().unwrap())
     }
 }
 
@@ -142,6 +168,13 @@ impl FakeHost {
         *self.restored_problems.lock().unwrap() = restored;
     }
 
+    /// Make access checks block until called again with `false` (like a
+    /// check stuck on a filesystem that does not answer).
+    pub fn hold_access_checks(&self, hold: bool) {
+        *self.held.lock().unwrap() = hold;
+        self.released.notify_all();
+    }
+
     /// Every access check requested so far.
     pub fn verified(&self) -> Vec<VerifyRequest> {
         self.verified.lock().unwrap().clone()
@@ -159,6 +192,8 @@ pub struct FakeExecState {
     pub hang_on: Option<fn(&Action) -> bool>,
     /// Roots of the [`Step::Thaw`]s run.
     pub thawed: Vec<u32>,
+    /// Called with the images directory after each successful `criu dump`.
+    pub after_dump: Option<fn(&Path)>,
 }
 
 /// Executes plans by recording them. `criu dump` creates a minimal image
@@ -219,6 +254,9 @@ impl Executor for FakeExecutor {
             && let Some(dir) = command.value_of("-D")
         {
             fs::write(Path::new(dir).join(layout::CRIU_INVENTORY), b"inv")?;
+            if let Some(after) = st.after_dump {
+                after(Path::new(dir));
+            }
         }
         Ok(StepOutput::default())
     }

@@ -1503,6 +1503,21 @@ impl Core {
                             Some(reason),
                         )
                     }
+                    CheckpointOutcome::Failed {
+                        reason,
+                        code: Some(HelperErrorCode::CheckpointUnfinalized),
+                    } => {
+                        // The job is gone and its image kept; the helper
+                        // finalizes it before the restore (which fails,
+                        // keeping the image, if it still cannot).
+                        tracing::warn!(job = %job, "checkpoint not finalized yet: {reason}");
+                        (
+                            E::CheckpointSucceeded,
+                            CheckpointStatus::Complete,
+                            None,
+                            None,
+                        )
+                    }
                     CheckpointOutcome::Failed { reason, .. } => (
                         E::CheckpointFailed {
                             reason: reason.clone(),

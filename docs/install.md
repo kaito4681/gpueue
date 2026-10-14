@@ -1082,7 +1082,11 @@ changed with `puzuz group`, `puzuz parallel` and `puzuz gpu parallel`.
 Paths of files, directories and sockets must be absolute. Programs (`criu_path`,
 `cuda_checkpoint_path`, `nvidia_smi_path`, `nvml_library`, the first word of `shell`) are either
 a bare name, looked up in `PATH`, or an absolute path; relative paths such as `bin/criu` are
-rejected. Every `*_secs` key is at most one year (31536000).
+rejected. The helper looks up `criu_path`, `cuda_checkpoint_path` and `nvidia_smi_path` once, when
+it starts, in its service's `PATH`, checks the file it found like an absolute path (owned by root
+and reached only through directories that only root can change) and uses that path from then on.
+A program that was not found stays unavailable until the helper is restarted (its log says so).
+Every `*_secs` key is at most one year (31536000).
 
 | Key | Default | Used by | Meaning |
 | --- | --- | --- | --- |
@@ -1099,7 +1103,7 @@ rejected. Every `*_secs` key is at most one year (31536000).
 | `checkpoint_size_limit_bytes` | unset (no limit) | daemon | warn when all images together exceed this size (images are never deleted automatically) |
 | `checkpoint_size_warning_interval_secs` | `3600` | daemon | how often each administrator is reminded while the limit is exceeded |
 | `checkpoint_tcp_close` | `true` | both | close TCP connections when checkpointing (`criu --tcp-close`) |
-| `criu_path` | `"criu"` | helper | name (looked up in `PATH`) or root-owned absolute path |
+| `criu_path` | `"criu"` | helper | name (looked up in `PATH` when the helper starts) or root-owned absolute path |
 | `cuda_checkpoint_path` | `"cuda-checkpoint"` | helper | same |
 | `nvidia_smi_path` | `"nvidia-smi"` | helper | same |
 | `cuda_checkpoint_mode` | `"manual"` | helper | `"manual"`: the helper calls cuda-checkpoint around criu. `"plugin"`: CRIU's CUDA plugin does it. |
@@ -1186,14 +1190,21 @@ unlimited).
 - Images are stored in `checkpoints_dir` (default `/var/lib/puzuz/checkpoints/<job id>/`), which
   only root can read. Each directory holds `images/` (CRIU image files), `dump.log`,
   `restore.log`, `meta.json` (GPU, driver, size, time) and a `COMPLETE` marker that is written
-  last. Directories without the marker are incomplete and are cleaned up when the helper starts.
+  last. Directories without the marker are incomplete and are cleaned up when the helper starts,
+  except one whose dump succeeded (a `DUMPED` marker, or CRIU's log says so): the job's
+  processes are gone then and the image is all that is left of it. The helper finalizes such a
+  directory when it starts or before the job is restored, and never deletes it. If writing the
+  metadata fails right after a successful dump (a full or failing disk), the job counts as
+  checkpointed, the helper logs the reason and the daemon logs a warning; a restore fails, keeping
+  the image, until the metadata can be written.
   The helper also writes `shutdown-manifest.json` there after the dumps at system shutdown.
 - Each job has at most one image. It is deleted when the restore succeeds, when the job is removed
   (`remove`, `clean`, `reset`), or when the dump fails. A failed restore keeps the image.
 - After a failed dump the helper moves its `dump.log` to `failed-logs/<job id>-<unix ms>.log` in
   the same directory (root only) and keeps the newest 20 of them. The job's last error names the
   file.
-- Space: before each dump the helper requires free space of at least (RSS + VRAM of the job) × 1.2.
+- Space: before each dump the helper requires free space of at least (RSS + VRAM of the job +
+  what is stored in its private `/tmp` and `/dev/shm`) × 1.2.
   Otherwise the checkpoint is refused and the job keeps running. Images are not compressed. A job with 7 GB of VRAM produced an
   8.1 GB image in tests. Do not use tmpfs (`puzuz doctor` fails on it). It also warns below 20 GiB
   free, or below the space left under `checkpoint_size_limit_bytes`.
@@ -1516,7 +1527,16 @@ dump is due (for example during `puzuz shutdown`, which then leaves the job runn
 warned on their next command. Refusals:
 
 - `not enough free space for the checkpoint: need N bytes, M available`: free space or move
-  `checkpoints_dir`, then checkpoint again.
+  `checkpoints_dir`, then checkpoint again. The need includes what the job stores in its own
+  `/tmp` and `/dev/shm` (the message then says how much).
+- `the job has Unix sockets bound to [...] on the host's filesystems (or to relative names ...)`:
+  a restore would make CRIU create, unlink and chown those paths as root. Bind the socket to an
+  absolute path below `/tmp` or to an abstract name. A relative name counts as a host path
+  because the directory it was bound in is not known.
+- `the job has internet sockets with SO_REUSEPORT (...)`: CRIU recreates sockets as root before it
+  gives the job its credentials back, so a restored `SO_REUSEPORT` socket would belong to root and
+  could join a root service's group on the same port (and receive part of its connections). Turn
+  `SO_REUSEPORT` off in the program, or run the job with `--no-checkpoint`.
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`: the job's
   mount namespace depends on a mount that is hidden under another one, so it could never be
   restored. Run the job again (`puzuz restart`). New jobs get a cleaned-up namespace.
@@ -1549,6 +1569,11 @@ refused:`), and its owner is warned.
 
 A failed restore keeps the job `Checkpointed` and keeps its image, so you can fix the cause and run
 `puzuz restore` again. The owner is warned on their next command.
+
+- `the checkpoint of job N was dumped but not finalized, and finalizing it failed again: ...`: the
+  dump succeeded, but the helper could not write the checkpoint's metadata (see
+  [Checkpoint storage](#checkpoint-storage)), typically because the disk with `checkpoints_dir`
+  is full or failing. Fix that and restore again.
 
 - `paths the checkpoint's mounts depend on are missing on this host: [...]`: CRIU would fail with
   `Can't stat mountpoint` or `Failed to open_tree <path>`. The job's namespace contained a mount

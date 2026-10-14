@@ -200,6 +200,19 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
         return Err("must run as root".into());
     }
     let mut cfg = config(args)?;
+    // Programs given by name are looked up once, in the service's PATH,
+    // and then checked and used by their absolute path.
+    let path_env = std::env::var_os("PATH")
+        .unwrap_or_else(|| puzuz_config::trust::DEFAULT_SERVICE_PATH.into());
+    for warning in cfg.resolve_programs(&path_env)? {
+        eprintln!("puzuz-helper: WARN {warning}");
+    }
+    eprintln!(
+        "puzuz-helper: criu {}; cuda-checkpoint {}; nvidia-smi {}",
+        cfg.checkpoint.criu.criu_path.display(),
+        cfg.checkpoint.cuda.path.display(),
+        cfg.nvidia_smi.display()
+    );
     for path in cfg.paths_to_check() {
         puzuz_helper::validate::check_root_owned_path(path)?;
     }

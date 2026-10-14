@@ -1089,8 +1089,11 @@ sudo systemctl restart puzuz-helper.service puzuz.service
 
 ファイル、ディレクトリ、ソケットのパスは絶対パスでなければなりません。プログラム（`criu_path`、
 `cuda_checkpoint_path`、`nvidia_smi_path`、`nvml_library`、`shell` の最初の単語）は、`PATH` から探される
-名前だけか、絶対パスのどちらかです。`bin/criu` のような相対パスは拒否されます。`*_secs` のキーはすべて最大
-1 年（31536000）です。
+名前だけか、絶対パスのどちらかです。`bin/criu` のような相対パスは拒否されます。ヘルパーは `criu_path`、
+`cuda_checkpoint_path`、`nvidia_smi_path` を起動時に一度だけサービスの `PATH` から探し、見つかったファイルを
+絶対パスと同じように検査し（root が所有し、root だけが変更できるディレクトリだけを通って到達できること）、
+以後はそのパスを使います。見つからなかったプログラムは、ヘルパーを再起動するまで使えないままです（ログに
+そう記録されます）。`*_secs` のキーはすべて最大 1 年（31536000）です。
 
 | キー | デフォルト | 使用者 | 意味 |
 | --- | --- | --- | --- |
@@ -1107,7 +1110,7 @@ sudo systemctl restart puzuz-helper.service puzuz.service
 | `checkpoint_size_limit_bytes` | 未設定（制限なし） | デーモン | 全イメージの合計がこのサイズを超えたら警告します（イメージが自動で削除されることはありません） |
 | `checkpoint_size_warning_interval_secs` | `3600` | デーモン | 上限を超えている間、各管理者に通知する間隔 |
 | `checkpoint_tcp_close` | `true` | 両方 | チェックポイント時に TCP 接続を閉じます（`criu --tcp-close`） |
-| `criu_path` | `"criu"` | ヘルパー | 名前（`PATH` から探す）または root が所有する絶対パス |
+| `criu_path` | `"criu"` | ヘルパー | 名前（ヘルパーの起動時に `PATH` から探す）または root が所有する絶対パス |
 | `cuda_checkpoint_path` | `"cuda-checkpoint"` | ヘルパー | 同上 |
 | `nvidia_smi_path` | `"nvidia-smi"` | ヘルパー | 同上 |
 | `cuda_checkpoint_mode` | `"manual"` | ヘルパー | `"manual"`：ヘルパーが criu の前後で cuda-checkpoint を呼び出します。`"plugin"`：CRIU の CUDA プラグインがそれを行います。 |
@@ -1195,13 +1198,20 @@ memory_total_bytes = 25757220864
 - イメージは `checkpoints_dir`（デフォルトは `/var/lib/puzuz/checkpoints/<job id>/`）に保存され、root だけが
   読めます。各ディレクトリには `images/`（CRIU のイメージファイル）、`dump.log`、`restore.log`、`meta.json`
   （GPU、ドライバー、サイズ、時刻）、最後に書き込まれる `COMPLETE` マーカーがあります。マーカーのない
-  ディレクトリは不完全なもので、ヘルパーの起動時に片付けられます。ヘルパーはシステムのシャットダウン時の
+  ディレクトリは不完全なもので、ヘルパーの起動時に片付けられます。ただし、ダンプが成功したもの（`DUMPED`
+  マーカーがあるか、CRIU のログがそう示すもの）は例外です。そのときジョブのプロセスはもう存在せず、
+  イメージだけがジョブの残りのすべてです。ヘルパーはそうしたディレクトリを起動時かジョブのリストアの前に
+  仕上げ、決して削除しません。ダンプの成功直後にメタデータの書き込みが失敗した場合（ディスクがいっぱいか
+  故障している場合）、ジョブはチェックポイント済みとして扱われ、ヘルパーは理由をログに書き、デーモンは警告を
+  ログに書きます。メタデータを書けるようになるまでリストアは失敗しますが、イメージは残ります。
+  ヘルパーはシステムのシャットダウン時の
   ダンプのあと、そこに `shutdown-manifest.json` も書き込みます。
 - 各ジョブのイメージは最大 1 つです。リストアが成功したとき、ジョブが削除されたとき（`remove`、`clean`、
   `reset`）、またはダンプが失敗したときに削除されます。リストアが失敗してもイメージは残ります。
 - ダンプが失敗すると、ヘルパーはその `dump.log` を同じディレクトリの `failed-logs/<job id>-<unix ms>.log`
   （root のみ）に移し、最新の 20 個を残します。ジョブの最後のエラーにそのファイル名が示されます。
-- 容量：各ダンプの前に、ヘルパーは少なくとも（ジョブの RSS + VRAM）× 1.2 の空き容量を要求します。足りなければ
+- 容量：各ダンプの前に、ヘルパーは少なくとも（ジョブの RSS + VRAM + ジョブ専用の `/tmp` と `/dev/shm` に
+  保存されている分）× 1.2 の空き容量を要求します。足りなければ
   チェックポイントは拒否され、ジョブは動き続けます。イメージは圧縮されません。テストでは、7 GB の VRAM を使う
   ジョブで 8.1 GB のイメージができました。tmpfs は使わないでください（`puzuz doctor` は失敗します）。空きが
   20 GiB 未満のとき、または `checkpoint_size_limit_bytes` までの残りより少ないときも警告します。
@@ -1520,7 +1530,16 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
 受けます。拒否の理由：
 
 - `not enough free space for the checkpoint: need N bytes, M available`：空き容量を作るか
-  `checkpoints_dir` を移してから、もう一度チェックポイントします。
+  `checkpoints_dir` を移してから、もう一度チェックポイントします。必要量には、ジョブが自分の `/tmp` と
+  `/dev/shm` に保存している分も含まれます（その場合、メッセージにその量が示されます）。
+- `the job has Unix sockets bound to [...] on the host's filesystems (or to relative names ...)`：
+  リストアの際に CRIU が root としてそれらのパスを作成、unlink、chown することになります。ソケットは `/tmp`
+  以下の絶対パスか抽象名にバインドしてください。相対名は、バインドされたディレクトリがわからないので、
+  ホストのパスとして扱われます。
+- `the job has internet sockets with SO_REUSEPORT (...)`：CRIU はジョブに資格情報を戻す前に root として
+  ソケットを作り直すので、リストアされた `SO_REUSEPORT` のソケットは root のものになり、同じポートの root の
+  サービスのグループに加わって（その接続の一部を受け取って）しまう可能性があります。プログラムで
+  `SO_REUSEPORT` を無効にするか、ジョブを `--no-checkpoint` で実行してください。
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`：ジョブのマウント
   名前空間が別のマウントの下に隠れたマウントに依存しているので、決してリストアできません。ジョブを実行し直して
   ください（`puzuz restart`）。新しいジョブには整理された名前空間が与えられます。
@@ -1552,6 +1571,11 @@ OS のシャットダウンや再起動の間に、ダンプが失敗したか�
 
 リストアが失敗してもジョブは `Checkpointed` のままで、イメージも残るので、原因を直してもう一度
 `puzuz restore` を実行できます。所有者は次にコマンドを実行したときに警告を受けます。
+
+- `the checkpoint of job N was dumped but not finalized, and finalizing it failed again: ...`：ダンプは
+  成功しましたが、ヘルパーがチェックポイントのメタデータを書き込めませんでした（[チェックポイントの保存先](#checkpoint-storage)
+  を参照）。典型的には、`checkpoints_dir` のあるディスクがいっぱいか故障しています。それを直してから、もう一度
+  リストアしてください。
 
 - `paths the checkpoint's mounts depend on are missing on this host: [...]`：CRIU は `Can't stat mountpoint`
   や `Failed to open_tree <path>` で失敗するはずの状態です。ジョブの名前空間に、今は存在しないマウントポイント、
