@@ -487,6 +487,16 @@ fn config_problems() {
     let report = run(&sys, None);
     assert_eq!(level(&report, "config"), Level::Fail);
 
+    // Bad priority settings are reported too.
+    sys.write(
+        "/etc/puzuz/config.toml",
+        "[priority]\ntres_billing_weights = \"mem=1\"\n",
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "config"), Level::Fail);
+    let message = report.find("config").unwrap().message.clone();
+    assert!(message.contains("tres_billing_weights"), "{message}");
+
     std::fs::remove_file(sys.path(Path::new("/etc/puzuz/config.toml"))).unwrap();
     let report = run(&sys, None);
     assert_eq!(level(&report, "config"), Level::Warn);
