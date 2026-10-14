@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
 
 use crate::config::{HelperConfig, SHUTDOWN_MANIFEST};
+use crate::deadmounts::DetachedMount;
 use crate::devices::DeviceRule;
 use crate::events::EventStore;
 use crate::host::{DumpHazards, HostProbe, ProcInfo};
@@ -113,6 +114,10 @@ pub enum SavedMounts {
         /// (see [`crate::access::HeldFile`]).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         held_files: Vec<crate::access::HeldFile>,
+        /// FUSE and network mounts that were gone or did not answer at the
+        /// dump, which the job did not use (see [`crate::deadmounts`]).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        detached_mounts: Vec<DetachedMount>,
     },
     MountPoints(Vec<String>),
 }
@@ -158,6 +163,16 @@ impl SavedMounts {
     pub fn held_files(&self) -> &[crate::access::HeldFile] {
         match self {
             SavedMounts::Full { held_files, .. } => held_files,
+            SavedMounts::MountPoints(_) => &[],
+        }
+    }
+
+    /// See [`SavedMounts::Full`].
+    pub fn detached_mounts(&self) -> &[DetachedMount] {
+        match self {
+            SavedMounts::Full {
+                detached_mounts, ..
+            } => detached_mounts,
             SavedMounts::MountPoints(_) => &[],
         }
     }
@@ -1526,6 +1541,30 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     ),
                 ));
             }
+            // A mount left out of the checkpoint (see `crate::deadmounts`)
+            // is replaced by the restore, but it needs its mount point.
+            let detached: Vec<String> = mounts
+                .detached_mounts()
+                .iter()
+                .map(|m| m.mount_point.clone())
+                .collect();
+            let no_mount_point = self.host.missing_mount_points(&detached).map_err(|e| {
+                error(
+                    HelperErrorCode::Internal,
+                    format!("checking the mount points the checkpoint needs: {e}"),
+                )
+            })?;
+            if !no_mount_point.is_empty() {
+                return Err(error(
+                    HelperErrorCode::InvalidRequest,
+                    format!(
+                        "the mount points {no_mount_point:?} of filesystems that were left out \
+                         of the checkpoint (they were gone or did not answer at the dump) are \
+                         missing on this host; create these directories, or mount the \
+                         filesystems there, and restore again"
+                    ),
+                ));
+            }
             let gone: Vec<&String> = used.iter().filter(|f| absent.contains(f)).collect();
             if !gone.is_empty() {
                 return Err(error(
@@ -1787,6 +1826,55 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 ck.criu.extra_restore_args.push(script.into());
             }
             Err(e) => return fail(self, format!("preparing the restore check: {e}")),
+        }
+        // Mounts detached at the dump: the host's filesystem if it is back,
+        // else an empty, inaccessible directory (see `crate::deadmounts`).
+        let detached: Vec<DetachedMount> = fs::read(dir.root().join(MOUNTS_FILE))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<SavedMounts>(&b).ok())
+            .map(|m| m.detached_mounts().to_vec())
+            .unwrap_or_default();
+        if !detached.is_empty() {
+            let placeholder = self
+                .cfg
+                .checkpoint_base
+                .join(crate::deadmounts::PLACEHOLDER_DIR);
+            let host = self.host.clone();
+            let mounts = detached.clone();
+            let sources = tokio::task::spawn_blocking(move || {
+                crate::deadmounts::ensure_placeholder(&placeholder)?;
+                host.detached_sources(&mounts, &placeholder)
+            })
+            .await
+            .map_err(io::Error::other)
+            .and_then(|r| r);
+            match sources {
+                Ok(sources) => {
+                    for (m, src) in detached.iter().zip(&sources) {
+                        let what = if src == &m.mount_point {
+                            "the host's filesystem, which is back"
+                        } else {
+                            "an empty, inaccessible directory (the filesystem is not back)"
+                        };
+                        eprintln!(
+                            "puzuz-helper: job {}: {} ({}) was left out of the checkpoint; \
+                             restoring it as {what}",
+                            job.0, m.mount_point, m.fstype
+                        );
+                    }
+                    ck.criu.extra_restore_args.extend(
+                        crate::deadmounts::restore_args(&detached, &sources)
+                            .into_iter()
+                            .map(Into::into),
+                    );
+                }
+                Err(e) => {
+                    return fail(
+                        self,
+                        format!("preparing the mounts left out of the checkpoint: {e}"),
+                    );
+                }
+            }
         }
         // One deadline for `criu restore` and the CUDA restore + unlock.
         let deadline = Deadline::after(ck.timeouts.operation_deadline(meta.size_bytes));
@@ -2099,13 +2187,18 @@ pub struct DumpPrecheck {
     hazards: DumpHazards,
     /// See [`JobRecord::dump_groups`].
     groups: Option<Vec<u32>>,
+    /// Dead mounts the job does not use, and the mounts below them (see
+    /// [`crate::deadmounts`]).
+    detached: Vec<DetachedMount>,
+    below_detached: Vec<String>,
 }
 
 /// The checks before a dump, which only read the job's state: the image
 /// base, the job's mounts (an image that depends on a hidden mount could
 /// never be restored, not even on this host), Unix sockets bound on the
-/// host's filesystems (see [`DumpHazards`]) and the free space for its
-/// memory. `private` are the mount points of the tmpfs mounts the job's
+/// host's filesystems (see [`DumpHazards`]), FUSE and network mounts that
+/// are gone or do not answer (see [`crate::deadmounts`]) and the free space
+/// for its memory. `private` are the mount points of the tmpfs mounts the job's
 /// namespace has of its own. An error means the dump is refused and the job
 /// is left alone.
 pub fn precheck_dump<H: HostProbe + ?Sized>(
@@ -2166,6 +2259,24 @@ pub fn precheck_dump<H: HostProbe + ?Sized>(
         ));
     }
     let host_pids: Vec<u32> = procs.iter().map(|p| p.host_pid).collect();
+    // Before anything that looks at the job's files: those on a filesystem
+    // that does not answer could block the helper.
+    let dead = host
+        .dead_mounts(init_pid, &host_pids)
+        .map_err(|e| format!("checking the job's FUSE and network mounts: {e}"))?;
+    if let Some(reason) = crate::deadmounts::refusal(&dead) {
+        return Err(reason);
+    }
+    let detached = DetachedMount::for_dump(&dead);
+    let below_detached = dead.below.clone();
+    // CRIU leaves the mounts below a detached one out of the image, so a
+    // restore does not need their mount points; a detached mount point is
+    // looked at by the restore itself (the host's mount there may be as
+    // dead as at the dump, or gone).
+    let mounts: Vec<String> = mounts
+        .into_iter()
+        .filter(|m| !below_detached.contains(m) && !detached.iter().any(|d| &d.mount_point == m))
+        .collect();
     let hazards = host
         .dump_hazards(&host_pids, private)
         .map_err(|e| format!("reading the job's open files: {e}"))?;
@@ -2218,6 +2329,8 @@ pub fn precheck_dump<H: HostProbe + ?Sized>(
         open_files,
         hazards,
         groups,
+        detached,
+        below_detached,
     })
 }
 
@@ -2277,9 +2390,23 @@ pub fn dump_job<H: HostProbe + ?Sized>(
         open_files,
         hazards,
         groups,
+        detached,
+        below_detached,
     } = precheck_dump(host, ck.mode, base, record, init_pid, private)
         .map_err(DumpError::Refused)?;
     let mut ck = dump_options(ck, &hazards);
+    for d in &detached {
+        eprintln!(
+            "puzuz-helper: job {}: {} ({}) {}; the job does not use it, so it is checkpointed \
+             without it",
+            record.job.0, d.mount_point, d.fstype, d.why
+        );
+    }
+    ck.criu.extra_dump_args.extend(
+        crate::deadmounts::dump_args(&detached, &below_detached)
+            .into_iter()
+            .map(Into::into),
+    );
     let mut cuda_pids = Vec::new();
     if !record.gpus.is_empty() {
         // Every process of the namespace that answers
@@ -2329,6 +2456,7 @@ pub fn dump_job<H: HostProbe + ?Sized>(
             source_mounts: Vec::new(),
             open_files,
             held_files: hazards.held_files.clone(),
+            detached_mounts: detached,
         };
         let mounts_json = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
         write_atomic(&dir.root().join(MOUNTS_FILE), &mounts_json).map_err(|e| e.to_string())?;
@@ -2540,6 +2668,7 @@ pub fn finish_dump<H: HostProbe + ?Sized>(
             mut source_mounts,
             open_files,
             mut held_files,
+            detached_mounts,
         } => {
             if external_sources.is_empty() {
                 external_sources = fs::read_to_string(dir.dump_log())
@@ -2572,6 +2701,7 @@ pub fn finish_dump<H: HostProbe + ?Sized>(
                 source_mounts,
                 open_files,
                 held_files,
+                detached_mounts,
             }
         }
         old @ SavedMounts::MountPoints(_) => old,

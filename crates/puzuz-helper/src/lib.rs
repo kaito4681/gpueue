@@ -13,6 +13,8 @@
 //! - [`host`]: `/proc`, `nvidia-smi`, users and mounts.
 //! - [`devices`]: GPU isolation (the device nodes a job unit may open).
 //! - [`mounts`]: mountinfo analysis (hidden mounts, CRIU's external binds).
+//! - [`deadmounts`]: FUSE and network mounts that are gone or do not
+//!   answer, and how dumps and restores get along without them.
 //! - [`forkguard`]: the preload library that makes forked children of CUDA
 //!   processes checkpointable.
 //! - [`gcroots`]: Nix GC roots that keep the helper's store path while jobs
@@ -20,6 +22,7 @@
 
 pub mod access;
 pub mod config;
+pub mod deadmounts;
 pub mod devices;
 pub mod engine;
 pub mod events;

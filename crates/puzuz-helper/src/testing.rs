@@ -31,6 +31,7 @@ pub struct FakeHost {
     restored_problems: Mutex<Vec<String>>,
     verified: Mutex<Vec<VerifyRequest>>,
     tmpfs_bytes: Mutex<u64>,
+    dead: Mutex<crate::deadmounts::DeadMounts>,
     /// While set, access checks block (see [`FakeHost::hold_access_checks`]).
     held: Mutex<bool>,
     released: std::sync::Condvar,
@@ -157,6 +158,7 @@ impl HostProbe for FakeHost {
         let problems = match req {
             VerifyRequest::Paths(_) => &self.path_problems,
             VerifyRequest::Restored(_) => &self.restored_problems,
+            VerifyRequest::Probe(c) => return Ok(vec![String::new(); c.paths.len()]),
             VerifyRequest::Exist(c) => {
                 return Ok(c
                     .paths
@@ -172,12 +174,25 @@ impl HostProbe for FakeHost {
     fn private_tmpfs_bytes(&self, _pid: u32, _private: &[String]) -> io::Result<u64> {
         Ok(*self.tmpfs_bytes.lock().unwrap())
     }
+
+    fn dead_mounts(
+        &self,
+        _init_pid: u32,
+        _host_pids: &[u32],
+    ) -> io::Result<crate::deadmounts::DeadMounts> {
+        Ok(self.dead.lock().unwrap().clone())
+    }
 }
 
 impl FakeHost {
     /// What [`HostProbe::dump_hazards`] reports for every job.
     pub fn set_dump_hazards(&self, h: DumpHazards) {
         *self.hazards.lock().unwrap() = h;
+    }
+
+    /// What [`HostProbe::dead_mounts`] reports for every job.
+    pub fn set_dead_mounts(&self, d: crate::deadmounts::DeadMounts) {
+        *self.dead.lock().unwrap() = d;
     }
 
     /// What [`HostProbe::process_groups`] reports for every job.
@@ -220,6 +235,8 @@ pub struct FakeExecState {
     /// What the `post-dump` hook of each successful `criu dump`
     /// (`--action-script`, see [`crate::access::run_dump_hook`]) reports.
     pub dump_hook_held: Option<Vec<crate::access::HeldFile>>,
+    /// The arguments of every `criu dump` run.
+    pub dump_args: Vec<Vec<String>>,
 }
 
 /// Executes plans by recording them. `criu dump` creates a minimal image
@@ -235,6 +252,14 @@ impl Executor for FakeExecutor {
             st.thawed.push(*root_pid);
         }
         // CRIU writes its log whether or not the dump succeeds.
+        if let Step::Run {
+            action: Action::CriuDump { .. },
+            command,
+            ..
+        } = step
+        {
+            st.dump_args.push(command.args_lossy());
+        }
         if let Step::Run {
             action: Action::CriuDump { .. },
             command,

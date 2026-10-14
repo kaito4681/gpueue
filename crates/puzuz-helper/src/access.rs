@@ -114,6 +114,22 @@ pub struct RestoredCheck {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExistCheck {
     pub paths: Vec<String>,
+    /// The paths are mount points of filesystems that a restore replaces
+    /// (see [`crate::deadmounts::mount_point_missing`]): one that cannot be
+    /// looked at because a filesystem that does not answer is mounted on
+    /// it is there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mount_points: bool,
+}
+
+/// Whether the filesystems at these paths answer (see
+/// [`crate::deadmounts::probe_paths`]), as root. In the child only so that
+/// a filesystem that does not answer cannot hold up the helper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeCheck {
+    pub paths: Vec<String>,
+    /// How long to wait for each path.
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +139,9 @@ pub enum VerifyRequest {
     Restored(RestoredCheck),
     /// The reply lists the missing paths, unlimited.
     Exist(ExistCheck),
+    /// The reply has one entry per path: empty if its filesystem answered,
+    /// else why not.
+    Probe(ProbeCheck),
 }
 
 /// The problems found (empty: all is well), or why the check could not be
@@ -150,8 +169,21 @@ pub fn run_verify_access() -> i32 {
             VerifyRequest::Exist(c) => Ok(c
                 .paths
                 .into_iter()
-                .filter(|p| fs::symlink_metadata(p).is_err())
+                .filter(|p| {
+                    if c.mount_points {
+                        crate::deadmounts::mount_point_missing(Path::new(p))
+                    } else {
+                        fs::symlink_metadata(p).is_err()
+                    }
+                })
                 .collect()),
+            VerifyRequest::Probe(c) => Ok(crate::deadmounts::probe_paths(
+                &c.paths,
+                std::time::Duration::from_millis(c.timeout_ms),
+            )
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect()),
         });
     match serde_json::to_vec(&reply) {
         Ok(out) => {
