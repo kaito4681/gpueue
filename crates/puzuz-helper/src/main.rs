@@ -218,6 +218,7 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
         cfg.checkpoint.cuda.path.display(),
         cfg.nvidia_smi.display()
     );
+    eprintln!("puzuz-helper: job policy: {}", cfg.job_policy.describe());
     for path in cfg.paths_to_check() {
         puzuz_helper::validate::check_root_owned_path(path)?;
     }

@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
 
 use crate::config::{HelperConfig, SHUTDOWN_MANIFEST};
+use crate::devices::DeviceRule;
 use crate::events::EventStore;
 use crate::host::{DumpHazards, HostProbe, ProcInfo};
 use crate::jobs::{self, JobFiles, JobRecord, RecordPhase, ShimSpec, UnitKind};
@@ -485,10 +486,17 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         if self.is_shutting_down() {
             return error(HelperErrorCode::ShuttingDown, "the helper is shutting down");
         }
-        let creds = match validate::check_spawn(&*self.host, &req) {
+        let creds = match validate::check_spawn(&*self.host, &self.cfg.job_policy, &req) {
             Ok(c) => c,
             Err(r) => return r.into(),
         };
+        if !creds.dropped.is_empty() {
+            eprintln!(
+                "puzuz-helper: job {} of {}: leaving out the supplementary groups {:?} \
+                 (job_denied_groups)",
+                req.job.0, creds.user.name, creds.dropped
+            );
+        }
         let files = JobFiles::new(&self.cfg.jobs_dir(), req.job);
         let record = JobRecord {
             job: req.job,
@@ -562,6 +570,9 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         self.ensure_log_dir(req)
             .map_err(|e| internal("preparing the log directory", e))?;
 
+        let devices = self
+            .unit_devices(req.job, &req.gpus)
+            .map_err(|e| error(HelperErrorCode::SpawnFailed, e))?;
         let mut argv = req.shell.clone();
         argv.push(req.command.clone());
         let mut envs = req.envs.clone();
@@ -609,8 +620,45 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             files: files.clone(),
             argv,
             envs,
+            devices,
         };
         self.launcher.spawn(&spec).await.map_err(Into::into)
+    }
+
+    /// The device access of a unit of `job` with `gpus` (see
+    /// [`crate::devices`]): `None` without `gpu_device_isolation`.
+    fn unit_devices(
+        &self,
+        job: JobId,
+        gpus: &[puzuz_protocol::helper::GpuIndex],
+    ) -> Result<Option<Vec<DeviceRule>>, String> {
+        if !self.cfg.gpu_device_isolation {
+            return Ok(None);
+        }
+        if gpus.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let minors = self.host.gpu_device_minors().map_err(|e| {
+            format!(
+                "finding the device nodes of the GPUs for gpu_device_isolation \
+                 ({}): {e}",
+                crate::devices::NVIDIA_GPUS_DIR
+            )
+        })?;
+        let unknown: Vec<String> = gpus
+            .iter()
+            .filter(|g| g.0 as usize >= minors.len())
+            .map(|g| g.0.to_string())
+            .collect();
+        if !unknown.is_empty() {
+            eprintln!(
+                "puzuz-helper: job {}: the NVIDIA driver knows no GPU {}; the job cannot open it \
+                 (gpu_device_isolation)",
+                job.0,
+                unknown.join(", ")
+            );
+        }
+        Ok(Some(crate::devices::job_device_allow(gpus, &minors)))
     }
 
     fn is_managed_log(&self, req: &SpawnRequest) -> bool {
@@ -1368,10 +1416,32 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 "the checkpoint belongs to another job or user",
             ));
         }
-        let creds = validate::check_credentials(&*self.host, record.uid, record.gid, None)?;
+        let creds = validate::check_credentials(
+            &*self.host,
+            &self.cfg.job_policy,
+            record.uid,
+            record.gid,
+            None,
+        )?;
         // CRIU restores the groups the job had at the dump (older images
-        // did not record them; the check after the restore covers those).
+        // did not record them; the check after the restore covers those,
+        // denied groups included: they are not in `allowed_gids`).
         if let Some(groups) = &record.dump_groups {
+            let denied: Vec<String> = groups
+                .iter()
+                .filter(|g| creds.is_denied(**g))
+                .map(|g| creds.denied_name(*g))
+                .collect();
+            if !denied.is_empty() {
+                return Err(validate::Rejection::policy(
+                    &creds.user.name,
+                    format!(
+                        "the checkpointed job ran with the groups {denied:?}, which are in \
+                         job_denied_groups; it cannot be restored"
+                    ),
+                )
+                .into());
+            }
             let gone: Vec<u32> = groups
                 .iter()
                 .copied()
@@ -1388,10 +1458,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 ));
             }
         }
-        let mut allowed_gids = creds.user.groups.clone();
-        allowed_gids.push(creds.user.gid);
-        allowed_gids.sort_unstable();
-        allowed_gids.dedup();
+        let allowed_gids = creds.allowed_gids();
         self.check_image_paths(&dir, &record, &allowed_gids)?;
         // CRIU fails with "Can't stat mountpoint" / "Failed to open_tree"
         // when a mount point of the job's namespace or the host path of an
@@ -1754,6 +1821,15 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         else {
             return fail(self, "empty restore plan".into());
         };
+        // The GPUs of this restore (the restored processes reopen their
+        // device nodes there, and CRIU's CUDA plugin runs in the unit).
+        let devices = match self.unit_devices(job, &req.gpus) {
+            Ok(d) => d,
+            Err(e) => return fail(self, e),
+        };
+        // The directories the shim hid behind a tmpfs must exist again as
+        // mount points (`/run` is empty after a reboot).
+        crate::jobs::ensure_restore_mount_points(&self.cfg.mounts);
         let spec = RestoreSpec {
             job,
             unit: unit.clone(),
@@ -1761,6 +1837,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             pidfile: dir.restore_pidfile(),
             timeout: timeout.min(deadline.remaining()),
             criu_root: self.cfg.criu_root.clone(),
+            devices,
         };
         let pid = match self.launcher.restore(&spec).await {
             Ok(pid) => pid,

@@ -34,5 +34,15 @@ RUN if ! command -v sshfs >/dev/null || ! command -v sshd >/dev/null; then \
          && rm -rf /var/lib/apt/lists/*) \
         || echo "sshfs/openssh-server not installed; the FUSE scenario will be skipped"; \
     fi
+# Optional: sudo and polkit (pkexec), so that scenario 19 of
+# scripts/e2e/scenario.sh can show that jobs cannot use them even when the
+# owner may (it skips those checks when they are missing).
+RUN if ! command -v sudo >/dev/null || ! command -v pkexec >/dev/null; then \
+        (apt-get update \
+         && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            sudo polkitd pkexec \
+         && rm -rf /var/lib/apt/lists/*) \
+        || echo "sudo/polkit not installed; scenario 19 skips their checks"; \
+    fi
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]

@@ -38,8 +38,14 @@
 //! accepted and then abandoned before systemd started its unit), or whose
 //! answer was lost while the helper never started it, is put back in line
 //! the same way and retried; no restore error is recorded for it. The "launch
-//! regardless of slots" mark is kept in memory only: after a daemon restart
+//! ahead of the queue" mark is kept in memory only: after a daemon restart
 //! such a job waits for a slot like any other.
+//!
+//! Launching actions skip the queue and the group's `parallel` limit. Only
+//! an administrator's (root or `puzuz-admin`) also ignore GPU slots and a
+//! paused group; anybody else's job waits in line, ahead of all others,
+//! until its GPUs have a free slot and its group is resumed (the reply and
+//! the job's view say why it waits, see [`puzuz_core::scheduler::LaunchWait`]).
 //!
 //! Job logs live in `<logs_dir>/<uid>/`, which the helper creates owned by
 //! the job's owner and writable by the daemon's group. The owner controls

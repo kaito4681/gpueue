@@ -40,7 +40,13 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
 2. **Scheduling.** A queued job starts when its group has a free slot and every requested GPU has
    a free slot. Candidates are considered in priority order (see
    [Priority and fair share](#priority-and-fair-share)). The daemon then asks the helper to spawn
-   it.
+   it. Immediate launches (`start <id>`, `add -i`, `restart -i`, `restore -i`) are marked as
+   forced, in memory. An administrator's is launched at once, ignoring every limit. Anybody else's
+   is part of the plan (`scheduler::Reserved::forced`): it goes before every other candidate and
+   skips the group's `parallel` limit and its dependencies, but it still needs a free slot on each
+   of its GPUs and an unpaused group. The action checks this in the same transaction, so a launch
+   that fits starts right away and one that does not is queued with the reason
+   (`scheduler::LaunchWait`), which the reply and the job's view (`waiting`) carry.
 3. **Daemon → helper.** The daemon keeps one connection to `/run/puzuz/helper.sock` and exchanges
    newline-delimited JSON. A Hello message checks the protocol version first. Then come requests
    with ids, and numbered events from the helper (job exited, checkpoint or restore finished).
@@ -63,12 +69,20 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    `puzuz-helper shim`. The unit has `Before=puzuz-helper.service` and `KillMode=mixed`, stdin is
    `/dev/null`, and the stop timeout is `grace_secs`. Each job lives in its own cgroup, outside the
    daemon, the helper and the user's session, so it survives restarts of the daemon and the
-   helper and the user logging out.
+   helper and the user logging out. With `gpu_device_isolation` (the default) the unit also has
+   `DevicePolicy=closed` and `DeviceAllow=` for the job's GPUs only (see
+   [GPU isolation](#gpu-isolation)).
 5. **Shim.** Still root, the shim creates a PID namespace and a mount namespace and starts the
    namespace's init, after it triggered the host's automount points (so that the namespace gets
    the automounted filesystems). The init makes the mounts private and mounts a fresh `/proc`. It removes mounts hidden under other mounts and mounts that do not survive a
    reboot (`/run/*`, `/media/*`), replaces each automounted filesystem stacked on its `autofs`
-   mount with a plain copy, and mounts private tmpfs on `/tmp` and `/dev/shm`. Then it drops to
+   mount with a plain copy, and mounts private tmpfs on `/tmp` and `/dev/shm`. Unless
+   `job_system_dbus = true`, it hides `/run/dbus` behind an empty tmpfs and, unless
+   `job_systemd_varlink = true`, hides `/run/systemd` behind a tmpfs that holds only journald's log
+   sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/`, so the job cannot
+   ask systemd or polkit for anything over D-Bus or Varlink, also once new sockets appear there;
+   CRIU dumps these mounts and recreates them on restore (see
+   [What a job can and cannot do](install.md#what-a-job-can-and-cannot-do)). Then it drops to
    the owner's
    uid, gid and groups with `no_new_privs`, opens the log
    (`/var/lib/puzuz/logs/<uid>/<id>.log`) and the working directory as the owner, and runs the
@@ -112,7 +126,8 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    must be mounted at the same place with the same type (automount points are triggered), and
    the files and working directories the job had open must exist. It starts a
    new unit `puzuz-job-<id>-r<n>.service` that runs `criu restore --root` on a bind mount of `/`
-   (`/run/puzuz-helper/criu-root`). In manual mode it then runs cuda-checkpoint `restore` and
+   (`/run/puzuz-helper/criu-root`), with the device access of the GPUs of the restore. In manual
+   mode it then runs cuda-checkpoint `restore` and
    `unlock` on the CUDA processes. In plugin mode CRIU's plugin does this before `criu restore`
    returns. Each image is restored in the mode it was dumped in, whatever `cuda_checkpoint_mode`
    says now. The job keeps its id and log, and the image is deleted afterwards.
@@ -181,20 +196,47 @@ failed and keeps the image as well.
 
 ## Other privilege boundaries
 
+- <a id="job-credentials"></a>The helper, not the daemon, decides whose jobs run, so a
+  compromised daemon cannot get around it. For every spawn and restore it looks the owner up
+  through NSS and refuses uid 0, gid 0, groups the owner is not in, users below `job_min_uid`
+  (default `UID_MIN` of `/etc/login.defs`), users missing from a non-empty `job_allowed_users`,
+  and a job group listed in `job_denied_groups` (root-equivalent groups such as `docker`, `disk`
+  or `sudo`, looked up in `/etc/group`), with an error of code `policy_denied` whose message
+  (`puzuz refuses to run jobs as <user>: <reason>`) becomes the job's spawn failure or restore
+  error. It computes the job's supplementary groups itself (what `initgroups` would set, without
+  denied groups and gid 0) and passes them to the shim; the helper's journal records the groups it
+  left out. A restore is refused when the checkpointed processes had a denied
+  group, and the check after the restore allows only the owner's groups minus the denied ones. See
+  [Who jobs may run as](install.md#who-jobs-may-run-as).
 - The helper binds its socket in `/run/puzuz`, which the daemon user owns, through a private
   root-owned staging directory that it uses only by file descriptor. It serves one daemon session
   at a time (a new one replaces the old), at most a few connections waiting for their Hello, and
   bounds the queues and requests in flight of a session.
-- The shim works on the job's mount namespace as root before it drops privileges. It looks up the
-  owner's groups first (NSS loads libraries by path), and it moves and detaches mounts (including
+- The shim works on the job's mount namespace as root before it drops privileges. It moves and detaches mounts (including
   the volatile ones below `/run` and `/media`) only through file descriptors, reached once
   through directories that only root can change and without following symlinks, so the owner
   cannot redirect a mount operation onto a system directory. A mount below a directory that
-  someone else can change is left alone.
+  someone else can change is left alone. The supplementary groups come from the helper (see
+  above), so the shim does not look them up again.
 - At start-up the helper looks up programs given by name (`criu`, `cuda-checkpoint`,
   `nvidia-smi`) once in its `PATH`, requires the file found, like a program given by an
   absolute path, to belong to root and to be reached only through directories that only root can
   change, and uses that absolute path from then on.
+- <a id="gpu-isolation"></a>**GPU isolation.** `CUDA_VISIBLE_DEVICES` only tells CUDA which
+  GPUs to use; any job could change it. With `gpu_device_isolation = true` (the default) the
+  helper gives every job unit, spawned or restored, `DevicePolicy=closed` and a `DeviceAllow=`
+  list (read-write): `/dev/nvidia<minor>` of each assigned GPU plus `/dev/nvidiactl`,
+  `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset` and `char-nvidia-uvm`, and
+  nothing for a CPU-only job. systemd enforces it with a cgroup device program for every process
+  of the unit, root included, so opening any other NVIDIA device fails with `EPERM`; `closed`
+  still allows the standard pseudo devices (`/dev/null`, `/dev/zero`, `/dev/full`,
+  `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, `/dev/pts/*`). GPU indices (PCI bus
+  order) are mapped to device minors with the driver's
+  `/proc/driver/nvidia/gpus/<PCI address>/information` (`Device Minor`, without excluded GPUs)
+  at every spawn and restore. A restore unit gets the GPUs of the restore: `criu restore` and, in
+  plugin mode, CRIU's CUDA plugin run inside it, and in manual mode the driver reopens the
+  device nodes in the restored processes when the helper runs `cuda-checkpoint --action restore`
+  on them. See [GPU isolation](install.md#gpu-isolation) in the installation guide.
 - At start-up the helper refuses directories it writes to or loads code from (including
   `<data_dir>/criu-no-plugins`, passed to `criu -L`, and the fork guard's `<data_dir>/lib`) unless
   they and their parents belong to root.

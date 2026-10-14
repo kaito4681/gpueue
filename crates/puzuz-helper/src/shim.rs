@@ -832,6 +832,130 @@ fn setup_mounts(plan: &MountPlan) -> Result<(), String> {
         )
         .map_err(|e| format!("mounting a tmpfs on {t}: {e}"))?;
     }
+    hide_dirs(&plan.hidden_dirs)?;
+    if let Some(keep) = &plan.systemd_run_keep {
+        mask_systemd_run(keep)?;
+    }
+    Ok(())
+}
+
+/// An empty, root-owned tmpfs on `path` (`mode=0755`), so that nothing
+/// below the host's directory is reachable in the job, also what is
+/// created there later.
+fn mount_empty_tmpfs(path: &Path) -> Result<(), String> {
+    mount(
+        Some("tmpfs"),
+        path,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        Some("mode=0755,size=1m"),
+    )
+    .map_err(|e| format!("hiding {}: {e}", path.display()))
+}
+
+/// Hide each directory of `dirs` (see [`MountPlan::hidden_dirs`]) behind
+/// an empty tmpfs, creating it first if only it is missing. Two names of
+/// one directory (`/var/run/dbus` when `/var/run` links to `/run`) are
+/// hidden once; a directory whose parent does not exist is skipped (there
+/// is no path to it).
+fn hide_dirs(dirs: &[String]) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut hidden: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let path = Path::new(dir);
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            continue;
+        };
+        let Ok(parent) = std::fs::canonicalize(parent) else {
+            continue;
+        };
+        let real = parent.join(name);
+        if hidden.contains(&real) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&real) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(format!("{}: not a directory", real.display())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .mode(0o755)
+                    .create(&real)
+                    .map_err(|e| format!("creating {}: {e}", real.display()))?;
+            }
+            Err(e) => return Err(format!("{}: {e}", real.display())),
+        }
+        mount_empty_tmpfs(&real)?;
+        hidden.push(real);
+    }
+    Ok(())
+}
+
+/// Hide `/run/systemd` behind an empty, root-owned tmpfs holding only the
+/// host's entries named in `keep` (relative paths of files or
+/// directories, bound from the host where they exist) and an empty
+/// `system` directory, so that nothing in the job reaches systemd's
+/// Varlink sockets (see [`MountPlan::systemd_run_keep`]). CRIU saves the
+/// tmpfs (its directories and mount-point files) in the image and binds
+/// the kept entries from the host again on restore.
+fn mask_systemd_run(keep: &[String]) -> Result<(), String> {
+    use rustix::fs::CWD;
+    use rustix::mount::{MoveMountFlags, OpenTreeFlags, move_mount, open_tree};
+    const DIR: &str = "/run/systemd";
+    if !std::fs::symlink_metadata(DIR).is_ok_and(|m| m.is_dir()) {
+        return Ok(());
+    }
+    // Copies of what stays, taken before the tmpfs covers them.
+    let mut kept = Vec::new();
+    for name in keep {
+        let rel = Path::new(name);
+        if name.is_empty()
+            || rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!("{DIR}: invalid entry to keep {name:?}"));
+        }
+        let path = format!("{DIR}/{name}");
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let copy = open_tree(
+            CWD,
+            path.as_str(),
+            OpenTreeFlags::OPEN_TREE_CLONE
+                | OpenTreeFlags::AT_RECURSIVE
+                | OpenTreeFlags::AT_SYMLINK_NOFOLLOW
+                | OpenTreeFlags::OPEN_TREE_CLOEXEC,
+        )
+        .map_err(|e| format!("copying {path}: {e}"))?;
+        kept.push((path, meta.is_dir(), copy));
+    }
+    mount_empty_tmpfs(Path::new(DIR))?;
+    // `sd_booted()` checks for this directory.
+    std::fs::create_dir(format!("{DIR}/system")).map_err(|e| format!("{DIR}/system: {e}"))?;
+    for (path, is_dir, copy) in kept {
+        if let Some(parent) = Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        if is_dir {
+            std::fs::create_dir(&path)
+        } else {
+            File::create(&path).map(drop)
+        }
+        .map_err(|e| format!("{path}: {e}"))?;
+        move_mount(
+            &copy,
+            "",
+            CWD,
+            path.as_str(),
+            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+        )
+        .map_err(|e| format!("binding {path}: {e}"))?;
+    }
     Ok(())
 }
 

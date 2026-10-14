@@ -7,6 +7,7 @@ use puzuz_core::authz;
 use puzuz_core::model::{
     Caller, GpuIndex, Job, JobId, JobResult, JobSpec, JobState, Timestamp, Uid,
 };
+pub use puzuz_core::scheduler::LaunchWait;
 use serde::{Deserialize, Serialize};
 
 use super::ApiError;
@@ -52,6 +53,11 @@ pub struct JobView {
     /// Owner/admin-only fields; `None` in the redacted view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<JobDetails>,
+    /// A forced launch (`start`, `add --immediate`, `restore --immediate`,
+    /// `restart --immediate` by a non-administrator) that waits in line,
+    /// and why. Filled in by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<LaunchWait>,
 }
 
 /// Fields only the owner and administrators may see.
@@ -119,6 +125,7 @@ impl JobView {
             finished_at: job.finished_at,
             checkpoint_size_bytes: None,
             details: None,
+            waiting: None,
         }
     }
 
@@ -246,9 +253,14 @@ pub struct AddJobRequest {
 pub struct AddJobResponse {
     pub id: JobId,
     /// `--immediate` while the helper is not connected: the job is queued
-    /// and starts (still ignoring slots) as soon as the helper is back.
+    /// and starts (still ahead of the queue) as soon as the helper is back.
     #[serde(default, skip_serializing_if = "is_false")]
     pub launch_pending: bool,
+    /// `--immediate` by a non-administrator while a GPU of the job has no
+    /// free slot or its group is paused: the job is queued and starts,
+    /// ahead of the queue, as soon as that changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<LaunchWait>,
 }
 
 impl AddJobResponse {
@@ -256,6 +268,7 @@ impl AddJobResponse {
         Self {
             id,
             launch_pending: false,
+            waiting: None,
         }
     }
 }
@@ -448,6 +461,7 @@ impl JobActionResult {
             outcome: ActionOutcome::Ok {
                 new_id: None,
                 launch_pending: false,
+                waiting: None,
             },
         }
     }
@@ -474,9 +488,14 @@ pub enum ActionOutcome {
         /// The job (for `restart`, the new one) was to be started or
         /// restored right away (`start`, `restore --immediate`, `restart
         /// --immediate`), but the helper is not connected: it is queued and
-        /// launched, still ignoring slots, as soon as the helper is back.
+        /// launched, still ahead of the queue, as soon as the helper is back.
         #[serde(default, skip_serializing_if = "is_false")]
         launch_pending: bool,
+        /// The launch is a non-administrator's and a GPU of the job has no
+        /// free slot or its group is paused: it is queued and launched,
+        /// ahead of the queue, as soon as that changes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        waiting: Option<LaunchWait>,
     },
     Error {
         error: ApiError,

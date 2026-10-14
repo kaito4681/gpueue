@@ -16,8 +16,11 @@
 - [验证](#verifying)
 - [配置](#configuration)
 - [管理员](#administrators)
+- [谁可以运行作业](#who-jobs-may-run-as)
+- [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)
 - [优先级与公平共享](#priority-and-fair-share)
 - [GPU 检测](#gpu-detection)
+- [GPU 隔离](#gpu-isolation)
 - [检查点存储](#checkpoint-storage)
 - [升级](#upgrading)
 - [卸载](#uninstalling)
@@ -1029,6 +1032,12 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/puzu
 | `criu_dump_timeout_secs` | 未设置 | helper | 可选，单独限制 `criu dump`；未设置时只适用期限 |
 | `criu_restore_timeout_secs` | 未设置 | helper | 可选，单独限制 `criu restore`；未设置时只适用期限 |
 | `fork_guard` | `true` | helper | 向作业预加载 fork guard（见 README 的限制一节） |
+| `gpu_device_isolation` | `true` | helper | 每个作业单元只能打开所分配 GPU 的设备节点（`DevicePolicy=closed`）；`false` 关闭此功能（见 [GPU 隔离](#gpu-isolation)） |
+| `job_system_dbus` | `false` | helper | `true` 允许作业访问系统 D-Bus（systemd、polkit）；默认情况下对作业隐藏 `/run/dbus`（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
+| `job_systemd_varlink` | `false` | helper | `true` 允许作业访问 `/run/systemd` 下的 systemd Varlink 服务；默认情况下该目录对作业隐藏，只保留 journald 的日志套接字、resolved 的名称解析套接字和 `resolv.conf` 文件以及 `userdb/`（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
+| `job_min_uid` | `/etc/login.defs` 的 `UID_MIN`，没有则为 `1000` | helper | 拒绝 uid 小于此值的用户的作业（见 [谁可以运行作业](#who-jobs-may-run-as)） |
+| `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | helper | 等同 root 的组：从作业的附加组中去掉；主组为其中之一的作业会被拒绝 |
+| `job_allowed_users` | `[]`（所有人） | helper | 非空时，只有列出的用户（按名称）可以运行作业 |
 | `gpu_detection` | `"auto"` | 守护进程 | `"auto"`：NVML，失败时退回 `[[gpus]]`。`"static"`：只用 `[[gpus]]`。 |
 | `nvml_library` | 未设置 | 守护进程 | NVML 库的路径或名称；默认先用 `libnvidia-ml.so.1`，再用 `libnvidia-ml.so` |
 | `update_source` | `"github:kaito4681/puzuz"` | CLI | `puzuz update` 和 `puzuz doctor` 查找发布版本的位置：`github:<owner>/<repo>` |
@@ -1052,6 +1061,71 @@ sudo usermod -aG puzuz-admin alice
 ```
 
 守护进程在每次请求时（通过 NSS）查询组成员关系，因此更改立即生效，无需重新登录。
+
+<a id="who-jobs-may-run-as"></a>
+## 谁可以运行作业
+
+root helper 以所有者身份启动每个作业，因此由它决定运行谁的作业；守护进程无法改变这一点。除了从不以 root
+（uid 0 或 gid 0）或所有者不属于的组运行作业之外，helper 对每次启动和每次恢复应用三项设置：
+
+- `job_min_uid`：uid 小于此值的用户会被拒绝。未设置时为 `/etc/login.defs` 的 `UID_MIN`（大多数发行版为
+  1000），文件中没有有效的 `UID_MIN` 时为 1000。这样系统账户（`www-data`、`postgres`、守护进程自己的
+  `puzuz` 用户等）就不能运行作业。
+- `job_denied_groups`：其成员无需密码即可以 root 身份行事的组。它们会从作业的附加组中去掉，因此属于
+  `docker` 的用户的作业在没有 `docker` 的情况下运行；去掉了哪些组会记录在 helper 的日志中
+  （不会改动作业的输出）。主组为其中之一的作业会被拒绝，进程带有其中之一的检查点也会被拒绝恢复（CRIU 会恢复该组）。
+  每次启动和恢复时在 `/etc/group` 中查找这些名称，其中没有的名称会被忽略。gid 0 总是会被去掉。默认值及
+  包含每个组的原因：
+
+  | 组 | 为什么等同 root |
+  | --- | --- |
+  | `docker` | 通过 Docker 套接字可以启动绑定挂载 `/` 并以 root 运行的容器 |
+  | `lxd`、`incus-admin` | 通过 LXD/Incus 可以做同样的事（特权容器、主机挂载）；不包括 Incus 受限的 `incus` 组 |
+  | `libvirt` | 管理 `qemu:///system`，可以把主机的块设备和目录交给其虚拟机 |
+  | `disk` | 可以直接读写块设备，也就是读写其上的所有文件 |
+  | `sudo`、`wheel`、`admin` | sudo 权限：sudo 通常会询问密码，无人值守的作业无法输入，但 `NOPASSWD` 规则或缓存的凭据会让作业成为 root |
+
+  因为不等同 root 而未包括的组：`shadow`（密码哈希，至多被离线破解）、`adm`（日志）、`kvm`，以及
+  `video`/`render`（设备；GPU 作业需要后两者）。请添加在你的主机上等同 root 的组（例如 `microk8s`），或去掉
+  某个组让作业重新可以使用它（例如 `job_denied_groups = ["lxd", "incus-admin", "libvirt", "disk", "sudo",
+  "wheel", "admin"]` 让作业可以使用 Docker）。
+- `job_allowed_users`：非空时，只有列出的用户（按名称）可以运行作业。
+
+被拒绝的作业启动失败，原因以 `puzuz refuses to run jobs as <user>:` 开头，后面是例如 `uid 999 is below
+job_min_uid 1000 (UID_MIN in /etc/login.defs)`、`primary group docker is in job_denied_groups` 或 `not in
+job_allowed_users`。`puzuz status` 将其显示为 `Failed to spawn`，`puzuz log <id>` 和
+`puzuz status --json` 会显示原因。被拒绝的恢复按恢复失败处理（见 [恢复失败](#restore-failures)），作业保持
+已检查点状态。`puzuz doctor` 会显示生效的策略（最小 uid 及其来源、拒绝的组以及其中哪些在主机上存在、允许
+的用户），helper 启动时也会将其写入日志。更改这些键后请重启 helper。
+
+<a id="what-a-job-can-and-cannot-do"></a>
+## 作业能做什么、不能做什么
+
+作业以其所有者身份运行，可以对文件、网络和所分配的 GPU 做所有者能做的事。puzuz 保证作业无法获得更多权限，
+即使所有者在 puzuz 之外可以（有 `NOPASSWD` 规则的 `sudo` 成员、`docker` 成员，或 polkit 信任的组的成员）。
+从检查点恢复的作业同样如此：恢复的单元以相同方式设置，恢复的进程保持其凭据。e2e 场景 19 会在检查点和恢复
+前后检查下面的每一项。
+
+| 作业…… | 原因 | 开关 |
+| --- | --- | --- |
+| 以所有者的 uid 和主 gid 运行，绝不以 root 运行 | helper 拒绝 uid 0、系统账户和被拒绝的主组（[谁可以运行作业](#who-jobs-may-run-as)） | `job_min_uid`、`job_denied_groups`、`job_allowed_users` |
+| 没有任何 capability（`CapInh`、`CapPrm`、`CapEff`、`CapBnd`、`CapAmb` 全为 0），且 `NoNewPrivs: 1` | shim 在运行命令前清空边界集并设置 `no_new_privs` | 无 |
+| 无法通过 `sudo`、`su`、`pkexec` 或其他 setuid / 文件 capability 程序获得特权 | 在 `no_new_privs` 下内核会忽略 setuid 位和文件 capability | 无 |
+| 无法访问系统 D-Bus，因此无法执行 `systemctl`、`run0`、`machinectl`、`busctl --system` 或其他对 systemd、polkit、系统服务的请求 | shim 在作业的挂载命名空间中用一个空的、属于 root 的 tmpfs 隐藏 `/run/dbus`（若 `/var/run` 不是指向 `/run` 的链接，`/var/run/dbus` 也一样），主机上还没有该目录时会先创建它，因此之后才出现的总线套接字同样无法访问；恢复时 CRIU 会保存并重建这个 tmpfs；polkit 从用户数据库而不是作业的组判断组成员关系，仅去掉组无法阻止它 | `job_system_dbus = true` |
+| 无法访问 systemd 的 Varlink 服务（`io.systemd.Manager` 的 reload 和 reexecute、`io.systemd.Credentials` 对系统凭据的解密、mountfsd、nsresourced、machined、logind、networkd、sysupdate 等），这些服务不经过 D-Bus，通过 polkit 为非特权调用者授权 | shim 用一个空的、属于 root 的 tmpfs 隐藏 `/run/systemd`，只保留 journald 的日志套接字（`journal/socket`、`journal/stdout`、`journal/dev-log`）、resolved 的 `resolve/io.systemd.Resolve`、`resolve/stub-resolv.conf` 和 `resolve/resolv.conf`（逐个绑定，因此之后在那里创建的套接字仍无法访问）、`userdb/` 目录（只用于用户和组查询，见下文）以及一个空的 `system/`；恢复时 CRIU 会保存并重建这些 | `job_systemd_varlink = true` |
+| 不具有 `docker`、`lxd`、`incus-admin`、`libvirt`、`disk`、`sudo`、`wheel`、`admin` 组（root 守护进程的套接字、原始块设备） | helper 将它们从附加组中去掉 | `job_denied_groups` |
+| 除标准伪设备和所分配 GPU 的设备节点外，无法打开任何设备节点 | `DevicePolicy=closed` 加 `DeviceAllow=`（[GPU 隔离](#gpu-isolation)） | `gpu_device_isolation` |
+
+每个开关都会削弱一项保证；`job_system_dbus = true` 或 `job_systemd_varlink = true` 时 `puzuz doctor` 会发出警告。puzuz 不限制的内容：所有者的
+uid 本身能做的事（文件、通过会话总线的用户服务、网络访问）、作业使用的 CPU、内存或磁盘量，以及自行检查凭据的
+其他服务的套接字（例如允许任何用户的守护进程套接字）。作业的挂载是私有的（不接收主机的传播），因此主机之后在
+`/run/dbus`、`/run/systemd` 或其 `journal/` 和 `resolve/` 中创建的套接字，无论恢复前后都不会出现在作业中（e2e 场景 19
+会检查这一点）。唯一整个绑定的目录是 `userdb/`：其中的服务只实现 `io.systemd.UserDatabase`（`GetUserRecord`、
+`GetGroupRecord`、`GetMemberships`），是只读查询，回答的内容 `getent` 也能查到，因此之后加入的套接字也不会授予任何权限。
+其他 root 套接字仍可访问，但不会给非特权调用者任何权限：udev 的 `/run/udev/io.systemd.Udev` 只接受 root（套接字模式为
+0644）；polkit 的 `/run/polkit/agent-helper.socket` 只能完成客户端通过 D-Bus 发起的 polkit 认证（作业无法访问 D-Bus）；
+系统总线不监听其他地址（只有 `<listen>unix:path=/run/dbus/system_bus_socket</listen>`）。名称解析可以正常使用，但作业看到的是
+作业启动时的 `resolv.conf`（这些文件是绑定挂载的，而 resolved 在变化时会替换文件）。
 
 <a id="priority-and-fair-share"></a>
 ## 优先级与公平共享
@@ -1198,6 +1272,44 @@ memory_total_bytes = 25757220864
 守护进程之前知道但现在找不到的 GPU 会继续以不可用状态列出，并保留其槽位上限。需要它的作业
 保持排队，请求它的新作业会被拒绝。每个 GPU 初始上限为 1 个作业。用
 `puzuz gpu parallel <N> [--gpu LIST]` 修改（`0` 表示不限）。
+
+<a id="gpu-isolation"></a>
+## GPU 隔离
+
+`CUDA_VISIBLE_DEVICES` 只是告诉 CUDA 使用哪些 GPU，作业也可以修改它。在 `gpu_device_isolation = true`
+（默认）时，helper 还会通过作业 systemd 单元的 cgroup 设备控制器，限制每个作业能打开的设备节点：
+
+- 每个作业单元，无论是启动的（`puzuz-job-<id>.service`）还是恢复的（`puzuz-job-<id>-r<n>.service`），都设置
+  `DevicePolicy=closed`。它允许标准伪设备（`/dev/null`、`/dev/zero`、`/dev/full`、`/dev/random`、
+  `/dev/urandom`、`/dev/tty`、`/dev/ptmx` 以及 `/dev/pts/*` 伪终端），未列出的其他设备一律拒绝。
+- 使用 GPU 的作业会获得对每块所分配 GPU 的 `/dev/nvidia<minor>`，以及 `/dev/nvidiactl`、`/dev/nvidia-uvm`、
+  `/dev/nvidia-uvm-tools`、`/dev/nvidia-modeset` 和 `char-nvidia-uvm`（按主设备号指定的统一内存设备，
+  以防驱动在单元启动之后才创建这些节点）的 `DeviceAllow=`（读写）。
+- 仅使用 CPU 的作业完全不能打开 NVIDIA 设备。
+- 恢复的作业获得其恢复所用 GPU（与检查点时编号相同）的节点。`criu restore` 以及插件模式下 CRIU 的 CUDA
+  插件都在恢复单元内运行；在手动模式下，驱动会在被恢复的进程中重新打开设备节点。开启隔离时，CUDA 作业的
+  检查点和恢复仍能正常工作（GPU 端到端测试会检查这一点）。
+
+该限制适用于单元中的所有进程，包括 root。打开其他 GPU 的 `/dev/nvidia<N>` 会以 `EPERM` 失败。在作业内，
+`nvidia-smi` 只显示该作业能打开的 GPU。在仅使用 CPU 的作业中，它会以 `Failed to initialize NVML: Unknown
+Error` 失败，CUDA 也找不到设备。查看某个单元的设置：
+
+```sh
+systemctl show -p DevicePolicy -p DeviceAllow puzuz-job-<id>.service
+```
+
+GPU 编号遵循 PCI 总线顺序，但设备节点以驱动的次设备号命名，两者不一定相同。每次启动和恢复时，helper 从
+`/proc/driver/nvidia/gpus/<PCI 地址>/information` 的 `Device Minor` 读取次设备号，并与 NVML 和 CUDA 一样，
+按 PCI 总线顺序计数，跳过标记为 `GPU Excluded: Yes` 的 GPU。驱动不认识的 GPU 编号（不存在的 GPU 的
+`[[gpus]]` 条目，或未加载驱动）不会获得它自己的节点，helper 会记录这一情况。
+
+要关闭隔离，请设置 `gpu_device_isolation = false` 并重启 `puzuz-helper.service`。此后启动或恢复的作业不受
+设备限制；正在运行的作业保留其单元的设置。以下情况需要关闭它：
+
+- 使用 **MIG** 的主机：CUDA 还会打开 MIG 实例的 `/dev/nvidia-caps/nvidia-cap<N>`，而它不被允许；
+- 作业需要其他设备节点，例如 `/dev/fuse`、`/dev/kvm` 或 `/dev/infiniband` 下的 RDMA 设备。
+
+`puzuz doctor` 会显示隔离是否开启（`gpu isolation`）。
 
 <a id="checkpoint-storage"></a>
 ## 检查点存储
@@ -1557,6 +1669,11 @@ refused:` 开头），其所有者会收到警告。
 
 恢复失败时，作业保持 `Checkpointed` 状态并保留其镜像，因此你可以修复原因后再次运行
 `puzuz restore`。所有者会在下次执行命令时收到警告。
+
+- `puzuz refuses to run jobs as <user>: ...`：作业的所有者或组被 `job_min_uid`、`job_denied_groups`
+  或 `job_allowed_users` 拒绝（见 [谁可以运行作业](#who-jobs-may-run-as)）；`the checkpointed job ran with
+  the groups ["docker"], which are in job_denied_groups` 表示作业在带有现在被拒绝的组时创建了检查点。
+  请更改设置（并重启 helper）或删除该作业。
 
 - `the checkpoint of job N was dumped but not finalized, and finalizing it failed again: ...`：转储
   已成功，但 helper 无法写入检查点的元数据（见 [检查点存储](#checkpoint-storage)），通常是因为

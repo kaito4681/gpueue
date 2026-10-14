@@ -37,6 +37,11 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    4 MiB 内查找行首（如果这一范围内的行数不够，就从那里开始输出），并且同时只运行少量这样的扫描。
 2. **调度。** 当排队作业的组有空闲槽位，且其申请的每块 GPU 都有空闲槽位时，该作业启动。
    候选作业按优先级顺序考虑（参见[优先级与公平共享](#priority-and-fair-share)）。守护进程随后请求 helper 创建它。
+   立即启动（`start <id>`、`add -i`、`restart -i`、`restore -i`）的作业会在内存中被标记为"强制"。管理员的
+   强制启动会忽略所有限制立即启动。其他用户的则纳入调度计划（`scheduler::Reserved::forced`）：先于其他所有
+   候选作业考虑，跳过组的 `parallel` 限制和依赖关系，但仍需要其每块 GPU 都有空闲槽位且组未暂停。操作在同一
+   事务中检查这一点，因此能放下的启动会立即开始，放不下的会带着原因（`scheduler::LaunchWait`）排队，原因
+   包含在响应和作业视图（`waiting`）中。
 3. **守护进程 → helper。** 守护进程与 `/run/puzuz/helper.sock` 保持一个连接，交换以换行分隔的 JSON。
    首先由 Hello 消息检查协议版本。之后是带 id 的请求，以及来自 helper 的带编号的事件（作业已退出、检查点或恢复已完成）。
    事件会被持久化，并在守护进程确认之前反复重放，因此守护进程停止期间不会丢失任何内容。
@@ -53,11 +58,16 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
 4. **helper → systemd。** helper 通过 D-Bus 启动一个临时服务，其主进程为
    `puzuz-helper shim`。该单元设置了 `Before=puzuz-helper.service` 和 `KillMode=mixed`，stdin 为
    `/dev/null`，停止超时为 `grace_secs`。每个作业都位于自己的 cgroup 中，独立于守护进程、helper 和用户会话，
-   因此在守护进程和 helper 重启以及用户注销后仍能继续存在。
+   因此在守护进程和 helper 重启以及用户注销后仍能继续存在。在 `gpu_device_isolation`（默认开启）时，该单元还设置了
+   `DevicePolicy=closed` 和只允许作业 GPU 的 `DeviceAllow=`（见 [GPU 隔离](#gpu-isolation)）。
 5. **Shim。** shim 仍以 root 身份运行，它创建一个 PID 命名空间和一个挂载命名空间，并在触发主机的自动挂载点之后
    （以便命名空间获得自动挂载的文件系统）启动该命名空间的 init。init 把挂载设为私有，并挂载一个新的 `/proc`。它会移除被其他挂载遮盖的挂载以及重启后不会保留的挂载
    （`/run/*`、`/media/*`），把每个叠加在其 `autofs` 挂载之上的自动挂载文件系统替换为普通的副本，
-   并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs。然后它切换到所有者的
+   并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs。除非 `job_system_dbus = true`，它会用一个空的 tmpfs 隐藏 `/run/dbus`，并且除非
+   `job_systemd_varlink = true`，用只保留 journald 日志套接字、resolved 名称解析套接字和 `resolv.conf` 文件以及 `userdb/`
+   的 tmpfs 隐藏 `/run/systemd`，因此即使之后出现新的套接字，作业也无法通过 D-Bus 或 Varlink 向 systemd 或 polkit
+   请求任何操作；CRIU 会转储这个挂载并在恢复时
+   重建它（见 [作业能做什么、不能做什么](install.md#what-a-job-can-and-cannot-do)）。然后它切换到所有者的
    uid、gid 和组并设置 `no_new_privs`，以所有者身份打开日志
    （`/var/lib/puzuz/logs/<uid>/<id>.log`）和工作目录，并通过 `sh -c` 运行命令。
    环境变量为客户端的环境变量，再加上 `CUDA_VISIBLE_DEVICES`、
@@ -85,7 +95,7 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    都放在一个带期限的子进程中进行（以免宕机的 NFS 服务器把它卡住），检查 GPU 型号、驱动、可用显存和挂载：CRIU 要绑定的路径必须存在，作业在转储时所在的文件系统
    （记录在 `helper-mounts.json` 中）必须以相同类型挂载在相同位置（自动挂载点会被触发），
    并且作业曾打开的文件和工作目录必须存在。它启动一个新单元 `puzuz-job-<id>-r<n>.service`，在 `/` 的 bind 挂载
-   （`/run/puzuz-helper/criu-root`）上运行 `criu restore --root`。在手动模式下，它随后对 CUDA 进程运行 cuda-checkpoint 的
+   （`/run/puzuz-helper/criu-root`）上运行 `criu restore --root`，并使用恢复所用 GPU 的设备访问权限。在手动模式下，它随后对 CUDA 进程运行 cuda-checkpoint 的
    `restore` 和 `unlock`。在插件模式下，CRIU 的插件会在 `criu restore` 返回之前完成这些操作。
    每个镜像都以其转储时的模式恢复，而不管 `cuda_checkpoint_mode` 现在的设置。作业保留其 id 和日志，镜像随后被删除。
    CRIU 以 root 身份按转储时的路径重新打开作业的文件，因此恢复过程会防范所有者在转储后更改这些路径（参见
@@ -137,16 +147,34 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 <a id="other-privilege-boundaries"></a>
 ## 其他权限边界
 
+- <a id="job-credentials"></a>运行谁的作业由 helper 而不是守护进程决定，因此被攻破的守护进程也无法绕过。
+  每次启动和恢复时，helper 通过 NSS 查找所有者，并以代码为 `policy_denied` 的错误拒绝 uid 0、gid 0、所有者
+  不属于的组、低于 `job_min_uid`（默认为 `/etc/login.defs` 的 `UID_MIN`）的用户、不在非空的
+  `job_allowed_users` 中的用户，以及属于 `job_denied_groups`（`docker`、`disk`、`sudo` 等等同 root 的组，在
+  `/etc/group` 中查找）的作业组；其消息（`puzuz refuses to run jobs as <user>: <reason>`）会成为作业的启动
+  失败原因或恢复错误。作业的附加组由 helper 自己计算（`initgroups` 会设置的组，去掉被拒绝的组和 gid 0）并
+  传给 shim；被去掉的组会记录在 helper 的日志中。检查点进程带有被拒绝的组时会拒绝恢复，恢复后的
+  检查也只允许所有者的组中去掉被拒绝的组后的那些。见 [谁可以运行作业](install.md#who-jobs-may-run-as)。
 - helper 通过一个私有的、归 root 所有的暂存目录（只通过文件描述符使用）把它的套接字绑定到守护进程用户所拥有的
   `/run/puzuz` 中。它一次只服务一个守护进程会话（新会话会取代旧会话），最多允许少量连接等待其 Hello，
   并限制一个会话的队列和进行中请求的数量。
-- shim 在降低权限之前以 root 身份处理作业的挂载命名空间。它首先查找所有者的组（NSS 会按路径加载库），
-  并且只通过文件描述符移动和卸离挂载（包括 `/run` 和 `/media` 下的易失挂载），这些文件描述符只经由只有 root
+- shim 在降低权限之前以 root 身份处理作业的挂载命名空间。它只通过文件描述符移动和卸离挂载（包括 `/run` 和 `/media` 下的易失挂载），这些文件描述符只经由只有 root
   能修改的目录、且不跟随符号链接地获取一次，因此所有者无法把挂载操作重定向到系统目录上。位于其他人可以修改的
-  目录下的挂载会保持不动。
+  目录下的挂载会保持不动。附加组由 helper 传入（见上文），因此 shim 不会再次查找。
 - 启动时，helper 会在其 `PATH` 中查找一次以名称给出的程序（`criu`、`cuda-checkpoint`、`nvidia-smi`），
   要求找到的文件与以绝对路径给出的程序一样，归 root 所有且只能经由只有 root 能修改的目录到达，此后一直使用
   该绝对路径。
+- <a id="gpu-isolation"></a>**GPU 隔离。** `CUDA_VISIBLE_DEVICES` 只是告诉 CUDA 使用哪些 GPU，任何作业都
+  可以修改它。在 `gpu_device_isolation = true`（默认）时，helper 为每个作业单元（无论启动的还是恢复的）设置
+  `DevicePolicy=closed` 和一个 `DeviceAllow=` 列表（读写）：每块所分配 GPU 的 `/dev/nvidia<minor>`，加上
+  `/dev/nvidiactl`、`/dev/nvidia-uvm`、`/dev/nvidia-uvm-tools`、`/dev/nvidia-modeset` 和 `char-nvidia-uvm`；
+  仅使用 CPU 的作业什么也不允许。systemd 通过 cgroup 设备程序对单元的所有进程（包括 root）强制执行，因此
+  打开其他 NVIDIA 设备会以 `EPERM` 失败；`closed` 仍允许标准伪设备（`/dev/null`、`/dev/zero`、`/dev/full`、
+  `/dev/random`、`/dev/urandom`、`/dev/tty`、`/dev/ptmx`、`/dev/pts/*`）。每次启动和恢复时，GPU 编号
+  （PCI 总线顺序）通过驱动的 `/proc/driver/nvidia/gpus/<PCI 地址>/information`（`Device Minor`，不含被排除的
+  GPU）映射到设备次设备号。恢复单元获得恢复所用的 GPU：`criu restore` 以及插件模式下 CRIU 的 CUDA 插件在其中
+  运行，而在手动模式下，当 helper 对被恢复的进程运行 `cuda-checkpoint --action restore` 时，驱动会在这些进程中
+  重新打开设备节点。见安装指南中的 [GPU 隔离](install.md#gpu-isolation)。
 - 启动时，helper 会拒绝它要写入或从中加载代码的目录（包括传给 `criu -L` 的
   `<data_dir>/criu-no-plugins`，以及 fork guard 的 `<data_dir>/lib`），除非这些目录及其父目录都归 root 所有。
 

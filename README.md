@@ -147,7 +147,7 @@ puzuz follow 0        # stream the output, like tail -f
 ```sh
 puzuz checkpoint 0    # save job 0 to disk and stop it; frees the GPU. State: Checkpointed
 puzuz restore 0       # queue it again; it resumes once its group and GPUs have a free slot
-puzuz restore -i 0    # ...or resume right away, ignoring slot limits
+puzuz restore -i 0    # ...or resume right away, ahead of the queue (see "GPU slots")
 ```
 
 A restored job continues from the moment it was checkpointed. It keeps its job id, and its output
@@ -197,6 +197,7 @@ and does not read pueue's files. These are the differences:
 | `send` | sends input to a task's stdin | not supported: jobs' stdin is `/dev/null`. Make the command non-interactive. |
 | `shutdown` | kills all tasks and stops the daemon | administrators only. Checkpoints all running jobs, then stops the daemon. A job whose checkpoint is refused keeps running. `--no-checkpoint` kills them instead. |
 | `restart` | finished tasks | also works on `Checkpointed` jobs: they start over as a new job, and the image is kept |
+| `start <id>`, `add -i`, `restart -i` (and `restore -i`) | start the task right away, ignoring every limit | skip the queue and the group's `parallel` limit, but wait for a free slot on the job's GPUs and for a paused group to be resumed; only administrators' ignore every limit (see [GPU slots](#gpu-slots)) |
 | `reset`, `-a/--all`, `-g/--group` | all tasks | your own jobs. Administrators act on everyone's. |
 | `pause/start/kill -a`, `-g` | also pause/resume the groups | only administrators pause/resume groups; for others, groups are left as they are |
 | Wording | "task" | "job". Option names such as `--print-task-id` are kept for compatibility. |
@@ -212,7 +213,7 @@ Extra commands and options:
 | `add --gpu <LIST>` | GPUs the job runs on, e.g. `0` or `0,1`. Without it the job is CPU-only (`CUDA_VISIBLE_DEVICES` is empty). |
 | `add --no-checkpoint` | never checkpoint this job; on shutdown it is terminated |
 | `checkpoint [IDS] [-g GROUP] [-a]` | save running jobs and stop them |
-| `restore [IDS] [-g GROUP] [-a] [-i]` | resume `Checkpointed` jobs (`-i`: right away, ignoring free slots) |
+| `restore [IDS] [-g GROUP] [-a] [-i]` | resume `Checkpointed` jobs (`-i`: right away, ahead of the queue, like `start`) |
 | `gpu [-j]`, `gpu parallel <N> [--gpu LIST]` | list GPUs, or set the per-GPU job limit (administrators) |
 | `add --nice <N>`, `nice <IDS>... <N>` | lower a job's priority by `N` (Slurm's nice; negative values for administrators only) |
 | `top <IDS>...` | move jobs to the top of your own queue (Slurm's `scontrol top`) |
@@ -257,6 +258,9 @@ columns, and `Checkpointed` jobs show the image size.
 - `checkpoint_size_bytes`, `details`, `details.last_error`, a job's `nice` and a group's
   `priority` are omitted when they do not apply (or are 0).
   For other users' jobs, `label` is null, `details` is absent and `reason` is `"<redacted>"`.
+- `waiting` is present on a queued job that was launched right away by a non-administrator but
+  waits for a GPU slot or its paused group: `{"reason": "gpu_slots", "gpus": [0]}`,
+  `{"reason": "group_paused"}` or `{"reason": "unavailable"}`.
 - `puzuz log --json` prints `{"<id>": {"job": <job>, "output": "..."}}`. `puzuz group --json`
   prints `{"groups": [...]}`. `puzuz gpu --json` prints
   `{"gpus": [{"index", "uuid", "name", "memory_total_bytes", "driver_version", "parallel",
@@ -277,6 +281,21 @@ columns, and `Checkpointed` jobs show the image size.
 - Each job belongs to the user who added it. It runs with that user's uid, gid and supplementary
   groups, with `no_new_privs` set and all capabilities dropped. The command runs in the directory
   it was added from, with the environment of the `puzuz add` invocation.
+- The root helper refuses jobs of system accounts (uid below `job_min_uid`, by default `UID_MIN`
+  of `/etc/login.defs`), of users missing from `job_allowed_users` when it is set, and of users
+  whose primary group is root-equivalent (`job_denied_groups`: `docker`, `lxd`, `incus-admin`,
+  `libvirt`, `disk`, `sudo`, `wheel`, `admin` by default). Those groups are left out of every
+  job's supplementary groups, so a job cannot use Docker or sudo even if its owner can (the
+  helper's journal records what it left out). A refused job fails to spawn with `puzuz refuses to run jobs as <user>: <reason>`.
+  See [Who jobs may run as](docs/install.md#who-jobs-may-run-as).
+- A job cannot become root or act as root, even when its owner can: setuid programs (`sudo`,
+  `su`, `pkexec`) do not gain privileges under `no_new_privs`, the system D-Bus is inaccessible in
+  job units (so no `systemctl`, `run0`, `machinectl` or other polkit-authorized action, whatever
+  the polkit rules grant the owner's groups; `job_system_dbus = true` lifts this), neither are
+  systemd's polkit-authorized Varlink services under `/run/systemd` (`job_systemd_varlink`), root-equivalent
+  groups are left out, and only the assigned GPUs' device nodes can be opened. The same holds
+  after a restore. See
+  [What a job can and cannot do](docs/install.md#what-a-job-can-and-cannot-do).
 - **Owner or administrator only:** changing a job (`kill`, `pause`, `start`, `remove`,
   `checkpoint`, `restore`, `restart`, `stash`, `enqueue`, `switch`, ...) and seeing its command,
   working directory, environment, label, failure reasons and log. Likewise, `add --after` only
@@ -298,6 +317,8 @@ columns, and `Checkpointed` jobs show the image size.
   When a regular user runs `pause/start/kill -g` or `-a`, only their own jobs are affected and no
   group's paused state changes (`pause --wait` then does nothing). The output says which happened
   (`All groups are being paused.` versus `Your jobs are being paused: 3, 4`).
+- **Administrators' immediate launches** (`start <id>`, `add -i`, `restart -i`, `restore -i`)
+  ignore GPU slots and paused groups; everybody else's wait for them (see [GPU slots](#gpu-slots)).
 - Administrators are root and members of the `puzuz-admin` group (primary or supplementary). The
   check is made on every request, so `usermod -aG puzuz-admin <user>` takes effect immediately.
 
@@ -311,7 +332,21 @@ columns, and `Checkpointed` jobs show the image size.
 - GPU indices follow PCI bus order, the same order as `nvidia-smi` and
   `CUDA_DEVICE_ORDER=PCI_BUS_ID`. Inside the job, `CUDA_VISIBLE_DEVICES` lists the requested
   GPUs, so the program sees them as `cuda:0`, `cuda:1`, ...
+- **GPU isolation:** a job can open only the device nodes of the GPUs it was given. Every job
+  unit has systemd's `DevicePolicy=closed`, with `DeviceAllow=` for the assigned GPUs'
+  `/dev/nvidia<N>` and the shared NVIDIA nodes; a CPU-only job gets no NVIDIA device at all.
+  Changing `CUDA_VISIBLE_DEVICES` or opening another GPU's node fails with `EPERM`, and
+  `nvidia-smi` inside a job shows only its own GPUs (in a CPU-only job it fails with
+  `Failed to initialize NVML: Unknown Error`). Administrators can turn this off with
+  `gpu_device_isolation = false`, e.g. for MIG (see
+  [GPU isolation](docs/install.md#gpu-isolation)).
 - Groups work as in pueue (the `default` group starts with `parallel 1`). Both limits apply.
+- Launching right away (`start <id>`, `add -i`, `restart -i`, `restore -i`) skips the queue and the
+  group's `parallel` limit, as in pueue, but not GPU slots or a paused group: if one of the job's
+  GPUs has no free slot or its group is paused, the job waits and starts ahead of every other
+  queued job as soon as that changes. The command says so, and `status` shows e.g.
+  `Queued (waiting for a GPU slot)`. Only administrators' immediate launches ignore GPU slots and
+  paused groups, so a user cannot push a GPU past the limit an administrator set.
 - GPUs are detected with NVML when the daemon starts (the `[[gpus]]` list in the configuration is
   only a fallback). Restart `puzuz.service` after adding or removing a GPU. `puzuz doctor`
   compares what the daemon detected with `nvidia-smi`.

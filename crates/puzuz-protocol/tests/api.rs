@@ -307,6 +307,7 @@ fn bulk_response_golden() {
                 outcome: ActionOutcome::Ok {
                     new_id: Some(JobId(9)),
                     launch_pending: false,
+                    waiting: None,
                 },
             },
             JobActionResult::error(
@@ -318,6 +319,17 @@ fn bulk_response_golden() {
                 outcome: ActionOutcome::Ok {
                     new_id: None,
                     launch_pending: true,
+                    waiting: None,
+                },
+            },
+            JobActionResult {
+                id: JobId(5),
+                outcome: ActionOutcome::Ok {
+                    new_id: None,
+                    launch_pending: false,
+                    waiting: Some(LaunchWait::GpuSlots {
+                        gpus: vec![GpuIndex(0)],
+                    }),
                 },
             },
         ],
@@ -326,7 +338,7 @@ fn bulk_response_golden() {
     assert!(!resp.all_ok());
     assert_golden(
         &resp,
-        r#"{"results":[{"id":1,"status":"ok"},{"id":2,"status":"ok","new_id":9},{"id":3,"status":"error","error":{"code":"invalid_state","message":"job 3 is not running"}},{"id":4,"status":"ok","launch_pending":true}]}"#,
+        r#"{"results":[{"id":1,"status":"ok"},{"id":2,"status":"ok","new_id":9},{"id":3,"status":"error","error":{"code":"invalid_state","message":"job 3 is not running"}},{"id":4,"status":"ok","launch_pending":true},{"id":5,"status":"ok","waiting":{"reason":"gpu_slots","gpus":[0]}}]}"#,
     );
     // Groups whose paused flag was set are listed; the field is optional.
     let paused = BulkJobResponse {
@@ -344,8 +356,17 @@ fn bulk_response_golden() {
         &AddJobResponse {
             id: JobId(6),
             launch_pending: true,
+            waiting: None,
         },
         r#"{"id":6,"launch_pending":true}"#,
+    );
+    assert_golden(
+        &AddJobResponse {
+            id: JobId(7),
+            launch_pending: false,
+            waiting: Some(LaunchWait::GroupPaused),
+        },
+        r#"{"id":7,"waiting":{"reason":"group_paused"}}"#,
     );
 }
 

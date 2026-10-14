@@ -82,6 +82,13 @@ pub struct HelperConfig {
     /// The installed fork guard, put into every job's `LD_PRELOAD`. Set at
     /// start-up when the installation succeeded.
     pub job_preload: Option<PathBuf>,
+    /// Restrict every job unit's device access to its assigned GPUs (see
+    /// [`crate::devices`]).
+    pub gpu_device_isolation: bool,
+    /// Who jobs may run as. The default is
+    /// [`JobPolicy::permissive`](crate::validate::JobPolicy::permissive)
+    /// (for tests); [`HelperConfig::resolve`] sets the configured one.
+    pub job_policy: crate::validate::JobPolicy,
 }
 
 impl Default for HelperConfig {
@@ -104,6 +111,8 @@ impl Default for HelperConfig {
             nvidia_smi: PathBuf::from("nvidia-smi"),
             fork_guard_dir: Some(PathBuf::from(DEFAULT_FORK_GUARD_DIR)),
             job_preload: None,
+            gpu_device_isolation: true,
+            job_policy: crate::validate::JobPolicy::permissive(),
         }
     }
 }
@@ -155,8 +164,22 @@ impl HelperConfig {
                 .job_stop_timeout
                 .unwrap_or(Duration::from_secs(file.grace_secs)),
             fork_guard_dir: file.fork_guard.then(|| file.data_dir.join("lib")),
+            gpu_device_isolation: file.gpu_device_isolation,
+            job_policy: crate::validate::JobPolicy::from_config(
+                file,
+                Path::new(puzuz_config::job_policy::LOGIN_DEFS_PATH),
+                Path::new(puzuz_config::job_policy::GROUP_FILE_PATH),
+            ),
             ..HelperConfig::default()
         };
+        if file.job_system_dbus {
+            // Jobs may reach the system D-Bus: /run/dbus stays.
+            cfg.mounts.hidden_dirs.clear();
+        }
+        if file.job_systemd_varlink {
+            // Jobs may reach systemd's Varlink services: /run/systemd stays.
+            cfg.mounts.systemd_run_keep = None;
+        }
         let ck = &mut cfg.checkpoint;
         ck.mode = o.cuda_mode.unwrap_or(match file.cuda_checkpoint_mode {
             CudaCheckpointMode::Manual => CudaMode::Manual,
@@ -396,6 +419,59 @@ mod tests {
         assert_eq!(c.checkpoint.cuda.path, PathBuf::from("/flag/cc"));
         assert_eq!(c.nvidia_smi, PathBuf::from("/flag/smi"));
         assert_eq!(c.job_stop_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn the_system_bus_is_covered_unless_allowed() {
+        let r = HelperConfig::resolve(&file(""), Overrides::default());
+        assert_eq!(r.config.mounts.hidden_dirs, ["/run/dbus", "/var/run/dbus"]);
+        let r = HelperConfig::resolve(&file("job_system_dbus = true\n"), Overrides::default());
+        assert!(r.config.mounts.hidden_dirs.is_empty());
+        assert!(r.config.mounts.systemd_run_keep.is_some());
+    }
+
+    #[test]
+    fn run_systemd_is_hidden_unless_allowed() {
+        let r = HelperConfig::resolve(&file(""), Overrides::default());
+        assert_eq!(
+            r.config.mounts.systemd_run_keep.as_deref(),
+            Some(&crate::jobs::SYSTEMD_RUN_KEEP.map(String::from)[..])
+        );
+        let r = HelperConfig::resolve(&file("job_systemd_varlink = true\n"), Overrides::default());
+        assert_eq!(r.config.mounts.systemd_run_keep, None);
+        assert_eq!(r.config.mounts.hidden_dirs, crate::jobs::SYSTEM_BUS_DIRS);
+    }
+
+    #[test]
+    fn gpu_device_isolation_is_on_unless_disabled() {
+        let r = HelperConfig::resolve(&file(""), Overrides::default());
+        assert!(r.config.gpu_device_isolation);
+        assert!(HelperConfig::default().gpu_device_isolation);
+        let r = HelperConfig::resolve(
+            &file("gpu_device_isolation = false\n"),
+            Overrides::default(),
+        );
+        assert!(!r.config.gpu_device_isolation);
+    }
+
+    #[test]
+    fn job_policy_comes_from_the_file() {
+        let r = HelperConfig::resolve(
+            &file(
+                "job_min_uid = 1500\njob_denied_groups = [\"docker\"]\njob_allowed_users = [\"a\"]\n",
+            ),
+            Overrides::default(),
+        );
+        let p = &r.config.job_policy;
+        assert_eq!(p.min_uid, 1500);
+        assert_eq!(p.denied_groups, ["docker"]);
+        assert_eq!(p.allowed_users, ["a"]);
+        assert_eq!(p.group_file, Path::new("/etc/group"));
+        let r = HelperConfig::resolve(&puzuz_config::Config::default(), Overrides::default());
+        assert_eq!(
+            r.config.job_policy.denied_groups,
+            puzuz_config::job_policy::DEFAULT_JOB_DENIED_GROUPS
+        );
     }
 
     #[test]

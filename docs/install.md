@@ -16,8 +16,11 @@ command on their `PATH`.
 - [Verifying](#verifying)
 - [Configuration](#configuration)
 - [Administrators](#administrators)
+- [Who jobs may run as](#who-jobs-may-run-as)
+- [What a job can and cannot do](#what-a-job-can-and-cannot-do)
 - [Priority and fair share](#priority-and-fair-share)
 - [GPU detection](#gpu-detection)
+- [GPU isolation](#gpu-isolation)
 - [Checkpoint storage](#checkpoint-storage)
 - [Upgrading](#upgrading)
 - [Uninstalling](#uninstalling)
@@ -1116,6 +1119,12 @@ Every `*_secs` key is at most one year (31536000).
 | `criu_dump_timeout_secs` | unset | helper | optional cap on `criu dump` alone; unset: only the deadline applies |
 | `criu_restore_timeout_secs` | unset | helper | optional cap on `criu restore` alone; unset: only the deadline applies |
 | `fork_guard` | `true` | helper | preload the fork guard into jobs (see the README's limitations) |
+| `gpu_device_isolation` | `true` | helper | each job unit may open only its assigned GPUs' device nodes (`DevicePolicy=closed`); `false` turns this off (see [GPU isolation](#gpu-isolation)) |
+| `job_system_dbus` | `false` | helper | `true` lets jobs reach the system D-Bus (systemd, polkit); by default `/run/dbus` is hidden from jobs (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
+| `job_systemd_varlink` | `false` | helper | `true` lets jobs reach systemd's Varlink services under `/run/systemd`; by default the directory is hidden from jobs except journald's log sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/` (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
+| `job_min_uid` | `UID_MIN` of `/etc/login.defs`, else `1000` | helper | jobs of users with a smaller uid are refused (see [Who jobs may run as](#who-jobs-may-run-as)) |
+| `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | helper | root-equivalent groups: dropped from jobs' supplementary groups; a job whose primary group is one of them is refused |
+| `job_allowed_users` | `[]` (everyone) | helper | if not empty, only these users (by name) may run jobs |
 | `gpu_detection` | `"auto"` | daemon | `"auto"`: NVML, falling back to `[[gpus]]`. `"static"`: only `[[gpus]]`. |
 | `nvml_library` | unset | daemon | NVML library path or name; by default `libnvidia-ml.so.1`, then `libnvidia-ml.so` |
 | `update_source` | `"github:kaito4681/puzuz"` | CLI | where `puzuz update` and `puzuz doctor` look for releases: `github:<owner>/<repo>` |
@@ -1141,6 +1150,84 @@ sudo usermod -aG puzuz-admin alice
 
 The daemon looks the group up on every request (through NSS), so the change applies at once,
 without logging in again.
+
+## Who jobs may run as
+
+The root helper starts every job as its owner, so it decides whose jobs it runs; the daemon cannot
+change that. Besides never running a job as root (uid 0 or gid 0) or with a group its owner is not
+in, the helper applies three settings to every spawn and every restore:
+
+- `job_min_uid`: users with a smaller uid are refused. Unset, it is `UID_MIN` of
+  `/etc/login.defs` (1000 on most distributions), or 1000 when the file has no valid `UID_MIN`.
+  This keeps system accounts (`www-data`, `postgres`, the daemon's own `puzuz` user, ...) from
+  running jobs.
+- `job_denied_groups`: groups whose members can act as root without a password. They are
+  removed from a job's supplementary groups, so a job of a user in `docker` runs without
+  `docker` (the helper's journal records which groups it left out; the job's output is not
+  touched). A job whose primary group is one of them is refused, and so is restoring a
+  checkpoint whose processes had one of them (CRIU would restore the group). Names are looked up
+  in `/etc/group` at each spawn and restore; names that are not listed there are ignored. gid 0 is
+  always left out. The defaults and why each is listed:
+
+  | Group | Why it is root-equivalent |
+  | --- | --- |
+  | `docker` | the Docker socket starts containers that bind-mount `/` and run as root |
+  | `lxd`, `incus-admin` | the same through LXD/Incus (privileged containers, host mounts); Incus's restricted `incus` group is not listed |
+  | `libvirt` | manages `qemu:///system`, whose VMs can be given host block devices and directories |
+  | `disk` | raw read/write access to block devices, and so to every file on them |
+  | `sudo`, `wheel`, `admin` | sudo rights: sudo normally asks for the password, which an unattended job cannot type, but `NOPASSWD` rules or cached credentials would let the job become root |
+
+  Not listed, because they do not amount to root: `shadow` (password hashes, at most cracked
+  offline), `adm` (logs), `kvm`, and `video`/`render` (devices; GPU jobs need the latter two).
+  Add groups that are root-equivalent on your hosts (e.g. `microk8s`), or remove one to let jobs
+  use it again (e.g. `job_denied_groups = ["lxd", "incus-admin", "libvirt", "disk", "sudo",
+  "wheel", "admin"]` lets jobs use Docker).
+- `job_allowed_users`: if not empty, only the users listed (by name) may run jobs.
+
+A refused job fails to spawn with a reason that starts with `puzuz refuses to run jobs as
+<user>:`, followed by e.g. `uid 999 is below job_min_uid 1000 (UID_MIN in /etc/login.defs)`,
+`primary group docker is in job_denied_groups` or `not in job_allowed_users`. `puzuz status`
+shows it as `Failed to spawn`, and `puzuz log <id>` and `puzuz status --json` show the reason. A
+refused restore is a restore failure (see [Restore failures](#restore-failures)): the job stays
+checkpointed. `puzuz doctor` prints the effective policy (the minimum uid
+and where it comes from, the denied groups and which of them exist on the host, the allowed
+users), and the helper logs it when it starts. Restart the helper after changing these keys.
+
+## What a job can and cannot do
+
+A job runs as its owner and can do what its owner can do on files, the network and its assigned
+GPUs. puzuz guarantees that it cannot gain more, even when the owner could outside puzuz (a
+member of `sudo` with a `NOPASSWD` rule, of `docker`, or of a group that polkit trusts). This
+holds for a job started from a checkpoint as well: the restored unit is set up the same way, and
+the restored processes keep their credentials. e2e scenario 19 checks each item below, before
+and after a checkpoint and restore.
+
+| A job ... | because | switch |
+| --- | --- | --- |
+| runs with its owner's uid and primary gid, never root | the helper refuses uid 0, system accounts and denied primary groups ([Who jobs may run as](#who-jobs-may-run-as)) | `job_min_uid`, `job_denied_groups`, `job_allowed_users` |
+| has no capabilities (`CapInh`, `CapPrm`, `CapEff`, `CapBnd` and `CapAmb` are all 0) and `NoNewPrivs: 1` | the shim empties the bounding set and sets `no_new_privs` before it runs the command | none |
+| cannot gain privileges with `sudo`, `su`, `pkexec` or any other setuid or file-capability program | `no_new_privs` makes the kernel ignore setuid bits and file capabilities | none |
+| cannot reach the system D-Bus, so no `systemctl`, `run0`, `machinectl`, `busctl --system` or other request to systemd, polkit or system services | the shim hides `/run/dbus` (also `/var/run/dbus` if `/var/run` is not a link to `/run`) behind an empty root-owned tmpfs in the job's mount namespace, creating the directory if the host has none yet, so a bus socket that appears later is out of reach as well; CRIU saves the tmpfs and recreates it on restore; polkit takes group membership from the user database, not from the job's groups, so dropping groups alone would not stop it | `job_system_dbus = true` |
+| cannot reach systemd's Varlink services (`io.systemd.Manager` reload and reexecute, `io.systemd.Credentials` decryption of system credentials, mountfsd, nsresourced, machined, logind, networkd, sysupdate, ...), which authorize unprivileged callers through polkit without D-Bus | the shim hides `/run/systemd` behind an empty root-owned tmpfs that holds only journald's log sockets (`journal/socket`, `journal/stdout`, `journal/dev-log`), resolved's `resolve/io.systemd.Resolve`, `resolve/stub-resolv.conf` and `resolve/resolv.conf` (bound one by one, so sockets created there later stay out of reach), the `userdb/` directory (user and group lookups only, see below) and an empty `system/`; CRIU saves and recreates this on restore | `job_systemd_varlink = true` |
+| does not have the groups `docker`, `lxd`, `incus-admin`, `libvirt`, `disk`, `sudo`, `wheel`, `admin` (root daemons' sockets, raw block devices) | the helper drops them from the supplementary groups | `job_denied_groups` |
+| cannot open device nodes except the standard pseudo devices and its assigned GPUs' | `DevicePolicy=closed` with `DeviceAllow=` ([GPU isolation](#gpu-isolation)) | `gpu_device_isolation` |
+
+Each switch weakens one guarantee; `puzuz doctor` warns when `job_system_dbus = true` or `job_systemd_varlink = true`. What puzuz
+does not limit: whatever the owner's uid itself may do (files, user services over the session bus,
+network access), the amount of CPU, memory or disk a job uses, and sockets of other services
+that check credentials on their own (for example a daemon socket that allows any user).
+The job's mounts are private (no propagation from the host), so a socket the host creates later
+in `/run/dbus`, in `/run/systemd` or in its `journal/` and `resolve/` subdirectories does not show
+up in the job, before or after a restore (e2e scenario 19 checks this). The one directory bound
+whole is `userdb/`: services there implement only `io.systemd.UserDatabase` (`GetUserRecord`,
+`GetGroupRecord`, `GetMemberships`), read-only lookups that `getent` answers anyway, so a socket
+added there later grants nothing. Other root sockets stay reachable but grant nothing to an
+unprivileged caller: udev's `/run/udev/io.systemd.Udev` only accepts root (socket mode 0644),
+polkit's `/run/polkit/agent-helper.socket` only completes a polkit authentication that a client
+started over D-Bus (which a job cannot reach), and the system bus listens on no other address
+(`<listen>unix:path=/run/dbus/system_bus_socket</listen>` only). Name resolution keeps working,
+but a job sees `resolv.conf` as it was when the job started (the files are bound, and resolved
+replaces them on changes).
 
 ## Priority and fair share
 
@@ -1305,6 +1392,53 @@ A GPU that the daemon knew before but no longer finds stays listed as unavailabl
 slot limit. Jobs that need it stay queued, and new jobs that ask for it are rejected. Each GPU
 starts with a limit of 1 job. Change it with `puzuz gpu parallel <N> [--gpu LIST]` (`0` means
 unlimited).
+
+## GPU isolation
+
+`CUDA_VISIBLE_DEVICES` only tells CUDA which GPUs to use, and a job can change it. With
+`gpu_device_isolation = true` (the default) the helper also restricts the device nodes each job
+can open, with the cgroup device controller of the job's systemd unit:
+
+- Every job unit, spawned (`puzuz-job-<id>.service`) or restored
+  (`puzuz-job-<id>-r<n>.service`), gets `DevicePolicy=closed`. That allows the standard pseudo
+  devices (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`,
+  `/dev/ptmx` and the `/dev/pts/*` pseudo terminals) and nothing else that is not listed.
+- A job with GPUs gets `DeviceAllow=` (read-write) for each assigned GPU's
+  `/dev/nvidia<minor>`, and for `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
+  `/dev/nvidia-modeset` and `char-nvidia-uvm` (the unified memory devices by major number, in
+  case the driver creates their nodes only after the unit started).
+- A CPU-only job gets no NVIDIA device at all.
+- A restored job gets the nodes of the GPUs it is restored on (the same indices as at the
+  checkpoint). `criu restore` and, in plugin mode, CRIU's CUDA plugin run inside the restore
+  unit; in manual mode the driver reopens the device nodes in the restored processes. Checkpoint
+  and restore of CUDA jobs work with isolation on (the GPU end-to-end test checks it).
+
+The filter applies to every process of the unit, root included. Opening another GPU's
+`/dev/nvidia<N>` fails with `EPERM`. Inside a job, `nvidia-smi` shows only the GPUs the job may
+open. In a CPU-only job it fails with `Failed to initialize NVML: Unknown Error`, and CUDA finds
+no device. To see what a unit got:
+
+```sh
+systemctl show -p DevicePolicy -p DeviceAllow puzuz-job-<id>.service
+```
+
+GPU indices follow PCI bus order, but device nodes are named after the driver's minor number,
+which can differ. At every spawn and restore the helper reads the minors from
+`/proc/driver/nvidia/gpus/<PCI address>/information` (`Device Minor`), in PCI bus order and
+without GPUs marked `GPU Excluded: Yes`, as NVML and CUDA count them. A GPU index the driver does
+not know (a `[[gpus]]` entry for a GPU that is not there, or no driver loaded) gets no node of
+its own, and the helper logs it.
+
+Set `gpu_device_isolation = false` and restart `puzuz-helper.service` to turn isolation off.
+Jobs started or restored after that get no device restrictions; running jobs keep the settings of
+their unit. You need to turn it off:
+
+- on hosts that use **MIG**: CUDA also opens `/dev/nvidia-caps/nvidia-cap<N>` of the MIG instance,
+  which is not allowed;
+- if jobs need other device nodes, such as `/dev/fuse`, `/dev/kvm` or RDMA devices under
+  `/dev/infiniband`.
+
+`puzuz doctor` shows whether isolation is on (`gpu isolation`).
 
 ## Checkpoint storage
 
@@ -1692,6 +1826,12 @@ refused:`), and its owner is warned.
 
 A failed restore keeps the job `Checkpointed` and keeps its image, so you can fix the cause and run
 `puzuz restore` again. The owner is warned on their next command.
+
+- `puzuz refuses to run jobs as <user>: ...`: the job's owner or group is refused by
+  `job_min_uid`, `job_denied_groups` or `job_allowed_users` (see
+  [Who jobs may run as](#who-jobs-may-run-as)); `the checkpointed job ran with the groups
+  ["docker"], which are in job_denied_groups` means the job was checkpointed with a group that is
+  denied now. Change the setting (and restart the helper) or remove the job.
 
 - `the checkpoint of job N was dumped but not finalized, and finalizing it failed again: ...`: the
   dump succeeded, but the helper could not write the checkpoint's metadata (see

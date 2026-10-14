@@ -2,7 +2,9 @@
 # Full-stack scenarios; runs inside the systemd container as root (see
 # scripts/e2e-test.sh). Users act through the real CLI with runuser:
 # alice (1000) and bob (1001) are regular users, carol (1002) is in
-# puzuz-admin; scenario 17 adds dave (1003), a user without usage.
+# puzuz-admin; scenario 17 adds dave (1003), a user without usage, and
+# scenario 18 svcacct (990, a system account) and dockeruser (1004, primary
+# group docker).
 #
 # Usage: scenario.sh main | reboot-prepare | reboot-verify | lib
 # Prints "PASS <scenario>" / "FAIL <scenario>: <reason>" per scenario and
@@ -249,6 +251,10 @@ s3_limits() {
     b=$(add bob -g free --gpu 0 -- 'echo CVD=$CUDA_VISIBLE_DEVICES; sleep 0.5')
     c=$(add alice -g free --gpu 1 -- 'echo CVD=$CUDA_VISIBLE_DEVICES; sleep 1')
     wait_state "$a" running
+    # GPU isolation (gpu_device_isolation = true, the default): every job
+    # unit is DevicePolicy=closed.
+    [ "$(systemctl show -p DevicePolicy --value "puzuz-job-$a.service")" = closed ] \
+        || fail "job $a's unit is not DevicePolicy=closed"
     wait_state "$c" running
     expect_state "$b" queued
     wait_state "$b" 'done/*' 30
@@ -259,6 +265,20 @@ s3_limits() {
     grep -qx 'CVD=0' "$LOGS/1000/$a.log" || fail "CUDA_VISIBLE_DEVICES of job $a"
     grep -qx 'CVD=0' "$LOGS/1001/$b.log" || fail "CUDA_VISIBLE_DEVICES of job $b"
     grep -qx 'CVD=1' "$LOGS/1000/$c.log" || fail "CUDA_VISIBLE_DEVICES of job $c"
+
+    # Immediate launches: a regular user's waits for the GPU slot (ahead of
+    # the queue), an administrator's ignores it.
+    a=$(add alice -g free --gpu 0 -- 'sleep 3')
+    wait_state "$a" running
+    b=$(add bob -i -g free --gpu 0 -- 'sleep 0.5')
+    expect_state "$b" queued
+    [ "$(q bob "job($b).get('waiting', {}).get('reason')")" = gpu_slots ] \
+        || fail "job $b does not say it waits for a GPU slot"
+    c=$(add carol -i -g free --gpu 0 -- 'sleep 0.5')
+    expect_state "$c" '@(running|done/*)'
+    for i in "$a" "$b" "$c"; do wait_state "$i" 'done/*' 30 && expect_state "$i" done/success; done
+    [ "$(started_at "$b")" -ge "$(finished_at "$a")" ] || fail "the immediate job $b shared GPU 0 with job $a"
+    [ "$(started_at "$c")" -lt "$(finished_at "$a")" ] || fail "the administrator's immediate job $c waited"
 }
 
 s4_checkpoint_restore() {
@@ -445,12 +465,30 @@ check_cuda_mode() {
     fi
 }
 
-# PUZUZ_E2E_GPU=1 only: a CUDA job (GPU 0 is real) keeps its GPU memory
-# across checkpoint/restore.
+# PUZUZ_E2E_GPU=1 only: GPU isolation, and a CUDA job (GPU 0 is real)
+# keeps its GPU memory across checkpoint/restore in a restore unit that is
+# isolated to GPU 0 as well.
 s9_gpu() {
-    local id before after
+    local id before after cpu gpu probe
     pz carol gpu parallel 1 || fail "gpu parallel"
     free_group
+    # GPU isolation: a CPU job cannot open any NVIDIA device; a job on GPU 0
+    # can open that GPU's nodes. What nvidia-smi sees is printed.
+    probe='python3 /e2e/open_dev.py /dev/null /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia0'
+    probe="$probe; nvidia-smi -L; echo nvidia-smi exit status \$?"
+    cpu=$(add alice -g free -- "$probe")
+    gpu=$(add alice -g free --gpu 0 -- "$probe")
+    wait_state "$cpu" 'done/*' 60
+    wait_state "$gpu" 'done/*' 60
+    echo "--- CPU job $cpu:"; cat "$LOGS/1000/$cpu.log"
+    echo "--- GPU job $gpu:"; cat "$LOGS/1000/$gpu.log"
+    for dev in nvidiactl nvidia-uvm nvidia0; do
+        grep -qx "open /dev/$dev: EPERM" "$LOGS/1000/$cpu.log" \
+            || fail "the CPU job $cpu could open /dev/$dev"
+        grep -qx "open /dev/$dev: ok" "$LOGS/1000/$gpu.log" \
+            || fail "the GPU job $gpu could not open /dev/$dev"
+    done
+    grep -qx "open /dev/null: ok" "$LOGS/1000/$cpu.log" || fail "the CPU job could not open /dev/null"
     id=$(add alice -g free --gpu 0 -- 'exec /opt/venv/bin/python3 -u /e2e/gpu_counter.py')
     wait_state "$id" running
     wait_for 60 "the GPU job to print" bash -c "[ \$(wc -l < $LOGS/1000/$id.log) -ge 5 ]"
@@ -460,6 +498,12 @@ s9_gpu() {
     before=$(last_line 1000 "$id" | cut -d' ' -f1)
     pz alice restore "$id" || fail "restore"
     wait_state "$id" running 300
+    # The restore unit is isolated to the GPU of the restore, too.
+    [ "$(systemctl show -p DevicePolicy --value "puzuz-job-$id-r1.service")" = closed ] \
+        || fail "the restore unit of job $id is not DevicePolicy=closed"
+    systemctl show -p DeviceAllow --value "puzuz-job-$id-r1.service" | grep -q '/dev/nvidia0 rw' \
+        || fail "the restore unit of job $id may not open /dev/nvidia0: \
+$(systemctl show -p DeviceAllow "puzuz-job-$id-r1.service")"
     sleep 2
     after=$(last_line 1000 "$id" | cut -d' ' -f1)
     echo "GPU counter before dump: $before, after restore: $after"
@@ -805,8 +849,16 @@ job_mountinfo() {
 }
 
 s15_prepare() {
-    local id name f out
+    local id name f out p
     need_mounts
+    # The sshfs server must outlive the helper's dumps at the reboot: a
+    # logind session (a PAM login with libpam-systemd) is stopped early in
+    # a shutdown, and every job's dump would fail on the dead /nfs.
+    for p in $(pgrep -f /usr/lib/openssh/sftp-server || true); do
+        echo "sftp-server $p: $(cat "/proc/$p/cgroup")"
+        ! grep -q '/session-[^/]*\.scope' "/proc/$p/cgroup" \
+            || fail "the sftp-server behind /nfs runs in a logind session"
+    done
     pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
     mkdir -p "$STATE"
     : >"$STATE/mounts"
@@ -1033,6 +1085,236 @@ s17_priority() {
     [ "$(started_at "$x2")" -le "$(started_at "$x1")" ] || fail "the niced job $x1 did not start last"
 }
 
+s18_job_policy() {
+    local id log groups journal
+    # A system account (uid below UID_MIN of /etc/login.defs, or 1000).
+    getent passwd 990 >/dev/null || useradd -m -u 990 -s /bin/sh svcacct
+    id=$(add svcacct -- 'echo should not run')
+    wait_state "$id" done/failed_to_spawn
+    # The log header (with the reason) goes to stderr.
+    log=$(pz svcacct log "$id" 2>&1) || fail "log failed"
+    echo "$log"
+    grep -q 'puzuz refuses to run jobs as svcacct: uid 990 is below job_min_uid' <<<"$log" \
+        || fail "the log does not show the refusal"
+
+    # A denied supplementary group is left out (the helper's journal says so).
+    groupadd -f docker
+    usermod -aG docker alice
+    id=$(add alice -- 'echo groups=$(id -Gn)')
+    PZ_TIMEOUT=30 pz alice wait "$id" >/dev/null || fail "wait failed"
+    expect_state "$id" done/success
+    log=$(pz alice log --full "$id") || fail "log failed"
+    echo "$log"
+    journal=$(journalctl -u puzuz-helper.service -o cat)
+    grep -q "job $id of alice: leaving out the supplementary groups \\[.*\"docker\"" <<<"$journal" \
+        || fail "the helper's journal does not say that docker was left out"
+    groups=$(sed -n 's/^groups=//p' <<<"$log")
+    [ -n "$groups" ] || fail "the job printed no groups"
+    ! grep -qw docker <<<"$groups" || fail "the job runs with the docker group: $groups"
+    gpasswd -d alice docker >/dev/null
+
+    # A denied primary group refuses the job.
+    getent passwd 1004 >/dev/null || useradd -m -u 1004 -g docker -s /bin/sh dockeruser
+    id=$(add dockeruser -- 'echo should not run')
+    wait_state "$id" done/failed_to_spawn
+    log=$(pz dockeruser log "$id" 2>&1) || fail "log failed"
+    grep -q 'puzuz refuses to run jobs as dockeruser: primary group docker is in job_denied_groups' \
+        <<<"$log" || fail "the log does not show the refusal: $log"
+}
+
+# s19: a job of a user who can become root in every usual way outside puzuz
+# (member of sudo with a NOPASSWD rule, a polkit rule trusting the sudo
+# group, member of docker with a root daemon socket, member of disk with a
+# block device) cannot do any of it, before and after a checkpoint/restore.
+# Each way is first shown to work for the same user outside puzuz.
+E2E_DOCKER_SOCK=/run/e2e-docker.sock
+E2E_LISTENERS=
+# late_sockets <job> <n>: as root, listen on new sockets in /run/dbus and
+# /run/systemd (also journal/ and resolve/) after job <job> started, and
+# add them to the list scenario 19's job checks.
+late_sockets() {
+    local dir sock
+    for dir in /run/dbus /run/systemd /run/systemd/journal /run/systemd/resolve; do
+        mkdir -p "$dir"
+        sock=$dir/e2e-late-$2
+        rm -f "$sock"
+        python3 -c '
+import os, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+os.chmod(sys.argv[1], 0o666)
+s.listen(16)
+while True:
+    s.accept()[0].close()' "$sock" &
+        E2E_LISTENERS="$E2E_LISTENERS $!"
+        wait_for 10 "the late socket $sock" test -S "$sock"
+        runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' \
+            "$sock" || fail "eve cannot connect to $sock outside puzuz"
+        echo "$sock" >>/home/eve/e2e-late-sockets
+    done
+    echo "control: eve can connect to the late sockets (round $2) outside puzuz"
+}
+s19_no_escalation() {
+    local id log dev uid gid out r
+    getent group sudo >/dev/null || groupadd sudo
+    groupadd -f docker
+    getent passwd 1005 >/dev/null || useradd -m -u 1005 -s /bin/bash eve
+    usermod -aG sudo,docker,disk eve
+    uid=$(id -u eve)
+    gid=$(id -g eve)
+    rm -f /home/eve/round1 /home/eve/round2 /home/eve/e2e-late-sockets
+
+    # A unit only root (or polkit) may start; it leaves a marker.
+    cat >/etc/systemd/system/e2e-escalate.service <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/bin/touch /run/e2e-escalated
+EOF
+    systemctl daemon-reload
+    rm -f /run/e2e-escalated
+    if command -v sudo >/dev/null; then
+        echo 'eve ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/e2e-eve
+        chmod 0440 /etc/sudoers.d/e2e-eve
+        runuser -u eve -- sudo -n true || fail "the sudoers rule does not work outside puzuz"
+        echo "control: eve can sudo outside puzuz"
+    else
+        echo "SKIP: no sudo in the image (the sudo checks are skipped)"
+    fi
+    if [ -d /usr/share/polkit-1 ] && command -v pkexec >/dev/null; then
+        mkdir -p /etc/polkit-1/rules.d
+        cat >/etc/polkit-1/rules.d/10-e2e-sudo.rules <<'EOF'
+polkit.addRule(function(action, subject) {
+    if (subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+        systemctl restart polkit.service 2>/dev/null || true
+        runuser -u eve -- systemctl --no-ask-password start e2e-escalate.service \
+            || fail "the polkit rule does not let eve start units outside puzuz"
+        [ -e /run/e2e-escalated ] || fail "the control start left no marker"
+        rm -f /run/e2e-escalated
+        echo "control: eve can start system units through polkit outside puzuz"
+    else
+        echo "SKIP: no polkit in the image (no control for the D-Bus checks)"
+    fi
+
+    # systemd's Varlink services: every socket under /run/systemd except
+    # the kept log and resolution sockets and userdb/ must be out of a
+    # job's reach; two polkit-authorized calls are shown to work for eve
+    # outside puzuz.
+    find /run/systemd -type s \
+        -not -path /run/systemd/journal/socket -not -path /run/systemd/journal/stdout \
+        -not -path /run/systemd/journal/dev-log -not -path /run/systemd/resolve/io.systemd.Resolve \
+        -not -path '/run/systemd/userdb/*' >/home/eve/e2e-varlink-sockets
+    echo "Varlink and other sockets under /run/systemd: $(tr '\n' ' ' </home/eve/e2e-varlink-sockets)"
+    rm -f /home/eve/e2e-cred-decrypt.json
+    if command -v varlinkctl >/dev/null && [ -S /run/systemd/io.systemd.Credentials ] \
+        && [ -d /etc/polkit-1/rules.d ]; then
+        out=$(varlinkctl call /run/systemd/io.systemd.Credentials io.systemd.Credentials.Encrypt \
+            '{"name":"e2e","text":"secret","scope":"system"}') || fail "encrypting a credential"
+        python3 -c 'import json, sys; b = json.loads(sys.argv[1])["blob"]; print(json.dumps({"name": "e2e", "blob": b, "scope": "system"}))' \
+            "$out" >/home/eve/e2e-cred-decrypt.json
+        runuser -u eve -- varlinkctl call /run/systemd/io.systemd.Credentials \
+            io.systemd.Credentials.Decrypt "$(cat /home/eve/e2e-cred-decrypt.json)" \
+            || fail "the polkit rule does not let eve decrypt system credentials outside puzuz"
+        echo "control: eve can decrypt system credentials through Varlink and polkit outside puzuz"
+    else
+        echo "SKIP: no io.systemd.Credentials or polkit (no Varlink control)"
+    fi
+    chown eve: /home/eve/e2e-varlink-sockets /home/eve/e2e-cred-decrypt.json 2>/dev/null || true
+
+    # A root daemon socket of group docker.
+    rm -f "$E2E_DOCKER_SOCK"
+    python3 -c '
+import os, socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+os.chown(sys.argv[1], 0, int(sys.argv[2]))
+os.chmod(sys.argv[1], 0o660)
+s.listen(16)
+while True:
+    c, _ = s.accept()
+    c.close()' "$E2E_DOCKER_SOCK" "$(getent group docker | cut -d: -f3)" &
+    wait_for 10 "the fake docker socket" test -S "$E2E_DOCKER_SOCK"
+    runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' \
+        "$E2E_DOCKER_SOCK" || fail "eve cannot connect to the docker socket outside puzuz"
+    echo "control: eve can connect to the docker socket outside puzuz"
+
+    # A block device of group disk.
+    truncate -s 1M "$STATE/e2e-blk.img" 2>/dev/null || { mkdir -p "$STATE"; truncate -s 1M "$STATE/e2e-blk.img"; }
+    dev=$(losetup -f --show "$STATE/e2e-blk.img") || fail "losetup"
+    chgrp disk "$dev"
+    chmod 0660 "$dev"
+    runuser -u eve -- python3 -c 'import os, sys; os.open(sys.argv[1], os.O_RDONLY)' "$dev" \
+        || fail "eve cannot open $dev outside puzuz"
+    echo "control: eve can open $dev outside puzuz"
+
+    : >/home/eve/e2e-late-sockets
+    chown eve: /home/eve/e2e-late-sockets
+    id=$(add eve -- "bash /e2e/escalation_checks.sh $uid $gid $E2E_DOCKER_SOCK $dev /home/eve")
+    wait_state "$id" running
+    # Sockets that appear after the job started: in the spawned job ...
+    late_sockets "$id" 1
+    runuser -u eve -- touch /home/eve/round1
+    wait_for 120 "the first round of checks" grep -q '^round 1 done$' "$LOGS/$uid/$id.log"
+    pz eve checkpoint "$id" || fail "checkpoint"
+    wait_state "$id" checkpointed 120
+    pz eve restore "$id" || fail "restore"
+    wait_state "$id" running 120
+    # The restored job's namespace still hides /run/dbus and /run/systemd.
+    out=$(grep -E ' /run/(dbus|systemd) ' \
+        "/proc/$(systemctl show -p MainPID --value "puzuz-job-$id-r1.service")/mountinfo" || true)
+    echo "restored job's mounts on /run/dbus and /run/systemd: $out"
+    grep -q ' /run/dbus .* - tmpfs ' <<<"$out" || fail "the restored job's namespace does not hide /run/dbus"
+    grep -q ' /run/systemd .* - tmpfs ' <<<"$out" || fail "the restored job's namespace does not hide /run/systemd"
+    # ... and in the restored one.
+    late_sockets "$id" 2
+    runuser -u eve -- touch /home/eve/round2
+    wait_state "$id" 'done/*' 120
+    expect_state "$id" done/success
+
+    log=$(cat "$LOGS/$uid/$id.log")
+    echo "$log"
+    ! grep -q '^BAD ' <<<"$log" || fail "a job escalated: $(grep '^BAD ' <<<"$log" | head -n 3)"
+    for r in 1 2; do
+        grep -qx "round $r done" <<<"$log" || fail "round $r did not finish"
+    done
+    for r in "systemctl --system start" "busctl --system call" "connect to the system bus socket" \
+        "connect to the docker socket" "open the block device" uid gid groups \
+        NoNewPrivs CapPrm CapEff CapBnd; do
+        [ "$(grep -cx "ok $r" <<<"$log")" = 2 ] || fail "check '$r' did not pass in both rounds"
+    done
+    if command -v sudo >/dev/null; then
+        [ "$(grep -cx 'ok sudo -n true' <<<"$log")" = 2 ] || fail "the sudo check did not run twice"
+    fi
+    if command -v pkexec >/dev/null; then
+        [ "$(grep -cx 'ok pkexec true' <<<"$log")" = 2 ] || fail "the pkexec check did not run twice"
+    fi
+    if command -v run0 >/dev/null; then
+        [ "$(grep -cx 'ok run0 true' <<<"$log")" = 2 ] || fail "the run0 check did not run twice"
+    fi
+    if [ -s /home/eve/e2e-cred-decrypt.json ]; then
+        for r in "varlinkctl Credentials.Decrypt" "varlinkctl Manager.Reload"; do
+            [ "$(grep -cx "ok $r" <<<"$log")" = 2 ] || fail "check '$r' did not pass in both rounds"
+        done
+    fi
+    [ "$(grep -cx 'ok journal socket reachable' <<<"$log")" = 2 ] || fail "the journal socket is gone in the job"
+    [ "$(grep -c '^ok connect to /run/systemd/' <<<"$log")" = $((2 * $(grep -c . /home/eve/e2e-varlink-sockets))) ] \
+        || fail "not every Varlink socket was tried and refused in both rounds"
+    [ ! -e /run/e2e-escalated ] || fail "a job started the root-only unit"
+    # Round 1 checks the sockets created before it, round 2 all of them.
+    [ "$(grep -c '^ok late socket .* hidden$' <<<"$log")" = $((3 * $(grep -c . /home/eve/e2e-late-sockets) / 2)) ] \
+        || fail "not every late socket was hidden"
+
+    for r in $E2E_LISTENERS; do kill "$r" 2>/dev/null || true; done
+    rm -f /run/dbus/e2e-late-* /run/systemd/e2e-late-* /run/systemd/journal/e2e-late-* \
+        /run/systemd/resolve/e2e-late-*
+    kill %1 2>/dev/null || true
+    losetup -d "$dev" || true
+    rm -f "$E2E_DOCKER_SOCK" /etc/sudoers.d/e2e-eve /etc/polkit-1/rules.d/10-e2e-sudo.rules
+}
+
 case "${1:-main}" in
 main)
     run "1 add/status/log/follow/wait" s1_lifecycle
@@ -1045,6 +1327,8 @@ main)
     run "10 many jobs at once" s10_burst
     run "13 checkpoint of a paused job" s13_paused_checkpoint
     run "17 multifactor priority (fair share, nice, top)" s17_priority
+    run "18 job credential policy" s18_job_policy
+    run "19 no privilege escalation from jobs" s19_no_escalation
     if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers

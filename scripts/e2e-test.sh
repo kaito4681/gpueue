@@ -36,8 +36,9 @@
 #                       missing (set in CI)
 #   PUZUZ_E2E_NAME      prefix of the container and volume names
 #                       (default puzuz-e2e), to tell parallel runs apart
-#   PUZUZ_E2E_GPU=1     also run the GPU scenarios (9: a
-#                       GPU counter, 11: PyTorch training with forked
+#   PUZUZ_E2E_GPU=1     also run the GPU scenarios (9: GPU
+#                       isolation (a CPU job cannot open /dev/nvidia*, a job
+#                       on GPU 0 can) and a GPU counter, 11: PyTorch training with forked
 #                       DataLoader workers, both checkpointed and restored;
 #                       14: both paused before the checkpoint, and pause
 #                       during a GPU dump; 12: NVML detection in the
@@ -80,7 +81,7 @@ only="${only//,/ }"
 # GPU scenarios without PUZUZ_E2E_GPU=1 (they would be skipped silently).
 for n in $only; do
     case "$n" in
-    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17) ;;
+    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17 | 18 | 19) ;;
     9 | 11 | 12 | 14)
         if [ "${PUZUZ_E2E_GPU:-}" != 1 ]; then
             echo "scenario $n needs PUZUZ_E2E_GPU=1" >&2

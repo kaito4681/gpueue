@@ -32,9 +32,16 @@
 //! cuda_checkpoint_path = "cuda-checkpoint"
 //! nvidia_smi_path = "nvidia-smi"
 //! cuda_checkpoint_mode = "manual"
+//! gpu_device_isolation = true
+//! job_system_dbus = false
+//! job_systemd_varlink = false
 //! checkpoint_deadline_base_secs = 180
 //! checkpoint_deadline_secs_per_gib = 30
 //! fork_guard = true
+//! # Groups dropped from jobs (and refused as a job's group); see
+//! # [`job_policy::DEFAULT_JOB_DENIED_GROUPS`].
+//! job_denied_groups = ["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]
+//! job_allowed_users = []             # empty: every user with uid >= job_min_uid
 //! update_source = "github:kaito4681/puzuz"
 //! update_check = true
 //! # GPUs are detected with NVML ("auto"). Without NVML (no driver, no
@@ -47,6 +54,7 @@
 //! criu_dump_timeout_secs = 3600      # default: only the deadline applies
 //! criu_restore_timeout_secs = 3600   # default: only the deadline applies
 //! nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
+//! job_min_uid = 1000                 # default: UID_MIN of /etc/login.defs, else 1000
 //!
 //! # Job priority (Slurm's priority/multifactor); see [`PriorityConfig`].
 //! [priority]
@@ -72,6 +80,7 @@
 //! memory_total_bytes = 25_757_220_864  # default unset
 //! ```
 
+pub mod job_policy;
 pub mod trust;
 
 use std::io;
@@ -134,6 +143,31 @@ pub struct Config {
     pub nvidia_smi_path: PathBuf,
     /// Who drives `cuda-checkpoint` during a dump/restore (helper only).
     pub cuda_checkpoint_mode: CudaCheckpointMode,
+    /// Restrict each job unit's device access to the GPUs it was assigned
+    /// (helper only): `DevicePolicy=closed` with `DeviceAllow=` of the
+    /// assigned GPUs' `/dev/nvidia<minor>` and the shared NVIDIA nodes; CPU
+    /// jobs get no NVIDIA device. `false` leaves device access alone (only
+    /// `CUDA_VISIBLE_DEVICES` selects the GPUs).
+    pub gpu_device_isolation: bool,
+    /// Let jobs reach the system D-Bus (helper only). `false` (the
+    /// default) hides `/run/dbus` in every job's mount namespace behind an
+    /// empty tmpfs (the shim mounts it, creating the directory if needed;
+    /// CRIU recreates it on restore), so a job cannot ask systemd,
+    /// polkit or other system services for anything (`systemctl`, `run0`,
+    /// `pkexec`, `machinectl`, ...). polkit decides group membership from
+    /// the user database, not from the job's (reduced) groups, so its
+    /// rules would otherwise apply to jobs as to their owners' sessions.
+    pub job_system_dbus: bool,
+    /// Let jobs reach systemd's Varlink services under `/run/systemd`
+    /// (helper only). `false` (the default) hides `/run/systemd` from jobs
+    /// except journald's log sockets, resolved's resolution socket and
+    /// `resolv.conf` files, and `userdb`: services such as
+    /// `io.systemd.Manager` (reload, reexecute), `io.systemd.Credentials`
+    /// (decrypting system credentials), mountfsd, nsresourced, machined
+    /// or logind authorize callers through polkit without the D-Bus
+    /// socket, so [`Config::job_system_dbus`] alone does not keep polkit
+    /// rules away from jobs.
+    pub job_systemd_varlink: bool,
     /// Fixed part of the deadline of a whole checkpoint or restore of a
     /// job, in seconds (helper only). The deadline is
     /// `checkpoint_deadline_base_secs + checkpoint_deadline_secs_per_gib *
@@ -156,6 +190,18 @@ pub struct Config {
     /// device mappings, which CRIU cannot dump. Installed into
     /// `<data_dir>/lib`.
     pub fork_guard: bool,
+    /// Jobs (spawns and restores) of users with a smaller uid are refused
+    /// (helper only). Unset: `UID_MIN` of `/etc/login.defs`, else 1000 (see
+    /// [`job_policy::effective_min_uid`]). uid 0 is always refused.
+    pub job_min_uid: Option<u32>,
+    /// Groups that grant root-equivalent power (helper only; see
+    /// [`job_policy::DEFAULT_JOB_DENIED_GROUPS`]). A job whose group is one
+    /// of them is refused; they are dropped from a job's supplementary
+    /// groups. Names are looked up in `/etc/group`; unknown names are
+    /// ignored.
+    pub job_denied_groups: Vec<String>,
+    /// If not empty, only these users (by name) may run jobs (helper only).
+    pub job_allowed_users: Vec<String>,
     /// Where `puzuz update` and `puzuz doctor` look for releases:
     /// `github:<owner>/<repo>` (CLI only).
     pub update_source: String,
@@ -352,11 +398,17 @@ impl Default for Config {
             cuda_checkpoint_path: PathBuf::from("cuda-checkpoint"),
             nvidia_smi_path: PathBuf::from("nvidia-smi"),
             cuda_checkpoint_mode: CudaCheckpointMode::Manual,
+            gpu_device_isolation: true,
+            job_system_dbus: false,
+            job_systemd_varlink: false,
             checkpoint_deadline_base_secs: 180,
             checkpoint_deadline_secs_per_gib: 30,
             criu_dump_timeout_secs: None,
             criu_restore_timeout_secs: None,
             fork_guard: true,
+            job_min_uid: None,
+            job_denied_groups: job_policy::default_denied_groups(),
+            job_allowed_users: Vec::new(),
             update_source: DEFAULT_UPDATE_SOURCE.to_owned(),
             update_check: true,
             gpu_detection: GpuDetection::Auto,
@@ -509,6 +561,17 @@ impl Config {
                 ));
             }
         }
+        for (key, names) in [
+            ("job_denied_groups", &self.job_denied_groups),
+            ("job_allowed_users", &self.job_allowed_users),
+        ] {
+            if let Some(bad) = names
+                .iter()
+                .find(|n| n.is_empty() || n.contains([':', '\n', '\0']) || n.trim() != *n)
+            {
+                return Err(format!("`{key}` contains an invalid name {bad:?}"));
+            }
+        }
         self.priority.validate()?;
         let mut seen = std::collections::HashSet::new();
         for gpu in &self.gpus {
@@ -599,6 +662,15 @@ mod tests {
         assert_eq!(config.checkpoint_deadline_base_secs, 180);
         assert_eq!(config.checkpoint_deadline_secs_per_gib, 30);
         assert!(config.fork_guard);
+        assert!(config.gpu_device_isolation);
+        assert!(!config.job_system_dbus);
+        assert!(!config.job_systemd_varlink);
+        assert_eq!(config.job_min_uid, None);
+        assert_eq!(
+            config.job_denied_groups,
+            job_policy::DEFAULT_JOB_DENIED_GROUPS
+        );
+        assert!(config.job_allowed_users.is_empty());
         let p = &config.priority;
         assert_eq!(p.priority_type, PriorityType::Multifactor);
         assert_eq!(p.priority_weight_age, 1000);
@@ -715,10 +787,16 @@ mod tests {
             daemon_user = "svc-puzuz"
             nvidia_smi_path = "/opt/nvidia-smi"
             cuda_checkpoint_mode = "plugin"
+            gpu_device_isolation = false
+            job_system_dbus = true
+            job_systemd_varlink = true
             criu_dump_timeout_secs = 60
             criu_restore_timeout_secs = 90
             checkpoint_deadline_base_secs = 20
             checkpoint_deadline_secs_per_gib = 0
+            job_min_uid = 2000
+            job_denied_groups = ["docker"]
+            job_allowed_users = ["alice", "bob"]
             some_future_setting = "x"
 
             [some_future_table]
@@ -757,10 +835,19 @@ mod tests {
         assert_eq!(config.daemon_user, "svc-puzuz");
         assert_eq!(config.nvidia_smi_path, PathBuf::from("/opt/nvidia-smi"));
         assert_eq!(config.cuda_checkpoint_mode, CudaCheckpointMode::Plugin);
+        assert!(!config.gpu_device_isolation);
+        assert!(config.job_system_dbus);
+        assert!(config.job_systemd_varlink);
         assert_eq!(config.criu_dump_timeout_secs, Some(60));
         assert_eq!(config.criu_restore_timeout_secs, Some(90));
         assert_eq!(config.checkpoint_deadline_base_secs, 20);
         assert_eq!(config.checkpoint_deadline_secs_per_gib, 0);
+        assert_eq!(config.job_min_uid, Some(2000));
+        assert_eq!(config.job_denied_groups, ["docker"]);
+        assert_eq!(config.job_allowed_users, ["alice", "bob"]);
+        // An empty list denies no group.
+        let config = Config::parse("job_denied_groups = []").unwrap();
+        assert!(config.job_denied_groups.is_empty());
     }
 
     #[test]
@@ -788,7 +875,9 @@ mod tests {
         );
         assert_eq!(config.criu_dump_timeout_secs, Some(3600));
         assert_eq!(config.criu_restore_timeout_secs, Some(3600));
+        assert_eq!(config.job_min_uid, Some(1000));
         // Everything else is the default.
+        config.job_min_uid = None;
         config.checkpoint_size_limit_bytes = None;
         config.nvml_library = None;
         config.criu_dump_timeout_secs = None;
@@ -826,6 +915,13 @@ mod tests {
         assert!(matches!(
             Config::parse("[[gpus]]\nindex = 0\n[[gpus]]\nindex = 0\n"),
             Err(ParseError::Invalid(_))
+        ));
+        assert!(invalid("job_denied_groups = [\"\"]").contains("job_denied_groups"));
+        assert!(invalid("job_allowed_users = [\"a:b\"]").contains("job_allowed_users"));
+        assert!(invalid("job_allowed_users = [\" alice\"]").contains("job_allowed_users"));
+        assert!(matches!(
+            Config::parse("job_min_uid = -1"),
+            Err(ParseError::Toml(_))
         ));
     }
 

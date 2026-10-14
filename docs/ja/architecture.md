@@ -41,7 +41,13 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    しか実行されません。
 2. **スケジューリング。** キューにあるジョブは、そのグループに空きスロットがあり、要求したすべての GPU に
    空きスロットがあるときに開始します。候補は優先度の順に検討されます（[優先度とフェアシェア](#priority-and-fair-share)
-   を参照）。デーモンはそこでヘルパーにジョブの起動を依頼します。
+   を参照）。デーモンはそこでヘルパーにジョブの起動を依頼します。すぐに実行する操作（`start <id>`、`add -i`、
+   `restart -i`、`restore -i`）のジョブには、メモリ上で「強制」の印が付きます。管理者のものはすべての上限を
+   無視してすぐに起動します。それ以外のユーザーのものは計画に含まれ（`scheduler::Reserved::forced`）、ほかの
+   どの候補よりも先に検討され、グループの `parallel` の上限と依存関係を飛ばしますが、各 GPU の空きスロットと、
+   グループが一時停止中でないことは必要です。操作は同じトランザクションの中でこれを確かめるので、収まる起動は
+   すぐに始まり、収まらないものは理由（`scheduler::LaunchWait`）とともにキューに入ります。理由は応答と
+   ジョブの表示（`waiting`）に含まれます。
 3. **デーモン → ヘルパー。** デーモンは `/run/puzuz/helper.sock` への接続を 1 本保持し、改行区切りの JSON を
    やり取りします。最初に Hello メッセージでプロトコルのバージョンを確認します。その後、ID 付きのリクエストと、
    ヘルパーからの番号付きのイベント（ジョブの終了、チェックポイントやリストアの完了）が続きます。イベントは
@@ -64,12 +70,17 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    サービスを開始します。ユニットには `Before=puzuz-helper.service` と `KillMode=mixed` が設定され、stdin は
    `/dev/null`、停止のタイムアウトは `grace_secs` です。各ジョブはデーモン、ヘルパー、ユーザーのセッションの
    外にある自分専用の cgroup で動くので、デーモンやヘルパーの再起動やユーザーのログアウトを生き延びます。
+   `gpu_device_isolation`（デフォルトで有効）のとき、ユニットには `DevicePolicy=closed` と、ジョブの GPU
+   だけを許可する `DeviceAllow=` も設定されます（[GPU の分離](#gpu-isolation) を参照）。
 5. **shim。** shim はまだ root のまま PID 名前空間とマウント名前空間を作り、ホストの automount ポイントを
    トリガーしたあとで（名前空間が automount されたファイルシステムを得られるように）、名前空間の init を
    開始します。init はマウントを private にし、新しい `/proc` をマウントします。他のマウントの下に隠れた
    マウントと、再起動後に残らないマウント（`/run/*`、`/media/*`）を取り除き、`autofs` マウントの上に重なった
    automount 済みのファイルシステムをそれぞれ普通のコピーに置き換え、`/tmp` と `/dev/shm` に専用の tmpfs を
-   マウントします。その後、`no_new_privs` を設定して所有者の uid、gid、グループに切り替え、ログ
+   マウントします。`job_system_dbus = true` でなければ `/run/dbus` を空の tmpfs で隠し、`job_systemd_varlink = true` でなければ
+   `/run/systemd` を journald のログのソケット、resolved の名前解決のソケットと `resolv.conf` のファイル、`userdb/` だけを
+   残した tmpfs で隠すので、ジョブは後からソケットが現れても D-Bus でも Varlink でも systemd や polkit に何も要求できません。CRIU はこのマウントを
+   ダンプし、リストアで作り直します（[ジョブにできること・できないこと](install.md#what-a-job-can-and-cannot-do)を参照）。その後、`no_new_privs` を設定して所有者の uid、gid、グループに切り替え、ログ
    （`/var/lib/puzuz/logs/<uid>/<id>.log`）と作業ディレクトリを所有者として開き、`sh -c` でコマンドを
    実行します。環境変数はクライアントのものに、`CUDA_VISIBLE_DEVICES`、`CUDA_DEVICE_ORDER=PCI_BUS_ID`、
    `LD_PRELOAD` の fork ガードを加えたものです。ジョブへのシグナル（TERM、INT、HUP、QUIT、USR1、USR2、
@@ -105,7 +116,8 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    パスが存在すること、ダンプ時にそれらがあったファイルシステム（`helper-mounts.json` に記録）が同じ場所に
    同じタイプでマウントされていること（automount ポイントはトリガーされます）、ジョブが開いていたファイルと
    作業ディレクトリが存在することです。次に、`/` のバインドマウント（`/run/puzuz-helper/criu-root`）上で
-   `criu restore --root` を実行する新しいユニット `puzuz-job-<id>-r<n>.service` を開始します。manual モード
+   `criu restore --root` を実行する新しいユニット `puzuz-job-<id>-r<n>.service` を、リストア先の GPU の
+   デバイスアクセスで開始します。manual モード
    ではその後 CUDA プロセスに対して cuda-checkpoint の `restore` と `unlock` を実行します。plugin モードでは
    `criu restore` が戻る前に CRIU のプラグインがこれを行います。各イメージは、現在の `cuda_checkpoint_mode`
    の値にかかわらず、ダンプしたときのモードでリストアされます。ジョブは ID とログを保ち、イメージはその後
@@ -171,19 +183,43 @@ CRIU は root として動き、リストアするジョブのすべてをダン
 <a id="other-privilege-boundaries"></a>
 ## その他の権限境界
 
+- <a id="job-credentials"></a>誰のジョブを実行するかはデーモンではなくヘルパーが決めるので、乗っ取られた
+  デーモンでもそれを回避できません。ヘルパーは起動とリストアのたびに所有者を NSS で調べ、uid 0、gid 0、所有者が
+  属していないグループ、`job_min_uid`（既定は `/etc/login.defs` の `UID_MIN`）未満のユーザー、空でない
+  `job_allowed_users` に含まれないユーザー、`job_denied_groups`（`docker`、`disk`、`sudo` などの root 相当の
+  グループ。`/etc/group` で調べます）に含まれるジョブのグループを、コード `policy_denied` のエラーで拒否します。
+  そのメッセージ（`puzuz refuses to run jobs as <user>: <reason>`）がジョブの起動失敗やリストアのエラーの理由に
+  なります。ジョブの補助グループはヘルパー自身が計算し（`initgroups` が設定するものから、拒否するグループと
+  gid 0 を除いたもの）、shim に渡します。外したグループはヘルパーのジャーナルに記録されます。
+  チェックポイントされたプロセスが拒否するグループを持っていたリストアは拒否され、リストア後の検査も所有者の
+  グループから拒否するグループを除いたものしか認めません。[ジョブを実行できるユーザー](install.md#who-jobs-may-run-as)
+  を参照してください。
 - ヘルパーは、デーモンのユーザーが所有する `/run/puzuz` に、root が所有する専用のステージングディレクトリを
   通してソケットをバインドします。このディレクトリはファイルディスクリプタ経由でのみ使います。同時に扱う
   デーモンのセッションは 1 つだけで（新しいセッションが古いものを置き換えます）、Hello を待っている接続は
   数本までに制限し、セッションのキューと処理中のリクエスト数にも上限を設けます。
-- shim は特権を落とす前に、root としてジョブのマウント名前空間を操作します。まず所有者のグループを調べ
-  （NSS はライブラリをパスで読み込むため）、マウントの移動と取り外し（`/run` と `/media` 以下の再起動後に
+- shim は特権を落とす前に、root としてジョブのマウント名前空間を操作します。マウントの移動と取り外し（`/run` と `/media` 以下の再起動後に
   残らないマウントを含む）はファイルディスクリプタ経由でのみ行います。そのファイルディスクリプタには、root
   だけが変更できるディレクトリを通り、シンボリックリンクをたどらずに一度だけ到達します。そのため、所有者が
   マウント操作をシステムディレクトリにすり替えることはできません。他人が変更できるディレクトリの下のマウントは
-  そのままにします。
+  そのままにします。補助グループはヘルパーから渡されるので（上記を参照）、shim が改めて調べることはありません。
 - 起動時、ヘルパーは名前で指定されたプログラム（`criu`、`cuda-checkpoint`、`nvidia-smi`）を自分の `PATH`
   から一度だけ探し、見つかったファイルが、絶対パスで指定されたプログラムと同じく、root のもので、root だけが
   変更できるディレクトリだけを通って到達できることを要求し、以後はその絶対パスを使います。
+- <a id="gpu-isolation"></a>**GPU の分離。** `CUDA_VISIBLE_DEVICES` は CUDA に使う GPU を伝えるだけで、
+  どのジョブでも書き換えられます。`gpu_device_isolation = true`（デフォルト）のとき、ヘルパーは開始した
+  ユニットにもリストアしたユニットにも、`DevicePolicy=closed` と `DeviceAllow=` のリスト（読み書き）を
+  設定します。許可するのは、割り当てた各 GPU の `/dev/nvidia<minor>` と、`/dev/nvidiactl`、
+  `/dev/nvidia-uvm`、`/dev/nvidia-uvm-tools`、`/dev/nvidia-modeset`、`char-nvidia-uvm` で、CPU だけの
+  ジョブには何も許可しません。systemd はこれを、root を含むユニットのすべてのプロセスに cgroup のデバイス
+  プログラムで適用するので、ほかの NVIDIA デバイスを開くと `EPERM` で失敗します。`closed` でも標準の疑似
+  デバイス（`/dev/null`、`/dev/zero`、`/dev/full`、`/dev/random`、`/dev/urandom`、`/dev/tty`、`/dev/ptmx`、
+  `/dev/pts/*`）は許可されます。GPU 番号（PCI バスの順序）は、開始とリストアのたびに、ドライバーの
+  `/proc/driver/nvidia/gpus/<PCI アドレス>/information`（`Device Minor`、除外された GPU を除く）でデバイスの
+  マイナー番号に対応付けます。リストアのユニットにはリストア先の GPU が許可されます。`criu restore` と、
+  plugin モードでは CRIU の CUDA プラグインがその中で動き、manual モードでは、ヘルパーが
+  `cuda-checkpoint --action restore` を実行したときに、リストアされたプロセスの中でドライバーがデバイス
+  ノードを開き直すためです。インストールガイドの [GPU の分離](install.md#gpu-isolation) を参照してください。
 - 起動時、ヘルパーは書き込み先やコードの読み込み元のディレクトリ（`criu -L` に渡す
   `<data_dir>/criu-no-plugins` や、fork ガードの `<data_dir>/lib` を含む）について、それらとその親が root の
   ものでなければ拒否します。

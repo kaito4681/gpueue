@@ -109,6 +109,64 @@ pub struct MountPlan {
     pub keep: Vec<String>,
     /// Mount a private tmpfs here (its contents are saved in the image).
     pub tmpfs: Vec<String>,
+    /// Hide each of these directories behind an empty, root-owned tmpfs,
+    /// after pruning: by default the system D-Bus directory under both of
+    /// its names (`/run/dbus`, `/var/run/dbus`), so that a job cannot reach
+    /// the system bus, also when its socket appears only later (the
+    /// host's directory is not visible in the job at all). A missing
+    /// directory is created first (as root, `0755`) if its parent exists;
+    /// two names of the same directory (`/var/run` is usually a link to
+    /// `/run`) are hidden once. Empty with `job_system_dbus = true`. CRIU
+    /// saves the tmpfs; the helper creates missing mount points before a
+    /// restore (see [`ensure_restore_mount_points`]).
+    #[serde(default)]
+    pub hidden_dirs: Vec<String>,
+    /// `Some`: hide `/run/systemd` behind an empty, root-owned tmpfs that
+    /// holds only these entries of the host's (relative paths, bound from
+    /// the host where they exist) and an empty `system` directory
+    /// (`sd_booted()`), so that a job cannot reach systemd's Varlink
+    /// services (`io.systemd.Manager`, `io.systemd.Credentials`, mountfsd,
+    /// nsresourced, machined, logind, networkd, ...). They authorize
+    /// unprivileged callers through polkit, which takes group membership
+    /// from the user database, and they do not go through the D-Bus
+    /// socket. Sockets the host creates later in `/run/systemd` (or in
+    /// `journal/` and `resolve/`, of which only single files are bound)
+    /// do not show up in the job. `None` with `job_systemd_varlink = true`.
+    #[serde(default)]
+    pub systemd_run_keep: Option<Vec<String>>,
+}
+
+/// What [`MountPlan::systemd_run_keep`] keeps by default: journald's log
+/// sockets (`/dev/log` links to `journal/dev-log`), resolved's
+/// resolution socket and the `resolv.conf` files `/etc/resolv.conf` may
+/// link to (not its query monitor), and the user database directory,
+/// whose services only answer user and group lookups
+/// (`io.systemd.UserDatabase`).
+pub const SYSTEMD_RUN_KEEP: [&str; 7] = [
+    "journal/socket",
+    "journal/stdout",
+    "journal/dev-log",
+    "resolve/io.systemd.Resolve",
+    "resolve/stub-resolv.conf",
+    "resolve/resolv.conf",
+    "userdb",
+];
+
+/// The system D-Bus directory under both names (see
+/// [`MountPlan::hidden_dirs`]).
+pub const SYSTEM_BUS_DIRS: [&str; 2] = ["/run/dbus", "/var/run/dbus"];
+
+/// Create the mount points a restore of a job hidden with `plan` needs
+/// on the host: the directories of [`MountPlan::hidden_dirs`] (the shim
+/// may have created them, and `/run` is empty after a reboot). Only where
+/// the parent exists; errors are left to the restore.
+pub fn ensure_restore_mount_points(plan: &MountPlan) {
+    for dir in &plan.hidden_dirs {
+        let path = std::path::Path::new(dir);
+        if path.parent().is_some_and(|p| p.is_dir()) && !path.exists() {
+            let _ = std::fs::DirBuilder::new().mode(0o755).create(path);
+        }
+    }
 }
 
 impl MountPlan {
@@ -125,6 +183,8 @@ impl Default for MountPlan {
             prune: vec!["/run/".into(), "/media/".into(), "/dev/shm".into()],
             keep: vec!["/run/nvidia-persistenced".into()],
             tmpfs: vec!["/tmp".into(), "/dev/shm".into()],
+            hidden_dirs: SYSTEM_BUS_DIRS.iter().map(|p| (*p).to_owned()).collect(),
+            systemd_run_keep: Some(SYSTEMD_RUN_KEEP.iter().map(|p| (*p).to_owned()).collect()),
         }
     }
 }

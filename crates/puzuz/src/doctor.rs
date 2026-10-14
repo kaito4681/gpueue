@@ -325,6 +325,116 @@ fn check_helper_settings(sys: &dyn System, config: &Config, nixos: bool) -> Chec
     })
 }
 
+/// `gpu_device_isolation`: whether job units may open only their GPUs' device nodes.
+fn check_gpu_isolation(config: &Config, nixos: bool) -> Check {
+    const NAME: &str = "gpu isolation";
+    if config.gpu_device_isolation {
+        return Check::ok(
+            NAME,
+            "on: job units get DevicePolicy=closed and may open only their assigned GPUs' \
+             /dev/nvidia* nodes (none for CPU jobs)",
+        );
+    }
+    let how = if nixos {
+        format!("set `services.puzuz.settings.gpu_device_isolation = true`, then `{REBUILD}`")
+    } else {
+        format!(
+            "set `gpu_device_isolation = true` in {DEFAULT_CONFIG_PATH} and \
+             `sudo systemctl restart {HELPER_UNIT}`"
+        )
+    };
+    Check::info(
+        NAME,
+        "off (gpu_device_isolation = false): every job can open every GPU; only \
+         CUDA_VISIBLE_DEVICES selects them",
+    )
+    .hint(format!("unless you need it off (e.g. for MIG), {how}"))
+}
+
+/// `job_system_dbus`: whether jobs may reach the system D-Bus (systemd, polkit).
+fn check_job_system_dbus(config: &Config, nixos: bool) -> Check {
+    const NAME: &str = "job d-bus";
+    let open: Vec<&str> = [
+        ("job_system_dbus", config.job_system_dbus),
+        ("job_systemd_varlink", config.job_systemd_varlink),
+    ]
+    .into_iter()
+    .filter(|(_, on)| *on)
+    .map(|(key, _)| key)
+    .collect();
+    if open.is_empty() {
+        return Check::ok(
+            NAME,
+            "blocked: jobs cannot reach the system D-Bus or systemd's Varlink services (no \
+             systemctl, run0, pkexec or other polkit-authorized actions from jobs)",
+        );
+    }
+    let keys = open
+        .iter()
+        .map(|k| format!("`{k} = true`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let how = if nixos {
+        format!("remove {keys} from `services.puzuz.settings`, then `{REBUILD}`")
+    } else {
+        format!(
+            "remove {keys} from {DEFAULT_CONFIG_PATH} and \
+             `sudo systemctl restart {HELPER_UNIT}`"
+        )
+    };
+    Check::warn(
+        NAME,
+        format!(
+            "allowed ({}): jobs can ask systemd and polkit for actions; polkit rules that \
+             trust a group apply to the jobs of its members",
+            open.iter()
+                .map(|k| format!("{k} = true"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .hint(format!("unless jobs need it, {how}"))
+}
+
+/// The helper's job credential policy: the minimum uid and where it comes from, the denied
+/// groups (and which of them exist here), the allowed users.
+fn check_job_policy(sys: &dyn System, config: &Config) -> Check {
+    use puzuz_config::job_policy;
+    const NAME: &str = "job policy";
+    let (min_uid, source) = job_policy::effective_min_uid(
+        config.job_min_uid,
+        &sys.path(Path::new(job_policy::LOGIN_DEFS_PATH)),
+    );
+    let groups = std::fs::read_to_string(sys.path(Path::new(job_policy::GROUP_FILE_PATH)))
+        .unwrap_or_default();
+    let present = job_policy::resolve_group_names(&groups, &config.job_denied_groups);
+    let denied = if config.job_denied_groups.is_empty() {
+        "none".to_owned()
+    } else {
+        config
+            .job_denied_groups
+            .iter()
+            .map(|name| match present.iter().find(|(n, _)| n == name) {
+                Some((_, gid)) => format!("{name} (gid {gid})"),
+                None => format!("{name} (absent)"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let allowed = if config.job_allowed_users.is_empty() {
+        format!("every user with uid >= {min_uid}")
+    } else {
+        config.job_allowed_users.join(", ")
+    };
+    Check::info(
+        NAME,
+        format!(
+            "jobs run as uid >= {min_uid} ({}); denied groups: {denied}; allowed users: {allowed}",
+            source.describe()
+        ),
+    )
+}
+
 /// The `--flags` (without values) of a command line.
 fn flags_of(argv: &[String]) -> Vec<String> {
     argv.iter()
@@ -430,6 +540,9 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     }
     checks.push(check_helper_binary(sys, nixos));
     checks.push(check_helper_settings(sys, &config, nixos));
+    checks.push(check_gpu_isolation(&config, nixos));
+    checks.push(check_job_system_dbus(&config, nixos));
+    checks.push(check_job_policy(sys, &config));
     if let Some(check) = check_daemon_write_paths(sys, &config, nixos) {
         checks.push(check);
     }

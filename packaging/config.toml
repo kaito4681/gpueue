@@ -74,6 +74,28 @@
 # the distribution's criu). "plugin": CRIU's CUDA plugin does it.
 # cuda_checkpoint_mode = "manual"
 
+# [helper] GPU isolation: every job unit gets DevicePolicy=closed and may open
+# only the NVIDIA device nodes of the GPUs it was assigned (/dev/nvidia<minor>,
+# /dev/nvidiactl, /dev/nvidia-uvm, /dev/nvidia-uvm-tools, /dev/nvidia-modeset);
+# CPU jobs get none. false: no device restrictions, CUDA_VISIBLE_DEVICES alone
+# selects the GPUs (needed for MIG, see docs/install.md).
+# gpu_device_isolation = true
+
+# [helper] Let jobs reach the system D-Bus. false (the default): /run/dbus is
+# hidden behind an empty tmpfs in every job's mount namespace, also after a
+# restore and also for a bus socket that appears later, so jobs cannot ask
+# systemd or polkit for anything (systemctl, run0, pkexec, machinectl, ...),
+# whatever polkit rules allow the owner's groups.
+# job_system_dbus = false
+
+# [helper] Let jobs reach systemd's Varlink services. false (the default):
+# /run/systemd is hidden from jobs except journald's log sockets, resolved's
+# resolution socket and resolv.conf files, and userdb/, so
+# polkit-authorized Varlink methods (io.systemd.Manager reload/reexecute,
+# io.systemd.Credentials decryption, mountfsd, nsresourced, machined, ...)
+# are out of reach as well.
+# job_systemd_varlink = false
+
 # [helper] Deadline of a whole checkpoint (CUDA lock + checkpoint + criu dump)
 # or restore (criu restore + CUDA restore + unlock) of one job, in seconds:
 #   base + per_gib * GiB
@@ -100,6 +122,27 @@
 # so such jobs can be checkpointed without changes. It does not apply to
 # statically linked programs.
 # fork_guard = true
+
+# [helper] Who jobs may run as (checked for every spawn and restore; uid 0 is
+# always refused). Jobs of users below job_min_uid are refused. Unset by
+# default: UID_MIN of /etc/login.defs, or 1000 when it has none.
+# Example:
+#   job_min_uid = 1000
+
+# [helper] Groups that give root-equivalent power. They are dropped from a
+# job's supplementary groups (the helper's journal records it), and a job whose primary
+# group is one of them is refused, as is restoring a checkpoint taken with
+# one. Names are looked up in /etc/group; names not listed there are ignored;
+# gid 0 is always dropped. Why each is listed: docker, lxd, incus-admin and
+# libvirt start containers or VMs with host mounts or devices as root; disk
+# gives raw access to block devices; sudo, wheel and admin give sudo rights
+# (NOPASSWD rules or cached credentials would let an unattended job become
+# root). Remove a group (e.g. docker) to let jobs use it again.
+# job_denied_groups = ["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]
+
+# [helper] If not empty, only these users (by name) may run jobs; others are
+# refused. Empty: every user with uid >= job_min_uid.
+# job_allowed_users = []
 
 # [cli] Where `puzuz update` and `puzuz doctor` look for releases:
 # "github:<owner>/<repo>" (the GitHub releases of that repository).

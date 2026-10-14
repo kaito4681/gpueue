@@ -544,6 +544,83 @@ fn helper_settings_come_from_the_config_unless_flags_override_them() {
 }
 
 #[test]
+fn job_system_dbus_is_shown() {
+    let (sys, _sockets) = healthy();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job d-bus"), Level::Ok);
+    assert!(message(&report, "job d-bus").starts_with("blocked: "));
+
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!("job_system_dbus = true\n{CONFIG}"),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job d-bus"), Level::Warn);
+    assert!(hint(&report, "job d-bus").contains("job_system_dbus = true"));
+
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!("job_systemd_varlink = true\n{CONFIG}"),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job d-bus"), Level::Warn);
+    assert!(message(&report, "job d-bus").contains("job_systemd_varlink = true"));
+}
+
+#[test]
+fn gpu_isolation_is_shown() {
+    let (sys, _sockets) = healthy();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpu isolation"), Level::Ok);
+    assert!(message(&report, "gpu isolation").starts_with("on: "));
+
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!("gpu_device_isolation = false\n{CONFIG}"),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpu isolation"), Level::Info);
+    assert!(message(&report, "gpu isolation").starts_with("off "));
+    assert!(hint(&report, "gpu isolation").contains("gpu_device_isolation = true"));
+}
+
+#[test]
+fn job_policy_shows_the_minimum_uid_source_and_denied_groups() {
+    let (sys, _sockets) = healthy();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job policy"), Level::Info);
+    let shown = message(&report, "job policy");
+    assert!(shown.contains("uid >= 1000 (built-in fallback)"), "{shown}");
+    assert!(shown.contains("docker (absent)"), "{shown}");
+    assert!(shown.contains("allowed users: every user"), "{shown}");
+
+    sys.write("/etc/login.defs", "# UID_MIN 1\nUID_MIN 2000\n");
+    sys.write("/etc/group", "docker:x:999:alice\nsudo:x:27:\n");
+    let report = run(&sys, None);
+    let shown = message(&report, "job policy");
+    assert!(
+        shown.contains("uid >= 2000 (UID_MIN in /etc/login.defs)"),
+        "{shown}"
+    );
+    assert!(shown.contains("docker (gid 999)"), "{shown}");
+    assert!(shown.contains("sudo (gid 27)"), "{shown}");
+    assert!(shown.contains("wheel (absent)"), "{shown}");
+
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!(
+            "job_min_uid = 1500\njob_denied_groups = []\njob_allowed_users = [\"alice\"]\n{CONFIG}"
+        ),
+    );
+    let shown = message(&run(&sys, None), "job policy").to_owned();
+    assert_eq!(
+        shown,
+        "jobs run as uid >= 1500 (job_min_uid in the configuration); denied groups: none; \
+         allowed users: alice"
+    );
+}
+
+#[test]
 fn kernel_checks() {
     let (sys, _sockets) = healthy();
     sys.write("/proc/sys/kernel/osrelease", "5.4.0\n");

@@ -11,6 +11,7 @@
 //! - [`launcher`]: how job units are started (systemd over D-Bus, or a fake).
 //! - [`shim`]: the job unit's main process (PID/mount namespace init).
 //! - [`host`]: `/proc`, `nvidia-smi`, users and mounts.
+//! - [`devices`]: GPU isolation (the device nodes a job unit may open).
 //! - [`mounts`]: mountinfo analysis (hidden mounts, CRIU's external binds).
 //! - [`forkguard`]: the preload library that makes forked children of CUDA
 //!   processes checkpointable.
@@ -19,6 +20,7 @@
 
 pub mod access;
 pub mod config;
+pub mod devices;
 pub mod engine;
 pub mod events;
 pub mod forkguard;
