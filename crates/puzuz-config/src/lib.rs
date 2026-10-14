@@ -48,6 +48,22 @@
 //! criu_restore_timeout_secs = 3600   # default: only the deadline applies
 //! nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
 //!
+//! # Job priority (Slurm's priority/multifactor); see [`PriorityConfig`].
+//! [priority]
+//! priority_type = "multifactor"
+//! priority_weight_age = 1000
+//! priority_weight_fairshare = 10000
+//! priority_weight_job_size = 0
+//! priority_weight_partition = 0
+//! priority_weight_tres = ""
+//! priority_max_age_secs = 604800             # 7 days
+//! priority_decay_half_life_secs = 604800     # 7 days; 0: no decay
+//! priority_calc_period_secs = 300
+//! priority_usage_reset_period = "none"
+//! priority_favor_small = false
+//! tres_billing_weights = "CPU=1.0,GRES/gpu=10.0"
+//! enable_user_top = true
+//!
 //! # The [[gpus]] list is empty by default. See [`GpuConfig`] for the fields.
 //! [[gpus]]
 //! index = 0                          # required
@@ -153,6 +169,118 @@ pub struct Config {
     /// Statically configured GPUs: used when NVML is unavailable, or always
     /// with `gpu_detection = "static"`.
     pub gpus: Vec<GpuConfig>,
+    /// The `[priority]` table: how pending jobs are ordered (daemon only).
+    pub priority: PriorityConfig,
+}
+
+/// The `[priority]` table: Slurm's multifactor priority settings, named
+/// after Slurm's (`PriorityWeightAge` is `priority_weight_age`, ...), with
+/// durations in seconds (`*_secs`) like the other keys. See
+/// [`puzuz_core::priority`] for the formula.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PriorityConfig {
+    /// `"multifactor"`, or `"basic"` for pueue's order (`-o` priority, then
+    /// submission order) (`PriorityType`).
+    pub priority_type: PriorityType,
+    /// `PriorityWeightAge`.
+    pub priority_weight_age: u32,
+    /// `PriorityWeightFairshare`.
+    pub priority_weight_fairshare: u32,
+    /// `PriorityWeightJobSize`.
+    pub priority_weight_job_size: u32,
+    /// `PriorityWeightPartition`; puzuz groups play the role of partitions.
+    pub priority_weight_partition: u32,
+    /// `PriorityWeightTRES`, e.g. `"GRES/gpu=1000"` or
+    /// `"CPU=100,GRES/gpu=1000"`; empty: no TRES factor.
+    pub priority_weight_tres: String,
+    /// `PriorityMaxAge`: the age factor reaches 1 after this long.
+    pub priority_max_age_secs: u64,
+    /// `PriorityDecayHalfLife`: usage halves after this long; 0 disables
+    /// the decay.
+    pub priority_decay_half_life_secs: u64,
+    /// `PriorityCalcPeriod`: how often usage is added up and decayed.
+    pub priority_calc_period_secs: u64,
+    /// `PriorityUsageResetPeriod`.
+    pub priority_usage_reset_period: ResetPeriod,
+    /// `PriorityFavorSmall`.
+    pub priority_favor_small: bool,
+    /// `TRESBillingWeights`: what one second of a job counts as for fair
+    /// share. Every job counts as one CPU.
+    pub tres_billing_weights: String,
+    /// Slurm's `SchedulerParameters=enable_user_top`: users may move their
+    /// own jobs to the top of their queue (`puzuz top`); administrators
+    /// always may.
+    pub enable_user_top: bool,
+}
+
+pub use puzuz_core::priority::{PriorityType, ResetPeriod, TresWeights};
+
+impl Default for PriorityConfig {
+    fn default() -> Self {
+        Self {
+            priority_type: PriorityType::Multifactor,
+            priority_weight_age: 1000,
+            priority_weight_fairshare: 10000,
+            priority_weight_job_size: 0,
+            priority_weight_partition: 0,
+            priority_weight_tres: String::new(),
+            priority_max_age_secs: 7 * 24 * 60 * 60,
+            priority_decay_half_life_secs: 7 * 24 * 60 * 60,
+            priority_calc_period_secs: 300,
+            priority_usage_reset_period: ResetPeriod::None,
+            priority_favor_small: false,
+            tres_billing_weights: "CPU=1.0,GRES/gpu=10.0".to_owned(),
+            enable_user_top: true,
+        }
+    }
+}
+
+impl PriorityConfig {
+    fn validate(&self) -> Result<(), String> {
+        TresWeights::parse(&self.priority_weight_tres)
+            .map_err(|e| format!("`priority.priority_weight_tres`: {e}"))?;
+        TresWeights::parse(&self.tres_billing_weights)
+            .map_err(|e| format!("`priority.tres_billing_weights`: {e}"))?;
+        if self.priority_calc_period_secs == 0 {
+            return Err("`priority.priority_calc_period_secs` must be positive".to_owned());
+        }
+        for (key, value) in [
+            ("priority_max_age_secs", self.priority_max_age_secs),
+            (
+                "priority_decay_half_life_secs",
+                self.priority_decay_half_life_secs,
+            ),
+            ("priority_calc_period_secs", self.priority_calc_period_secs),
+        ] {
+            if value > MAX_SECS {
+                return Err(format!(
+                    "`priority.{key}` = {value} is too large (at most {MAX_SECS}, one year)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The settings the priority calculation needs.
+    pub fn params(&self) -> puzuz_core::priority::Params {
+        puzuz_core::priority::Params {
+            kind: self.priority_type,
+            weight_age: self.priority_weight_age,
+            weight_fairshare: self.priority_weight_fairshare,
+            weight_job_size: self.priority_weight_job_size,
+            weight_partition: self.priority_weight_partition,
+            // Validated when the file was read.
+            weight_tres: TresWeights::parse(&self.priority_weight_tres).unwrap_or_default(),
+            max_age_ms: (self.priority_max_age_secs * 1000) as i64,
+            favor_small: self.priority_favor_small,
+        }
+    }
+
+    /// [`PriorityConfig::tres_billing_weights`], parsed.
+    pub fn billing_weights(&self) -> TresWeights {
+        TresWeights::parse(&self.tres_billing_weights).unwrap_or_default()
+    }
 }
 
 /// [`Config::gpu_detection`]: NVML falling back to [`Config::gpus`]
@@ -234,6 +362,7 @@ impl Default for Config {
             gpu_detection: GpuDetection::Auto,
             nvml_library: None,
             gpus: Vec::new(),
+            priority: PriorityConfig::default(),
         }
     }
 }
@@ -380,6 +509,7 @@ impl Config {
                 ));
             }
         }
+        self.priority.validate()?;
         let mut seen = std::collections::HashSet::new();
         for gpu in &self.gpus {
             if !seen.insert(gpu.index) {
@@ -469,6 +599,102 @@ mod tests {
         assert_eq!(config.checkpoint_deadline_base_secs, 180);
         assert_eq!(config.checkpoint_deadline_secs_per_gib, 30);
         assert!(config.fork_guard);
+        let p = &config.priority;
+        assert_eq!(p.priority_type, PriorityType::Multifactor);
+        assert_eq!(p.priority_weight_age, 1000);
+        assert_eq!(p.priority_weight_fairshare, 10000);
+        assert_eq!(p.priority_weight_job_size, 0);
+        assert_eq!(p.priority_weight_partition, 0);
+        assert_eq!(p.priority_weight_tres, "");
+        assert_eq!(p.priority_max_age_secs, 604_800);
+        assert_eq!(p.priority_decay_half_life_secs, 604_800);
+        assert_eq!(p.priority_calc_period_secs, 300);
+        assert_eq!(p.priority_usage_reset_period, ResetPeriod::None);
+        assert!(!p.priority_favor_small);
+        assert_eq!(
+            p.billing_weights(),
+            TresWeights {
+                cpu: 1.0,
+                gpu: 10.0
+            }
+        );
+        assert!(p.enable_user_top);
+        assert_eq!(p.params(), puzuz_core::priority::Params::default());
+    }
+
+    #[test]
+    fn parses_the_priority_table() {
+        let config = Config::parse(
+            r#"
+            grace_secs = 5
+
+            [priority]
+            priority_type = "basic"
+            priority_weight_age = 1
+            priority_weight_fairshare = 2
+            priority_weight_job_size = 3
+            priority_weight_partition = 4
+            priority_weight_tres = "GRES/gpu=1000"
+            priority_max_age_secs = 60
+            priority_decay_half_life_secs = 0
+            priority_calc_period_secs = 10
+            priority_usage_reset_period = "WEEKLY"
+            priority_favor_small = true
+            tres_billing_weights = "CPU=2"
+            enable_user_top = false
+            future_key = 1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.grace_secs, 5);
+        let p = &config.priority;
+        assert_eq!(p.priority_usage_reset_period, ResetPeriod::Weekly);
+        assert!(!p.enable_user_top);
+        let params = p.params();
+        assert_eq!(params.kind, PriorityType::Basic);
+        assert_eq!(
+            (
+                params.weight_age,
+                params.weight_fairshare,
+                params.weight_job_size,
+                params.weight_partition
+            ),
+            (1, 2, 3, 4)
+        );
+        assert_eq!(params.weight_tres.gpu, 1000.0);
+        assert_eq!(params.max_age_ms, 60_000);
+        assert!(params.favor_small);
+        assert_eq!(p.billing_weights(), TresWeights { cpu: 2.0, gpu: 0.0 });
+    }
+
+    #[test]
+    fn rejects_bad_priority_settings() {
+        for (text, needle) in [
+            ("priority_weight_tres = \"mem=1\"", "priority_weight_tres"),
+            ("tres_billing_weights = \"CPU\"", "tres_billing_weights"),
+            ("priority_calc_period_secs = 0", "priority_calc_period_secs"),
+            (
+                "priority_decay_half_life_secs = 31536001",
+                "priority_decay_half_life_secs",
+            ),
+            ("priority_max_age_secs = 31536001", "priority_max_age_secs"),
+        ] {
+            let message = invalid(&format!("[priority]\n{text}"));
+            assert!(message.contains(needle), "{text}: {message}");
+        }
+        for text in [
+            "priority_type = \"fifo\"",
+            "priority_usage_reset_period = \"hourly\"",
+            "priority_weight_age = -1",
+        ] {
+            assert!(
+                matches!(
+                    Config::parse(&format!("[priority]\n{text}")),
+                    Err(ParseError::Toml(_))
+                ),
+                "{text}"
+            );
+        }
     }
 
     #[test]
