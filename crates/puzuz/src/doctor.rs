@@ -13,7 +13,9 @@ use puzuz_protocol::api::{CheckpointStorage, GpuDetectionStatus, GpuSource, Vers
 
 use crate::install_method::{self, Detection, InstallMethod, LocalUnit, Method, OsRelease};
 use crate::service::{ADMIN_GROUP, DAEMON_UNIT, HELPER_UNIT, TMPFILES_PATH, UNIT_DIR};
-use crate::system::{System, check_root_owned_chain, find_program, is_root_owned_and_protected};
+use crate::system::{
+    Program, System, check_root_owned_chain, find_runnable_program, is_root_owned_and_protected,
+};
 
 mod sudo_path;
 
@@ -141,6 +143,9 @@ impl Report {
 pub struct LoadedConfig {
     pub config: Config,
     pub check: Check,
+    /// The file passed the helper's trust check (only root can change it), or does not exist
+    /// or cannot be parsed (the defaults apply). The programs it names are run only if so.
+    pub trusted: bool,
 }
 
 pub fn load_config(sys: &dyn System) -> LoadedConfig {
@@ -166,15 +171,21 @@ fn load_config_on(sys: &dyn System, nixos: bool) -> LoadedConfig {
                 format!("{DEFAULT_CONFIG_PATH} does not exist; the defaults apply"),
             )
             .hint(hint),
+            trusted: true,
         };
     }
     match Config::load(&path) {
         Ok(config) => {
             let mut check = check_config_trust(sys, nixos);
-            if check.level == Level::Ok {
+            let trusted = check.level == Level::Ok;
+            if trusted {
                 check = check_config_readable(sys, nixos);
             }
-            LoadedConfig { config, check }
+            LoadedConfig {
+                config,
+                check,
+                trusted,
+            }
         }
         Err(err) => {
             let hint = if nixos {
@@ -188,6 +199,7 @@ fn load_config_on(sys: &dyn System, nixos: bool) -> LoadedConfig {
             LoadedConfig {
                 config: Config::default(),
                 check: Check::fail("config", err.to_string()).hint(hint),
+                trusted: true,
             }
         }
     }
@@ -380,27 +392,36 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     // name the NixOS module.
     let detection = install_method::detect(sys);
     let nixos = detection.os.is_nixos();
-    let LoadedConfig { config, check } = load_config_on(sys, nixos);
+    let LoadedConfig {
+        config,
+        check,
+        trusted,
+    } = load_config_on(sys, nixos);
+    // As root, the programs an untrusted configuration names are never run.
+    let programs = Programs {
+        config_trusted: trusted || sys.euid() != 0,
+        nixos,
+    };
     let mut checks = vec![check, check_install_method(&detection)];
     checks.extend(sudo_path::check(sys, &detection));
     let api_socket = socket.map_or_else(|| config.api_socket.clone(), Path::to_owned);
     let daemon = sys.daemon_version(&api_socket);
 
-    checks.push(check_criu(sys, &config.criu_path, nixos));
+    checks.push(check_criu(sys, &config.criu_path, programs));
     let driver = driver_version(sys);
     checks.push(check_driver(&driver, nixos));
     checks.push(check_cuda_checkpoint(
         sys,
         &config.cuda_checkpoint_path,
         driver.as_ref().ok(),
-        nixos,
+        programs,
     ));
     if config.cuda_checkpoint_mode == CudaCheckpointMode::Plugin {
         checks.push(check_cuda_plugin(sys, driver.is_ok(), nixos));
     }
     if driver.is_ok() {
         let detection = daemon.as_ref().ok().and_then(|v| v.gpu_detection.as_ref());
-        checks.push(check_gpus(sys, &config, detection, nixos));
+        checks.push(check_gpus(sys, &config, detection, programs));
     }
     checks.push(check_kernel(sys));
     checks.push(check_systemd(sys));
@@ -571,8 +592,76 @@ fn check_install_method(detection: &Detection) -> Check {
     check
 }
 
-fn check_criu(sys: &dyn System, configured: &Path, nixos: bool) -> Check {
+/// How the checks that run a configured program may do so.
+#[derive(Debug, Clone, Copy)]
+struct Programs {
+    /// The configuration file may name programs to run (see [`LoadedConfig::trusted`]).
+    config_trusted: bool,
+    nixos: bool,
+}
+
+impl Programs {
+    /// Resolves the program the configuration key `key` names, or the FAIL to report instead of
+    /// running it: as root, neither a program from an untrusted configuration nor one that
+    /// someone else could replace is run.
+    fn resolve(
+        self,
+        sys: &dyn System,
+        name: &'static str,
+        key: &str,
+        configured: &Path,
+    ) -> Result<Option<PathBuf>, Check> {
+        if !self.config_trusted {
+            return Err(Check::fail(
+                name,
+                format!(
+                    "{} was not run: {DEFAULT_CONFIG_PATH} failed the trust check (see \"config\"), \
+                     so the programs it names are not run as root",
+                    configured.display()
+                ),
+            )
+            .hint(rewrite_config_first(
+                self.nixos,
+                format!(
+                    "make {DEFAULT_CONFIG_PATH} and {} owned by root and not group- or \
+                     world-writable, then re-run `sudo puzuz doctor`",
+                    Path::new(DEFAULT_CONFIG_PATH)
+                        .parent()
+                        .unwrap_or(Path::new("/"))
+                        .display()
+                ),
+            )));
+        }
+        match find_runnable_program(sys, configured) {
+            Program::Found(path) => Ok(Some(path)),
+            Program::Missing => Ok(None),
+            Program::Untrusted { path, reason } => Err(Check::fail(
+                name,
+                format!(
+                    "{} was not run as root: {reason}; the helper would refuse it too",
+                    path.display()
+                ),
+            )
+            .hint(if self.nixos {
+                format!(
+                    "point `{key}` in `services.puzuz.settings` at a path in /nix/store (or \
+                     remove it), then `{REBUILD}`"
+                )
+            } else {
+                format!(
+                    "make {} and its directories owned by root and not group- or \
+                     world-writable (`sudo chown root: {0}; sudo chmod go-w {0}`), or point \
+                     `{key}` in {DEFAULT_CONFIG_PATH} at a copy that is",
+                    path.display()
+                )
+            })),
+        }
+    }
+}
+
+fn check_criu(sys: &dyn System, configured: &Path, programs: Programs) -> Check {
     const NAME: &str = "criu";
+    let nixos = programs.nixos;
     let install = if nixos {
         format!(
             "set `services.puzuz.criuPackage` to CRIU {}.{} or newer (its default, the puzuz \
@@ -586,8 +675,12 @@ fn check_criu(sys: &dyn System, configured: &Path, nixos: bool) -> Check {
             MIN_CRIU.0, MIN_CRIU.1, DEFAULT_CONFIG_PATH
         )
     };
-    let Some(path) = find_program(sys, configured) else {
-        return Check::fail(NAME, format!("{} not found", configured.display())).hint(install);
+    let path = match programs.resolve(sys, NAME, "criu_path", configured) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return Check::fail(NAME, format!("{} not found", configured.display())).hint(install);
+        }
+        Err(check) => return check,
     };
     let shown = path.display();
     let output = match sys.run(&path.to_string_lossy(), &["--version"]) {
@@ -619,10 +712,19 @@ fn driver_version(sys: &dyn System) -> Result<Version, String> {
             return Ok(version);
         }
     }
-    let Some(smi) = find_program(sys, Path::new("nvidia-smi")) else {
-        return Err(
-            "no NVIDIA driver found (no /proc/driver/nvidia/version, no nvidia-smi)".into(),
-        );
+    let smi = match find_runnable_program(sys, Path::new("nvidia-smi")) {
+        Program::Found(smi) => smi,
+        Program::Missing => {
+            return Err(
+                "no NVIDIA driver found (no /proc/driver/nvidia/version, no nvidia-smi)".into(),
+            );
+        }
+        Program::Untrusted { path, reason } => {
+            return Err(format!(
+                "no /proc/driver/nvidia/version, and {} was not run as root: {reason}",
+                path.display()
+            ));
+        }
     };
     let output = sys
         .run(
@@ -697,9 +799,10 @@ fn check_cuda_checkpoint(
     sys: &dyn System,
     configured: &Path,
     driver: Option<&Version>,
-    nixos: bool,
+    programs: Programs,
 ) -> Check {
     const NAME: &str = "cuda-checkpoint";
+    let nixos = programs.nixos;
     // Without a driver there is nothing to checkpoint on a GPU.
     let missing = if driver.is_some() {
         Level::Fail
@@ -718,16 +821,20 @@ fn check_cuda_checkpoint(
              into /usr/local/bin, or set `cuda_checkpoint_path` in {DEFAULT_CONFIG_PATH}"
         )
     };
-    let Some(path) = find_program(sys, configured) else {
-        return Check::new(
-            missing,
-            NAME,
-            format!(
-                "{} not found; GPU jobs cannot be checkpointed",
-                configured.display()
-            ),
-        )
-        .hint(install);
+    let path = match programs.resolve(sys, NAME, "cuda_checkpoint_path", configured) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return Check::new(
+                missing,
+                NAME,
+                format!(
+                    "{} not found; GPU jobs cannot be checkpointed",
+                    configured.display()
+                ),
+            )
+            .hint(install);
+        }
+        Err(check) => return check,
     };
     let shown = path.display();
     let output = match sys.run(&path.to_string_lossy(), &["--help"]) {
@@ -816,20 +923,25 @@ fn check_gpus(
     sys: &dyn System,
     config: &Config,
     detection: Option<&GpuDetectionStatus>,
-    nixos: bool,
+    programs: Programs,
 ) -> Check {
     const NAME: &str = "gpus";
-    let Some(smi) = find_program(sys, &config.nvidia_smi_path) else {
-        return Check::warn(
-            NAME,
-            "nvidia-smi not found; the helper needs it to find CUDA processes",
-        )
-        .hint(if nixos {
-            "set `services.puzuz.nvidiaSmiPath` (the default, with the NVIDIA driver enabled \
+    let nixos = programs.nixos;
+    let smi = match programs.resolve(sys, NAME, "nvidia_smi_path", &config.nvidia_smi_path) {
+        Ok(Some(smi)) => smi,
+        Err(check) => return check,
+        Ok(None) => {
+            return Check::warn(
+                NAME,
+                "nvidia-smi not found; the helper needs it to find CUDA processes",
+            )
+            .hint(if nixos {
+                "set `services.puzuz.nvidiaSmiPath` (the default, with the NVIDIA driver enabled \
              through `hardware.nvidia`, is its nvidia-smi), then `sudo nixos-rebuild switch`"
-        } else {
-            "install nvidia-smi (part of the NVIDIA driver utilities)"
-        });
+            } else {
+                "install nvidia-smi (part of the NVIDIA driver utilities)"
+            });
+        }
     };
     let listed: Vec<GpuId> = match sys.run(
         &smi.to_string_lossy(),

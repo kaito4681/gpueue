@@ -24,8 +24,8 @@ const TARBALL: &[u8] = include_bytes!("testdata/puzuz-v9.0.0-x86_64-unknown-linu
 const TARBALL_SIG: &[u8] =
     include_bytes!("testdata/puzuz-v9.0.0-x86_64-unknown-linux-gnu.tar.gz.minisig");
 
-const API: &str = "http://fake-api";
-const REPO_API: &str = "http://fake-api/repos/kaito4681/puzuz";
+const API: &str = "http://127.0.0.1:8080";
+const REPO_API: &str = "http://127.0.0.1:8080/repos/kaito4681/puzuz";
 
 fn sha256_line(data: &[u8], name: &str) -> String {
     let hex: String = Sha256::digest(data)
@@ -291,6 +291,38 @@ fn check_reports_a_newer_release() {
     assert_eq!(url, &format!("{REPO_API}/releases/latest"));
     assert!(headers.contains(&("Authorization".to_owned(), "Bearer secret-token".to_owned())));
     assert!(!out.contains("secret-token"));
+}
+
+#[test]
+fn the_token_is_never_sent_to_another_host() {
+    let sys = system();
+    let elsewhere = "https://attacker.example";
+    sys.set_env("PUZUZ_RELEASE_API_URL", elsewhere);
+    sys.serve(
+        &format!("{elsewhere}/repos/kaito4681/puzuz/releases/latest"),
+        200,
+        release_json("v9.0.0"),
+    );
+    run(&sys, &opts(true, None)).unwrap();
+    let log = sys.http_log.borrow();
+    assert!(!log.is_empty());
+    assert!(
+        log.iter()
+            .all(|(_, headers)| headers.iter().all(|(name, _)| name != "Authorization")),
+        "{log:?}"
+    );
+
+    for (url, local) in [
+        ("http://127.0.0.1:8080", true),
+        ("http://localhost/", true),
+        ("http://[::1]:80", true),
+        ("https://api.github.com", false),
+        ("http://127.0.0.1.example.com", false),
+        ("http://127.0.0.1@example.com", false),
+        ("ftp://localhost", false),
+    ] {
+        assert_eq!(is_loopback_url(url), local, "{url}");
+    }
 }
 
 fn dropped() -> HttpError {
@@ -639,6 +671,20 @@ fn the_puzuz_rpm_is_updated_from_the_release_url() {
         "{hint}"
     );
 
+    // openSUSE uses zypper.
+    sys.write(
+        "/etc/os-release",
+        "ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n",
+    );
+    let out = run(&sys, &opts(true, None)).unwrap();
+    assert!(
+        out.contains(&format!(
+            "run `sudo zypper install {base}/v9.0.0/puzuz-9.0.0-1.{arch}.rpm`"
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("dnf"), "{out}");
+
     // Another rpm named differently (e.g. a distribution's own package) gets the generic hint.
     let sys = system();
     sys.write(
@@ -685,6 +731,67 @@ fn the_install_method_is_checked_before_contacting_github() {
         "{err}"
     );
     assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
+}
+
+#[test]
+fn a_helper_unit_installed_another_way_is_refused_before_downloading() {
+    let sys = system();
+    sys.write(
+        "/etc/systemd/system/puzuz-helper.service",
+        "[Service]\nExecStart=/opt/puzuz-helper serve\n",
+    );
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(
+        err.contains("only updates an installation whose units were both written"),
+        "{err}"
+    );
+    assert!(err.contains("puzuz-helper.service"), "{err}");
+    assert!(sys.http_log.borrow().is_empty(), "contacted GitHub");
+    assert!(!installed(&sys));
+}
+
+#[test]
+fn a_failed_service_install_is_reported_without_waiting() {
+    let mut sys = system();
+    sys.write_exe("/usr/local/bin/puzuz-helper", "old helper");
+    sys.respond(
+        "puzuz service install",
+        CmdOutput::failed("", "error: cannot run `systemd-sysusers`\n"),
+    );
+    sys.daemon = daemon(puzuz_protocol::BINARY_VERSION, None);
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(err.contains("service install` failed (see above)"), "{err}");
+    assert!(
+        err.contains("the binaries in /usr/local/bin were not replaced"),
+        "{err}"
+    );
+    assert!(!err.contains("the daemon is not running it"), "{err}");
+    assert!(sys.sleeps.borrow().is_empty(), "{:?}", sys.sleeps.borrow());
+}
+
+#[test]
+fn installed_binaries_with_failed_checks_are_a_warning() {
+    let sys = system();
+    // What `service install` copied before its final doctor report failed.
+    let release = tempfile::tempdir().unwrap();
+    let dir = extract(TARBALL, release.path(), NAME).unwrap();
+    for name in ["puzuz", "puzuz-helper"] {
+        std::fs::copy(
+            dir.join(name),
+            sys.path(&Path::new("/usr/local/bin").join(name)),
+        )
+        .unwrap();
+    }
+    sys.respond(
+        "puzuz service install",
+        CmdOutput::failed("FAIL  criu: criu not found\n", ""),
+    );
+    let out = run(&sys, &opts(false, None)).unwrap();
+    assert!(
+        out.contains("warning: installed the binaries of puzuz 9.0.0, but some checks"),
+        "{out}"
+    );
+    assert!(out.contains("puzuz is now 9.0.0"), "{out}");
 }
 
 #[test]
@@ -740,6 +847,8 @@ fn other_install_methods_get_their_own_hint() {
         "dpkg-query -S",
         CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
     );
+    sys.missing("rpm");
+    sys.missing("pacman");
     let err = run(&sys, &opts(false, None)).unwrap_err();
     assert!(err.contains("installed as a unit no package owns"), "{err}");
     assert!(
@@ -826,6 +935,8 @@ fn a_leftover_unit_does_not_block_the_update() {
         "dpkg-query -S",
         CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
     );
+    sys.missing("rpm");
+    sys.missing("pacman");
     run(&sys, &opts(false, None)).unwrap();
     assert!(installed(&sys));
 }

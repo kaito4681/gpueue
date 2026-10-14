@@ -694,29 +694,48 @@ impl Query {
     }
 }
 
-/// Who owns the packaged unit: `Some(owner)`, or `None` if a package manager definitely says
-/// nobody does. If none can answer (missing, or failing), the owner is [`Owner::Unknown`].
+/// The owner queries, the native package manager of the distribution family first (an rpm
+/// database is the native one on the SUSE family too).
+fn queries_for(os: &OsRelease) -> Vec<&'static Query> {
+    let native = match os.family() {
+        Some(Family::Debian) => Some("dpkg-query"),
+        Some(Family::Rhel | Family::Suse) => Some("rpm"),
+        Some(Family::Arch) => Some("pacman"),
+        None => None,
+    };
+    let mut queries: Vec<&Query> = QUERIES.iter().collect();
+    queries.sort_by_key(|query| Some(query.program) != native);
+    queries
+}
+
+/// Who owns the packaged unit: `Some(owner)`, or `None` if every installed package manager
+/// definitely says nobody does. If any package manager reports an owner, that is the owner
+/// (another one's "not owned" means only that its own database does not list the file, e.g.
+/// dpkg installed on Fedora). If none can answer (missing, or failing), or one fails while the
+/// others say "not owned", the owner is [`Owner::Unknown`].
 ///
-/// Each path (the unit, and the same file under the other of /usr/lib and /lib) is asked of
-/// the package managers in turn until one answers definitely.
-fn query_owner(sys: &dyn System, unit: &Path) -> Option<Owner> {
+/// Each package manager is asked about the unit and, where it exists, the same file under the
+/// other of /usr/lib and /lib (a package may list either on a merged-/usr system).
+fn query_owner(sys: &dyn System, os: &OsRelease, unit: &Path) -> Option<Owner> {
     let paths: Vec<PathBuf> = std::iter::once(unit.to_owned())
-        .chain(other_package_path(unit))
+        .chain(other_package_path(unit).filter(|other| exists(sys, other)))
         .collect();
-    let mut not_owned = false;
-    for path in &paths {
-        for query in QUERIES {
+    let mut answered = false;
+    let mut undecided = false;
+    for query in queries_for(os) {
+        for path in &paths {
             match query.ask(sys, path) {
                 Answer::Owned(name) => return Some((query.owner)(name)),
-                Answer::NotOwned => {
-                    not_owned = true;
-                    break;
+                Answer::NotOwned => answered = true,
+                Answer::Undecided => {
+                    answered = true;
+                    undecided = true;
                 }
-                Answer::Undecided | Answer::Missing => {}
+                Answer::Missing => break,
             }
         }
     }
-    if not_owned {
+    if answered && !undecided {
         None
     } else {
         Some(Owner::Unknown)
@@ -756,7 +775,7 @@ struct UnitDetection {
     leftover: Option<PathBuf>,
 }
 
-fn detect_unit(sys: &dyn System, name: &str) -> UnitDetection {
+fn detect_unit(sys: &dyn System, os: &OsRelease, name: &str) -> UnitDetection {
     let etc_unit = Path::new(UNIT_DIR).join(name);
     let etc = classify_etc_unit(sys, &etc_unit);
     let local = match etc {
@@ -776,7 +795,7 @@ fn detect_unit(sys: &dyn System, name: &str) -> UnitDetection {
             if in_nix_store(&resolved) || runs_from_nix_store(&text) {
                 Method::Nix { unit }
             } else {
-                match query_owner(sys, &unit) {
+                match query_owner(sys, os, &unit) {
                     Some(owner) => Method::Package {
                         unit,
                         owner,
@@ -823,8 +842,8 @@ fn detect_unit(sys: &dyn System, name: &str) -> UnitDetection {
 /// Detects how puzuz is installed.
 pub fn detect(sys: &dyn System) -> Detection {
     let os = OsRelease::read(sys);
-    let daemon = detect_unit(sys, DAEMON_UNIT);
-    let helper = detect_unit(sys, HELPER_UNIT);
+    let daemon = detect_unit(sys, &os, DAEMON_UNIT);
+    let helper = detect_unit(sys, &os, HELPER_UNIT);
     let partial = match (&daemon.install, &helper.install) {
         (InstallMethod::None, InstallMethod::None) => None,
         (InstallMethod::None, helper) => {

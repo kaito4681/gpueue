@@ -161,6 +161,8 @@ rpm:
   # Optional signature of the .rpm itself (rpm -K): build-package.sh sets
   # PUZUZ_RPM_SIGNING_KEY to an ASCII-armored GPG secret key file (and
   # NFPM_RPM_PASSPHRASE to its passphrase) when one is available; empty
-  # means unsigned. Every release asset is signed with minisign anyway.
+  # means unsigned. Releases build unsigned .rpm files and sign them in a
+  # separate job (scripts/dist/sign-rpm.sh), away from the build. Every
+  # release asset is signed with minisign anyway.
   signature:
     key_file: ${PUZUZ_RPM_SIGNING_KEY}

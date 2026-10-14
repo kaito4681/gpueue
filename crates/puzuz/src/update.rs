@@ -13,8 +13,9 @@
 //! installed directory>`. A Nix GC root left from binaries built with Nix is removed afterwards
 //! (see `service install`). Running jobs are not affected.
 //!
-//! Test-only overrides, not shown in `--help`: `PUZUZ_RELEASE_API_URL` (a fake API) and
-//! `PUZUZ_UPDATE_PUBKEY_FILE` (another public key).
+//! Test-only overrides, compiled only into unit tests and builds with the `test-hooks` cargo
+//! feature (the test versions of scripts/dist/build-test-versions.sh, never a release):
+//! `PUZUZ_RELEASE_API_URL` (a fake API) and `PUZUZ_UPDATE_PUBKEY_FILE` (another public key).
 
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -27,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::doctor;
-use crate::install_method::{self, Detection, InstallMethod, Method, Owner};
+use crate::install_method::{self, Detection, Family, InstallMethod, Method, OsRelease, Owner};
 use crate::release_key::RELEASE_PUBKEY;
 use crate::system::System;
 
@@ -204,17 +205,49 @@ pub struct Client<'a> {
     token: Option<Token>,
 }
 
+/// A test-only override from the environment; always `None` in release builds, so that an
+/// environment passed through `sudo -E` cannot replace the release key or the API.
+#[cfg(any(test, feature = "test-hooks"))]
+fn test_override(sys: &dyn System, name: &str) -> Option<String> {
+    sys.env_var(name).filter(|value| !value.is_empty())
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn test_override(_sys: &dyn System, _name: &str) -> Option<String> {
+    None
+}
+
+/// Whether the API URL is on this machine (`http://127.0.0.1:8080`, `http://localhost`, ...).
+fn is_loopback_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 impl<'a> Client<'a> {
     pub fn new(sys: &'a dyn System, config: &Config) -> Result<Self> {
-        let api = sys
-            .env_var(API_URL_ENV)
-            .filter(|url| !url.is_empty())
+        let api = test_override(sys, API_URL_ENV)
+            .map(|url| url.trim_end_matches('/').to_owned())
             .unwrap_or_else(|| DEFAULT_API_URL.to_owned());
+        // The token is for GitHub: never sent to another host (a test API runs locally).
+        let token = find_token(sys)?.filter(|_| api == DEFAULT_API_URL || is_loopback_url(&api));
         Ok(Self {
             sys,
-            api: api.trim_end_matches('/').to_owned(),
+            api,
             repo: source_repo(config)?,
-            token: find_token(sys)?,
+            token,
         })
     }
 
@@ -300,7 +333,7 @@ impl<'a> Client<'a> {
 
 /// The public key releases must be signed with.
 fn public_key(sys: &dyn System) -> Result<String> {
-    match sys.env_var(PUBKEY_FILE_ENV).filter(|p| !p.is_empty()) {
+    match test_override(sys, PUBKEY_FILE_ENV) {
         Some(path) => {
             std::fs::read_to_string(&path).map_err(|err| format!("{PUBKEY_FILE_ENV}={path}: {err}"))
         }
@@ -432,7 +465,7 @@ fn how_to_update(detection: &Detection, version: Option<&Version>, repo: &str) -
         InstallMethod::One(Method::Package {
             owner: Owner::Rpm(name),
             ..
-        }) if name == "puzuz" => rpm_update_hint(repo, version),
+        }) if name == "puzuz" => rpm_update_hint(repo, version, &detection.os),
         InstallMethod::One(method) => detection.update_hint(method),
         InstallMethod::None if detection.os.is_nixos() => {
             "install it with the `services.puzuz` NixOS module (see docs/install.md)".to_owned()
@@ -442,8 +475,9 @@ fn how_to_update(detection: &Detection, version: Option<&Version>, repo: &str) -
 }
 
 /// How to update the puzuz .rpm of the GitHub releases of `repo` to `version` (or to the
-/// latest release), and how to check its signature first.
-fn rpm_update_hint(repo: &str, version: Option<&Version>) -> String {
+/// latest release), and how to check its signature first: with zypper on the SUSE family,
+/// with dnf elsewhere.
+fn rpm_update_hint(repo: &str, version: Option<&Version>, os: &OsRelease) -> String {
     let arch = std::env::consts::ARCH;
     let (version, latest) = match version {
         Some(version) => (version.to_string(), String::new()),
@@ -453,10 +487,18 @@ fn rpm_update_hint(repo: &str, version: Option<&Version>) -> String {
         ),
     };
     let base = format!("https://github.com/{repo}/releases/download/v{version}");
+    let rpm = format!("{base}/puzuz-{version}-1.{arch}.rpm");
+    if os.family() == Some(Family::Suse) {
+        return format!(
+            "run `sudo zypper install {rpm}`{latest} (there is no zypper repository yet). \
+             zypper checks the package signature once the key is imported with `sudo rpm \
+             --import {base}/RPM-GPG-KEY-puzuz`"
+        );
+    }
     format!(
-        "run `sudo dnf upgrade {base}/puzuz-{version}-1.{arch}.rpm`{latest} (there is no dnf \
-         repository yet). To check the package signature first, run `sudo rpm --import \
-         {base}/RPM-GPG-KEY-puzuz` and add `--setopt=localpkg_gpgcheck=1`"
+        "run `sudo dnf upgrade {rpm}`{latest} (there is no dnf repository yet). To check the \
+         package signature first, run `sudo rpm --import {base}/RPM-GPG-KEY-puzuz` and add \
+         `--setopt=localpkg_gpgcheck=1`"
     )
 }
 
@@ -471,6 +513,26 @@ fn service_install_bin_dir(detection: &Detection, repo: &str) -> Result<PathBuf>
             "puzuz is installed in more than one way ({}; one of them is {managed}); run \
              `puzuz doctor` and remove all but one first",
             detection.partial.as_deref().unwrap_or("its units disagree")
+        ));
+    }
+    // The helper unit installed some other way (e.g. written by hand): the new `service
+    // install` would refuse to overwrite it, after the download. A missing helper unit, or one
+    // in /usr/lib that no package owns (which the unit in /etc shadows), is no obstacle.
+    if let (InstallMethod::One(Method::ServiceInstall { .. }), Some(partial)) =
+        (method, &detection.partial)
+        && detection.helper.methods().iter().any(|helper| {
+            !matches!(
+                helper,
+                Method::ServiceInstall { .. } | Method::Unowned { .. }
+            )
+        })
+    {
+        return Err(format!(
+            "{partial}; `puzuz update` only updates an installation whose units were both \
+             written by `puzuz service install`. Run `puzuz doctor`, remove the other \
+             installation of {} (or replace it with `sudo puzuz service install --force`) and \
+             re-run",
+            crate::service::HELPER_UNIT
         ));
     }
     match method {
@@ -685,17 +747,23 @@ fn install_release(sys: &dyn System, plan: &InstallPlan<'_>, out: &mut dyn Write
     out.write_all(output.stdout.as_bytes()).ok();
     out.write_all(output.stderr.as_bytes()).ok();
     if !output.success {
-        let running = crate::service::status(sys, None, &mut io::sink()).unwrap_or(false);
-        if !running {
+        // `service install` also fails when it installed everything but its final doctor
+        // report has a failure. Whether the units' binaries are now the release's tells the
+        // two apart (also for releases that exit with 1 in both cases).
+        if !binaries_installed(sys, &plan.work.join(&name), plan.bin_dir) {
             return Err(format!(
-                "`{} service install` failed (see above)",
-                new_puzuz.display()
+                "`{} service install` failed (see above); the binaries in {} were not replaced \
+                 (still puzuz {})",
+                new_puzuz.display(),
+                plan.bin_dir.display(),
+                current_version()
             ));
         }
         writeln!(
             out,
-            "warning: the services run, but some checks above failed; fix them and re-run \
-             `puzuz doctor`"
+            "warning: installed the binaries of puzuz {}, but some checks above failed; fix \
+             them and re-run `puzuz doctor`",
+            plan.target
         )
         .ok();
     }
@@ -707,6 +775,19 @@ fn install_release(sys: &dyn System, plan: &InstallPlan<'_>, out: &mut dyn Write
     wait_for_daemon(sys, plan)?;
     writeln!(out, "\npuzuz is now {}.", plan.target).ok();
     Ok(())
+}
+
+/// Whether `puzuz` and `puzuz-helper` in `bin_dir` are the ones extracted to `release_dir`.
+fn binaries_installed(sys: &dyn System, release_dir: &Path, bin_dir: &Path) -> bool {
+    ["puzuz", "puzuz-helper"].iter().all(|name| {
+        match (
+            std::fs::read(sys.path(&release_dir.join(name))),
+            std::fs::read(sys.path(&bin_dir.join(name))),
+        ) {
+            (Ok(new), Ok(installed)) => new == installed,
+            _ => false,
+        }
+    })
 }
 
 /// Asks the new binary what it is and which database schema it supports, and refuses a release

@@ -13,6 +13,9 @@
 > NVIDIA GPU）でテストされています。実機での実際の再起動をまたいだテストは**まだ**行っていません。
 > [プロジェクトの状況](#project-status) を参照してください。
 
+> **リリースはまだ公開されていません。** 以下のダウンロードリンク、APT リポジトリ、`stable` ブランチは、最初の
+> リリースから使えるようになります。
+
 <a id="why"></a>
 ## なぜ puzuz か
 
@@ -216,7 +219,8 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 | `restore [IDS] [-g GROUP] [-a] [-i]` | `Checkpointed` のジョブを再開します（`-i`：空きスロットを無視してすぐに） |
 | `gpu [-j]`、`gpu parallel <N> [--gpu LIST]` | GPU の一覧を表示するか、GPU ごとのジョブ数の上限を設定します（管理者） |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | systemd サービスを管理します。install は最後のチェックが失敗すると 0 以外で終了します（[docs/ja/install.md](docs/ja/install.md) を参照） |
-| `uninstall [--purge] [--yes]` | サービスと、`service install` がコピーしたバイナリを削除します（管理者） |
+| `uninstall [--purge] [--yes]` | サービスと、`service install` がコピーしたバイナリを削除します（root が必要） |
+| `update [--check] [--version V] [-y]` | 最新（または指定した）リリースに puzuz を更新します。root が必要で、root でなければ確認だけを行います（[docs/ja/install.md](docs/ja/install.md#upgrading) を参照） |
 | `doctor` | インストール状態を確認します |
 | `daemon` | デーモンをフォアグラウンドで実行します（systemd がこれを行います） |
 

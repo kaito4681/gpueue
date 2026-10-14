@@ -311,6 +311,33 @@ pub fn find_program(sys: &dyn System, program: &Path) -> Option<PathBuf> {
         .find(|candidate| sys.path(candidate).is_file())
 }
 
+/// What [`find_runnable_program`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Program {
+    /// May be run (a system path).
+    Found(PathBuf),
+    /// A bare name not in [`TOOL_DIRS`], or a path that does not exist.
+    Missing,
+    /// Running as root, but someone else could replace it: it is not run.
+    Untrusted { path: PathBuf, reason: String },
+}
+
+/// [`find_program`] for a program this process runs. As root (`puzuz doctor` and `service
+/// install` run as root), only one that nobody but root can replace is accepted: the helper's
+/// rule, [`check_root_owned_chain`], applied to the resolved path.
+pub fn find_runnable_program(sys: &dyn System, program: &Path) -> Program {
+    let Some(path) = find_program(sys, program) else {
+        return Program::Missing;
+    };
+    if sys.euid() != 0 {
+        return Program::Found(path);
+    }
+    match check_root_owned_chain(sys, &path) {
+        Ok(()) => Program::Found(path),
+        Err(reason) => Program::Untrusted { path, reason },
+    }
+}
+
 /// Whether the system path is owned by root and not writable by group or others.
 pub fn is_root_owned_and_protected(sys: &dyn System, path: &Path) -> io::Result<bool> {
     let meta = std::fs::metadata(sys.path(path))?;

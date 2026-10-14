@@ -162,6 +162,85 @@ fn configured_criu_path_is_used() {
     assert_eq!(message(&report, "criu"), "4.2.1 (/opt/criu/sbin/criu)");
 }
 
+fn chmod(sys: &FakeSystem, path: &str, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        sys.path(Path::new(path)),
+        std::fs::Permissions::from_mode(mode),
+    )
+    .unwrap();
+}
+
+#[test]
+fn as_root_programs_others_can_replace_are_not_run() {
+    let (mut sys, _sockets) = healthy();
+    sys.euid = 0;
+    let report = run(&sys, None);
+    assert_eq!(message(&report, "criu"), "4.2.1 (/usr/sbin/criu)");
+    assert_eq!(level(&report, "gpus"), Level::Info, "{report:#?}");
+
+    // A configured path in a directory anyone can write to.
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!("criu_path = \"/opt/criu/sbin/criu\"\n{CONFIG}"),
+    );
+    sys.write_exe("/opt/criu/sbin/criu", "");
+    chmod(&sys, "/opt/criu/sbin", 0o777);
+    sys.log.borrow_mut().clear();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "criu"), Level::Fail);
+    assert!(
+        message(&report, "criu").starts_with("/opt/criu/sbin/criu was not run as root: "),
+        "{}",
+        message(&report, "criu")
+    );
+    assert!(hint(&report, "criu").contains("`criu_path`"), "{report:#?}");
+    assert!(!sys.ran("criu"), "{:?}", sys.commands());
+
+    // Unprivileged, it is run (as the user).
+    sys.euid = 1000;
+    let report = run(&sys, None);
+    assert_eq!(message(&report, "criu"), "4.2.1 (/opt/criu/sbin/criu)");
+
+    // A bare name resolves through systemd's PATH; the resolved file is checked.
+    sys.euid = 0;
+    chmod(&sys, "/usr/bin/nvidia-smi", 0o777);
+    sys.log.borrow_mut().clear();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpus"), Level::Fail);
+    assert!(
+        message(&report, "gpus").starts_with("/usr/bin/nvidia-smi was not run as root"),
+        "{report:#?}"
+    );
+    assert!(!sys.ran("nvidia-smi"), "{:?}", sys.commands());
+}
+
+#[test]
+fn as_root_nothing_an_untrusted_config_names_is_run() {
+    let (mut sys, _sockets) = healthy();
+    sys.euid = 0;
+    chmod(&sys, "/etc/puzuz/config.toml", 0o666);
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "config"), Level::Fail);
+    for name in ["criu", "cuda-checkpoint", "gpus"] {
+        assert_eq!(level(&report, name), Level::Fail, "{name}");
+        assert!(
+            message(&report, name).contains("failed the trust check"),
+            "{name}: {}",
+            message(&report, name)
+        );
+    }
+    for program in ["criu", "cuda-checkpoint", "nvidia-smi --query-gpu=index"] {
+        assert!(!sys.ran(program), "{program}: {:?}", sys.commands());
+    }
+
+    // Unprivileged, doctor reports the config but still checks the programs.
+    sys.euid = 1000;
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "config"), Level::Fail);
+    assert_eq!(level(&report, "criu"), Level::Ok);
+}
+
 #[test]
 fn without_a_driver_gpu_checks_only_warn() {
     let (sys, _sockets) = healthy();
@@ -1143,6 +1222,9 @@ fn not_owned(sys: &FakeSystem) {
         "dpkg-query -S",
         CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
     );
+    // A Debian system: no other package manager could own it.
+    sys.missing("rpm");
+    sys.missing("pacman");
 }
 
 #[test]

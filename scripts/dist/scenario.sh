@@ -14,6 +14,9 @@ set -euo pipefail
 # shellcheck disable=SC1091
 . /dist/versions
 TOKEN="$(cat /dist/token)"
+# install.sh honours the two overrides only with PUZUZ_TEST_HOOKS=1; the test
+# versions of puzuz are built with the test-hooks feature.
+export PUZUZ_TEST_HOOKS=1
 export PUZUZ_RELEASE_API_URL=http://127.0.0.1:8080
 export PUZUZ_UPDATE_PUBKEY_FILE=/dist/release.pub
 
@@ -117,6 +120,14 @@ scenario_17() {
     chmod +x /tmp/oldglibc/getconf
     PATH="/tmp/oldglibc:$PATH" GH_TOKEN="$TOKEN" expect_fail "glibc 2.31 is too old" bash "$install"
     GH_TOKEN="$TOKEN" expect_fail "checksum mismatch" bash "$install" --version "$VERSION-test.badsha"
+    GH_TOKEN="$TOKEN" expect_fail "is not the checksum of puzuz-v$VERSION-test.nullsha-" \
+        bash "$install" --version "$VERSION-test.nullsha"
+    # Several times: the listing check once lost a race against SIGPIPE.
+    local _try
+    for _try in 1 2 3 4 5; do
+        GH_TOKEN="$TOKEN" expect_fail "contains links or special files" \
+            bash "$install" --version "$VERSION-test.symlink"
+    done
     # A unit a package owns is refused before anything is downloaded.
     install_deb
     GH_TOKEN="$TOKEN" expect_fail "distribution package puzuz (dpkg" bash "$install" --version 9.9.9
@@ -266,13 +277,17 @@ scenario_18() {
     grep -qF "INFO  update: puzuz $V2 is available (this is $V1)" /tmp/doctor.out ||
         { cat /tmp/doctor.out; fail "doctor does not report v2"; }
 
-    step "18: a bad signature is refused; nothing changes"
+    step "18: a bad signature, a link in the tarball, a checksum of another file: refused, nothing changes"
     local before
     before="$(sha256sum "$puzuz")"
     expect_fail "bad signature" "$puzuz" update --yes --version "$VERSION-test.badsig"
     [ "$(sha256sum "$puzuz")" = "$before" ] || fail "the binary changed"
     [ "$(daemon_version)" = "$V1" ] || fail "the daemon changed"
     [ ! -e /var/lib/puzuz/update ] || fail "the download directory was left behind"
+    expect_fail "is a link or special file" "$puzuz" update --yes --version "$VERSION-test.symlink"
+    expect_fail "checksum" "$puzuz" update --yes --version "$VERSION-test.nullsha"
+    [ "$(sha256sum "$puzuz")" = "$before" ] || fail "the binary changed"
+    [ "$(daemon_version)" = "$V1" ] || fail "the daemon changed"
 
     step "18: sudo puzuz update installs v2; the job keeps running"
     "$puzuz" update --yes | tee /tmp/update.out
