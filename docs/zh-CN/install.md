@@ -135,10 +135,12 @@ aarch64 且 glibc 为 2.34 或更高版本，以及 puzuz 是否并非由包管�
 
 1. 查找发布版本（`/repos/kaito4681/puzuz/releases/latest` 或 `/releases/tags/v<X>`），
 2. 将 `puzuz-v<X>-<target>.tar.gz`（`x86_64-unknown-linux-gnu` 或 `aarch64-unknown-linux-gnu`）
-   及其 `.sha256` 文件下载到临时目录（只用 HTTPS，重定向也是如此），确认 `.sha256` 文件是按名称给出的该
+   及其 `.sha256` 和 `.minisig` 文件下载到临时目录（只用 HTTPS，重定向也是如此），确认 `.sha256` 文件是按名称给出的该
    tarball 的校验和，并校验校验和，
-3. 如果安装了 `minisign`，还会用内置于脚本中的发布密钥（`packaging/minisign.pub`）校验 `.minisig` 签名。
-   没有 `minisign` 时，它会提示签名未经校验，
+3. 用内置于脚本中的发布密钥（`packaging/minisign.pub`）校验 `.minisig` 签名。它使用 `PATH` 中的
+   `minisign`；如果没有，就从 GitHub 将 minisign 0.12 的静态二进制发布包下载到临时目录，用内置于脚本中的
+   SHA-256 校验和（与 `scripts/dist/get-minisign.sh` 相同）校验后使用。如果下载失败，它会停止，并提示你
+   从发行版安装 `minisign`（例如 `sudo apt install minisign`）后重新运行；签名校验绝不会被跳过，
 4. 解压 tarball（拒绝链接以及指向其外部的路径），运行新的 `puzuz service install`
    （它沿用当前安装所在的目录，否则使用 `/usr/local/bin`；只有你指定了 `--bin-dir` 时才会传递该选项），
    并打印其 `puzuz doctor` 报告，
@@ -1406,7 +1408,8 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 在恢复出的作业运行之前，helper 会检查其所有者能否以作业打开每个文件的同样方式、通过同样的
 路径且不经过符号链接打开这些文件（见 [恢复与路径](architecture.md#restores-and-paths)）。对于
 作业在转储时已经打开的文件，即使其所有者现在无法以那种方式打开它（作业以只读方式创建的文件，
-或所有文件都显示为 root 所有的 sshfs 挂载），只要它确实是同一个文件，检查也会通过：
+或所有文件都显示为 root 所有的 sshfs 挂载；也包括它在转储前一刻才打开的文件），只要它确实是同一个文件，
+检查也会通过：
 
 - 在同一个已挂载的文件系统上（期间没有重启或重新挂载）：设备和 inode 相同；或
 - 文件系统重新挂载之后：所有者、组、权限、大小、修改时间和变更时间（ctime）与转储刚结束时
@@ -1490,8 +1493,8 @@ sudo puzuz update --version 0.2.0 --yes
    `service install` 失败，`puzuz update` 会检查已安装的二进制文件：若它们不是该发布版本的文件，
    就以该错误停止；若是（只有最后的检查失败），就发出警告并继续。
 
-`install.sh`（再次运行，可选 `--version`）同样可用，效果相同，只是它仅在安装了 `minisign` 时
-才验证签名。
+`install.sh`（再次运行，可选 `--version`）同样可用，效果相同；它用 `PATH` 中的 `minisign` 验证签名，
+或者下载一个固定版本的 minisign（参见[运行安装程序](#running-the-installer)）。
 
 `service install`（因此上述两种方式都是）会替换二进制文件和单元，并在有任何变化时重启两个
 服务。配置文件会被保留。

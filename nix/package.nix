@@ -33,6 +33,7 @@ let
     "dump_refuses_without_free_space_and_keeps_a_stopped_job_stopped"
     "exit_events_are_persisted_replayed_and_acked"
     "failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first"
+    "files_opened_just_before_the_dump_are_held"
     "job_policy_refuses_spawns_and_restores"
     "nix_gc_roots_follow_jobs_and_their_checkpoints"
     "plugin_mode_refuses_to_dump_cuda_jobs_without_the_plugin"
@@ -60,10 +61,12 @@ rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../crates
       # Embedded with include_str!: unit templates, config, release key, maintainer
-      # scripts, install.sh, deb-check.sh (the last ones by the marker test).
+      # scripts, install.sh, deb-check.sh (the last ones by the marker test),
+      # get-minisign.sh (by the minisign pin test).
       ../packaging
       ../scripts/install.sh
       ../scripts/dist/deb-check.sh
+      ../scripts/dist/get-minisign.sh
       ../README.md
       ../LICENSE
       ../docs

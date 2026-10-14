@@ -283,6 +283,53 @@ pub fn run_restore_hook(request: &Path) -> i32 {
     if ok { 0 } else { 1 }
 }
 
+/// The request of [`run_dump_hook`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DumpHookRequest {
+    /// Host PID of the dumped namespace init.
+    pub init_pid: u32,
+    /// Mount points of the namespace's own tmpfs mounts.
+    pub private: Vec<String>,
+}
+
+/// The CRIU action script of a dump: `puzuz-helper dump-hook <request>`,
+/// passed to `criu dump --action-script`.
+///
+/// At `post-dump` CRIU has dumped the job but not killed it yet: its tasks
+/// are stopped under CRIU's control, holding exactly the files the image
+/// has. The hook reads the [`DumpHookRequest`] from `<request>` and writes
+/// the job's [`HeldFile`]s ([`crate::host::held_files`]) next to it
+/// ([`hook_result_path`]). The list the helper made before the dump misses
+/// files the job opened after it (e.g. a file it creates every few
+/// moments). The hook never fails the dump (CRIU would resume the job):
+/// without its result, the helper's earlier list is used.
+pub fn run_dump_hook(request: &Path) -> i32 {
+    if std::env::var("CRTOOLS_SCRIPT_ACTION").as_deref() != Ok("post-dump") {
+        return 0;
+    }
+    let result = (|| -> Result<(), String> {
+        let req: DumpHookRequest = serde_json::from_slice(
+            &fs::read(request).map_err(|e| format!("reading {}: {e}", request.display()))?,
+        )
+        .map_err(|e| format!("decoding {}: {e}", request.display()))?;
+        let proc_root = Path::new("/proc");
+        let pids = crate::host::ns_processes(proc_root, req.init_pid)
+            .map_err(|e| format!("listing the job's processes: {e}"))?;
+        let held = crate::host::held_files(proc_root, &pids, &req.private);
+        let out = hook_result_path(request);
+        let tmp = out.with_extension("tmp");
+        serde_json::to_vec(&held)
+            .map_err(io::Error::other)
+            .and_then(|b| fs::write(&tmp, b))
+            .and_then(|()| fs::rename(&tmp, &out))
+            .map_err(|e| format!("writing {}: {e}", out.display()))
+    })();
+    if let Err(e) = result {
+        eprintln!("puzuz-helper: listing the files of the dumped job: {e}");
+    }
+    0
+}
+
 /// SIGKILL to every process in the PID namespace of `init`, and to `init`.
 fn kill_tree(init: u32) {
     use nix::sys::signal::{Signal, kill};

@@ -50,6 +50,44 @@ pub const MOUNTS_FILE: &str = "helper-mounts.json";
 pub const RESTORE_CHECK_FILE: &str = "restore-check.json";
 /// The `--action-script` that runs that check (CRIU passes no arguments).
 pub const RESTORE_CHECK_SCRIPT: &str = "restore-check.sh";
+/// File in a checkpoint directory with the request of the hook CRIU runs
+/// after a dump, while the job is still stopped (see
+/// [`crate::access::run_dump_hook`]); its result is written next to it.
+pub const DUMP_HOOK_FILE: &str = "dump-hook.json";
+/// The `--action-script` of `criu dump` that runs that hook.
+pub const DUMP_HOOK_SCRIPT: &str = "dump-hook.sh";
+
+/// Writes the root-only `--action-script` `<script>` that runs
+/// `<exe> <subcommand> <request>` (CRIU passes no arguments) and returns
+/// its path.
+fn write_action_script(
+    script: &Path,
+    exe: &Path,
+    subcommand: &str,
+    request: &Path,
+) -> Result<String, String> {
+    let quote = |p: &Path| -> Result<String, String> {
+        let s = p
+            .to_str()
+            .ok_or_else(|| format!("{} is not UTF-8", p.display()))?;
+        if s.contains('\'') {
+            return Err(format!("{s} contains a quote"));
+        }
+        Ok(format!("'{s}'"))
+    };
+    let body = format!(
+        "#!/bin/sh\nexec {} {subcommand} {}\n",
+        quote(exe)?,
+        quote(request)?
+    );
+    write_atomic(script, body.as_bytes())
+        .and_then(|()| fs::set_permissions(script, fs::Permissions::from_mode(0o700)))
+        .map_err(|e| format!("writing {}: {e}", script.display()))?;
+    script
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{} is not UTF-8", script.display()))
+}
 
 /// Contents of [`MOUNTS_FILE`]. Older helpers wrote only the list of mount
 /// points.
@@ -1174,6 +1212,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 let record = entry.record.clone();
                 let op_ends = self.op_ends.clone();
                 let private = self.cfg.mounts.tmpfs.clone();
+                let helper_exe = self.cfg.helper_exe.clone();
                 tokio::task::spawn_blocking(move || {
                     let mut exec = factory();
                     dump_job(
@@ -1184,6 +1223,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                         &record,
                         init_pid,
                         &private,
+                        Some(&helper_exe),
                         cap,
                         &|end| op_ends.set(job, end),
                     )
@@ -1653,28 +1693,12 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         .map_err(|e| format!("writing {}: {e}", request.display()))?;
         // CRIU executes the action script without arguments: a root-only
         // wrapper next to the request.
-        let quote = |p: &Path| -> Result<String, String> {
-            let s = p
-                .to_str()
-                .ok_or_else(|| format!("{} is not UTF-8", p.display()))?;
-            if s.contains('\'') {
-                return Err(format!("{s} contains a quote"));
-            }
-            Ok(format!("'{s}'"))
-        };
-        let script = files.dir().join(RESTORE_CHECK_SCRIPT);
-        let body = format!(
-            "#!/bin/sh\nexec {} verify-restore-hook {}\n",
-            quote(&self.cfg.helper_exe)?,
-            quote(&request)?
-        );
-        write_atomic(&script, body.as_bytes())
-            .and_then(|()| fs::set_permissions(&script, fs::Permissions::from_mode(0o700)))
-            .map_err(|e| format!("writing {}: {e}", script.display()))?;
-        script
-            .to_str()
-            .map(str::to_owned)
-            .ok_or_else(|| format!("{} is not UTF-8", script.display()))
+        write_action_script(
+            &files.dir().join(RESTORE_CHECK_SCRIPT),
+            &self.cfg.helper_exe,
+            "verify-restore-hook",
+            &request,
+        )
     }
 
     /// What [`crate::access::run_restore_hook`] found: `Ok` only if it ran
@@ -2203,6 +2227,10 @@ fn gib(bytes: u64) -> String {
 /// [`plan::Timeouts::operation_deadline`] for the job's RSS + VRAM (at most
 /// `cap`); `on_deadline` is told the latest time the dump may take, its
 /// rollback included.
+///
+/// With `hook_exe` (this binary), `criu dump` runs
+/// [`crate::access::run_dump_hook`] once it has dumped the job, to record
+/// the files the job held at that moment (see [`finish_dump`]).
 #[allow(clippy::too_many_arguments)]
 pub fn dump_job<H: HostProbe + ?Sized>(
     host: &H,
@@ -2212,6 +2240,7 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     record: &JobRecord,
     init_pid: u32,
     private: &[String],
+    hook_exe: Option<&Path>,
     cap: Option<Duration>,
     on_deadline: &dyn Fn(Instant),
 ) -> Result<CheckpointMeta, DumpError> {
@@ -2224,7 +2253,7 @@ pub fn dump_job<H: HostProbe + ?Sized>(
         groups,
     } = precheck_dump(host, ck.mode, base, record, init_pid, private)
         .map_err(DumpError::Refused)?;
-    let ck = &dump_options(ck, &hazards);
+    let mut ck = dump_options(ck, &hazards);
     let mut cuda_pids = Vec::new();
     if !record.gpus.is_empty() {
         // Every process of the namespace that answers
@@ -2288,6 +2317,44 @@ pub fn dump_job<H: HostProbe + ?Sized>(
             dir.root().display()
         )));
     }
+    // The held files above were listed while the job ran: it may open
+    // others before CRIU stops it. The hook lists them again while CRIU
+    // has it stopped, after the dump.
+    if let Some(exe) = hook_exe {
+        let request = dir.root().join(DUMP_HOOK_FILE);
+        let hook = crate::access::DumpHookRequest {
+            init_pid,
+            private: private.to_vec(),
+        };
+        let script = serde_json::to_vec(&hook)
+            .map_err(|e| e.to_string())
+            .and_then(|b| {
+                write_atomic(&request, &b)
+                    .map_err(|e| format!("writing {}: {e}", request.display()))
+            })
+            .and_then(|()| {
+                write_action_script(
+                    &dir.root().join(DUMP_HOOK_SCRIPT),
+                    exe,
+                    "dump-hook",
+                    &request,
+                )
+            });
+        match script {
+            Ok(script) => {
+                ck.criu.extra_dump_args.push("--action-script".into());
+                ck.criu.extra_dump_args.push(script.into());
+            }
+            Err(e) => {
+                let _ = dir.remove();
+                return Err(DumpError::Refused(format!(
+                    "writing the checkpoint's metadata to {}: {e}",
+                    dir.root().display()
+                )));
+            }
+        }
+    }
+    let ck = &ck;
     let target = DumpTarget {
         tree_root_pid: init_pid,
         images_dir: dir.images_dir(),
@@ -2428,6 +2495,21 @@ pub fn finish_dump<H: HostProbe + ?Sized>(
             }
             if source_mounts.is_empty() && !external_sources.is_empty() {
                 source_mounts = host.source_mounts(&external_sources).unwrap_or_default();
+            }
+            // The files the job held when CRIU had stopped it, which it may
+            // have opened after the list above was made (see `dump_job`).
+            if let Ok(b) = fs::read(crate::access::hook_result_path(
+                &dir.root().join(DUMP_HOOK_FILE),
+            )) && let Ok(at_dump) = serde_json::from_slice::<Vec<crate::access::HeldFile>>(&b)
+            {
+                for f in at_dump {
+                    if !held_files
+                        .iter()
+                        .any(|h| (&h.path, h.dev, h.ino) == (&f.path, f.dev, f.ino))
+                    {
+                        held_files.push(f);
+                    }
+                }
             }
             // The job is gone now: its files no longer change.
             crate::access::complete_held_files(&mut held_files);

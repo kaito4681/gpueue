@@ -164,8 +164,11 @@ hold a root file opened with the dump-time mode. The helper therefore:
   private tmpfs) come from the image and are skipped. A file the job held at the dump only
   needs its path to lead to that very file: a job may hold a file in a way its owner could not
   open it again (created read-only, or on an sshfs mount that shows files as root's), and
-  getting that same file back gives it nothing new. It is that file if it has the device and
-  inode recorded before the dump, or (after a remount, when device numbers change and FUSE
+  getting that same file back gives it nothing new. The files held are listed before the
+  dump and again by `puzuz-helper dump-hook`, CRIU's `post-dump` action script, which runs
+  while the dumped tasks are still stopped under CRIU's control (so a file the job opened
+  just before CRIU stopped it counts too). It is that file if it has the device and
+  inode recorded at the dump, or (after a remount, when device numbers change and FUSE
   filesystems such as sshfs have renumbered their inodes) the owner, group, mode, size,
   modification and change times recorded right after the dump; the change time cannot be set by
   users, and renaming or linking another file there changes it (see

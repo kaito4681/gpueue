@@ -281,6 +281,50 @@ impl SystemHost {
     }
 }
 
+/// The files on the host's filesystems that the processes `host_pids`
+/// hold open or mapped (see [`HeldFile`]; without their attributes yet).
+pub fn held_files(proc_root: &Path, host_pids: &[u32], private: &[String]) -> Vec<HeldFile> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out: Vec<HeldFile> = Vec::new();
+    for pid in host_pids {
+        let dir = proc_root.join(pid.to_string());
+        let links = ["fd", "map_files"].iter().flat_map(|sub| {
+            fs::read_dir(dir.join(sub))
+                .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        });
+        for link in links {
+            let Ok(target) = fs::read_link(&link) else {
+                continue;
+            };
+            let Some(target) = target.to_str() else {
+                continue;
+            };
+            // Not deleted files (CRIU saves them), nor pipes, sockets and
+            // the like.
+            if !target.starts_with('/')
+                || target.ends_with(" (deleted)")
+                || is_private_path(target, private)
+            {
+                continue;
+            }
+            let Ok(m) = fs::metadata(&link) else {
+                continue;
+            };
+            let held = HeldFile {
+                path: target.to_owned(),
+                dev: m.dev(),
+                ino: m.ino(),
+                attrs: None,
+            };
+            if !out.contains(&held) {
+                out.push(held);
+            }
+        }
+    }
+    out
+}
+
 /// Host PIDs of the processes in the PID namespace whose init has host PID
 /// `init_pid`.
 pub fn ns_processes(proc_root: &Path, init_pid: u32) -> io::Result<Vec<u32>> {
@@ -527,22 +571,7 @@ impl HostProbe for SystemHost {
                     continue;
                 }
                 let Some(path) = target.strip_suffix(" (deleted)") else {
-                    if target.starts_with('/')
-                        && !is_private_path(&target, private)
-                        && let Ok(m) = fs::metadata(&link)
-                    {
-                        use std::os::unix::fs::MetadataExt;
-                        let held = HeldFile {
-                            path: target.into_owned(),
-                            dev: m.dev(),
-                            ino: m.ino(),
-                            attrs: None,
-                        };
-                        if !out.held_files.contains(&held) {
-                            out.held_files.push(held);
-                        }
-                    }
-                    continue;
+                    continue; // a held file, see `held_files`
                 };
                 if !path.starts_with('/') || is_private_path(path, private) {
                     continue;
@@ -553,6 +582,7 @@ impl HostProbe for SystemHost {
                 }
             }
         }
+        out.held_files = held_files(&self.proc_root, host_pids, private);
         for (pid, fd) in socket_fds {
             if let Some(addr) = reuseport_inet_socket(pid, fd)
                 && !out.reuseport_sockets.contains(&addr)
@@ -766,6 +796,51 @@ mod tests {
         assert_eq!(snap.gpus[0].free_bytes, 15000 * 1024 * 1024);
         assert_eq!(snap.compute_apps[0].used_bytes, 7000 * 1024 * 1024);
         assert_eq!(snap.compute_apps[1].used_bytes, 0);
+    }
+
+    /// [`held_files`] lists the files a process holds open, not pipes,
+    /// deleted files or files under the namespace's own mounts.
+    #[test]
+    fn lists_held_files() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let gone = dir.path().join("gone.txt");
+        fs::write(&gone, "x").unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec 4<\"$1\"; rm \"$1\"; echo ready; exec sleep 30")
+            .arg("sh")
+            .arg(&gone)
+            .stdout(std::process::Stdio::piped())
+            .stderr(fs::File::create(&path).unwrap())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut ready,
+        )
+        .unwrap();
+        let proc_root = Path::new("/proc");
+        let held = held_files(proc_root, &[child.id()], &[]);
+        let private = vec![dir.path().to_str().unwrap().to_owned()];
+        let held_private = held_files(proc_root, &[child.id()], &private);
+        let _ = child.kill();
+        let _ = child.wait();
+        let m = fs::metadata(&path).unwrap();
+        let p = path.to_str().unwrap();
+        assert!(
+            held.iter()
+                .any(|h| h.path == p && (h.dev, h.ino) == (m.dev(), m.ino())),
+            "{held:?}"
+        );
+        assert!(
+            held.iter()
+                .all(|h| !h.path.contains("gone.txt") && h.path.starts_with('/')),
+            "{held:?}"
+        );
+        assert!(held_private.iter().all(|h| h.path != p), "{held_private:?}");
     }
 
     #[test]

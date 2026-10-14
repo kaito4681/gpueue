@@ -53,6 +53,10 @@ enum Command {
     /// restored tasks (internal; see `puzuz_helper::access`).
     #[command(hide = true)]
     VerifyRestoreHook { request: PathBuf },
+    /// `--action-script` of `criu dump`: records the files of the dumped
+    /// job (internal; see `puzuz_helper::access::run_dump_hook`).
+    #[command(hide = true)]
+    DumpHook { request: PathBuf },
     /// `ExecStart` of a restore unit: bind-mount / on ROOT in a private
     /// mount namespace (unless ROOT is empty), then exec criu (internal).
     #[command(hide = true)]
@@ -126,6 +130,7 @@ fn main() -> ExitCode {
         Command::CriuWrap { root, criu } => shim::run_criu_wrap(root, criu),
         Command::VerifyAccess => puzuz_helper::access::run_verify_access(),
         Command::VerifyRestoreHook { request } => puzuz_helper::access::run_restore_hook(&request),
+        Command::DumpHook { request } => puzuz_helper::access::run_dump_hook(&request),
         Command::Serve(args) => match serve(*args) {
             Ok(()) => 0,
             Err(e) => {

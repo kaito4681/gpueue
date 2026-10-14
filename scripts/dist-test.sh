@@ -107,6 +107,10 @@ echo "v$v1" >"$stage/releases/latest"
 
 cp "$root/scripts/install.sh" "$root/scripts/dist/fake_github.py" "$root/scripts/dist/scenario.sh" \
     "$minisign" "$stage/"
+# The minisign release tarball, which install.sh downloads (from the fake
+# server) when minisign is not installed.
+mkdir -p "$stage/minisign-download"
+cp "$(dirname "$minisign")"/minisign-*-linux.tar.gz "$stage/minisign-download/"
 cp "$stage/keys/release.pub" "$stage/release.pub"
 rm -f "$stage/keys/release.key" "$stage/keys/other.key"
 token="test-$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"

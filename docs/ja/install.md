@@ -156,10 +156,14 @@ curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.s
 
 1. リリースを調べます（`/repos/kaito4681/puzuz/releases/latest` または `/releases/tags/v<X>`）。
 2. `puzuz-v<X>-<target>.tar.gz`（`x86_64-unknown-linux-gnu` または `aarch64-unknown-linux-gnu`）と
-   その `.sha256` ファイルを一時ディレクトリに（リダイレクト先も含めて HTTPS だけで）ダウンロードし、
+   その `.sha256` と `.minisig` ファイルを一時ディレクトリに（リダイレクト先も含めて HTTPS だけで）ダウンロードし、
    `.sha256` ファイルがその tarball の名前でのチェックサムであることを確かめてから、チェックサムを確認します。
-3. `minisign` がインストールされていれば、スクリプトに組み込まれたリリース鍵（`packaging/minisign.pub`）で
-   `.minisig` の署名も確認します。`minisign` がなければ、署名を確認しなかったことを伝えます。
+3. スクリプトに組み込まれたリリース鍵（`packaging/minisign.pub`）で `.minisig` の署名を確認します。
+   `PATH` にある `minisign` を使い、なければ GitHub から minisign 0.12 の静的バイナリのリリースを一時
+   ディレクトリにダウンロードし、スクリプトに組み込まれた SHA-256 チェックサム（`scripts/dist/get-minisign.sh`
+   と同じもの）で確認してから使います。このダウンロードに失敗すると、ディストリビューションから `minisign` を
+   インストールして（例: `sudo apt install minisign`）再実行するよう伝えて止まります。署名の確認を省くことは
+   ありません。
 4. tarball を展開し（リンクや tarball の外を指すパスは拒否します）、新しい `puzuz service install` を実行し
    （現在のインストール先のディレクトリを維持し、なければ `/usr/local/bin` を使います。`--bin-dir` は指定
    した場合にだけ渡されます）、その `puzuz doctor` のレポートを表示します。
@@ -1541,7 +1545,8 @@ automount ポイントをトリガーしながら）確認し、なければ分�
 リストアされたジョブが動き出す前に、ヘルパーは、その所有者がジョブの各ファイルを、ジョブが開いているのと同じ
 方法で、同じパスから、シンボリックリンクなしで開けることを確認します（[リストアとパス](architecture.md#restores-and-paths)
 を参照）。ダンプ時にジョブが既に開いていたファイルは、今は所有者がその方法で開けなくても（ジョブが読み取り
-専用で作成したファイルや、すべてのファイルが root のものとして見える sshfs マウント）、それがまさにそのファイル
+専用で作成したファイルや、すべてのファイルが root のものとして見える sshfs マウント。ダンプの直前に開いた
+ファイルも含みます）、それがまさにそのファイル
 であれば通ります。
 
 - 同じマウント済みのファイルシステム上（間に再起動や再マウントがない）：同じデバイスと inode であること。または
@@ -1634,8 +1639,9 @@ sudo puzuz update --version 0.2.0 --yes
    `puzuz update` はインストールされたバイナリを調べます。リリースのものになっていなければそのエラーで止まり、
    なっていれば（最後の確認だけが失敗した場合）警告して続けます。
 
-`install.sh`（必要なら `--version` を付けて再実行）でも同じことができます。ただし署名を確認するのは `minisign`
-がインストールされている場合だけです。
+`install.sh`（必要なら `--version` を付けて再実行）でも同じことができます。署名は `PATH` にある `minisign`、
+なければダウンロードした固定版の minisign で確認します（[インストーラーの実行](#running-the-installer)
+を参照）。
 
 `service install`（したがって上記のどちらの方法も）は、バイナリとユニットを置き換え、何か変わっていれば両方の
 サービスを再起動します。設定ファイルは保持されます。
