@@ -126,8 +126,14 @@ if ! skipped /nfs && ! mounted /nfs && command -v sshfs >/dev/null \
     cp "$DISK/ssh/id.pub" /root/.ssh/authorized_keys
     chmod 0600 /root/.ssh/authorized_keys
     ssh-keygen -A >/dev/null
+    # UsePAM=no: with libpam-systemd installed (polkitd pulls it in), each
+    # SSH login would be a logind session, which systemd stops early in a
+    # shutdown; the sftp-server behind /nfs would be gone before the
+    # helper dumps the jobs (and CRIU cannot dump a disconnected FUSE
+    # mount).
     pgrep -x sshd >/dev/null \
-        || /usr/sbin/sshd -o ListenAddress=127.0.0.1 -o PermitRootLogin=prohibit-password
+        || /usr/sbin/sshd -o ListenAddress=127.0.0.1 -o PermitRootLogin=prohibit-password \
+            -o UsePAM=no
     for _ in $(seq 50); do
         sshfs -o allow_other,default_permissions,IdentityFile="$DISK/ssh/id",StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,LogLevel=ERROR \
             root@127.0.0.1:/srv/ext4/export /nfs 2>/dev/null && break
