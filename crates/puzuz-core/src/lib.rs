@@ -7,6 +7,7 @@ pub mod authz;
 pub mod error;
 pub mod lifecycle;
 pub mod model;
+pub mod priority;
 pub mod scheduler;
 #[cfg(feature = "storage")]
 pub mod storage;

@@ -62,6 +62,37 @@ pub enum AdminOperation {
     /// `reset` of other users' jobs; a plain `reset` by a normal user only
     /// touches their own jobs (see [`reset_scope`]).
     ResetAll,
+    /// `share set`: a user's fair-share shares.
+    SetShares,
+    /// `group priority`: a group's partition priority.
+    SetGroupPriority,
+    /// `site`: a job's site factor.
+    SetSiteFactor,
+    /// A negative nice value (raising a job's priority), see
+    /// [`require_nice`].
+    NegativeNice,
+}
+
+/// Whether `caller` may set `job`'s nice value to `nice`: the owner may
+/// set values `>= 0` (lowering the priority, as with Slurm's `--nice`);
+/// administrators may set any value on any job.
+pub fn require_nice(caller: &Caller, job: &Job, nice: i32) -> Result<(), Error> {
+    require_mutate(caller, job)?;
+    if nice < 0 {
+        require_admin_for(caller, AdminOperation::NegativeNice)?;
+    }
+    Ok(())
+}
+
+/// Whether `caller` may move `job` to the top of its owner's queue (`puzuz
+/// top`, Slurm's `scontrol top`): administrators always, the owner when
+/// `enable_user_top` is set.
+pub fn require_top(caller: &Caller, job: &Job, enable_user_top: bool) -> Result<(), Error> {
+    if caller.is_admin || (enable_user_top && caller.uid == job.owner) {
+        Ok(())
+    } else {
+        Err(Error::PermissionDenied)
+    }
 }
 
 pub fn require_admin(caller: &Caller) -> Result<(), Error> {
@@ -244,11 +275,14 @@ mod tests {
                 priority: 2,
                 label: Some("resnet-sweep".to_owned()),
                 no_checkpoint: true,
+                nice: 0,
             },
             state,
             created_at: 10,
             started_at: Some(20),
             finished_at: None,
+            site_factor: 0,
+            top_seq: None,
         }
     }
 
@@ -418,5 +452,38 @@ mod tests {
         let redacted = format!("{:?}", redact_state(&terminating));
         assert!(!redacted.contains("alice"));
         assert!(redacted.contains(REDACTED));
+    }
+    #[test]
+    fn nice_rules() {
+        let j = job(JobState::Queued { enqueued_at: 0 });
+        // The owner may only lower the priority.
+        assert!(require_nice(&user(OWNER), &j, 0).is_ok());
+        assert!(require_nice(&user(OWNER), &j, 100).is_ok());
+        assert_eq!(
+            require_nice(&user(OWNER), &j, -1),
+            Err(Error::PermissionDenied)
+        );
+        // Others may not touch it at all.
+        assert_eq!(
+            require_nice(&user(OTHER), &j, 5),
+            Err(Error::PermissionDenied)
+        );
+        // Administrators may set anything.
+        assert!(require_nice(&admin(), &j, -1000).is_ok());
+    }
+
+    #[test]
+    fn top_rules() {
+        let j = job(JobState::Queued { enqueued_at: 0 });
+        assert!(require_top(&user(OWNER), &j, true).is_ok());
+        assert_eq!(
+            require_top(&user(OWNER), &j, false),
+            Err(Error::PermissionDenied)
+        );
+        assert_eq!(
+            require_top(&user(OTHER), &j, true),
+            Err(Error::PermissionDenied)
+        );
+        assert!(require_top(&admin(), &j, false).is_ok());
     }
 }
