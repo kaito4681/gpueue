@@ -302,6 +302,12 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - GPU 编号遵循 PCI 总线顺序，与 `nvidia-smi` 和
   `CUDA_DEVICE_ORDER=PCI_BUS_ID` 的顺序相同。在作业内部，`CUDA_VISIBLE_DEVICES` 列出所申请的
   GPU，因此程序看到的是 `cuda:0`、`cuda:1`……
+- **GPU 隔离：** 作业只能打开分配给它的 GPU 的设备节点。每个作业单元都设置了 systemd 的
+  `DevicePolicy=closed`，并用 `DeviceAllow=` 只允许所分配 GPU 的 `/dev/nvidia<N>` 和共用的 NVIDIA 节点；
+  仅使用 CPU 的作业完全不能打开 NVIDIA 设备。修改 `CUDA_VISIBLE_DEVICES` 或打开其他 GPU 的节点都会以
+  `EPERM` 失败，作业内的 `nvidia-smi` 只显示自己的 GPU（在仅使用 CPU 的作业中会以
+  `Failed to initialize NVML: Unknown Error` 失败）。管理员可以用 `gpu_device_isolation = false` 关闭它，
+  例如使用 MIG 时（见 [GPU 隔离](docs/zh-CN/install.md#gpu-isolation)）。
 - 组的行为与 pueue 相同（`default` 组初始为 `parallel 1`）。两种限制同时生效。
 - 立即启动（`start <id>`、`add -i`、`restart -i`、`restore -i`）与 pueue 一样会跳过队列和组的 `parallel`
   限制，但不会跳过 GPU 槽位和暂停的组：如果作业的某个 GPU 没有空闲槽位，或者它的组已暂停，作业会等待，

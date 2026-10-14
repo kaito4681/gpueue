@@ -58,7 +58,8 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
 4. **helper → systemd。** helper 通过 D-Bus 启动一个临时服务，其主进程为
    `puzuz-helper shim`。该单元设置了 `Before=puzuz-helper.service` 和 `KillMode=mixed`，stdin 为
    `/dev/null`，停止超时为 `grace_secs`。每个作业都位于自己的 cgroup 中，独立于守护进程、helper 和用户会话，
-   因此在守护进程和 helper 重启以及用户注销后仍能继续存在。
+   因此在守护进程和 helper 重启以及用户注销后仍能继续存在。在 `gpu_device_isolation`（默认开启）时，该单元还设置了
+   `DevicePolicy=closed` 和只允许作业 GPU 的 `DeviceAllow=`（见 [GPU 隔离](#gpu-isolation)）。
 5. **Shim。** shim 仍以 root 身份运行，它创建一个 PID 命名空间和一个挂载命名空间，并在触发主机的自动挂载点之后
    （以便命名空间获得自动挂载的文件系统）启动该命名空间的 init。init 把挂载设为私有，并挂载一个新的 `/proc`。它会移除被其他挂载遮盖的挂载以及重启后不会保留的挂载
    （`/run/*`、`/media/*`），把每个叠加在其 `autofs` 挂载之上的自动挂载文件系统替换为普通的副本，
@@ -90,7 +91,7 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    都放在一个带期限的子进程中进行（以免宕机的 NFS 服务器把它卡住），检查 GPU 型号、驱动、可用显存和挂载：CRIU 要绑定的路径必须存在，作业在转储时所在的文件系统
    （记录在 `helper-mounts.json` 中）必须以相同类型挂载在相同位置（自动挂载点会被触发），
    并且作业曾打开的文件和工作目录必须存在。它启动一个新单元 `puzuz-job-<id>-r<n>.service`，在 `/` 的 bind 挂载
-   （`/run/puzuz-helper/criu-root`）上运行 `criu restore --root`。在手动模式下，它随后对 CUDA 进程运行 cuda-checkpoint 的
+   （`/run/puzuz-helper/criu-root`）上运行 `criu restore --root`，并使用恢复所用 GPU 的设备访问权限。在手动模式下，它随后对 CUDA 进程运行 cuda-checkpoint 的
    `restore` 和 `unlock`。在插件模式下，CRIU 的插件会在 `criu restore` 返回之前完成这些操作。
    每个镜像都以其转储时的模式恢复，而不管 `cuda_checkpoint_mode` 现在的设置。作业保留其 id 和日志，镜像随后被删除。
    CRIU 以 root 身份按转储时的路径重新打开作业的文件，因此恢复过程会防范所有者在转储后更改这些路径（参见
@@ -150,6 +151,17 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 - 启动时，helper 会在其 `PATH` 中查找一次以名称给出的程序（`criu`、`cuda-checkpoint`、`nvidia-smi`），
   要求找到的文件与以绝对路径给出的程序一样，归 root 所有且只能经由只有 root 能修改的目录到达，此后一直使用
   该绝对路径。
+- <a id="gpu-isolation"></a>**GPU 隔离。** `CUDA_VISIBLE_DEVICES` 只是告诉 CUDA 使用哪些 GPU，任何作业都
+  可以修改它。在 `gpu_device_isolation = true`（默认）时，helper 为每个作业单元（无论启动的还是恢复的）设置
+  `DevicePolicy=closed` 和一个 `DeviceAllow=` 列表（读写）：每块所分配 GPU 的 `/dev/nvidia<minor>`，加上
+  `/dev/nvidiactl`、`/dev/nvidia-uvm`、`/dev/nvidia-uvm-tools`、`/dev/nvidia-modeset` 和 `char-nvidia-uvm`；
+  仅使用 CPU 的作业什么也不允许。systemd 通过 cgroup 设备程序对单元的所有进程（包括 root）强制执行，因此
+  打开其他 NVIDIA 设备会以 `EPERM` 失败；`closed` 仍允许标准伪设备（`/dev/null`、`/dev/zero`、`/dev/full`、
+  `/dev/random`、`/dev/urandom`、`/dev/tty`、`/dev/ptmx`、`/dev/pts/*`）。每次启动和恢复时，GPU 编号
+  （PCI 总线顺序）通过驱动的 `/proc/driver/nvidia/gpus/<PCI 地址>/information`（`Device Minor`，不含被排除的
+  GPU）映射到设备次设备号。恢复单元获得恢复所用的 GPU：`criu restore` 以及插件模式下 CRIU 的 CUDA 插件在其中
+  运行，而在手动模式下，当 helper 对被恢复的进程运行 `cuda-checkpoint --action restore` 时，驱动会在这些进程中
+  重新打开设备节点。见安装指南中的 [GPU 隔离](install.md#gpu-isolation)。
 - 启动时，helper 会拒绝它要写入或从中加载代码的目录（包括传给 `criu -L` 的
   `<data_dir>/criu-no-plugins`，以及 fork guard 的 `<data_dir>/lib`），除非这些目录及其父目录都归 root 所有。
 

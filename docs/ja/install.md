@@ -31,6 +31,7 @@ docs/<lang>/ go up two levels (../../packaging/...). Code blocks are copied unch
 - [管理者](#administrators)
 - [優先度とフェアシェア](#priority-and-fair-share)
 - [GPU の検出](#gpu-detection)
+- [GPU の分離](#gpu-isolation)
 - [チェックポイントの保存先](#checkpoint-storage)
 - [アップグレード](#upgrading)
 - [アンインストール](#uninstalling)
@@ -1120,6 +1121,7 @@ sudo systemctl restart puzuz-helper.service puzuz.service
 | `criu_dump_timeout_secs` | 未設定 | ヘルパー | `criu dump` 単体の任意の上限。未設定なら期限だけが適用されます |
 | `criu_restore_timeout_secs` | 未設定 | ヘルパー | `criu restore` 単体の任意の上限。未設定なら期限だけが適用されます |
 | `fork_guard` | `true` | ヘルパー | ジョブに fork ガードをプリロードします（README の制限事項を参照） |
+| `gpu_device_isolation` | `true` | ヘルパー | 各ジョブのユニットが開けるデバイスノードを、割り当てた GPU のものに限ります（`DevicePolicy=closed`）。`false` で無効になります（[GPU の分離](#gpu-isolation) を参照） |
 | `gpu_detection` | `"auto"` | デーモン | `"auto"`：NVML、失敗したら `[[gpus]]`。`"static"`：`[[gpus]]` のみ。 |
 | `nvml_library` | 未設定 | デーモン | NVML ライブラリのパスまたは名前。デフォルトでは `libnvidia-ml.so.1`、次に `libnvidia-ml.so` |
 | `update_source` | `"github:kaito4681/puzuz"` | CLI | `puzuz update` と `puzuz doctor` がリリースを探す場所：`github:<owner>/<repo>` |
@@ -1308,6 +1310,53 @@ memory_total_bytes = 25757220864
 デーモンが以前は知っていたのにもう見つからない GPU は、利用不可として一覧に残り、スロットの上限も保たれます。
 それを必要とするジョブはキューに留まり、それを要求する新しいジョブは拒否されます。各 GPU は 1 ジョブの上限で
 始まります。`puzuz gpu parallel <N> [--gpu LIST]` で変更します（`0` は無制限）。
+
+<a id="gpu-isolation"></a>
+## GPU の分離
+
+`CUDA_VISIBLE_DEVICES` は CUDA にどの GPU を使うかを伝えるだけで、ジョブが書き換えることもできます。
+`gpu_device_isolation = true`（デフォルト）のとき、ヘルパーはさらに、ジョブの systemd ユニットの cgroup
+デバイスコントローラーで、各ジョブが開けるデバイスノードを制限します。
+
+- 開始したユニット（`puzuz-job-<id>.service`）もリストアしたユニット（`puzuz-job-<id>-r<n>.service`）も、
+  すべてのジョブのユニットに `DevicePolicy=closed` が設定されます。これは標準の疑似デバイス
+  （`/dev/null`、`/dev/zero`、`/dev/full`、`/dev/random`、`/dev/urandom`、`/dev/tty`、`/dev/ptmx` と
+  `/dev/pts/*` の疑似端末）を許可し、リストにないほかのものはすべて拒否します。
+- GPU を使うジョブには、割り当てた各 GPU の `/dev/nvidia<minor>` と、`/dev/nvidiactl`、`/dev/nvidia-uvm`、
+  `/dev/nvidia-uvm-tools`、`/dev/nvidia-modeset`、`char-nvidia-uvm`（ユニファイドメモリのデバイスをメジャー
+  番号で指定したもの。ドライバーがユニットの開始後にノードを作る場合に備えます）の `DeviceAllow=`
+  （読み書き）が付きます。
+- CPU だけのジョブは NVIDIA デバイスをまったく開けません。
+- リストアしたジョブには、リストア先の GPU（チェックポイント時と同じ番号）のノードが許可されます。
+  `criu restore` と、plugin モードでは CRIU の CUDA プラグインはリストアのユニットの中で動きます。manual
+  モードでは、リストアされたプロセスの中でドライバーがデバイスノードを開き直します。分離が有効でも CUDA
+  ジョブのチェックポイントとリストアは動作します（GPU のエンドツーエンドテストで確認しています）。
+
+この制限は root を含むユニットのすべてのプロセスに適用されます。他の GPU の `/dev/nvidia<N>` を開くと
+`EPERM` で失敗します。ジョブの中の `nvidia-smi` には、そのジョブが開ける GPU だけが表示されます。CPU だけの
+ジョブでは `Failed to initialize NVML: Unknown Error` で失敗し、CUDA はデバイスを見つけません。ユニットに
+何が設定されたかは次のように確認できます。
+
+```sh
+systemctl show -p DevicePolicy -p DeviceAllow puzuz-job-<id>.service
+```
+
+GPU 番号は PCI バスの順序に従いますが、デバイスノードの名前はドライバーのマイナー番号で、両者は一致すると
+は限りません。ヘルパーは開始とリストアのたびに、`/proc/driver/nvidia/gpus/<PCI アドレス>/information` の
+`Device Minor` からマイナー番号を読みます。NVML や CUDA と同じく、PCI バスの順序で、`GPU Excluded: Yes` の
+GPU を除いて数えます。ドライバーが知らない GPU 番号（存在しない GPU の `[[gpus]]` エントリーや、ドライバーが
+読み込まれていない場合）には、その GPU 自身のノードは許可されず、ヘルパーはそのことをログに記録します。
+
+分離を無効にするには `gpu_device_isolation = false` を設定し、`puzuz-helper.service` を再起動します。
+それ以降に開始またはリストアしたジョブにはデバイスの制限がかかりません。実行中のジョブはユニットの設定を
+そのまま保ちます。次の場合は無効にする必要があります。
+
+- **MIG** を使うホスト：CUDA は MIG インスタンスの `/dev/nvidia-caps/nvidia-cap<N>` も開きますが、これは
+  許可されません。
+- ジョブがほかのデバイスノード（`/dev/fuse`、`/dev/kvm`、`/dev/infiniband` 以下の RDMA デバイスなど）を
+  必要とする場合。
+
+`puzuz doctor` は分離が有効かどうかを表示します（`gpu isolation`）。
 
 <a id="checkpoint-storage"></a>
 ## チェックポイントの保存先

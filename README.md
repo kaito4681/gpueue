@@ -317,6 +317,14 @@ columns, and `Checkpointed` jobs show the image size.
 - GPU indices follow PCI bus order, the same order as `nvidia-smi` and
   `CUDA_DEVICE_ORDER=PCI_BUS_ID`. Inside the job, `CUDA_VISIBLE_DEVICES` lists the requested
   GPUs, so the program sees them as `cuda:0`, `cuda:1`, ...
+- **GPU isolation:** a job can open only the device nodes of the GPUs it was given. Every job
+  unit has systemd's `DevicePolicy=closed`, with `DeviceAllow=` for the assigned GPUs'
+  `/dev/nvidia<N>` and the shared NVIDIA nodes; a CPU-only job gets no NVIDIA device at all.
+  Changing `CUDA_VISIBLE_DEVICES` or opening another GPU's node fails with `EPERM`, and
+  `nvidia-smi` inside a job shows only its own GPUs (in a CPU-only job it fails with
+  `Failed to initialize NVML: Unknown Error`). Administrators can turn this off with
+  `gpu_device_isolation = false`, e.g. for MIG (see
+  [GPU isolation](docs/install.md#gpu-isolation)).
 - Groups work as in pueue (the `default` group starts with `parallel 1`). Both limits apply.
 - Launching right away (`start <id>`, `add -i`, `restart -i`, `restore -i`) skips the queue and the
   group's `parallel` limit, as in pueue, but not GPU slots or a paused group: if one of the job's

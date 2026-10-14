@@ -324,6 +324,13 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 - GPU 番号は PCI バスの順序に従います。これは `nvidia-smi` や `CUDA_DEVICE_ORDER=PCI_BUS_ID` と同じ順序です。
   ジョブの中では `CUDA_VISIBLE_DEVICES` に要求した GPU が並ぶので、プログラムからは `cuda:0`、`cuda:1`、…
   として見えます。
+- **GPU の分離：** ジョブが開けるのは、割り当てられた GPU のデバイスノードだけです。すべてのジョブの
+  ユニットには systemd の `DevicePolicy=closed` が設定され、`DeviceAllow=` で割り当てた GPU の
+  `/dev/nvidia<N>` と共通の NVIDIA ノードだけが許可されます。CPU だけのジョブは NVIDIA デバイスをまったく
+  開けません。`CUDA_VISIBLE_DEVICES` を書き換えたり、他の GPU のノードを開いたりしても `EPERM` で失敗し、
+  ジョブの中の `nvidia-smi` には自分の GPU だけが表示されます（CPU だけのジョブでは
+  `Failed to initialize NVML: Unknown Error` で失敗します）。管理者は `gpu_device_isolation = false` で
+  無効にできます。MIG を使うときなどに必要です（[GPU の分離](docs/ja/install.md#gpu-isolation) を参照）。
 - グループは pueue と同じように動作します（`default` グループは `parallel 1` で始まります）。両方の上限が
   適用されます。
 - すぐに実行する操作（`start <id>`、`add -i`、`restart -i`、`restore -i`）は、pueue と同じく待ち行列と

@@ -18,6 +18,7 @@ command on their `PATH`.
 - [Administrators](#administrators)
 - [Priority and fair share](#priority-and-fair-share)
 - [GPU detection](#gpu-detection)
+- [GPU isolation](#gpu-isolation)
 - [Checkpoint storage](#checkpoint-storage)
 - [Upgrading](#upgrading)
 - [Uninstalling](#uninstalling)
@@ -1113,6 +1114,7 @@ Every `*_secs` key is at most one year (31536000).
 | `criu_dump_timeout_secs` | unset | helper | optional cap on `criu dump` alone; unset: only the deadline applies |
 | `criu_restore_timeout_secs` | unset | helper | optional cap on `criu restore` alone; unset: only the deadline applies |
 | `fork_guard` | `true` | helper | preload the fork guard into jobs (see the README's limitations) |
+| `gpu_device_isolation` | `true` | helper | each job unit may open only its assigned GPUs' device nodes (`DevicePolicy=closed`); `false` turns this off (see [GPU isolation](#gpu-isolation)) |
 | `gpu_detection` | `"auto"` | daemon | `"auto"`: NVML, falling back to `[[gpus]]`. `"static"`: only `[[gpus]]`. |
 | `nvml_library` | unset | daemon | NVML library path or name; by default `libnvidia-ml.so.1`, then `libnvidia-ml.so` |
 | `update_source` | `"github:kaito4681/puzuz"` | CLI | where `puzuz update` and `puzuz doctor` look for releases: `github:<owner>/<repo>` |
@@ -1302,6 +1304,53 @@ A GPU that the daemon knew before but no longer finds stays listed as unavailabl
 slot limit. Jobs that need it stay queued, and new jobs that ask for it are rejected. Each GPU
 starts with a limit of 1 job. Change it with `puzuz gpu parallel <N> [--gpu LIST]` (`0` means
 unlimited).
+
+## GPU isolation
+
+`CUDA_VISIBLE_DEVICES` only tells CUDA which GPUs to use, and a job can change it. With
+`gpu_device_isolation = true` (the default) the helper also restricts the device nodes each job
+can open, with the cgroup device controller of the job's systemd unit:
+
+- Every job unit, spawned (`puzuz-job-<id>.service`) or restored
+  (`puzuz-job-<id>-r<n>.service`), gets `DevicePolicy=closed`. That allows the standard pseudo
+  devices (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`,
+  `/dev/ptmx` and the `/dev/pts/*` pseudo terminals) and nothing else that is not listed.
+- A job with GPUs gets `DeviceAllow=` (read-write) for each assigned GPU's
+  `/dev/nvidia<minor>`, and for `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
+  `/dev/nvidia-modeset` and `char-nvidia-uvm` (the unified memory devices by major number, in
+  case the driver creates their nodes only after the unit started).
+- A CPU-only job gets no NVIDIA device at all.
+- A restored job gets the nodes of the GPUs it is restored on (the same indices as at the
+  checkpoint). `criu restore` and, in plugin mode, CRIU's CUDA plugin run inside the restore
+  unit; in manual mode the driver reopens the device nodes in the restored processes. Checkpoint
+  and restore of CUDA jobs work with isolation on (the GPU end-to-end test checks it).
+
+The filter applies to every process of the unit, root included. Opening another GPU's
+`/dev/nvidia<N>` fails with `EPERM`. Inside a job, `nvidia-smi` shows only the GPUs the job may
+open. In a CPU-only job it fails with `Failed to initialize NVML: Unknown Error`, and CUDA finds
+no device. To see what a unit got:
+
+```sh
+systemctl show -p DevicePolicy -p DeviceAllow puzuz-job-<id>.service
+```
+
+GPU indices follow PCI bus order, but device nodes are named after the driver's minor number,
+which can differ. At every spawn and restore the helper reads the minors from
+`/proc/driver/nvidia/gpus/<PCI address>/information` (`Device Minor`), in PCI bus order and
+without GPUs marked `GPU Excluded: Yes`, as NVML and CUDA count them. A GPU index the driver does
+not know (a `[[gpus]]` entry for a GPU that is not there, or no driver loaded) gets no node of
+its own, and the helper logs it.
+
+Set `gpu_device_isolation = false` and restart `puzuz-helper.service` to turn isolation off.
+Jobs started or restored after that get no device restrictions; running jobs keep the settings of
+their unit. You need to turn it off:
+
+- on hosts that use **MIG**: CUDA also opens `/dev/nvidia-caps/nvidia-cap<N>` of the MIG instance,
+  which is not allowed;
+- if jobs need other device nodes, such as `/dev/fuse`, `/dev/kvm` or RDMA devices under
+  `/dev/infiniband`.
+
+`puzuz doctor` shows whether isolation is on (`gpu isolation`).
 
 ## Checkpoint storage
 

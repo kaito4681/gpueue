@@ -18,6 +18,7 @@
 - [管理员](#administrators)
 - [优先级与公平共享](#priority-and-fair-share)
 - [GPU 检测](#gpu-detection)
+- [GPU 隔离](#gpu-isolation)
 - [检查点存储](#checkpoint-storage)
 - [升级](#upgrading)
 - [卸载](#uninstalling)
@@ -1027,6 +1028,7 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/puzu
 | `criu_dump_timeout_secs` | 未设置 | helper | 可选，单独限制 `criu dump`；未设置时只适用期限 |
 | `criu_restore_timeout_secs` | 未设置 | helper | 可选，单独限制 `criu restore`；未设置时只适用期限 |
 | `fork_guard` | `true` | helper | 向作业预加载 fork guard（见 README 的限制一节） |
+| `gpu_device_isolation` | `true` | helper | 每个作业单元只能打开所分配 GPU 的设备节点（`DevicePolicy=closed`）；`false` 关闭此功能（见 [GPU 隔离](#gpu-isolation)） |
 | `gpu_detection` | `"auto"` | 守护进程 | `"auto"`：NVML，失败时退回 `[[gpus]]`。`"static"`：只用 `[[gpus]]`。 |
 | `nvml_library` | 未设置 | 守护进程 | NVML 库的路径或名称；默认先用 `libnvidia-ml.so.1`，再用 `libnvidia-ml.so` |
 | `update_source` | `"github:kaito4681/puzuz"` | CLI | `puzuz update` 和 `puzuz doctor` 查找发布版本的位置：`github:<owner>/<repo>` |
@@ -1196,6 +1198,44 @@ memory_total_bytes = 25757220864
 守护进程之前知道但现在找不到的 GPU 会继续以不可用状态列出，并保留其槽位上限。需要它的作业
 保持排队，请求它的新作业会被拒绝。每个 GPU 初始上限为 1 个作业。用
 `puzuz gpu parallel <N> [--gpu LIST]` 修改（`0` 表示不限）。
+
+<a id="gpu-isolation"></a>
+## GPU 隔离
+
+`CUDA_VISIBLE_DEVICES` 只是告诉 CUDA 使用哪些 GPU，作业也可以修改它。在 `gpu_device_isolation = true`
+（默认）时，helper 还会通过作业 systemd 单元的 cgroup 设备控制器，限制每个作业能打开的设备节点：
+
+- 每个作业单元，无论是启动的（`puzuz-job-<id>.service`）还是恢复的（`puzuz-job-<id>-r<n>.service`），都设置
+  `DevicePolicy=closed`。它允许标准伪设备（`/dev/null`、`/dev/zero`、`/dev/full`、`/dev/random`、
+  `/dev/urandom`、`/dev/tty`、`/dev/ptmx` 以及 `/dev/pts/*` 伪终端），未列出的其他设备一律拒绝。
+- 使用 GPU 的作业会获得对每块所分配 GPU 的 `/dev/nvidia<minor>`，以及 `/dev/nvidiactl`、`/dev/nvidia-uvm`、
+  `/dev/nvidia-uvm-tools`、`/dev/nvidia-modeset` 和 `char-nvidia-uvm`（按主设备号指定的统一内存设备，
+  以防驱动在单元启动之后才创建这些节点）的 `DeviceAllow=`（读写）。
+- 仅使用 CPU 的作业完全不能打开 NVIDIA 设备。
+- 恢复的作业获得其恢复所用 GPU（与检查点时编号相同）的节点。`criu restore` 以及插件模式下 CRIU 的 CUDA
+  插件都在恢复单元内运行；在手动模式下，驱动会在被恢复的进程中重新打开设备节点。开启隔离时，CUDA 作业的
+  检查点和恢复仍能正常工作（GPU 端到端测试会检查这一点）。
+
+该限制适用于单元中的所有进程，包括 root。打开其他 GPU 的 `/dev/nvidia<N>` 会以 `EPERM` 失败。在作业内，
+`nvidia-smi` 只显示该作业能打开的 GPU。在仅使用 CPU 的作业中，它会以 `Failed to initialize NVML: Unknown
+Error` 失败，CUDA 也找不到设备。查看某个单元的设置：
+
+```sh
+systemctl show -p DevicePolicy -p DeviceAllow puzuz-job-<id>.service
+```
+
+GPU 编号遵循 PCI 总线顺序，但设备节点以驱动的次设备号命名，两者不一定相同。每次启动和恢复时，helper 从
+`/proc/driver/nvidia/gpus/<PCI 地址>/information` 的 `Device Minor` 读取次设备号，并与 NVML 和 CUDA 一样，
+按 PCI 总线顺序计数，跳过标记为 `GPU Excluded: Yes` 的 GPU。驱动不认识的 GPU 编号（不存在的 GPU 的
+`[[gpus]]` 条目，或未加载驱动）不会获得它自己的节点，helper 会记录这一情况。
+
+要关闭隔离，请设置 `gpu_device_isolation = false` 并重启 `puzuz-helper.service`。此后启动或恢复的作业不受
+设备限制；正在运行的作业保留其单元的设置。以下情况需要关闭它：
+
+- 使用 **MIG** 的主机：CUDA 还会打开 MIG 实例的 `/dev/nvidia-caps/nvidia-cap<N>`，而它不被允许；
+- 作业需要其他设备节点，例如 `/dev/fuse`、`/dev/kvm` 或 `/dev/infiniband` 下的 RDMA 设备。
+
+`puzuz doctor` 会显示隔离是否开启（`gpu isolation`）。
 
 <a id="checkpoint-storage"></a>
 ## 检查点存储

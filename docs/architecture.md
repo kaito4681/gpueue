@@ -69,7 +69,9 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    `puzuz-helper shim`. The unit has `Before=puzuz-helper.service` and `KillMode=mixed`, stdin is
    `/dev/null`, and the stop timeout is `grace_secs`. Each job lives in its own cgroup, outside the
    daemon, the helper and the user's session, so it survives restarts of the daemon and the
-   helper and the user logging out.
+   helper and the user logging out. With `gpu_device_isolation` (the default) the unit also has
+   `DevicePolicy=closed` and `DeviceAllow=` for the job's GPUs only (see
+   [GPU isolation](#gpu-isolation)).
 5. **Shim.** Still root, the shim creates a PID namespace and a mount namespace and starts the
    namespace's init, after it triggered the host's automount points (so that the namespace gets
    the automounted filesystems). The init makes the mounts private and mounts a fresh `/proc`. It removes mounts hidden under other mounts and mounts that do not survive a
@@ -117,7 +119,8 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    must be mounted at the same place with the same type (automount points are triggered), and
    the files and working directories the job had open must exist. It starts a
    new unit `puzuz-job-<id>-r<n>.service` that runs `criu restore --root` on a bind mount of `/`
-   (`/run/puzuz-helper/criu-root`). In manual mode it then runs cuda-checkpoint `restore` and
+   (`/run/puzuz-helper/criu-root`), with the device access of the GPUs of the restore. In manual
+   mode it then runs cuda-checkpoint `restore` and
    `unlock` on the CUDA processes. In plugin mode CRIU's plugin does this before `criu restore`
    returns. Each image is restored in the mode it was dumped in, whatever `cuda_checkpoint_mode`
    says now. The job keeps its id and log, and the image is deleted afterwards.
@@ -195,6 +198,21 @@ restore as failed, also when the unit is already gone; the image is kept.
   `nvidia-smi`) once in its `PATH`, requires the file found, like a program given by an
   absolute path, to belong to root and to be reached only through directories that only root can
   change, and uses that absolute path from then on.
+- <a id="gpu-isolation"></a>**GPU isolation.** `CUDA_VISIBLE_DEVICES` only tells CUDA which
+  GPUs to use; any job could change it. With `gpu_device_isolation = true` (the default) the
+  helper gives every job unit, spawned or restored, `DevicePolicy=closed` and a `DeviceAllow=`
+  list (read-write): `/dev/nvidia<minor>` of each assigned GPU plus `/dev/nvidiactl`,
+  `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset` and `char-nvidia-uvm`, and
+  nothing for a CPU-only job. systemd enforces it with a cgroup device program for every process
+  of the unit, root included, so opening any other NVIDIA device fails with `EPERM`; `closed`
+  still allows the standard pseudo devices (`/dev/null`, `/dev/zero`, `/dev/full`,
+  `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx`, `/dev/pts/*`). GPU indices (PCI bus
+  order) are mapped to device minors with the driver's
+  `/proc/driver/nvidia/gpus/<PCI address>/information` (`Device Minor`, without excluded GPUs)
+  at every spawn and restore. A restore unit gets the GPUs of the restore: `criu restore` and, in
+  plugin mode, CRIU's CUDA plugin run inside it, and in manual mode the driver reopens the
+  device nodes in the restored processes when the helper runs `cuda-checkpoint --action restore`
+  on them. See [GPU isolation](install.md#gpu-isolation) in the installation guide.
 - At start-up the helper refuses directories it writes to or loads code from (including
   `<data_dir>/criu-no-plugins`, passed to `criu -L`, and the fork guard's `<data_dir>/lib`) unless
   they and their parents belong to root.

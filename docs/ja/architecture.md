@@ -70,6 +70,8 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    サービスを開始します。ユニットには `Before=puzuz-helper.service` と `KillMode=mixed` が設定され、stdin は
    `/dev/null`、停止のタイムアウトは `grace_secs` です。各ジョブはデーモン、ヘルパー、ユーザーのセッションの
    外にある自分専用の cgroup で動くので、デーモンやヘルパーの再起動やユーザーのログアウトを生き延びます。
+   `gpu_device_isolation`（デフォルトで有効）のとき、ユニットには `DevicePolicy=closed` と、ジョブの GPU
+   だけを許可する `DeviceAllow=` も設定されます（[GPU の分離](#gpu-isolation) を参照）。
 5. **shim。** shim はまだ root のまま PID 名前空間とマウント名前空間を作り、ホストの automount ポイントを
    トリガーしたあとで（名前空間が automount されたファイルシステムを得られるように）、名前空間の init を
    開始します。init はマウントを private にし、新しい `/proc` をマウントします。他のマウントの下に隠れた
@@ -110,7 +112,8 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    パスが存在すること、ダンプ時にそれらがあったファイルシステム（`helper-mounts.json` に記録）が同じ場所に
    同じタイプでマウントされていること（automount ポイントはトリガーされます）、ジョブが開いていたファイルと
    作業ディレクトリが存在することです。次に、`/` のバインドマウント（`/run/puzuz-helper/criu-root`）上で
-   `criu restore --root` を実行する新しいユニット `puzuz-job-<id>-r<n>.service` を開始します。manual モード
+   `criu restore --root` を実行する新しいユニット `puzuz-job-<id>-r<n>.service` を、リストア先の GPU の
+   デバイスアクセスで開始します。manual モード
    ではその後 CUDA プロセスに対して cuda-checkpoint の `restore` と `unlock` を実行します。plugin モードでは
    `criu restore` が戻る前に CRIU のプラグインがこれを行います。各イメージは、現在の `cuda_checkpoint_mode`
    の値にかかわらず、ダンプしたときのモードでリストアされます。ジョブは ID とログを保ち、イメージはその後
@@ -185,6 +188,20 @@ CRIU は root として動き、リストアするジョブのすべてをダン
 - 起動時、ヘルパーは名前で指定されたプログラム（`criu`、`cuda-checkpoint`、`nvidia-smi`）を自分の `PATH`
   から一度だけ探し、見つかったファイルが、絶対パスで指定されたプログラムと同じく、root のもので、root だけが
   変更できるディレクトリだけを通って到達できることを要求し、以後はその絶対パスを使います。
+- <a id="gpu-isolation"></a>**GPU の分離。** `CUDA_VISIBLE_DEVICES` は CUDA に使う GPU を伝えるだけで、
+  どのジョブでも書き換えられます。`gpu_device_isolation = true`（デフォルト）のとき、ヘルパーは開始した
+  ユニットにもリストアしたユニットにも、`DevicePolicy=closed` と `DeviceAllow=` のリスト（読み書き）を
+  設定します。許可するのは、割り当てた各 GPU の `/dev/nvidia<minor>` と、`/dev/nvidiactl`、
+  `/dev/nvidia-uvm`、`/dev/nvidia-uvm-tools`、`/dev/nvidia-modeset`、`char-nvidia-uvm` で、CPU だけの
+  ジョブには何も許可しません。systemd はこれを、root を含むユニットのすべてのプロセスに cgroup のデバイス
+  プログラムで適用するので、ほかの NVIDIA デバイスを開くと `EPERM` で失敗します。`closed` でも標準の疑似
+  デバイス（`/dev/null`、`/dev/zero`、`/dev/full`、`/dev/random`、`/dev/urandom`、`/dev/tty`、`/dev/ptmx`、
+  `/dev/pts/*`）は許可されます。GPU 番号（PCI バスの順序）は、開始とリストアのたびに、ドライバーの
+  `/proc/driver/nvidia/gpus/<PCI アドレス>/information`（`Device Minor`、除外された GPU を除く）でデバイスの
+  マイナー番号に対応付けます。リストアのユニットにはリストア先の GPU が許可されます。`criu restore` と、
+  plugin モードでは CRIU の CUDA プラグインがその中で動き、manual モードでは、ヘルパーが
+  `cuda-checkpoint --action restore` を実行したときに、リストアされたプロセスの中でドライバーがデバイス
+  ノードを開き直すためです。インストールガイドの [GPU の分離](install.md#gpu-isolation) を参照してください。
 - 起動時、ヘルパーは書き込み先やコードの読み込み元のディレクトリ（`criu -L` に渡す
   `<data_dir>/criu-no-plugins` や、fork ガードの `<data_dir>/lib` を含む）について、それらとその親が root の
   ものでなければ拒否します。
