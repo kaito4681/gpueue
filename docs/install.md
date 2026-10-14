@@ -1550,7 +1550,10 @@ mount). At the dump the helper records the filesystem type and mount point of ea
 paths, and the files and working directories the job has open. Before a restore it checks that
 they are still there (triggering automount points on the way) and refuses with a clear error
 otherwise (see [Restore failures](#restore-failures)). The image is kept, so you can mount the
-filesystem and run `puzuz restore` again.
+filesystem and run `puzuz restore` again. The exception are FUSE and network filesystems that are
+already gone, or do not answer, when the job is dumped: a job that does not use them is dumped
+without them (see
+[Network and FUSE filesystems that stop answering](#network-and-fuse-filesystems-that-stop-answering)).
 
 Before a restored job runs, the helper checks that its owner could open each of its files the way
 the job has it open, by the same path and without symlinks (see
@@ -1573,7 +1576,7 @@ as root's (`root@server:`, `allow_other,default_permissions`) the restore is the
 filesystems where the owner may open the files as the job does (the usual case), changes do not
 matter.
 
-Tested across a simulated reboot (`scripts/e2e-test.sh`, scenarios 15 and 16) with the job's
+Tested across a simulated reboot (`scripts/e2e-test.sh`, scenarios 15, 16 and 20) with the job's
 working directory and open files on each of these:
 
 | Mount | Restore after a reboot |
@@ -1584,6 +1587,8 @@ working directory and open files on each of these:
 | `x-systemd.automount` (job started before and after the trigger; not yet triggered at restore time) | works: the restore pre-check triggers it |
 | FUSE network filesystem (sshfs, mounted by root with `allow_other,default_permissions`, so that files show as root's), with the job writing and renaming its own files there, and other inode numbers after the reboot | works while the FUSE daemon is up again before the restore |
 | filesystem not mounted after the reboot (missing fstab entry, NFS server down) | refused: `<path> needs <type> on <mount point>` |
+| FUSE filesystem whose daemon died while jobs ran (sshfs killed: the mount stays but does not answer; then unmounted on the host), with jobs that do not use it | works: they are checkpointed without it (also on the same boot), and get an empty, inaccessible directory there until the filesystem is mounted again, then the filesystem itself |
+| the same, with the job's working directory on it | not checkpointed (also not at the shutdown): `the job depends on a filesystem that is gone or does not answer: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
 | tmpfs mounted by the administrator (e.g. `/scratch`) with the job's files or working directory on it | refused: its contents are gone after a reboot. Use a tmpfs only for jobs that do not need to survive one. A restore on the same boot works. |
 
 Not tested, or not supported:
@@ -1592,14 +1597,69 @@ Not tested, or not supported:
   `nfs` module. NFS behaves like any other filesystem in the checks above. Mount it from
   `/etc/fstab` (`_netdev`, or `x-systemd.automount`) so that it is mounted before the helper
   starts and unmounted only after the helper has dumped the jobs at shutdown
-  (`puzuz-helper.service` is ordered after `remote-fs.target`). Files that the job had open are
-  reopened by path, so they must still exist on the server.
+  (`puzuz-helper.service` is ordered after `remote-fs.target`, `network.target` and
+  `network-online.target`). Files that the job had open are reopened by path, so they must still
+  exist on the server.
 - **autofs indirect maps** (an autofs daemon mounting `/net/<host>` or `/home/<user>` on demand):
   keys mounted when the job starts are visible to it; keys first accessed later are not (the
   namespace is private). Restoring such a namespace has not been tested.
 - **Removable media and `/run`:** not visible to jobs at all.
 - Filesystems that cannot be mounted again at the same path after a reboot (paths with a boot ID
   or a random name) make every job that started while they were mounted unrestorable.
+
+### Network and FUSE filesystems that stop answering
+
+A job's namespace holds every FUSE and network filesystem that was mounted when the job started,
+whether the job uses it or not, and CRIU can only save such a mount by binding the host's mount
+again on restore. When one goes away while jobs run, the helper notices it before each dump: its
+FUSE daemon exited (sshfs whose SSH connection dropped unmounts its mount on the host, but every
+job keeps a dead copy), or it does not answer (its server is down). A FUSE or network mount
+(`fuse.*`, `nfs`, `nfs4`, `cifs`, `smb3`, `9p`, `ceph`, `glusterfs`, ...) counts as dead if the host
+no longer has it, or if `statfs` on it fails with a connection error (`ENOTCONN`, `EIO`, `ESTALE`,
+...) or does not return within 5 s (asked in a child process, so a hung NFS server cannot hold up
+the helper).
+
+- A job that uses a dead mount (a file it has open there, its working or root directory, its
+  executable, a file it has mapped, or a Unix socket bound there) is **not checkpointed**. The
+  dump is refused before the job is touched (see [Checkpoint failures](#checkpoint-failures)),
+  with a reason that names the mount and what the job has there, for example `the job depends on
+  a filesystem that is gone or does not answer: /nfs (fuse.sshfs) is no longer mounted on the
+  host; the job uses it: the working directory /nfs/run`. Mount the filesystem again and
+  checkpoint it then. At a shutdown such a job is stopped by systemd and shown as `Checkpoint
+  failed` with that reason.
+- **Every other job is checkpointed without the mount**. On restore its mount point gets the
+  filesystem again if a filesystem of the same type is mounted there and answers, and an empty
+  directory that the job cannot open (root's, mode 0,
+  `/var/lib/puzuz/checkpoints/detached-mount`) otherwise. The job never sees what lies under the
+  mount point on the host. Mounts below a dead mount are left out. The restore needs the mount
+  point directory itself; if it is gone (a mount point created at boot), it is refused until the
+  directory exists again.
+
+The helper logs each mount it leaves out (`journalctl -u puzuz-helper`: `job N: /nfs
+(fuse.sshfs) is no longer mounted on the host; the job does not use it, so it is checkpointed
+without it`).
+
+At a shutdown, `puzuz-helper.service` is stopped (and dumps the jobs) before `remote-fs.target`,
+`network-online.target` and `network.target`, so mounts from `/etc/fstab` and the network stay
+until the dumps are done. FUSE daemons that run in a **login session** are another matter: an
+sshfs that a user started over SSH, or the `sftp-server` that serves a local sshfs, is stopped
+with its session (`session-<n>.scope`) right at the beginning of the shutdown, in parallel with
+the services. A service cannot order itself against units that logind creates at each login, but
+a drop-in for all session scopes can make systemd end the sessions only after the helper has
+dumped the jobs:
+
+```ini
+# /etc/systemd/system/session-.scope.d/50-puzuz.conf
+[Unit]
+Before=puzuz-helper.service
+```
+
+Run `systemctl daemon-reload` and check a session with `systemctl show -p Before
+session-<n>.scope`. A shutdown then waits for the dumps before it stops the users' processes.
+Processes of the users' `systemd --user` services run in `user@<uid>.service` and are stopped at
+the same time; the same line in `/etc/systemd/system/user@.service.d/50-puzuz.conf` covers them.
+puzuz does not install these drop-ins. Without them, jobs that use such a mount are not
+checkpointed when its daemon is gone first, and the other jobs are.
 
 ## Upgrading
 
@@ -1794,6 +1854,11 @@ warned on their next command. Refusals:
   gives the job its credentials back, so a restored `SO_REUSEPORT` socket would belong to root and
   could join a root service's group on the same port (and receive part of its connections). Turn
   `SO_REUSEPORT` off in the program, or run the job with `--no-checkpoint`.
+- `the job depends on a filesystem that is gone or does not answer: <mount point> (<type>) ...;
+  the job uses it: ...`: a FUSE or network filesystem that the job uses is no longer mounted on
+  the host, or does not answer. Mount it again (restart the sshfs, bring the NFS server back) and
+  checkpoint again. See
+  [Network and FUSE filesystems that stop answering](#network-and-fuse-filesystems-that-stop-answering).
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`: the job's
   mount namespace depends on a mount that is hidden under another one, so it could never be
   restored. Run the job again (`puzuz restart`). New jobs get a cleaned-up namespace.
@@ -1848,6 +1913,10 @@ A failed restore keeps the job `Checkpointed` and keeps its image, so you can fi
   the empty mount point directory instead, and the job would go on writing to the filesystem
   underneath. Mount it (`systemctl start data.mount`, `mount -a`, start the NFS server, ...) and
   restore again. See [Filesystems and mounts](#filesystems-and-mounts).
+- `the mount points [...] of filesystems that were left out of the checkpoint (they were gone or
+  did not answer at the dump) are missing on this host`: CRIU needs the directory to mount
+  something on. Create it (or mount the filesystem there) and restore again. See
+  [Network and FUSE filesystems that stop answering](#network-and-fuse-filesystems-that-stop-answering).
 - `files or directories the job used are missing on this host: [...]`: files the job had open,
   or its working directory, are gone, typically because they were on a tmpfs (`/scratch`) that
   is empty after the reboot. The job cannot be restored. Remove it (`puzuz remove`).

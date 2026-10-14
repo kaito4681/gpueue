@@ -76,7 +76,13 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    （恢复后则是 init），并被转发给作业的进程组；STOP、CONT 和 KILL 会送到单元的每个进程。helper 会拒绝
    任何其他信号，因为它们会送达 root 的 shim 而不是作业。
 6. **检查点。** helper 检查可用空间（用于 RSS 和显存、保存在镜像中的已删除文件，以及作业的 `/tmp` 和
-   `/dev/shm` 的内容）、挂载和作业的套接字。如果检查失败，它会在触碰作业之前拒绝转储，作业继续运行，
+   `/dev/shm` 的内容）、挂载和作业的套接字。作业命名空间中的 FUSE 和网络挂载，如果主机上已没有它，
+   或者其 `statfs` 以连接错误失败或在 5 秒内没有返回（在子进程中检查），就被视为已死：在其上有打开的
+   文件、工作目录或根目录、可执行文件、映射或绑定的 Unix 套接字的作业，会被拒绝，原因中写明该挂载。
+   对其他作业，helper 把它们作为带有自己键名的外部挂载交给 CRIU
+   （`--external mnt[<mount point>]:puzuz-detached-<n>`，其下的挂载用 `--skip-mnt`），并记录在
+   `helper-mounts.json` 中，这样一个已死的文件系统不会让所有作业都无法做检查点（见
+   [不再响应的网络和 FUSE 文件系统](install.md#network-and-fuse-filesystems-that-stop-answering)）。如果检查失败，它会在触碰作业之前拒绝转储，作业继续运行，
    `checkpoint` 请求会失败并给出原因（只有在应当转储时才发现的拒绝，会改为随结果一起报告，并由守护进程警告所有者）。
    在手动模式下，它随后对每个 CUDA 进程运行
    `cuda-checkpoint --action lock` 和 `checkpoint`，接着以 `--tcp-close` 和
@@ -94,7 +100,9 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
 7. **恢复。** helper 先占用该作业（此后删除其检查点的请求会被拒绝），然后在其请求循环之外、并把每次文件系统查找
    都放在一个带期限的子进程中进行（以免宕机的 NFS 服务器把它卡住），检查 GPU 型号、驱动、可用显存和挂载：CRIU 要绑定的路径必须存在，作业在转储时所在的文件系统
    （记录在 `helper-mounts.json` 中）必须以相同类型挂载在相同位置（自动挂载点会被触发），
-   并且作业曾打开的文件和工作目录必须存在。它启动一个新单元 `puzuz-job-<id>-r<n>.service`，在 `/` 的 bind 挂载
+   并且作业曾打开的文件和工作目录必须存在。转储时略去的挂载，如果相同位置再次挂载着同一类型的文件系统
+   且它响应，就从主机的该挂载绑定，否则从一个属于 root、权限为 0 的空目录
+   （`/var/lib/puzuz/checkpoints/detached-mount`）绑定；其挂载点必须存在。它启动一个新单元 `puzuz-job-<id>-r<n>.service`，在 `/` 的 bind 挂载
    （`/run/puzuz-helper/criu-root`）上运行 `criu restore --root`，并使用恢复所用 GPU 的设备访问权限。在手动模式下，它随后对 CUDA 进程运行 cuda-checkpoint 的
    `restore` 和 `unlock`。在插件模式下，CRIU 的插件会在 `criu restore` 返回之前完成这些操作。
    每个镜像都以其转储时的模式恢复，而不管 `cuda_checkpoint_mode` 现在的设置。作业保留其 id 和日志，镜像随后被删除。

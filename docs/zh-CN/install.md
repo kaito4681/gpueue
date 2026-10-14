@@ -1411,7 +1411,8 @@ CRIU 在恢复时通过绑定挂载相同的主机路径来重建作业命名空
 helper 会记录这些路径各自的文件系统类型和挂载点，以及作业打开的文件和工作目录。恢复前，它会
 检查这些是否仍然存在（途中触发自动挂载点），否则以明确的错误拒绝（见
 [恢复失败](#restore-failures)）。镜像会被保留，因此你可以挂载该文件系统后再次运行
-`puzuz restore`。
+`puzuz restore`。例外是在作业转储时已经消失或不响应的 FUSE 和网络文件系统：不使用它们的作业会
+在不包含它们的情况下被转储（见 [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)）。
 
 在恢复出的作业运行之前，helper 会检查其所有者能否以作业打开每个文件的同样方式、通过同样的
 路径且不经过符号链接打开这些文件（见 [恢复与路径](architecture.md#restores-and-paths)）。对于
@@ -1430,7 +1431,7 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 `allow_other,default_permissions`），恢复随后就会被拒绝。在所有者可以像作业那样打开文件的
 文件系统上（通常情况），文件的变化无关紧要。
 
-已在模拟重启中测试（`scripts/e2e-test.sh`，场景 15 和 16），作业的工作目录和打开的文件分别位于
+已在模拟重启中测试（`scripts/e2e-test.sh`，场景 15、16 和 20），作业的工作目录和打开的文件分别位于
 以下各种挂载上：
 
 | 挂载 | 重启后恢复 |
@@ -1441,6 +1442,8 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 | `x-systemd.automount`（作业在触发前和触发后启动；恢复时尚未触发） | 可行：恢复的预检查会触发它 |
 | FUSE 网络文件系统（sshfs，由 root 以 `allow_other,default_permissions` 挂载，因此文件显示为 root 所有），作业在其中写入和重命名自己的文件，且重启后 inode 号不同 | 只要 FUSE 守护进程在恢复前重新运行即可 |
 | 重启后未挂载的文件系统（缺少 fstab 条目、NFS 服务器宕机） | 拒绝：`<path> needs <type> on <mount point>` |
+| 作业运行期间其守护进程死掉的 FUSE 文件系统（sshfs 被 kill：挂载仍在但不响应；随后在主机上被卸载），以及不使用它的作业 | 可行：它们在不包含该挂载的情况下被检查点（同一次启动内也可以），在文件系统重新挂载之前在该处得到一个空的、无法访问的目录，之后得到文件系统本身 |
+| 同上，但作业的工作目录位于其上 | 不会被检查点（关机时也不会）：`the job depends on a filesystem that is gone or does not answer: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
 | 管理员挂载的 tmpfs（例如 `/scratch`），作业的文件或工作目录位于其上 | 拒绝：重启后其内容已丢失。只把 tmpfs 用于不需要跨重启保留的作业。同一次启动内的恢复可行。 |
 
 未测试或不支持：
@@ -1448,13 +1451,58 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 - **内核 NFS**（NFSv3/v4）未测试：Docker 测试环境无法加载主机的 `nfs` 模块。在上述检查中，NFS
   与其他文件系统表现相同。请从 `/etc/fstab` 挂载它（`_netdev` 或 `x-systemd.automount`），使其
   在 helper 启动前挂载，并在关机时 helper 转储完作业之后才卸载（`puzuz-helper.service` 排在
-  `remote-fs.target` 之后）。作业打开的文件会按路径重新打开，因此它们必须仍存在于服务器上。
+  `remote-fs.target`、`network.target` 和 `network-online.target` 之后）。作业打开的文件会按路径重新打开，因此它们必须仍存在于服务器上。
 - **autofs 间接映射**（autofs 守护进程按需挂载 `/net/<host>` 或 `/home/<user>`）：作业启动时已
   挂载的键对其可见；之后才首次访问的键不可见（命名空间是私有的）。恢复这样的命名空间尚未
   测试。
 - **可移动介质和 `/run`**：对作业完全不可见。
 - 重启后无法在相同路径重新挂载的文件系统（路径中含有 boot ID 或随机名称），会使在其挂载期间
   启动的所有作业都无法恢复。
+
+<a id="network-and-fuse-filesystems-that-stop-answering"></a>
+### 不再响应的网络和 FUSE 文件系统
+
+作业的命名空间包含作业启动时已挂载的每个 FUSE 和网络文件系统，无论作业是否使用它；而 CRIU 只能
+通过在恢复时再次绑定主机的挂载来保存这样的挂载。当作业运行期间其中某个消失时，helper 会在每次转储
+前发现它：其 FUSE 守护进程退出了（SSH 连接断开的 sshfs 会卸载它在主机上的挂载，但每个作业都留着一个
+死掉的副本），或者它不响应（其服务器宕机）。FUSE 或网络挂载（`fuse.*`、`nfs`、`nfs4`、`cifs`、
+`smb3`、`9p`、`ceph`、`glusterfs` 等）如果主机上已没有它，或者对它的 `statfs` 以连接错误
+（`ENOTCONN`、`EIO`、`ESTALE` 等）失败，或在 5 秒内没有返回（在子进程中检查，以免卡住的 NFS
+服务器拖住 helper），就被视为已死。
+
+- 使用已死挂载的作业（在其上打开的文件、工作目录或根目录、可执行文件、映射的文件，或绑定在其上的
+  Unix 套接字）**不会被检查点**。转储会在触碰作业之前被拒绝（见 [检查点失败](#checkpoint-failures)），
+  原因中会写明该挂载以及作业在其上拥有的东西，例如 `the job depends on a filesystem that is gone or
+  does not answer: /nfs (fuse.sshfs) is no longer mounted on the host; the job uses it: the working
+  directory /nfs/run`。请重新挂载该文件系统，然后再做检查点。关机时，这样的作业会被 systemd 停止，
+  并带着该原因显示为 `Checkpoint failed`。
+- **其他所有作业都会在不包含该挂载的情况下被检查点**。恢复时，如果该处挂载着同一类型的文件系统且
+  它响应，其挂载点就得到该文件系统，否则得到一个作业无法打开的空目录（属于 root，权限 0，
+  `/var/lib/puzuz/checkpoints/detached-mount`）。作业永远看不到主机上挂载点之下的内容。已死挂载之下
+  的挂载会被略去。恢复需要挂载点目录本身；如果它已不存在（在启动时创建的挂载点），在该目录再次存在
+  之前恢复会被拒绝。
+
+helper 会把它略去的每个挂载记入日志（`journalctl -u puzuz-helper`：`job N: /nfs (fuse.sshfs) is no
+longer mounted on the host; the job does not use it, so it is checkpointed without it`）。
+
+关机时，`puzuz-helper.service` 会在 `remote-fs.target`、`network-online.target` 和 `network.target`
+之前停止（并转储作业），因此 `/etc/fstab` 中的挂载和网络会一直保留到转储完成。运行在**登录会话**中
+的 FUSE 守护进程则不同：用户通过 SSH 启动的 sshfs，或为本地 sshfs 提供服务的 `sftp-server`，会在关机
+一开始就与服务并行地随其会话（`session-<n>.scope`）一起被停止。服务无法让自己相对于 logind 在每次
+登录时创建的单元排序，但一个针对所有会话 scope 的 drop-in 可以让 systemd 在 helper 转储完作业之后
+才结束这些会话：
+
+```ini
+# /etc/systemd/system/session-.scope.d/50-puzuz.conf
+[Unit]
+Before=puzuz-helper.service
+```
+
+运行 `systemctl daemon-reload`，并用 `systemctl show -p Before session-<n>.scope` 检查某个会话。之后
+关机会先等待转储，再停止用户的进程。用户的 `systemd --user` 服务的进程运行在 `user@<uid>.service`
+中，并在同一时间被停止；在 `/etc/systemd/system/user@.service.d/50-puzuz.conf` 中写入同样的一行即可
+覆盖它们。puzuz 不会安装这些 drop-in。没有它们时，如果这样的挂载的守护进程先消失，使用它的作业不会
+被检查点，而其他作业会。
 
 <a id="upgrading"></a>
 ## 升级
@@ -1639,6 +1687,10 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
 - `the job has internet sockets with SO_REUSEPORT (...)`：CRIU 在把凭据交还给作业之前以 root 身份重建
   套接字，因此恢复后的 `SO_REUSEPORT` 套接字将属于 root，并可能加入同一端口上某个 root 服务的组（并接收其
   部分连接）。请在程序中关闭 `SO_REUSEPORT`，或用 `--no-checkpoint` 运行该作业。
+- `the job depends on a filesystem that is gone or does not answer: <mount point> (<type>) ...;
+  the job uses it: ...`：作业使用的 FUSE 或网络文件系统已不再挂载在主机上，或不响应。请重新挂载它
+  （重启 sshfs、恢复 NFS 服务器），然后再次做检查点。见
+  [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)。
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`：作业的
   挂载命名空间依赖一个被另一个挂载遮盖的挂载，因此永远无法恢复。请重新运行该作业
   （`puzuz restart`）。新作业会得到清理过的命名空间。
@@ -1688,6 +1740,9 @@ refused:` 开头），其所有者会收到警告。
   挂载，或者那里挂载了另一种类型的文件系统。CRIU 会改为绑定空的挂载点目录，作业将继续写入
   下层的文件系统。请挂载它（`systemctl start data.mount`、`mount -a`、启动 NFS 服务器……），然后
   再次恢复。见 [文件系统和挂载](#filesystems-and-mounts)。
+- `the mount points [...] of filesystems that were left out of the checkpoint (they were gone or
+  did not answer at the dump) are missing on this host`：CRIU 需要一个目录来在其上挂载东西。请创建它
+  （或在该处挂载文件系统），然后再次恢复。见 [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)。
 - `files or directories the job used are missing on this host: [...]`：作业打开的文件或其工作目录
   已不存在，通常是因为它们位于重启后变空的 tmpfs（`/scratch`）上。该作业无法恢复。请删除它
   （`puzuz remove`）。
