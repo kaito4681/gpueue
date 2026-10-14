@@ -418,9 +418,30 @@ pub trait StoreOps: sealed::Sealed {
         atomic(self.conn(), |c| jobs::move_to_top(c, ids))
     }
 
-    /// Jobs that finished after `since`, ordered by id.
-    fn list_jobs_finished_since(&self, since: Timestamp) -> Result<Vec<Job>> {
-        jobs::list_finished_since(self.conn(), since)
+    /// Resets what an administrator granted a job (a negative nice, the
+    /// site factor) and its `top` position, for `restart --in-place`.
+    fn clear_job_priority_grants(&self, id: JobId) -> Result<()> {
+        priority::clear_priority_grants(self.conn(), id)
+    }
+
+    /// Records when a running job's run time was last charged (`None` when
+    /// it is not running).
+    fn set_job_run_since(&self, id: JobId, since: Option<Timestamp>) -> Result<()> {
+        priority::set_run_since(self.conn(), id, since)
+    }
+
+    fn job_run_since(&self, id: JobId) -> Result<Option<Timestamp>> {
+        priority::run_since(self.conn(), id)
+    }
+
+    /// Every job's `run_since` that is set.
+    fn list_job_run_since(&self) -> Result<std::collections::HashMap<JobId, Timestamp>> {
+        priority::list_run_since(self.conn())
+    }
+
+    /// Owners of the jobs that are not `done`.
+    fn list_active_owners(&self) -> Result<std::collections::BTreeSet<Uid>> {
+        priority::active_owners(self.conn())
     }
 
     // ----- groups -----
@@ -555,6 +576,11 @@ pub trait StoreOps: sealed::Sealed {
     /// Replaces every user's usage (users missing from `usage` have none).
     fn replace_user_usage(&self, usage: &BTreeMap<Uid, f64>) -> Result<()> {
         atomic(self.conn(), |c| priority::replace_usage(c, usage))
+    }
+
+    /// Adds `amount` to a user's usage.
+    fn add_user_usage(&self, uid: Uid, amount: f64) -> Result<()> {
+        priority::add_usage(self.conn(), uid, amount)
     }
 
     /// When usage was last calculated, if ever.

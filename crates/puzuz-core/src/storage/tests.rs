@@ -1665,25 +1665,50 @@ fn shares_usage_and_times_are_stored() {
 }
 
 #[test]
-fn jobs_finished_since() {
+fn run_since_usage_additions_grants_and_active_owners() {
     let store = Store::open_in_memory().unwrap();
+    let a = store.insert_job(Uid(1), &spec("a"), &queued(0), 0).unwrap();
+    let b = store.insert_job(Uid(2), &spec("b"), &queued(0), 0).unwrap();
+    assert_eq!(store.job_run_since(a.id).unwrap(), None);
+    store.set_job_run_since(a.id, Some(42)).unwrap();
+    assert_eq!(store.job_run_since(a.id).unwrap(), Some(42));
+    assert_eq!(
+        store.list_job_run_since().unwrap(),
+        std::collections::HashMap::from([(a.id, 42)])
+    );
+    store.set_job_run_since(a.id, None).unwrap();
+    assert!(store.list_job_run_since().unwrap().is_empty());
+    assert_domain(
+        store.set_job_run_since(JobId(99), Some(1)).unwrap_err(),
+        Error::JobNotFound(JobId(99)),
+    );
+
+    store.add_user_usage(Uid(1), 2.5).unwrap();
+    store.add_user_usage(Uid(1), 1.5).unwrap();
+    store.add_user_usage(Uid(2), 0.0).unwrap();
+    store.add_user_usage(Uid(2), f64::NAN).unwrap();
+    assert_eq!(
+        store.list_user_usage().unwrap(),
+        BTreeMap::from([(Uid(1), 4.0)])
+    );
+
+    store.set_job_nice(a.id, -5).unwrap();
+    store.set_job_site_factor(a.id, 9).unwrap();
+    store.move_jobs_to_top(&[a.id]).unwrap();
+    store.set_job_nice(b.id, 7).unwrap();
+    store.clear_job_priority_grants(a.id).unwrap();
+    store.clear_job_priority_grants(b.id).unwrap();
+    let a = store.get_job(a.id).unwrap().unwrap();
+    assert_eq!((a.spec.nice, a.site_factor, a.top_seq), (0, 0, None));
+    // A positive nice stays.
+    assert_eq!(store.get_job(b.id).unwrap().unwrap().spec.nice, 7);
+
     let done = JobState::Done {
         result: JobResult::Success,
     };
-    let a = store.insert_job(Uid(1), &spec("a"), &queued(0), 0).unwrap();
-    let b = store.insert_job(Uid(1), &spec("b"), &queued(0), 0).unwrap();
-    let _c = store.insert_job(Uid(1), &spec("c"), &queued(0), 0).unwrap();
-    store
-        .update_job_state(a.id, &done, Some(1), Some(10))
-        .unwrap();
-    store
-        .update_job_state(b.id, &done, Some(1), Some(20))
-        .unwrap();
-    let ids: Vec<JobId> = store
-        .list_jobs_finished_since(10)
-        .unwrap()
-        .iter()
-        .map(|j| j.id)
-        .collect();
-    assert_eq!(ids, [b.id]);
+    store.update_job_state(b.id, &done, None, Some(1)).unwrap();
+    assert_eq!(
+        store.list_active_owners().unwrap(),
+        std::collections::BTreeSet::from([Uid(1)])
+    );
 }

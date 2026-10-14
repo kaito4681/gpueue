@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, Row, params};
 
 use super::{JobFilter, Result};
 use crate::error::{Error, StorageError};
@@ -300,34 +300,19 @@ pub(super) fn set_site_factor(conn: &Connection, id: JobId, site: i32) -> Result
     one_job(changed, id)
 }
 
+/// `meta` key: the next `top_seq`.
+const NEXT_TOP_SEQ: &str = "next_top_seq";
+
 /// Must run inside a savepoint or transaction.
 pub(super) fn move_to_top(conn: &Connection, ids: &[JobId]) -> Result<()> {
     // The first id ends up first: it gets the highest sequence number.
-    let mut next: i64 = conn
-        .prepare_cached("SELECT value FROM meta WHERE key = 'next_top_seq'")?
-        .query_row([], |row| row.get(0))
-        .optional()?
-        .unwrap_or(0);
+    let mut next = super::meta::get(conn, NEXT_TOP_SEQ)?.unwrap_or(0);
     let mut stmt = conn.prepare_cached("UPDATE jobs SET top_seq = ?2 WHERE id = ?1")?;
     for id in ids.iter().rev() {
         one_job(stmt.execute(params![id.0, next])?, *id)?;
         next += 1;
     }
-    conn.prepare_cached(
-        "INSERT INTO meta (key, value) VALUES ('next_top_seq', ?1)
-         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-    )?
-    .execute([next])?;
-    Ok(())
-}
-
-/// Jobs that finished after `since` (for usage accounting), ordered by id.
-pub(super) fn list_finished_since(conn: &Connection, since: Timestamp) -> Result<Vec<Job>> {
-    load_where(
-        conn,
-        "jobs.state = 'done' AND jobs.finished_at > ?1",
-        &[&since],
-    )
+    super::meta::set(conn, NEXT_TOP_SEQ, next)
 }
 
 pub(super) fn remove(conn: &Connection, id: JobId) -> Result<()> {

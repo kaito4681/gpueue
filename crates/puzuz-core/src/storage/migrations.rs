@@ -167,6 +167,8 @@ ALTER TABLE checkpoints
 ///   by administrators) and `jobs.top_seq` (set by `puzuz top`; `NULL` for
 ///   jobs never moved to the top). Existing jobs keep their `priority`,
 ///   which now orders their owner's jobs only.
+/// - `jobs.run_since`: while a job is running, when its run time was last
+///   charged to its owner's usage (`NULL` otherwise).
 /// - `groups.priority`, the partition factor's input.
 /// - `user_shares`: shares set by administrators (users without a row have
 ///   the default, 1).
@@ -174,13 +176,11 @@ ALTER TABLE checkpoints
 ///   because decay makes it fractional.
 /// - `meta` gains `usage_calc_at`, `usage_reset_at` and `next_top_seq`
 ///   when they are first needed.
-/// - `jobs_by_finished_at` finds the jobs that finished since the last
-///   usage calculation without reading the whole history.
 const V6: &str = r#"
 ALTER TABLE jobs ADD COLUMN nice INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN site_factor INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN top_seq INTEGER CHECK (top_seq >= 0);
-CREATE INDEX jobs_by_finished_at ON jobs (finished_at);
+ALTER TABLE jobs ADD COLUMN run_since INTEGER;
 ALTER TABLE groups ADD COLUMN priority INTEGER NOT NULL DEFAULT 0 CHECK (priority >= 0);
 CREATE TABLE user_shares (
     uid    INTEGER PRIMARY KEY NOT NULL,
