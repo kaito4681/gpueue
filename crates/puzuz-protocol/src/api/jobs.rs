@@ -191,9 +191,31 @@ impl ListJobsQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListJobsResponse {
     pub jobs: Vec<JobView>,
+    /// Administrators only: jobs the helper runs although the daemon's
+    /// database has them finished, queued, checkpointed or not at all
+    /// (e.g. after the database was restored from a backup). Their GPUs
+    /// count as taken, a queued job with the same id is not started, and an
+    /// administrator can stop them with `puzuz kill <id>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphans: Vec<OrphanJob>,
+}
+
+/// A job the helper runs that the daemon does not account for (see
+/// [`ListJobsResponse::orphans`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanJob {
+    pub id: JobId,
+    /// The uid it runs as, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Uid>,
+    /// The GPUs it was started with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<GpuIndex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// Body of `POST /v1/jobs` (`puzuz add`). The owner is taken from the

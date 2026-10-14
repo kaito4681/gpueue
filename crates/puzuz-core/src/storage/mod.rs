@@ -101,7 +101,11 @@ impl Store {
                 )));
             }
         }
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // FULL, not NORMAL: in WAL mode NORMAL may lose the last commits on
+        // a power failure, and the daemon acknowledges helper events (which
+        // the helper then forgets) right after the commit that applied
+        // them. Writes are few, so the extra fsync per commit is cheap.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         migrations::migrate(&mut conn)?;
         Ok(Self { conn })
     }
@@ -359,6 +363,13 @@ pub trait StoreOps: sealed::Sealed {
         jobs::list(self.conn(), filter)
     }
 
+    /// The jobs scheduling needs, ordered by id: every job that is not
+    /// `done`, plus the `done` jobs that one of those depends on. Reads no
+    /// other finished job.
+    fn list_unfinished_jobs(&self) -> Result<Vec<Job>> {
+        jobs::list_unfinished(self.conn())
+    }
+
     /// Sets a job's state and both timestamps, exactly as given, in one
     /// statement. Fails with [`Error::JobNotFound`](crate::Error::JobNotFound)
     /// if the job does not exist.
@@ -470,21 +481,28 @@ pub trait StoreOps: sealed::Sealed {
     }
 
     /// Jobs of `owner` whose last dump failed and whose owner has not been
-    /// told yet, ordered by id. A new record ([`put_checkpoint`]) or a
-    /// status change ([`set_checkpoint_status`]) makes a failure
-    /// unacknowledged again.
+    /// told yet, ordered by id, with the `created_at` of the failed record
+    /// (which identifies the dump, for
+    /// [`acknowledge_checkpoint_failures`]). A new record
+    /// ([`put_checkpoint`]) or a status change ([`set_checkpoint_status`])
+    /// makes a failure unacknowledged again.
     ///
+    /// [`acknowledge_checkpoint_failures`]: StoreOps::acknowledge_checkpoint_failures
     /// [`put_checkpoint`]: StoreOps::put_checkpoint
     /// [`set_checkpoint_status`]: StoreOps::set_checkpoint_status
-    fn unacknowledged_checkpoint_failures(&self, owner: Uid) -> Result<Vec<JobId>> {
+    fn unacknowledged_checkpoint_failures(&self, owner: Uid) -> Result<Vec<(JobId, Timestamp)>> {
         checkpoints::unacknowledged_failures(self.conn(), owner)
     }
 
-    /// Marks the failed dumps of `job_ids` as reported to their owner.
-    /// Records that are not failed (or do not exist) are left alone.
-    fn acknowledge_checkpoint_failures(&self, job_ids: &[JobId]) -> Result<()> {
+    /// Marks the failed dumps `(job id, created_at)` as reported to their
+    /// owner, as read by [`unacknowledged_checkpoint_failures`]. A record
+    /// that has been replaced since (another dump, with another
+    /// `created_at`), or is not failed, is left alone.
+    ///
+    /// [`unacknowledged_checkpoint_failures`]: StoreOps::unacknowledged_checkpoint_failures
+    fn acknowledge_checkpoint_failures(&self, failures: &[(JobId, Timestamp)]) -> Result<()> {
         atomic(self.conn(), |c| {
-            checkpoints::acknowledge_failures(c, job_ids)
+            checkpoints::acknowledge_failures(c, failures)
         })
     }
 
@@ -532,16 +550,25 @@ pub trait StoreOps: sealed::Sealed {
         job_errors::clear(self.conn(), job_id)
     }
 
-    /// Jobs of `owner` with an error the owner has not been told about yet,
-    /// ordered by id.
-    fn unacknowledged_job_errors(&self, owner: Uid) -> Result<Vec<(JobId, JobErrorKind)>> {
+    /// Every recorded job error, ordered by job id.
+    fn list_job_errors(&self) -> Result<Vec<JobError>> {
+        job_errors::list(self.conn())
+    }
+
+    /// The errors of `owner`'s jobs the owner has not been told about yet,
+    /// ordered by job id.
+    fn unacknowledged_job_errors(&self, owner: Uid) -> Result<Vec<JobError>> {
         job_errors::unacknowledged(self.conn(), owner)
     }
 
-    /// Marks the errors of `job_ids` as reported to their owner. Jobs
-    /// without an error are ignored.
-    fn acknowledge_job_errors(&self, job_ids: &[JobId]) -> Result<()> {
-        atomic(self.conn(), |c| job_errors::acknowledge(c, job_ids))
+    /// Marks the errors `(job id, recorded_at)` as reported to their owner,
+    /// as read by [`unacknowledged_job_errors`]. An error recorded since
+    /// (with another `recorded_at`) stays unacknowledged; jobs without an
+    /// error are ignored.
+    ///
+    /// [`unacknowledged_job_errors`]: StoreOps::unacknowledged_job_errors
+    fn acknowledge_job_errors(&self, errors: &[(JobId, Timestamp)]) -> Result<()> {
+        atomic(self.conn(), |c| job_errors::acknowledge(c, errors))
     }
 }
 

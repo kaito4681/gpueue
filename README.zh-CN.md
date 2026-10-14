@@ -258,7 +258,8 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   由此可以看到谁在使用哪块 GPU。
 - **仅限管理员：** `group add/remove`、`parallel`、`gpu parallel`、暂停或继续整个组
   （`pause/start/kill -g` 针对一个组，`pause/start/kill -a` 针对所有组）、
-  `shutdown`，以及对其他用户作业执行 `reset`。与 pueue 一样，`pause` 和 `kill` 会暂停所选的组，
+  `shutdown`、对其他用户作业执行 `reset`，以及对[孤立作业](docs/zh-CN/architecture.md#orphans)（helper 正在运行、
+  但守护进程并不掌握的进程；`status` 会向管理员列出它们）执行 `kill <id>`。与 pueue 一样，`pause` 和 `kill` 会暂停所选的组，
   `start` 会继续它们，而 `pause --wait` 只暂停组，并让运行中的作业运行完毕。与 pueue 不同的是，
   即使组中没有排队的作业，`kill -g/-a` 也会暂停这些组。
   普通用户运行 `pause/start/kill -g` 或 `-a` 时，只有其自己的作业受影响，任何组的暂停状态都不会改变

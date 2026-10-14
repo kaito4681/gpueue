@@ -96,6 +96,14 @@ pub trait Helper: Send + Sync + 'static {
 
     fn state(&self) -> HelperState;
 
+    /// How many event notices ([`HelperNotice::Event`] and
+    /// [`HelperNotice::UndecodableEvent`]) have been put on the notice
+    /// channel so far. Read right after a request returns, it counts every
+    /// event the helper sent before its answer, so the daemon can make sure
+    /// it has applied them before acting on the answer (see
+    /// `Core::spawn_lost_check`).
+    fn events_delivered(&self) -> u64;
+
     /// Starts a job; returns its PID.
     fn spawn(&self, request: SpawnRequest) -> BoxFuture<'_, HelperResult<u32>>;
 

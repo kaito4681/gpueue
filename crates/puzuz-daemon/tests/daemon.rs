@@ -11,7 +11,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
-use puzuz_core::model::{GpuIndex, JobId, JobResult, JobSpec, JobState};
+use puzuz_core::model::{GpuIndex, JobId, JobResult, JobSpec, JobState, Uid};
 use puzuz_daemon::api::TEST_UID_HEADER;
 use puzuz_daemon::helper::FakeOutcome;
 use puzuz_daemon::{
@@ -2889,5 +2889,172 @@ async fn immediate_launches_wait_for_a_disconnected_helper() {
         alice.job(waiting).await.state,
         JobState::Queued { .. }
     ));
+    h.stop().await;
+}
+
+/// A job the helper runs although the database has it finished (e.g. after
+/// the database was restored from a backup) is an orphan: its GPU slots
+/// stay taken and a queued job with its id is not started; administrators
+/// see it in `status` and `doctor` and may kill it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn orphans_keep_their_gpus_and_admins_can_kill_them() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    let admin = h.client(ADMIN);
+    let first = alice.add(&job_request("first", &[0])).await;
+    h.exit(first, 0).await;
+    alice.wait_state(first, &done(JobResult::Success)).await;
+
+    h.stop().await;
+    h.helper
+        .insert_running_as(first, Uid(ALICE), &[GpuIndex(0)]);
+    h.start(1).await;
+    let mut orphans = Vec::new();
+    for _ in 0..250 {
+        let version: VersionResponse = admin.get("/v1/version").await.json();
+        orphans = version.orphan_jobs.unwrap();
+        if !orphans.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(orphans, [first]);
+
+    // GPU 0 is taken by the orphan.
+    let next = alice.add(&job_request("next", &[0])).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(matches!(
+        alice.job(next).await.state,
+        JobState::Queued { .. }
+    ));
+    let gpus: ListGpusResponse = alice.get("/v1/gpus").await.json();
+    assert_eq!(gpus.gpus[0].used, 1);
+
+    // Only administrators see it.
+    let listed: ListJobsResponse = admin.get("/v1/jobs").await.json();
+    assert_eq!(listed.orphans.len(), 1);
+    assert_eq!(listed.orphans[0].id, first);
+    assert_eq!(listed.orphans[0].owner, Some(Uid(ALICE)));
+    assert_eq!(listed.orphans[0].gpus, [GpuIndex(0)]);
+    let listed: ListJobsResponse = alice.get("/v1/jobs").await.json();
+    assert!(listed.orphans.is_empty());
+
+    // Its owner cannot kill it (the job is finished as far as the daemon
+    // knows); an administrator can.
+    let reply = alice.action(first, "kill", json!({})).await;
+    assert_eq!(reply.error().code, ErrorCode::InvalidState);
+    assert!(h.helper.is_running(first));
+    let reply = admin.action(first, "kill", json!({})).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    alice.wait_state(next, &JobState::Running).await;
+    assert!(!h.helper.is_running(first));
+    let version: VersionResponse = admin.get("/v1/version").await.json();
+    assert_eq!(version.orphan_jobs, Some(Vec::new()));
+    // The finished job is untouched.
+    assert_eq!(alice.job(first).await.state, done(JobResult::Success));
+    h.stop().await;
+}
+
+/// `switch` swaps the "launch regardless of slots" mark with the ids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switch_swaps_the_forced_launch_mark() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let busy = alice.add(&job_request("busy", &[])).await;
+    alice.wait_state(busy, &JobState::Running).await;
+    let a = alice.add(&job_request("a", &[])).await;
+    let b = alice.add(&job_request("b", &[])).await;
+
+    // `start a` while the helper is away: a waits, to be launched
+    // regardless of slots once it is back.
+    h.helper.disconnect();
+    let reply = alice.action(a, "start", json!({})).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(launch_pending(&reply));
+    let reply = alice
+        .post("/v1/jobs/switch", json!({"first": a, "second": b}))
+        .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    assert_eq!(alice.job(b).await.details.unwrap().command, "a");
+
+    h.helper.reconnect();
+    // The job started with `start` (now `b`) is launched; the other waits
+    // for the slot `busy` holds.
+    alice.wait_state(b, &JobState::Running).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(matches!(alice.job(a).await.state, JobState::Queued { .. }));
+    h.stop().await;
+}
+
+/// Connections and streams are limited per user: one over the limit is
+/// answered with `too_many_requests`, and served again once others close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connections_and_streams_are_limited_per_user() {
+    const MAX_CONNECTIONS_PER_UID: usize = 64;
+    const MAX_STREAMS_PER_UID: usize = 16;
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+
+    // Streams count per caller.
+    let mut streams = Vec::new();
+    for _ in 0..MAX_STREAMS_PER_UID {
+        let response = alice.open(Method::GET, "/v1/events", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        streams.push(response);
+    }
+    let reply = alice.get("/v1/events").await;
+    assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(reply.error().code, ErrorCode::TooManyRequests);
+    let id = alice.add(&job_request("x", &[])).await;
+    let reply = alice.get(&format!("/v1/jobs/{id}/log?follow=true")).await;
+    assert_eq!(reply.error().code, ErrorCode::TooManyRequests);
+    // Others are not affected.
+    let other = bob.open(Method::GET, "/v1/events", None).await;
+    assert_eq!(other.status(), StatusCode::OK);
+    drop(other);
+    streams.pop();
+    let mut reopened = None;
+    for _ in 0..250 {
+        let response = alice.open(Method::GET, "/v1/events", None).await;
+        if response.status() == StatusCode::OK {
+            reopened = Some(response);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(reopened.is_some(), "a closed stream frees its place");
+    drop(reopened);
+    drop(streams);
+
+    // Connections count per peer uid (this process's, whatever the test
+    // header says).
+    let socket = h.dir.path().join("puzuz.sock");
+    let mut idle = Vec::new();
+    for _ in 0..MAX_CONNECTIONS_PER_UID {
+        idle.push(tokio::net::UnixStream::connect(&socket).await.unwrap());
+    }
+    let mut refused = false;
+    for _ in 0..250 {
+        let reply = alice.get("/v1/version").await;
+        if reply.status == StatusCode::TOO_MANY_REQUESTS {
+            assert_eq!(reply.error().code, ErrorCode::TooManyRequests);
+            refused = true;
+            break;
+        }
+        // Connections of the streams above may still be closing.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refused);
+    drop(idle);
+    let mut served = false;
+    for _ in 0..250 {
+        if alice.get("/v1/version").await.status == StatusCode::OK {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(served);
     h.stop().await;
 }

@@ -137,6 +137,25 @@ impl Launches {
         }
     }
 
+    /// Swaps the records of two jobs whose ids `switch` swapped.
+    pub fn swap(&self, a: JobId, b: JobId) {
+        let mut state = self.state.lock().unwrap();
+        let (ra, rb) = (state.jobs.remove(&a), state.jobs.remove(&b));
+        if let Some(record) = ra {
+            state.jobs.insert(b, record);
+        }
+        if let Some(record) = rb {
+            state.jobs.insert(a, record);
+        }
+        let (sa, sb) = (state.settled.remove(&a), state.settled.remove(&b));
+        if sa {
+            state.settled.insert(b);
+        }
+        if sb {
+            state.settled.insert(a);
+        }
+    }
+
     /// Forgets the launches of a removed job.
     pub fn forget(&self, id: JobId) {
         let mut state = self.state.lock().unwrap();

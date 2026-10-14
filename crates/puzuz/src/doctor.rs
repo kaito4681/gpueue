@@ -1407,6 +1407,23 @@ fn check_daemon(daemon: &Result<VersionResponse, String>) -> Vec<Check> {
                     "sudo systemctl start {HELPER_UNIT}; see `journalctl -u {HELPER_UNIT}`"
                 ))
             });
+            if let Some(orphans) = version.orphan_jobs.as_deref().filter(|o| !o.is_empty()) {
+                let ids: Vec<String> = orphans.iter().map(ToString::to_string).collect();
+                checks.push(
+                    Check::warn(
+                        "orphaned jobs",
+                        format!(
+                            "the helper runs jobs the daemon does not account for: {} (their \
+                             GPUs stay taken)",
+                            ids.join(", ")
+                        ),
+                    )
+                    .hint(
+                        "`puzuz status` shows them to administrators; an administrator can stop \
+                         one with `puzuz kill <id>`",
+                    ),
+                );
+            }
             checks
         }
         Err(err) => vec![

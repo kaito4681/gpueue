@@ -29,6 +29,9 @@ pub enum ErrorCode {
     HelperUnavailable,
     /// The daemon is shutting down and accepts no new work.
     ShuttingDown,
+    /// The caller has too many connections or streams (`log --follow`,
+    /// `/v1/events`) open at once; retry once some have closed.
+    TooManyRequests,
     Internal,
 }
 
@@ -44,6 +47,7 @@ impl ErrorCode {
             ErrorCode::VersionMismatch => 400,
             ErrorCode::Unsupported => 501,
             ErrorCode::HelperUnavailable | ErrorCode::ShuttingDown => 503,
+            ErrorCode::TooManyRequests => 429,
             ErrorCode::Internal => 500,
         }
     }
@@ -62,6 +66,7 @@ impl ErrorCode {
             ErrorCode::Unsupported => "unsupported",
             ErrorCode::HelperUnavailable => "helper_unavailable",
             ErrorCode::ShuttingDown => "shutting_down",
+            ErrorCode::TooManyRequests => "too_many_requests",
             ErrorCode::Internal => "internal",
         }
     }

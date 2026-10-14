@@ -114,10 +114,32 @@ impl Status {
     }
 }
 
+/// Resources held outside the job list: processes the helper runs that the
+/// daemon does not account for (orphans).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reserved {
+    /// GPU slots taken, per GPU.
+    pub gpus: HashMap<GpuIndex, u32>,
+    /// Jobs not to launch (a process with their id is still running).
+    pub held: HashSet<JobId>,
+}
+
 /// Decides which jobs to enqueue, fail, start and restore at time `now`.
 ///
 /// See the [module documentation](self) for the rules.
 pub fn plan(now: Timestamp, jobs: &[Job], groups: &[Group], gpus: &[Gpu]) -> Plan {
+    plan_with(now, jobs, groups, gpus, &Reserved::default())
+}
+
+/// [`plan`], with `reserved` GPU slots taken in addition to those of the
+/// jobs, and `reserved.held` jobs left waiting.
+pub fn plan_with(
+    now: Timestamp,
+    jobs: &[Job],
+    groups: &[Group],
+    gpus: &[Gpu],
+    reserved: &Reserved,
+) -> Plan {
     let mut out = Plan::default();
 
     let groups: HashMap<&str, &Group> = groups.iter().map(|g| (g.name.as_str(), g)).collect();
@@ -161,7 +183,7 @@ pub fn plan(now: Timestamp, jobs: &[Job], groups: &[Group], gpus: &[Gpu]) -> Pla
 
     // Slots currently in use.
     let mut group_used: HashMap<&str, u32> = HashMap::new();
-    let mut gpu_used: HashMap<GpuIndex, u32> = HashMap::new();
+    let mut gpu_used: HashMap<GpuIndex, u32> = reserved.gpus.clone();
     for job in jobs.iter().filter(|j| j.state.occupies_slot()) {
         *group_used.entry(job.spec.group.as_str()).or_default() += 1;
         for gpu in dedup(&job.spec.gpus) {
@@ -172,6 +194,7 @@ pub fn plan(now: Timestamp, jobs: &[Job], groups: &[Group], gpus: &[Gpu]) -> Pla
     let mut candidates: Vec<&Job> = jobs
         .iter()
         .filter(|j| matches!(status[&j.id], Status::Queued | Status::RestoreQueued))
+        .filter(|j| !reserved.held.contains(&j.id))
         .collect();
     candidates.sort_by(|a, b| {
         b.spec
@@ -341,6 +364,35 @@ mod tests {
     fn run(jobs: Vec<J>, groups: &[Group], gpus: &[Gpu]) -> Plan {
         let jobs: Vec<Job> = jobs.into_iter().map(|j| j.0).collect();
         plan(NOW, &jobs, groups, gpus)
+    }
+
+    #[test]
+    fn reserved_gpu_slots_and_held_jobs_are_respected() {
+        let jobs: Vec<Job> = vec![
+            job(1, queued()).gpus(&[0]).0,
+            job(2, queued()).gpus(&[1]).0,
+            job(3, queued()).0,
+        ];
+        let reserved = Reserved {
+            gpus: HashMap::from([(GpuIndex(0), 1)]),
+            held: HashSet::from([JobId(3)]),
+        };
+        let out = plan_with(
+            NOW,
+            &jobs,
+            &[group(DEFAULT_GROUP, 0)],
+            &[gpu(0, 1), gpu(1, 1)],
+            &reserved,
+        );
+        // GPU 0 is taken by an orphan; job 3 shares its id with one.
+        assert_eq!(out.start, ids(&[2]));
+        let out = plan(
+            NOW,
+            &jobs,
+            &[group(DEFAULT_GROUP, 0)],
+            &[gpu(0, 1), gpu(1, 1)],
+        );
+        assert_eq!(out.start, ids(&[1, 2, 3]));
     }
 
     /// Expected (start, restore) for table-driven slot tests.

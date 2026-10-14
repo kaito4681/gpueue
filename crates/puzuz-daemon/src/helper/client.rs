@@ -49,6 +49,8 @@ struct Inner {
     state: Mutex<HelperState>,
     notices: Mutex<Option<mpsc::UnboundedSender<HelperNotice>>>,
     task: Mutex<Option<CancellationToken>>,
+    /// See [`Helper::events_delivered`].
+    events_delivered: AtomicU64,
 }
 
 impl HelperClient {
@@ -62,6 +64,7 @@ impl HelperClient {
                 state: Mutex::new(HelperState::default()),
                 notices: Mutex::new(None),
                 task: Mutex::new(None),
+                events_delivered: AtomicU64::new(0),
             }),
         }
     }
@@ -69,8 +72,15 @@ impl HelperClient {
 
 impl Inner {
     fn notify(&self, notice: HelperNotice) {
-        if let Some(tx) = self.notices.lock().unwrap().as_ref() {
-            let _ = tx.send(notice);
+        let is_event = matches!(
+            notice,
+            HelperNotice::Event(_) | HelperNotice::UndecodableEvent { .. }
+        );
+        if let Some(tx) = self.notices.lock().unwrap().as_ref()
+            && tx.send(notice).is_ok()
+            && is_event
+        {
+            self.events_delivered.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -348,6 +358,10 @@ impl Helper for HelperClient {
         self.inner.state.lock().unwrap().clone()
     }
 
+    fn events_delivered(&self) -> u64 {
+        self.inner.events_delivered.load(Ordering::SeqCst)
+    }
+
     fn spawn(&self, request: SpawnRequest) -> BoxFuture<'_, HelperResult<u32>> {
         async move {
             match self.inner.request(Request::Spawn(request)).await? {
@@ -454,6 +468,8 @@ mod tests {
                         job: JobId(3),
                         pid: Some(42),
                         phase: RunningPhase::Running,
+                        uid: None,
+                        gpus: None,
                     }],
                 },
                 Request::Spawn(_) => ResponseResult::Spawned { pid: 7 },

@@ -20,6 +20,8 @@ storage = ["dep:rusqlite"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# Counts the queries scheduling runs (storage tests).
+rusqlite = { workspace = true, features = ["trace"] }
 
 [lints]
 workspace = true

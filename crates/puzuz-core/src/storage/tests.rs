@@ -76,7 +76,7 @@ fn in_memory_store_is_migrated() {
 }
 
 #[test]
-fn on_disk_store_uses_wal_normal_sync_and_private_mode() {
+fn on_disk_store_uses_wal_full_sync_and_private_mode() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.sqlite");
     let store = Store::open(&path).unwrap();
@@ -86,12 +86,12 @@ fn on_disk_store_uses_wal_normal_sync_and_private_mode() {
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
-    // NORMAL == 1
+    // FULL == 2
     let sync: i64 = store
         .conn
         .query_row("PRAGMA synchronous", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(sync, 1);
+    assert_eq!(sync, 2);
     let fk: bool = store
         .conn
         .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
@@ -338,6 +338,130 @@ fn job_ids_increase_and_are_never_reused() {
         .insert_job(Uid(1), &spec("true"), &queued(0), 0)
         .unwrap();
     assert_eq!(job.id, JobId(3));
+}
+
+thread_local! {
+    /// Statements run and rows returned on this thread (see [`count_sql`]).
+    static SQL_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn count_sql(event: rusqlite::trace::TraceEvent<'_>) {
+    use rusqlite::trace::TraceEvent;
+    SQL_COUNTS.with(|counts| {
+        let (statements, rows) = counts.get();
+        match event {
+            TraceEvent::Stmt(..) => counts.set((statements + 1, rows)),
+            TraceEvent::Row(_) => counts.set((statements, rows + 1)),
+            _ => {}
+        }
+    });
+}
+
+/// Runs `f` and returns how many statements it ran and rows it read.
+fn sql_counts<T>(store: &Store, f: impl FnOnce(&Store) -> T) -> (T, usize, usize) {
+    use rusqlite::trace::TraceEventCodes;
+    SQL_COUNTS.with(|counts| counts.set((0, 0)));
+    store.conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_STMT | TraceEventCodes::SQLITE_TRACE_ROW,
+        Some(count_sql),
+    );
+    let value = f(store);
+    store.conn.trace_v2(TraceEventCodes::empty(), None);
+    let (statements, rows) = SQL_COUNTS.with(|counts| counts.get());
+    (value, statements, rows)
+}
+
+#[test]
+fn scheduling_reads_only_unfinished_jobs_and_their_dependencies() {
+    let mut store = Store::open_in_memory().unwrap();
+    let success = JobState::Done {
+        result: JobResult::Success,
+    };
+    let failed = JobState::Done {
+        result: JobResult::Failed { exit_code: 1 },
+    };
+    // A long history: finished jobs with env, GPUs and dependencies.
+    store
+        .transaction(|tx| {
+            for _ in 0..2000 {
+                tx.insert_job(Uid(1), &full_spec(), &success, 0)?;
+            }
+            Ok::<_, StorageError>(())
+        })
+        .unwrap();
+    let dep_ok = store.insert_job(Uid(1), &spec("ok"), &success, 0).unwrap();
+    let dep_failed = store.insert_job(Uid(1), &spec("no"), &failed, 0).unwrap();
+    let waiting = store
+        .insert_job(
+            Uid(2),
+            &JobSpec {
+                dependencies: vec![dep_ok.id, dep_failed.id, JobId(999_999)],
+                ..full_spec()
+            },
+            &queued(5),
+            0,
+        )
+        .unwrap();
+    let running = store
+        .insert_job(
+            Uid(1),
+            &JobSpec {
+                dependencies: Vec::new(),
+                ..full_spec()
+            },
+            &JobState::Running,
+            0,
+        )
+        .unwrap();
+    let checkpointed = store
+        .insert_job(Uid(1), &spec("c"), &JobState::Checkpointed, 0)
+        .unwrap();
+    // A finished job depending on a finished one pulls in neither.
+    store
+        .insert_job(
+            Uid(1),
+            &JobSpec {
+                dependencies: vec![JobId(3)],
+                ..spec("d")
+            },
+            &failed,
+            0,
+        )
+        .unwrap();
+
+    let (jobs, statements, rows) = sql_counts(&store, |s| s.list_unfinished_jobs().unwrap());
+    let ids: Vec<JobId> = jobs.iter().map(|j| j.id).collect();
+    assert_eq!(
+        ids,
+        [
+            dep_ok.id,
+            dep_failed.id,
+            waiting.id,
+            running.id,
+            checkpointed.id
+        ]
+    );
+    // One query per table, however many jobs there are; the rows read are
+    // those of the selected jobs only.
+    assert_eq!(statements, 4);
+    assert!(rows < 30, "read {rows} rows");
+    // Loaded completely, exactly as `list_jobs` and `get_job` load them.
+    let all = store.list_jobs(&JobFilter::all()).unwrap();
+    for job in &jobs {
+        assert_eq!(Some(job), all.iter().find(|j| j.id == job.id));
+        assert_eq!(Some(job), store.get_job(job.id).unwrap().as_ref());
+    }
+    assert_eq!(jobs[2].spec.envs, full_spec().envs);
+    assert_eq!(jobs[2].spec.gpus, full_spec().gpus);
+    assert_eq!(
+        jobs[2].spec.dependencies,
+        [dep_ok.id, dep_failed.id, JobId(999_999)]
+    );
+
+    // Listing every job also takes four queries, not some per job.
+    let (all, statements, _) = sql_counts(&store, |s| s.list_jobs(&JobFilter::all()).unwrap());
+    assert_eq!(all.len(), 2006);
+    assert_eq!(statements, 4);
 }
 
 #[test]
@@ -720,6 +844,17 @@ fn gpu_upsert_keeps_configured_parallel() {
 
 // ----- checkpoints -----
 
+const CHECKPOINT_AT: Timestamp = 1_700_000_000_000;
+
+fn unacked_errors(store: &Store, owner: Uid) -> Vec<(JobId, JobErrorKind)> {
+    store
+        .unacknowledged_job_errors(owner)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.job_id, e.kind))
+        .collect()
+}
+
 fn checkpoint(job_id: JobId) -> CheckpointRecord {
     CheckpointRecord {
         job_id,
@@ -727,7 +862,7 @@ fn checkpoint(job_id: JobId) -> CheckpointRecord {
         size_bytes: None,
         gpu_model: Some("NVIDIA GeForce RTX 4090".to_owned()),
         driver_version: Some("570.86.10".to_owned()),
-        created_at: 1_700_000_000_000,
+        created_at: CHECKPOINT_AT,
         status: CheckpointStatus::InProgress,
         failure_reason: None,
         paused: false,
@@ -827,16 +962,20 @@ fn checkpoint_failures_are_reported_once_per_failure() {
     }
     assert_eq!(
         store.unacknowledged_checkpoint_failures(Uid(1)).unwrap(),
-        [a.id]
+        [(a.id, CHECKPOINT_AT)]
     );
     assert_eq!(
         store.unacknowledged_checkpoint_failures(Uid(2)).unwrap(),
-        [other.id]
+        [(other.id, CHECKPOINT_AT)]
     );
 
     // Acknowledging ignores records that did not fail.
     store
-        .acknowledge_checkpoint_failures(&[a.id, b.id, JobId(99)])
+        .acknowledge_checkpoint_failures(&[
+            (a.id, CHECKPOINT_AT),
+            (b.id, CHECKPOINT_AT),
+            (JobId(99), 0),
+        ])
         .unwrap();
     assert!(
         store
@@ -861,13 +1000,26 @@ fn checkpoint_failures_are_reported_once_per_failure() {
     );
 
     // A new dump that fails is a new warning.
-    store.put_checkpoint(&checkpoint(a.id)).unwrap();
+    let later = CheckpointRecord {
+        created_at: CHECKPOINT_AT + 1,
+        ..checkpoint(a.id)
+    };
+    store.put_checkpoint(&later).unwrap();
     store
         .set_checkpoint_status(a.id, CheckpointStatus::Failed, None, Some("boom"))
         .unwrap();
     assert_eq!(
         store.unacknowledged_checkpoint_failures(Uid(1)).unwrap(),
-        [a.id]
+        [(a.id, CHECKPOINT_AT + 1)]
+    );
+    // Acknowledging the earlier failure (read before the new dump) does
+    // not swallow it.
+    store
+        .acknowledge_checkpoint_failures(&[(a.id, CHECKPOINT_AT)])
+        .unwrap();
+    assert_eq!(
+        store.unacknowledged_checkpoint_failures(Uid(1)).unwrap(),
+        [(a.id, CHECKPOINT_AT + 1)]
     );
 }
 
@@ -899,7 +1051,7 @@ fn version_one_database_is_upgraded_keeping_checkpoints() {
     assert!(!record.paused, "old records were not paused");
     assert_eq!(
         store.unacknowledged_checkpoint_failures(Uid(1)).unwrap(),
-        [JobId(0)]
+        [(JobId(0), 0)]
     );
 }
 
@@ -1083,16 +1235,16 @@ fn job_errors_are_kept_without_a_checkpoint_record_and_reported_once() {
         })
     );
     assert_eq!(
-        store.unacknowledged_job_errors(Uid(1)).unwrap(),
+        unacked_errors(&store, Uid(1)),
         [(a.id, JobErrorKind::Restore)]
     );
     assert_eq!(
-        store.unacknowledged_job_errors(Uid(2)).unwrap(),
+        unacked_errors(&store, Uid(2)),
         [(other.id, JobErrorKind::Restore)]
     );
 
     store
-        .acknowledge_job_errors(&[a.id, b.id, JobId(99)])
+        .acknowledge_job_errors(&[(a.id, 10), (b.id, 0), (JobId(99), 0)])
         .unwrap();
     assert!(store.unacknowledged_job_errors(Uid(1)).unwrap().is_empty());
 
@@ -1107,9 +1259,18 @@ fn job_errors_are_kept_without_a_checkpoint_record_and_reported_once() {
         .set_job_error(a.id, JobErrorKind::Restore, "driver mismatch", 13)
         .unwrap();
     assert_eq!(
-        store.unacknowledged_job_errors(Uid(1)).unwrap(),
+        unacked_errors(&store, Uid(1)),
         [(a.id, JobErrorKind::Restore)]
     );
+    // Acknowledging the error read before it (a warning shown while the
+    // new one was recorded) leaves the new one to report.
+    store.acknowledge_job_errors(&[(a.id, 12)]).unwrap();
+    assert_eq!(
+        unacked_errors(&store, Uid(1)),
+        [(a.id, JobErrorKind::Restore)]
+    );
+    store.acknowledge_job_errors(&[(a.id, 13)]).unwrap();
+    assert!(store.unacknowledged_job_errors(Uid(1)).unwrap().is_empty());
 
     assert!(store.clear_job_error(a.id).unwrap());
     assert!(!store.clear_job_error(a.id).unwrap());
@@ -1215,7 +1376,7 @@ fn version_two_database_moves_restore_errors_out_of_checkpoints() {
     assert_eq!(record.failure_reason, None);
     // ... and is reported once, as it never was before.
     assert_eq!(
-        store.unacknowledged_job_errors(Uid(1)).unwrap(),
+        unacked_errors(&store, Uid(1)),
         [(JobId(0), JobErrorKind::Restore)]
     );
 

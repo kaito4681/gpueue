@@ -688,6 +688,8 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     Phase::Checkpointing => RunningPhase::Checkpointing,
                     Phase::Restoring => RunningPhase::Restoring,
                 },
+                uid: Some(e.record.uid),
+                gpus: Some(e.record.gpus.clone()),
             })
             .collect();
         ResponseResult::Running { jobs }

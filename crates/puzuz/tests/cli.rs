@@ -163,6 +163,7 @@ async fn route(
                     checkpoints: None,
                     gpu_detection: None,
                     schema_version: None,
+                    orphan_jobs: None,
                 },
             );
         }
@@ -183,7 +184,13 @@ async fn route(
                 }],
             },
         ),
-        ("GET", "/v1/jobs") => json(StatusCode::OK, ListJobsResponse { jobs: jobs() }),
+        ("GET", "/v1/jobs") => json(
+            StatusCode::OK,
+            ListJobsResponse {
+                jobs: jobs(),
+                orphans: Vec::new(),
+            },
+        ),
         ("GET", "/v1/jobs/2") => {
             // A single job comes with its environment.
             let mut job = jobs().remove(1);

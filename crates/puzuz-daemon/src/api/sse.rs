@@ -14,6 +14,8 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use super::{AppState, Auth};
+use crate::error::Failure;
+use crate::limits::UidPermit;
 use crate::state::DaemonEvent;
 
 struct Subscription {
@@ -21,17 +23,24 @@ struct Subscription {
     caller: Caller,
     cancel: CancellationToken,
     done: bool,
+    /// Counts against the caller's stream limit while open.
+    _permit: UidPermit,
 }
 
 pub async fn events(
     State(core): State<AppState>,
     Auth(caller): Auth,
-) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, Failure> {
+    let permit = core
+        .streams
+        .try_acquire(caller.uid.0)
+        .ok_or_else(super::log::too_many_streams)?;
     let subscription = Subscription {
         events: core.subscribe(),
         caller,
         cancel: core.cancel.clone(),
         done: false,
+        _permit: permit,
     };
     let stream = futures::stream::unfold(subscription, |mut sub| async move {
         if sub.done {
@@ -57,5 +66,5 @@ pub async fn events(
             }
         }
     });
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

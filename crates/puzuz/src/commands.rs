@@ -10,9 +10,9 @@ use chrono::{DateTime, Local};
 use puzuz_core::model::{DEFAULT_GROUP, Group, JobId, JobResult, JobState};
 use puzuz_protocol::api::{
     BulkJobRequest, BulkJobResponse, CleanRequest, CreateGroupRequest, EnqueueOptions, ErrorCode,
-    Event, JobAction, JobSelector, JobView, KillOptions, ListJobsQuery, LogQuery, PauseOptions,
-    ResetRequest, RestartOptions, RestoreOptions, SetGpusParallelRequest, ShutdownRequest,
-    StashOptions, SwitchRequest,
+    Event, JobAction, JobSelector, JobView, KillOptions, ListJobsQuery, ListJobsResponse, LogQuery,
+    PauseOptions, ResetRequest, RestartOptions, RestoreOptions, SetGpusParallelRequest,
+    ShutdownRequest, StashOptions, SwitchRequest,
 };
 use puzuz_protocol::client::{Client, ClientError};
 use serde::Serialize;
@@ -636,7 +636,12 @@ impl App {
     async fn status(&self, query: &[String], json: bool, group: Option<&str>) -> Result<ExitCode> {
         let query = Query::parse(&query.join(" "))?;
         let groups = self.client.list_groups().await?.groups;
-        let all_jobs = self.jobs().await?;
+        // Orphans are only listed for administrators.
+        let ListJobsResponse {
+            jobs: mut all_jobs,
+            orphans,
+        } = self.client.list_jobs(&ListJobsQuery::default()).await?;
+        all_jobs.sort_by_key(|job| job.id);
         let no_jobs_at_all = all_jobs.is_empty();
         let jobs: Vec<JobView> = all_jobs
             .into_iter()
@@ -659,6 +664,9 @@ impl App {
             &self.ctx,
         )?;
         outln!("{output}")?;
+        if !orphans.is_empty() {
+            eprintln!("{}", render::orphans_note(&orphans));
+        }
         Ok(ExitCode::SUCCESS)
     }
 

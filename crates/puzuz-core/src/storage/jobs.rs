@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, Row, params};
 
 use super::{JobFilter, Result};
 use crate::error::{Error, StorageError};
@@ -127,7 +127,7 @@ fn job_row(row: &Row<'_>) -> rusqlite::Result<JobRow> {
                 label: row.get(6)?,
                 no_checkpoint: row.get(7)?,
             },
-            // Placeholder; decoded from `state_data` in `finish_job`.
+            // Placeholder; decoded from `state_data` in `decode_state`.
             state: JobState::Running,
             created_at: row.get(10)?,
             started_at: row.get(11)?,
@@ -138,8 +138,8 @@ fn job_row(row: &Row<'_>) -> rusqlite::Result<JobRow> {
     })
 }
 
-/// Decodes the state and loads env, GPUs and dependencies.
-fn finish_job(conn: &Connection, row: JobRow) -> Result<Job> {
+/// Decodes the state (the child tables are loaded by [`load_where`]).
+fn decode_state(row: JobRow) -> Result<Job> {
     let JobRow {
         mut job,
         state_name,
@@ -154,45 +154,93 @@ fn finish_job(conn: &Connection, row: JobRow) -> Result<Job> {
             job.state.name()
         )));
     }
-
-    job.spec.envs = conn
-        .prepare_cached("SELECT key, value FROM job_env WHERE job_id = ?1")?
-        .query_map([id.0], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    job.spec.gpus = conn
-        .prepare_cached("SELECT gpu_index FROM job_gpus WHERE job_id = ?1 ORDER BY position")?
-        .query_map([id.0], |row| row.get(0).map(GpuIndex))?
-        .collect::<rusqlite::Result<_>>()?;
-    job.spec.dependencies = conn
-        .prepare_cached("SELECT depends_on FROM job_deps WHERE job_id = ?1 ORDER BY position")?
-        .query_map([id.0], |row| row.get(0).map(JobId))?
-        .collect::<rusqlite::Result<_>>()?;
     Ok(job)
 }
 
+/// The jobs matching `condition` (an SQL expression over the `jobs` table
+/// that qualifies its columns with `jobs.`), ordered by id, with env, GPUs
+/// and dependencies. Four queries however many jobs match: each child table
+/// is read once for all of them.
+fn load_where(
+    conn: &Connection,
+    condition: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<Job>> {
+    let rows = conn
+        .prepare_cached(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE {condition} ORDER BY jobs.id"
+        ))?
+        .query_map(params, job_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut jobs = rows
+        .into_iter()
+        .map(decode_state)
+        .collect::<Result<Vec<_>>>()?;
+    let index: HashMap<JobId, usize> = jobs.iter().enumerate().map(|(i, j)| (j.id, i)).collect();
+
+    let mut env = conn.prepare_cached(&format!(
+        "SELECT c.job_id, c.key, c.value FROM job_env c JOIN jobs ON jobs.id = c.job_id
+         WHERE {condition}"
+    ))?;
+    let mut rows = env.query(params)?;
+    while let Some(row) = rows.next()? {
+        if let Some(&i) = index.get(&JobId(row.get(0)?)) {
+            jobs[i].spec.envs.insert(row.get(1)?, row.get(2)?);
+        }
+    }
+    let mut gpus = conn.prepare_cached(&format!(
+        "SELECT c.job_id, c.gpu_index FROM job_gpus c JOIN jobs ON jobs.id = c.job_id
+         WHERE {condition} ORDER BY c.job_id, c.position"
+    ))?;
+    let mut rows = gpus.query(params)?;
+    while let Some(row) = rows.next()? {
+        if let Some(&i) = index.get(&JobId(row.get(0)?)) {
+            jobs[i].spec.gpus.push(GpuIndex(row.get(1)?));
+        }
+    }
+    let mut deps = conn.prepare_cached(&format!(
+        "SELECT c.job_id, c.depends_on FROM job_deps c JOIN jobs ON jobs.id = c.job_id
+         WHERE {condition} ORDER BY c.job_id, c.position"
+    ))?;
+    let mut rows = deps.query(params)?;
+    while let Some(row) = rows.next()? {
+        if let Some(&i) = index.get(&JobId(row.get(0)?)) {
+            jobs[i].spec.dependencies.push(JobId(row.get(1)?));
+        }
+    }
+    Ok(jobs)
+}
+
 pub(super) fn get(conn: &Connection, id: JobId) -> Result<Option<Job>> {
-    let row = conn
-        .prepare_cached(&format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"))?
-        .query_row([id.0], job_row)
-        .optional()?;
-    row.map(|row| finish_job(conn, row)).transpose()
+    Ok(load_where(conn, "jobs.id = ?1", &[&id.0])?.pop())
 }
 
 pub(super) fn list(conn: &Connection, filter: &JobFilter<'_>) -> Result<Vec<Job>> {
-    let rows = conn
-        .prepare_cached(&format!(
-            "SELECT {JOB_COLUMNS} FROM jobs
-             WHERE (?1 IS NULL OR owner_uid = ?1)
-               AND (?2 IS NULL OR group_name = ?2)
-               AND (?3 IS NULL OR state = ?3)
-             ORDER BY id"
-        ))?
-        .query_map(
-            params![filter.owner.map(|u| u.0), filter.group, filter.state],
-            job_row,
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter().map(|row| finish_job(conn, row)).collect()
+    load_where(
+        conn,
+        "(?1 IS NULL OR jobs.owner_uid = ?1)
+         AND (?2 IS NULL OR jobs.group_name = ?2)
+         AND (?3 IS NULL OR jobs.state = ?3)",
+        &[&filter.owner.map(|u| u.0), &filter.group, &filter.state],
+    )
+}
+
+/// What scheduling looks at: every job that has not finished (`done`), and
+/// the finished jobs those depend on (their result decides whether the
+/// dependants may start). Other finished jobs are not read, so a long
+/// history does not slow scheduling down.
+pub(super) fn list_unfinished(conn: &Connection) -> Result<Vec<Job>> {
+    load_where(
+        conn,
+        "jobs.state != 'done'
+         OR jobs.id IN (SELECT d.depends_on FROM job_deps d
+                        JOIN jobs w ON w.id = d.job_id
+                        WHERE w.state != 'done')",
+        &[],
+    )
 }
 
 pub(super) fn update_state(

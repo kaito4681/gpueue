@@ -30,6 +30,11 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    并带有 `x-puzuz-version` 请求头。守护进程从 `SO_PEERCRED` 读取调用者的 uid，检查授权并保存作业。
    日志以原始字节流的形式传输，状态变化则以 Server-Sent Events（`/v1/events`）传输。待处理的警告（例如转储失败）
    通过 `x-puzuz-warnings` 响应头返回，由 CLI 打印到 stderr。
+   <a id="api-limits"></a>每个用户都能连接到该套接字，因此守护进程会限制单个用户同时保持打开的资源：
+   每个 uid 最多 64 个连接和 16 个流（`log --follow`、`/v1/events`），全部连接合计最多 4096 个
+   （`puzuz.service` 把 `LimitNOFILE` 设得远高于此）。超出限制的请求会收到 `too_many_requests`。
+   连接必须在 20 秒内发送请求头，空闲的 keep-alive 连接会在 20 秒后关闭。`log --tail` 最多只在日志末尾
+   4 MiB 内查找行首（如果这一范围内的行数不够，就从那里开始输出），并且同时只运行少量这样的扫描。
 2. **调度。** 当排队作业的组有空闲槽位，且其申请的每块 GPU 都有空闲槽位时，该作业启动。
    守护进程随后请求 helper 创建它。
 3. **守护进程 → helper。** 守护进程与 `/run/puzuz/helper.sock` 保持一个连接，交换以换行分隔的 JSON。
@@ -39,7 +44,12 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    因此即使守护进程在确认之前停止，一个事件也只会被应用一次。无法解码的事件（来自更新版本的 helper）
    会被记录到日志并确认，而不会断开连接。重新连接后，双方会核对各自的作业列表：helper 已不再运行的作业视为丢失（lost）；
    守护进程认为正在创建检查点、但 helper 仍在正常运行的作业，说明其检查点请求已丢失，该作业会以检查点失败的状态回到
-   运行（或暂停）状态。超时的检查点请求也按同样的方式处理。
+   运行（或暂停）状态。超时的检查点请求也按同样的方式处理。在因为 helper 不再知道某个作业而把它标记为丢失之前，
+   守护进程会先应用 helper 在给出该答复之前发送的所有事件，因此刚刚退出的作业会保留其结果。
+   <a id="orphans"></a>如果 helper 正在运行的作业在守护进程看来已完成、正在排队、已创建检查点或根本不存在
+   （例如从备份恢复数据库之后），该作业就是*孤立作业*（orphan）。它会继续运行，其 GPU 计为已占用，
+   具有相同 id 的排队作业在它结束之前不会启动。`puzuz status` 会向管理员列出孤立作业，`puzuz doctor`
+   会对其发出警告，管理员可以用 `puzuz kill <id>` 停止它。
 4. **helper → systemd。** helper 通过 D-Bus 启动一个临时服务，其主进程为
    `puzuz-helper shim`。该单元设置了 `Before=puzuz-helper.service` 和 `KillMode=mixed`，stdin 为
    `/dev/null`，停止超时为 `grace_secs`。每个作业都位于自己的 cgroup 中，独立于守护进程、helper 和用户会话，
@@ -167,7 +177,7 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 
 | 数据 | 位置 | 所有者 |
 | --- | --- | --- |
-| 作业、组、GPU 槽位上限、检查点记录、待处理的警告 | `/var/lib/puzuz/daemon/state.sqlite`（WAL，用 `PRAGMA user_version` 管理 schema 版本） | 守护进程 |
+| 作业、组、GPU 槽位上限、检查点记录、待处理的警告 | `/var/lib/puzuz/daemon/state.sqlite`（WAL 并使用 `synchronous=FULL`，已确认的 helper 事件在断电后也不会丢失；用 `PRAGMA user_version` 管理 schema 版本） | 守护进程 |
 | 作业记录、事件队列 | `/var/lib/puzuz/helper/` | helper |
 | 作业输出 | `/var/lib/puzuz/logs/<uid>/<id>.log` | 目录由 helper 创建（归该用户所有，组为 `puzuz`，模式 2770）。shim 以所有者身份写入日志。守护进程读取和截断日志时不跟随符号链接，并且仅当它是归作业所有者所有的普通文件时才这样做。 |
 | 检查点镜像 | `/var/lib/puzuz/checkpoints/<id>/` | helper（仅 root） |

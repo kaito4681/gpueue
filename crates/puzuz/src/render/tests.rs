@@ -144,6 +144,30 @@ fn status_renders_one_table_per_group() {
 }
 
 #[test]
+fn orphans_note_lists_each_orphan() {
+    let note = orphans_note(&[
+        puzuz_protocol::api::OrphanJob {
+            id: JobId(4),
+            owner: Some(Uid(1000)),
+            gpus: vec![GpuIndex(0), GpuIndex(2)],
+            pid: Some(77),
+        },
+        puzuz_protocol::api::OrphanJob {
+            id: JobId(9),
+            owner: None,
+            gpus: Vec::new(),
+            pid: None,
+        },
+    ]);
+    assert_eq!(
+        note,
+        "Warning: the helper runs jobs the daemon does not account for (their GPUs stay taken \
+         until they end; stop one with `puzuz kill <id>`):\n  job 4, uid 1000, pid 77, GPUs \
+         0,2\n  job 9"
+    );
+}
+
+#[test]
 fn status_for_empty_daemon_shows_hint() {
     let groups = groups();
     let output = status(

@@ -138,6 +138,15 @@ pub struct VersionResponse {
         deserialize_with = "lenient_option"
     )]
     pub schema_version: Option<i64>,
+    /// Jobs the helper runs that the daemon's database does not account
+    /// for (orphans, see [`ListJobsResponse::orphans`](super::ListJobsResponse::orphans)),
+    /// for `puzuz doctor`. Ids only. Absent from daemons that predate it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_option"
+    )]
+    pub orphan_jobs: Option<Vec<JobId>>,
 }
 
 /// Decodes an optional field, yielding `None` instead of an error when the
