@@ -1,10 +1,10 @@
 # Runs every test of puzuz-helper in a NixOS VM, with nothing skipped
 # (`nix build .#checks.x86_64-linux.helper-tests`).
 #
-# The package build skips the tests that cannot pass in the Nix build sandbox
-# (see `skippedTests` in nix/package.nix): mainly those in tests/protocol.rs
-# that start a job, because the helper makes the job's log directory setgid
-# and the sandbox refuses setgid modes. The tests use fakes for systemd, CRIU
+# The package build runs no tests (see `doCheck` in nix/package.nix): those
+# in tests/protocol.rs that start a job cannot pass in the Nix build sandbox,
+# because the helper makes the job's log directory setgid and the sandbox
+# refuses setgid modes. The tests use fakes for systemd, CRIU
 # and the host, and must run as an unprivileged user (tests/protocol.rs
 # asserts it), so the VM only needs a normal user, a real /tmp and python3.
 # A test that skips itself prints "skipped: <why>"; the check fails then, so

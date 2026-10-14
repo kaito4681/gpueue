@@ -74,9 +74,9 @@ jobs:
 
   # flake.nix: evaluate the outputs and run the checks (the home-manager
   # module evaluation; on x86_64 also two NixOS VM tests, which need KVM: the
-  # NixOS module, and every puzuz-helper test including those the sandboxed
-  # package build skips), then build puzuz (which runs the tests that work in
-  # the Nix sandbox) and CRIU on both architectures.
+  # NixOS module, and every puzuz-helper test), run the whole test suite with
+  # the Nix toolchain outside the build sandbox, then build puzuz (without its
+  # tests) and CRIU on both architectures.
   nix:
     strategy:
       fail-fast: false
@@ -99,11 +99,10 @@ jobs:
           # Only where KVM is enabled; the arm runner has no VM tests.
           extra_nix_config: ${{ matrix.runner == 'ubuntu-24.04' && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
       - run: nix flake check -L
-      # The package build skips the tests that spawn jobs (the build sandbox
-      # refuses setgid), and only the x86_64 runner has KVM for the VM test that
-      # runs them; run the whole suite with the Nix toolchain outside the sandbox.
+      # The package build runs no tests: those that spawn jobs cannot pass in
+      # the build sandbox (it refuses setgid). Run the whole suite with the Nix
+      # toolchain outside the sandbox instead, on both architectures.
       - name: Tests outside the build sandbox
-        if: matrix.runner == 'ubuntu-24.04-arm'
         run: nix develop -c cargo test --workspace --locked
       - run: nix build -L .#default
       - run: |

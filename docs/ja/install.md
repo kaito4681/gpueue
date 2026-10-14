@@ -473,7 +473,7 @@ GitHub リリースからは何もダウンロードしません。出力は次�
 | `nixosModules.default` | NixOS モジュール `services.puzuz`（[NixOS](#nixos) を参照） |
 | `homeManagerModules.default` | home-manager モジュール `programs.puzuz`（[home-manager](#home-manager) を参照） |
 | `packages.<system>.helper-tests` | `helper-tests` チェック用の puzuz-helper のテスト実行ファイル（ビルドのみで実行はしない） |
-| `checks.<system>.*` | `home-manager`（モジュールの評価）と、x86_64 では KVM が必要な 2 つの NixOS VM テスト：`nixos`（モジュール）と `helper-tests`（サンドボックス内のパッケージビルドでスキップされるものも含む、puzuz-helper のすべてのテスト） |
+| `checks.<system>.*` | `home-manager`（モジュールの評価）と、x86_64 では KVM が必要な 2 つの NixOS VM テスト：`nixos`（モジュール）と `helper-tests`（puzuz-helper のすべてのテスト。ジョブを起動する helper のテストは Nix のビルドサンドボックス内では通らないため、パッケージビルド自体はテストを実行しない） |
 
 リリースに追従するには `github:kaito4681/puzuz/stable` を使います。`stable` ブランチは、リリースが安定版
 リリースとして公開されたとき、それが最も高いバージョンであれば、そのタグに移動します（ドラフト、プレリリース、
