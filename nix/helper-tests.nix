@@ -1,6 +1,6 @@
 # The test executables of puzuz-helper (its unit tests, the binary's tests
-# and tests/protocol.rs), built like the package but not run: some of them
-# cannot pass in the build sandbox (see `skippedTests` in package.nix), so
+# and tests/protocol.rs), built like the package but not run: many of them
+# cannot pass in the build sandbox (see `doCheck` in package.nix), so
 # nix/tests/helper-tests.nix runs all of them in a NixOS VM instead.
 #
 # Installed as $out/bin/<target>-<kind>, e.g. protocol-test.

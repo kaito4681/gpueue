@@ -423,7 +423,7 @@ sudo dnf remove puzuz
 | `nixosModules.default` | NixOS 模块 `services.puzuz`（参见 [NixOS](#nixos)） |
 | `homeManagerModules.default` | home-manager 模块 `programs.puzuz`（参见 [home-manager](#home-manager)） |
 | `packages.<system>.helper-tests` | puzuz-helper 的测试可执行文件（只构建，不运行），供 `helper-tests` 检查使用 |
-| `checks.<system>.*` | `home-manager`（模块求值），以及在 x86_64 上需要 KVM 的两个 NixOS VM 测试：`nixos`（该模块）和 `helper-tests`（所有 puzuz-helper 测试，包括沙箱化的软件包构建所跳过的那些） |
+| `checks.<system>.*` | `home-manager`（模块求值），以及在 x86_64 上需要 KVM 的两个 NixOS VM 测试：`nixos`（该模块）和 `helper-tests`（所有 puzuz-helper 测试；由于 helper 中启动作业的测试无法在 Nix 构建沙箱内通过，软件包构建本身不运行测试） |
 
 要跟随发布版本，请使用 `github:kaito4681/puzuz/stable`：当某个发布版本作为稳定版本发布、且是最高版本时，
 `stable` 分支会移动到它的标签（绝不会移动到草稿、预发布版本或旧系列的补丁版本；见

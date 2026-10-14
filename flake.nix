@@ -31,6 +31,8 @@
             rustfmt
             rust-analyzer
             shellcheck
+            # forkguard's test runs a Python script (and skips itself without it).
+            python3
           ];
         };
       });

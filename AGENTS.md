@@ -24,10 +24,11 @@
   `nix/nixos-module.nix`, the home-manager module `nix/home-manager-module.nix`, and their tests
   in `nix/tests/`). Without Nix on the host, run `nix flake check` / `nix build .#default` in a
   pinned `nixos/nix` Docker image; the NixOS VM tests (`.#checks.x86_64-linux.nixos`, and
-  `.#checks.x86_64-linux.helper-tests`, which runs every puzuz-helper test including those the
-  sandboxed build skips) need `--device /dev/kvm` and
-  `--option system-features "kvm nixos-test"`. Tests that cannot
-  pass in the Nix sandbox are listed in `nix/package.nix`. Published stable releases move the `stable` branch
+  `.#checks.x86_64-linux.helper-tests`, which runs every puzuz-helper test) need `--device /dev/kvm` and
+  `--option system-features "kvm nixos-test"`. The package build
+  runs no tests (`doCheck = false`: the helper's job-spawning tests cannot pass in the Nix
+  sandbox, which refuses setgid); CI runs `nix develop -c cargo test --workspace --locked`
+  instead. Published stable releases move the `stable` branch
   (`.github/workflows/release-nix.yml`). The module generates its units from `packaging/`.
 - CI (`.github/workflows/ci.yml`, on pull requests) has these jobs: `lint` (fmt, clippy), `test`,
   `msrv` (`rust-version`), `shellcheck`, the CPU e2e, `service-install`, `dist-build` and `dist`
