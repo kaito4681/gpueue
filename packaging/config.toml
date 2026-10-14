@@ -74,6 +74,13 @@
 # the distribution's criu). "plugin": CRIU's CUDA plugin does it.
 # cuda_checkpoint_mode = "manual"
 
+# [helper] GPU isolation: every job unit gets DevicePolicy=closed and may open
+# only the NVIDIA device nodes of the GPUs it was assigned (/dev/nvidia<minor>,
+# /dev/nvidiactl, /dev/nvidia-uvm, /dev/nvidia-uvm-tools, /dev/nvidia-modeset);
+# CPU jobs get none. false: no device restrictions, CUDA_VISIBLE_DEVICES alone
+# selects the GPUs (needed for MIG, see docs/install.md).
+# gpu_device_isolation = true
+
 # [helper] Deadline of a whole checkpoint (CUDA lock + checkpoint + criu dump)
 # or restore (criu restore + CUDA restore + unlock) of one job, in seconds:
 #   base + per_gib * GiB

@@ -325,6 +325,32 @@ fn check_helper_settings(sys: &dyn System, config: &Config, nixos: bool) -> Chec
     })
 }
 
+/// `gpu_device_isolation`: whether job units may open only their GPUs' device nodes.
+fn check_gpu_isolation(config: &Config, nixos: bool) -> Check {
+    const NAME: &str = "gpu isolation";
+    if config.gpu_device_isolation {
+        return Check::ok(
+            NAME,
+            "on: job units get DevicePolicy=closed and may open only their assigned GPUs' \
+             /dev/nvidia* nodes (none for CPU jobs)",
+        );
+    }
+    let how = if nixos {
+        format!("set `services.puzuz.settings.gpu_device_isolation = true`, then `{REBUILD}`")
+    } else {
+        format!(
+            "set `gpu_device_isolation = true` in {DEFAULT_CONFIG_PATH} and \
+             `sudo systemctl restart {HELPER_UNIT}`"
+        )
+    };
+    Check::info(
+        NAME,
+        "off (gpu_device_isolation = false): every job can open every GPU; only \
+         CUDA_VISIBLE_DEVICES selects them",
+    )
+    .hint(format!("unless you need it off (e.g. for MIG), {how}"))
+}
+
 /// The `--flags` (without values) of a command line.
 fn flags_of(argv: &[String]) -> Vec<String> {
     argv.iter()
@@ -430,6 +456,7 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     }
     checks.push(check_helper_binary(sys, nixos));
     checks.push(check_helper_settings(sys, &config, nixos));
+    checks.push(check_gpu_isolation(&config, nixos));
     if let Some(check) = check_daemon_write_paths(sys, &config, nixos) {
         checks.push(check);
     }

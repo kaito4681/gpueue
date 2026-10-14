@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
 
 use crate::config::{HelperConfig, SHUTDOWN_MANIFEST};
+use crate::devices::DeviceRule;
 use crate::events::EventStore;
 use crate::host::{DumpHazards, HostProbe, ProcInfo};
 use crate::jobs::{self, JobFiles, JobRecord, RecordPhase, ShimSpec, UnitKind};
@@ -524,6 +525,9 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         self.ensure_log_dir(req)
             .map_err(|e| internal("preparing the log directory", e))?;
 
+        let devices = self
+            .unit_devices(req.job, &req.gpus)
+            .map_err(|e| error(HelperErrorCode::SpawnFailed, e))?;
         let mut argv = req.shell.clone();
         argv.push(req.command.clone());
         let mut envs = req.envs.clone();
@@ -571,8 +575,45 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             files: files.clone(),
             argv,
             envs,
+            devices,
         };
         self.launcher.spawn(&spec).await.map_err(Into::into)
+    }
+
+    /// The device access of a unit of `job` with `gpus` (see
+    /// [`crate::devices`]): `None` without `gpu_device_isolation`.
+    fn unit_devices(
+        &self,
+        job: JobId,
+        gpus: &[puzuz_protocol::helper::GpuIndex],
+    ) -> Result<Option<Vec<DeviceRule>>, String> {
+        if !self.cfg.gpu_device_isolation {
+            return Ok(None);
+        }
+        if gpus.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let minors = self.host.gpu_device_minors().map_err(|e| {
+            format!(
+                "finding the device nodes of the GPUs for gpu_device_isolation \
+                 ({}): {e}",
+                crate::devices::NVIDIA_GPUS_DIR
+            )
+        })?;
+        let unknown: Vec<String> = gpus
+            .iter()
+            .filter(|g| g.0 as usize >= minors.len())
+            .map(|g| g.0.to_string())
+            .collect();
+        if !unknown.is_empty() {
+            eprintln!(
+                "puzuz-helper: job {}: the NVIDIA driver knows no GPU {}; the job cannot open it \
+                 (gpu_device_isolation)",
+                job.0,
+                unknown.join(", ")
+            );
+        }
+        Ok(Some(crate::devices::job_device_allow(gpus, &minors)))
     }
 
     fn is_managed_log(&self, req: &SpawnRequest) -> bool {
@@ -1723,6 +1764,12 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         else {
             return fail(self, "empty restore plan".into());
         };
+        // The GPUs of this restore (the restored processes reopen their
+        // device nodes there, and CRIU's CUDA plugin runs in the unit).
+        let devices = match self.unit_devices(job, &req.gpus) {
+            Ok(d) => d,
+            Err(e) => return fail(self, e),
+        };
         let spec = RestoreSpec {
             job,
             unit: unit.clone(),
@@ -1730,6 +1777,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             pidfile: dir.restore_pidfile(),
             timeout: timeout.min(deadline.remaining()),
             criu_root: self.cfg.criu_root.clone(),
+            devices,
         };
         let pid = match self.launcher.restore(&spec).await {
             Ok(pid) => pid,

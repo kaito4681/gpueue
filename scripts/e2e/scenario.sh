@@ -244,6 +244,10 @@ s3_limits() {
     b=$(add bob -g free --gpu 0 -- 'echo CVD=$CUDA_VISIBLE_DEVICES; sleep 0.5')
     c=$(add alice -g free --gpu 1 -- 'echo CVD=$CUDA_VISIBLE_DEVICES; sleep 1')
     wait_state "$a" running
+    # GPU isolation (gpu_device_isolation = true, the default): every job
+    # unit is DevicePolicy=closed.
+    [ "$(systemctl show -p DevicePolicy --value "puzuz-job-$a.service")" = closed ] \
+        || fail "job $a's unit is not DevicePolicy=closed"
     wait_state "$c" running
     expect_state "$b" queued
     wait_state "$b" 'done/*' 30
@@ -440,12 +444,30 @@ check_cuda_mode() {
     fi
 }
 
-# PUZUZ_E2E_GPU=1 only: a CUDA job (GPU 0 is real) keeps its GPU memory
-# across checkpoint/restore.
+# PUZUZ_E2E_GPU=1 only: GPU isolation, and a CUDA job (GPU 0 is real)
+# keeps its GPU memory across checkpoint/restore in a restore unit that is
+# isolated to GPU 0 as well.
 s9_gpu() {
-    local id before after
+    local id before after cpu gpu probe
     pz carol gpu parallel 1 || fail "gpu parallel"
     free_group
+    # GPU isolation: a CPU job cannot open any NVIDIA device; a job on GPU 0
+    # can open that GPU's nodes. What nvidia-smi sees is printed.
+    probe='python3 /e2e/open_dev.py /dev/null /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia0'
+    probe="$probe; nvidia-smi -L; echo nvidia-smi exit status \$?"
+    cpu=$(add alice -g free -- "$probe")
+    gpu=$(add alice -g free --gpu 0 -- "$probe")
+    wait_state "$cpu" 'done/*' 60
+    wait_state "$gpu" 'done/*' 60
+    echo "--- CPU job $cpu:"; cat "$LOGS/1000/$cpu.log"
+    echo "--- GPU job $gpu:"; cat "$LOGS/1000/$gpu.log"
+    for dev in nvidiactl nvidia-uvm nvidia0; do
+        grep -qx "open /dev/$dev: EPERM" "$LOGS/1000/$cpu.log" \
+            || fail "the CPU job $cpu could open /dev/$dev"
+        grep -qx "open /dev/$dev: ok" "$LOGS/1000/$gpu.log" \
+            || fail "the GPU job $gpu could not open /dev/$dev"
+    done
+    grep -qx "open /dev/null: ok" "$LOGS/1000/$cpu.log" || fail "the CPU job could not open /dev/null"
     id=$(add alice -g free --gpu 0 -- 'exec /opt/venv/bin/python3 -u /e2e/gpu_counter.py')
     wait_state "$id" running
     wait_for 60 "the GPU job to print" bash -c "[ \$(wc -l < $LOGS/1000/$id.log) -ge 5 ]"
@@ -455,6 +477,12 @@ s9_gpu() {
     before=$(last_line 1000 "$id" | cut -d' ' -f1)
     pz alice restore "$id" || fail "restore"
     wait_state "$id" running 300
+    # The restore unit is isolated to the GPU of the restore, too.
+    [ "$(systemctl show -p DevicePolicy --value "puzuz-job-$id-r1.service")" = closed ] \
+        || fail "the restore unit of job $id is not DevicePolicy=closed"
+    systemctl show -p DeviceAllow --value "puzuz-job-$id-r1.service" | grep -q '/dev/nvidia0 rw' \
+        || fail "the restore unit of job $id may not open /dev/nvidia0: \
+$(systemctl show -p DeviceAllow "puzuz-job-$id-r1.service")"
     sleep 2
     after=$(last_line 1000 "$id" | cut -d' ' -f1)
     echo "GPU counter before dump: $before, after restore: $after"

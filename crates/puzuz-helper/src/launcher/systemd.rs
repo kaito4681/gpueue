@@ -16,6 +16,10 @@
 //!   because systemd opens that file as root, following symlinks, in a
 //!   directory the job's owner controls; the shim opens the log itself
 //!   after dropping privileges.
+//! - With `gpu_device_isolation` (the default), `DevicePolicy=closed` and a
+//!   `DeviceAllow=` list of the assigned GPUs' NVIDIA device nodes (none
+//!   for a CPU job; see [`crate::devices`]). Restored units get the same
+//!   for the GPUs of the restore.
 //!
 //! Restored job unit `puzuz-job-<id>-r<n>.service`: `Type=forking`,
 //! `PIDFile=`, `ExecStart=<helper> criu-wrap <root> criu restore -d
@@ -38,6 +42,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use super::{
     LaunchError, LaunchResult, LaunchSpec, Launcher, RestoreSpec, UnitState, parse_unit_name,
 };
+use crate::devices::DeviceRule;
 use crate::host::children_of;
 use crate::jobs::{StartFailure, StartReport, UnitKind};
 
@@ -352,6 +357,7 @@ impl Launcher for SystemdLauncher {
         let dir = spec.files.dir().to_string_lossy().into_owned();
         let mut props =
             self.common_props(format!("puzuz job {}: {}", spec.job.0, spec.argv.join(" ")));
+        props.extend(device_props(spec.devices.as_deref()));
         props.extend([
             ("Type", Value::from("exec")),
             (
@@ -393,6 +399,7 @@ impl Launcher for SystemdLauncher {
         argv.push(criu.to_string_lossy().into_owned());
         argv.extend(spec.command.args_lossy());
         let mut props = self.common_props(format!("puzuz job {} (restored)", spec.job.0));
+        props.extend(device_props(spec.devices.as_deref()));
         props.extend([
             ("Type", Value::from("forking")),
             (
@@ -559,6 +566,18 @@ impl Launcher for SystemdLauncher {
     }
 }
 
+/// `DevicePolicy=closed` with `DeviceAllow=` of `devices` (an array of
+/// `(path, access)` on D-Bus); nothing without isolation.
+pub fn device_props(devices: Option<&[DeviceRule]>) -> Props<'static> {
+    let Some(devices) = devices else {
+        return Vec::new();
+    };
+    vec![
+        ("DevicePolicy", Value::from("closed")),
+        ("DeviceAllow", Value::from(devices.to_vec())),
+    ]
+}
+
 /// `KillUnit`'s `whom`: signals the shim forwards (see
 /// [`crate::shim::FORWARDED`]) go to the main process only; those it cannot
 /// (STOP, CONT, KILL) go to every process. The helper refuses all others
@@ -644,6 +663,25 @@ mod tests {
         assert!(!crate::shim::is_forwardable(17)); // CHLD
         assert!(!crate::shim::is_forwardable(11)); // SEGV
         assert!(!crate::shim::is_forwardable(34)); // SIGRTMIN
+    }
+
+    #[test]
+    fn device_properties() {
+        assert!(device_props(None).is_empty());
+        let rules = vec![
+            ("/dev/nvidia1".to_owned(), "rw".to_owned()),
+            ("/dev/nvidiactl".to_owned(), "rw".to_owned()),
+        ];
+        let props = device_props(Some(&rules));
+        assert_eq!(props.len(), 2);
+        assert_eq!(props[0], ("DevicePolicy", Value::from("closed")));
+        assert_eq!(props[1].0, "DeviceAllow");
+        assert_eq!(props[1].1.value_signature().to_string(), "a(ss)");
+        assert_eq!(props[1].1, Value::from(rules));
+        // A CPU job: closed, nothing allowed beyond systemd's pseudo devices.
+        let props = device_props(Some(&[]));
+        assert_eq!(props[0], ("DevicePolicy", Value::from("closed")));
+        assert_eq!(props[1].1.value_signature().to_string(), "a(ss)");
     }
 
     #[test]

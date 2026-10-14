@@ -82,6 +82,9 @@ pub struct HelperConfig {
     /// The installed fork guard, put into every job's `LD_PRELOAD`. Set at
     /// start-up when the installation succeeded.
     pub job_preload: Option<PathBuf>,
+    /// Restrict every job unit's device access to its assigned GPUs (see
+    /// [`crate::devices`]).
+    pub gpu_device_isolation: bool,
 }
 
 impl Default for HelperConfig {
@@ -104,6 +107,7 @@ impl Default for HelperConfig {
             nvidia_smi: PathBuf::from("nvidia-smi"),
             fork_guard_dir: Some(PathBuf::from(DEFAULT_FORK_GUARD_DIR)),
             job_preload: None,
+            gpu_device_isolation: true,
         }
     }
 }
@@ -155,6 +159,7 @@ impl HelperConfig {
                 .job_stop_timeout
                 .unwrap_or(Duration::from_secs(file.grace_secs)),
             fork_guard_dir: file.fork_guard.then(|| file.data_dir.join("lib")),
+            gpu_device_isolation: file.gpu_device_isolation,
             ..HelperConfig::default()
         };
         let ck = &mut cfg.checkpoint;
@@ -396,6 +401,18 @@ mod tests {
         assert_eq!(c.checkpoint.cuda.path, PathBuf::from("/flag/cc"));
         assert_eq!(c.nvidia_smi, PathBuf::from("/flag/smi"));
         assert_eq!(c.job_stop_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn gpu_device_isolation_is_on_unless_disabled() {
+        let r = HelperConfig::resolve(&file(""), Overrides::default());
+        assert!(r.config.gpu_device_isolation);
+        assert!(HelperConfig::default().gpu_device_isolation);
+        let r = HelperConfig::resolve(
+            &file("gpu_device_isolation = false\n"),
+            Overrides::default(),
+        );
+        assert!(!r.config.gpu_device_isolation);
     }
 
     #[test]

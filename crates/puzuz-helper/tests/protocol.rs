@@ -813,6 +813,96 @@ async fn checkpoint_then_restore() {
     assert!(matches!(c.event().await.event, Event::JobExited { .. }));
 }
 
+/// With `gpu_device_isolation` (the default), job units may open the
+/// device nodes of their GPUs only, found by minor number; restore units
+/// get those of the GPUs of the restore.
+#[tokio::test]
+async fn units_may_open_only_their_gpus() {
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    // GPU index 0 is /dev/nvidia4, index 1 /dev/nvidia2.
+    env.host.set_gpu_minors(vec![4, 2]);
+    let devices = |nodes: &[&str]| {
+        let mut all: Vec<String> = nodes.iter().map(|n| (*n).to_owned()).collect();
+        all.extend(
+            [
+                "/dev/nvidiactl",
+                "/dev/nvidia-uvm",
+                "/dev/nvidia-uvm-tools",
+                "/dev/nvidia-modeset",
+                "char-nvidia-uvm",
+            ]
+            .map(String::from),
+        );
+        Some(
+            all.into_iter()
+                .map(|p| (p, "rw".to_owned()))
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    let image_dir = spawn_and_dump(&env, &mut c, 1).await;
+    assert_eq!(
+        env.launcher.spawned()[0].devices,
+        devices(&["/dev/nvidia4"])
+    );
+    let r = c
+        .request(Request::Restore(RestoreRequest {
+            job: JobId(1),
+            uid: Uid(uid()),
+            image_dir,
+            gpus: vec![GpuIndex(1), GpuIndex(0)],
+        }))
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::RestoreFinished {
+                outcome: RestoreOutcome::Success { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    assert_eq!(
+        env.launcher.restored()[0].devices,
+        devices(&["/dev/nvidia2", "/dev/nvidia4"])
+    );
+
+    // A CPU job: no NVIDIA device at all.
+    let mut cpu = env.spawn_req(2);
+    cpu.gpus.clear();
+    assert!(matches!(
+        c.request(Request::Spawn(cpu)).await,
+        ResponseResult::Spawned { .. }
+    ));
+    assert_eq!(env.launcher.spawned()[1].devices, Some(Vec::new()));
+    assert_eq!(env.launcher.spawned()[1].envs["CUDA_VISIBLE_DEVICES"], "");
+
+    // A GPU the driver does not know adds no node of its own.
+    let mut unknown = env.spawn_req(3);
+    unknown.gpus = vec![GpuIndex(7)];
+    assert!(matches!(
+        c.request(Request::Spawn(unknown)).await,
+        ResponseResult::Spawned { .. }
+    ));
+    assert_eq!(env.launcher.spawned()[2].devices, devices(&[]));
+
+    // `gpu_device_isolation = false`: no device restrictions.
+    drop(c);
+    let mut cfg = with_mode(config(&env.root, uid()), &env.root, env.mode);
+    cfg.gpu_device_isolation = false;
+    env.restart_with(cfg).await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(4))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    assert_eq!(env.launcher.spawned()[3].devices, None);
+}
+
 /// Spawns job `job` and checkpoints it successfully; the image directory.
 async fn spawn_and_dump(env: &Env, c: &mut Client, job: u64) -> PathBuf {
     assert!(matches!(
@@ -1118,6 +1208,7 @@ async fn an_interrupted_restore_is_killed_and_reported() {
             pidfile: image_dir.join("restore.pid"),
             timeout: Duration::from_secs(1),
             criu_root: None,
+            devices: None,
         })
         .await
         .unwrap();

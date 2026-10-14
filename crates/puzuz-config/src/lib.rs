@@ -32,6 +32,7 @@
 //! cuda_checkpoint_path = "cuda-checkpoint"
 //! nvidia_smi_path = "nvidia-smi"
 //! cuda_checkpoint_mode = "manual"
+//! gpu_device_isolation = true
 //! checkpoint_deadline_base_secs = 180
 //! checkpoint_deadline_secs_per_gib = 30
 //! fork_guard = true
@@ -134,6 +135,12 @@ pub struct Config {
     pub nvidia_smi_path: PathBuf,
     /// Who drives `cuda-checkpoint` during a dump/restore (helper only).
     pub cuda_checkpoint_mode: CudaCheckpointMode,
+    /// Restrict each job unit's device access to the GPUs it was assigned
+    /// (helper only): `DevicePolicy=closed` with `DeviceAllow=` of the
+    /// assigned GPUs' `/dev/nvidia<minor>` and the shared NVIDIA nodes; CPU
+    /// jobs get no NVIDIA device. `false` leaves device access alone (only
+    /// `CUDA_VISIBLE_DEVICES` selects the GPUs).
+    pub gpu_device_isolation: bool,
     /// Fixed part of the deadline of a whole checkpoint or restore of a
     /// job, in seconds (helper only). The deadline is
     /// `checkpoint_deadline_base_secs + checkpoint_deadline_secs_per_gib *
@@ -352,6 +359,7 @@ impl Default for Config {
             cuda_checkpoint_path: PathBuf::from("cuda-checkpoint"),
             nvidia_smi_path: PathBuf::from("nvidia-smi"),
             cuda_checkpoint_mode: CudaCheckpointMode::Manual,
+            gpu_device_isolation: true,
             checkpoint_deadline_base_secs: 180,
             checkpoint_deadline_secs_per_gib: 30,
             criu_dump_timeout_secs: None,
@@ -599,6 +607,7 @@ mod tests {
         assert_eq!(config.checkpoint_deadline_base_secs, 180);
         assert_eq!(config.checkpoint_deadline_secs_per_gib, 30);
         assert!(config.fork_guard);
+        assert!(config.gpu_device_isolation);
         let p = &config.priority;
         assert_eq!(p.priority_type, PriorityType::Multifactor);
         assert_eq!(p.priority_weight_age, 1000);
@@ -715,6 +724,7 @@ mod tests {
             daemon_user = "svc-puzuz"
             nvidia_smi_path = "/opt/nvidia-smi"
             cuda_checkpoint_mode = "plugin"
+            gpu_device_isolation = false
             criu_dump_timeout_secs = 60
             criu_restore_timeout_secs = 90
             checkpoint_deadline_base_secs = 20
@@ -757,6 +767,7 @@ mod tests {
         assert_eq!(config.daemon_user, "svc-puzuz");
         assert_eq!(config.nvidia_smi_path, PathBuf::from("/opt/nvidia-smi"));
         assert_eq!(config.cuda_checkpoint_mode, CudaCheckpointMode::Plugin);
+        assert!(!config.gpu_device_isolation);
         assert_eq!(config.criu_dump_timeout_secs, Some(60));
         assert_eq!(config.criu_restore_timeout_secs, Some(90));
         assert_eq!(config.checkpoint_deadline_base_secs, 20);

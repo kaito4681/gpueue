@@ -58,6 +58,9 @@ pub trait HostProbe: Send + Sync + 'static {
     fn job_processes(&self, init_pid: u32) -> io::Result<Vec<ProcInfo>>;
     /// GPUs and the processes using them.
     fn gpu_snapshot(&self) -> io::Result<GpuSnapshot>;
+    /// Minor numbers of the GPUs' device nodes, by GPU index (see
+    /// [`crate::devices::read_gpu_minors`]).
+    fn gpu_device_minors(&self) -> io::Result<Vec<u32>>;
     fn available_bytes(&self, path: &Path) -> io::Result<u64>;
     fn is_tmpfs(&self, path: &Path) -> io::Result<bool>;
     /// Map inner PIDs of the namespace of `ns_member` to host PIDs.
@@ -181,6 +184,9 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     }
     fn gpu_snapshot(&self) -> io::Result<GpuSnapshot> {
         (**self).gpu_snapshot()
+    }
+    fn gpu_device_minors(&self) -> io::Result<Vec<u32>> {
+        (**self).gpu_device_minors()
     }
     fn available_bytes(&self, path: &Path) -> io::Result<u64> {
         (**self).available_bytes(path)
@@ -332,6 +338,10 @@ impl HostProbe for SystemHost {
             "--format=csv,noheader,nounits",
         ])?;
         Ok(parse_nvidia_smi(&gpus, &apps))
+    }
+
+    fn gpu_device_minors(&self) -> io::Result<Vec<u32>> {
+        crate::devices::read_gpu_minors(&self.proc_root.join("driver/nvidia/gpus"))
     }
 
     fn available_bytes(&self, path: &Path) -> io::Result<u64> {

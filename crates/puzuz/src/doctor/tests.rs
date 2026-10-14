@@ -544,6 +544,23 @@ fn helper_settings_come_from_the_config_unless_flags_override_them() {
 }
 
 #[test]
+fn gpu_isolation_is_shown() {
+    let (sys, _sockets) = healthy();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpu isolation"), Level::Ok);
+    assert!(message(&report, "gpu isolation").starts_with("on: "));
+
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!("gpu_device_isolation = false\n{CONFIG}"),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "gpu isolation"), Level::Info);
+    assert!(message(&report, "gpu isolation").starts_with("off "));
+    assert!(hint(&report, "gpu isolation").contains("gpu_device_isolation = true"));
+}
+
+#[test]
 fn kernel_checks() {
     let (sys, _sockets) = healthy();
     sys.write("/proc/sys/kernel/osrelease", "5.4.0\n");

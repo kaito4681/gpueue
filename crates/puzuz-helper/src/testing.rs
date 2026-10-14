@@ -19,6 +19,8 @@ use crate::host::{DumpHazards, GpuSnapshot, HostProbe, ProcInfo, UserInfo};
 pub struct FakeHost {
     users: Mutex<BTreeMap<u32, UserInfo>>,
     gpus: Mutex<GpuSnapshot>,
+    /// See [`FakeHost::set_gpu_minors`].
+    minors: Mutex<Option<Vec<u32>>>,
     available: Mutex<Option<u64>>,
     cuda: Mutex<Vec<u32>>,
     mounts: Mutex<Vec<String>>,
@@ -48,6 +50,12 @@ impl FakeHost {
 
     pub fn set_gpus(&self, snap: GpuSnapshot) {
         *self.gpus.lock().unwrap() = snap;
+    }
+
+    /// Minor numbers of the GPUs' device nodes by index. Unset: GPU index
+    /// `i` has minor `i`, for the GPUs of [`FakeHost::set_gpus`].
+    pub fn set_gpu_minors(&self, minors: Vec<u32>) {
+        *self.minors.lock().unwrap() = Some(minors);
     }
 
     /// Host PIDs reported as using CUDA.
@@ -86,6 +94,21 @@ impl HostProbe for FakeHost {
 
     fn gpu_snapshot(&self) -> io::Result<GpuSnapshot> {
         Ok(self.gpus.lock().unwrap().clone())
+    }
+
+    fn gpu_device_minors(&self) -> io::Result<Vec<u32>> {
+        if let Some(minors) = self.minors.lock().unwrap().clone() {
+            return Ok(minors);
+        }
+        let count = self
+            .gpus
+            .lock()
+            .unwrap()
+            .gpus
+            .iter()
+            .map(|g| g.index + 1)
+            .max();
+        Ok((0..count.unwrap_or(0)).collect())
     }
 
     fn available_bytes(&self, _path: &Path) -> io::Result<u64> {

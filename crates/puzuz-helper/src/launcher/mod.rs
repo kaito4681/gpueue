@@ -22,6 +22,7 @@ use std::time::Duration;
 use puzuz_checkpoint::CommandSpec;
 use puzuz_protocol::helper::{ExitStatus, HelperErrorCode, JobId};
 
+use crate::devices::DeviceRule;
 use crate::jobs::{JobFiles, UnitKind};
 
 /// Everything needed to start a job unit.
@@ -35,6 +36,8 @@ pub struct LaunchSpec {
     /// For the unit description and tests; the shim reads `spawn.json`.
     pub argv: Vec<String>,
     pub envs: BTreeMap<String, String>,
+    /// See [`RestoreSpec::devices`].
+    pub devices: Option<Vec<DeviceRule>>,
 }
 
 /// A `criu restore` to run in a fresh job unit.
@@ -49,6 +52,10 @@ pub struct RestoreSpec {
     /// Where `/` is bind-mounted (in a private mount namespace) for
     /// `criu restore --root`.
     pub criu_root: Option<PathBuf>,
+    /// `Some`: the unit gets `DevicePolicy=closed` and these `DeviceAllow=`
+    /// entries (see [`crate::devices`]); `None`: no device restrictions
+    /// (`gpu_device_isolation = false`).
+    pub devices: Option<Vec<DeviceRule>>,
 }
 
 /// What the service manager knows about a unit.
