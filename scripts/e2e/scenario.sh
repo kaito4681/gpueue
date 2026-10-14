@@ -1190,7 +1190,7 @@ while True:
         grep -qx "round $r done" <<<"$log" || fail "round $r did not finish"
     done
     for r in "systemctl --system start" "busctl --system call" "connect to the system bus socket" \
-        "connect to the docker socket" "open the block device" "run0 true" uid gid groups \
+        "connect to the docker socket" "open the block device" uid gid groups \
         NoNewPrivs CapPrm CapEff CapBnd; do
         [ "$(grep -cx "ok $r" <<<"$log")" = 2 ] || fail "check '$r' did not pass in both rounds"
     done
@@ -1199,6 +1199,9 @@ while True:
     fi
     if command -v pkexec >/dev/null; then
         [ "$(grep -cx 'ok pkexec true' <<<"$log")" = 2 ] || fail "the pkexec check did not run twice"
+    fi
+    if command -v run0 >/dev/null; then
+        [ "$(grep -cx 'ok run0 true' <<<"$log")" = 2 ] || fail "the run0 check did not run twice"
     fi
     [ ! -e /run/e2e-escalated ] || fail "a job started the root-only unit"
 
