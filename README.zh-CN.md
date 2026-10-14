@@ -10,7 +10,8 @@
 并从中断处继续运行，而不必从头开始。
 
 > **状态：预发布。** 下文所述的全部功能均已实现，并已在 Docker 中测试（systemd 作为 PID 1、
-> 真实的 CRIU、真实的 NVIDIA GPU）。但尚**未**在真实主机上经历真实重启的测试。
+> 真实的 CRIU、真实的 NVIDIA GPU），并在运行 CPU 作业的 QEMU/KVM 虚拟机的真实重启和关机中测试过。
+> 但尚**未**在物理机（裸机）上或带着 GPU 作业经历真实重启的测试。
 > 参见[项目状态](#project-status)。
 
 > **尚未发布任何版本。** 下面的下载链接、APT 仓库和 `stable` 分支将从第一个版本发布起可用。
@@ -414,11 +415,18 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - 在 Docker 中使用真实 GPU（驱动 595、手动模式的 CRIU 4.2.1、Python 3.12 上的 PyTorch 2.8）：
   CUDA 计数器以及使用 fork 出的 DataLoader worker 的 PyTorch 训练的检查点/恢复，
   其结果与未中断的运行完全相同；以及守护进程在打包好的、沙箱化的 `puzuz.service` 中通过 NVML 检测 GPU。
+- QEMU/KVM 虚拟机的真实操作系统重启和关机（`scripts/vm-reboot-test.sh`）：Ubuntu 26.04、systemd 259 和
+  CRIU 4.2，puzuz 通过 `puzuz service install` 安装，`/var/lib/puzuz` 位于独立的 ext4 磁盘上，运行两个用户的
+  CPU 作业以及一个 `--no-checkpoint` 作业。场景包括 `systemctl reboot`、`systemctl poweroff` 后重新启动，
+  以及在一个 1 GiB 作业的 `puzuz checkpoint` 仍在进行时重启。每次启动后，上一次启动的 journal 必须显示正确的
+  停止顺序（守护进程最先停止，helper 在自身停止之前转储作业，`--no-checkpoint` 作业的 unit 只在 helper 之后
+  停止，最后卸载 `/var/lib/puzuz`），且没有超时或
+  SIGKILL；`--no-checkpoint` 作业必须收到了 SIGTERM；恢复后的作业必须从停止处继续计数。
 
 尚未测试：
 
-- 在主机上真实的操作系统重启：驱动重新加载，以及相对于文件系统和
-  `nvidia-persistenced` 的停止顺序。
+- 物理机（裸机）上的真实重启，以及真实重启中与 GPU 相关的部分：GPU 作业跨重启的检查点与恢复、驱动重新加载，
+  以及相对于 `nvidia-persistenced` 的停止顺序。
 - 从真实的 GitHub Release 用 `install.sh` 安装（已在 Ubuntu 22.04/24.04/26.04 和 Debian 12 容器中针对伪造的发布服务器测试，
   `scripts/dist-test.sh`）。
 - 在运行着 systemd 的环境中使用 `.deb`（其安装、重新安装、卸载和清除已在不带 systemd 的普通 Debian 12 和 Ubuntu 容器中测试，
@@ -448,6 +456,7 @@ scripts/test-in-docker.sh                                   # cargo test --works
 scripts/test-in-docker.sh clippy --workspace --all-targets
 scripts/test-in-docker.sh fmt --all
 scripts/e2e-test.sh               # full stack under systemd in a privileged container
+scripts/vm-reboot-test.sh         # real reboot/poweroff of a QEMU/KVM VM with CPU jobs (needs /dev/kvm)
 scripts/service-install-test.sh   # service install / status / uninstall and doctor
 scripts/helper-systemd-test.sh    # the helper alone under systemd
 scripts/dist-test.sh              # install.sh against a fake GitHub API (PUZUZ_DIST_BASE=debian:12 ...)

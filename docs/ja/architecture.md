@@ -226,7 +226,7 @@ CRIU は root として動き、リストアするジョブのすべてをダン
   プログラムで適用するので、ほかの NVIDIA デバイスを開くと `EPERM` で失敗します。`closed` でも標準の疑似
   デバイス（`/dev/null`、`/dev/zero`、`/dev/full`、`/dev/random`、`/dev/urandom`、`/dev/tty`、`/dev/ptmx`、
   `/dev/pts/*`）は許可されます。GPU 番号（PCI バスの順序）は、開始とリストアのたびに、ドライバーの
-  `/proc/driver/nvidia/gpus/<PCI アドレス>/information`（`Device Minor`、除外された GPU を除く）でデバイスの
+  `/proc/driver/nvidia/gpus/<PCI address>/information`（`Device Minor`、除外された GPU を除く）でデバイスの
   マイナー番号に対応付けます。リストアのユニットにはリストア先の GPU が許可されます。`criu restore` と、
   plugin モードでは CRIU の CUDA プラグインがその中で動き、manual モードでは、ヘルパーが
   `cuda-checkpoint --action restore` を実行したときに、リストアされたプロセスの中でドライバーがデバイス

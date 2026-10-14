@@ -22,6 +22,8 @@
 - [GPU 检测](#gpu-detection)
 - [GPU 隔离](#gpu-isolation)
 - [检查点存储](#checkpoint-storage)
+- [CUDA 插件模式](#cuda-plugin-mode)
+- [文件系统和挂载](#filesystems-and-mounts)
 - [升级](#upgrading)
 - [卸载](#uninstalling)
 - [故障排查](#troubleshooting)
@@ -166,7 +168,7 @@ Alma Linux 上可以改用 [.rpm](#installing-the-fedorarhelrocky-package)，在
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.pub
+minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 ```
 
 `curl ... | sudo bash` 会直接运行下载到的内容。要先校验 `install.sh`，请将它与签名一起下载，用发布密钥
@@ -175,7 +177,7 @@ minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.
 ```sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh.minisig
-minisign -Vm install.sh -p packaging/minisign.pub
+minisign -Vm install.sh -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 sudo bash install.sh
 ```
 
@@ -958,16 +960,37 @@ puzuz doctor           # every check, with a `fix:` line for each problem; exits
 puzuz service status   # both units, and whether the daemon is reachable and connected to the helper
 ```
 
-`puzuz doctor` 检查以下内容：配置文件及其所有权、安装方式（见 [安装方式](#install-method)）、
-`criu`（4.2 或更新版本）、NVIDIA 驱动、`cuda-checkpoint`（是否支持手动模式、版本是否与驱动
-匹配）、守护进程检测到的 GPU（通过 NVML 或来自 `[[gpus]]`）与 `nvidia-smi` 的对比（见
-[GPU 检测](#gpu-detection)）、内核、systemd 版本、两个单元、helper 二进制文件及其上层所有目录
-的所有权（取自单元实际生效的 `ExecStart=`，包括 drop-in）、守护进程的目录是否在其
-`ReadWritePaths=` 之内、两个套接字、守护进程和 helper 的版本及二者的连接、检查点目录（是否
-存在、是否为 tmpfs、可用空间）以及检查点总大小、你是否为管理员，以及（除非
-`update_check = false`）是否有更新的发布版本。最后这项检查最多为 INFO，无法访问 GitHub 时
-同样如此。它不会运行 `criu check`。请自行运行 `sudo criu check`，查看 CRIU 在此内核上支持
-哪些功能。
+`puzuz doctor` 按以下顺序检查（括号内为检查项的名称）：
+
+- 配置文件及其所有权（`config`）
+- 安装方式（`install method`，见 [安装方式](#install-method)）
+- 在 RHEL 系发行版上且 puzuz 位于 `/usr/local/bin` 时：sudo 的 `secure_path` 是否包含该目录（`sudo PATH`）
+- `criu`，4.2 或更新版本（`criu`）
+- NVIDIA 驱动（`nvidia driver`）
+- `cuda-checkpoint`：是否支持手动模式、版本是否与驱动匹配（`cuda-checkpoint`）
+- 仅在 plugin 模式下：CRIU 的 CUDA 插件（`cuda plugin`，见 [CUDA 插件模式](#cuda-plugin-mode)）
+- 有驱动时，守护进程检测到的 GPU（通过 NVML 或来自 `[[gpus]]`）与 `nvidia-smi` 的对比（`gpus`，见
+  [GPU 检测](#gpu-detection)）
+- 内核（`kernel`）和 systemd 版本（`systemd`）
+- 两个单元（`puzuz-helper.service`、`puzuz.service`）
+- helper 二进制文件及其上层所有目录的所有权，取自单元实际生效的 `ExecStart=`，包括 drop-in
+  （`helper binary`）
+- helper 使用的设置：即 `config.toml` 中的值，当其单元中的参数覆盖了这些值时发出警告（`helper settings`）
+- 作业的单元是否只能打开分配给它的 GPU 的设备节点（`gpu isolation`，见 [GPU 隔离](#gpu-isolation)）
+- 作业能否访问系统 D-Bus 或 systemd 的 Varlink 服务；启用 `job_system_dbus` 或 `job_systemd_varlink` 时
+  发出警告（`job d-bus`，见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)）
+- 作业可以以哪些用户身份运行：最小 uid、被拒绝的组和允许的用户（`job policy`，见
+  [谁可以运行作业](#who-jobs-may-run-as)）
+- 守护进程的目录是否在其 `ReadWritePaths=` 之内（`daemon write paths`）
+- 守护进程和 helper 的套接字（`daemon socket`、`helper socket`）
+- 守护进程和 helper 的版本及二者的连接（`daemon`、`helper`）
+- helper 正在运行但守护进程未记录的作业（`orphaned jobs`，仅在存在时显示）
+- 检查点目录（是否存在、是否为 tmpfs、可用空间）以及检查点总大小（`checkpoint dir`、`checkpoint usage`）
+- 你是否为管理员（`admin`）
+- 除非 `update_check = false`，是否有更新的发布版本（`update`）。这项检查最多为 INFO，无法访问 GitHub 时
+  同样如此。
+
+它不会运行 `criu check`。请自行运行 `sudo criu check`，查看 CRIU 在此内核上支持哪些功能。
 
 试运行一个作业：
 
@@ -1193,8 +1216,9 @@ priority = site factor
 `restart --in-place`）会保留 0 或以上的 nice 值，但不会保留负的 nice 值、site 因子或其 `top` 位置。
 `puzuz prio` 按调度器的顺序列出的正是调度器所考虑的作业。`puzuz status --json` 会在作业的 `nice` 和组的 `priority` 不为 0 时显示它们。
 
-从没有优先级功能的发布版本升级时，数据库会迁移到 schema 版本 6：已有作业保留其 `-o` 优先级，从此它只对
-其所有者的作业排序，用量从零开始。旧的发布版本无法打开迁移后的数据库（`puzuz update` 会拒绝安装它们）。
+目前尚未发布任何版本，因此这只与开发构建有关：引入优先级之前的构建的数据库会在守护进程启动时迁移到
+schema 版本 6。已有作业保留其 `-o` 优先级，从此它只对其所有者的作业排序，用量从零开始。旧的构建无法打开
+迁移后的数据库（`puzuz update` 会拒绝安装它们）。
 
 **设置。** 位于 `/etc/puzuz/config.toml` 的 `[priority]` 表中（更改后请重启 `puzuz.service`）。
 `[priority]` 行之后的键都属于该表，因此请把其他键放在它的上方。
@@ -1299,7 +1323,7 @@ systemctl show -p DevicePolicy -p DeviceAllow puzuz-job-<id>.service
 ```
 
 GPU 编号遵循 PCI 总线顺序，但设备节点以驱动的次设备号命名，两者不一定相同。每次启动和恢复时，helper 从
-`/proc/driver/nvidia/gpus/<PCI 地址>/information` 的 `Device Minor` 读取次设备号，并与 NVML 和 CUDA 一样，
+`/proc/driver/nvidia/gpus/<PCI address>/information` 的 `Device Minor` 读取次设备号，并与 NVML 和 CUDA 一样，
 按 PCI 总线顺序计数，跳过标记为 `GPU Excluded: Yes` 的 GPU。驱动不认识的 GPU 编号（不存在的 GPU 的
 `[[gpus]]` 条目，或未加载驱动）不会获得它自己的节点，helper 会记录这一情况。
 
@@ -1514,7 +1538,7 @@ Before=puzuz-helper.service
 | --- | --- |
 | `install.sh`（或发布版本的 `puzuz service install`） | `sudo puzuz update` |
 | `.deb` | `sudo apt update && sudo apt upgrade`（或用 `sudo apt install ./puzuz_<new version>_<arch>.deb` 安装发布版本中更新的 `.deb`） |
-| `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>`（openSUSE 上为 `sudo zypper install <URL>`；尚无 dnf 仓库） |
+| `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>`（尚无 dnf 仓库） |
 | 从源码构建 | `cargo build --release -p puzuz -p puzuz-helper`，然后 `sudo target/release/puzuz service install` |
 | 来自 Nix 构建的 `puzuz service install`（非 NixOS） | 再次执行相同的 `nix build` 和 `service install`（见 [使用 Nix 安装](#installing-with-nix)） |
 | AUR 软件包 `puzuz-bin`（发布之后；在此之前 Arch 使用 `install.sh` 和 `sudo puzuz update`） | `yay -Syu`（任意 AUR helper），然后 `sudo systemctl restart puzuz-helper.service puzuz.service`；`puzuz update` 会拒绝 |
@@ -1660,6 +1684,8 @@ sudo ls /var/lib/puzuz/checkpoints/failed-logs/   # dump.log of failed dumps (ne
 | `daemon` | runs version X while this puzuz is Y | 升级后运行 `sudo systemctl restart puzuz-helper.service puzuz.service`，或更新 CLI |
 | `checkpoint dir` | on tmpfs, or little free space | 将 `checkpoints_dir` 移到有足够空间容纳作业 RAM + VRAM 的磁盘上 |
 | `helper settings` | ExecStart= passes flags | 将设置移入 `config.toml` 并去掉这些参数 |
+| `job d-bus` | allowed (`job_system_dbus = true` or `job_systemd_varlink = true`): jobs can ask systemd and polkit for actions (WARN) | 除非作业需要，否则从 `/etc/puzuz/config.toml` 中删除该键并运行 `sudo systemctl restart puzuz-helper.service` |
+| `orphaned jobs` | the helper runs jobs the daemon does not account for (WARN; their GPUs stay taken) | `puzuz status` 会向管理员显示这些作业；管理员可以用 `puzuz kill <id>` 停止它们 |
 
 在 NixOS 上（`/etc/os-release` 中为 `ID=nixos`），`fix:` 行给出的是[模块选项](#nixos)，而不是在 NixOS
 上不适用的步骤，并且之后都要运行 `sudo nixos-rebuild switch`：用 `services.puzuz.settings` 代替编辑

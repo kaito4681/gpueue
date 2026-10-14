@@ -35,6 +35,8 @@ docs/<lang>/ go up two levels (../../packaging/...). Code blocks are copied unch
 - [GPU の検出](#gpu-detection)
 - [GPU の分離](#gpu-isolation)
 - [チェックポイントの保存先](#checkpoint-storage)
+- [CUDA プラグインモード](#cuda-plugin-mode)
+- [ファイルシステムとマウント](#filesystems-and-mounts)
 - [アップグレード](#upgrading)
 - [アンインストール](#uninstalling)
 - [トラブルシューティング](#troubleshooting)
@@ -193,7 +195,7 @@ Arch Linux では公開後に [AUR パッケージ](#arch-linux-aur) を使え�
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.pub
+minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 ```
 
 `curl ... | sudo bash` はダウンロードした内容をそのまま実行します。先に `install.sh` を確認するには、署名と
@@ -202,7 +204,7 @@ minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.
 ```sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh.minisig
-minisign -Vm install.sh -p packaging/minisign.pub
+minisign -Vm install.sh -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 sudo bash install.sh
 ```
 
@@ -1049,16 +1051,44 @@ puzuz doctor           # every check, with a `fix:` line for each problem; exits
 puzuz service status   # both units, and whether the daemon is reachable and connected to the helper
 ```
 
-`puzuz doctor` は次のものを確認します。設定ファイルとその所有者、インストール方法（[インストール方法](#install-method)
-を参照）、`criu`（バージョン 4.2 以降）、NVIDIA ドライバー、`cuda-checkpoint`（manual モードへの対応、
-ドライバーと一致するバージョン）、デーモンが（NVML で、または `[[gpus]]` から）検出した GPU と `nvidia-smi` の
-比較（[GPU の検出](#gpu-detection) を参照）、カーネル、systemd のバージョン、両方のユニット、ヘルパーの
-バイナリとその上のすべてのディレクトリの所有者（ドロップインを含むユニットの実効的な `ExecStart=` から取得）、
-デーモンのディレクトリが `ReadWritePaths=` の中にあるか、両方のソケット、デーモンとヘルパーのバージョンと
-その接続、チェックポイントのディレクトリ（存在するか、tmpfs でないか、空き容量）とチェックポイントの合計
-サイズ、あなたが管理者かどうか、そして（`update_check = false` でなければ）新しいリリースがあるかどうかです。
-最後のチェックは最大でも INFO で、GitHub に接続できない場合も同様です。`criu check` は実行しません。この
-カーネルで CRIU が何に対応しているかは、自分で `sudo criu check` を実行して確認してください。
+`puzuz doctor` は次のものをこの順に確認します（括弧内はチェックの名前）。
+
+- 設定ファイルとその所有者（`config`）
+- インストール方法（`install method`、[インストール方法](#install-method) を参照）
+- RHEL 系で puzuz が `/usr/local/bin` にある場合：sudo の `secure_path` にそのディレクトリが含まれるか
+  （`sudo PATH`）
+- `criu`、バージョン 4.2 以降（`criu`）
+- NVIDIA ドライバー（`nvidia driver`）
+- `cuda-checkpoint`：manual モードへの対応、ドライバーと一致するバージョン（`cuda-checkpoint`）
+- plugin モードの場合のみ、CRIU の CUDA プラグイン（`cuda plugin`、
+  [CUDA プラグインモード](#cuda-plugin-mode) を参照）
+- ドライバーがある場合、デーモンが（NVML で、または `[[gpus]]` から）検出した GPU と `nvidia-smi` の比較
+  （`gpus`、[GPU の検出](#gpu-detection) を参照）
+- カーネル（`kernel`）と systemd のバージョン（`systemd`）
+- 両方のユニット（`puzuz-helper.service`、`puzuz.service`）
+- ヘルパーのバイナリとその上のすべてのディレクトリの所有者。ドロップインを含むユニットの実効的な
+  `ExecStart=` から取得します（`helper binary`）
+- ヘルパーが使う設定：`config.toml` の値で、ユニットのフラグがそれを上書きしている場合は警告します
+  （`helper settings`）
+- ジョブのユニットが自分の GPU のデバイスノードだけを開けるか（`gpu isolation`、
+  [GPU の分離](#gpu-isolation) を参照）
+- ジョブがシステムの D-Bus や systemd の Varlink サービスに到達できるか。`job_system_dbus` か
+  `job_systemd_varlink` が有効なら警告します（`job d-bus`、
+  [ジョブにできること・できないこと](#what-a-job-can-and-cannot-do) を参照）
+- ジョブを実行できるユーザー：最小の uid、拒否するグループ、許可するユーザー（`job policy`、
+  [ジョブを実行できるユーザー](#who-jobs-may-run-as) を参照）
+- デーモンのディレクトリが `ReadWritePaths=` の中にあるか（`daemon write paths`）
+- デーモンとヘルパーのソケット（`daemon socket`、`helper socket`）
+- デーモンとヘルパーのバージョンとその接続（`daemon`、`helper`）
+- ヘルパーが実行しているのにデーモンが把握していないジョブ（`orphaned jobs`、ある場合のみ）
+- チェックポイントのディレクトリ（存在するか、tmpfs でないか、空き容量）とチェックポイントの合計サイズ
+  （`checkpoint dir`、`checkpoint usage`）
+- あなたが管理者かどうか（`admin`）
+- `update_check = false` でなければ、新しいリリースがあるかどうか（`update`）。このチェックは最大でも INFO で、
+  GitHub に接続できない場合も同様です。
+
+`criu check` は実行しません。このカーネルで CRIU が何に対応しているかは、自分で `sudo criu check` を実行して
+確認してください。
 
 ジョブを試してみます。
 
@@ -1311,9 +1341,10 @@ restart したジョブ（コピーでも `restart --in-place` でも）は、0 
 サイトファクター、`top` の位置は引き継ぎません。`puzuz prio` はスケジューラーが考慮するジョブをちょうどその
 順序で一覧表示します。`puzuz status --json` は、ジョブの `nice` とグループの `priority` が 0 でないときに表示します。
 
-優先度のないリリースからアップグレードすると、データベースはスキーマバージョン 6 に移行します。既存の
-ジョブは `-o` の優先度を保ち、以後それはその所有者のジョブの順序だけを決めます。使用量は 0 から始まります。
-古いリリースは移行したデータベースを開けません（`puzuz update` はそれらのインストールを拒否します）。
+リリースはまだ公開されていないため、これは開発ビルドにだけ関係します。優先度より前のビルドのデータベースは、
+デーモンの起動時にスキーマバージョン 6 に移行します。既存のジョブは `-o` の優先度を保ち、以後それはその
+所有者のジョブの順序だけを決めます。使用量は 0 から始まります。古いビルドは移行したデータベースを開けません
+（`puzuz update` はそれらのインストールを拒否します）。
 
 **設定。** `/etc/puzuz/config.toml` の `[priority]` テーブルです（変更したら `puzuz.service` を再起動して
 ください）。`[priority]` の行より下のキーはこのテーブルに属するので、他のキーはその上に置いてください。
@@ -1426,7 +1457,7 @@ systemctl show -p DevicePolicy -p DeviceAllow puzuz-job-<id>.service
 ```
 
 GPU 番号は PCI バスの順序に従いますが、デバイスノードの名前はドライバーのマイナー番号で、両者は一致すると
-は限りません。ヘルパーは開始とリストアのたびに、`/proc/driver/nvidia/gpus/<PCI アドレス>/information` の
+は限りません。ヘルパーは開始とリストアのたびに、`/proc/driver/nvidia/gpus/<PCI address>/information` の
 `Device Minor` からマイナー番号を読みます。NVML や CUDA と同じく、PCI バスの順序で、`GPU Excluded: Yes` の
 GPU を除いて数えます。ドライバーが知らない GPU 番号（存在しない GPU の `[[gpus]]` エントリーや、ドライバーが
 読み込まれていない場合）には、その GPU 自身のノードは許可されず、ヘルパーはそのことをログに記録します。
@@ -1664,7 +1695,7 @@ Before=puzuz-helper.service
 | --- | --- |
 | `install.sh`（またはリリースの `puzuz service install`） | `sudo puzuz update` |
 | `.deb` | `sudo apt update && sudo apt upgrade`（またはリリースの新しい `.deb` を `sudo apt install ./puzuz_<new version>_<arch>.deb` でインストール） |
-| `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>`（openSUSE では `sudo zypper install <URL>`。dnf リポジトリはまだありません） |
+| `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>`（dnf リポジトリはまだありません） |
 | ソースからビルド | `cargo build --release -p puzuz -p puzuz-helper` のあと `sudo target/release/puzuz service install` |
 | Nix ビルドからの `puzuz service install`（NixOS 以外） | 同じ `nix build` と `service install` をもう一度（[Nix でのインストール](#installing-with-nix) を参照） |
 | AUR パッケージ `puzuz-bin`（公開後。それまで Arch は `install.sh` と `sudo puzuz update` を使います） | `yay -Syu`（任意の AUR ヘルパー）のあと `sudo systemctl restart puzuz-helper.service puzuz.service`。`puzuz update` は拒否します |
@@ -1817,6 +1848,8 @@ sudo ls /var/lib/puzuz/checkpoints/failed-logs/   # dump.log of failed dumps (ne
 | `daemon` | runs version X while this puzuz is Y | アップグレード後に `sudo systemctl restart puzuz-helper.service puzuz.service` を実行するか、CLI を更新します |
 | `checkpoint dir` | on tmpfs, or little free space | `checkpoints_dir` を、ジョブの RAM + VRAM を収められるディスクに移します |
 | `helper settings` | ExecStart= passes flags | 設定を `config.toml` に移し、フラグを削除します |
+| `job d-bus` | allowed (`job_system_dbus = true` or `job_systemd_varlink = true`): jobs can ask systemd and polkit for actions (WARN) | ジョブに必要でなければ、そのキーを `/etc/puzuz/config.toml` から削除して `sudo systemctl restart puzuz-helper.service` を実行します |
+| `orphaned jobs` | the helper runs jobs the daemon does not account for (WARN; their GPUs stay taken) | `puzuz status` は管理者にそれらを表示します。管理者は `puzuz kill <id>` で停止できます |
 
 NixOS（`/etc/os-release` が `ID=nixos`）では、`fix:` の行は NixOS では当てはまらない手順の代わりに
 [モジュールのオプション](#nixos) を挙げ、いずれも `sudo nixos-rebuild switch` を続けます。
