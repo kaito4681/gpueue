@@ -85,9 +85,6 @@ pub struct HelperConfig {
     /// Restrict every job unit's device access to its assigned GPUs (see
     /// [`crate::devices`]).
     pub gpu_device_isolation: bool,
-    /// Let job units reach the system D-Bus (see
-    /// [`crate::launcher::systemd::system_dbus_props`]).
-    pub job_system_dbus: bool,
     /// Who jobs may run as. The default is
     /// [`JobPolicy::permissive`](crate::validate::JobPolicy::permissive)
     /// (for tests); [`HelperConfig::resolve`] sets the configured one.
@@ -115,7 +112,6 @@ impl Default for HelperConfig {
             fork_guard_dir: Some(PathBuf::from(DEFAULT_FORK_GUARD_DIR)),
             job_preload: None,
             gpu_device_isolation: true,
-            job_system_dbus: false,
             job_policy: crate::validate::JobPolicy::permissive(),
         }
     }
@@ -169,7 +165,6 @@ impl HelperConfig {
                 .unwrap_or(Duration::from_secs(file.grace_secs)),
             fork_guard_dir: file.fork_guard.then(|| file.data_dir.join("lib")),
             gpu_device_isolation: file.gpu_device_isolation,
-            job_system_dbus: file.job_system_dbus,
             job_policy: crate::validate::JobPolicy::from_config(
                 file,
                 Path::new(puzuz_config::job_policy::LOGIN_DEFS_PATH),
@@ -177,6 +172,10 @@ impl HelperConfig {
             ),
             ..HelperConfig::default()
         };
+        if file.job_system_dbus {
+            // Jobs may reach the system D-Bus: nothing is covered.
+            cfg.mounts.inaccessible.clear();
+        }
         let ck = &mut cfg.checkpoint;
         ck.mode = o.cuda_mode.unwrap_or(match file.cuda_checkpoint_mode {
             CudaCheckpointMode::Manual => CudaMode::Manual,
@@ -416,6 +415,17 @@ mod tests {
         assert_eq!(c.checkpoint.cuda.path, PathBuf::from("/flag/cc"));
         assert_eq!(c.nvidia_smi, PathBuf::from("/flag/smi"));
         assert_eq!(c.job_stop_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn the_system_bus_is_covered_unless_allowed() {
+        let r = HelperConfig::resolve(&file(""), Overrides::default());
+        assert_eq!(
+            r.config.mounts.inaccessible,
+            crate::jobs::SYSTEM_BUS_SOCKETS
+        );
+        let r = HelperConfig::resolve(&file("job_system_dbus = true\n"), Overrides::default());
+        assert!(r.config.mounts.inaccessible.is_empty());
     }
 
     #[test]

@@ -1208,7 +1208,7 @@ polkit が信頼するグループのメンバー）でも、ジョブがそれ�
 | 所有者の uid とプライマリ gid で実行され、root にはならない | ヘルパーが uid 0、システムアカウント、拒否するプライマリグループを拒否する（[ジョブを実行できるユーザー](#who-jobs-may-run-as)） | `job_min_uid`、`job_denied_groups`、`job_allowed_users` |
 | ケーパビリティを持たず（`CapInh`、`CapPrm`、`CapEff`、`CapBnd`、`CapAmb` がすべて 0）、`NoNewPrivs: 1` | shim がコマンドを実行する前にバウンディングセットを空にし、`no_new_privs` を設定する | なし |
 | `sudo`、`su`、`pkexec` などの setuid やファイルケーパビリティのプログラムで権限を得られない | `no_new_privs` のもとではカーネルが setuid ビットとファイルケーパビリティを無視する | なし |
-| システムの D-Bus に接続できないので、`systemctl`、`run0`、`machinectl`、`busctl --system` など、systemd、polkit、システムサービスへの要求はできない | すべてのジョブのユニットに `InaccessiblePaths=/run/dbus/system_bus_socket`（`/var/run/...` も）が付く。polkit はグループの所属をジョブのグループではなくユーザーデータベースから判断するので、グループを外すだけでは防げない | `job_system_dbus = true` |
+| システムの D-Bus に接続できないので、`systemctl`、`run0`、`machinectl`、`busctl --system` など、systemd、polkit、システムサービスへの要求はできない | shim がジョブのマウント名前空間で `/run/dbus/system_bus_socket`（別のものなら `/var/run/...` も）の上に systemd の接続できないソケットノード（`/run/systemd/inaccessible/sock`）をバインドマウントし、リストアでは CRIU がこのマウントを作り直す。polkit はグループの所属をジョブのグループではなくユーザーデータベースから判断するので、グループを外すだけでは防げない | `job_system_dbus = true` |
 | `docker`、`lxd`、`incus-admin`、`libvirt`、`disk`、`sudo`、`wheel`、`admin` のグループを持たない（root のデーモンのソケット、ブロックデバイスそのもの） | ヘルパーが補助グループから外す | `job_denied_groups` |
 | 標準の疑似デバイスと割り当てた GPU のもの以外のデバイスノードを開けない | `DevicePolicy=closed` と `DeviceAllow=`（[GPU の分離](#gpu-isolation)） | `gpu_device_isolation` |
 

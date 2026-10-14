@@ -832,6 +832,49 @@ fn setup_mounts(plan: &MountPlan) -> Result<(), String> {
         )
         .map_err(|e| format!("mounting a tmpfs on {t}: {e}"))?;
     }
+    cover_sockets(plan)?;
+    Ok(())
+}
+
+/// Bind systemd's inaccessible socket node over each socket of
+/// `plan.inaccessible` (the system D-Bus socket unless `job_system_dbus`),
+/// so that nothing in the job can connect to it. After the pruning, which
+/// would detach it again (it lies below `/run`). A path that does not
+/// exist (no D-Bus daemon) or is not a socket is skipped; two names of the
+/// same file (`/var/run` is usually a link to `/run`) are covered once.
+/// Fails without the node: the job must not start with the bus reachable.
+fn cover_sockets(plan: &MountPlan) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+    let mut covered: Vec<PathBuf> = Vec::new();
+    for path in &plan.inaccessible {
+        let Ok(real) = std::fs::canonicalize(path) else {
+            continue;
+        };
+        if covered.contains(&real) {
+            continue;
+        }
+        match std::fs::metadata(&real) {
+            Ok(meta) if meta.file_type().is_socket() => {}
+            _ => continue,
+        }
+        let node = Path::new(crate::jobs::INACCESSIBLE_SOCKET);
+        if !std::fs::symlink_metadata(node).is_ok_and(|m| m.file_type().is_socket()) {
+            return Err(format!(
+                "cannot cover {path}: {} is missing (it is created by systemd at boot); \
+                 set job_system_dbus = true to let jobs reach it",
+                node.display()
+            ));
+        }
+        mount(
+            Some(node),
+            &real,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(|e| format!("covering {}: {e}", real.display()))?;
+        covered.push(real);
+    }
     Ok(())
 }
 
@@ -963,8 +1006,6 @@ mod tests {
 2 1 0:2 / /run rw - tmpfs tmpfs rw
 3 2 0:3 / /run/user/1000 rw - tmpfs tmpfs rw
 4 2 0:4 / /run/nvidia-persistenced/socket rw - tmpfs tmpfs rw
-9 2 0:2 /systemd/inaccessible/sock /run/dbus/system_bus_socket ro - tmpfs tmpfs rw
-10 2 0:2 /systemd/inaccessible/dir /run/credentials ro - tmpfs tmpfs rw
 5 1 0:5 / /media/usb\\040disk rw - ext4 /dev/y rw
 8 1 0:8 / /mnt/data rw - ext4 /dev/w rw
 6 1 0:6 / /dev/shm rw - tmpfs tmpfs rw
@@ -972,12 +1013,7 @@ mod tests {
 ";
         assert_eq!(
             mounts_to_prune(mi, &MountPlan::default()),
-            [
-                "/run/user/1000",
-                "/run/credentials",
-                "/media/usb disk",
-                "/dev/shm"
-            ]
+            ["/run/user/1000", "/media/usb disk", "/dev/shm"]
         );
         assert!(path_under("/run/a", "/run/"));
         assert!(!path_under("/run", "/run/"));

@@ -149,8 +149,9 @@ pub struct Config {
     /// `CUDA_VISIBLE_DEVICES` selects the GPUs).
     pub gpu_device_isolation: bool,
     /// Let jobs reach the system D-Bus (helper only). `false` (the
-    /// default) makes `/run/dbus/system_bus_socket` inaccessible in every
-    /// job unit (`InaccessiblePaths=`), so a job cannot ask systemd,
+    /// default) covers `/run/dbus/system_bus_socket` in every job's mount
+    /// namespace with systemd's inaccessible socket node (the shim
+    /// bind-mounts it; CRIU recreates it on restore), so a job cannot ask systemd,
     /// polkit or other system services for anything (`systemctl`, `run0`,
     /// `pkexec`, `machinectl`, ...). polkit decides group membership from
     /// the user database, not from the job's (reduced) groups, so its

@@ -260,7 +260,6 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
         cfg.helper_exe.clone(),
         cfg.spawn_timeout,
         cfg.job_stop_timeout,
-        cfg.job_system_dbus,
     )
     .await
     .map_err(|e| format!("connecting to systemd: {e}"))?;

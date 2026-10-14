@@ -71,16 +71,15 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    `/dev/null`、停止のタイムアウトは `grace_secs` です。各ジョブはデーモン、ヘルパー、ユーザーのセッションの
    外にある自分専用の cgroup で動くので、デーモンやヘルパーの再起動やユーザーのログアウトを生き延びます。
    `gpu_device_isolation`（デフォルトで有効）のとき、ユニットには `DevicePolicy=closed` と、ジョブの GPU
-   だけを許可する `DeviceAllow=` も設定されます（[GPU の分離](#gpu-isolation) を参照）。`job_system_dbus = true`
-   でなければ、システムの D-Bus のソケットの `InaccessiblePaths=` も付くので、ジョブは systemd や polkit に何も
-   要求できません。shim は `/run/*` を外すときもこのマウントを残し、リストアのユニットにも同じプロパティが付くので、
-   CRIU はリストアのユニットの名前空間からこれを作り直します（[ジョブにできること・できないこと](install.md#what-a-job-can-and-cannot-do)を参照）。
+   だけを許可する `DeviceAllow=` も設定されます（[GPU の分離](#gpu-isolation) を参照）。
 5. **shim。** shim はまだ root のまま PID 名前空間とマウント名前空間を作り、ホストの automount ポイントを
    トリガーしたあとで（名前空間が automount されたファイルシステムを得られるように）、名前空間の init を
    開始します。init はマウントを private にし、新しい `/proc` をマウントします。他のマウントの下に隠れた
    マウントと、再起動後に残らないマウント（`/run/*`、`/media/*`）を取り除き、`autofs` マウントの上に重なった
    automount 済みのファイルシステムをそれぞれ普通のコピーに置き換え、`/tmp` と `/dev/shm` に専用の tmpfs を
-   マウントします。その後、`no_new_privs` を設定して所有者の uid、gid、グループに切り替え、ログ
+   マウントします。`job_system_dbus = true` でなければ、システムの D-Bus のソケットの上に systemd の接続できない
+   ソケットノードをバインドマウントするので、ジョブは systemd や polkit に何も要求できません。CRIU はこのマウントを
+   ダンプし、リストアで作り直します（[ジョブにできること・できないこと](install.md#what-a-job-can-and-cannot-do)を参照）。その後、`no_new_privs` を設定して所有者の uid、gid、グループに切り替え、ログ
    （`/var/lib/puzuz/logs/<uid>/<id>.log`）と作業ディレクトリを所有者として開き、`sh -c` でコマンドを
    実行します。環境変数はクライアントのものに、`CUDA_VISIBLE_DEVICES`、`CUDA_DEVICE_ORDER=PCI_BUS_ID`、
    `LD_PRELOAD` の fork ガードを加えたものです。ジョブへのシグナル（TERM、INT、HUP、QUIT、USR1、USR2、

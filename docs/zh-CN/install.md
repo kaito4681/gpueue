@@ -1108,7 +1108,7 @@ job_allowed_users`。`puzuz status` 将其显示为 `Failed to spawn`，`puzuz l
 | 以所有者的 uid 和主 gid 运行，绝不以 root 运行 | helper 拒绝 uid 0、系统账户和被拒绝的主组（[谁可以运行作业](#who-jobs-may-run-as)） | `job_min_uid`、`job_denied_groups`、`job_allowed_users` |
 | 没有任何 capability（`CapInh`、`CapPrm`、`CapEff`、`CapBnd`、`CapAmb` 全为 0），且 `NoNewPrivs: 1` | shim 在运行命令前清空边界集并设置 `no_new_privs` | 无 |
 | 无法通过 `sudo`、`su`、`pkexec` 或其他 setuid / 文件 capability 程序获得特权 | 在 `no_new_privs` 下内核会忽略 setuid 位和文件 capability | 无 |
-| 无法访问系统 D-Bus，因此无法执行 `systemctl`、`run0`、`machinectl`、`busctl --system` 或其他对 systemd、polkit、系统服务的请求 | 每个作业单元都有 `InaccessiblePaths=/run/dbus/system_bus_socket`（以及 `/var/run/...`）；polkit 从用户数据库而不是作业的组判断组成员关系，仅去掉组无法阻止它 | `job_system_dbus = true` |
+| 无法访问系统 D-Bus，因此无法执行 `systemctl`、`run0`、`machinectl`、`busctl --system` 或其他对 systemd、polkit、系统服务的请求 | shim 在作业的挂载命名空间中把 systemd 的不可访问套接字节点（`/run/systemd/inaccessible/sock`）绑定挂载到 `/run/dbus/system_bus_socket`（若 `/var/run/...` 是独立路径也一样）上，恢复时 CRIU 会重建这个挂载；polkit 从用户数据库而不是作业的组判断组成员关系，仅去掉组无法阻止它 | `job_system_dbus = true` |
 | 不具有 `docker`、`lxd`、`incus-admin`、`libvirt`、`disk`、`sudo`、`wheel`、`admin` 组（root 守护进程的套接字、原始块设备） | helper 将它们从附加组中去掉 | `job_denied_groups` |
 | 除标准伪设备和所分配 GPU 的设备节点外，无法打开任何设备节点 | `DevicePolicy=closed` 加 `DeviceAllow=`（[GPU 隔离](#gpu-isolation)） | `gpu_device_isolation` |
 

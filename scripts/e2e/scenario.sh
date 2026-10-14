@@ -1175,10 +1175,12 @@ while True:
     wait_state "$id" checkpointed 120
     pz eve restore "$id" || fail "restore"
     wait_state "$id" running 120
-    # The restored unit is set up like a spawned one.
-    out=$(systemctl show -p InaccessiblePaths --value "puzuz-job-$id-r1.service")
-    echo "restored unit InaccessiblePaths: $out"
-    grep -q /run/dbus/system_bus_socket <<<"$out" || fail "the restored unit can reach the system bus"
+    # The restored job's namespace still has the bus socket covered.
+    out=$(grep ' /run/dbus/system_bus_socket ' \
+        "/proc/$(systemctl show -p MainPID --value "puzuz-job-$id-r1.service")/mountinfo" || true)
+    echo "restored job's mount over the bus socket: $out"
+    grep -q '/systemd/inaccessible/sock /run/dbus/system_bus_socket ' <<<"$out" \
+        || fail "the restored job's namespace does not cover the system bus socket"
     runuser -u eve -- touch /home/eve/round2
     wait_state "$id" 'done/*' 120
     expect_state "$id" done/success

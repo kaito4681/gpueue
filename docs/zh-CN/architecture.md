@@ -59,14 +59,13 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    `puzuz-helper shim`。该单元设置了 `Before=puzuz-helper.service` 和 `KillMode=mixed`，stdin 为
    `/dev/null`，停止超时为 `grace_secs`。每个作业都位于自己的 cgroup 中，独立于守护进程、helper 和用户会话，
    因此在守护进程和 helper 重启以及用户注销后仍能继续存在。在 `gpu_device_isolation`（默认开启）时，该单元还设置了
-   `DevicePolicy=closed` 和只允许作业 GPU 的 `DeviceAllow=`（见 [GPU 隔离](#gpu-isolation)）。除非
-   `job_system_dbus = true`，它还设置了系统 D-Bus 套接字的 `InaccessiblePaths=`，因此作业无法向 systemd 或 polkit
-   请求任何操作；shim 在去掉 `/run/*` 时保留这个挂载，恢复单元也设置相同的属性，因此 CRIU 会从恢复单元的命名空间
-   重建它（见 [作业能做什么、不能做什么](install.md#what-a-job-can-and-cannot-do)）。
+   `DevicePolicy=closed` 和只允许作业 GPU 的 `DeviceAllow=`（见 [GPU 隔离](#gpu-isolation)）。
 5. **Shim。** shim 仍以 root 身份运行，它创建一个 PID 命名空间和一个挂载命名空间，并在触发主机的自动挂载点之后
    （以便命名空间获得自动挂载的文件系统）启动该命名空间的 init。init 把挂载设为私有，并挂载一个新的 `/proc`。它会移除被其他挂载遮盖的挂载以及重启后不会保留的挂载
    （`/run/*`、`/media/*`），把每个叠加在其 `autofs` 挂载之上的自动挂载文件系统替换为普通的副本，
-   并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs。然后它切换到所有者的
+   并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs。除非 `job_system_dbus = true`，它会把 systemd 的不可访问套接字
+   节点绑定挂载到系统 D-Bus 套接字上，因此作业无法向 systemd 或 polkit 请求任何操作；CRIU 会转储这个挂载并在恢复时
+   重建它（见 [作业能做什么、不能做什么](install.md#what-a-job-can-and-cannot-do)）。然后它切换到所有者的
    uid、gid 和组并设置 `no_new_privs`，以所有者身份打开日志
    （`/var/lib/puzuz/logs/<uid>/<id>.log`）和工作目录，并通过 `sh -c` 运行命令。
    环境变量为客户端的环境变量，再加上 `CUDA_VISIBLE_DEVICES`、

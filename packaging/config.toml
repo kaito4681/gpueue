@@ -81,8 +81,9 @@
 # selects the GPUs (needed for MIG, see docs/install.md).
 # gpu_device_isolation = true
 
-# [helper] Let jobs reach the system D-Bus. false (the default): every job unit
-# gets InaccessiblePaths=/run/dbus/system_bus_socket, so jobs cannot ask
+# [helper] Let jobs reach the system D-Bus. false (the default): the system bus
+# socket (/run/dbus/system_bus_socket) is covered with an inaccessible node in
+# every job's mount namespace, also after a restore, so jobs cannot ask
 # systemd or polkit for anything (systemctl, run0, pkexec, machinectl, ...),
 # whatever polkit rules allow the owner's groups.
 # job_system_dbus = false
