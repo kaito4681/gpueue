@@ -471,6 +471,15 @@ impl FakeHelper {
         self.with(|s| s.ignore_acks = ignore);
     }
 
+    /// The helper's state was reset (its state directory wiped): its
+    /// queued events are gone, and its event numbering starts over.
+    pub fn reset_event_numbering(&self) {
+        self.with(|s| {
+            s.next_seq = 0;
+            s.unacked.clear();
+        });
+    }
+
     /// Simulates the helper going away; requests fail until [`reconnect`].
     ///
     /// [`reconnect`]: FakeHelper::reconnect

@@ -2139,39 +2139,29 @@ impl Core {
         });
     }
 
-    /// Applies helper event `seq` (`None`: undecodable, only recorded) and
-    /// records it as applied.
-    ///
-    /// The helper replays the events the daemon has not acknowledged after
-    /// every reconnect, and the daemon acknowledges an event only after
-    /// applying it, so a replay may repeat an event applied already. During
-    /// a replay (`replaying`: between a (re)connect and its
-    /// [`HelperNotice::Connected`]) events up to the last one applied are
-    /// therefore skipped. Applying one again would be wrong for some, e.g.
-    /// a refused dump of a job that has been running since would mark it
-    /// as terminating.
-    ///
-    /// The helper keeps its sequence numbers across restarts. Should a live
-    /// event still come with a number not above the last one applied (the
-    /// helper's state was reset), the numbering starts over from it.
-    async fn apply_helper_event(
-        self: &Arc<Self>,
-        seq: u64,
-        event: Option<hp::Event>,
-        replaying: bool,
-    ) {
-        let last = match self.read(|s| s.helper_event_seq()).await {
+    /// The sequence number of the last helper event applied (0 if none,
+    /// or if it cannot be read).
+    async fn last_helper_event(&self) -> u64 {
+        match self.read(|s| s.helper_event_seq()).await {
             Ok(last) => last,
             Err(e) => {
                 tracing::error!("cannot read the last helper event applied: {}", e.0.message);
                 0
             }
-        };
+        }
+    }
+
+    /// Applies helper event `seq` (`None`: undecodable, only recorded) and
+    /// records it as applied.
+    ///
+    /// The helper keeps its sequence numbers across restarts. Should an
+    /// event that is not a replayed duplicate (see
+    /// [`Core::receive_helper_event`]) still come with a number not above
+    /// the last one applied (the helper's state was reset), the numbering
+    /// starts over from it.
+    async fn apply_helper_event(self: &Arc<Self>, seq: u64, event: Option<hp::Event>) {
+        let last = self.last_helper_event().await;
         if seq <= last {
-            if replaying {
-                tracing::debug!(seq, "skipping a replayed helper event applied already");
-                return;
-            }
             tracing::warn!(
                 seq,
                 last,
@@ -2190,10 +2180,97 @@ impl Core {
         }
     }
 
+    /// Counts `count` event notices as handled (see
+    /// [`Helper::events_delivered`]).
+    fn events_handled(&self, count: usize) {
+        self.events_applied.send_modify(|n| *n += count as u64);
+    }
+
+    /// Acknowledges the helper's events up to `seq`.
+    async fn ack_helper_events(&self, seq: hp::EventSeq) {
+        if let Err(e) = self.helper.ack_events(seq).await {
+            tracing::debug!("cannot acknowledge helper events: {e}");
+        }
+    }
+
+    /// Handles helper event `seq` (`None`: undecodable): applies,
+    /// counts and acknowledges it, unless it is held back in `held`.
+    ///
+    /// The helper replays the events the daemon has not acknowledged after
+    /// every reconnect, and the daemon acknowledges an event only after
+    /// applying it, so a replay may repeat events applied already. Applying
+    /// one again would be wrong for some, e.g. a refused dump of a job that
+    /// has been running since would mark it as terminating. During a replay
+    /// (`replaying`: between a (re)connect and its
+    /// [`HelperNotice::Connected`]) events up to the last one applied are
+    /// therefore held back: they were applied already if the replay goes
+    /// on past the last one applied, or ends there. A replay that ends
+    /// below it comes from a helper whose numbering was reset, whose
+    /// events are new (see [`Core::end_replay`]).
+    async fn receive_helper_event(
+        self: &Arc<Self>,
+        seq: hp::EventSeq,
+        event: Option<hp::Event>,
+        replaying: bool,
+        held: &mut Vec<(hp::EventSeq, Option<hp::Event>)>,
+    ) {
+        if replaying {
+            if seq.0 <= self.last_helper_event().await {
+                held.push((seq, event));
+                return;
+            }
+            if !held.is_empty() {
+                // Acknowledged with this event.
+                tracing::debug!(
+                    count = held.len(),
+                    "skipping replayed helper events applied already"
+                );
+                self.events_handled(held.len());
+                held.clear();
+            }
+        }
+        self.apply_helper_event(seq.0, event).await;
+        self.events_handled(1);
+        self.ack_helper_events(seq).await;
+    }
+
+    /// Settles the events a replay held back (see
+    /// [`Core::receive_helper_event`]) at its end: duplicates if the
+    /// replay reached the last event applied, otherwise the helper's
+    /// numbering was reset and they are applied.
+    async fn end_replay(self: &Arc<Self>, held: &mut Vec<(hp::EventSeq, Option<hp::Event>)>) {
+        let Some(&(up_to, _)) = held.last() else {
+            return;
+        };
+        let last = self.last_helper_event().await;
+        if up_to.0 >= last {
+            tracing::debug!(
+                count = held.len(),
+                "skipping replayed helper events applied already"
+            );
+            self.events_handled(held.len());
+            held.clear();
+            self.ack_helper_events(up_to).await;
+            return;
+        }
+        tracing::warn!(
+            last,
+            replayed_up_to = up_to.0,
+            "the helper's event numbering was reset (was its state wiped?); applying its replayed events"
+        );
+        for (seq, event) in std::mem::take(held) {
+            self.apply_helper_event(seq.0, event).await;
+            self.events_handled(1);
+            self.ack_helper_events(seq).await;
+        }
+    }
+
     /// Consumes helper notices until the daemon stops.
     pub async fn notice_loop(self: Arc<Self>, mut notices: mpsc::UnboundedReceiver<HelperNotice>) {
         // Events before the first `Connected` are a replay, too.
         let mut replaying = true;
+        // See `Core::receive_helper_event`.
+        let mut held = Vec::new();
         loop {
             let notice = tokio::select! {
                 _ = self.cancel.cancelled() => return,
@@ -2202,12 +2279,13 @@ impl Core {
             let Some(notice) = notice else { return };
             match notice {
                 HelperNotice::Event(envelope) => {
-                    self.apply_helper_event(envelope.seq.0, Some(envelope.event), replaying)
-                        .await;
-                    self.events_applied.send_modify(|n| *n += 1);
-                    if let Err(e) = self.helper.ack_events(envelope.seq).await {
-                        tracing::debug!("cannot acknowledge helper events: {e}");
-                    }
+                    self.receive_helper_event(
+                        envelope.seq,
+                        Some(envelope.event),
+                        replaying,
+                        &mut held,
+                    )
+                    .await;
                 }
                 HelperNotice::UndecodableEvent { seq, error } => {
                     tracing::warn!(
@@ -2215,19 +2293,20 @@ impl Core {
                         "skipping a helper event this daemon cannot decode \
                          (is the helper newer than the daemon?): {error}"
                     );
-                    self.apply_helper_event(seq.0, None, replaying).await;
-                    self.events_applied.send_modify(|n| *n += 1);
-                    if let Err(e) = self.helper.ack_events(seq).await {
-                        tracing::debug!("cannot acknowledge helper events: {e}");
-                    }
+                    self.receive_helper_event(seq, None, replaying, &mut held)
+                        .await;
                 }
                 HelperNotice::Connected { version, running } => {
                     replaying = false;
+                    self.end_replay(&mut held).await;
                     tracing::info!(%version, live = running.len(), "reconciling with the helper");
                     self.reconcile(running).await;
                 }
                 HelperNotice::Disconnected => {
                     replaying = true;
+                    // Not acknowledged: replayed again after the reconnect.
+                    self.events_handled(held.len());
+                    held.clear();
                     self.reconciled.store(false, Ordering::SeqCst);
                 }
             }

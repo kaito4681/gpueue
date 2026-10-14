@@ -53,7 +53,8 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    Events are persisted and replayed until the daemon acknowledges them, so nothing is lost while
    the daemon is down. The daemon stores the number of the last event it applied with its effect
    and skips replayed events up to it, so an event is applied once even if the daemon stopped
-   before acknowledging it. An event it cannot decode (from a newer helper) is logged and
+   before acknowledging it. A replay that ends below that number comes from a helper whose state
+   was reset (its numbering started over), so its events are applied. An event it cannot decode (from a newer helper) is logged and
    acknowledged rather than ending the connection. After a reconnect both sides reconcile their
    lists of jobs: a job the helper no longer runs is lost, and a job the daemon believes is being
    checkpointed but the helper runs normally lost its checkpoint request and goes back to running

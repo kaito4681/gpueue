@@ -1098,6 +1098,53 @@ async fn replayed_helper_events_are_applied_once() {
     h.stop().await;
 }
 
+/// Replayed events that come with numbers up to the last one applied are
+/// applied all the same when the helper's numbering was reset (its state
+/// was wiped): the replay ends below the last number applied, which a
+/// helper that kept its numbering cannot do. Skipping them would mark the
+/// job lost instead of recording its exit (#20).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replayed_events_are_applied_after_the_helpers_numbering_was_reset() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(3).await;
+    let alice = h.client(ALICE);
+    let ids = [
+        alice.add(&job_request("a", &[])).await,
+        alice.add(&job_request("b", &[])).await,
+        alice.add(&job_request("c", &[])).await,
+    ];
+    for id in ids {
+        alice.wait_state(id, &JobState::Running).await;
+        h.wait_spawned(id).await;
+    }
+    let [a, b, c] = ids;
+    // Events 1 and 2 are applied and acknowledged.
+    h.exit(a, 0).await;
+    h.exit(b, 0).await;
+    for id in [a, b] {
+        alice.wait_state(id, &done(JobResult::Success)).await;
+    }
+
+    h.helper.disconnect();
+    h.helper.reset_event_numbering();
+    h.helper.exit(c, 3);
+    assert_eq!(h.helper.unacked()[0].seq.0, 1);
+    h.helper.reconnect();
+    let job = alice
+        .wait_for(c, "finished", |j| j.state != JobState::Running)
+        .await;
+    assert_eq!(job.state, done(JobResult::Failed { exit_code: 3 }));
+
+    // The numbering goes on from there.
+    let d = alice.add(&job_request("d", &[])).await;
+    alice.wait_state(d, &JobState::Running).await;
+    h.exit(d, 4).await;
+    alice
+        .wait_state(d, &done(JobResult::Failed { exit_code: 4 }))
+        .await;
+    h.stop().await;
+}
+
 /// A job paused when it is checkpointed is resumed for the dump (CRIU and
 /// cuda-checkpoint need it running) and restored stopped (the helper is
 /// asked to leave it stopped, so no signal follows the restore), still
