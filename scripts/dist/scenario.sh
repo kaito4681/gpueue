@@ -14,11 +14,15 @@ set -euo pipefail
 # shellcheck disable=SC1091
 . /dist/versions
 TOKEN="$(cat /dist/token)"
-# install.sh honours the two overrides only with PUZUZ_TEST_HOOKS=1; the test
-# versions of puzuz are built with the test-hooks feature.
+# install.sh honours the overrides only with PUZUZ_TEST_HOOKS=1; the test
+# versions of puzuz are built with the test-hooks feature. The minisign that
+# install.sh downloads when none is installed comes from a local server too
+# (the real release tarball, checked against the checksum in install.sh).
 export PUZUZ_TEST_HOOKS=1
 export PUZUZ_RELEASE_API_URL=http://127.0.0.1:8080
 export PUZUZ_UPDATE_PUBKEY_FILE=/dist/release.pub
+MINISIGN_TARBALL="$(basename /dist/minisign-download/minisign-*-linux.tar.gz)"
+export PUZUZ_MINISIGN_TARBALL_URL="http://127.0.0.1:8081/$MINISIGN_TARBALL"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -69,6 +73,12 @@ start_server() {
     cp -r /dist/releases /srv/releases
     systemd-run --quiet --unit fake-github python3 /dist/fake_github.py /srv/releases 8080 "$TOKEN"
     wait_for 20 "the fake GitHub API" curl -s -o /dev/null http://127.0.0.1:8080/
+    mkdir -p /srv/minisign
+    cp /dist/minisign-download/"$MINISIGN_TARBALL" /srv/minisign/
+    echo "not a tarball" >/srv/minisign/corrupt.tar.gz
+    systemd-run --quiet --unit minisign-download \
+        python3 -m http.server --bind 127.0.0.1 --directory /srv/minisign 8081
+    wait_for 20 "the minisign download server" curl -s -o /dev/null http://127.0.0.1:8081/
 }
 set_latest() { echo "v$1" >/srv/releases/latest; }
 
@@ -159,12 +169,24 @@ scenario_17() {
     mv /tmp/os-release.saved /etc/os-release
     [ ! -e /usr/local/bin/puzuz ] || fail "a refused install left /usr/local/bin/puzuz"
 
+    step "17: without minisign installed, a downloaded one checks the signature"
+    ! command -v minisign >/dev/null || fail "minisign is installed already"
+    GH_TOKEN="$TOKEN" expect_fail "bad signature" bash "$install" --version "$VERSION-test.badsig"
+    # A minisign download that fails, or does not match the pinned checksum,
+    # stops the installation (there is no way to skip the signature).
+    PUZUZ_MINISIGN_TARBALL_URL=http://127.0.0.1:8081/missing.tar.gz GH_TOKEN="$TOKEN" \
+        expect_fail "install it (e.g." bash "$install"
+    PUZUZ_MINISIGN_TARBALL_URL=http://127.0.0.1:8081/corrupt.tar.gz GH_TOKEN="$TOKEN" \
+        expect_fail "does not match its SHA-256 checksum" bash "$install"
+    [ ! -e /usr/local/bin/puzuz ] || fail "a refused install left /usr/local/bin/puzuz"
+
     step "17: install v1 (token from a file, saved for puzuz update)"
     printf '%s\n' "$TOKEN" >/root/token
     chmod 600 /root/token
     bash "$install" --token-file /root/token --save-token | tee /tmp/install-v1.out
     grep -q "verified the SHA-256 checksum" /tmp/install-v1.out || fail "checksum not verified"
-    grep -q "signature was not checked" /tmp/install-v1.out || fail "no note about the missing minisign"
+    grep -q "downloading minisign" /tmp/install-v1.out || fail "minisign not downloaded"
+    grep -q "verified the minisign signature" /tmp/install-v1.out || fail "signature not verified"
     grep -q "puzuz $V1 is installed in /usr/local/bin" /tmp/install-v1.out || fail "no success message"
     # install.sh no longer passes --bin-dir: `service install` chose /usr/local/bin.
     grep -q "installing into /usr/local/bin" /tmp/install-v1.out || fail "no note about /usr/local/bin"
@@ -193,6 +215,9 @@ scenario_17() {
     set_latest "$V2"
     GH_TOKEN="$TOKEN" bash "$install" | tee /tmp/install-v2.out
     grep -q "verified the minisign signature" /tmp/install-v2.out || fail "signature not verified"
+    grep -q "checking the signature with /usr/local/bin/minisign" /tmp/install-v2.out ||
+        fail "the installed minisign was not used"
+    if grep -q "downloading minisign" /tmp/install-v2.out; then fail "minisign downloaded again"; fi
     wait_for 30 "the v2 daemon" bash -c "puzuz service status 2>/dev/null | grep -q 'version $V2, API'"
     /usr/local/bin/puzuz --version | grep -qF "$V2" || fail "puzuz --version is not $V2"
     job_alive "$id" || fail "job $id stopped during the update"

@@ -19,6 +19,14 @@ INSTALL_MARKER='# Installed by `puzuz service install`; re-running it overwrites
 # The release signing key; must match packaging/minisign.pub (checked by the
 # release workflow and a unit test).
 MINISIGN_PUBKEY="RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv"
+# Without minisign in PATH, this static minisign release (x86_64 and aarch64
+# binaries in one tarball) is downloaded and checked against this SHA-256.
+# Must match scripts/dist/get-minisign.sh (checked by a unit test).
+MINISIGN_VERSION="0.12"
+MINISIGN_SHA256="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
+MINISIGN_URL="https://github.com/jedisct1/minisign/releases/download/$MINISIGN_VERSION/minisign-$MINISIGN_VERSION-linux.tar.gz"
+# Set by find_minisign: the minisign that checks the signature.
+MINISIGN=""
 
 usage() {
     cat <<EOF
@@ -43,6 +51,10 @@ Options:
   --purge            with --uninstall: also delete /etc/puzuz and /var/lib/puzuz
   -y, --yes          do not ask before purging
   -h, --help         show this help
+
+The release tarball's SHA-256 checksum and minisign signature are always
+checked. Without minisign in PATH, a pinned minisign $MINISIGN_VERSION release is
+downloaded for that (and checked against the SHA-256 built into this script).
 
 Releases are downloaded through the GitHub API. A GitHub token is optional (it
 raises the API rate limit); one is taken from, in this order, GH_TOKEN or
@@ -490,18 +502,59 @@ verify() {
     [ "${actual%% *}" = "${BASH_REMATCH[1]}" ] ||
         die "SHA-256 checksum mismatch for $tarball; not installing it"
     info "verified the SHA-256 checksum"
-    if command -v minisign >/dev/null 2>&1; then
-        local key=(-P "$MINISIGN_PUBKEY")
-        # Test-only: another public key file (ignored without PUZUZ_TEST_HOOKS=1).
-        if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_UPDATE_PUBKEY_FILE:-}" ]; then
-            key=(-p "$PUZUZ_UPDATE_PUBKEY_FILE")
-        fi
-        minisign -V -q "${key[@]}" -m "$WORK/$tarball" -x "$WORK/$tarball.minisig" >/dev/null ||
-            die "bad signature on $tarball; not installing it"
-        info "verified the minisign signature"
-    else
-        info "minisign is not installed: the signature was not checked (\`puzuz update\` always checks it)"
+    local key=(-P "$MINISIGN_PUBKEY")
+    # Test-only: another public key file (ignored without PUZUZ_TEST_HOOKS=1).
+    if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_UPDATE_PUBKEY_FILE:-}" ]; then
+        key=(-p "$PUZUZ_UPDATE_PUBKEY_FILE")
     fi
+    "$MINISIGN" -V -q "${key[@]}" -m "$WORK/$tarball" -x "$WORK/$tarball.minisig" >/dev/null ||
+        die "bad signature on $tarball; not installing it"
+    info "verified the minisign signature"
+}
+
+# minisign_unavailable REASON: stops. The signature is never skipped.
+minisign_unavailable() {
+    die "$1. minisign is needed to check the release signature: install it (e.g. \`sudo apt install minisign\`, \`sudo dnf install minisign\` or \`sudo pacman -S minisign\`) and re-run this script"
+}
+
+# Sets MINISIGN: the one in PATH, else the pinned static release, downloaded
+# into $WORK and checked against MINISIGN_SHA256. Only this machine's binary
+# is taken from the tarball, written (by tar -O) into a new regular file.
+find_minisign() {
+    MINISIGN="$(command -v minisign 2>/dev/null)" || MINISIGN=""
+    if [ -n "$MINISIGN" ]; then
+        info "checking the signature with $MINISIGN"
+        return
+    fi
+    local url="$MINISIGN_URL" proto='=https' arch archive="$WORK/minisign.tar.gz" sum
+    # Test-only: another download URL (ignored without PUZUZ_TEST_HOOKS=1).
+    # The checksum below is checked all the same.
+    if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_MINISIGN_TARBALL_URL:-}" ]; then
+        url="$PUZUZ_MINISIGN_TARBALL_URL"
+        case "$url" in http://*) proto='=http,https' ;; esac
+    fi
+    case "$TARGET" in
+    x86_64-*) arch=x86_64 ;;
+    aarch64-*) arch=aarch64 ;;
+    *) die "no minisign binary for $TARGET" ;;
+    esac
+    info "minisign is not installed: downloading minisign $MINISIGN_VERSION to check the signature"
+    # A public download: no GitHub token is sent.
+    curl --proto "$proto" --proto-redir "$proto" -fsSL --retry 3 -o "$archive" "$url" ||
+        minisign_unavailable "cannot download minisign from $url"
+    sum="$(sha256sum "$archive")"
+    [ "${sum%% *}" = "$MINISIGN_SHA256" ] ||
+        minisign_unavailable "the downloaded minisign does not match its SHA-256 checksum"
+    mkdir -m 0700 "$WORK/minisign"
+    tar -xzOf "$archive" "minisign-linux/$arch/minisign" >"$WORK/minisign/minisign" 2>/dev/null ||
+        minisign_unavailable "cannot extract minisign from its release tarball"
+    [ -s "$WORK/minisign/minisign" ] ||
+        minisign_unavailable "cannot extract minisign from its release tarball"
+    chmod 0755 "$WORK/minisign/minisign"
+    MINISIGN="$WORK/minisign/minisign"
+    # Fails, e.g., when the temporary directory is on a noexec file system.
+    "$MINISIGN" -v >/dev/null 2>&1 ||
+        minisign_unavailable "the downloaded minisign does not run (is $WORK on a noexec file system?)"
 }
 
 # Safe extraction: regular files and directories only, below one top directory.
@@ -604,9 +657,8 @@ do_install() {
     info "installing puzuz $version from $REPO"
     download_asset "$WORK/release.json" "$tarball"
     download_asset "$WORK/release.json" "$tarball.sha256"
-    if command -v minisign >/dev/null 2>&1; then
-        download_asset "$WORK/release.json" "$tarball.minisig"
-    fi
+    download_asset "$WORK/release.json" "$tarball.minisig"
+    find_minisign
     verify "$tarball"
     extract "$tarball" "$name"
 
