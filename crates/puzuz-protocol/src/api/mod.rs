@@ -15,6 +15,7 @@
 mod error;
 mod events;
 mod jobs;
+mod priority;
 mod resources;
 pub mod routes;
 mod warnings;
@@ -26,6 +27,10 @@ pub use jobs::{
     CleanResponse, EnqueueOptions, JobAction, JobActionResult, JobDetails, JobSelector, JobView,
     KillOptions, ListDetails, ListJobsQuery, ListJobsResponse, LogQuery, OrphanJob, PauseOptions,
     ResetRequest, RestartOptions, RestoreOptions, StashOptions, SwitchRequest,
+};
+pub use priority::{
+    NiceRequest, PriorityResponse, PriorityWeights, SetGroupPriorityRequest, SetSharesRequest,
+    SharesResponse, SiteRequest, TopRequest,
 };
 pub use resources::{
     CheckpointStorage, CreateGroupRequest, DetectedGpuSummary, GpuDetection, GpuDetectionStatus,

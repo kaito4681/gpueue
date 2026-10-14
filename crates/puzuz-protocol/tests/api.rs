@@ -36,11 +36,14 @@ fn sample_job() -> Job {
             priority: 0,
             label: Some("run1".into()),
             no_checkpoint: false,
+            nice: 0,
         },
         state: JobState::Running,
         created_at: 1_000,
         started_at: Some(2_000),
         finished_at: None,
+        site_factor: 0,
+        top_seq: None,
     }
 }
 
@@ -203,6 +206,7 @@ fn add_job_request_golden() {
             priority: 0,
             label: None,
             no_checkpoint: true,
+            nice: 0,
         },
         stashed: false,
         enqueue_at: None,
@@ -394,6 +398,7 @@ fn event_golden_and_sse() {
             name: "gpu".into(),
             parallel: 2,
             paused: false,
+            priority: 0,
         },
     };
     assert_golden(
@@ -592,6 +597,21 @@ fn routes() {
         (Route::Shutdown, Method::Post, "/v1/daemon/shutdown"),
         (Route::Version, Method::Get, "/v1/version"),
         (Route::Events, Method::Get, "/v1/events"),
+        (Route::NiceJobs, Method::Post, "/v1/jobs/nice"),
+        (Route::TopJobs, Method::Post, "/v1/jobs/top"),
+        (Route::SiteJobs, Method::Post, "/v1/jobs/site"),
+        (Route::Priority, Method::Get, "/v1/priority"),
+        (Route::ListShares, Method::Get, "/v1/shares"),
+        (
+            Route::SetShares(puzuz_core::model::Uid(1000)),
+            Method::Put,
+            "/v1/shares/1000",
+        ),
+        (
+            Route::SetGroupPriority("a b".into()),
+            Method::Put,
+            "/v1/groups/a%20b/priority",
+        ),
     ];
     for (route, method, path) in cases {
         assert_eq!(route.method(), method, "{route:?}");

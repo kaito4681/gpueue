@@ -59,6 +59,7 @@ pub mod helper;
 mod launch;
 mod limits;
 mod logfile;
+mod priority;
 mod server;
 mod state;
 mod usage;
@@ -198,10 +199,12 @@ impl Daemon {
             trust_uid_header,
         );
         core.check_checkpoint_usage().await;
+        core.start_usage().await;
         let notices = core.helper.connect();
         let tasks = vec![
             tokio::spawn(core.clone().notice_loop(notices)),
             tokio::spawn(core.clone().scheduler_loop()),
+            tokio::spawn(core.clone().usage_loop()),
         ];
 
         let app = api::router(core.clone());

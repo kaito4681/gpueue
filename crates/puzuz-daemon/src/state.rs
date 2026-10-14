@@ -384,6 +384,10 @@ pub fn no_pre(_: &dyn StoreOps, _: &Job) -> Result<(), StorageError> {
 
 pub struct Core {
     pub config: Config,
+    /// `config.priority` as the priority calculation takes it.
+    pub priority_params: puzuz_core::priority::Params,
+    /// CPUs of the machine (for the job size and TRES factors).
+    pub cpus: u32,
     pub db: Db,
     pub helper: Arc<dyn Helper>,
     pub users: Arc<dyn UserDb>,
@@ -454,6 +458,8 @@ impl Core {
         let (events, _) = broadcast::channel(1024);
         let (changes, _) = watch::channel(0);
         Arc::new(Self {
+            priority_params: config.priority.params(),
+            cpus: crate::priority::machine_cpus(),
             config,
             db: Db::new(store),
             helper,
@@ -997,7 +1003,11 @@ impl Core {
                     } else {
                         JobState::Queued { enqueued_at: now }
                     };
-                    let new = tx.insert_job(job.owner, &job.spec, &state, now)?;
+                    // A negative nice is an administrator's grant to
+                    // this job; the copy does not inherit it.
+                    let mut spec = job.spec.clone();
+                    spec.nice = spec.nice.max(0);
+                    let new = tx.insert_job(job.owner, &spec, &state, now)?;
                     changes.added(new.id);
                     copy = Some(new);
                 }
@@ -2095,7 +2105,15 @@ impl Core {
                     .into_iter()
                     .filter(|gpu| core.gpu_available(gpu.index))
                     .collect();
-                let plan = scheduler::plan_with(now, &jobs, &groups, &gpus, &reserved);
+                let table = crate::priority::fair_share_table(tx, &jobs)?;
+                let fairshare = puzuz_core::priority::fair_share_factors(&table);
+                let input = scheduler::PriorityInput {
+                    params: &core.priority_params,
+                    fairshare: &fairshare,
+                    resources: core.priority_resources(gpus.len()),
+                };
+                let plan =
+                    scheduler::plan_prioritized(now, &jobs, &groups, &gpus, &reserved, &input);
                 let mut by_id: HashMap<JobId, Job> = jobs.into_iter().map(|j| (j.id, j)).collect();
                 for id in &plan.enqueue {
                     let Some(job) = by_id.get_mut(id) else {
@@ -2379,6 +2397,7 @@ mod tests {
             priority: 0,
             label: None,
             no_checkpoint: false,
+            nice: 0,
         }
     }
 

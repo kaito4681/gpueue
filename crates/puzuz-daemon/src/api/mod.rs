@@ -19,9 +19,10 @@ use puzuz_protocol::api::routes::{self, JobActionKind};
 use puzuz_protocol::api::{
     API_VERSION, AddJobRequest, AddJobResponse, BulkJobRequest, CleanRequest, CreateGroupRequest,
     EnqueueOptions, ErrorCode, HelperStatus, JobAction, JobActionResult, JobView, KillOptions,
-    ListGpusResponse, ListGroupsResponse, ListJobsQuery, ListJobsResponse, PauseOptions,
-    ResetRequest, RestartOptions, RestoreOptions, SetGpusParallelRequest, SetParallelRequest,
-    ShutdownRequest, StashOptions, SwitchRequest, VERSION_HEADER, VersionResponse, WARNINGS_HEADER,
+    ListGpusResponse, ListGroupsResponse, ListJobsQuery, ListJobsResponse, NiceRequest,
+    PauseOptions, ResetRequest, RestartOptions, RestoreOptions, SetGpusParallelRequest,
+    SetGroupPriorityRequest, SetParallelRequest, SetSharesRequest, ShutdownRequest, SiteRequest,
+    StashOptions, SwitchRequest, TopRequest, VERSION_HEADER, VersionResponse, WARNINGS_HEADER,
     Warning,
 };
 
@@ -56,6 +57,13 @@ pub fn router(core: Arc<Core>) -> Router {
         .route(routes::JOBS_CLEAN, post(clean))
         .route(routes::JOBS_RESET, post(reset))
         .route(routes::JOBS_SWITCH, post(switch))
+        .route(routes::JOBS_NICE, post(nice))
+        .route(routes::JOBS_TOP, post(top))
+        .route(routes::JOBS_SITE, post(site))
+        .route(routes::PRIORITY, get(priorities))
+        .route(routes::SHARES, get(shares))
+        .route(routes::SHARE_TEMPLATE, put(set_shares))
+        .route(routes::GROUP_PRIORITY_TEMPLATE, put(set_group_priority))
         .route(routes::JOB_TEMPLATE, get(get_job).delete(remove_job))
         .route(routes::JOB_LOG_TEMPLATE, get(log::job_log))
         .route(routes::JOB_ACTION_TEMPLATE, post(job_action))
@@ -296,6 +304,67 @@ async fn switch(
 ) -> ApiResult<StatusCode> {
     core.switch(caller, request).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Priority and fair share
+// ---------------------------------------------------------------------------
+
+async fn nice(
+    State(core): State<AppState>,
+    Auth(caller): Auth,
+    JsonBody(request): JsonBody<NiceRequest>,
+) -> ApiResult<Response> {
+    Ok(Json(core.nice(caller, request).await?).into_response())
+}
+
+async fn top(
+    State(core): State<AppState>,
+    Auth(caller): Auth,
+    JsonBody(request): JsonBody<TopRequest>,
+) -> ApiResult<Response> {
+    Ok(Json(core.top(caller, request).await?).into_response())
+}
+
+async fn site(
+    State(core): State<AppState>,
+    Auth(caller): Auth,
+    JsonBody(request): JsonBody<SiteRequest>,
+) -> ApiResult<Response> {
+    Ok(Json(core.site(caller, request).await?).into_response())
+}
+
+async fn priorities(State(core): State<AppState>, Auth(_): Auth) -> ApiResult<Response> {
+    Ok(Json(core.priorities().await?).into_response())
+}
+
+async fn shares(State(core): State<AppState>, Auth(_): Auth) -> ApiResult<Response> {
+    Ok(Json(core.shares().await?).into_response())
+}
+
+async fn set_shares(
+    State(core): State<AppState>,
+    Auth(caller): Auth,
+    Path(uid): Path<String>,
+    JsonBody(request): JsonBody<SetSharesRequest>,
+) -> ApiResult<StatusCode> {
+    let uid = Uid(uid
+        .parse()
+        .map_err(|_| Failure::bad_request(format!("invalid uid {uid:?}")))?);
+    core.set_shares(caller, uid, request.shares).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_group_priority(
+    State(core): State<AppState>,
+    Auth(caller): Auth,
+    Path(name): Path<String>,
+    JsonBody(request): JsonBody<SetGroupPriorityRequest>,
+) -> ApiResult<Response> {
+    let group = core
+        .set_group_priority(caller, name, request.priority)
+        .await?;
+    Ok(Json(group).into_response())
 }
 
 // ---------------------------------------------------------------------------

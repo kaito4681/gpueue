@@ -1230,6 +1230,7 @@ dependencies = [
 name = "puzuz-config"
 version = "0.1.0"
 dependencies = [
+ "puzuz-core",
  "puzuz-protocol",
  "serde",
  "tempfile",
@@ -1253,6 +1254,7 @@ name = "puzuz-daemon"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "futures",
  "http-body-util",
  "hyper",
