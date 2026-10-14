@@ -677,10 +677,13 @@ memory = g.get("memory_total_bytes") or 0
 assert abs(memory - (int(mib) << 20)) <= 1 << 20, f"memory {memory} != {mib} MiB"
 print(f"NVML detected GPU {index}: {name}, {uuid}, {memory} bytes, driver {driver}")
 EOF
-    journalctl -u puzuz.service --since "$since" -o cat --no-pager \
-        | grep -q 'detected 1 GPU(s) with NVML' || fail "the daemon did not log NVML detection"
-    ! journalctl -u puzuz.service --since "$since" -o cat --no-pager \
-        | grep 'NVML failed' || fail "the daemon logged an NVML failure"
+    # The journal is captured first (see s2_authz): `journalctl | grep -q`
+    # fails when grep's early exit kills journalctl with SIGPIPE.
+    local journal
+    journal="$(journalctl -u puzuz.service --since "$since" -o cat --no-pager)" \
+        || fail "journalctl failed"
+    grep -q 'detected 1 GPU(s) with NVML' <<<"$journal" || fail "the daemon did not log NVML detection"
+    ! grep 'NVML failed' <<<"$journal" || fail "the daemon logged an NVML failure"
     out=$(pz carol doctor 2>&1) || true
     grep -E '^OK +gpus: 1 GPU\(s\), detected with NVML$' <<<"$out" \
         || fail "doctor does not report NVML detection: $(grep gpus <<<"$out")"
