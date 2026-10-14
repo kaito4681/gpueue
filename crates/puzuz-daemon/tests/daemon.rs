@@ -288,6 +288,24 @@ impl Harness {
         panic!("job {id} never reached the helper");
     }
 
+    /// Waits until the fake helper has received `count` signals. The daemon
+    /// records a state change before it runs the change's effects, so a
+    /// job pausing on its own (restored or reverted to `Paused`) shows as
+    /// `Paused` a moment before its SIGSTOP reaches the helper; unlike an
+    /// API action, nothing else waits for that signal.
+    async fn wait_signals(&self, count: usize) {
+        for _ in 0..250 {
+            if self.helper.signals().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "the helper never got {count} signals: {:?}",
+            self.helper.signals()
+        );
+    }
+
     /// The job's process exits with `code` (once it has been spawned).
     async fn exit(&self, id: JobId, code: i32) {
         self.wait_spawned(id).await;
@@ -946,6 +964,7 @@ async fn lost_checkpoint_requests_do_not_leave_jobs_checkpointing() {
     alice
         .wait_for(id, "paused again", |j| j.state == JobState::Paused)
         .await;
+    h.wait_signals(3).await;
     assert_eq!(h.helper.jobs()[&id].phase, RunningPhase::Stopped);
     assert_eq!(
         h.helper.signals(),
@@ -1056,6 +1075,7 @@ async fn a_job_paused_before_its_checkpoint_is_restored_paused() {
         .await;
     assert_eq!(reply.status, StatusCode::OK);
     alice.wait_state(id, &JobState::Paused).await;
+    h.wait_signals(3).await;
     assert_eq!(
         h.helper.signals(),
         [
@@ -1129,6 +1149,7 @@ async fn a_job_paused_at_an_os_shutdown_is_restored_paused() {
     }
     alice.wait_state(paused, &JobState::Paused).await;
     alice.wait_state(running, &JobState::Running).await;
+    h.wait_signals(2).await;
     assert_eq!(
         h.helper.signals(),
         [(paused, signal::SIGSTOP), (paused, signal::SIGSTOP)]
