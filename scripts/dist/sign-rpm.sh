@@ -37,7 +37,7 @@ trap cleanup EXIT
 mkdir -m 700 "$GNUPGHOME"
 
 gpg --batch --quiet --import "$key" 2>/dev/null || die "cannot import $key"
-fpr="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+fpr="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" && fpr == "" { fpr = $10 } END { print fpr }')"
 [ -n "$fpr" ] || die "$key holds no secret key"
 fprs="$(gpg --batch --with-colons --import-options show-only --import "$keyring" 2>/dev/null |
     awk -F: '$1 == "fpr" { print $10 }')" || die "cannot read $keyring"
