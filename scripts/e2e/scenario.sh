@@ -830,8 +830,16 @@ job_mountinfo() {
 }
 
 s15_prepare() {
-    local id name f out
+    local id name f out p
     need_mounts
+    # The sshfs server must outlive the helper's dumps at the reboot: a
+    # logind session (a PAM login with libpam-systemd) is stopped early in
+    # a shutdown, and every job's dump would fail on the dead /nfs.
+    for p in $(pgrep -f /usr/lib/openssh/sftp-server || true); do
+        echo "sftp-server $p: $(cat "/proc/$p/cgroup")"
+        ! grep -q '/session-[^/]*\.scope' "/proc/$p/cgroup" \
+            || fail "the sftp-server behind /nfs runs in a logind session"
+    done
     pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
     mkdir -p "$STATE"
     : >"$STATE/mounts"

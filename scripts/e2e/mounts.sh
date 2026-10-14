@@ -126,16 +126,20 @@ if ! skipped /nfs && ! mounted /nfs && command -v sshfs >/dev/null \
     cp "$DISK/ssh/id.pub" /root/.ssh/authorized_keys
     chmod 0600 /root/.ssh/authorized_keys
     ssh-keygen -A >/dev/null
-    # UsePAM=no: with libpam-systemd installed (polkitd pulls it in), each
-    # SSH login would be a logind session, which systemd stops early in a
-    # shutdown; the sftp-server behind /nfs would be gone before the
-    # helper dumps the jobs (and CRIU cannot dump a disconnected FUSE
-    # mount).
-    pgrep -x sshd >/dev/null \
-        || /usr/sbin/sshd -o ListenAddress=127.0.0.1 -o PermitRootLogin=prohibit-password \
-            -o UsePAM=no
+    # An sshd of our own (port 2022) without PAM, not the image's
+    # ssh.service: where libpam-systemd is installed (polkitd, installed
+    # for scenario 19, pulls it in) and logind runs, a PAM login is a
+    # logind session, and systemd stops session scopes early in a
+    # shutdown. The sftp-server behind /nfs would then be gone before the
+    # helper dumps the jobs at the reboot of scenarios 7/15/16, and CRIU
+    # fails on every job's (now disconnected) /nfs mount ("failed to dump
+    # fs ./nfs (fuse)"). Scenario 15 checks that the sftp-server is in no
+    # session.
+    [ -e /run/sshd-e2e.pid ] && kill -0 "$(cat /run/sshd-e2e.pid)" 2>/dev/null \
+        || /usr/sbin/sshd -o ListenAddress=127.0.0.1 -o Port=2022 -o UsePAM=no \
+            -o PermitRootLogin=prohibit-password -o PidFile=/run/sshd-e2e.pid
     for _ in $(seq 50); do
-        sshfs -o allow_other,default_permissions,IdentityFile="$DISK/ssh/id",StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,LogLevel=ERROR \
+        sshfs -p 2022 -o allow_other,default_permissions,IdentityFile="$DISK/ssh/id",StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,LogLevel=ERROR \
             root@127.0.0.1:/srv/ext4/export /nfs 2>/dev/null && break
         sleep 0.2
     done
