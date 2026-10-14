@@ -9,7 +9,7 @@ use comfy_table::presets::{NOTHING, UTF8_HORIZONTAL_ONLY};
 use comfy_table::{Cell, CellAlignment, ContentArrangement, Row, Table};
 use puzuz_core::authz::REDACTED;
 use puzuz_core::model::{DEFAULT_GROUP, Group, JobId, JobResult, JobState};
-use puzuz_protocol::api::{ActionOutcome, GpuView, JobActionResult, JobView};
+use puzuz_protocol::api::{ActionOutcome, GpuView, JobActionResult, JobView, OrphanJob};
 
 use crate::clock::{Clock, human_bytes};
 use crate::query::Column;
@@ -598,6 +598,29 @@ pub fn log_output_line(truncated_to: Option<usize>, style: &Style) -> String {
         Some(lines) => format!("{header} (last {lines} lines)"),
         None => header,
     }
+}
+
+/// The note `status` prints (to stderr) for administrators about jobs the
+/// helper runs that the daemon does not account for.
+pub fn orphans_note(orphans: &[OrphanJob]) -> String {
+    let mut out = String::from(
+        "Warning: the helper runs jobs the daemon does not account for (their GPUs stay \
+         taken until they end; stop one with `puzuz kill <id>`):",
+    );
+    for orphan in orphans {
+        out.push_str(&format!("\n  job {}", orphan.id));
+        if let Some(owner) = orphan.owner {
+            out.push_str(&format!(", uid {owner}"));
+        }
+        if let Some(pid) = orphan.pid {
+            out.push_str(&format!(", pid {pid}"));
+        }
+        if !orphan.gpus.is_empty() {
+            let gpus: Vec<String> = orphan.gpus.iter().map(ToString::to_string).collect();
+            out.push_str(&format!(", GPUs {}", gpus.join(",")));
+        }
+    }
+    out
 }
 
 /// Keeps the last `lines` lines of `log`. Returns the kept bytes and whether

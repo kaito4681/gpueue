@@ -275,7 +275,8 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   （`status`、`gpu`）。これで誰がどの GPU を使っているかが分かります。
 - **管理者のみ：** `group add/remove`、`parallel`、`gpu parallel`、グループ全体の一時停止や再開
   （1 つのグループには `pause/start/kill -g`、全グループには `pause/start/kill -a`）、`shutdown`、他の
-  ユーザーのジョブの `reset`。pueue と同様に、`pause` と `kill` は選択したグループを一時停止し、`start` は
+  ユーザーのジョブの `reset`、[孤立ジョブ](docs/ja/architecture.md#orphans)（デーモンが把握していないのにヘルパーが
+  実行しているプロセス。`status` が管理者に表示します）の `kill <id>`。pueue と同様に、`pause` と `kill` は選択したグループを一時停止し、`start` は
   再開します。`pause --wait` はグループだけを一時停止し、実行中のジョブは最後まで実行させます。pueue と
   異なり、`kill -g/-a` はキューに何もなくてもグループを一時停止します。一般ユーザーが
   `pause/start/kill -g` や `-a` を実行した場合は、自分のジョブだけが対象になり、どのグループの一時停止

@@ -57,7 +57,9 @@ mod error;
 pub mod gpu;
 pub mod helper;
 mod launch;
+mod limits;
 mod logfile;
+mod server;
 mod state;
 mod usage;
 pub mod users;
@@ -202,16 +204,8 @@ impl Daemon {
             tokio::spawn(core.clone().scheduler_loop()),
         ];
 
-        let app = api::router(core.clone()).into_make_service_with_connect_info::<api::PeerCred>();
-        let cancel = core.cancel.clone();
-        let server = tokio::spawn(async move {
-            let result = axum::serve(listener, app)
-                .with_graceful_shutdown(cancel.cancelled_owned())
-                .await;
-            if let Err(e) = result {
-                tracing::error!("API server failed: {e}");
-            }
-        });
+        let app = api::router(core.clone());
+        let server = tokio::spawn(server::serve(listener, app, core.cancel.clone()));
         tracing::info!(socket = %socket.display(), "puzuz daemon listening");
         Ok(Self {
             core,

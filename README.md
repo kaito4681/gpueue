@@ -267,7 +267,9 @@ columns, and `Checkpointed` jobs show the image size.
   times (`status`, `gpu`). This shows who is using which GPU.
 - **Administrators only:** `group add/remove`, `parallel`, `gpu parallel`, pausing or resuming
   whole groups (`pause/start/kill -g` for one group, `pause/start/kill -a` for all groups),
-  `shutdown`, and `reset` of other users' jobs. As in pueue, `pause` and `kill` pause the selected
+  `shutdown`, `reset` of other users' jobs, and `kill <id>` of an
+  [orphan](docs/architecture.md#orphans) (a process the helper runs that the daemon does not
+  account for; `status` lists them to administrators). As in pueue, `pause` and `kill` pause the selected
   groups, `start` resumes them, and `pause --wait` pauses only the groups and lets running jobs
   finish. Unlike pueue, `kill -g/-a` pauses the groups even when nothing is queued in them.
   When a regular user runs `pause/start/kill -g` or `-a`, only their own jobs are affected and no

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use puzuz_core::model::JobId;
+use puzuz_core::model::{GpuIndex, JobId, Uid};
 use puzuz_protocol::helper::{
     CheckpointOptions, CheckpointOutcome, Event, EventEnvelope, EventSeq, ExitStatus,
     HelperErrorCode, RestoreOutcome, RestoreRequest, RunningJob, RunningPhase, SpawnRequest,
@@ -85,6 +85,11 @@ struct State {
     hold_launches: bool,
     /// Held requests fail with `ConnectionLost` when released.
     lose_held: bool,
+    /// Owner and GPUs of the jobs started by spawn or restore requests
+    /// (or [`FakeHelper::insert_running_as`]), reported by `list_running`.
+    launched: BTreeMap<JobId, (Uid, Vec<GpuIndex>)>,
+    /// Event notices sent (see [`Helper::events_delivered`]).
+    delivered: u64,
     /// Spawn/restore requests currently held.
     held: usize,
 }
@@ -99,28 +104,36 @@ impl State {
         self.unacked.push(envelope.clone());
         if self.connected
             && let Some(tx) = &self.notices
+            && tx.send(HelperNotice::Event(envelope)).is_ok()
         {
-            let _ = tx.send(HelperNotice::Event(envelope));
+            self.delivered += 1;
         }
     }
 
     fn running(&self) -> Vec<RunningJob> {
         self.jobs
             .iter()
-            .map(|(id, job)| RunningJob {
-                job: *id,
-                pid: Some(job.pid),
-                phase: job.phase,
+            .map(|(id, job)| {
+                let launched = self.launched.get(id);
+                RunningJob {
+                    job: *id,
+                    pid: Some(job.pid),
+                    phase: job.phase,
+                    uid: launched.map(|(uid, _)| *uid),
+                    gpus: launched.map(|(_, gpus)| gpus.clone()),
+                }
             })
             .collect()
     }
 
     /// Replays unacknowledged events, then reports the live jobs, as the
     /// real helper connection does.
-    fn announce(&self) {
+    fn announce(&mut self) {
         let Some(tx) = &self.notices else { return };
         for event in &self.unacked {
-            let _ = tx.send(HelperNotice::Event(event.clone()));
+            if tx.send(HelperNotice::Event(event.clone())).is_ok() {
+                self.delivered += 1;
+            }
         }
         let _ = tx.send(HelperNotice::Connected {
             version: "fake".to_owned(),
@@ -249,6 +262,7 @@ impl FakeHelper {
     pub fn insert_running(&self, job: JobId) {
         self.with(|s| {
             let pid = s.next_pid();
+            s.launched.remove(&job);
             s.jobs.insert(
                 job,
                 FakeJob {
@@ -256,6 +270,15 @@ impl FakeHelper {
                     phase: RunningPhase::Running,
                 },
             );
+        });
+    }
+
+    /// Like [`FakeHelper::insert_running`], for a job running as `uid` on
+    /// `gpus` (reported by `list_running`).
+    pub fn insert_running_as(&self, job: JobId, uid: Uid, gpus: &[GpuIndex]) {
+        self.insert_running(job);
+        self.with(|s| {
+            s.launched.insert(job, (uid, gpus.to_vec()));
         });
     }
 
@@ -469,6 +492,8 @@ impl FakeHelper {
                     phase: RunningPhase::Running,
                 },
             );
+            s.launched
+                .insert(request.job, (request.uid, request.gpus.clone()));
             s.spawned.push(request);
             Ok(pid)
         })
@@ -577,6 +602,7 @@ impl FakeHelper {
                                 phase: RunningPhase::Running,
                             },
                         );
+                        s.launched.insert(job, (request.uid, request.gpus.clone()));
                         RestoreOutcome::Success { pid }
                     }
                     FakeOutcome::Fail(reason) | FakeOutcome::Refuse(reason) => {
@@ -616,6 +642,10 @@ impl Helper for FakeHelper {
             connected,
             version: connected.then(|| "fake".to_owned()),
         }
+    }
+
+    fn events_delivered(&self) -> u64 {
+        self.with(|s| s.delivered)
     }
 
     fn spawn(&self, request: SpawnRequest) -> BoxFuture<'_, HelperResult<u32>> {

@@ -17,7 +17,7 @@
 //! has been answered (see [`crate::launch`]); [`Core::wait_for_launch`] and
 //! [`Core::launch_in_flight`] enforce that ordering per job.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,7 +30,7 @@ use puzuz_core::model::{Caller, GpuIndex, Group, Job, JobId, JobResult, JobState
 use puzuz_core::scheduler;
 use puzuz_core::storage::StorageError;
 use puzuz_core::storage::{
-    CheckpointRecord, CheckpointStatus, JobError, JobErrorKind, JobFilter, Store, StoreOps, Tx,
+    CheckpointRecord, CheckpointStatus, JobError, JobErrorKind, Store, StoreOps, Tx,
 };
 use puzuz_protocol::api::{self, ErrorCode, GpuDetectionStatus, JobView, Warning};
 use puzuz_protocol::helper::{
@@ -45,6 +45,7 @@ use crate::error::{ApiResult, Failure};
 use crate::gpu::DetectedGpu;
 use crate::helper::{Helper, HelperError, HelperNotice};
 use crate::launch::{LaunchOutcome, Launches, RetryStatus, SettleGuard};
+use crate::limits::{MAX_STREAMS_PER_UID, UidLimiter};
 use crate::logfile;
 use crate::usage::SizeWarnings;
 use crate::users::UserDb;
@@ -134,6 +135,18 @@ impl JobInfo {
         }
         view
     }
+}
+
+/// The warnings a caller has not been shown yet (see
+/// [`Core::pending_warnings`]), with what identifies the failures among
+/// them, so that acknowledging them cannot swallow a newer one.
+#[derive(Debug, Default)]
+pub struct PendingWarnings {
+    pub warnings: Vec<Warning>,
+    /// Failed dumps: job and the `created_at` of its checkpoint record.
+    dumps: Vec<(JobId, Timestamp)>,
+    /// Failed restores: job and the `recorded_at` of its error.
+    errors: Vec<(JobId, Timestamp)>,
 }
 
 /// Internal change notifications; turned into per-caller
@@ -268,6 +281,39 @@ const CHECKPOINT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// Spawn/restore requests the scheduler has outstanding at most.
 const MAX_CONCURRENT_LAUNCHES: usize = 8;
 
+/// `log --tail` scans running at once at most (see `api::log`).
+const MAX_TAIL_SCANS: usize = 2;
+
+/// How long a check that found a job gone from the helper waits for the
+/// helper events received before that answer to be applied (see
+/// [`Core::spawn_lost_check`]).
+const EVENT_CATCH_UP_WAIT: Duration = Duration::from_secs(30);
+
+/// A job the helper runs that the database does not account for: it has
+/// it finished, queued, checkpointed, or not at all (e.g. after restoring
+/// the database from a backup). It keeps its GPU slots taken, a queued job
+/// with its id is not launched, administrators see it in `status` and
+/// `doctor`, and may stop it with `kill`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Orphan {
+    pub job: JobId,
+    pub owner: Option<Uid>,
+    /// As reported by the helper; from the database for older helpers.
+    pub gpus: Vec<GpuIndex>,
+    pub pid: Option<u32>,
+}
+
+impl Orphan {
+    pub fn view(&self) -> api::OrphanJob {
+        api::OrphanJob {
+            id: self.job,
+            owner: self.owner,
+            gpus: self.gpus.clone(),
+            pid: self.pid,
+        }
+    }
+}
+
 /// Testing only: awaited by an action whose launch the helper did not carry
 /// out, before it finds out whether the launch is being retried (see
 /// [`Core::set_launch_check_hook`]).
@@ -361,8 +407,19 @@ pub struct Core {
     pub shutdown_complete: CancellationToken,
     /// Jobs `reset` will remove once they have stopped.
     pending_removal: Mutex<BTreeSet<JobId>>,
-    /// Live helper jobs the database does not account for.
-    orphans: Mutex<BTreeSet<JobId>>,
+    /// Live helper jobs the database does not account for (see
+    /// [`Orphan`]).
+    orphans: Mutex<BTreeMap<JobId, Orphan>>,
+    /// How many helper event notices the notice loop has handled (see
+    /// [`Helper::events_delivered`]).
+    events_applied: watch::Sender<u64>,
+    /// Bounds the concurrent backward scans of `log --tail` (see
+    /// `api::log`), which run on the blocking pool shared with the
+    /// database.
+    pub(crate) tail_scans: Semaphore,
+    /// Open `log --follow` and `/v1/events` streams per caller (see
+    /// [`crate::limits`]).
+    pub(crate) streams: Arc<UidLimiter>,
     /// Spawn and restore requests the helper has not answered yet.
     launches: Launches,
     /// Bounds the scheduler's concurrent spawn/restore requests.
@@ -412,7 +469,10 @@ impl Core {
             cancel: CancellationToken::new(),
             shutdown_complete: CancellationToken::new(),
             pending_removal: Mutex::new(BTreeSet::new()),
-            orphans: Mutex::new(BTreeSet::new()),
+            orphans: Mutex::new(BTreeMap::new()),
+            events_applied: watch::channel(0).0,
+            tail_scans: Semaphore::new(MAX_TAIL_SCANS),
+            streams: UidLimiter::new(MAX_STREAMS_PER_UID, usize::MAX),
             launches: Launches::default(),
             launch_slots: Semaphore::new(MAX_CONCURRENT_LAUNCHES),
             unconfirmed_launches: Mutex::new(HashMap::new()),
@@ -567,8 +627,107 @@ impl Core {
         result.unwrap_or(Retried::No)
     }
 
-    pub fn orphans(&self) -> Vec<JobId> {
-        self.orphans.lock().unwrap().iter().copied().collect()
+    /// The live helper jobs the database does not account for, by id.
+    pub fn orphans(&self) -> Vec<Orphan> {
+        self.orphans.lock().unwrap().values().cloned().collect()
+    }
+
+    fn is_orphan(&self, id: JobId) -> bool {
+        self.orphans.lock().unwrap().contains_key(&id)
+    }
+
+    /// Forgets orphan `id` (its process ended); returns whether it was one.
+    fn forget_orphan(&self, id: JobId) -> bool {
+        let removed = self.orphans.lock().unwrap().remove(&id).is_some();
+        if removed {
+            tracing::info!(job = %id, "the orphaned job has ended");
+            self.wake_scheduler();
+        }
+        removed
+    }
+
+    /// GPU slots taken and job ids held by orphans, for scheduling.
+    pub(crate) fn orphan_reservations(&self) -> scheduler::Reserved {
+        let mut reserved = scheduler::Reserved::default();
+        for orphan in self.orphans.lock().unwrap().values() {
+            reserved.held.insert(orphan.job);
+            let mut seen = HashSet::new();
+            for gpu in orphan.gpus.iter().filter(|g| seen.insert(**g)) {
+                *reserved.gpus.entry(*gpu).or_default() += 1;
+            }
+        }
+        reserved
+    }
+
+    /// `kill` of orphan `id` by an administrator: `signal`, or SIGTERM and
+    /// SIGKILL after the grace period (as for jobs). Returns `false` if `id`
+    /// is no orphan.
+    pub async fn kill_orphan(self: &Arc<Self>, id: JobId, sig: Option<i32>) -> ApiResult<bool> {
+        if !self.is_orphan(id) {
+            return Ok(false);
+        }
+        if !self.helper_ready() {
+            return Err(Self::helper_unavailable());
+        }
+        tracing::warn!(job = %id, signal = ?sig, "killing an orphaned job");
+        match self.helper.signal(id, sig.unwrap_or(signal::SIGTERM)).await {
+            Ok(()) => {}
+            Err(HelperError::Rejected {
+                code: HelperErrorCode::JobNotFound,
+                ..
+            }) => {
+                self.forget_orphan(id);
+                return Ok(true);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        if sig.is_none() {
+            let core = self.clone();
+            let grace = Duration::from_secs(self.config.grace_secs);
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = core.cancel.cancelled() => return,
+                    _ = tokio::time::sleep(grace) => {}
+                }
+                if core.is_orphan(id)
+                    && let Err(HelperError::Rejected {
+                        code: HelperErrorCode::JobNotFound,
+                        ..
+                    }) = core.helper.signal(id, signal::SIGKILL).await
+                {
+                    core.forget_orphan(id);
+                }
+            });
+        }
+        Ok(true)
+    }
+
+    /// Swaps what is kept in memory under the ids of two jobs `switch`
+    /// swaps (inside the transaction that swaps them in the database): the
+    /// "launch regardless of slots" mark and the launch records.
+    pub(crate) fn swap_in_memory(&self, a: JobId, b: JobId) {
+        let mut forced = self.forced.lock().unwrap();
+        let (has_a, has_b) = (forced.remove(&a), forced.remove(&b));
+        if has_a {
+            forced.insert(b);
+        }
+        if has_b {
+            forced.insert(a);
+        }
+        drop(forced);
+        self.launches.swap(a, b);
+    }
+
+    /// Waits until the notice loop has handled `count` helper event notices
+    /// (see [`Helper::events_delivered`]); `false` if it has not by
+    /// [`EVENT_CATCH_UP_WAIT`] or the daemon stops.
+    async fn events_applied_up_to(&self, count: u64) -> bool {
+        let mut applied = self.events_applied.subscribe();
+        tokio::select! {
+            result = applied.wait_for(|n| *n >= count) => result.is_ok(),
+            _ = self.cancel.cancelled() => false,
+            _ = tokio::time::sleep(EVENT_CATCH_UP_WAIT) => false,
+        }
     }
 
     pub fn log_path(&self, owner: Uid, id: JobId) -> PathBuf {
@@ -635,7 +794,7 @@ impl Core {
     /// The warnings `owner` has not been shown yet (failed dumps and failed
     /// restores, ordered by job), followed by checkpoint size warnings (see
     /// [`crate::usage`]).
-    pub async fn pending_warnings(&self, owner: Uid) -> ApiResult<Vec<Warning>> {
+    pub async fn pending_warnings(&self, owner: Uid) -> ApiResult<PendingWarnings> {
         let (dumps, errors) = self
             .read(move |s| {
                 Ok((
@@ -645,29 +804,35 @@ impl Core {
             })
             .await?;
         let mut warnings: Vec<Warning> = dumps
-            .into_iter()
-            .map(|job| Warning::CheckpointFailed { job })
-            .chain(errors.into_iter().map(|(job, kind)| match kind {
-                JobErrorKind::Restore => Warning::RestoreFailed { job },
+            .iter()
+            .map(|&(job, _)| Warning::CheckpointFailed { job })
+            .chain(errors.iter().map(|error| match error.kind {
+                JobErrorKind::Restore => Warning::RestoreFailed { job: error.job_id },
             }))
             .collect();
         warnings.sort_by_key(Warning::job);
         warnings.extend(self.pending_size_warnings(owner).await);
-        Ok(warnings)
+        Ok(PendingWarnings {
+            warnings,
+            dumps,
+            errors: errors
+                .into_iter()
+                .map(|error| (error.job_id, error.recorded_at))
+                .collect(),
+        })
     }
 
-    /// Records that `warnings` have been shown to `owner`.
-    pub async fn acknowledge_warnings(&self, owner: Uid, warnings: &[Warning]) -> ApiResult<()> {
-        self.acknowledge_size_warnings(owner, warnings);
-        let mut dumps = Vec::new();
-        let mut errors = Vec::new();
-        for warning in warnings {
-            match warning {
-                Warning::CheckpointFailed { job } => dumps.push(*job),
-                Warning::RestoreFailed { job } => errors.push(*job),
-                Warning::CheckpointOverLimit { .. } | Warning::CheckpointUsageOverLimit { .. } => {}
-            }
-        }
+    /// Records that `pending` has been shown to `owner`: exactly the
+    /// failures that were read, so one recorded since (a newer failed dump
+    /// or restore of the same job) is still reported.
+    pub async fn acknowledge_warnings(
+        &self,
+        owner: Uid,
+        pending: &PendingWarnings,
+    ) -> ApiResult<()> {
+        self.acknowledge_size_warnings(owner, &pending.warnings);
+        let dumps = pending.dumps.clone();
+        let errors = pending.errors.clone();
         self.read(move |s| {
             s.acknowledge_checkpoint_failures(&dumps)?;
             s.acknowledge_job_errors(&errors)
@@ -1117,19 +1282,28 @@ impl Core {
             let Ok(running) = core.helper.list_running().await else {
                 return;
             };
+            // Every event the helper sent before this answer, e.g. the
+            // job's exit, has been received by now.
+            let received = core.helper.events_delivered();
             if running.iter().any(|r| r.job == id) {
                 core.unconfirmed_launches.lock().unwrap().remove(&id);
                 return;
             }
+            // Its exit (or restore outcome) may have been received but not
+            // applied yet: the notice loop applies events one at a time.
+            // Deciding before it has would record an exited job as lost
+            // (and fail its dependants) or launch an exited job again.
+            if !core.events_applied_up_to(received).await {
+                tracing::warn!(job = %id, "helper events are not applied in time; checking the job anyway");
+            }
+            // An event the helper reported right around the list arrives
+            // shortly; give it time too.
+            tokio::select! {
+                _ = core.cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
             let unconfirmed = core.unconfirmed_launches.lock().unwrap().remove(&id);
             if let Some(launched) = unconfirmed {
-                // An exit (or restore outcome) reported just before the
-                // list was taken arrives shortly; give it time before
-                // launching the job again.
-                tokio::select! {
-                    _ = core.cancel.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                }
                 match core.requeue_unstarted(id, Some(started_at), launched).await {
                     Ok(true) => {
                         tracing::warn!(job = %id, "the helper never started the job; requeueing it");
@@ -1141,8 +1315,12 @@ impl Core {
                 }
                 return;
             }
+            if !core.still_live(id, started_at).await {
+                return;
+            }
             tracing::warn!(job = %id, "the helper no longer knows the job; marking it lost");
-            core.handle_event(id, lifecycle::Event::Lost, no_pre).await;
+            core.handle_event_in_run(id, lifecycle::Event::Lost, Some(started_at), no_pre)
+                .await;
         });
     }
 
@@ -1314,6 +1492,7 @@ impl Core {
                 let Ok(running) = core.helper.list_running().await else {
                     continue;
                 };
+                let received = core.helper.events_delivered();
                 match running.iter().find(|r| r.job == id).map(|r| r.phase) {
                     Some(phase @ (hp::RunningPhase::Running | hp::RunningPhase::Stopped)) => {
                         core.abandon_lost_checkpoint(id, phase).await;
@@ -1321,8 +1500,24 @@ impl Core {
                     }
                     Some(_) => missing = false,
                     None if missing => {
-                        tracing::warn!(job = %id, "the helper no longer knows the job; marking it lost");
-                        core.handle_event(id, lifecycle::Event::Lost, no_pre).await;
+                        // Its outcome may be received but not applied yet
+                        // (see `Core::spawn_lost_check`).
+                        core.events_applied_up_to(received).await;
+                        let still_checkpointing = matches!(
+                            core.read(move |s| s.get_job(id)).await,
+                            Ok(Some(job)) if job.state == JobState::Checkpointing
+                                && job.started_at == started_at
+                        );
+                        if still_checkpointing {
+                            tracing::warn!(job = %id, "the helper no longer knows the job; marking it lost");
+                            core.handle_event_in_run(
+                                id,
+                                lifecycle::Event::Lost,
+                                Some(started_at),
+                                no_pre,
+                            )
+                            .await;
+                        }
                         return;
                     }
                     None => missing = true,
@@ -1432,6 +1627,20 @@ impl Core {
     where
         P: FnOnce(&dyn StoreOps, &Job) -> Result<(), StorageError> + Send + 'static,
     {
+        self.handle_event_in_run(id, event, None, pre).await
+    }
+
+    /// [`Core::handle_event`], only if the job is still in the run that
+    /// began at `started_at` (when given).
+    async fn handle_event_in_run<P>(
+        self: &Arc<Self>,
+        id: JobId,
+        event: lifecycle::Event,
+        started_at: Option<Option<Timestamp>>,
+        pre: P,
+    ) where
+        P: FnOnce(&dyn StoreOps, &Job) -> Result<(), StorageError> + Send + 'static,
+    {
         let core = self.clone();
         let now = now_ms();
         let result = self
@@ -1439,6 +1648,9 @@ impl Core {
                 let Some(mut job) = tx.get_job(id)? else {
                     return Ok(None);
                 };
+                if started_at.is_some_and(|at| at != job.started_at) {
+                    return Ok(None);
+                }
                 let mut transition = match lifecycle::on_event(&job, &event) {
                     Ok(t) => t,
                     Err(e) => {
@@ -1470,6 +1682,17 @@ impl Core {
     async fn process_helper_event(self: &Arc<Self>, event: hp::Event, seq: u64) {
         use lifecycle::{Event as E, ExitStatus as X};
         let mark = move |tx: &dyn StoreOps, _: &Job| tx.set_helper_event_seq(seq);
+        // An orphan's process is gone once it exited or was dumped.
+        match &event {
+            hp::Event::JobExited { job, .. }
+            | hp::Event::CheckpointFinished {
+                job,
+                outcome: CheckpointOutcome::Success { .. },
+            } => {
+                self.forget_orphan(*job);
+            }
+            _ => {}
+        }
         match event {
             hp::Event::JobExited { job, status } => {
                 let event = match status {
@@ -1570,8 +1793,8 @@ impl Core {
     /// 再発見"):
     /// - live in the database but unknown to the helper → `Lost` (an exit
     ///   status would have been replayed as an event before this point);
-    /// - known to the helper but not live in the database → orphan, logged
-    ///   and left alone;
+    /// - known to the helper but not live in the database → [`Orphan`]: its
+    ///   GPU slots stay taken until it ends; it is not stopped by itself;
     /// - `Terminating` jobs get their SIGTERM/SIGKILL sequence re-armed;
     /// - `Checkpointing` jobs the helper runs but does not dump lost their
     ///   checkpoint request (see [`Core::abandon_lost_checkpoint`]).
@@ -1583,7 +1806,7 @@ impl Core {
     pub async fn reconcile(self: &Arc<Self>, running: Vec<RunningJob>) {
         let live: HashMap<JobId, hp::RunningPhase> =
             running.iter().map(|r| (r.job, r.phase)).collect();
-        let jobs = match self.read(|s| s.list_jobs(&JobFilter::all())).await {
+        let jobs = match self.read(|s| s.list_unfinished_jobs()).await {
             Ok(jobs) => jobs,
             Err(e) => {
                 tracing::error!("cannot reconcile with the helper: {}", e.0.message);
@@ -1631,13 +1854,49 @@ impl Core {
                 Some(_) => {}
             }
         }
-        let live: HashSet<JobId> = live.into_keys().collect();
-        let orphans: BTreeSet<JobId> = live.difference(&accounted).copied().collect();
-        for id in &orphans {
+        let unaccounted: Vec<RunningJob> = running
+            .into_iter()
+            .filter(|r| !accounted.contains(&r.job))
+            .collect();
+        // A helper that predates reporting owner and GPUs: take them from
+        // the database, if it still has the job.
+        let ids: Vec<JobId> = unaccounted
+            .iter()
+            .filter(|r| r.uid.is_none() || r.gpus.is_none())
+            .map(|r| r.job)
+            .collect();
+        let known: HashMap<JobId, Job> = self
+            .read(move |s| {
+                let mut known = HashMap::new();
+                for id in ids {
+                    if let Some(job) = s.get_job(id)? {
+                        known.insert(id, job);
+                    }
+                }
+                Ok(known)
+            })
+            .await
+            .unwrap_or_default();
+        let mut orphans = BTreeMap::new();
+        for r in unaccounted {
+            let job = known.get(&r.job);
+            let orphan = Orphan {
+                job: r.job,
+                owner: r.uid.or(job.map(|j| j.owner)),
+                gpus: r
+                    .gpus
+                    .or_else(|| job.map(|j| j.spec.gpus.clone()))
+                    .unwrap_or_default(),
+                pid: r.pid,
+            };
             tracing::warn!(
-                job = %id,
-                "the helper runs a job the daemon does not account for; leaving it alone"
+                job = %orphan.job,
+                owner = ?orphan.owner,
+                gpus = ?orphan.gpus,
+                "the helper runs a job the daemon does not account for; its GPU slots stay \
+                 taken until it ends (an administrator can stop it with `puzuz kill`)"
             );
+            orphans.insert(orphan.job, orphan);
         }
         *self.orphans.lock().unwrap() = orphans;
         self.reconciled.store(true, Ordering::SeqCst);
@@ -1722,6 +1981,7 @@ impl Core {
                 HelperNotice::Event(envelope) => {
                     self.apply_helper_event(envelope.seq.0, Some(envelope.event), replaying)
                         .await;
+                    self.events_applied.send_modify(|n| *n += 1);
                     if let Err(e) = self.helper.ack_events(envelope.seq).await {
                         tracing::debug!("cannot acknowledge helper events: {e}");
                     }
@@ -1733,6 +1993,7 @@ impl Core {
                          (is the helper newer than the daemon?): {error}"
                     );
                     self.apply_helper_event(seq.0, None, replaying).await;
+                    self.events_applied.send_modify(|n| *n += 1);
                     if let Err(e) = self.helper.ack_events(seq).await {
                         tracing::debug!("cannot acknowledge helper events: {e}");
                     }
@@ -1775,8 +2036,10 @@ impl Core {
         let core = self.clone();
         let launched = self
             .write(move |tx, ch| {
-                let mut jobs = tx.list_jobs(&JobFilter::all())?;
+                // Finished jobs only matter as dependencies.
+                let mut jobs = tx.list_unfinished_jobs()?;
                 let groups = tx.list_groups()?;
+                let reserved = core.orphan_reservations();
                 let mut launched = Vec::new();
                 // Forced launches first, ignoring slots; they still take
                 // theirs, which the plan below accounts for.
@@ -1794,7 +2057,10 @@ impl Core {
                             job.state,
                             JobState::Queued { .. } | JobState::RestoreQueued { .. }
                         );
-                        if !queued || job.spec.gpus.iter().any(|g| !core.gpu_available(*g)) {
+                        if !queued
+                            || reserved.held.contains(&job.id)
+                            || job.spec.gpus.iter().any(|g| !core.gpu_available(*g))
+                        {
                             continue;
                         }
                         let t = lifecycle::dispatch(job)?;
@@ -1808,7 +2074,7 @@ impl Core {
                     .into_iter()
                     .filter(|gpu| core.gpu_available(gpu.index))
                     .collect();
-                let plan = scheduler::plan(now, &jobs, &groups, &gpus);
+                let plan = scheduler::plan_with(now, &jobs, &groups, &gpus, &reserved);
                 let mut by_id: HashMap<JobId, Job> = jobs.into_iter().map(|j| (j.id, j)).collect();
                 for id in &plan.enqueue {
                     let Some(job) = by_id.get_mut(id) else {
@@ -1920,7 +2186,7 @@ impl Core {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             rx.borrow_and_update();
-            if let Ok(jobs) = self.read(|s| s.list_jobs(&JobFilter::all())).await
+            if let Ok(jobs) = self.read(|s| s.list_unfinished_jobs()).await
                 && pred(&jobs)
             {
                 return true;
@@ -1960,7 +2226,7 @@ impl Core {
                     tracing::warn!("the helper has not answered every spawn or restore request");
                 }
             }
-            let jobs = match self.read(|s| s.list_jobs(&JobFilter::all())).await {
+            let jobs = match self.read(|s| s.list_unfinished_jobs()).await {
                 Ok(jobs) => jobs,
                 Err(_) => break,
             };
@@ -2189,6 +2455,52 @@ mod tests {
         // Checked again with the helper, which runs it.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(state(core.clone()).await, JobState::Running);
+        core.cancel.cancel();
+    }
+
+    /// The helper no longer knows a job whose exit it has sent but the
+    /// notice loop has not applied yet: the job is not marked lost (which
+    /// would fail its dependants), its exit is applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exit_received_but_not_applied_yet_is_not_overridden_as_lost() {
+        let helper = FakeHelper::new();
+        let core = core_with(helper.clone(), None, Vec::new());
+        let job = core
+            .db
+            .call(|s| s.insert_job(Uid(1), &spec(), &JobState::Running, 0))
+            .await
+            .unwrap();
+        let id = job.id;
+        helper.insert_running(id);
+        let notices = core.helper.connect();
+        // The job exits; the event is received, but the notice loop is busy
+        // (here: not running yet).
+        helper.exit(id, 0);
+        assert_eq!(core.helper.events_delivered(), 1);
+        // A signal found the job gone.
+        core.spawn_lost_check(id, job.started_at);
+        let state = |core: Arc<Core>| async move {
+            core.db
+                .call(move |s| s.get_job(id).unwrap().unwrap().state)
+                .await
+        };
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(state(core.clone()).await, JobState::Running);
+
+        // The notice loop catches up.
+        tokio::spawn(core.clone().notice_loop(notices));
+        let success = JobState::Done {
+            result: JobResult::Success,
+        };
+        for _ in 0..100 {
+            if state(core.clone()).await == success {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(state(core.clone()).await, success);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(state(core.clone()).await, success);
         core.cancel.cancel();
     }
 

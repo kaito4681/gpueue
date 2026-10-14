@@ -1,7 +1,8 @@
 //! The operations behind the API endpoints.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use puzuz_core::authz::{self, AdminOperation};
 use puzuz_core::lifecycle::{self, Action, Effect, Transition};
@@ -121,10 +122,26 @@ impl Core {
                 if let Some(group) = group.as_deref() {
                     filter = filter.group(group);
                 }
-                s.list_jobs(&filter)?
+                // A fixed number of queries, not a few per job.
+                let jobs = s.list_jobs(&filter)?;
+                let mut checkpoints: HashMap<JobId, _> = s
+                    .list_checkpoints()?
                     .into_iter()
-                    .map(|job| JobInfo::load(s, job))
-                    .collect::<Result<Vec<_>, _>>()
+                    .map(|record| (record.job_id, record))
+                    .collect();
+                let mut errors: HashMap<JobId, _> = s
+                    .list_job_errors()?
+                    .into_iter()
+                    .map(|error| (error.job_id, error))
+                    .collect();
+                Ok(jobs
+                    .into_iter()
+                    .map(|job| JobInfo {
+                        checkpoint: checkpoints.remove(&job.id),
+                        error: errors.remove(&job.id),
+                        job,
+                    })
+                    .collect::<Vec<_>>())
             })
             .await?;
         Ok(infos.iter().map(|info| info.view(&caller)).collect())
@@ -298,6 +315,26 @@ impl Core {
             new_id: copy.map(|(copy, _)| copy.id),
             launch_pending,
         })
+    }
+
+    /// [`Core::job_action`] on a job named by its id. An administrator's
+    /// `kill` of an orphan (a process the helper runs that the database
+    /// does not account for, see [`crate::state::Orphan`]) stops that
+    /// process, whatever the database says about the id.
+    pub async fn job_action_by_id(
+        self: &Arc<Self>,
+        caller: Caller,
+        id: JobId,
+        action: JobAction,
+        removed_together: Vec<JobId>,
+    ) -> ApiResult<ActionDone> {
+        if let JobAction::Kill(options) = &action
+            && caller.is_admin
+            && self.kill_orphan(id, options.signal).await?
+        {
+            return Ok(ActionDone::default());
+        }
+        self.job_action(caller, id, action, removed_together).await
     }
 
     /// Runs the effects of an action. A launch the helper did not carry
@@ -500,10 +537,15 @@ impl Core {
         };
         let mut results = Vec::new();
         for id in ids {
-            match self
-                .job_action(caller, id, action.clone(), together.clone())
-                .await
-            {
+            // Orphans are only killed when named.
+            let result = if explicit {
+                self.job_action_by_id(caller, id, action.clone(), together.clone())
+                    .await
+            } else {
+                self.job_action(caller, id, action.clone(), together.clone())
+                    .await
+            };
+            match result {
                 Ok(done) => results.push(JobActionResult {
                     id,
                     outcome: done.outcome(),
@@ -639,18 +681,42 @@ impl Core {
     pub async fn switch(self: &Arc<Self>, caller: Caller, request: SwitchRequest) -> ApiResult<()> {
         self.reject_if_shutting_down()?;
         let SwitchRequest { first, second } = request;
-        self.write(move |tx, ch| {
-            let a = tx.get_job(first)?.ok_or_else(|| job_not_found(first))?;
-            let b = tx.get_job(second)?.ok_or_else(|| job_not_found(second))?;
-            authz::require_mutate(&caller, &a)?;
-            authz::require_mutate(&caller, &b)?;
-            lifecycle::check_switch(&a, &b)?;
-            tx.swap_job_ids(first, second)?;
-            ch.updated(first);
-            ch.updated(second);
-            Ok(())
-        })
-        .await
+        let core = self.clone();
+        let swapped_flag = Arc::new(AtomicBool::new(false));
+        let swapped = swapped_flag.clone();
+        let result = self
+            .write(move |tx, ch| {
+                let a = tx.get_job(first)?.ok_or_else(|| job_not_found(first))?;
+                let b = tx.get_job(second)?.ok_or_else(|| job_not_found(second))?;
+                authz::require_mutate(&caller, &a)?;
+                authz::require_mutate(&caller, &b)?;
+                lifecycle::check_switch(&a, &b)?;
+                // A queued job whose earlier launch (put back in line) has not
+                // returned yet: its request settles under the old id.
+                if let Some(id) = [first, second]
+                    .into_iter()
+                    .find(|id| core.launch_in_flight(*id))
+                {
+                    return Err(Failure::new(
+                        ErrorCode::InvalidState,
+                        format!("job {id} is being launched; try again in a moment"),
+                    ));
+                }
+                tx.swap_job_ids(first, second)?;
+                // Under the database lock, so the scheduler sees both swapped.
+                // Should the commit fail, the swap is undone below.
+                core.swap_in_memory(first, second);
+                swapped.store(true, Ordering::SeqCst);
+                ch.updated(first);
+                ch.updated(second);
+                Ok(())
+            })
+            .await;
+        if result.is_err() && swapped_flag.load(Ordering::SeqCst) {
+            // The commit failed: the ids were not swapped after all.
+            self.swap_in_memory(first, second);
+        }
+        result
     }
 
     // -----------------------------------------------------------------
@@ -726,6 +792,8 @@ impl Core {
     }
 
     fn gpu_views(&self, gpus: Vec<Gpu>, jobs: &[Job]) -> Vec<GpuView> {
+        // Orphans take slots too (listed by `status` for administrators).
+        let orphan_slots = self.orphan_reservations().gpus;
         gpus.into_iter()
             .map(|gpu| {
                 let holders: Vec<GpuJob> = jobs
@@ -745,7 +813,7 @@ impl Core {
                     uuid: gpu.uuid,
                     name: gpu.name,
                     parallel: gpu.parallel,
-                    used: holders.len() as u32,
+                    used: holders.len() as u32 + orphan_slots.get(&gpu.index).copied().unwrap_or(0),
                     jobs: holders,
                 }
             })
@@ -754,7 +822,7 @@ impl Core {
 
     pub async fn list_gpus(&self) -> ApiResult<Vec<GpuView>> {
         let (gpus, jobs) = self
-            .read(|s| Ok((s.list_gpus()?, s.list_jobs(&JobFilter::all())?)))
+            .read(|s| Ok((s.list_gpus()?, s.list_unfinished_jobs()?)))
             .await?;
         Ok(self.gpu_views(gpus, &jobs))
     }
@@ -776,7 +844,7 @@ impl Core {
                     tx.set_gpu_parallel(*index, parallel)?;
                 }
                 ch.touch();
-                Ok((tx.list_gpus()?, tx.list_jobs(&JobFilter::all())?))
+                Ok((tx.list_gpus()?, tx.list_unfinished_jobs()?))
             })
             .await?;
         Ok(self.gpu_views(all, &jobs))

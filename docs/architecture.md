@@ -30,6 +30,13 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    from `SO_PEERCRED`, checks authorization and stores the job. Logs are streamed as raw bytes and
    state changes as Server-Sent Events (`/v1/events`). Pending warnings, such as a failed dump, come
    back in an `x-puzuz-warnings` header and the CLI prints them on stderr.
+   <a id="api-limits"></a>Every user can reach the socket, so the daemon limits what one user keeps
+   open: at most 64 connections and 16 streams (`log --follow`, `/v1/events`) per uid, and 4096
+   connections in total (`puzuz.service` raises `LimitNOFILE` well above that). A request over a
+   limit is answered with `too_many_requests`. A connection must send its request headers within
+   20 seconds, and an idle keep-alive connection is closed after 20 seconds. `log --tail` looks
+   for line starts in the last 4 MiB of the log at most (the output starts there if they hold
+   fewer lines), and only a few such scans run at once.
 2. **Scheduling.** A queued job starts when its group has a free slot and every requested GPU has
    a free slot. The daemon then asks the helper to spawn it.
 3. **Daemon → helper.** The daemon keeps one connection to `/run/puzuz/helper.sock` and exchanges
@@ -43,7 +50,13 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    lists of jobs: a job the helper no longer runs is lost, and a job the daemon believes is being
    checkpointed but the helper runs normally lost its checkpoint request and goes back to running
    (or paused) with a failed checkpoint. A checkpoint request that times out is followed up the
-   same way.
+   same way. Before the daemon marks a job lost because the helper no longer knows it, it applies
+   every event the helper sent before saying so, so a job that has just exited keeps its result.
+   <a id="orphans"></a>A job the helper runs that the daemon has as finished, queued, checkpointed
+   or not at all (for example after restoring the database from a backup) is an *orphan*. It is
+   left running, its GPUs count as taken, and a queued job with its id is not started until it
+   ends. `puzuz status` lists orphans to administrators, `puzuz doctor` warns about them, and an
+   administrator can stop one with `puzuz kill <id>`.
 4. **Helper → systemd.** Over D-Bus the helper starts a transient service whose main process is
    `puzuz-helper shim`. The unit has `Before=puzuz-helper.service` and `KillMode=mixed`, stdin is
    `/dev/null`, and the stop timeout is `grace_secs`. Each job lives in its own cgroup, outside the
@@ -184,7 +197,7 @@ restore as failed; the image is kept.
 
 | Data | Location | Owner |
 | --- | --- | --- |
-| jobs, groups, GPU slot limits, checkpoint records, pending warnings | `/var/lib/puzuz/daemon/state.sqlite` (WAL, schema versioned with `PRAGMA user_version`) | daemon |
+| jobs, groups, GPU slot limits, checkpoint records, pending warnings | `/var/lib/puzuz/daemon/state.sqlite` (WAL with `synchronous=FULL`, so an acknowledged helper event survives a power failure; schema versioned with `PRAGMA user_version`) | daemon |
 | job records, event queue | `/var/lib/puzuz/helper/` | helper |
 | job output | `/var/lib/puzuz/logs/<uid>/<id>.log` | the helper creates the directory (owned by the user, group `puzuz`, mode 2770). The shim writes the log as the owner. The daemon reads and truncates it without following symlinks and only if it is a regular file owned by the job's owner. |
 | checkpoint images | `/var/lib/puzuz/checkpoints/<id>/` | helper (root only) |

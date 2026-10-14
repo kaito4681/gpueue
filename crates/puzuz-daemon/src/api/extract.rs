@@ -2,15 +2,13 @@
 //! [`ApiError`](puzuz_protocol::api::ApiError) rejections.
 
 use axum::body::Bytes;
-use axum::extract::connect_info::{ConnectInfo, Connected};
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{FromRequest, FromRequestParts, Request};
 use axum::http::request::Parts;
 use axum::http::{Extensions, HeaderMap};
-use axum::serve::IncomingStream;
 use puzuz_core::model::{Caller, Uid};
 use puzuz_protocol::api::ErrorCode;
 use serde::de::DeserializeOwned;
-use tokio::net::UnixListener;
 
 use super::AppState;
 use crate::error::{ApiResult, Failure};
@@ -19,23 +17,11 @@ use crate::error::{ApiResult, Failure};
 /// `trust_uid_header` (never configurable from the config file).
 pub const TEST_UID_HEADER: &str = "x-puzuz-test-uid";
 
-/// Per-connection info: the peer's uid from `SO_PEERCRED`.
+/// Per-connection info: the peer's uid from `SO_PEERCRED`, attached to
+/// every request as `ConnectInfo<PeerCred>` (see `crate::server`).
 #[derive(Debug, Clone, Copy)]
 pub struct PeerCred {
     pub uid: Option<u32>,
-}
-
-impl Connected<IncomingStream<'_, UnixListener>> for PeerCred {
-    fn connect_info(stream: IncomingStream<'_, UnixListener>) -> Self {
-        let uid = match stream.io().peer_cred() {
-            Ok(cred) => Some(cred.uid()),
-            Err(e) => {
-                tracing::warn!("cannot read peer credentials: {e}");
-                None
-            }
-        };
-        PeerCred { uid }
-    }
 }
 
 /// The authenticated caller.

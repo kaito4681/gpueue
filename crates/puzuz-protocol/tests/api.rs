@@ -436,6 +436,7 @@ fn resource_bodies_golden() {
             checkpoints: None,
             gpu_detection: None,
             schema_version: None,
+            orphan_jobs: None,
         },
         r#"{"api_version":1,"daemon_version":"0.1.0","helper":{"connected":true,"version":"0.1.0"}}"#,
     );
@@ -454,6 +455,7 @@ fn resource_bodies_golden() {
         }),
         gpu_detection: None,
         schema_version: None,
+        orphan_jobs: None,
     };
     assert_golden(
         &with_usage,

@@ -16,6 +16,10 @@ TimeoutStopSec=60s
 Restart=on-failure
 RestartSec=2s
 UMask=0007
+# Every API connection and log stream takes a file descriptor. The daemon
+# caps connections per user and in total well below this (see
+# docs/architecture.md), so no user can run it out of descriptors.
+LimitNOFILE=65536
 
 # The daemon is unprivileged and needs no privileges at all.
 NoNewPrivileges=yes

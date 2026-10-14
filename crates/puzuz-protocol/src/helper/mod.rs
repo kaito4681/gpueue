@@ -274,6 +274,14 @@ pub struct RunningJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub phase: RunningPhase,
+    /// The uid the job runs as. Absent from helpers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<Uid>,
+    /// The GPUs the job was started with, so the daemon can count the
+    /// slots of a job its database does not account for. Absent from
+    /// helpers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpus: Option<Vec<GpuIndex>>,
 }
 
 /// What the helper is doing with a live job.

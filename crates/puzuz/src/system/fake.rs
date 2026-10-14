@@ -174,6 +174,7 @@ impl FakeSystem {
             checkpoints: None,
             gpu_detection: None,
             schema_version: None,
+            orphan_jobs: None,
         })
     }
 }

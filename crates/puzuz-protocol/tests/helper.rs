@@ -171,6 +171,8 @@ fn responses_golden() {
                     job: JobId(7),
                     pid: Some(4242),
                     phase: RunningPhase::Running,
+                    uid: None,
+                    gpus: None,
                 }],
             },
         ),
@@ -599,6 +601,8 @@ fn unknown_codes_and_phases_decode_to_the_fallback() {
                     job: JobId(3),
                     pid: None,
                     phase: RunningPhase::Unknown,
+                    uid: None,
+                    gpus: None,
                 }],
             },
         })

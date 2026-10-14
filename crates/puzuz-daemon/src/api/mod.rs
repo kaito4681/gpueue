@@ -26,7 +26,7 @@ use puzuz_protocol::api::{
 };
 
 use crate::error::{ApiResult, Failure};
-use crate::state::Core;
+use crate::state::{Core, PendingWarnings};
 pub use extract::{Auth, PeerCred, TEST_UID_HEADER};
 use extract::{JsonBody, OptionalJson};
 
@@ -99,15 +99,15 @@ async fn attach_warnings(State(core): State<AppState>, request: Request, next: N
     let pending = match uid {
         Some(uid) => core.pending_warnings(Uid(uid)).await.unwrap_or_else(|e| {
             tracing::warn!("cannot read pending warnings: {}", e.0.message);
-            Vec::new()
+            PendingWarnings::default()
         }),
-        None => Vec::new(),
+        None => PendingWarnings::default(),
     };
     let mut response = next.run(request).await;
-    if pending.is_empty() || !response.status().is_success() {
+    if pending.warnings.is_empty() || !response.status().is_success() {
         return response;
     }
-    let value = match HeaderValue::from_str(&Warning::encode_header(&pending)) {
+    let value = match HeaderValue::from_str(&Warning::encode_header(&pending.warnings)) {
         Ok(value) => value,
         Err(e) => {
             tracing::warn!("cannot encode warnings: {e}");
@@ -188,7 +188,13 @@ async fn list_jobs(
     if !include_envs {
         jobs = jobs.into_iter().map(JobView::without_envs).collect();
     }
-    Ok(Json(ListJobsResponse { jobs }))
+    // Only administrators can do something about orphans.
+    let orphans = if caller.is_admin {
+        core.orphans().iter().map(|orphan| orphan.view()).collect()
+    } else {
+        Vec::new()
+    };
+    Ok(Json(ListJobsResponse { jobs, orphans }))
 }
 
 async fn add_job(
@@ -248,8 +254,8 @@ async fn job_action(
         JobActionKind::Enqueue => JobAction::Enqueue(opts::<EnqueueOptions>(&body)?),
         JobActionKind::Remove => unreachable!("filtered above"),
     };
-    let done =
-        detached(async move { core.job_action(caller, id, action, Vec::new()).await }).await?;
+    let done = detached(async move { core.job_action_by_id(caller, id, action, Vec::new()).await })
+        .await?;
     Ok(Json(JobActionResult {
         id,
         outcome: done.outcome(),
@@ -411,6 +417,7 @@ async fn version(State(core): State<AppState>) -> Json<VersionResponse> {
         gpu_detection: Some(core.gpu_detection.clone()),
         // The database is at this version once the daemon has opened it.
         schema_version: Some(puzuz_core::storage::SCHEMA_VERSION),
+        orphan_jobs: Some(core.orphans().iter().map(|orphan| orphan.job).collect()),
     })
 }
 

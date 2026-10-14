@@ -106,6 +106,7 @@ fn daemon(version: &str, schema: Option<i64>) -> Result<VersionResponse, String>
         checkpoints: None,
         gpu_detection: None,
         schema_version: schema,
+        orphan_jobs: None,
     })
 }
 

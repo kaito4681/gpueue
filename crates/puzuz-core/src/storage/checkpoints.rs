@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use super::jobs::{blob_to_path, path_to_blob};
 use super::{CheckpointRecord, CheckpointStatus, Result};
 use crate::error::{Error, StorageError};
-use crate::model::{JobId, Uid};
+use crate::model::{JobId, Timestamp, Uid};
 
 const COLUMNS: &str = "job_id, path, size_bytes, gpu_model, driver_version, created_at, status, failure_reason, paused";
 
@@ -108,24 +108,30 @@ pub(super) fn delete(conn: &Connection, job_id: JobId) -> Result<bool> {
     Ok(changed > 0)
 }
 
-pub(super) fn unacknowledged_failures(conn: &Connection, owner: Uid) -> Result<Vec<JobId>> {
+pub(super) fn unacknowledged_failures(
+    conn: &Connection,
+    owner: Uid,
+) -> Result<Vec<(JobId, Timestamp)>> {
     Ok(conn
         .prepare_cached(
-            "SELECT c.job_id FROM checkpoints c JOIN jobs j ON j.id = c.job_id
+            "SELECT c.job_id, c.created_at FROM checkpoints c JOIN jobs j ON j.id = c.job_id
              WHERE c.status = 'failed' AND c.failure_acknowledged = 0 AND j.owner_uid = ?1
              ORDER BY c.job_id",
         )?
-        .query_map([owner.0], |row| Ok(JobId(row.get(0)?)))?
+        .query_map([owner.0], |row| Ok((JobId(row.get(0)?), row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?)
 }
 
-pub(super) fn acknowledge_failures(conn: &Connection, job_ids: &[JobId]) -> Result<()> {
+pub(super) fn acknowledge_failures(
+    conn: &Connection,
+    failures: &[(JobId, Timestamp)],
+) -> Result<()> {
     let mut statement = conn.prepare_cached(
         "UPDATE checkpoints SET failure_acknowledged = 1
-         WHERE job_id = ?1 AND status = 'failed'",
+         WHERE job_id = ?1 AND created_at = ?2 AND status = 'failed'",
     )?;
-    for id in job_ids {
-        statement.execute([id.0])?;
+    for (id, created_at) in failures {
+        statement.execute(params![id.0, created_at])?;
     }
     Ok(())
 }
