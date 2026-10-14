@@ -194,6 +194,9 @@ pub struct FakeExecState {
     pub thawed: Vec<u32>,
     /// Called with the images directory after each successful `criu dump`.
     pub after_dump: Option<fn(&Path)>,
+    /// What the `post-dump` hook of each successful `criu dump`
+    /// (`--action-script`, see [`crate::access::run_dump_hook`]) reports.
+    pub dump_hook_held: Option<Vec<crate::access::HeldFile>>,
 }
 
 /// Executes plans by recording them. `criu dump` creates a minimal image
@@ -254,6 +257,20 @@ impl Executor for FakeExecutor {
             && let Some(dir) = command.value_of("-D")
         {
             fs::write(Path::new(dir).join(layout::CRIU_INVENTORY), b"inv")?;
+            if let (Some(held), Some(script)) =
+                (&st.dump_hook_held, command.value_of("--action-script"))
+            {
+                let script = fs::read_to_string(script)?;
+                let request = script
+                    .trim_end()
+                    .rsplit_once(" dump-hook ")
+                    .map(|(_, r)| r.trim_matches('\''))
+                    .ok_or_else(|| io::Error::other(format!("unknown action script {script}")))?;
+                fs::write(
+                    crate::access::hook_result_path(Path::new(request)),
+                    serde_json::to_vec(held).map_err(io::Error::other)?,
+                )?;
+            }
             if let Some(after) = st.after_dump {
                 after(Path::new(dir));
             }

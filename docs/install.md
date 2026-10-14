@@ -1422,7 +1422,8 @@ Before a restored job runs, the helper checks that its owner could open each of 
 the job has it open, by the same path and without symlinks (see
 [Restores and paths](architecture.md#restores-and-paths)). A file the job already had open at the
 dump passes even if its owner could not open it that way now (a file the job created read-only,
-or an sshfs mount on which every file shows as root's), as long as it is that very file:
+or an sshfs mount on which every file shows as root's; this includes files it opened a moment
+before the dump), as long as it is that very file:
 
 - on the same mounted filesystem (no reboot or remount in between): the same device and inode, or
 - after the filesystem was mounted again: the same owner, group, mode, size, modification time
