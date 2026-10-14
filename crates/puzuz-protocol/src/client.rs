@@ -17,7 +17,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::header::{ACCEPT, CONTENT_TYPE, HOST};
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use puzuz_core::model::{GpuIndex, Group, JobId};
+use puzuz_core::model::{GpuIndex, Group, JobId, Uid};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::net::UnixStream;
@@ -28,9 +28,10 @@ use crate::api::{
     AddJobRequest, AddJobResponse, ApiError, BulkJobRequest, BulkJobResponse, CONTENT_TYPE_EVENTS,
     CONTENT_TYPE_JSON, CONTENT_TYPE_LOG, CleanRequest, CleanResponse, CreateGroupRequest,
     ErrorCode, Event, GpuView, JobAction, JobActionResult, JobView, ListGpusResponse,
-    ListGroupsResponse, ListJobsQuery, ListJobsResponse, LogQuery, Method, ResetRequest,
-    SetGpusParallelRequest, SetParallelRequest, ShutdownRequest, SseDecoder, SwitchRequest,
-    VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
+    ListGroupsResponse, ListJobsQuery, ListJobsResponse, LogQuery, Method, NiceRequest,
+    PriorityResponse, ResetRequest, SetGpusParallelRequest, SetGroupPriorityRequest,
+    SetParallelRequest, SetSharesRequest, SharesResponse, ShutdownRequest, SiteRequest, SseDecoder,
+    SwitchRequest, TopRequest, VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
 };
 
 /// Error bodies longer than this are cut when they are not valid JSON.
@@ -195,6 +196,52 @@ impl Client {
         Ok(ByteStream {
             body: response.into_body(),
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Priority and fair share
+    // -----------------------------------------------------------------------
+
+    /// `POST /v1/jobs/nice`.
+    pub async fn nice(&self, request: &NiceRequest) -> Result<BulkJobResponse> {
+        self.json(&Route::NiceJobs, "", Some(request)).await
+    }
+
+    /// `POST /v1/jobs/top`.
+    pub async fn top(&self, request: &TopRequest) -> Result<BulkJobResponse> {
+        self.json(&Route::TopJobs, "", Some(request)).await
+    }
+
+    /// `POST /v1/jobs/site`.
+    pub async fn site(&self, request: &SiteRequest) -> Result<BulkJobResponse> {
+        self.json(&Route::SiteJobs, "", Some(request)).await
+    }
+
+    /// `GET /v1/priority`.
+    pub async fn priority(&self) -> Result<PriorityResponse> {
+        self.json(&Route::Priority, "", None::<&()>).await
+    }
+
+    /// `GET /v1/shares`.
+    pub async fn shares(&self) -> Result<SharesResponse> {
+        self.json(&Route::ListShares, "", None::<&()>).await
+    }
+
+    /// `PUT /v1/shares/{uid}`.
+    pub async fn set_shares(&self, uid: Uid, shares: u32) -> Result<()> {
+        self.empty(
+            &Route::SetShares(uid),
+            "",
+            Some(&SetSharesRequest { shares }),
+        )
+        .await
+    }
+
+    /// `PUT /v1/groups/{name}/priority`.
+    pub async fn set_group_priority(&self, name: &str, priority: u32) -> Result<Group> {
+        let route = Route::SetGroupPriority(name.to_owned());
+        self.json(&route, "", Some(&SetGroupPriorityRequest { priority }))
+            .await
     }
 
     // -----------------------------------------------------------------------

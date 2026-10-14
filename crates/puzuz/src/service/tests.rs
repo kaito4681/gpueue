@@ -1256,10 +1256,11 @@ fn template_toml_key(text: &str) -> Option<&str> {
 }
 
 /// Splits the commented TOML of the configuration template by its
-/// convention: a `# key = value` line shows a default, and lines indented by
-/// `#   ` right below a `# Example:` line form an example. Returns the
-/// default lines and the example blocks. Panics on commented TOML that
-/// follows neither form (such as a table header outside an example).
+/// convention: a `# key = value` line shows a default, a `# [table]` line
+/// starts a table whose defaults follow, and lines indented by `#   ` right
+/// below a `# Example:` line form an example. Returns the default lines and
+/// the example blocks. Panics on commented TOML that follows neither form
+/// (such as an array of tables outside an example).
 fn template_defaults_and_examples(template: &str) -> (String, Vec<String>) {
     let mut defaults = String::new();
     let mut examples: Vec<String> = Vec::new();
@@ -1281,7 +1282,8 @@ fn template_defaults_and_examples(template: &str) -> (String, Vec<String>) {
             continue;
         };
         if let Some(text) = comment.strip_prefix(' ')
-            && !text.starts_with([' ', '['])
+            && !text.starts_with(' ')
+            && !text.starts_with("[[")
             && template_toml_key(text).is_some()
         {
             defaults.push_str(text);
@@ -1299,15 +1301,17 @@ fn template_defaults_and_examples(template: &str) -> (String, Vec<String>) {
 #[test]
 fn config_template_convention() {
     let (defaults, examples) = template_defaults_and_examples(
-        "# a = 1\n# Example:\n#   b = 2\n#   [[c]]\n# prose, then\n#   indented prose\n",
+        "# a = 1\n# Example:\n#   b = 2\n#   [[c]]\n# prose, then\n#   indented prose\n\
+         # [t]\n# d = 3\n",
     );
-    assert_eq!(defaults, "a = 1\n");
+    assert_eq!(defaults, "a = 1\n[t]\nd = 3\n");
     assert_eq!(examples, ["b = 2\n[[c]]\n"]);
     for unmarked in [
         "#   b = 2\n",
         "# [[gpus]]\n",
         "#  index = 0\n",
         "# Example:\n\n#   x = 1\n",
+        "#  [table]\n",
     ] {
         assert!(
             std::panic::catch_unwind(|| template_defaults_and_examples(unmarked)).is_err(),
@@ -1333,11 +1337,18 @@ fn config_template_documents_every_key_and_parses_to_the_defaults() {
         .flat_map(|example| example.lines().filter_map(template_toml_key))
         .collect();
 
-    // Every key is shown, with its default or in an example.
+    // Every key is shown, with its default or in an example; so is every
+    // key of the [priority] table.
     for key in defaults.as_object().unwrap().keys() {
         assert!(
             default_keys.contains(&key.as_str()) || example_keys.contains(&key.as_str()),
             "{key} is not documented"
+        );
+    }
+    for key in defaults["priority"].as_object().unwrap().keys() {
+        assert!(
+            default_keys.contains(&key.as_str()),
+            "priority.{key} is not documented"
         );
     }
     // Every field of a [[gpus]] entry is described and in the example.

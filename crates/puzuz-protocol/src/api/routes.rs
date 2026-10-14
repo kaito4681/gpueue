@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use puzuz_core::model::{GpuIndex, JobId};
+use puzuz_core::model::{GpuIndex, JobId, Uid};
 
 use super::JobAction;
 
@@ -19,9 +19,16 @@ pub const JOBS_BULK: &str = "/v1/jobs/bulk";
 pub const JOBS_CLEAN: &str = "/v1/jobs/clean";
 pub const JOBS_RESET: &str = "/v1/jobs/reset";
 pub const JOBS_SWITCH: &str = "/v1/jobs/switch";
+pub const JOBS_NICE: &str = "/v1/jobs/nice";
+pub const JOBS_TOP: &str = "/v1/jobs/top";
+pub const JOBS_SITE: &str = "/v1/jobs/site";
 pub const GROUPS: &str = "/v1/groups";
 pub const GROUP_TEMPLATE: &str = "/v1/groups/{name}";
 pub const GROUP_PARALLEL_TEMPLATE: &str = "/v1/groups/{name}/parallel";
+pub const GROUP_PRIORITY_TEMPLATE: &str = "/v1/groups/{name}/priority";
+pub const PRIORITY: &str = "/v1/priority";
+pub const SHARES: &str = "/v1/shares";
+pub const SHARE_TEMPLATE: &str = "/v1/shares/{uid}";
 pub const GPUS: &str = "/v1/gpus";
 pub const GPUS_PARALLEL: &str = "/v1/gpus/parallel";
 pub const GPU_PARALLEL_TEMPLATE: &str = "/v1/gpus/{index}/parallel";
@@ -78,6 +85,20 @@ pub enum Route {
     SwitchJobs,
     /// `GET /v1/jobs/{id}/log` — query [`super::LogQuery`] → raw bytes.
     JobLog(JobId),
+    /// `POST /v1/jobs/nice` — [`super::NiceRequest`] → [`super::BulkJobResponse`].
+    NiceJobs,
+    /// `POST /v1/jobs/top` — [`super::TopRequest`] → [`super::BulkJobResponse`].
+    TopJobs,
+    /// `POST /v1/jobs/site` — [`super::SiteRequest`] → [`super::BulkJobResponse`].
+    SiteJobs,
+    /// `GET /v1/priority` → [`super::PriorityResponse`].
+    Priority,
+    /// `GET /v1/shares` → [`super::SharesResponse`].
+    ListShares,
+    /// `PUT /v1/shares/{uid}` — [`super::SetSharesRequest`] → `204`.
+    SetShares(Uid),
+    /// `PUT /v1/groups/{name}/priority` — [`super::SetGroupPriorityRequest`] → group.
+    SetGroupPriority(String),
     /// `GET /v1/groups` → [`super::ListGroupsResponse`].
     ListGroups,
     /// `POST /v1/groups` — [`super::CreateGroupRequest`] → `201` group.
@@ -172,17 +193,24 @@ impl Route {
             | Route::ListGroups
             | Route::ListGpus
             | Route::Version
-            | Route::Events => Method::Get,
+            | Route::Events
+            | Route::Priority
+            | Route::ListShares => Method::Get,
             Route::JobAction(_, JobActionKind::Remove) | Route::DeleteGroup(_) => Method::Delete,
-            Route::SetGroupParallel(_) | Route::SetGpuParallel(_) | Route::SetGpusParallel => {
-                Method::Put
-            }
+            Route::SetGroupParallel(_)
+            | Route::SetGpuParallel(_)
+            | Route::SetGpusParallel
+            | Route::SetShares(_)
+            | Route::SetGroupPriority(_) => Method::Put,
             Route::AddJob
             | Route::JobAction(..)
             | Route::BulkJobAction
             | Route::CleanJobs
             | Route::ResetJobs
             | Route::SwitchJobs
+            | Route::NiceJobs
+            | Route::TopJobs
+            | Route::SiteJobs
             | Route::CreateGroup
             | Route::Shutdown => Method::Post,
         }
@@ -201,6 +229,15 @@ impl Route {
             Route::CleanJobs => JOBS_CLEAN.to_owned(),
             Route::ResetJobs => JOBS_RESET.to_owned(),
             Route::SwitchJobs => JOBS_SWITCH.to_owned(),
+            Route::NiceJobs => JOBS_NICE.to_owned(),
+            Route::TopJobs => JOBS_TOP.to_owned(),
+            Route::SiteJobs => JOBS_SITE.to_owned(),
+            Route::Priority => PRIORITY.to_owned(),
+            Route::ListShares => SHARES.to_owned(),
+            Route::SetShares(uid) => format!("{SHARES}/{uid}"),
+            Route::SetGroupPriority(name) => {
+                format!("{GROUPS}/{}/priority", percent_encode(name))
+            }
             Route::JobLog(id) => format!("{JOBS}/{id}/log"),
             Route::ListGroups | Route::CreateGroup => GROUPS.to_owned(),
             Route::DeleteGroup(name) => format!("{GROUPS}/{}", percent_encode(name)),

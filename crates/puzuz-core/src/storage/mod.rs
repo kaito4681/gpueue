@@ -30,6 +30,7 @@ mod job_errors;
 mod jobs;
 mod meta;
 pub mod migrations;
+mod priority;
 
 #[cfg(test)]
 mod tests;
@@ -44,6 +45,8 @@ use rusqlite::{Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 pub use crate::error::StorageError;
+use std::collections::BTreeMap;
+
 use crate::model::{Gpu, GpuIndex, Group, Job, JobId, JobSpec, JobState, Timestamp, Uid};
 pub use migrations::SCHEMA_VERSION;
 
@@ -397,6 +400,50 @@ pub trait StoreOps: sealed::Sealed {
         atomic(self.conn(), |c| jobs::swap_ids(c, a, b))
     }
 
+    /// Sets a job's nice value. Fails with
+    /// [`Error::JobNotFound`](crate::Error::JobNotFound) if it does not exist.
+    fn set_job_nice(&self, id: JobId, nice: i32) -> Result<()> {
+        jobs::set_nice(self.conn(), id, nice)
+    }
+
+    /// Sets a job's site factor.
+    fn set_job_site_factor(&self, id: JobId, site: i32) -> Result<()> {
+        jobs::set_site_factor(self.conn(), id, site)
+    }
+
+    /// Moves jobs to the top of their owners' queues (`puzuz top`): each
+    /// gets a `top_seq` above every earlier one, the first id the highest.
+    /// Fails (changing nothing) if a job does not exist.
+    fn move_jobs_to_top(&self, ids: &[JobId]) -> Result<()> {
+        atomic(self.conn(), |c| jobs::move_to_top(c, ids))
+    }
+
+    /// Resets what an administrator granted a job (a negative nice, the
+    /// site factor) and its `top` position, for `restart --in-place`.
+    fn clear_job_priority_grants(&self, id: JobId) -> Result<()> {
+        priority::clear_priority_grants(self.conn(), id)
+    }
+
+    /// Records when a running job's run time was last charged (`None` when
+    /// it is not running).
+    fn set_job_run_since(&self, id: JobId, since: Option<Timestamp>) -> Result<()> {
+        priority::set_run_since(self.conn(), id, since)
+    }
+
+    fn job_run_since(&self, id: JobId) -> Result<Option<Timestamp>> {
+        priority::run_since(self.conn(), id)
+    }
+
+    /// Every job's `run_since` that is set.
+    fn list_job_run_since(&self) -> Result<std::collections::HashMap<JobId, Timestamp>> {
+        priority::list_run_since(self.conn())
+    }
+
+    /// Owners of the jobs that are not `done`.
+    fn list_active_owners(&self) -> Result<std::collections::BTreeSet<Uid>> {
+        priority::active_owners(self.conn())
+    }
+
     // ----- groups -----
 
     fn list_groups(&self) -> Result<Vec<Group>> {
@@ -419,6 +466,10 @@ pub trait StoreOps: sealed::Sealed {
 
     fn set_group_paused(&self, name: &str, paused: bool) -> Result<()> {
         groups::set_paused(self.conn(), name, paused)
+    }
+
+    fn set_group_priority(&self, name: &str, priority: u32) -> Result<()> {
+        groups::set_priority(self.conn(), name, priority)
     }
 
     /// Removes an empty group. The default group cannot be removed.
@@ -504,6 +555,50 @@ pub trait StoreOps: sealed::Sealed {
         atomic(self.conn(), |c| {
             checkpoints::acknowledge_failures(c, failures)
         })
+    }
+
+    // ----- fair share -----
+
+    /// Shares set by administrators, per user.
+    fn list_user_shares(&self) -> Result<BTreeMap<Uid, u32>> {
+        priority::list_shares(self.conn())
+    }
+
+    fn set_user_shares(&self, uid: Uid, shares: u32) -> Result<()> {
+        priority::set_shares(self.conn(), uid, shares)
+    }
+
+    /// Decayed usage per user (billing-seconds).
+    fn list_user_usage(&self) -> Result<BTreeMap<Uid, f64>> {
+        priority::list_usage(self.conn())
+    }
+
+    /// Replaces every user's usage (users missing from `usage` have none).
+    fn replace_user_usage(&self, usage: &BTreeMap<Uid, f64>) -> Result<()> {
+        atomic(self.conn(), |c| priority::replace_usage(c, usage))
+    }
+
+    /// Adds `amount` to a user's usage.
+    fn add_user_usage(&self, uid: Uid, amount: f64) -> Result<()> {
+        priority::add_usage(self.conn(), uid, amount)
+    }
+
+    /// When usage was last calculated, if ever.
+    fn usage_calc_at(&self) -> Result<Option<Timestamp>> {
+        priority::usage_calc_at(self.conn())
+    }
+
+    fn set_usage_calc_at(&self, at: Timestamp) -> Result<()> {
+        priority::set_usage_calc_at(self.conn(), at)
+    }
+
+    /// When usage was last reset (or first calculated), if ever.
+    fn usage_reset_at(&self) -> Result<Option<Timestamp>> {
+        priority::usage_reset_at(self.conn())
+    }
+
+    fn set_usage_reset_at(&self, at: Timestamp) -> Result<()> {
+        priority::set_usage_reset_at(self.conn(), at)
     }
 
     // ----- helper events -----

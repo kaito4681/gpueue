@@ -187,6 +187,7 @@ fn job_request(command: &str, gpus: &[u32]) -> AddJobRequest {
             priority: 0,
             label: Some("experiment".to_owned()),
             no_checkpoint: false,
+            nice: 0,
         },
         stashed: false,
         enqueue_at: None,
@@ -210,6 +211,8 @@ struct Harness {
     /// `checkpoint_size_warning_interval_secs` of the next start.
     checkpoint_limit: Option<u64>,
     warning_interval_secs: u64,
+    /// The `[priority]` table of the next start.
+    priority: puzuz_daemon::config::PriorityConfig,
 }
 
 impl Harness {
@@ -226,6 +229,7 @@ impl Harness {
             daemon: None,
             checkpoint_limit: None,
             warning_interval_secs: Config::default().checkpoint_size_warning_interval_secs,
+            priority: Config::default().priority,
         };
         harness.start_with(detector).await;
         harness
@@ -237,6 +241,7 @@ impl Harness {
             grace_secs: 1,
             checkpoint_size_limit_bytes: self.checkpoint_limit,
             checkpoint_size_warning_interval_secs: self.warning_interval_secs,
+            priority: self.priority.clone(),
             ..Config::default()
         }
         .with_data_dir(self.dir.path())
@@ -3057,4 +3062,514 @@ async fn connections_and_streams_are_limited_per_user() {
     }
     assert!(served);
     h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Priority and fair share
+// ---------------------------------------------------------------------------
+
+/// A daemon whose `[priority]` table is changed by `f`.
+async fn harness_with_priority(
+    gpus: u32,
+    f: impl FnOnce(&mut puzuz_daemon::config::PriorityConfig),
+) -> Harness {
+    let mut h = Harness::new(gpus).await;
+    h.stop().await;
+    f(&mut h.priority);
+    h.start(gpus).await;
+    h
+}
+
+fn bulk_results(reply: &Reply) -> Vec<(u64, Option<ErrorCode>)> {
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    reply
+        .json::<BulkJobResponse>()
+        .results
+        .into_iter()
+        .map(|r| {
+            let code = match r.outcome {
+                puzuz_protocol::api::ActionOutcome::Ok { .. } => None,
+                puzuz_protocol::api::ActionOutcome::Error { error } => Some(error.code),
+            };
+            (r.id.0, code)
+        })
+        .collect()
+}
+
+/// The ids `GET /v1/priority` lists, in scheduling order.
+async fn priority_order(client: &Client) -> Vec<u64> {
+    let reply = client.get("/v1/priority").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let response: puzuz_protocol::api::PriorityResponse = reply.json();
+    response.jobs.iter().map(|p| p.id.0).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lower_usage_user_starts_first() {
+    let mut h = harness_with_priority(1, |p| p.priority_calc_period_secs = 1).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+
+    // Bob uses the only GPU for a while.
+    let running = bob.add(&job_request("train", &[0])).await;
+    bob.wait_state(running, &JobState::Running).await;
+    // Both queue a GPU job; Bob's is older.
+    let bobs = bob.add(&job_request("more", &[0])).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let alices = alice.add(&job_request("first", &[0])).await;
+    // Wait until Bob's usage has been recorded.
+    let mut charged = false;
+    for _ in 0..100 {
+        let shares: puzuz_protocol::api::SharesResponse = alice.get("/v1/shares").await.json();
+        if shares
+            .users
+            .iter()
+            .any(|u| u.uid == Uid(BOB) && u.raw_usage > 0.0)
+        {
+            let a = shares.users.iter().find(|u| u.uid == Uid(ALICE)).unwrap();
+            let b = shares.users.iter().find(|u| u.uid == Uid(BOB)).unwrap();
+            assert!(a.fairshare > b.fairshare, "{shares:?}");
+            assert!(a.active && b.active);
+            charged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(charged, "bob was never charged");
+    assert_eq!(priority_order(&alice).await, [alices.0, bobs.0]);
+
+    h.exit(running, 0).await;
+    alice.wait_state(alices, &JobState::Running).await;
+    assert!(matches!(bob.job(bobs).await.state, JobState::Queued { .. }));
+
+    // Usage survives a restart.
+    h.stop().await;
+    h.start(1).await;
+    let shares: puzuz_protocol::api::SharesResponse =
+        h.client(ADMIN).get("/v1/shares").await.json();
+    let b = shares.users.iter().find(|u| u.uid == Uid(BOB)).unwrap();
+    assert!(b.raw_usage > 0.0, "{shares:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn basic_priority_keeps_pueues_order() {
+    let h = harness_with_priority(0, |p| {
+        p.priority_type = puzuz_daemon::config::PriorityType::Basic;
+    })
+    .await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let blocker = alice.add(&job_request("block", &[])).await;
+    alice.wait_state(blocker, &JobState::Running).await;
+    let a = alice.add(&job_request("a", &[])).await;
+    let mut request = job_request("b", &[]);
+    request.spec.priority = 5;
+    let b = bob.add(&request).await;
+    // Bob's -o 5 wins across users, as in pueue.
+    assert_eq!(priority_order(&alice).await, [b.0, a.0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o_priority_and_top_order_only_the_owners_jobs() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let blocker = alice.add(&job_request("block", &[])).await;
+    alice.wait_state(blocker, &JobState::Running).await;
+
+    let a1 = alice.add(&job_request("a1", &[])).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let b1 = bob.add(&job_request("b1", &[])).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let mut request = job_request("a2", &[]);
+    request.spec.priority = 100;
+    let a2 = alice.add(&request).await;
+    let a3 = alice.add(&job_request("a3", &[])).await;
+    // a2 takes a1's place (alice's oldest); bob's job is not overtaken by
+    // more than alice's own waiting time.
+    assert_eq!(priority_order(&alice).await, [a2.0, b1.0, a1.0, a3.0]);
+
+    // `top` moves a3 to the front of alice's queue.
+    let reply = alice.post("/v1/jobs/top", json!({ "ids": [a3.0] })).await;
+    assert_eq!(bulk_results(&reply), [(a3.0, None)]);
+    assert_eq!(priority_order(&alice).await, [a3.0, b1.0, a2.0, a1.0]);
+    // Not bob's.
+    let reply = bob
+        .post("/v1/jobs/top", json!({ "ids": [a1.0, b1.0] }))
+        .await;
+    assert_eq!(
+        bulk_results(&reply),
+        [(a1.0, Some(ErrorCode::PermissionDenied)), (b1.0, None)]
+    );
+    // An administrator may move anyone's job; unknown jobs fail alone.
+    let reply = h
+        .client(ADMIN)
+        .post("/v1/jobs/top", json!({ "ids": [a1.0, 999] }))
+        .await;
+    assert_eq!(
+        bulk_results(&reply),
+        [(a1.0, None), (999, Some(ErrorCode::JobNotFound))]
+    );
+    assert_eq!(priority_order(&alice).await, [a1.0, b1.0, a3.0, a2.0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn top_can_be_disabled_for_users() {
+    let h = harness_with_priority(0, |p| p.enable_user_top = false).await;
+    let alice = h.client(ALICE);
+    let id = alice
+        .add(&AddJobRequest {
+            stashed: true,
+            ..job_request("x", &[])
+        })
+        .await;
+    let reply = alice.post("/v1/jobs/top", json!({ "ids": [id.0] })).await;
+    assert_eq!(
+        bulk_results(&reply),
+        [(id.0, Some(ErrorCode::PermissionDenied))]
+    );
+    let reply = h
+        .client(ADMIN)
+        .post("/v1/jobs/top", json!({ "ids": [id.0] }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(id.0, None)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nice_site_shares_and_group_priority_authorization() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let admin = h.client(ADMIN);
+    let stashed = |command: &str| AddJobRequest {
+        stashed: true,
+        ..job_request(command, &[])
+    };
+
+    // Negative nice at submission is for administrators.
+    let mut request = stashed("x");
+    request.spec.nice = -1;
+    let reply = alice
+        .post("/v1/jobs", serde_json::to_value(&request).unwrap())
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::PermissionDenied);
+    request.spec.nice = 10;
+    let id = alice.add(&request).await;
+    assert_eq!(alice.job(id).await.nice, 10);
+
+    // Users may raise the nice value of their own jobs only.
+    let reply = alice
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 20 }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(id.0, None)]);
+    let reply = alice
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": -5 }))
+        .await;
+    let results = bulk_results(&reply);
+    assert_eq!(results, [(id.0, Some(ErrorCode::PermissionDenied))]);
+    let reply = bob
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 5 }))
+        .await;
+    assert_eq!(
+        bulk_results(&reply),
+        [(id.0, Some(ErrorCode::PermissionDenied))]
+    );
+    let reply = admin
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": -5 }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(id.0, None)]);
+    assert_eq!(alice.job(id).await.nice, -5);
+
+    // Site factors are for administrators.
+    let reply = alice
+        .post("/v1/jobs/site", json!({ "ids": [id.0], "site": 100 }))
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::PermissionDenied);
+    let reply = admin
+        .post("/v1/jobs/site", json!({ "ids": [id.0], "site": 100 }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(id.0, None)]);
+
+    // So are shares and group priorities.
+    let reply = alice
+        .call(
+            Method::PUT,
+            &format!("/v1/shares/{ALICE}"),
+            Some(json!({ "shares": 100 })),
+        )
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::PermissionDenied);
+    let reply = admin
+        .call(
+            Method::PUT,
+            &format!("/v1/shares/{BOB}"),
+            Some(json!({ "shares": 3 })),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let shares: puzuz_protocol::api::SharesResponse = alice.get("/v1/shares").await.json();
+    let b = shares.users.iter().find(|u| u.uid == Uid(BOB)).unwrap();
+    assert_eq!(b.shares, 3);
+    assert!(!b.active);
+
+    let reply = alice
+        .call(
+            Method::PUT,
+            "/v1/groups/default/priority",
+            Some(json!({ "priority": 5 })),
+        )
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::PermissionDenied);
+    let reply = admin
+        .call(
+            Method::PUT,
+            "/v1/groups/default/priority",
+            Some(json!({ "priority": 5 })),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let group: puzuz_core::model::Group = reply.json();
+    assert_eq!(group.priority, 5);
+    let reply = admin
+        .call(
+            Method::PUT,
+            "/v1/groups/nope/priority",
+            Some(json!({ "priority": 5 })),
+        )
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::GroupNotFound);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn priority_view_hides_commands_and_shows_factors() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let blocker = alice.add(&job_request("block", &[])).await;
+    alice.wait_state(blocker, &JobState::Running).await;
+    let mut request = job_request("secret-command", &[]);
+    request.spec.nice = 7;
+    let id = alice.add(&request).await;
+
+    let reply = bob.get("/v1/priority").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&reply.body);
+    assert!(!text.contains("secret-command"), "{text}");
+    assert!(!text.contains("hunter2"), "{text}");
+    let response: puzuz_protocol::api::PriorityResponse = reply.json();
+    assert_eq!(
+        response.priority_type,
+        puzuz_daemon::config::PriorityType::Multifactor
+    );
+    assert_eq!(response.weights.fairshare, 10000);
+    // Only pending jobs are listed.
+    assert_eq!(response.jobs.len(), 1);
+    let p = &response.jobs[0];
+    assert_eq!((p.id, p.owner, p.nice), (id, Uid(ALICE), 7));
+    assert_eq!(p.factors.fairshare, 1.0);
+    assert!((p.priority - (p.weighted.age + 10000.0 - 7.0)).abs() < 1e-6);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restarted_copy_does_not_inherit_a_negative_nice() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let id = alice.add(&job_request("x", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    let reply = h
+        .client(ADMIN)
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": -5 }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(id.0, None)]);
+    h.exit(id, 0).await;
+    alice.wait_state(id, &done(JobResult::Success)).await;
+    // Finished jobs cannot be reniced.
+    let reply = alice
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 1 }))
+        .await;
+    assert_eq!(
+        bulk_results(&reply),
+        [(id.0, Some(ErrorCode::InvalidState))]
+    );
+    let reply = alice
+        .action(id, "restart", json!({ "stashed": true }))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let result: puzuz_protocol::api::JobActionResult = reply.json();
+    let puzuz_protocol::api::ActionOutcome::Ok {
+        new_id: Some(new_id),
+        ..
+    } = result.outcome
+    else {
+        panic!("no new job: {result:?}");
+    };
+    assert_eq!(alice.job(new_id).await.nice, 0);
+}
+
+/// `uid`'s raw usage as `GET /v1/shares` shows it (0 if not listed).
+async fn raw_usage(client: &Client, uid: u32) -> f64 {
+    let shares: puzuz_protocol::api::SharesResponse = client.get("/v1/shares").await.json();
+    shares
+        .users
+        .iter()
+        .find(|u| u.uid == Uid(uid))
+        .map_or(0.0, |u| u.raw_usage)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_running_time_is_billed() {
+    // The default calculation period (5 min) never passes here: all usage
+    // comes from jobs leaving the running state.
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let id = alice.add(&job_request("train", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Pausing charges the run so far (CPU-only: billing 1 per second).
+    assert_eq!(
+        alice.action(id, "pause", json!({})).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Paused).await;
+    let paused = raw_usage(&alice, ALICE).await;
+    assert!((0.5..2.0).contains(&paused), "{paused}");
+    // Paused time is not billed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(raw_usage(&alice, ALICE).await, paused);
+
+    // Resumed, then checkpointed: the second run is charged.
+    assert_eq!(
+        alice.action(id, "start", json!(null)).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Running).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        alice.action(id, "checkpoint", json!(null)).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Checkpointed).await;
+    let checkpointed = raw_usage(&alice, ALICE).await;
+    assert!(
+        (0.3..1.5).contains(&(checkpointed - paused)),
+        "{paused} -> {checkpointed}"
+    );
+
+    // Waiting checkpointed, waiting to be restored and being removed while
+    // waiting cost nothing, although the job's started_at is old.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let other = bob.add(&job_request("other", &[])).await;
+    bob.wait_state(other, &JobState::Running).await;
+    assert_eq!(
+        alice.action(id, "restore", json!({})).await.status,
+        StatusCode::OK
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(matches!(
+        alice.job(id).await.state,
+        JobState::RestoreQueued { .. }
+    ));
+    // (Killing it is refused: it does not run; it can only be removed.)
+    assert_eq!(
+        alice.action(id, "kill", json!({})).await.status,
+        StatusCode::CONFLICT
+    );
+    let reply = alice
+        .call(Method::DELETE, &format!("/v1/jobs/{id}"), None)
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(raw_usage(&alice, ALICE).await, checkpointed);
+    h.exit(other, 0).await;
+    bob.wait_state(other, &done(JobResult::Success)).await;
+    assert!(raw_usage(&bob, BOB).await > 0.0);
+
+    // A restored job is billed from the restore on, before any calculation.
+    let id = alice.add(&job_request("again", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    alice.action(id, "checkpoint", json!(null)).await;
+    alice.wait_state(id, &JobState::Checkpointed).await;
+    let before = raw_usage(&alice, ALICE).await;
+    alice.action(id, "restore", json!({})).await;
+    alice.wait_state(id, &JobState::Running).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    h.exit(id, 0).await;
+    alice.wait_state(id, &done(JobResult::Success)).await;
+    let after = raw_usage(&alice, ALICE).await;
+    assert!(
+        (0.3..1.5).contains(&(after - before)),
+        "{before} -> {after}"
+    );
+
+    // Usage and run records survive a restart.
+    h.stop().await;
+    h.start(0).await;
+    assert!(raw_usage(&h.client(ADMIN), ALICE).await >= after * 0.99);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn users_may_only_raise_nice_values() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let id = alice
+        .add(&AddJobRequest {
+            stashed: true,
+            ..job_request("x", &[])
+        })
+        .await;
+    let reply = h
+        .client(ADMIN)
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 10000 }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(id.0, None)]);
+    let reply = alice
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 0 }))
+        .await;
+    let response: BulkJobResponse = reply.json();
+    let puzuz_protocol::api::ActionOutcome::Error { error } = &response.results[0].outcome else {
+        panic!("{response:?}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    assert!(error.message.contains("10000"), "{}", error.message);
+    let reply = alice
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 20000 }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(id.0, None)]);
+    assert_eq!(alice.job(id).await.nice, 20000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_in_place_drops_administrators_grants() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let admin = h.client(ADMIN);
+    let id = alice.add(&job_request("x", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    for (path, body) in [
+        ("/v1/jobs/nice", json!({ "ids": [id.0], "nice": -5 })),
+        ("/v1/jobs/site", json!({ "ids": [id.0], "site": 3 })),
+        ("/v1/jobs/top", json!({ "ids": [id.0] })),
+    ] {
+        assert_eq!(bulk_results(&admin.post(path, body).await), [(id.0, None)]);
+    }
+    h.exit(id, 0).await;
+    alice.wait_state(id, &done(JobResult::Success)).await;
+    // Keep it queued: the default group runs one job at a time.
+    let blocker = alice.add(&job_request("block", &[])).await;
+    alice.wait_state(blocker, &JobState::Running).await;
+    let reply = alice
+        .action(id, "restart", json!({ "in_place": true }))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(alice.job(id).await.nice, 0);
+    let response: puzuz_protocol::api::PriorityResponse = alice.get("/v1/priority").await.json();
+    let p = response.jobs.iter().find(|p| p.id == id).unwrap();
+    assert_eq!((p.nice, p.site), (0, 0));
 }

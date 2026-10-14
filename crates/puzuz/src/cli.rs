@@ -14,8 +14,12 @@
 //!   checkpoint states (see `crate::query`). `status --json` prints puzuz's own schema
 //!   (`{"groups": [...], "jobs": [...]}`, job views without their environment), not pueue's
 //!   state dump.
-//! - puzuz extensions: `add --gpu/--no-checkpoint`, `checkpoint`, `restore`, `gpu`, `daemon`,
-//!   `service`, `uninstall`, `doctor` and `update`.
+//! - puzuz extensions: `add --gpu/--no-checkpoint/--nice`, `checkpoint`, `restore`, `gpu`,
+//!   `prio`, `nice`, `top`, `site`, `share`, `group priority`, `daemon`, `service`, `uninstall`,
+//!   `doctor` and `update`.
+//! - Priority: with the default multifactor priority (see `puzuz prio`), `add -o/--priority`
+//!   and `switch` only order the caller's own jobs; another user's job is never overtaken
+//!   because of them. `priority_type = "basic"` restores pueue's global order.
 
 use std::{fmt, path::PathBuf, str::FromStr};
 
@@ -178,9 +182,19 @@ pub enum SubCommand {
         #[arg(short, long, num_args(1..))]
         after: Vec<usize>,
 
-        /// Priority of the job; higher numbers are started first. May be negative.
+        /// Priority of the job among your own jobs; higher numbers are started first. May be
+        /// negative.
+        ///
+        /// With the default multifactor priority this only orders your own jobs (see `puzuz
+        /// prio`); with `priority_type = "basic"` it orders every job, as in pueue.
         #[arg(short = 'o', long, allow_negative_numbers = true)]
         priority: Option<i32>,
+
+        /// (puzuz) Lower the job's priority by this much (Slurm's `--nice`).
+        ///
+        /// Only administrators may give negative values.
+        #[arg(long, allow_negative_numbers = true)]
+        nice: Option<i32>,
 
         /// A free-form label shown in the status table.
         #[arg(short, long)]
@@ -215,7 +229,8 @@ pub enum SubCommand {
 
     /// Swap the queue position of two jobs.
     ///
-    /// Only works on queued and stashed jobs.
+    /// Only works on queued and stashed jobs. With the default multifactor priority the
+    /// position only matters among the owner's own jobs.
     Switch {
         /// The first job id.
         #[arg(value_name = "ID_1")]
@@ -619,6 +634,73 @@ pub enum SubCommand {
         cmd: Option<GpuCommand>,
     },
 
+    /// (puzuz) Show the priority of pending jobs and its factors (like Slurm's `sprio`).
+    ///
+    /// Queued and restore-queued jobs are listed in the order they are considered for
+    /// starting, with the weighted factors their priority is the sum of. Every user's jobs are
+    /// listed, but never their commands.
+    Prio {
+        /// Only show these jobs.
+        #[arg(value_name = "IDS")]
+        task_ids: Vec<usize>,
+
+        /// Print as JSON.
+        #[arg(short, long)]
+        json: bool,
+    },
+
+    /// (puzuz) Set the nice value of jobs (like Slurm's nice option): it is subtracted from
+    /// their priority.
+    ///
+    /// Users may only raise the nice value of their own jobs (never below 0); administrators
+    /// may set any value, including negative ones, on any job.
+    #[command(allow_negative_numbers = true)]
+    Nice {
+        /// The ids of the jobs.
+        #[arg(value_name = "IDS", required = true, num_args(1..))]
+        task_ids: Vec<usize>,
+
+        /// The new nice value.
+        #[arg(value_name = "NICE", allow_negative_numbers = true)]
+        nice: i32,
+    },
+
+    /// (puzuz) Move jobs to the top of their owner's queue (Slurm's `scontrol top`).
+    ///
+    /// The jobs go before the owner's other jobs, in the order given, but not before other
+    /// users' jobs. Users may move their own jobs unless `enable_user_top = false`;
+    /// administrators may move any job.
+    Top {
+        /// The ids of the jobs.
+        #[arg(value_name = "IDS", required = true)]
+        task_ids: Vec<usize>,
+    },
+
+    /// (puzuz) Set the site factor of jobs, which is added to their priority (administrators
+    /// only).
+    #[command(allow_negative_numbers = true)]
+    Site {
+        /// The ids of the jobs.
+        #[arg(value_name = "IDS", required = true, num_args(1..))]
+        task_ids: Vec<usize>,
+
+        /// The new site factor.
+        #[arg(value_name = "SITE", allow_negative_numbers = true)]
+        site: i32,
+    },
+
+    /// (puzuz) Show the fair-share state of each user (like Slurm's `sshare`).
+    ///
+    /// Lists users with unfinished jobs or recorded usage, and users whose shares were set.
+    Share {
+        /// Print as JSON.
+        #[arg(short, long)]
+        json: bool,
+
+        #[command(subcommand)]
+        cmd: Option<ShareCommand>,
+    },
+
     /// (puzuz) Run the daemon in the foreground (normally started by systemd).
     ///
     /// The global --socket option sets the socket to listen on.
@@ -731,6 +813,11 @@ impl SubCommand {
             SubCommand::Checkpoint { .. } => "checkpoint",
             SubCommand::Restore { .. } => "restore",
             SubCommand::Gpu { .. } => "gpu",
+            SubCommand::Prio { .. } => "prio",
+            SubCommand::Nice { .. } => "nice",
+            SubCommand::Top { .. } => "top",
+            SubCommand::Site { .. } => "site",
+            SubCommand::Share { .. } => "share",
             SubCommand::Daemon { .. } => "daemon",
             SubCommand::Service { .. } => "service",
             SubCommand::Uninstall { .. } => "uninstall",
@@ -781,6 +868,33 @@ pub enum GroupCommand {
     Remove {
         /// Name of the group to remove.
         name: String,
+    },
+
+    /// (puzuz) Set a group's priority (administrators only).
+    ///
+    /// A group's partition factor is its priority over the highest group priority; it counts
+    /// with `priority_weight_partition` (Slurm's partition `PriorityJobFactor`).
+    Priority {
+        /// Name of the group.
+        name: String,
+
+        /// The new priority (0 or more).
+        priority: u32,
+    },
+}
+
+/// Subcommands of `share`.
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub enum ShareCommand {
+    /// Set a user's shares (administrators only; default 1).
+    ///
+    /// A user's normalised share is their shares over the shares of all active users.
+    Set {
+        /// User name or uid.
+        user: String,
+
+        /// The new number of shares (0 or more).
+        shares: u32,
     },
 }
 

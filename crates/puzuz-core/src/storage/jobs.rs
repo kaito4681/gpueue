@@ -56,8 +56,9 @@ pub(super) fn insert(
         .map_err(|e| StorageError::Corrupt(format!("cannot encode job state: {e}")))?;
     conn.prepare_cached(
         "INSERT INTO jobs (id, owner_uid, command, cwd, group_name, priority, label,
-                           no_checkpoint, state, state_data, created_at, started_at, finished_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL)",
+                           no_checkpoint, state, state_data, created_at, started_at, finished_at,
+                           nice)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12)",
     )?
     .execute(params![
         id.0,
@@ -71,6 +72,7 @@ pub(super) fn insert(
         state.name(),
         state_data,
         created_at,
+        spec.nice,
     ])?;
 
     let mut env =
@@ -98,11 +100,14 @@ pub(super) fn insert(
         created_at,
         started_at: None,
         finished_at: None,
+        site_factor: 0,
+        top_seq: None,
     })
 }
 
 const JOB_COLUMNS: &str = "id, owner_uid, command, cwd, group_name, priority, label, \
-                           no_checkpoint, state, state_data, created_at, started_at, finished_at";
+                           no_checkpoint, state, state_data, created_at, started_at, finished_at, \
+                           nice, site_factor, top_seq";
 
 /// A `jobs` row before its child tables are loaded.
 struct JobRow {
@@ -126,12 +131,15 @@ fn job_row(row: &Row<'_>) -> rusqlite::Result<JobRow> {
                 priority: row.get(5)?,
                 label: row.get(6)?,
                 no_checkpoint: row.get(7)?,
+                nice: row.get(13)?,
             },
             // Placeholder; decoded from `state_data` in `decode_state`.
             state: JobState::Running,
             created_at: row.get(10)?,
             started_at: row.get(11)?,
             finished_at: row.get(12)?,
+            site_factor: row.get(14)?,
+            top_seq: row.get::<_, Option<i64>>(15)?.map(|seq| seq.max(0) as u64),
         },
         state_name: row.get(8)?,
         state_data: row.get(9)?,
@@ -268,6 +276,43 @@ pub(super) fn update_state(
         return Err(Error::JobNotFound(id).into());
     }
     Ok(())
+}
+
+/// Fails with [`Error::JobNotFound`] unless exactly one row changed.
+fn one_job(changed: usize, id: JobId) -> Result<()> {
+    if changed == 0 {
+        return Err(Error::JobNotFound(id).into());
+    }
+    Ok(())
+}
+
+pub(super) fn set_nice(conn: &Connection, id: JobId, nice: i32) -> Result<()> {
+    let changed = conn
+        .prepare_cached("UPDATE jobs SET nice = ?2 WHERE id = ?1")?
+        .execute(params![id.0, nice])?;
+    one_job(changed, id)
+}
+
+pub(super) fn set_site_factor(conn: &Connection, id: JobId, site: i32) -> Result<()> {
+    let changed = conn
+        .prepare_cached("UPDATE jobs SET site_factor = ?2 WHERE id = ?1")?
+        .execute(params![id.0, site])?;
+    one_job(changed, id)
+}
+
+/// `meta` key: the next `top_seq`.
+const NEXT_TOP_SEQ: &str = "next_top_seq";
+
+/// Must run inside a savepoint or transaction.
+pub(super) fn move_to_top(conn: &Connection, ids: &[JobId]) -> Result<()> {
+    // The first id ends up first: it gets the highest sequence number.
+    let mut next = super::meta::get(conn, NEXT_TOP_SEQ)?.unwrap_or(0);
+    let mut stmt = conn.prepare_cached("UPDATE jobs SET top_seq = ?2 WHERE id = ?1")?;
+    for id in ids.iter().rev() {
+        one_job(stmt.execute(params![id.0, next])?, *id)?;
+        next += 1;
+    }
+    super::meta::set(conn, NEXT_TOP_SEQ, next)
 }
 
 pub(super) fn remove(conn: &Connection, id: JobId) -> Result<()> {

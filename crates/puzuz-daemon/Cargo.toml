@@ -35,6 +35,8 @@ nvml-wrapper.workspace = true
 hyper = { workspace = true, features = ["server", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 tower-service.workspace = true
+# The local time zone, for priority_usage_reset_period.
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

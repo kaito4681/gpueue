@@ -15,6 +15,10 @@ pub enum Error {
     #[error("permission denied")]
     PermissionDenied,
 
+    /// Permission denied, with the reason for the user.
+    #[error("{0}")]
+    Forbidden(String),
+
     #[error("job {id} cannot be {action} while it is {state}")]
     InvalidTransition {
         id: JobId,

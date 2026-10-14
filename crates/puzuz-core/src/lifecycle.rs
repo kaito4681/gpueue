@@ -736,11 +736,14 @@ mod tests {
                 priority: 0,
                 label: None,
                 no_checkpoint: false,
+                nice: 0,
             },
             state,
             created_at: 0,
             started_at: None,
             finished_at: None,
+            site_factor: 0,
+            top_seq: None,
         }
     }
 

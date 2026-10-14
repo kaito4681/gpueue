@@ -79,6 +79,7 @@ impl Client {
                 priority: 0,
                 label: None,
                 no_checkpoint: false,
+                nice: 0,
             },
             stashed: false,
             enqueue_at: None,

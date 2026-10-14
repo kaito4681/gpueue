@@ -2,7 +2,7 @@
 # Full-stack scenarios; runs inside the systemd container as root (see
 # scripts/e2e-test.sh). Users act through the real CLI with runuser:
 # alice (1000) and bob (1001) are regular users, carol (1002) is in
-# puzuz-admin.
+# puzuz-admin; scenario 17 adds dave (1003), a user without usage.
 #
 # Usage: scenario.sh main | reboot-prepare | reboot-verify | lib
 # Prints "PASS <scenario>" / "FAIL <scenario>: <reason>" per scenario and
@@ -957,6 +957,59 @@ s10_burst() {
     done
 }
 
+# prio_ids <user>: the pending jobs as `puzuz prio --json` orders them.
+prio_ids() {
+    pz "$1" prio --json | python3 -c 'import json, sys; print(" ".join(str(j["id"]) for j in json.load(sys.stdin)["jobs"]))'
+}
+# raw_usage <user> <uid>: the decayed usage of <uid> as `puzuz share --json` shows it.
+raw_usage() {
+    pz "$1" share --json | python3 -c "import json, sys; print(next((u['raw_usage'] for u in json.load(sys.stdin)['users'] if u['uid'] == $2), 0))"
+}
+bob_charged() { python3 -c "import sys; sys.exit(0 if float('$(raw_usage carol 1001)') > 0 else 1)"; }
+
+s17_priority() {
+    local run bobs daves blocker x1 x2 x3 out
+    free_group
+    # dave has never used the machine; bob uses GPU 0 for a while.
+    getent passwd 1003 >/dev/null || useradd -m -u 1003 -s /bin/sh dave
+    run=$(add bob -g free --gpu 0 -- 'sleep 4')
+    wait_state "$run" running
+    bobs=$(add bob -g free --gpu 0 -- 'echo bob')
+    sleep 0.3
+    daves=$(add dave -g free --gpu 0 -- 'echo dave')
+    # Usage is recalculated every second (priority_calc_period_secs = 1).
+    wait_for 30 "bob's usage to be recorded" bob_charged
+    out=$(pz dave share) || fail "share"
+    echo "$out"
+    grep -q bob <<<"$out" || fail "share does not list bob"
+    out=$(pz dave prio) || fail "prio"
+    echo "$out"
+    ! grep -q 'echo bob' <<<"$out" || fail "prio shows another user's command"
+    [ "$(prio_ids dave)" = "$daves $bobs" ] || fail "dave's job is not first: $(prio_ids dave)"
+    wait_state "$bobs" 'done/*' 60
+    expect_state "$daves" done/success
+    [ "$(started_at "$daves")" -le "$(started_at "$bobs")" ] \
+        || fail "bob's older job started before the job of dave, who used less"
+
+    # top: alice's newest job goes first among her own jobs.
+    blocker=$(add alice -g free --gpu 1 -- 'sleep 3')
+    wait_state "$blocker" running
+    x1=$(add alice -g free --gpu 1 -- 'true')
+    x2=$(add alice -g free --gpu 1 -- 'true')
+    x3=$(add alice -g free --gpu 1 -- 'true')
+    ! pz alice nice "$x1" -5 2>/dev/null || fail "a user set a negative nice value"
+    ! pz bob top "$x1" 2>/dev/null || fail "bob moved alice's job"
+    ! pz alice share set alice 100 2>/dev/null || fail "a user set shares"
+    pz alice nice "$x1" 10 || fail "nice"
+    pz alice top "$x3" || fail "top"
+    [ "$(prio_ids alice)" = "$x3 $x2 $x1" ] || fail "order after top and nice: $(prio_ids alice)"
+    pz carol share set bob 2 || fail "share set"
+    pz carol group priority free 1 || fail "group priority"
+    for id in "$x1" "$x2" "$x3"; do wait_state "$id" 'done/*' 60; done
+    [ "$(started_at "$x3")" -le "$(started_at "$x2")" ] || fail "job $x3 did not start first"
+    [ "$(started_at "$x2")" -le "$(started_at "$x1")" ] || fail "the niced job $x1 did not start last"
+}
+
 case "${1:-main}" in
 main)
     run "1 add/status/log/follow/wait" s1_lifecycle
@@ -968,6 +1021,7 @@ main)
     run "8 puzuz shutdown" s8_shutdown
     run "10 many jobs at once" s10_burst
     run "13 checkpoint of a paused job" s13_paused_checkpoint
+    run "17 multifactor priority (fair share, nice, top)" s17_priority
     if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers

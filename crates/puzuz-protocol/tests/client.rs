@@ -85,6 +85,7 @@ fn group(name: &str, parallel: u32) -> Group {
         name: name.into(),
         parallel,
         paused: false,
+        priority: 0,
     }
 }
 
@@ -470,6 +471,7 @@ async fn add_job_posts_flattened_spec() {
             priority: 0,
             label: None,
             no_checkpoint: false,
+            nice: 0,
         },
         stashed: false,
         enqueue_at: None,
@@ -504,6 +506,7 @@ async fn unencodable_request_is_an_error_not_a_panic() {
             priority: 0,
             label: None,
             no_checkpoint: false,
+            nice: 0,
         },
         stashed: false,
         enqueue_at: None,

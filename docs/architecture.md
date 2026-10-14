@@ -38,7 +38,9 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    for line starts in the last 4 MiB of the log at most (the output starts there if they hold
    fewer lines), and only a few such scans run at once.
 2. **Scheduling.** A queued job starts when its group has a free slot and every requested GPU has
-   a free slot. The daemon then asks the helper to spawn it.
+   a free slot. Candidates are considered in priority order (see
+   [Priority and fair share](#priority-and-fair-share)). The daemon then asks the helper to spawn
+   it.
 3. **Daemon → helper.** The daemon keeps one connection to `/run/puzuz/helper.sock` and exchanges
    newline-delimited JSON. A Hello message checks the protocol version first. Then come requests
    with ids, and numbered events from the helper (job exited, checkpoint or restore finished).
@@ -218,11 +220,43 @@ restore as failed, also when the unit is already gone; the image is kept.
   if needed.
 - **`systemctl stop/restart puzuz-helper` or `puzuz`** on its own leaves jobs running.
 
+## Priority and fair share
+
+The order of queued jobs is Slurm's multifactor priority (the formula and settings are in
+[docs/install.md](install.md#priority-and-fair-share)). The work is split like the rest of the
+scheduler:
+
+- `puzuz-core::priority` is pure: the factors, the formula, the owner's order (top, `-o`
+  priority, id; applied by handing out the ages of a user's eligible jobs in that order), the
+  classic fair-share
+  factor `2^(-U/S)`, the decay, the billing of a job and the reset-period boundaries (computed
+  from the local UTC offset the daemon passes in). `scheduler::plan_prioritized` orders the
+  candidates with it and then applies the usual slot, pause and dependency rules unchanged, so a
+  high-priority job that does not fit never blocks jobs behind it. `plan`/`plan_with` keep pueue's
+  order (also used for `priority_type = "basic"`). `scheduler::pending_priorities` (behind
+  `puzuz prio`) uses the same candidate selection, so it lists what the plan considers.
+- The storage keeps `jobs.nice`, `jobs.site_factor`, `jobs.top_seq`, `jobs.run_since`, `groups.priority`, the
+  `user_shares` and `user_usage` tables and, in `meta`, when usage was last calculated and reset
+  (schema version 6).
+- Only running time is billed. Every state change goes through one place in the daemon
+  (`Core::apply_in_tx`), which sets `jobs.run_since` when a job starts running and, when it stops
+  running, charges the time since to its owner's usage in the same transaction. A usage task runs
+  every `priority_calc_period_secs`: in one transaction it decays every user's usage by the time
+  since the last calculation, charges running jobs up to now (moving their `run_since`), applies a
+  due reset and recomputes the fair-share factors, which the daemon caches. Scheduling passes use
+  the cache and do not read the usage tables. One charge covers at most two periods, so daemon
+  downtime is not billed.
+- The API adds `GET /v1/priority` (pending jobs with their factors, no commands, for everyone),
+  `GET /v1/shares`, `PUT /v1/shares/{uid}` and `PUT /v1/groups/{name}/priority` (administrators),
+  and `POST /v1/jobs/nice`, `/v1/jobs/top` and `/v1/jobs/site`, which report per job like the
+  bulk endpoint. Negative nice values, site factors, shares and group priorities are checked in
+  `puzuz-core::authz`.
+
 ## State
 
 | Data | Location | Owner |
 | --- | --- | --- |
-| jobs, groups, GPU slot limits, checkpoint records, pending warnings | `/var/lib/puzuz/daemon/state.sqlite` (WAL with `synchronous=FULL`, so an acknowledged helper event survives a power failure; schema versioned with `PRAGMA user_version`) | daemon |
+| jobs, groups, GPU slot limits, checkpoint records, pending warnings, fair-share shares and usage | `/var/lib/puzuz/daemon/state.sqlite` (WAL with `synchronous=FULL`, so an acknowledged helper event survives a power failure; schema versioned with `PRAGMA user_version`) | daemon |
 | job records, event queue | `/var/lib/puzuz/helper/` | helper |
 | job output | `/var/lib/puzuz/logs/<uid>/<id>.log` | the helper creates the directory (owned by the user, group `puzuz`, mode 2770). The shim writes the log as the owner. The daemon reads and truncates it without following symlinks and only if it is a regular file owned by the job's owner. |
 | checkpoint images | `/var/lib/puzuz/checkpoints/<id>/` | helper (root only) |

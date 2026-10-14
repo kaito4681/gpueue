@@ -9,7 +9,10 @@ use comfy_table::presets::{NOTHING, UTF8_HORIZONTAL_ONLY};
 use comfy_table::{Cell, CellAlignment, ContentArrangement, Row, Table};
 use puzuz_core::authz::REDACTED;
 use puzuz_core::model::{DEFAULT_GROUP, Group, JobId, JobResult, JobState};
-use puzuz_protocol::api::{ActionOutcome, GpuView, JobActionResult, JobView, OrphanJob};
+use puzuz_core::priority::PriorityType;
+use puzuz_protocol::api::{
+    ActionOutcome, GpuView, JobActionResult, JobView, OrphanJob, PriorityResponse, SharesResponse,
+};
 
 use crate::clock::{Clock, human_bytes};
 use crate::query::Column;
@@ -402,6 +405,146 @@ pub fn gpus(gpus: &[GpuView], ctx: &RenderCtx) -> String {
         ]);
     }
     table.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Priority and fair share
+// ---------------------------------------------------------------------------
+
+/// A duration in seconds as `7d`, `5m`, `90s`, ... (the largest unit that
+/// divides it).
+pub fn human_secs(secs: u64) -> String {
+    if secs == 0 {
+        return "0s".into();
+    }
+    for (unit, size) in [("d", 86_400), ("h", 3_600), ("m", 60)] {
+        if secs.is_multiple_of(size) {
+            return format!("{}{unit}", secs / size);
+        }
+    }
+    format!("{secs}s")
+}
+
+/// Rounds a priority or weighted factor for display (Slurm shows integers).
+fn whole(value: f64) -> String {
+    let rounded = value.round();
+    // Avoid printing "-0".
+    if rounded == 0.0 {
+        "0".into()
+    } else {
+        format!("{rounded:.0}")
+    }
+}
+
+/// The output of `puzuz prio` (like Slurm's `sprio`): one row per pending
+/// job, in scheduling order, with the weighted factors.
+pub fn priorities(response: &PriorityResponse, ctx: &RenderCtx) -> String {
+    let basic = response.priority_type == PriorityType::Basic;
+    let headline = if basic {
+        "priority_type = \"basic\": pending jobs are ordered by -o priority, then by id.".to_owned()
+    } else {
+        let w = &response.weights;
+        let mut weights = format!(
+            "Weights: age {}, fairshare {}, jobsize {}, partition {}",
+            w.age, w.fairshare, w.job_size, w.partition
+        );
+        if !w.tres.is_empty() {
+            weights.push_str(&format!(", tres {}", w.tres));
+        }
+        weights
+    };
+    if response.jobs.is_empty() {
+        return format!("{headline}\nNo pending jobs.");
+    }
+    let mut table = ctx.table();
+    table.load_preset(UTF8_HORIZONTAL_ONLY);
+    if basic {
+        table.set_header(vec!["Id", "Owner", "Group", "Prio"]);
+    } else {
+        table.set_header(vec![
+            "Id",
+            "Owner",
+            "Group",
+            "Priority",
+            "Site",
+            "Age",
+            "Fairshare",
+            "JobSize",
+            "Partition",
+            "TRES",
+            "Nice",
+        ]);
+    }
+    for job in &response.jobs {
+        let mut row = vec![
+            Cell::new(job.id),
+            Cell::new(ctx.users.name(job.owner)),
+            Cell::new(&job.group),
+            Cell::new(whole(job.priority)),
+        ];
+        if !basic {
+            row.extend([
+                Cell::new(job.site),
+                Cell::new(whole(job.weighted.age)),
+                Cell::new(whole(job.weighted.fairshare)),
+                Cell::new(whole(job.weighted.job_size)),
+                Cell::new(whole(job.weighted.partition)),
+                Cell::new(whole(job.weighted.tres)),
+                Cell::new(job.nice),
+            ]);
+        }
+        table.add_row(
+            row.into_iter()
+                .map(|cell| cell.set_alignment(CellAlignment::Right)),
+        );
+    }
+    format!("{headline}\n{table}")
+}
+
+/// The output of `puzuz share` (like Slurm's `sshare`).
+pub fn shares(response: &SharesResponse, ctx: &RenderCtx) -> String {
+    let decay = if response.decay_half_life_secs == 0 {
+        "no decay".to_owned()
+    } else {
+        format!("half-life {}", human_secs(response.decay_half_life_secs))
+    };
+    let footer = format!(
+        "Usage is billing × seconds (billing {}), {decay}, recalculated every {}, reset: {}.",
+        if response.billing_weights.is_empty() {
+            "0".to_owned()
+        } else {
+            response.billing_weights.clone()
+        },
+        human_secs(response.calc_period_secs),
+        response.usage_reset_period,
+    );
+    if response.users.is_empty() {
+        return format!("No users with jobs or usage.\n{footer}");
+    }
+    let mut table = ctx.table();
+    table.load_preset(UTF8_HORIZONTAL_ONLY).set_header(vec![
+        "User",
+        "RawShares",
+        "NormShares",
+        "RawUsage",
+        "EffectvUsage",
+        "FairShare",
+    ]);
+    for user in &response.users {
+        let mut name = ctx.users.name(user.uid);
+        if !user.active {
+            name.push_str(" (inactive)");
+        }
+        table.add_row(vec![
+            Cell::new(name),
+            Cell::new(user.shares).set_alignment(CellAlignment::Right),
+            Cell::new(format!("{:.6}", user.norm_shares)).set_alignment(CellAlignment::Right),
+            Cell::new(format!("{:.0}", user.raw_usage)).set_alignment(CellAlignment::Right),
+            Cell::new(format!("{:.6}", user.effective_usage)).set_alignment(CellAlignment::Right),
+            Cell::new(format!("{:.6}", user.fairshare)).set_alignment(CellAlignment::Right),
+        ]);
+    }
+    format!("{table}\n{footer}")
 }
 
 // ---------------------------------------------------------------------------

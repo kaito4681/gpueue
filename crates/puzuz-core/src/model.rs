@@ -68,10 +68,23 @@ pub struct JobSpec {
     pub gpus: Vec<GpuIndex>,
     /// Jobs that must finish successfully before this one may start.
     pub dependencies: Vec<JobId>,
+    /// The job's place among its owner's jobs (pueue's `-o/--priority`);
+    /// higher first. With multifactor priority it only orders the owner's
+    /// own jobs (see [`crate::priority`]); with basic priority it orders
+    /// every job.
     pub priority: i32,
     pub label: Option<String>,
     /// Do not checkpoint on shutdown; just SIGTERM, then SIGKILL.
     pub no_checkpoint: bool,
+    /// Subtracted from the multifactor priority (Slurm's `--nice`). Users
+    /// may only set values `>= 0`; negative values are for administrators.
+    /// Can be changed after submission (`puzuz nice`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub nice: i32,
+}
+
+fn is_zero(value: &i32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +97,14 @@ pub struct Job {
     /// Set when the job first started running; kept across checkpoint/restore.
     pub started_at: Option<Timestamp>,
     pub finished_at: Option<Timestamp>,
+    /// Added to the multifactor priority; set by administrators (Slurm's
+    /// site factor). Not copied by `restart`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub site_factor: i32,
+    /// Set by `puzuz top` (Slurm's `scontrol top`): jobs with a value come
+    /// first among their owner's jobs, higher values first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_seq: Option<u64>,
 }
 
 /// Lifecycle state of a job.
@@ -205,6 +226,15 @@ pub struct Group {
     pub name: String,
     pub parallel: u32,
     pub paused: bool,
+    /// The group's priority (Slurm's partition `PriorityJobFactor`); its
+    /// share of the highest group priority is the partition factor of the
+    /// group's jobs. Set by administrators (`puzuz group priority`).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub priority: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

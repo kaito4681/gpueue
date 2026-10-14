@@ -20,8 +20,10 @@
 //!    Failures cascade within one plan: a job depending on a job that this
 //!    plan marks as `DependencyFailed` is marked as well.
 //! 3. **Starting and restoring.** `Queued` and `RestoreQueued` jobs compete
-//!    for the same slots and are considered in one list ordered by higher
-//!    priority first, then lower [`JobId`] (pueue's order). A job is launched
+//!    for the same slots and are considered in one list ordered by priority:
+//!    with [`plan`] and [`plan_with`] by higher `-o` priority first, then
+//!    lower [`JobId`] (pueue's order); with [`plan_prioritized`] by the
+//!    multifactor priority of [`crate::priority`]. A job is launched
 //!    when
 //!    - its group exists and is not paused,
 //!    - its group has a free slot,
@@ -54,7 +56,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{Gpu, GpuIndex, Group, Job, JobId, JobResult, JobState, Timestamp};
+use crate::model::{Gpu, GpuIndex, Group, Job, JobId, JobResult, JobState, Timestamp, Uid};
+use crate::priority::{self, JobPriority, Params, Resources};
 
 /// What the daemon should do, as decided by [`plan`].
 ///
@@ -140,17 +143,81 @@ pub fn plan_with(
     gpus: &[Gpu],
     reserved: &Reserved,
 ) -> Plan {
-    let mut out = Plan::default();
+    plan_inner(now, jobs, groups, gpus, reserved, None)
+}
 
-    let groups: HashMap<&str, &Group> = groups.iter().map(|g| (g.name.as_str(), g)).collect();
-    let gpus: HashMap<GpuIndex, &Gpu> = gpus.iter().map(|g| (g.index, g)).collect();
+/// The inputs of the multifactor priority besides jobs and groups.
+#[derive(Debug, Clone, Copy)]
+pub struct PriorityInput<'a> {
+    pub params: &'a Params,
+    /// Fair-share factor per user (see [`priority::fair_share_factors`]).
+    pub fairshare: &'a HashMap<Uid, f64>,
+    pub resources: Resources,
+}
+
+/// [`plan_with`], with candidates ordered by `input` (see
+/// [`crate::priority`]) instead of pueue's order. With
+/// `priority_type = "basic"` the order is pueue's.
+pub fn plan_prioritized(
+    now: Timestamp,
+    jobs: &[Job],
+    groups: &[Group],
+    gpus: &[Gpu],
+    reserved: &Reserved,
+    input: &PriorityInput<'_>,
+) -> Plan {
+    plan_inner(now, jobs, groups, gpus, reserved, Some(input))
+}
+
+/// The priorities of the jobs [`plan_prioritized`] would consider with the
+/// same arguments, in the order it considers them, as `puzuz prio` shows
+/// them: queued and restore-queued jobs (including delayed enqueues that
+/// are due), without jobs this plan fails for a failed dependency and
+/// without `reserved.held` jobs.
+pub fn pending_priorities(
+    now: Timestamp,
+    jobs: &[Job],
+    groups: &[Group],
+    reserved: &Reserved,
+    input: &PriorityInput<'_>,
+) -> Vec<JobPriority> {
+    let prepared = prepare(now, jobs, groups, reserved);
+    order(
+        now,
+        jobs,
+        &prepared.status,
+        &prepared.candidates,
+        groups,
+        input,
+    )
+}
+
+/// What [`plan_inner`] and [`pending_priorities`] share: the effective
+/// status of every job, the delayed enqueues and dependency failures of
+/// this plan, and the candidates (unordered).
+struct Prepared<'a> {
+    status: HashMap<JobId, Status>,
+    enqueue: Vec<JobId>,
+    dependency_failed: Vec<JobId>,
+    candidates: Vec<&'a Job>,
+}
+
+fn prepare<'a>(
+    now: Timestamp,
+    jobs: &'a [Job],
+    group_list: &[Group],
+    reserved: &Reserved,
+) -> Prepared<'a> {
+    let groups: HashMap<&str, &Group> = group_list.iter().map(|g| (g.name.as_str(), g)).collect();
     let group_paused = |name: &str| groups.get(name).is_some_and(|g| g.paused);
+    let mut enqueue = Vec::new();
+    let mut dependency_failed = Vec::new();
 
     let mut status: HashMap<JobId, Status> = HashMap::with_capacity(jobs.len());
     for job in jobs {
         let s = Status::of(job, now);
         if s == Status::Queued && matches!(job.state, JobState::Stashed { .. }) {
-            out.enqueue.push(job.id);
+            enqueue.push(job.id);
         }
         status.insert(job.id, s);
     }
@@ -172,7 +239,7 @@ pub fn plan_with(
                 .any(|dep| status.get(dep) == Some(&Status::DoneFailed));
             if failed {
                 status.insert(job.id, Status::DoneFailed);
-                out.dependency_failed.push(job.id);
+                dependency_failed.push(job.id);
                 changed = true;
             }
         }
@@ -180,6 +247,95 @@ pub fn plan_with(
             break;
         }
     }
+
+    let candidates: Vec<&Job> = jobs
+        .iter()
+        .filter(|j| matches!(status[&j.id], Status::Queued | Status::RestoreQueued))
+        .filter(|j| !reserved.held.contains(&j.id))
+        .collect();
+    Prepared {
+        status,
+        enqueue,
+        dependency_failed,
+        candidates,
+    }
+}
+
+/// When `job` became eligible to start (for the age factor): when it was
+/// queued, or when its last dependency finished; `None` while a
+/// dependency has not finished successfully.
+fn eligible_since(
+    job: &Job,
+    now: Timestamp,
+    status: &HashMap<JobId, Status>,
+    by_id: &HashMap<JobId, &Job>,
+) -> Option<Timestamp> {
+    let queued_at = match &job.state {
+        JobState::Queued { enqueued_at } | JobState::RestoreQueued { enqueued_at } => *enqueued_at,
+        // A delayed enqueue that is due: queued by this plan.
+        _ => return Some(now),
+    };
+    if matches!(job.state, JobState::RestoreQueued { .. }) {
+        return Some(queued_at);
+    }
+    let mut since = queued_at;
+    for dep in &job.spec.dependencies {
+        match status.get(dep) {
+            None => {}
+            Some(Status::DoneSuccess) => {
+                if let Some(at) = by_id.get(dep).and_then(|d| d.finished_at) {
+                    since = since.max(at);
+                }
+            }
+            Some(_) => return None,
+        }
+    }
+    Some(since.min(now))
+}
+
+fn order(
+    now: Timestamp,
+    jobs: &[Job],
+    status: &HashMap<JobId, Status>,
+    candidates: &[&Job],
+    groups: &[Group],
+    input: &PriorityInput<'_>,
+) -> Vec<JobPriority> {
+    let by_id: HashMap<JobId, &Job> = jobs.iter().map(|j| (j.id, j)).collect();
+    let ctx = priority::Context {
+        params: input.params,
+        now,
+        fairshare: input.fairshare,
+        groups,
+        resources: input.resources,
+    };
+    priority::prioritize(candidates, &ctx, |job| {
+        eligible_since(job, now, status, &by_id)
+    })
+}
+
+fn plan_inner(
+    now: Timestamp,
+    jobs: &[Job],
+    group_list: &[Group],
+    gpus: &[Gpu],
+    reserved: &Reserved,
+    input: Option<&PriorityInput<'_>>,
+) -> Plan {
+    let Prepared {
+        status,
+        enqueue,
+        dependency_failed,
+        mut candidates,
+    } = prepare(now, jobs, group_list, reserved);
+    let mut out = Plan {
+        enqueue,
+        dependency_failed,
+        ..Plan::default()
+    };
+
+    let groups: HashMap<&str, &Group> = group_list.iter().map(|g| (g.name.as_str(), g)).collect();
+    let gpus: HashMap<GpuIndex, &Gpu> = gpus.iter().map(|g| (g.index, g)).collect();
 
     // Slots currently in use.
     let mut group_used: HashMap<&str, u32> = HashMap::new();
@@ -191,17 +347,19 @@ pub fn plan_with(
         }
     }
 
-    let mut candidates: Vec<&Job> = jobs
-        .iter()
-        .filter(|j| matches!(status[&j.id], Status::Queued | Status::RestoreQueued))
-        .filter(|j| !reserved.held.contains(&j.id))
-        .collect();
-    candidates.sort_by(|a, b| {
-        b.spec
-            .priority
-            .cmp(&a.spec.priority)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    match input {
+        Some(input) => {
+            let ordered = order(now, jobs, &status, &candidates, group_list, input);
+            let by_id: HashMap<JobId, &Job> = candidates.iter().map(|j| (j.id, *j)).collect();
+            candidates = ordered.iter().map(|p| by_id[&p.id]).collect();
+        }
+        None => candidates.sort_by(|a, b| {
+            b.spec
+                .priority
+                .cmp(&a.spec.priority)
+                .then_with(|| a.id.cmp(&b.id))
+        }),
+    }
 
     let has_room = |parallel: u32, used: u32| parallel == 0 || used < parallel;
 
@@ -306,11 +464,14 @@ mod tests {
                 priority: 0,
                 label: None,
                 no_checkpoint: false,
+                nice: 0,
             },
             state,
             created_at: 0,
             started_at: None,
             finished_at: None,
+            site_factor: 0,
+            top_seq: None,
         })
     }
 
@@ -338,6 +499,7 @@ mod tests {
             name: name.into(),
             parallel,
             paused: false,
+            priority: 0,
         }
     }
 
@@ -927,5 +1089,213 @@ mod tests {
             &[],
         );
         assert_eq!(p.start, ids(&[1]));
+    }
+    // ----- multifactor priority -----
+
+    impl J {
+        fn owner(mut self, uid: u32) -> Self {
+            self.0.owner = Uid(uid);
+            self
+        }
+        fn at(mut self, enqueued_at: Timestamp) -> Self {
+            self.0.state = match self.0.state {
+                JobState::RestoreQueued { .. } => JobState::RestoreQueued { enqueued_at },
+                _ => JobState::Queued { enqueued_at },
+            };
+            self
+        }
+    }
+
+    fn prioritized(
+        jobs: Vec<J>,
+        groups: &[Group],
+        gpus: &[Gpu],
+        params: &Params,
+        fairshare: &HashMap<Uid, f64>,
+    ) -> Plan {
+        let jobs: Vec<Job> = jobs.into_iter().map(|j| j.0).collect();
+        let input = PriorityInput {
+            params,
+            fairshare,
+            resources: Resources {
+                gpus: gpus.len() as u32,
+                cpus: 8,
+            },
+        };
+        plan_prioritized(NOW, &jobs, groups, gpus, &Reserved::default(), &input)
+    }
+
+    #[test]
+    fn lower_usage_user_gets_the_gpu_first() {
+        // User 1 submitted first, but used the machine a lot.
+        let fairshare = HashMap::from([(Uid(1), 0.1), (Uid(2), 0.9)]);
+        let jobs = || {
+            vec![
+                job(1, queued()).owner(1).gpus(&[0]).at(NOW - 1000),
+                job(2, queued()).owner(2).gpus(&[0]).at(NOW),
+            ]
+        };
+        let p = prioritized(
+            jobs(),
+            &[group(DEFAULT_GROUP, 0)],
+            &[gpu(0, 1)],
+            &Params::default(),
+            &fairshare,
+        );
+        assert_eq!(p.start, ids(&[2]));
+        // Basic priority: pueue's order.
+        let basic = Params {
+            kind: crate::priority::PriorityType::Basic,
+            ..Params::default()
+        };
+        let p = prioritized(
+            jobs(),
+            &[group(DEFAULT_GROUP, 0)],
+            &[gpu(0, 1)],
+            &basic,
+            &fairshare,
+        );
+        assert_eq!(p.start, ids(&[1]));
+        let p = run(jobs(), &[group(DEFAULT_GROUP, 0)], &[gpu(0, 1)]);
+        assert_eq!(p.start, ids(&[1]));
+    }
+
+    #[test]
+    fn prioritized_plan_keeps_slots_dependencies_and_pauses() {
+        let fairshare = HashMap::from([(Uid(1), 1.0), (Uid(2), 0.0)]);
+        let p = prioritized(
+            vec![
+                // Best priority, but its dependency has not finished.
+                job(1, queued()).owner(1).deps(&[9]),
+                job(9, JobState::Running).owner(1),
+                // Paused group.
+                job(2, queued()).owner(1).group("held"),
+                // The GPU is taken by job 3.
+                job(3, JobState::Running).owner(2).gpus(&[0]),
+                job(4, queued()).owner(1).gpus(&[0]),
+                // Fits.
+                job(5, queued()).owner(2),
+                job(6, restore_queued()).owner(1),
+            ],
+            &[group(DEFAULT_GROUP, 0), paused("held", 0)],
+            &[gpu(0, 1)],
+            &Params::default(),
+            &fairshare,
+        );
+        assert_eq!(p.start, ids(&[5]));
+        assert_eq!(p.restore, ids(&[6]));
+        // A high-priority job blocked on a GPU does not block others (no
+        // head-of-line blocking), as with basic priority.
+        let p = prioritized(
+            vec![
+                job(1, queued()).owner(1).gpus(&[0, 1]),
+                job(2, JobState::Running).owner(2).gpus(&[1]),
+                job(3, queued()).owner(2).gpus(&[0]),
+            ],
+            &[group(DEFAULT_GROUP, 0)],
+            &[gpu(0, 1), gpu(1, 1)],
+            &Params::default(),
+            &HashMap::from([(Uid(2), 0.0)]),
+        );
+        assert_eq!(p.start, ids(&[3]));
+    }
+
+    #[test]
+    fn group_parallel_limit_goes_to_the_best_priority() {
+        let fairshare = HashMap::from([(Uid(1), 0.2), (Uid(2), 0.8)]);
+        let p = prioritized(
+            vec![
+                job(1, queued()).owner(1),
+                job(2, queued()).owner(1),
+                job(3, queued()).owner(2),
+                job(4, queued()).owner(2),
+            ],
+            &[group(DEFAULT_GROUP, 3)],
+            &[],
+            &Params::default(),
+            &fairshare,
+        );
+        assert_eq!(p.start, ids(&[3, 4, 1]));
+    }
+
+    #[test]
+    fn age_counts_from_the_last_dependency() {
+        let finished = |id: u64, at: Timestamp| {
+            let mut j = job(id, success());
+            j.0.finished_at = Some(at);
+            j
+        };
+        let jobs: Vec<Job> = vec![
+            finished(1, NOW - 1000).0,
+            job(2, queued()).deps(&[1]).at(NOW - 5000).0,
+            job(3, queued()).owner(2).at(NOW - 3000).0,
+        ];
+        let params = Params {
+            weight_fairshare: 0,
+            max_age_ms: 10_000,
+            ..Params::default()
+        };
+        let fairshare = HashMap::new();
+        let input = PriorityInput {
+            params: &params,
+            fairshare: &fairshare,
+            resources: Resources::default(),
+        };
+        let p = pending_priorities(
+            NOW,
+            &jobs,
+            &[group(DEFAULT_GROUP, 0)],
+            &Reserved::default(),
+            &input,
+        );
+        // Job 2 waited since its dependency finished (1 s), job 3 for 3 s.
+        assert_eq!(p.iter().map(|p| p.id.0).collect::<Vec<_>>(), [3, 2]);
+        assert!((p[1].factors.age - 0.1).abs() < 1e-9);
+        assert!((p[0].factors.age - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pending_priorities_list_what_the_plan_considers() {
+        let jobs: Vec<Job> = vec![
+            job(1, failed()).0,
+            // Fails for its dependency in this plan.
+            job(2, queued()).deps(&[1]).0,
+            // Held (an orphan with its id runs).
+            job(3, queued()).0,
+            job(4, queued()).owner(2).0,
+            job(5, restore_queued()).0,
+            job(
+                6,
+                JobState::Stashed {
+                    enqueue_at: Some(NOW - 1),
+                },
+            )
+            .0,
+        ];
+        let reserved = Reserved {
+            gpus: HashMap::new(),
+            held: HashSet::from([JobId(3)]),
+        };
+        let params = Params::default();
+        let fairshare = HashMap::new();
+        let input = PriorityInput {
+            params: &params,
+            fairshare: &fairshare,
+            resources: Resources::default(),
+        };
+        let groups = [group(DEFAULT_GROUP, 0)];
+        let listed: HashSet<u64> = pending_priorities(NOW, &jobs, &groups, &reserved, &input)
+            .iter()
+            .map(|p| p.id.0)
+            .collect();
+        assert_eq!(listed, HashSet::from([4, 5, 6]));
+        let plan = plan_prioritized(NOW, &jobs, &groups, &[], &reserved, &input);
+        let launched: HashSet<u64> = plan
+            .start
+            .iter()
+            .chain(&plan.restore)
+            .map(|id| id.0)
+            .collect();
+        assert_eq!(launched, listed);
     }
 }

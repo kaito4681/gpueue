@@ -10,6 +10,7 @@ repository.workspace = true
 # The root helper depends on this crate: keep it small (no async runtime,
 # no SQLite, no I/O beyond reading the file).
 [dependencies]
+puzuz-core.workspace = true
 puzuz-protocol.workspace = true
 serde.workspace = true
 thiserror.workspace = true

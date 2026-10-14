@@ -384,6 +384,12 @@ pub fn no_pre(_: &dyn StoreOps, _: &Job) -> Result<(), StorageError> {
 
 pub struct Core {
     pub config: Config,
+    /// `config.priority` as the priority calculation takes it.
+    pub priority_params: puzuz_core::priority::Params,
+    /// CPUs of the machine (for the job size and TRES factors).
+    pub cpus: u32,
+    /// Fair-share factor per user (see [`crate::priority`]).
+    pub(crate) fairshare: Mutex<Arc<HashMap<Uid, f64>>>,
     pub db: Db,
     pub helper: Arc<dyn Helper>,
     pub users: Arc<dyn UserDb>,
@@ -454,6 +460,9 @@ impl Core {
         let (events, _) = broadcast::channel(1024);
         let (changes, _) = watch::channel(0);
         Arc::new(Self {
+            priority_params: config.priority.params(),
+            cpus: crate::priority::machine_cpus(),
+            fairshare: Mutex::new(Arc::new(HashMap::new())),
             config,
             db: Db::new(store),
             helper,
@@ -946,8 +955,24 @@ impl Core {
             // given up as interrupted.
             let restored = matches!(job.state, JobState::Restoring | JobState::Checkpointed)
                 && transition.next.as_ref() == Some(&JobState::Running);
+            let old = job.state.clone();
             transition.apply(job, now);
             tx.update_job_state(job.id, &job.state, job.started_at, job.finished_at)?;
+            self.account_run(tx, &old, job, now)?;
+            if matches!(old, JobState::Done { .. })
+                && matches!(
+                    job.state,
+                    JobState::Queued { .. } | JobState::Stashed { .. }
+                )
+            {
+                // `restart --in-place`: like a restarted copy, the job
+                // starts without an administrator's grants (a negative
+                // nice, the site factor) and its `top` position.
+                tx.clear_job_priority_grants(job.id)?;
+                job.spec.nice = job.spec.nice.max(0);
+                job.site_factor = 0;
+                job.top_seq = None;
+            }
             if !is_launch_state(&job.state) {
                 self.forced.lock().unwrap().remove(&job.id);
             }
@@ -997,7 +1022,11 @@ impl Core {
                     } else {
                         JobState::Queued { enqueued_at: now }
                     };
-                    let new = tx.insert_job(job.owner, &job.spec, &state, now)?;
+                    // A negative nice is an administrator's grant to
+                    // this job; the copy does not inherit it.
+                    let mut spec = job.spec.clone();
+                    spec.nice = spec.nice.max(0);
+                    let new = tx.insert_job(job.owner, &spec, &state, now)?;
                     changes.added(new.id);
                     copy = Some(new);
                 }
@@ -1417,6 +1446,8 @@ impl Core {
                 JobState::Running
             };
             tx.update_job_state(id, &next, job.started_at, None)?;
+            let old = std::mem::replace(&mut job.state, next.clone());
+            core.account_run(tx, &old, &job, now)?;
             if record.is_some() {
                 tx.set_checkpoint_status(id, CheckpointStatus::Failed, None, Some(&reason))?;
             } else {
@@ -2095,7 +2126,14 @@ impl Core {
                     .into_iter()
                     .filter(|gpu| core.gpu_available(gpu.index))
                     .collect();
-                let plan = scheduler::plan_with(now, &jobs, &groups, &gpus, &reserved);
+                let fairshare = core.fairshare_factors();
+                let input = scheduler::PriorityInput {
+                    params: &core.priority_params,
+                    fairshare: &fairshare,
+                    resources: core.priority_resources(gpus.len()),
+                };
+                let plan =
+                    scheduler::plan_prioritized(now, &jobs, &groups, &gpus, &reserved, &input);
                 let mut by_id: HashMap<JobId, Job> = jobs.into_iter().map(|j| (j.id, j)).collect();
                 for id in &plan.enqueue {
                     let Some(job) = by_id.get_mut(id) else {
@@ -2379,6 +2417,7 @@ mod tests {
             priority: 0,
             label: None,
             no_checkpoint: false,
+            nice: 0,
         }
     }
 

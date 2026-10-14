@@ -1111,7 +1111,7 @@ fn doctor() {
 #[test]
 fn subcommand_names_match_clap() {
     let command = Cli::command();
-    let samples: [&[&str]; 30] = [
+    let samples: [&[&str]; 35] = [
         &["add", "x"],
         &["remove", "1"],
         &["switch", "1", "2"],
@@ -1137,6 +1137,11 @@ fn subcommand_names_match_clap() {
         &["checkpoint"],
         &["restore"],
         &["gpu"],
+        &["prio"],
+        &["nice", "1", "2"],
+        &["top", "1"],
+        &["site", "1", "2"],
+        &["share"],
         &["daemon"],
         &["service", "status"],
         &["uninstall"],
@@ -1417,4 +1422,112 @@ fn commands_and_options_in_help_texts_exist() {
         commands >= 5,
         "only {commands} commands found in help texts"
     );
+}
+
+// --- Priority (puzuz extensions) ------------------------------------------------------------
+
+#[test]
+fn add_nice() {
+    let SubCommand::Add { nice, priority, .. } = cmd(&["add", "--nice", "5", "-o", "-2", "true"])
+    else {
+        panic!()
+    };
+    assert_eq!(nice, Some(5));
+    assert_eq!(priority, Some(-2));
+    let SubCommand::Add { nice, .. } = cmd(&["add", "--nice", "-5", "true"]) else {
+        panic!()
+    };
+    assert_eq!(nice, Some(-5));
+    let SubCommand::Add { nice, .. } = cmd(&["add", "true"]) else {
+        panic!()
+    };
+    assert_eq!(nice, None);
+}
+
+#[test]
+fn nice_top_and_site() {
+    assert_eq!(
+        cmd(&["nice", "3", "10"]),
+        SubCommand::Nice {
+            task_ids: vec![3],
+            nice: 10
+        }
+    );
+    assert_eq!(
+        cmd(&["nice", "3", "4", "-5"]),
+        SubCommand::Nice {
+            task_ids: vec![3, 4],
+            nice: -5
+        }
+    );
+    assert_eq!(
+        parse_err(&["nice", "3"]),
+        ErrorKind::MissingRequiredArgument
+    );
+    assert_eq!(
+        cmd(&["top", "4", "2"]),
+        SubCommand::Top {
+            task_ids: vec![4, 2]
+        }
+    );
+    assert_eq!(parse_err(&["top"]), ErrorKind::MissingRequiredArgument);
+    assert_eq!(
+        cmd(&["site", "1", "-100"]),
+        SubCommand::Site {
+            task_ids: vec![1],
+            site: -100
+        }
+    );
+}
+
+#[test]
+fn prio_and_share() {
+    assert_eq!(
+        cmd(&["prio"]),
+        SubCommand::Prio {
+            task_ids: vec![],
+            json: false
+        }
+    );
+    assert_eq!(
+        cmd(&["prio", "-j", "1", "2"]),
+        SubCommand::Prio {
+            task_ids: vec![1, 2],
+            json: true
+        }
+    );
+    assert_eq!(
+        cmd(&["share", "--json"]),
+        SubCommand::Share {
+            json: true,
+            cmd: None
+        }
+    );
+    assert_eq!(
+        cmd(&["share", "set", "alice", "3"]),
+        SubCommand::Share {
+            json: false,
+            cmd: Some(ShareCommand::Set {
+                user: "alice".into(),
+                shares: 3
+            })
+        }
+    );
+    assert_eq!(
+        parse_err(&["share", "set", "alice", "-1"]),
+        ErrorKind::UnknownArgument
+    );
+    assert_eq!(
+        cmd(&["group", "priority", "gpu", "10"]),
+        SubCommand::Group {
+            json: false,
+            cmd: Some(GroupCommand::Priority {
+                name: "gpu".into(),
+                priority: 10
+            })
+        }
+    );
+    for name in ["prio", "nice", "top", "site", "share"] {
+        assert!(Cli::command().find_subcommand(name).is_some(), "{name}");
+    }
 }

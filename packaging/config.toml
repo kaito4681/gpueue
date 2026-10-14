@@ -137,3 +137,69 @@
 #   uuid = "GPU-..."
 #   name = "NVIDIA GeForce RTX 4090"
 #   memory_total_bytes = 25_757_220_864
+
+# Job priority: how queued jobs compete for group and GPU slots. The settings
+# follow Slurm's priority/multifactor plugin; each key is the Slurm parameter
+# in snake_case (PriorityWeightAge is priority_weight_age, ...), with
+# durations in seconds. Keys below the [priority] line belong to the table
+# (up to the next table, such as the [[gpus]] entries `puzuz service install`
+# appends), so keep other keys above it. See "Priority and fair share" in
+# docs/install.md.
+#
+# The priority of a pending job is
+#     site factor
+#   + priority_weight_age       * age factor
+#   + priority_weight_fairshare * fair-share factor
+#   + priority_weight_job_size  * job size factor
+#   + priority_weight_partition * partition (group) factor
+#   + priority_weight_tres      * TRES factors
+#   - nice
+#
+# Every factor is between 0 and 1. pueue's `-o/--priority`, `puzuz top` and
+# `switch` only order a user's own jobs. `puzuz prio` shows each pending job's
+# factors, `puzuz share` the fair-share state.
+# [priority]
+
+# "multifactor", or "basic" for pueue's order (higher -o priority first, then
+# submission order; nice, top and fair share are ignored). PriorityType.
+# priority_type = "multifactor"
+
+# Weights of the factors (PriorityWeight*). 0 disables a factor.
+# priority_weight_age = 1000
+# priority_weight_fairshare = 10000
+# priority_weight_job_size = 0
+# Groups play the role of Slurm partitions: a group's factor is its priority
+# (`puzuz group priority <group> <n>`) over the highest group priority.
+# priority_weight_partition = 0
+# Per resource (CPU, GRES/gpu): weight × the job's share of the machine's
+# total, e.g. "GRES/gpu=1000". Empty: no TRES factor. PriorityWeightTRES.
+# priority_weight_tres = ""
+
+# The age factor (time since the job became eligible: queued with every
+# dependency done) reaches 1 after this many seconds. PriorityMaxAge.
+# priority_max_age_secs = 604800
+
+# Past usage counts half after this many seconds; 0 disables the decay.
+# PriorityDecayHalfLife.
+# priority_decay_half_life_secs = 604800
+
+# How often usage is added up and decayed, in seconds. PriorityCalcPeriod.
+# priority_calc_period_secs = 300
+
+# Clear all usage: "none", "now" (whenever the daemon starts), "daily",
+# "weekly" (Sunday), "monthly", "quarterly" or "yearly", at 00:00 local time.
+# PriorityUsageResetPeriod.
+# priority_usage_reset_period = "none"
+
+# Give small jobs (fewer GPUs, or CPU-only) the larger job size factor.
+# PriorityFavorSmall.
+# priority_favor_small = false
+
+# What one second of a running job counts as for fair share (TRESBillingWeights).
+# Every job counts as one CPU, plus its GPUs.
+# tres_billing_weights = "CPU=1.0,GRES/gpu=10.0"
+
+# Users may move their own queued jobs to the top of their queue with
+# `puzuz top` (Slurm's SchedulerParameters=enable_user_top); administrators
+# always may.
+# enable_user_top = true

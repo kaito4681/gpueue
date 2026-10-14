@@ -33,7 +33,13 @@ pub struct JobView {
     pub group: String,
     pub gpus: Vec<GpuIndex>,
     pub dependencies: Vec<JobId>,
+    /// pueue's `-o/--priority`. With multifactor priority it orders the
+    /// owner's jobs only (see `puzuz prio`).
     pub priority: i32,
+    /// Subtracted from the multifactor priority (`puzuz nice`); omitted
+    /// when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub nice: i32,
     pub label: Option<String>,
     pub no_checkpoint: bool,
     pub state: JobState,
@@ -104,6 +110,7 @@ impl JobView {
             gpus: job.spec.gpus.clone(),
             dependencies: job.spec.dependencies.clone(),
             priority: job.spec.priority,
+            nice: job.spec.nice,
             label: None,
             no_checkpoint: job.spec.no_checkpoint,
             state: authz::redact_state(&job.state),
@@ -255,6 +262,10 @@ impl AddJobResponse {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &i32) -> bool {
+    *value == 0
 }
 
 // ---------------------------------------------------------------------------

@@ -53,6 +53,7 @@ pub struct AddArgs<'a> {
     pub group: Option<&'a str>,
     pub after: &'a [usize],
     pub priority: Option<i32>,
+    pub nice: Option<i32>,
     pub label: Option<&'a str>,
     pub gpu: &'a [u32],
     pub no_checkpoint: bool,
@@ -88,6 +89,7 @@ pub fn add_request(
             priority: args.priority.unwrap_or(0),
             label: args.label.map(str::to_owned),
             no_checkpoint: args.no_checkpoint,
+            nice: args.nice.unwrap_or(0),
         },
         // As in pueue, a delayed job is stashed until its time comes.
         stashed: args.stashed || args.delay.is_some(),

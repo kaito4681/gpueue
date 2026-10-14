@@ -14,3 +14,7 @@ name = "GPU 0"
 index = 1
 uuid = "GPU-fake-1"
 name = "Fake GPU 1"
+
+# Recalculate fair-share usage every second (scenario 17).
+[priority]
+priority_calc_period_secs = 1
