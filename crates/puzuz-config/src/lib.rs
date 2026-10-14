@@ -34,6 +34,7 @@
 //! cuda_checkpoint_mode = "manual"
 //! gpu_device_isolation = true
 //! job_system_dbus = false
+//! job_systemd_varlink = false
 //! checkpoint_deadline_base_secs = 180
 //! checkpoint_deadline_secs_per_gib = 30
 //! fork_guard = true
@@ -157,6 +158,15 @@ pub struct Config {
     /// the user database, not from the job's (reduced) groups, so its
     /// rules would otherwise apply to jobs as to their owners' sessions.
     pub job_system_dbus: bool,
+    /// Let jobs reach systemd's Varlink services under `/run/systemd`
+    /// (helper only). `false` (the default) hides `/run/systemd` from jobs
+    /// except `journal`, `resolve` and `userdb`: services such as
+    /// `io.systemd.Manager` (reload, reexecute), `io.systemd.Credentials`
+    /// (decrypting system credentials), mountfsd, nsresourced, machined
+    /// or logind authorize callers through polkit without the D-Bus
+    /// socket, so [`Config::job_system_dbus`] alone does not keep polkit
+    /// rules away from jobs.
+    pub job_systemd_varlink: bool,
     /// Fixed part of the deadline of a whole checkpoint or restore of a
     /// job, in seconds (helper only). The deadline is
     /// `checkpoint_deadline_base_secs + checkpoint_deadline_secs_per_gib *
@@ -389,6 +399,7 @@ impl Default for Config {
             cuda_checkpoint_mode: CudaCheckpointMode::Manual,
             gpu_device_isolation: true,
             job_system_dbus: false,
+            job_systemd_varlink: false,
             checkpoint_deadline_base_secs: 180,
             checkpoint_deadline_secs_per_gib: 30,
             criu_dump_timeout_secs: None,
@@ -652,6 +663,7 @@ mod tests {
         assert!(config.fork_guard);
         assert!(config.gpu_device_isolation);
         assert!(!config.job_system_dbus);
+        assert!(!config.job_systemd_varlink);
         assert_eq!(config.job_min_uid, None);
         assert_eq!(
             config.job_denied_groups,
@@ -776,6 +788,7 @@ mod tests {
             cuda_checkpoint_mode = "plugin"
             gpu_device_isolation = false
             job_system_dbus = true
+            job_systemd_varlink = true
             criu_dump_timeout_secs = 60
             criu_restore_timeout_secs = 90
             checkpoint_deadline_base_secs = 20
@@ -823,6 +836,7 @@ mod tests {
         assert_eq!(config.cuda_checkpoint_mode, CudaCheckpointMode::Plugin);
         assert!(!config.gpu_device_isolation);
         assert!(config.job_system_dbus);
+        assert!(config.job_systemd_varlink);
         assert_eq!(config.criu_dump_timeout_secs, Some(60));
         assert_eq!(config.criu_restore_timeout_secs, Some(90));
         assert_eq!(config.checkpoint_deadline_base_secs, 20);

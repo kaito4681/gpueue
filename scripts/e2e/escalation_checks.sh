@@ -58,6 +58,35 @@ s.connect(sys.argv[1])' "$docker_sock"
 import os, sys
 os.open(sys.argv[1], os.O_RDONLY)' "$blockdev"
 
+    # systemd's Varlink services (polkit-authorized without D-Bus): every
+    # socket the host has under /run/systemd outside journal/, resolve/
+    # and userdb/ (listed by the scenario), and two calls that the polkit
+    # rule lets the owner make outside puzuz.
+    local sock n=0
+    while read -r sock; do
+        [ -n "$sock" ] || continue
+        n=$((n + 1))
+        must_fail "connect to $sock" python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])' "$sock"
+    done <"$home/e2e-varlink-sockets"
+    echo "   (tried $n Varlink sockets)"
+    if [ -s "$home/e2e-cred-decrypt.json" ]; then
+        must_fail "varlinkctl Credentials.Decrypt" varlinkctl call \
+            /run/systemd/io.systemd.Credentials io.systemd.Credentials.Decrypt \
+            "$(cat "$home/e2e-cred-decrypt.json")"
+        must_fail "varlinkctl Manager.Reload" varlinkctl call \
+            /run/systemd/io.systemd.Manager io.systemd.Manager.Reload '{}'
+    else
+        echo "skip varlinkctl calls (no io.systemd.Credentials on this host)"
+    fi
+    must_fail_if systemd-dissect "systemd-dissect --mount (mountfsd)" \
+        systemd-dissect --mount --mkdir /usr/lib/os-release "$home/e2e-dissect"
+    # What stays: logging and name resolution.
+    [ -S /run/systemd/journal/socket ] && ok "journal socket reachable" \
+        || bad "journal socket reachable" "missing"
+
     # Identity: the submitter's uid and primary gid, no denied groups, no
     # privileges.
     [ "$(id -u)" = "$uid" ] && ok "uid" || bad "uid" "$(id -u) != $uid"

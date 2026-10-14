@@ -298,7 +298,8 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 - 所有者が root になれる場合でも、ジョブは root になることも root として操作することもできません。`no_new_privs`
   のもとでは setuid プログラム（`sudo`、`su`、`pkexec`）は権限を得られず、ジョブのユニットからはシステムの D-Bus
   に接続できないので、polkit のルールが所有者のグループに何を許していても `systemctl`、`run0`、`machinectl`
-  などの polkit で認可される操作はできません（`job_system_dbus = true` で解除できます）。root 相当のグループは
+  などの polkit で認可される操作はできません（`job_system_dbus = true` で解除できます）。`/run/systemd` の下の、
+  polkit で認可する systemd の Varlink サービスにも接続できません（`job_systemd_varlink`）。root 相当のグループは
   外され、開けるデバイスノードは割り当てた GPU のものだけです。リストアの後も同じです。
   [ジョブにできること・できないこと](docs/ja/install.md#what-a-job-can-and-cannot-do)を参照してください。
 - **所有者または管理者のみ：** ジョブの変更（`kill`、`pause`、`start`、`remove`、`checkpoint`、

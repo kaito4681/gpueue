@@ -354,25 +354,44 @@ fn check_gpu_isolation(config: &Config, nixos: bool) -> Check {
 /// `job_system_dbus`: whether jobs may reach the system D-Bus (systemd, polkit).
 fn check_job_system_dbus(config: &Config, nixos: bool) -> Check {
     const NAME: &str = "job d-bus";
-    if !config.job_system_dbus {
+    let open: Vec<&str> = [
+        ("job_system_dbus", config.job_system_dbus),
+        ("job_systemd_varlink", config.job_systemd_varlink),
+    ]
+    .into_iter()
+    .filter(|(_, on)| *on)
+    .map(|(key, _)| key)
+    .collect();
+    if open.is_empty() {
         return Check::ok(
             NAME,
-            "blocked: job units cannot reach the system D-Bus (no systemctl, run0, pkexec or \
-             other polkit-authorized actions from jobs)",
+            "blocked: jobs cannot reach the system D-Bus or systemd's Varlink services (no \
+             systemctl, run0, pkexec or other polkit-authorized actions from jobs)",
         );
     }
+    let keys = open
+        .iter()
+        .map(|k| format!("`{k} = true`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
     let how = if nixos {
-        format!("set `services.puzuz.settings.job_system_dbus = false`, then `{REBUILD}`")
+        format!("remove {keys} from `services.puzuz.settings`, then `{REBUILD}`")
     } else {
         format!(
-            "remove `job_system_dbus = true` from {DEFAULT_CONFIG_PATH} and \
+            "remove {keys} from {DEFAULT_CONFIG_PATH} and \
              `sudo systemctl restart {HELPER_UNIT}`"
         )
     };
     Check::warn(
         NAME,
-        "allowed (job_system_dbus = true): jobs can ask systemd and polkit for actions; \
-         polkit rules that trust a group apply to the jobs of its members",
+        format!(
+            "allowed ({}): jobs can ask systemd and polkit for actions; polkit rules that \
+             trust a group apply to the jobs of its members",
+            open.iter()
+                .map(|k| format!("{k} = true"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     )
     .hint(format!("unless jobs need it, {how}"))
 }

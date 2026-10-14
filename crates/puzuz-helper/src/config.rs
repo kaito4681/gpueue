@@ -172,9 +172,19 @@ impl HelperConfig {
             ),
             ..HelperConfig::default()
         };
+        use crate::jobs::{KEPT_VARLINK_COVERED, SYSTEM_BUS_SOCKETS};
         if file.job_system_dbus {
-            // Jobs may reach the system D-Bus: nothing is covered.
-            cfg.mounts.inaccessible.clear();
+            // Jobs may reach the system D-Bus.
+            cfg.mounts
+                .inaccessible
+                .retain(|p| !SYSTEM_BUS_SOCKETS.contains(&p.as_str()));
+        }
+        if file.job_systemd_varlink {
+            // Jobs may reach systemd's Varlink services: /run/systemd stays.
+            cfg.mounts.systemd_run_keep = None;
+            cfg.mounts
+                .inaccessible
+                .retain(|p| !KEPT_VARLINK_COVERED.contains(&p.as_str()));
         }
         let ck = &mut cfg.checkpoint;
         ck.mode = o.cuda_mode.unwrap_or(match file.cuda_checkpoint_mode {
@@ -422,10 +432,33 @@ mod tests {
         let r = HelperConfig::resolve(&file(""), Overrides::default());
         assert_eq!(
             r.config.mounts.inaccessible,
-            crate::jobs::SYSTEM_BUS_SOCKETS
+            [
+                "/run/dbus/system_bus_socket",
+                "/var/run/dbus/system_bus_socket",
+                "/run/systemd/resolve/io.systemd.Resolve.Monitor"
+            ]
         );
         let r = HelperConfig::resolve(&file("job_system_dbus = true\n"), Overrides::default());
-        assert!(r.config.mounts.inaccessible.is_empty());
+        assert_eq!(
+            r.config.mounts.inaccessible,
+            crate::jobs::KEPT_VARLINK_COVERED
+        );
+        assert!(r.config.mounts.systemd_run_keep.is_some());
+    }
+
+    #[test]
+    fn run_systemd_is_hidden_unless_allowed() {
+        let r = HelperConfig::resolve(&file(""), Overrides::default());
+        assert_eq!(
+            r.config.mounts.systemd_run_keep.as_deref(),
+            Some(&crate::jobs::SYSTEMD_RUN_KEEP.map(String::from)[..])
+        );
+        let r = HelperConfig::resolve(&file("job_systemd_varlink = true\n"), Overrides::default());
+        assert_eq!(r.config.mounts.systemd_run_keep, None);
+        assert_eq!(
+            r.config.mounts.inaccessible,
+            crate::jobs::SYSTEM_BUS_SOCKETS
+        );
     }
 
     #[test]

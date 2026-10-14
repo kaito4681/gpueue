@@ -833,6 +833,68 @@ fn setup_mounts(plan: &MountPlan) -> Result<(), String> {
         .map_err(|e| format!("mounting a tmpfs on {t}: {e}"))?;
     }
     cover_sockets(plan)?;
+    if let Some(keep) = &plan.systemd_run_keep {
+        mask_systemd_run(keep)?;
+    }
+    Ok(())
+}
+
+/// Hide `/run/systemd` behind an empty, root-owned tmpfs holding only the
+/// host's entries named in `keep` (bound from the host, where they are
+/// directories) and an empty `system` directory, so that nothing in the job
+/// reaches systemd's Varlink sockets (see [`MountPlan::systemd_run_keep`]).
+/// After [`cover_sockets`], which binds a node from
+/// `/run/systemd/inaccessible`. CRIU saves the tmpfs (its directories) in
+/// the image and binds the kept entries from the host again on restore.
+fn mask_systemd_run(keep: &[String]) -> Result<(), String> {
+    use rustix::fs::CWD;
+    use rustix::mount::{MoveMountFlags, OpenTreeFlags, move_mount, open_tree};
+    const DIR: &str = "/run/systemd";
+    if !std::fs::symlink_metadata(DIR).is_ok_and(|m| m.is_dir()) {
+        return Ok(());
+    }
+    // Copies of what stays, taken before the tmpfs covers them.
+    let mut kept = Vec::new();
+    for name in keep {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(format!("{DIR}: invalid entry to keep {name:?}"));
+        }
+        let path = format!("{DIR}/{name}");
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let copy = open_tree(
+            CWD,
+            path.as_str(),
+            OpenTreeFlags::OPEN_TREE_CLONE
+                | OpenTreeFlags::AT_RECURSIVE
+                | OpenTreeFlags::AT_SYMLINK_NOFOLLOW
+                | OpenTreeFlags::OPEN_TREE_CLOEXEC,
+        )
+        .map_err(|e| format!("copying {path}: {e}"))?;
+        kept.push((path, copy));
+    }
+    mount(
+        Some("tmpfs"),
+        DIR,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        Some("mode=0755,size=1m"),
+    )
+    .map_err(|e| format!("hiding {DIR}: {e}"))?;
+    // `sd_booted()` checks for this directory.
+    std::fs::create_dir(format!("{DIR}/system")).map_err(|e| format!("{DIR}/system: {e}"))?;
+    for (path, copy) in kept {
+        std::fs::create_dir(&path).map_err(|e| format!("{path}: {e}"))?;
+        move_mount(
+            &copy,
+            "",
+            CWD,
+            path.as_str(),
+            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+        )
+        .map_err(|e| format!("binding {path}: {e}"))?;
+    }
     Ok(())
 }
 
@@ -861,7 +923,7 @@ fn cover_sockets(plan: &MountPlan) -> Result<(), String> {
         if !std::fs::symlink_metadata(node).is_ok_and(|m| m.file_type().is_socket()) {
             return Err(format!(
                 "cannot cover {path}: {} is missing (it is created by systemd at boot); \
-                 set job_system_dbus = true to let jobs reach it",
+                 set job_system_dbus = true (or job_systemd_varlink = true) to let jobs reach it",
                 node.display()
             ));
         }

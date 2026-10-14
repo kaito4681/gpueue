@@ -291,7 +291,8 @@ columns, and `Checkpointed` jobs show the image size.
 - A job cannot become root or act as root, even when its owner can: setuid programs (`sudo`,
   `su`, `pkexec`) do not gain privileges under `no_new_privs`, the system D-Bus is inaccessible in
   job units (so no `systemctl`, `run0`, `machinectl` or other polkit-authorized action, whatever
-  the polkit rules grant the owner's groups; `job_system_dbus = true` lifts this), root-equivalent
+  the polkit rules grant the owner's groups; `job_system_dbus = true` lifts this), neither are
+  systemd's polkit-authorized Varlink services under `/run/systemd` (`job_systemd_varlink`), root-equivalent
   groups are left out, and only the assigned GPUs' device nodes can be opened. The same holds
   after a restore. See
   [What a job can and cannot do](docs/install.md#what-a-job-can-and-cannot-do).

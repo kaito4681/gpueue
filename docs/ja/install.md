@@ -1129,6 +1129,7 @@ sudo systemctl restart puzuz-helper.service puzuz.service
 | `fork_guard` | `true` | ヘルパー | ジョブに fork ガードをプリロードします（README の制限事項を参照） |
 | `gpu_device_isolation` | `true` | ヘルパー | 各ジョブのユニットが開けるデバイスノードを、割り当てた GPU のものに限ります（`DevicePolicy=closed`）。`false` で無効になります（[GPU の分離](#gpu-isolation) を参照） |
 | `job_system_dbus` | `false` | ヘルパー | `true` にするとジョブがシステムの D-Bus（systemd、polkit）に接続できます。デフォルトではジョブのユニットから接続できません（[ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)を参照） |
+| `job_systemd_varlink` | `false` | ヘルパー | `true` にするとジョブが `/run/systemd` の下にある systemd の Varlink サービスに接続できます。デフォルトでは `journal/`、`resolve/`、`userdb/` 以外のこのディレクトリをジョブから隠します（[ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)を参照） |
 | `job_min_uid` | `/etc/login.defs` の `UID_MIN`、なければ `1000` | ヘルパー | uid がこれより小さいユーザーのジョブを拒否します（[ジョブを実行できるユーザー](#who-jobs-may-run-as)を参照） |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | ヘルパー | root 相当のグループ。ジョブの補助グループから外し、プライマリグループがこれらのいずれかであるジョブは拒否します |
 | `job_allowed_users` | `[]`（全員） | ヘルパー | 空でなければ、ここに（名前で）挙げたユーザーだけがジョブを実行できます |
@@ -1213,15 +1214,19 @@ polkit が信頼するグループのメンバー）でも、ジョブがそれ�
 | ケーパビリティを持たず（`CapInh`、`CapPrm`、`CapEff`、`CapBnd`、`CapAmb` がすべて 0）、`NoNewPrivs: 1` | shim がコマンドを実行する前にバウンディングセットを空にし、`no_new_privs` を設定する | なし |
 | `sudo`、`su`、`pkexec` などの setuid やファイルケーパビリティのプログラムで権限を得られない | `no_new_privs` のもとではカーネルが setuid ビットとファイルケーパビリティを無視する | なし |
 | システムの D-Bus に接続できないので、`systemctl`、`run0`、`machinectl`、`busctl --system` など、systemd、polkit、システムサービスへの要求はできない | shim がジョブのマウント名前空間で `/run/dbus/system_bus_socket`（別のものなら `/var/run/...` も）の上に systemd の接続できないソケットノード（`/run/systemd/inaccessible/sock`）をバインドマウントし、リストアでは CRIU がこのマウントを作り直す。polkit はグループの所属をジョブのグループではなくユーザーデータベースから判断するので、グループを外すだけでは防げない | `job_system_dbus = true` |
+| systemd の Varlink サービス（`io.systemd.Manager` の reload と reexecute、`io.systemd.Credentials` のシステム資格情報の復号、mountfsd、nsresourced、machined、logind、networkd、sysupdate など）に接続できない。これらは D-Bus を通らずに polkit で一般ユーザーの呼び出しを認可する | shim が `/run/systemd` を空の tmpfs で隠し、ホストの `journal/`（ログ）、`resolve/`（名前解決。問い合わせを監視するソケットは塞ぐ）、`userdb/`（ユーザーの検索）と空の `system/` だけを残す。リストアでは CRIU がこれを保存して作り直す | `job_systemd_varlink = true` |
 | `docker`、`lxd`、`incus-admin`、`libvirt`、`disk`、`sudo`、`wheel`、`admin` のグループを持たない（root のデーモンのソケット、ブロックデバイスそのもの） | ヘルパーが補助グループから外す | `job_denied_groups` |
 | 標準の疑似デバイスと割り当てた GPU のもの以外のデバイスノードを開けない | `DevicePolicy=closed` と `DeviceAllow=`（[GPU の分離](#gpu-isolation)） | `gpu_device_isolation` |
 
-それぞれの切り替えは保証を 1 つ弱めます。`job_system_dbus = true` のときは `puzuz doctor` が警告します。
+それぞれの切り替えは保証を 1 つ弱めます。`job_system_dbus = true` か `job_systemd_varlink = true` のときは `puzuz doctor` が警告します。
 puzuz が制限しないもの：所有者の uid そのものにできること（ファイル、セッションバス経由のユーザーサービス、
 ネットワーク）、ジョブが使う CPU、メモリ、ディスクの量、自分で資格情報を確かめるほかのサービスのソケット
-（たとえば、どのユーザーにも許すデーモンのソケット）。新しい systemd の Varlink サービス
-（`/run/systemd/io.systemd.*`）には接続できます。ユーザーの代わりに操作するものは、polkit と呼び出し元の uid を
-自分で確かめます。
+（たとえば、どのユーザーにも許すデーモンのソケット）。`/run/systemd` の外にある root のソケットには接続できますが、
+一般ユーザーには何も許しません。`/run/systemd/private` と udev の `/run/udev/io.systemd.Udev` は root しか受け付けず
+（ソケットのモードは 0700 と 0644）、polkit の `/run/polkit/agent-helper.socket` はクライアントが D-Bus 経由で始めた
+polkit の認証を完了させるだけで（ジョブは D-Bus に接続できません）、システムバスはほかのアドレスでは待ち受けません
+（`<listen>unix:path=/run/dbus/system_bus_socket</listen>` だけ）。ジョブより後に起動した Varlink サービス（後から
+作られたソケット）はジョブから隠れません。
 
 <a id="priority-and-fair-share"></a>
 ## 優先度とフェアシェア

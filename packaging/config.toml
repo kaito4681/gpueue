@@ -88,6 +88,13 @@
 # whatever polkit rules allow the owner's groups.
 # job_system_dbus = false
 
+# [helper] Let jobs reach systemd's Varlink services. false (the default):
+# /run/systemd is hidden from jobs except journal/, resolve/ and userdb/, so
+# polkit-authorized Varlink methods (io.systemd.Manager reload/reexecute,
+# io.systemd.Credentials decryption, mountfsd, nsresourced, machined, ...)
+# are out of reach as well.
+# job_systemd_varlink = false
+
 # [helper] Deadline of a whole checkpoint (CUDA lock + checkpoint + criu dump)
 # or restore (criu restore + CUDA restore + unlock) of one job, in seconds:
 #   base + per_gib * GiB

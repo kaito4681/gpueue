@@ -276,7 +276,8 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   见 [谁可以运行作业](docs/zh-CN/install.md#who-jobs-may-run-as)。
 - 即使所有者可以成为 root，作业也无法成为 root 或以 root 身份操作：在 `no_new_privs` 下 setuid 程序（`sudo`、
   `su`、`pkexec`）无法获得特权；作业单元无法访问系统 D-Bus，因此无论 polkit 规则授予所有者的组什么权限，
-  都无法执行 `systemctl`、`run0`、`machinectl` 或其他经 polkit 授权的操作（`job_system_dbus = true` 可解除）；
+  都无法执行 `systemctl`、`run0`、`machinectl` 或其他经 polkit 授权的操作（`job_system_dbus = true` 可解除），
+  也无法访问 `/run/systemd` 下经 polkit 授权的 systemd Varlink 服务（`job_systemd_varlink`）；
   等同 root 的组会被去掉；只能打开所分配 GPU 的设备节点。恢复之后同样如此。见
   [作业能做什么、不能做什么](docs/zh-CN/install.md#what-a-job-can-and-cannot-do)。
 - **仅限所有者或管理员：** 更改作业（`kill`、`pause`、`start`、`remove`、

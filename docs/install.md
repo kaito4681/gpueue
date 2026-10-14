@@ -1121,6 +1121,7 @@ Every `*_secs` key is at most one year (31536000).
 | `fork_guard` | `true` | helper | preload the fork guard into jobs (see the README's limitations) |
 | `gpu_device_isolation` | `true` | helper | each job unit may open only its assigned GPUs' device nodes (`DevicePolicy=closed`); `false` turns this off (see [GPU isolation](#gpu-isolation)) |
 | `job_system_dbus` | `false` | helper | `true` lets jobs reach the system D-Bus (systemd, polkit); by default it is inaccessible in job units (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
+| `job_systemd_varlink` | `false` | helper | `true` lets jobs reach systemd's Varlink services under `/run/systemd`; by default the directory is hidden from jobs except `journal/`, `resolve/` and `userdb/` (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_min_uid` | `UID_MIN` of `/etc/login.defs`, else `1000` | helper | jobs of users with a smaller uid are refused (see [Who jobs may run as](#who-jobs-may-run-as)) |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | helper | root-equivalent groups: dropped from jobs' supplementary groups; a job whose primary group is one of them is refused |
 | `job_allowed_users` | `[]` (everyone) | helper | if not empty, only these users (by name) may run jobs |
@@ -1207,15 +1208,20 @@ and after a checkpoint and restore.
 | has no capabilities (`CapInh`, `CapPrm`, `CapEff`, `CapBnd` and `CapAmb` are all 0) and `NoNewPrivs: 1` | the shim empties the bounding set and sets `no_new_privs` before it runs the command | none |
 | cannot gain privileges with `sudo`, `su`, `pkexec` or any other setuid or file-capability program | `no_new_privs` makes the kernel ignore setuid bits and file capabilities | none |
 | cannot reach the system D-Bus, so no `systemctl`, `run0`, `machinectl`, `busctl --system` or other request to systemd, polkit or system services | the shim bind-mounts systemd's inaccessible socket node (`/run/systemd/inaccessible/sock`) over `/run/dbus/system_bus_socket` (also `/var/run/...` if separate) in the job's mount namespace, and CRIU recreates that mount on restore; polkit takes group membership from the user database, not from the job's groups, so dropping groups alone would not stop it | `job_system_dbus = true` |
+| cannot reach systemd's Varlink services (`io.systemd.Manager` reload and reexecute, `io.systemd.Credentials` decryption of system credentials, mountfsd, nsresourced, machined, logind, networkd, sysupdate, ...), which authorize unprivileged callers through polkit without D-Bus | the shim hides `/run/systemd` behind an empty tmpfs that keeps only the host's `journal/` (logging), `resolve/` (name resolution; its query monitor socket is covered) and `userdb/` (user lookups), plus an empty `system/`; CRIU saves and recreates this on restore | `job_systemd_varlink = true` |
 | does not have the groups `docker`, `lxd`, `incus-admin`, `libvirt`, `disk`, `sudo`, `wheel`, `admin` (root daemons' sockets, raw block devices) | the helper drops them from the supplementary groups | `job_denied_groups` |
 | cannot open device nodes except the standard pseudo devices and its assigned GPUs' | `DevicePolicy=closed` with `DeviceAllow=` ([GPU isolation](#gpu-isolation)) | `gpu_device_isolation` |
 
-Each switch weakens one guarantee; `puzuz doctor` warns when `job_system_dbus = true`. What puzuz
+Each switch weakens one guarantee; `puzuz doctor` warns when `job_system_dbus = true` or `job_systemd_varlink = true`. What puzuz
 does not limit: whatever the owner's uid itself may do (files, user services over the session bus,
 network access), the amount of CPU, memory or disk a job uses, and sockets of other services
 that check credentials on their own (for example a daemon socket that allows any user).
-Varlink services of newer systemd versions (`/run/systemd/io.systemd.*`) remain reachable; those
-that act on a user's behalf check polkit and the caller's uid themselves.
+Other root sockets outside `/run/systemd` stay reachable but do not grant anything to an
+unprivileged caller: `/run/systemd/private` and udev's `/run/udev/io.systemd.Udev` only accept
+root (socket modes 0700 and 0644), polkit's `/run/polkit/agent-helper.socket` only completes a
+polkit authentication that a client started over D-Bus (which a job cannot reach), and the system
+bus listens on no other address (`<listen>unix:path=/run/dbus/system_bus_socket</listen>` only).
+A Varlink service started after the job (its socket created later) is not hidden from it.
 
 ## Priority and fair share
 

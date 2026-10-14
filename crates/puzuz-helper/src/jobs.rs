@@ -119,7 +119,28 @@ pub struct MountPlan {
     /// exists on every systemd host, also after a reboot).
     #[serde(default)]
     pub inaccessible: Vec<String>,
+    /// `Some`: hide `/run/systemd` behind an empty tmpfs that holds only
+    /// these entries of the host's (bound from it, where they exist) and
+    /// an empty `system` directory (`sd_booted()`), so that a job cannot
+    /// reach systemd's Varlink services (`io.systemd.Manager`,
+    /// `io.systemd.Credentials`, mountfsd, nsresourced, machined, logind,
+    /// networkd, ...). They authorize unprivileged callers through polkit,
+    /// which takes group membership from the user database, and they do
+    /// not go through the D-Bus socket. Kept by default: `journal`
+    /// (logging), `resolve` (name resolution, `/etc/resolv.conf`),
+    /// `userdb` (user and group lookups). `None` with
+    /// `job_systemd_varlink = true`.
+    #[serde(default)]
+    pub systemd_run_keep: Option<Vec<String>>,
 }
+
+/// What [`MountPlan::systemd_run_keep`] keeps by default.
+pub const SYSTEMD_RUN_KEEP: [&str; 3] = ["journal", "resolve", "userdb"];
+
+/// Varlink sockets inside the kept entries that are covered as well
+/// (with `job_systemd_varlink = false`): resolved's query monitor, which
+/// shows every name the host resolves to callers polkit lets in.
+pub const KEPT_VARLINK_COVERED: [&str; 1] = ["/run/systemd/resolve/io.systemd.Resolve.Monitor"];
 
 /// Mode-0000 socket node that systemd (PID 1) creates at boot for
 /// `InaccessiblePaths=`; bound over a socket, `connect` fails with
@@ -146,7 +167,12 @@ impl Default for MountPlan {
             prune: vec!["/run/".into(), "/media/".into(), "/dev/shm".into()],
             keep: vec!["/run/nvidia-persistenced".into()],
             tmpfs: vec!["/tmp".into(), "/dev/shm".into()],
-            inaccessible: SYSTEM_BUS_SOCKETS.iter().map(|p| (*p).to_owned()).collect(),
+            inaccessible: SYSTEM_BUS_SOCKETS
+                .iter()
+                .chain(&KEPT_VARLINK_COVERED)
+                .map(|p| (*p).to_owned())
+                .collect(),
+            systemd_run_keep: Some(SYSTEMD_RUN_KEEP.iter().map(|p| (*p).to_owned()).collect()),
         }
     }
 }

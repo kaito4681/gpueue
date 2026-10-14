@@ -557,6 +557,14 @@ fn job_system_dbus_is_shown() {
     let report = run(&sys, None);
     assert_eq!(level(&report, "job d-bus"), Level::Warn);
     assert!(hint(&report, "job d-bus").contains("job_system_dbus = true"));
+
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!("job_systemd_varlink = true\n{CONFIG}"),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job d-bus"), Level::Warn);
+    assert!(message(&report, "job d-bus").contains("job_systemd_varlink = true"));
 }
 
 #[test]

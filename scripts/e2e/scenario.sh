@@ -1154,6 +1154,29 @@ EOF
         echo "SKIP: no polkit in the image (no control for the D-Bus checks)"
     fi
 
+    # systemd's Varlink services: every socket under /run/systemd except
+    # journal/, resolve/ and userdb/ must be out of a job's reach; two
+    # polkit-authorized calls are shown to work for eve outside puzuz.
+    find /run/systemd -type s \
+        -not -path '/run/systemd/journal/*' -not -path '/run/systemd/resolve/*' \
+        -not -path '/run/systemd/userdb/*' >/home/eve/e2e-varlink-sockets
+    echo "Varlink and other sockets under /run/systemd: $(tr '\n' ' ' </home/eve/e2e-varlink-sockets)"
+    rm -f /home/eve/e2e-cred-decrypt.json
+    if command -v varlinkctl >/dev/null && [ -S /run/systemd/io.systemd.Credentials ] \
+        && [ -d /etc/polkit-1/rules.d ]; then
+        out=$(varlinkctl call /run/systemd/io.systemd.Credentials io.systemd.Credentials.Encrypt \
+            '{"name":"e2e","text":"secret","scope":"system"}') || fail "encrypting a credential"
+        python3 -c 'import json, sys; b = json.loads(sys.argv[1])["blob"]; print(json.dumps({"name": "e2e", "blob": b, "scope": "system"}))' \
+            "$out" >/home/eve/e2e-cred-decrypt.json
+        runuser -u eve -- varlinkctl call /run/systemd/io.systemd.Credentials \
+            io.systemd.Credentials.Decrypt "$(cat /home/eve/e2e-cred-decrypt.json)" \
+            || fail "the polkit rule does not let eve decrypt system credentials outside puzuz"
+        echo "control: eve can decrypt system credentials through Varlink and polkit outside puzuz"
+    else
+        echo "SKIP: no io.systemd.Credentials or polkit (no Varlink control)"
+    fi
+    chown eve: /home/eve/e2e-varlink-sockets /home/eve/e2e-cred-decrypt.json 2>/dev/null || true
+
     # A root daemon socket of group docker.
     rm -f "$E2E_DOCKER_SOCK"
     python3 -c '
@@ -1217,6 +1240,14 @@ while True:
     if command -v run0 >/dev/null; then
         [ "$(grep -cx 'ok run0 true' <<<"$log")" = 2 ] || fail "the run0 check did not run twice"
     fi
+    if [ -s /home/eve/e2e-cred-decrypt.json ]; then
+        for r in "varlinkctl Credentials.Decrypt" "varlinkctl Manager.Reload"; do
+            [ "$(grep -cx "ok $r" <<<"$log")" = 2 ] || fail "check '$r' did not pass in both rounds"
+        done
+    fi
+    [ "$(grep -cx 'ok journal socket reachable' <<<"$log")" = 2 ] || fail "the journal socket is gone in the job"
+    [ "$(grep -c '^ok connect to /run/systemd/' <<<"$log")" = $((2 * $(grep -c . /home/eve/e2e-varlink-sockets))) ] \
+        || fail "not every Varlink socket was tried and refused in both rounds"
     [ ! -e /run/e2e-escalated ] || fail "a job started the root-only unit"
 
     kill %1 2>/dev/null || true
