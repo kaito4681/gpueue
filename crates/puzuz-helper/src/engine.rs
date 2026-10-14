@@ -1640,25 +1640,28 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
 
     /// What [`crate::access::run_restore_hook`] found: `Ok` only if it ran
     /// and found nothing.
-    fn restore_check_outcome(files: &JobFiles) -> Result<(), String> {
+    fn restore_check_outcome(files: &JobFiles) -> Result<(), RestoreCheckError> {
         let result = crate::access::hook_result_path(&files.dir().join(RESTORE_CHECK_FILE));
-        let reply: crate::access::VerifyReply = fs::read(&result)
-            .map_err(|e| format!("the check of the restored job did not run ({e})"))
-            .and_then(|b| {
-                serde_json::from_slice(&b).map_err(|e| format!("reading its result: {e}"))
-            })?;
+        let bytes = fs::read(&result).map_err(|e| {
+            RestoreCheckError::NotRun(format!("the check of the restored job did not run ({e})"))
+        })?;
+        let reply: crate::access::VerifyReply = serde_json::from_slice(&bytes).map_err(|e| {
+            RestoreCheckError::Failed(format!(
+                "reading the result of the check of the restored job failed: {e}"
+            ))
+        })?;
         match reply {
             Ok(problems) if problems.is_empty() => Ok(()),
-            Ok(problems) => Err(format!(
+            Ok(problems) => Err(RestoreCheckError::Refused(format!(
                 "the restored job would have files or credentials its owner may not have \
                  (paths or groups changed since the checkpoint?); it was killed before it ran \
                  and the image is kept: {}",
                 problems.join("; ")
-            )),
-            Err(e) => Err(format!(
+            ))),
+            Err(e) => Err(RestoreCheckError::Failed(format!(
                 "checking the restored job failed; it was killed before it ran and the image \
                  is kept: {e}"
-            )),
+            ))),
         }
     }
 
@@ -1775,8 +1778,10 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 // Refused by the check of the restored tasks, or another
                 // failure of criu.
                 let reason = match Self::restore_check_outcome(&files) {
-                    Err(reason) if !reason.contains("did not run") => reason,
-                    _ => {
+                    Err(RestoreCheckError::Refused(reason) | RestoreCheckError::Failed(reason)) => {
+                        reason
+                    }
+                    Ok(()) | Err(RestoreCheckError::NotRun(_)) => {
                         let summary = fs::read_to_string(dir.restore_log())
                             .map(|l| probe::summarize_criu_log(&l, 5).join("; "))
                             .unwrap_or_default();
@@ -1789,7 +1794,8 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
 
         // CRIU only resumes the tasks when the hook succeeded; make sure it
         // did run.
-        if let Err(reason) = Self::restore_check_outcome(&files) {
+        if let Err(e) = Self::restore_check_outcome(&files) {
+            let reason = e.into_reason();
             eprintln!(
                 "puzuz-helper: refusing the restore of job {}: {reason}",
                 job.0
@@ -2387,6 +2393,26 @@ fn unfinalized_reason(dir: &CheckpointDir, error: &str) -> String {
          helper starts again",
         dir.root().display()
     )
+}
+
+/// Why the check of restored tasks (see [`crate::access::run_restore_hook`])
+/// did not pass. Each holds the reason reported for the restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestoreCheckError {
+    /// It left no result: CRIU did not get as far as running it.
+    NotRun(String),
+    /// It found files or credentials the owner may not have.
+    Refused(String),
+    /// It ran but could not check, or its result is unreadable.
+    Failed(String),
+}
+
+impl RestoreCheckError {
+    fn into_reason(self) -> String {
+        match self {
+            Self::NotRun(r) | Self::Refused(r) | Self::Failed(r) => r,
+        }
+    }
 }
 
 /// Whether a job was restored from the image in `dir`: `criu restore`

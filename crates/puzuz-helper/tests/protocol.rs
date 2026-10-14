@@ -907,6 +907,37 @@ async fn a_restored_job_holding_files_its_owner_may_not_open_is_killed() {
     ));
 }
 
+/// A refusal of the check of the restored tasks is reported as such,
+/// whatever its text says (here a path that reads like "the check did not
+/// run"), not as a failure of criu.
+#[tokio::test]
+async fn a_refused_restore_reports_the_refusal_whatever_it_says() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 3).await;
+    env.launcher.set_restore_check_problems(vec![
+        "fd 3 of process 4242 (/srv/the check did not run): its owner may not read it".into(),
+    ]);
+    assert_eq!(
+        c.request(restore_req(3, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+    let ev = c.event().await;
+    let Event::RestoreFinished {
+        outcome: RestoreOutcome::Failed { reason, .. },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert!(
+        reason.contains("files or credentials its owner may not have"),
+        "{reason}"
+    );
+    assert!(reason.contains("/srv/the check did not run"), "{reason}");
+    assert!(!reason.contains("criu restore failed"), "{reason}");
+}
+
 /// A tiny `files.img` with the given regular file paths and bound socket
 /// paths (see `puzuz_helper::images`).
 fn files_image(files: &[&str], sockets: &[&str]) -> Vec<u8> {
