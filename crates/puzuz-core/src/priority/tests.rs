@@ -392,6 +392,33 @@ fn top_moves_jobs_to_the_front_of_the_owners_queue() {
 }
 
 #[test]
+fn ineligible_jobs_take_no_age_from_runnable_ones() {
+    let env = Env::new(only("age", 1000));
+    // Job 1 waits for a dependency (not eligible) but comes first in its
+    // owner's order (-o 10); job 2 can start. Job 2 keeps its own age.
+    let mut blocked = queued_at(job(1, 1), NOW - 7 * DAY / 2);
+    blocked.spec.priority = 10;
+    let runnable = queued_at(job(2, 1), NOW - 7 * DAY / 4);
+    let refs = [&blocked, &runnable];
+    let ctx = Context {
+        params: &env.params,
+        now: NOW,
+        fairshare: &env.fairshare,
+        groups: &env.groups,
+        resources: env.resources,
+    };
+    let p = prioritize(&refs, &ctx, |job| match (job.id.0, &job.state) {
+        (1, _) => None,
+        (_, JobState::Queued { enqueued_at }) => Some(*enqueued_at),
+        _ => None,
+    });
+    let of = |id| p.iter().find(|p| p.id.0 == id).unwrap();
+    assert!(close(of(1).factors.age, 0.0));
+    assert!(close(of(2).factors.age, 0.25));
+    assert_eq!(p[0].id, JobId(2));
+}
+
+#[test]
 fn equal_priorities_follow_the_owners_order_then_id() {
     // Everything aged out: totals tie.
     let env = Env::new(Params::default());
@@ -515,41 +542,53 @@ fn running(id: u64, owner: u32, started: Timestamp, gpus: &[u32]) -> Job {
 }
 
 #[test]
-fn usage_charges_running_and_recently_finished_jobs() {
-    let w = TresWeights::parse("CPU=1.0,GRES/gpu=10.0").unwrap();
-    let since = NOW - 300_000;
-    let mut finished = running(3, 2, since - 1000, &[0]);
-    finished.state = JobState::Done {
+fn only_running_time_is_charged() {
+    use JobState::*;
+    let done = Done {
         result: JobResult::Success,
     };
-    finished.finished_at = Some(since + 60_000);
-    let mut old = finished.clone();
-    old.id = JobId(4);
-    old.finished_at = Some(since - 1);
-    let mut paused = running(5, 2, since - 1000, &[0]);
-    paused.state = JobState::Paused;
-    let mut checkpointed = running(6, 2, since - 1000, &[0]);
-    checkpointed.state = JobState::Checkpointed;
-    let jobs = [
-        // The whole period: (1 + 2 × 10) × 300 s.
-        running(1, 1, since - 1000, &[0, 1]),
-        // Started in the middle: 1 × 100 s.
-        running(2, 1, NOW - 100_000, &[]),
-        // Finished after 60 s: 11 × 60 s.
-        finished,
-        old,
-        paused,
-        checkpointed,
-    ];
-    let charges = usage_charges(since, NOW, 600_000, &jobs, &w);
+    let queued = Queued { enqueued_at: 0 };
+    // Entering and leaving Running is all that matters.
+    assert_eq!(run_change(&queued, &Running), RunChange::Start);
+    assert_eq!(run_change(&Restoring, &Running), RunChange::Start);
+    assert_eq!(run_change(&Paused, &Running), RunChange::Start);
+    assert_eq!(run_change(&Checkpointing, &Running), RunChange::Start);
+    assert_eq!(run_change(&Running, &Paused), RunChange::Stop);
+    assert_eq!(run_change(&Running, &Checkpointing), RunChange::Stop);
+    assert_eq!(run_change(&Running, &done), RunChange::Stop);
+    // A job killed while checkpointed (or restore-queued) did not run.
+    assert_eq!(run_change(&Checkpointed, &done), RunChange::None);
+    assert_eq!(
+        run_change(&RestoreQueued { enqueued_at: 0 }, &done),
+        RunChange::None
+    );
+    assert_eq!(run_change(&Checkpointing, &Checkpointed), RunChange::None);
+    assert_eq!(run_change(&Paused, &done), RunChange::None);
+    assert_eq!(run_change(&Running, &Running), RunChange::None);
+}
+
+#[test]
+fn running_charges_bill_billing_times_seconds() {
+    let w = TresWeights::parse("CPU=1.0,GRES/gpu=10.0").unwrap();
+    let a = running(1, 1, 0, &[0, 1]);
+    let b = running(2, 1, 0, &[]);
+    let c = running(3, 2, 0, &[0]);
+    let charges = running_charges(
+        NOW,
+        600_000,
+        &[(&a, NOW - 300_000), (&b, NOW - 100_000), (&c, NOW - 60_000)],
+        &w,
+    );
+    // (1 + 2 × 10) × 300 s + 1 × 100 s; 11 × 60 s.
     assert!(close(charges[&Uid(1)], 21.0 * 300.0 + 100.0));
     assert!(close(charges[&Uid(2)], 11.0 * 60.0));
-    assert_eq!(charges.len(), 2);
-
-    // At most `max_ms` per job.
-    let long = [running(1, 1, NOW - DAY, &[0, 1])];
-    let charges = usage_charges(NOW - DAY, NOW, 600_000, &long, &w);
-    assert!(close(charges[&Uid(1)], 21.0 * 600.0));
+    // At most `max_ms`; nothing for a time in the future.
+    assert!(close(
+        run_charge(&a, NOW - DAY, NOW, 600_000, &w),
+        21.0 * 600.0
+    ));
+    assert!(close(run_charge(&a, NOW + 1, NOW, 600_000, &w), 0.0));
+    assert!(running_charges(NOW, 600_000, &[(&a, NOW)], &w).is_empty());
 }
 
 #[test]

@@ -44,8 +44,10 @@
 //! owner's order is: jobs moved to the top first (most recent `top` first),
 //! then higher `-o` priority, then lower id ([`owner_order`]).
 //!
-//! It is applied through the age factor: the ages of a user's pending jobs
-//! are handed out in the owner's order, oldest age to the first job. The
+//! It is applied through the age factor: the ages of a user's eligible
+//! pending jobs (those whose dependencies are done) are handed out in the
+//! owner's order, oldest age to the first job; jobs that cannot start yet
+//! keep an age of 0 and take no age from runnable jobs. The
 //! sum of the user's priorities is unchanged, so other users are not
 //! affected, and among jobs of one user that differ in nothing else (the
 //! common case: same group, no nice or site factor, job size not weighted)
@@ -417,11 +419,20 @@ pub fn prioritize(
     let mut age: HashMap<JobId, f64> = HashMap::with_capacity(candidates.len());
     let mut rank: HashMap<JobId, usize> = HashMap::with_capacity(candidates.len());
     for jobs in by_owner.values_mut() {
-        let mut ages: Vec<f64> = jobs.iter().map(|job| age_of(job)).collect();
-        ages.sort_by(|a, b| b.total_cmp(a));
         jobs.sort_by(|a, b| owner_order(a, b));
-        for (i, (job, age_value)) in jobs.iter().zip(ages).enumerate() {
+        // Only eligible jobs trade ages; the others stay at 0.
+        let eligible: Vec<&Job> = jobs
+            .iter()
+            .copied()
+            .filter(|job| eligible_since(job).is_some())
+            .collect();
+        let mut ages: Vec<f64> = eligible.iter().map(|job| age_of(job)).collect();
+        ages.sort_by(|a, b| b.total_cmp(a));
+        for (job, age_value) in eligible.iter().zip(ages) {
             age.insert(job.id, age_value);
+        }
+        for (i, job) in jobs.iter().enumerate() {
+            age.entry(job.id).or_insert(0.0);
             rank.insert(job.id, i);
         }
     }
@@ -609,38 +620,54 @@ pub fn billing(job: &Job, weights: &TresWeights) -> f64 {
     weights.cpu * CPUS_PER_JOB as f64 + weights.gpu * gpu_count(job) as f64
 }
 
-/// The usage (billing × seconds) to charge per user for the interval from
-/// `since` to `now`: every `Running` job for the time it ran in the
-/// interval, and every job that finished in it (`Done` with a
-/// `finished_at` after `since`) up to its end. Paused, checkpointed and other jobs are not
-/// charged. No job is charged for more than `max_ms`, so time the daemon
-/// was not running is not billed.
-pub fn usage_charges(
+/// How a state change affects usage accounting: only `Running` time is
+/// billed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunChange {
+    /// The job starts running (spawned, restored, resumed): its uncharged
+    /// run time starts counting now.
+    Start,
+    /// The job stops running (paused, checkpointing, exited, killed, lost):
+    /// the time since it was last charged is charged now.
+    Stop,
+    /// Neither.
+    None,
+}
+
+/// What the state change from `old` to `new` means for accounting.
+pub fn run_change(old: &JobState, new: &JobState) -> RunChange {
+    match (*old == JobState::Running, *new == JobState::Running) {
+        (false, true) => RunChange::Start,
+        (true, false) => RunChange::Stop,
+        _ => RunChange::None,
+    }
+}
+
+/// The usage (billing × seconds) of `job` running from `since` to `until`,
+/// at most `max_ms`: a job whose uncharged run time is older than that
+/// (the daemon was not running) is not billed for the rest.
+pub fn run_charge(
+    job: &Job,
     since: Timestamp,
+    until: Timestamp,
+    max_ms: i64,
+    weights: &TresWeights,
+) -> f64 {
+    let ms = (until - since).clamp(0, max_ms.max(0));
+    billing(job, weights) * ms as f64 / 1000.0
+}
+
+/// The usage to charge per user at `now` for running jobs, each given with
+/// when it was last charged (or started running); see [`run_charge`].
+pub fn running_charges(
     now: Timestamp,
     max_ms: i64,
-    jobs: &[Job],
+    running: &[(&Job, Timestamp)],
     weights: &TresWeights,
 ) -> BTreeMap<Uid, f64> {
     let mut out: BTreeMap<Uid, f64> = BTreeMap::new();
-    for job in jobs {
-        let end = match &job.state {
-            JobState::Running => now,
-            JobState::Done { .. } => match job.finished_at {
-                Some(at) if at > since => at.min(now),
-                _ => continue,
-            },
-            _ => continue,
-        };
-        let Some(started) = job.started_at else {
-            continue;
-        };
-        let start = started.max(since);
-        let ms = (end - start).clamp(0, max_ms.max(0));
-        if ms == 0 {
-            continue;
-        }
-        let charge = billing(job, weights) * ms as f64 / 1000.0;
+    for (job, since) in running {
+        let charge = run_charge(job, *since, now, max_ms, weights);
         if charge > 0.0 {
             *out.entry(job.owner).or_default() += charge;
         }

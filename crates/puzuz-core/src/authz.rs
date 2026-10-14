@@ -68,31 +68,52 @@ pub enum AdminOperation {
     SetGroupPriority,
     /// `site`: a job's site factor.
     SetSiteFactor,
-    /// A negative nice value (raising a job's priority), see
-    /// [`require_nice`].
-    NegativeNice,
+}
+
+/// Whether `caller` may change a nice value from `current` to `nice` (a
+/// new job starts at 0). As in Slurm, users may only raise it (lowering
+/// their own priority), never below 0; administrators may set any value.
+pub fn require_nice_value(caller: &Caller, current: i32, nice: i32) -> Result<(), Error> {
+    if caller.is_admin {
+        return Ok(());
+    }
+    if nice < 0 {
+        return Err(Error::Forbidden(
+            "only administrators may set a negative nice value".to_owned(),
+        ));
+    }
+    if nice < current {
+        return Err(Error::Forbidden(format!(
+            "only administrators may lower a nice value (it is {current})"
+        )));
+    }
+    Ok(())
 }
 
 /// Whether `caller` may set `job`'s nice value to `nice`: the owner may
-/// set values `>= 0` (lowering the priority, as with Slurm's `--nice`);
-/// administrators may set any value on any job.
+/// raise it ([`require_nice_value`]); administrators may set any value on
+/// any job.
 pub fn require_nice(caller: &Caller, job: &Job, nice: i32) -> Result<(), Error> {
     require_mutate(caller, job)?;
-    if nice < 0 {
-        require_admin_for(caller, AdminOperation::NegativeNice)?;
-    }
-    Ok(())
+    require_nice_value(caller, job.spec.nice, nice)
 }
 
 /// Whether `caller` may move `job` to the top of its owner's queue (`puzuz
 /// top`, Slurm's `scontrol top`): administrators always, the owner when
 /// `enable_user_top` is set.
 pub fn require_top(caller: &Caller, job: &Job, enable_user_top: bool) -> Result<(), Error> {
-    if caller.is_admin || (enable_user_top && caller.uid == job.owner) {
-        Ok(())
-    } else {
-        Err(Error::PermissionDenied)
+    if caller.is_admin {
+        return Ok(());
     }
+    if caller.uid != job.owner {
+        return Err(Error::PermissionDenied);
+    }
+    if !enable_user_top {
+        return Err(Error::Forbidden(
+            "moving jobs to the top is disabled for users (enable_user_top = false)".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn require_admin(caller: &Caller) -> Result<(), Error> {
@@ -459,10 +480,21 @@ mod tests {
         // The owner may only lower the priority.
         assert!(require_nice(&user(OWNER), &j, 0).is_ok());
         assert!(require_nice(&user(OWNER), &j, 100).is_ok());
-        assert_eq!(
+        assert!(matches!(
             require_nice(&user(OWNER), &j, -1),
-            Err(Error::PermissionDenied)
-        );
+            Err(Error::Forbidden(m)) if m.contains("negative")
+        ));
+        // ... and not undo a nice value an administrator set.
+        let mut niced = j.clone();
+        niced.spec.nice = 10_000;
+        assert!(matches!(
+            require_nice(&user(OWNER), &niced, 0),
+            Err(Error::Forbidden(m)) if m.contains("10000")
+        ));
+        assert!(require_nice(&user(OWNER), &niced, 10_000).is_ok());
+        assert!(require_nice(&user(OWNER), &niced, 20_000).is_ok());
+        assert!(require_nice(&admin(), &niced, 0).is_ok());
+        assert!(require_nice_value(&user(OWNER), 0, 5).is_ok());
         // Others may not touch it at all.
         assert_eq!(
             require_nice(&user(OTHER), &j, 5),
@@ -476,10 +508,10 @@ mod tests {
     fn top_rules() {
         let j = job(JobState::Queued { enqueued_at: 0 });
         assert!(require_top(&user(OWNER), &j, true).is_ok());
-        assert_eq!(
+        assert!(matches!(
             require_top(&user(OWNER), &j, false),
-            Err(Error::PermissionDenied)
-        );
+            Err(Error::Forbidden(m)) if m.contains("enable_user_top")
+        ));
         assert_eq!(
             require_top(&user(OTHER), &j, true),
             Err(Error::PermissionDenied)

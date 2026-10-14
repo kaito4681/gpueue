@@ -114,7 +114,7 @@ impl From<puzuz_core::Error> for ApiError {
             E::JobNotFound(_) => ErrorCode::JobNotFound,
             E::GroupNotFound(_) => ErrorCode::GroupNotFound,
             E::GpuNotFound(_) => ErrorCode::GpuNotFound,
-            E::PermissionDenied => ErrorCode::PermissionDenied,
+            E::PermissionDenied | E::Forbidden(_) => ErrorCode::PermissionDenied,
             E::InvalidTransition { .. } => ErrorCode::InvalidState,
             // puzuz-core may grow variants (e.g. storage errors) before this
             // mapping is updated.
