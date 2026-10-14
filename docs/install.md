@@ -1725,7 +1725,9 @@ runs it. `--purge` asks for confirmation on the terminal. When there is no termi
 - `--purge` asks for confirmation (`-y/--yes` skips it). It does not descend into mount points
   (for example the bind mount of `/` below `/run/puzuz-helper`). Those are reported for you to
   unmount and delete by hand. A purge directory that is itself a mount point (for example
-  `/var/lib/puzuz` on its own filesystem) is emptied and kept. The deletion never follows
+  `/var/lib/puzuz` on its own filesystem) is emptied and kept. A directory that is not empty any
+  more when it is to be removed (a user's log directory a running process keeps writing to) is
+  kept and reported too, and the other directories are still deleted. The deletion never follows
   symlinks, including ones users place in their log directories.
 - The system user `puzuz` and the group `puzuz-admin` are always kept.
 

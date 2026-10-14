@@ -1250,6 +1250,61 @@ fn purge_reports_a_purge_directory_that_is_a_mount_point_as_kept() {
 }
 
 #[test]
+fn purge_keeps_a_user_directory_that_fills_up_again_and_goes_on() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write("/var/lib/puzuz/daemon/state.sqlite", "db");
+    sys.write("/var/lib/puzuz/logs/1000/7.log", "log");
+    sys.write("/var/lib/puzuz/logs/1001/8.log", "log");
+    sys.write("/run/puzuz/puzuz.sock", "");
+    sys.write("/run/puzuz-helper/helper.sock", "");
+    // The user writes a new log after their directory was emptied, before it is removed.
+    let racing = sys.path(Path::new("/var/lib/puzuz/logs/1000/9.log"));
+    let raced = std::cell::Cell::new(false);
+    let remove = |parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr| {
+        if name == "1000" && !raced.replace(true) {
+            std::fs::write(&racing, "new log").unwrap();
+        }
+        remove_dir(parent, name)
+    };
+    let mut out = Vec::new();
+    purge(&sys, &remove, &mut out).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(raced.get());
+    assert!(
+        out.contains(
+            "kept /var/lib/puzuz/logs/1000 (files were added to it while it was deleted; delete \
+             it by hand)"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("kept /var/lib/puzuz (deleted what could be deleted; see above)"),
+        "{out}"
+    );
+    assert_eq!(
+        sys.read("/var/lib/puzuz/logs/1000/9.log").unwrap(),
+        "new log"
+    );
+    assert!(!sys.exists("/var/lib/puzuz/logs/1000/7.log"));
+    assert!(!sys.exists("/var/lib/puzuz/logs/1001"));
+    assert!(!sys.exists("/var/lib/puzuz/daemon"));
+    // The other purge directories are deleted all the same.
+    for dir in ["/etc/puzuz", "/run/puzuz", "/run/puzuz-helper"] {
+        assert!(out.contains(&format!("removed {dir}\n")), "{out}");
+        assert!(!sys.exists(dir), "{dir}");
+    }
+
+    // Another error still stops the purge.
+    sys.write("/var/lib/puzuz/logs/1000/9.log", "log");
+    sys.write("/etc/puzuz/config.toml", "");
+    let failing = |_: &std::os::fd::OwnedFd, _: &std::ffi::OsStr| Err(nix::errno::Errno::EIO);
+    let err = purge(&sys, &failing, &mut Vec::new()).unwrap_err();
+    assert!(err.contains("removing /var/lib/puzuz/logs/1000"), "{err}");
+    assert!(sys.exists("/etc/puzuz/config.toml"));
+}
+
+#[test]
 fn purge_asks_for_confirmation() {
     let sys = system();
     run_install(&sys, &opts()).unwrap();

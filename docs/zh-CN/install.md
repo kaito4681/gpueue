@@ -1566,7 +1566,8 @@ sudo puzuz uninstall --purge    # also delete /etc/puzuz, /var/lib/puzuz, /run/p
   `sudo systemctl stop 'puzuz-job-*'` 停止它们，或在卸载前为它们创建检查点或终止它们。
 - `--purge` 会请求确认（`-y/--yes` 跳过确认）。它不会进入挂载点（例如 `/run/puzuz-helper` 下
   `/` 的绑定挂载）。这些挂载点会被报告，由你手工卸载并删除。本身就是挂载点的待删除目录（例如位于
-  独立文件系统上的 `/var/lib/puzuz`）会被清空并保留。删除过程从不跟随符号链接（包括用户放在自己
+  独立文件系统上的 `/var/lib/puzuz`）会被清空并保留。在要删除时已不再为空的目录（仍有进程在写入的
+  用户日志目录）同样会被保留并报告，其他目录仍会被删除。删除过程从不跟随符号链接（包括用户放在自己
   日志目录中的符号链接）。
 - 系统用户 `puzuz` 和组 `puzuz-admin` 始终会被保留。
 

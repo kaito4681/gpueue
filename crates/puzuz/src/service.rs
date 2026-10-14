@@ -1113,27 +1113,7 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
     }
 
     if options.purge {
-        let mounts = mount_points(sys);
-        for dir in PURGE_DIRS {
-            let path = Path::new(dir);
-            if sys.path(path).symlink_metadata().is_err() {
-                continue;
-            }
-            let purged = remove_tree(sys, path, &mounts)?;
-            for skipped in &purged.kept_mounts {
-                writeln!(
-                    out,
-                    "kept {} (a mount point; unmount it and delete it by hand)",
-                    skipped.display()
-                )
-                .ok();
-            }
-            if purged.removed {
-                writeln!(out, "removed {dir}").ok();
-            } else if purged.is_mount {
-                writeln!(out, "kept {dir} (a mount point; deleted what was in it)").ok();
-            }
-        }
+        purge(sys, &remove_dir, out)?;
         writeln!(
             out,
             "The system user puzuz and the group {ADMIN_GROUP} are kept."
@@ -1146,6 +1126,52 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
              `sudo puzuz uninstall --purge` deletes them."
         )
         .ok();
+    }
+    Ok(())
+}
+
+/// Removes an empty directory: `name` in the directory `parent`.
+type RemoveDir<'a> = dyn Fn(&std::os::fd::OwnedFd, &std::ffi::OsStr) -> nix::Result<()> + 'a;
+
+/// [`RemoveDir`] with `unlinkat(AT_REMOVEDIR)`.
+fn remove_dir(parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> nix::Result<()> {
+    nix::unistd::unlinkat(parent, name, nix::unistd::UnlinkatFlags::RemoveDir)
+}
+
+/// Deletes [`PURGE_DIRS`] with [`remove_tree`], reporting what is kept. What cannot be deleted
+/// below a purge directory (a mount point, or a directory a user keeps adding files to) is
+/// reported and the rest is still deleted.
+fn purge(sys: &dyn System, remove_dir: &RemoveDir<'_>, out: &mut dyn Write) -> Result<()> {
+    let mounts = mount_points(sys);
+    for dir in PURGE_DIRS {
+        let path = Path::new(dir);
+        if sys.path(path).symlink_metadata().is_err() {
+            continue;
+        }
+        let purged = remove_tree(sys, path, &mounts, remove_dir)?;
+        for skipped in &purged.kept_mounts {
+            writeln!(
+                out,
+                "kept {} (a mount point; unmount it and delete it by hand)",
+                skipped.display()
+            )
+            .ok();
+        }
+        for skipped in &purged.kept_not_empty {
+            writeln!(
+                out,
+                "kept {} (files were added to it while it was deleted; delete it by hand)",
+                skipped.display()
+            )
+            .ok();
+        }
+        if purged.removed {
+            writeln!(out, "removed {dir}").ok();
+        } else if purged.is_mount {
+            writeln!(out, "kept {dir} (a mount point; deleted what was in it)").ok();
+        } else {
+            writeln!(out, "kept {dir} (deleted what could be deleted; see above)").ok();
+        }
     }
     Ok(())
 }
@@ -1192,6 +1218,9 @@ struct Purged {
     kept_mounts: Vec<PathBuf>,
     /// The directory itself is a mount point: its contents were deleted, the directory kept.
     is_mount: bool,
+    /// Directories below it that were not empty any more when they were to be removed (system
+    /// paths).
+    kept_not_empty: Vec<PathBuf>,
 }
 
 /// Deletes the system path `path` recursively without following symlinks and without entering
@@ -1200,7 +1229,13 @@ struct Purged {
 /// Users own directories inside the purged trees (`/var/lib/puzuz/logs/<uid>/`), so the walk
 /// works on directory file descriptors (`openat(O_NOFOLLOW)`, `unlinkat`), never on path names
 /// that could be swapped for a symlink between a check and its use (CVE-2022-21658).
-fn remove_tree(sys: &dyn System, path: &Path, mounts: &BTreeSet<PathBuf>) -> Result<Purged> {
+/// `remove_dir` removes the emptied directories.
+fn remove_tree(
+    sys: &dyn System,
+    path: &Path,
+    mounts: &BTreeSet<PathBuf>,
+    remove_dir: &RemoveDir<'_>,
+) -> Result<Purged> {
     use nix::fcntl::{OFlag, open};
     use nix::sys::stat::Mode;
 
@@ -1224,18 +1259,20 @@ fn remove_tree(sys: &dyn System, path: &Path, mounts: &BTreeSet<PathBuf>) -> Res
         name,
         path,
         parent_dev,
+        remove_dir,
     };
     purged.removed = remove_entry(&at, mounts, true, &mut purged)?;
     Ok(purged)
 }
 
 /// An entry [`remove_entry`] removes: `name` in the directory `parent` (on the device
-/// `parent_dev`), the system path `path`.
+/// `parent_dev`), the system path `path`; directories are removed with `remove_dir`.
 struct Location<'a> {
     parent: &'a std::os::fd::OwnedFd,
     name: &'a std::ffi::OsStr,
     path: &'a Path,
     parent_dev: u64,
+    remove_dir: &'a RemoveDir<'a>,
 }
 
 /// Removes the entry; returns whether it is gone. `top` is the purge directory itself, which
@@ -1300,13 +1337,22 @@ fn remove_entry(
             name,
             path: &path.join(name),
             parent_dev: dev,
+            remove_dir: at.remove_dir,
         };
         empty &= remove_entry(&child, mounts, false, purged)?;
     }
     drop(dir);
     if empty && !is_mount {
-        unlinkat(at.parent, at.name, UnlinkatFlags::RemoveDir).map_err(removing)?;
-        return Ok(true);
+        return match (at.remove_dir)(at.parent, at.name) {
+            Ok(()) => Ok(true),
+            // A user added a file to their directory (`/var/lib/puzuz/logs/<uid>/`) since it
+            // was listed: it is kept, like a mount point, and the purge goes on.
+            Err(Errno::ENOTEMPTY | Errno::EEXIST) if !top => {
+                purged.kept_not_empty.push(path.to_owned());
+                Ok(false)
+            }
+            Err(err) => Err(removing(err)),
+        };
     }
     Ok(false)
 }
