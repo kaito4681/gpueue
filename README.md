@@ -288,6 +288,13 @@ columns, and `Checkpointed` jobs show the image size.
   job's supplementary groups, so a job cannot use Docker or sudo even if its owner can (the
   helper's journal records what it left out). A refused job fails to spawn with `puzuz refuses to run jobs as <user>: <reason>`.
   See [Who jobs may run as](docs/install.md#who-jobs-may-run-as).
+- A job cannot become root or act as root, even when its owner can: setuid programs (`sudo`,
+  `su`, `pkexec`) do not gain privileges under `no_new_privs`, the system D-Bus is inaccessible in
+  job units (so no `systemctl`, `run0`, `machinectl` or other polkit-authorized action, whatever
+  the polkit rules grant the owner's groups; `job_system_dbus = true` lifts this), root-equivalent
+  groups are left out, and only the assigned GPUs' device nodes can be opened. The same holds
+  after a restore. See
+  [What a job can and cannot do](docs/install.md#what-a-job-can-and-cannot-do).
 - **Owner or administrator only:** changing a job (`kill`, `pause`, `start`, `remove`,
   `checkpoint`, `restore`, `restart`, `stash`, `enqueue`, `switch`, ...) and seeing its command,
   working directory, environment, label, failure reasons and log. Likewise, `add --after` only

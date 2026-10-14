@@ -71,7 +71,10 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    `/dev/null`、停止のタイムアウトは `grace_secs` です。各ジョブはデーモン、ヘルパー、ユーザーのセッションの
    外にある自分専用の cgroup で動くので、デーモンやヘルパーの再起動やユーザーのログアウトを生き延びます。
    `gpu_device_isolation`（デフォルトで有効）のとき、ユニットには `DevicePolicy=closed` と、ジョブの GPU
-   だけを許可する `DeviceAllow=` も設定されます（[GPU の分離](#gpu-isolation) を参照）。
+   だけを許可する `DeviceAllow=` も設定されます（[GPU の分離](#gpu-isolation) を参照）。`job_system_dbus = true`
+   でなければ、システムの D-Bus のソケットの `InaccessiblePaths=` も付くので、ジョブは systemd や polkit に何も
+   要求できません。shim は `/run/*` を外すときもこのマウントを残し、リストアのユニットにも同じプロパティが付くので、
+   CRIU はリストアのユニットの名前空間からこれを作り直します（[ジョブにできること・できないこと](install.md#what-a-job-can-and-cannot-do)を参照）。
 5. **shim。** shim はまだ root のまま PID 名前空間とマウント名前空間を作り、ホストの automount ポイントを
    トリガーしたあとで（名前空間が automount されたファイルシステムを得られるように）、名前空間の init を
    開始します。init はマウントを private にし、新しい `/proc` をマウントします。他のマウントの下に隠れた

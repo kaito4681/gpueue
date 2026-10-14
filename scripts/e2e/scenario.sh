@@ -1091,6 +1091,122 @@ s18_job_policy() {
         <<<"$log" || fail "the log does not show the refusal: $log"
 }
 
+# s19: a job of a user who can become root in every usual way outside puzuz
+# (member of sudo with a NOPASSWD rule, a polkit rule trusting the sudo
+# group, member of docker with a root daemon socket, member of disk with a
+# block device) cannot do any of it, before and after a checkpoint/restore.
+# Each way is first shown to work for the same user outside puzuz.
+E2E_DOCKER_SOCK=/run/e2e-docker.sock
+s19_no_escalation() {
+    local id log dev uid gid out r
+    getent group sudo >/dev/null || groupadd sudo
+    groupadd -f docker
+    getent passwd 1005 >/dev/null || useradd -m -u 1005 -s /bin/bash eve
+    usermod -aG sudo,docker,disk eve
+    uid=$(id -u eve)
+    gid=$(id -g eve)
+    rm -f /home/eve/round2
+
+    # A unit only root (or polkit) may start; it leaves a marker.
+    cat >/etc/systemd/system/e2e-escalate.service <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/bin/touch /run/e2e-escalated
+EOF
+    systemctl daemon-reload
+    rm -f /run/e2e-escalated
+    if command -v sudo >/dev/null; then
+        echo 'eve ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/e2e-eve
+        chmod 0440 /etc/sudoers.d/e2e-eve
+        runuser -u eve -- sudo -n true || fail "the sudoers rule does not work outside puzuz"
+        echo "control: eve can sudo outside puzuz"
+    else
+        echo "SKIP: no sudo in the image (the sudo checks are skipped)"
+    fi
+    if [ -d /usr/share/polkit-1 ] && command -v pkexec >/dev/null; then
+        mkdir -p /etc/polkit-1/rules.d
+        cat >/etc/polkit-1/rules.d/10-e2e-sudo.rules <<'EOF'
+polkit.addRule(function(action, subject) {
+    if (subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+        systemctl restart polkit.service 2>/dev/null || true
+        runuser -u eve -- systemctl --no-ask-password start e2e-escalate.service \
+            || fail "the polkit rule does not let eve start units outside puzuz"
+        [ -e /run/e2e-escalated ] || fail "the control start left no marker"
+        rm -f /run/e2e-escalated
+        echo "control: eve can start system units through polkit outside puzuz"
+    else
+        echo "SKIP: no polkit in the image (no control for the D-Bus checks)"
+    fi
+
+    # A root daemon socket of group docker.
+    rm -f "$E2E_DOCKER_SOCK"
+    python3 -c '
+import os, socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+os.chown(sys.argv[1], 0, int(sys.argv[2]))
+os.chmod(sys.argv[1], 0o660)
+s.listen(16)
+while True:
+    c, _ = s.accept()
+    c.close()' "$E2E_DOCKER_SOCK" "$(getent group docker | cut -d: -f3)" &
+    wait_for 10 "the fake docker socket" test -S "$E2E_DOCKER_SOCK"
+    runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' \
+        "$E2E_DOCKER_SOCK" || fail "eve cannot connect to the docker socket outside puzuz"
+    echo "control: eve can connect to the docker socket outside puzuz"
+
+    # A block device of group disk.
+    truncate -s 1M "$STATE/e2e-blk.img" 2>/dev/null || { mkdir -p "$STATE"; truncate -s 1M "$STATE/e2e-blk.img"; }
+    dev=$(losetup -f --show "$STATE/e2e-blk.img") || fail "losetup"
+    chgrp disk "$dev"
+    chmod 0660 "$dev"
+    runuser -u eve -- python3 -c 'import os, sys; os.open(sys.argv[1], os.O_RDONLY)' "$dev" \
+        || fail "eve cannot open $dev outside puzuz"
+    echo "control: eve can open $dev outside puzuz"
+
+    id=$(add eve -- "bash /e2e/escalation_checks.sh $uid $gid $E2E_DOCKER_SOCK $dev /home/eve")
+    wait_state "$id" running
+    wait_for 120 "the first round of checks" grep -q '^round 1 done$' "$LOGS/$uid/$id.log"
+    pz eve checkpoint "$id" || fail "checkpoint"
+    wait_state "$id" checkpointed 120
+    pz eve restore "$id" || fail "restore"
+    wait_state "$id" running 120
+    # The restored unit is set up like a spawned one.
+    out=$(systemctl show -p InaccessiblePaths --value "puzuz-job-$id-r1.service")
+    echo "restored unit InaccessiblePaths: $out"
+    grep -q /run/dbus/system_bus_socket <<<"$out" || fail "the restored unit can reach the system bus"
+    runuser -u eve -- touch /home/eve/round2
+    wait_state "$id" 'done/*' 120
+    expect_state "$id" done/success
+
+    log=$(cat "$LOGS/$uid/$id.log")
+    echo "$log"
+    ! grep -q '^BAD ' <<<"$log" || fail "a job escalated: $(grep '^BAD ' <<<"$log" | head -n 3)"
+    for r in 1 2; do
+        grep -qx "round $r done" <<<"$log" || fail "round $r did not finish"
+    done
+    for r in "systemctl --system start" "busctl --system call" "connect to the system bus socket" \
+        "connect to the docker socket" "open the block device" "run0 true" uid gid groups \
+        NoNewPrivs CapPrm CapEff CapBnd; do
+        [ "$(grep -cx "ok $r" <<<"$log")" = 2 ] || fail "check '$r' did not pass in both rounds"
+    done
+    if command -v sudo >/dev/null; then
+        [ "$(grep -cx 'ok sudo -n true' <<<"$log")" = 2 ] || fail "the sudo check did not run twice"
+    fi
+    if command -v pkexec >/dev/null; then
+        [ "$(grep -cx 'ok pkexec true' <<<"$log")" = 2 ] || fail "the pkexec check did not run twice"
+    fi
+    [ ! -e /run/e2e-escalated ] || fail "a job started the root-only unit"
+
+    kill %1 2>/dev/null || true
+    losetup -d "$dev" || true
+    rm -f "$E2E_DOCKER_SOCK" /etc/sudoers.d/e2e-eve /etc/polkit-1/rules.d/10-e2e-sudo.rules
+}
+
 case "${1:-main}" in
 main)
     run "1 add/status/log/follow/wait" s1_lifecycle
@@ -1104,6 +1220,7 @@ main)
     run "13 checkpoint of a paused job" s13_paused_checkpoint
     run "17 multifactor priority (fair share, nice, top)" s17_priority
     run "18 job credential policy" s18_job_policy
+    run "19 no privilege escalation from jobs" s19_no_escalation
     if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers

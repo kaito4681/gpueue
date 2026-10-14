@@ -30,6 +30,7 @@ docs/<lang>/ go up two levels (../../packaging/...). Code blocks are copied unch
 - [設定](#configuration)
 - [管理者](#administrators)
 - [ジョブを実行できるユーザー](#who-jobs-may-run-as)
+- [ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)
 - [優先度とフェアシェア](#priority-and-fair-share)
 - [GPU の検出](#gpu-detection)
 - [GPU の分離](#gpu-isolation)
@@ -1123,6 +1124,7 @@ sudo systemctl restart puzuz-helper.service puzuz.service
 | `criu_restore_timeout_secs` | 未設定 | ヘルパー | `criu restore` 単体の任意の上限。未設定なら期限だけが適用されます |
 | `fork_guard` | `true` | ヘルパー | ジョブに fork ガードをプリロードします（README の制限事項を参照） |
 | `gpu_device_isolation` | `true` | ヘルパー | 各ジョブのユニットが開けるデバイスノードを、割り当てた GPU のものに限ります（`DevicePolicy=closed`）。`false` で無効になります（[GPU の分離](#gpu-isolation) を参照） |
+| `job_system_dbus` | `false` | ヘルパー | `true` にするとジョブがシステムの D-Bus（systemd、polkit）に接続できます。デフォルトではジョブのユニットから接続できません（[ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)を参照） |
 | `job_min_uid` | `/etc/login.defs` の `UID_MIN`、なければ `1000` | ヘルパー | uid がこれより小さいユーザーのジョブを拒否します（[ジョブを実行できるユーザー](#who-jobs-may-run-as)を参照） |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | ヘルパー | root 相当のグループ。ジョブの補助グループから外し、プライマリグループがこれらのいずれかであるジョブは拒否します |
 | `job_allowed_users` | `[]`（全員） | ヘルパー | 空でなければ、ここに（名前で）挙げたユーザーだけがジョブを実行できます |
@@ -1191,6 +1193,31 @@ job_allowed_users` が続く理由で起動に失敗します。`puzuz status` �
 （[リストアの失敗](#restore-failures)を参照）、ジョブはチェックポイント済みのままです。`puzuz doctor` は有効な
 ポリシー（最小 uid とその出どころ、拒否するグループとそのうちホストに存在するもの、許可するユーザー）を表示し、
 ヘルパーも起動時にログに記録します。これらのキーを変えたらヘルパーを再起動してください。
+
+<a id="what-a-job-can-and-cannot-do"></a>
+## ジョブにできること・できないこと
+
+ジョブは所有者として実行され、ファイル、ネットワーク、割り当てた GPU に対して所有者ができることはできます。
+puzuz は、所有者が puzuz の外ではできる場合（`NOPASSWD` ルールのある `sudo` のメンバー、`docker` のメンバー、
+polkit が信頼するグループのメンバー）でも、ジョブがそれ以上の権限を得られないことを保証します。チェックポイント
+から再開したジョブも同じです。リストアしたユニットも同じように設定され、リストアしたプロセスは資格情報を
+そのまま保ちます。e2e のシナリオ 19 は、チェックポイントとリストアの前後で以下の各項目を確かめます。
+
+| ジョブは… | 理由 | 切り替え |
+| --- | --- | --- |
+| 所有者の uid とプライマリ gid で実行され、root にはならない | ヘルパーが uid 0、システムアカウント、拒否するプライマリグループを拒否する（[ジョブを実行できるユーザー](#who-jobs-may-run-as)） | `job_min_uid`、`job_denied_groups`、`job_allowed_users` |
+| ケーパビリティを持たず（`CapInh`、`CapPrm`、`CapEff`、`CapBnd`、`CapAmb` がすべて 0）、`NoNewPrivs: 1` | shim がコマンドを実行する前にバウンディングセットを空にし、`no_new_privs` を設定する | なし |
+| `sudo`、`su`、`pkexec` などの setuid やファイルケーパビリティのプログラムで権限を得られない | `no_new_privs` のもとではカーネルが setuid ビットとファイルケーパビリティを無視する | なし |
+| システムの D-Bus に接続できないので、`systemctl`、`run0`、`machinectl`、`busctl --system` など、systemd、polkit、システムサービスへの要求はできない | すべてのジョブのユニットに `InaccessiblePaths=/run/dbus/system_bus_socket`（`/var/run/...` も）が付く。polkit はグループの所属をジョブのグループではなくユーザーデータベースから判断するので、グループを外すだけでは防げない | `job_system_dbus = true` |
+| `docker`、`lxd`、`incus-admin`、`libvirt`、`disk`、`sudo`、`wheel`、`admin` のグループを持たない（root のデーモンのソケット、ブロックデバイスそのもの） | ヘルパーが補助グループから外す | `job_denied_groups` |
+| 標準の疑似デバイスと割り当てた GPU のもの以外のデバイスノードを開けない | `DevicePolicy=closed` と `DeviceAllow=`（[GPU の分離](#gpu-isolation)） | `gpu_device_isolation` |
+
+それぞれの切り替えは保証を 1 つ弱めます。`job_system_dbus = true` のときは `puzuz doctor` が警告します。
+puzuz が制限しないもの：所有者の uid そのものにできること（ファイル、セッションバス経由のユーザーサービス、
+ネットワーク）、ジョブが使う CPU、メモリ、ディスクの量、自分で資格情報を確かめるほかのサービスのソケット
+（たとえば、どのユーザーにも許すデーモンのソケット）。新しい systemd の Varlink サービス
+（`/run/systemd/io.systemd.*`）には接続できます。ユーザーの代わりに操作するものは、polkit と呼び出し元の uid を
+自分で確かめます。
 
 <a id="priority-and-fair-share"></a>
 ## 優先度とフェアシェア

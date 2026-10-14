@@ -963,6 +963,8 @@ mod tests {
 2 1 0:2 / /run rw - tmpfs tmpfs rw
 3 2 0:3 / /run/user/1000 rw - tmpfs tmpfs rw
 4 2 0:4 / /run/nvidia-persistenced/socket rw - tmpfs tmpfs rw
+9 2 0:2 /systemd/inaccessible/sock /run/dbus/system_bus_socket ro - tmpfs tmpfs rw
+10 2 0:2 /systemd/inaccessible/dir /run/credentials ro - tmpfs tmpfs rw
 5 1 0:5 / /media/usb\\040disk rw - ext4 /dev/y rw
 8 1 0:8 / /mnt/data rw - ext4 /dev/w rw
 6 1 0:6 / /dev/shm rw - tmpfs tmpfs rw
@@ -970,7 +972,12 @@ mod tests {
 ";
         assert_eq!(
             mounts_to_prune(mi, &MountPlan::default()),
-            ["/run/user/1000", "/media/usb disk", "/dev/shm"]
+            [
+                "/run/user/1000",
+                "/run/credentials",
+                "/media/usb disk",
+                "/dev/shm"
+            ]
         );
         assert!(path_under("/run/a", "/run/"));
         assert!(!path_under("/run", "/run/"));

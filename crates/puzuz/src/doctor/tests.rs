@@ -544,6 +544,22 @@ fn helper_settings_come_from_the_config_unless_flags_override_them() {
 }
 
 #[test]
+fn job_system_dbus_is_shown() {
+    let (sys, _sockets) = healthy();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job d-bus"), Level::Ok);
+    assert!(message(&report, "job d-bus").starts_with("blocked: "));
+
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!("job_system_dbus = true\n{CONFIG}"),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job d-bus"), Level::Warn);
+    assert!(hint(&report, "job d-bus").contains("job_system_dbus = true"));
+}
+
+#[test]
 fn gpu_isolation_is_shown() {
     let (sys, _sockets) = healthy();
     let report = run(&sys, None);

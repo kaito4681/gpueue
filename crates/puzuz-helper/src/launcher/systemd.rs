@@ -20,6 +20,10 @@
 //!   `DeviceAllow=` list of the assigned GPUs' NVIDIA device nodes (none
 //!   for a CPU job; see [`crate::devices`]). Restored units get the same
 //!   for the GPUs of the restore.
+//! - Unless `job_system_dbus = true`, `InaccessiblePaths=` of the system
+//!   D-Bus socket ([`SYSTEM_BUS_SOCKETS`]): a job cannot ask systemd or
+//!   polkit for anything. Restored units get the same, so the restored
+//!   mount namespace matches the dumped one.
 //!
 //! Restored job unit `puzuz-job-<id>-r<n>.service`: `Type=forking`,
 //! `PIDFile=`, `ExecStart=<helper> criu-wrap <root> criu restore -d
@@ -101,6 +105,8 @@ pub struct SystemdLauncher {
     helper_exe: PathBuf,
     spawn_timeout: Duration,
     job_stop_timeout: Duration,
+    /// `job_system_dbus`: job units may reach the system D-Bus.
+    job_system_dbus: bool,
     proc_root: PathBuf,
     /// Set by [`Launcher::stop_waiting`].
     stopping: Arc<AtomicBool>,
@@ -114,12 +120,14 @@ impl SystemdLauncher {
         helper_exe: PathBuf,
         spawn_timeout: Duration,
         job_stop_timeout: Duration,
+        job_system_dbus: bool,
     ) -> zbus::Result<Self> {
         Ok(Self {
             conn: Connection::system().await?,
             helper_exe,
             spawn_timeout,
             job_stop_timeout,
+            job_system_dbus,
             proc_root: PathBuf::from("/proc"),
             stopping: Arc::new(AtomicBool::new(false)),
         })
@@ -277,7 +285,7 @@ impl SystemdLauncher {
     }
 
     fn common_props(&self, description: String) -> Props<'static> {
-        vec![
+        let mut props = vec![
             ("Description", Value::from(description)),
             ("Before", Value::from(vec![HELPER_UNIT.to_owned()])),
             ("RemainAfterExit", Value::from(true)),
@@ -290,7 +298,9 @@ impl SystemdLauncher {
                 "TimeoutStopUSec",
                 Value::from(duration_usec(self.job_stop_timeout)),
             ),
-        ]
+        ];
+        props.extend(system_dbus_props(self.job_system_dbus));
+        props
     }
 
     async fn wait_for_start(&self, spec: &LaunchSpec) -> LaunchResult<u32> {
@@ -566,6 +576,38 @@ impl Launcher for SystemdLauncher {
     }
 }
 
+/// The system D-Bus socket, under both names: `/var/run` is normally a
+/// symlink to `/run` (systemd resolves it, so the entry is then the same
+/// mount), but a separate `/var/run` must not leave a way around. The `-`
+/// prefix: a path that does not exist (no D-Bus daemon) is skipped.
+pub const SYSTEM_BUS_SOCKETS: [&str; 2] = [
+    "-/run/dbus/system_bus_socket",
+    "-/var/run/dbus/system_bus_socket",
+];
+
+/// `InaccessiblePaths=` of the system D-Bus socket unless `allowed`
+/// (`job_system_dbus`): systemd mounts an inaccessible socket node over it
+/// in the unit's mount namespace, so connecting fails with `EACCES` and
+/// nothing a job does reaches systemd, polkit (`pkexec`, `run0`,
+/// `systemctl`, `machinectl`, ...) or any other system service. polkit
+/// takes group membership from the user database, so without this its
+/// rules for e.g. an admin group would apply to the jobs of that group's
+/// members even though the helper drops the group from them.
+pub fn system_dbus_props(allowed: bool) -> Props<'static> {
+    if allowed {
+        return Vec::new();
+    }
+    vec![(
+        "InaccessiblePaths",
+        Value::from(
+            SYSTEM_BUS_SOCKETS
+                .iter()
+                .map(|p| (*p).to_owned())
+                .collect::<Vec<_>>(),
+        ),
+    )]
+}
+
 /// `DevicePolicy=closed` with `DeviceAllow=` of `devices` (an array of
 /// `(path, access)` on D-Bus); nothing without isolation.
 pub fn device_props(devices: Option<&[DeviceRule]>) -> Props<'static> {
@@ -663,6 +705,22 @@ mod tests {
         assert!(!crate::shim::is_forwardable(17)); // CHLD
         assert!(!crate::shim::is_forwardable(11)); // SEGV
         assert!(!crate::shim::is_forwardable(34)); // SIGRTMIN
+    }
+
+    #[test]
+    fn system_dbus_is_inaccessible_unless_allowed() {
+        assert!(system_dbus_props(true).is_empty());
+        let props = system_dbus_props(false);
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].0, "InaccessiblePaths");
+        assert_eq!(
+            props[0].1,
+            Value::from(vec![
+                "-/run/dbus/system_bus_socket".to_owned(),
+                "-/var/run/dbus/system_bus_socket".to_owned(),
+            ])
+        );
+        assert_eq!(props[0].1.value_signature(), "as");
     }
 
     #[test]

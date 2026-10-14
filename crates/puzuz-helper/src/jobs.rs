@@ -95,6 +95,10 @@ pub enum UnitKind {
 /// recreates the namespace on restore and fails on missing mount points or
 /// bind sources).
 ///
+/// The inaccessible node systemd mounts over the system D-Bus socket
+/// (`job_system_dbus = false`) is kept: it is what keeps the job off the
+/// bus, and it exists after a reboot as well.
+///
 /// `/mnt` is not pruned: administrators mount persistent filesystems there
 /// (`/mnt/data`), and a job whose cwd is below a pruned mount would write
 /// to the directory underneath it on the root filesystem. A restore checks
@@ -123,7 +127,15 @@ impl Default for MountPlan {
     fn default() -> Self {
         Self {
             prune: vec!["/run/".into(), "/media/".into(), "/dev/shm".into()],
-            keep: vec!["/run/nvidia-persistenced".into()],
+            // The system D-Bus socket: covered by the inaccessible node
+            // of `InaccessiblePaths=` (see
+            // `crate::launcher::systemd::system_dbus_props`), which must
+            // stay (and is recreated by CRIU from the restore unit's
+            // namespace, which has the same mount).
+            keep: vec![
+                "/run/nvidia-persistenced".into(),
+                "/run/dbus/system_bus_socket".into(),
+            ],
             tmpfs: vec!["/tmp".into(), "/dev/shm".into()],
         }
     }

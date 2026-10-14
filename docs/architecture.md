@@ -71,7 +71,11 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    daemon, the helper and the user's session, so it survives restarts of the daemon and the
    helper and the user logging out. With `gpu_device_isolation` (the default) the unit also has
    `DevicePolicy=closed` and `DeviceAllow=` for the job's GPUs only (see
-   [GPU isolation](#gpu-isolation)).
+   [GPU isolation](#gpu-isolation)). Unless `job_system_dbus = true`, it also has
+   `InaccessiblePaths=` of the system D-Bus socket, so the job cannot ask systemd or polkit for
+   anything; the shim keeps that mount when it prunes `/run/*`, and restore units get the same
+   property, so CRIU recreates it from the restore unit's namespace (see
+   [What a job can and cannot do](install.md#what-a-job-can-and-cannot-do)).
 5. **Shim.** Still root, the shim creates a PID namespace and a mount namespace and starts the
    namespace's init, after it triggered the host's automount points (so that the namespace gets
    the automounted filesystems). The init makes the mounts private and mounts a fresh `/proc`. It removes mounts hidden under other mounts and mounts that do not survive a

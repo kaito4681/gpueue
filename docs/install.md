@@ -17,6 +17,7 @@ command on their `PATH`.
 - [Configuration](#configuration)
 - [Administrators](#administrators)
 - [Who jobs may run as](#who-jobs-may-run-as)
+- [What a job can and cannot do](#what-a-job-can-and-cannot-do)
 - [Priority and fair share](#priority-and-fair-share)
 - [GPU detection](#gpu-detection)
 - [GPU isolation](#gpu-isolation)
@@ -1116,6 +1117,7 @@ Every `*_secs` key is at most one year (31536000).
 | `criu_restore_timeout_secs` | unset | helper | optional cap on `criu restore` alone; unset: only the deadline applies |
 | `fork_guard` | `true` | helper | preload the fork guard into jobs (see the README's limitations) |
 | `gpu_device_isolation` | `true` | helper | each job unit may open only its assigned GPUs' device nodes (`DevicePolicy=closed`); `false` turns this off (see [GPU isolation](#gpu-isolation)) |
+| `job_system_dbus` | `false` | helper | `true` lets jobs reach the system D-Bus (systemd, polkit); by default it is inaccessible in job units (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_min_uid` | `UID_MIN` of `/etc/login.defs`, else `1000` | helper | jobs of users with a smaller uid are refused (see [Who jobs may run as](#who-jobs-may-run-as)) |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | helper | root-equivalent groups: dropped from jobs' supplementary groups; a job whose primary group is one of them is refused |
 | `job_allowed_users` | `[]` (everyone) | helper | if not empty, only these users (by name) may run jobs |
@@ -1186,6 +1188,31 @@ refused restore is a restore failure (see [Restore failures](#restore-failures))
 checkpointed. `puzuz doctor` prints the effective policy (the minimum uid
 and where it comes from, the denied groups and which of them exist on the host, the allowed
 users), and the helper logs it when it starts. Restart the helper after changing these keys.
+
+## What a job can and cannot do
+
+A job runs as its owner and can do what its owner can do on files, the network and its assigned
+GPUs. puzuz guarantees that it cannot gain more, even when the owner could outside puzuz (a
+member of `sudo` with a `NOPASSWD` rule, of `docker`, or of a group that polkit trusts). This
+holds for a job started from a checkpoint as well: the restored unit is set up the same way, and
+the restored processes keep their credentials. e2e scenario 19 checks each item below, before
+and after a checkpoint and restore.
+
+| A job ... | because | switch |
+| --- | --- | --- |
+| runs with its owner's uid and primary gid, never root | the helper refuses uid 0, system accounts and denied primary groups ([Who jobs may run as](#who-jobs-may-run-as)) | `job_min_uid`, `job_denied_groups`, `job_allowed_users` |
+| has no capabilities (`CapInh`, `CapPrm`, `CapEff`, `CapBnd` and `CapAmb` are all 0) and `NoNewPrivs: 1` | the shim empties the bounding set and sets `no_new_privs` before it runs the command | none |
+| cannot gain privileges with `sudo`, `su`, `pkexec` or any other setuid or file-capability program | `no_new_privs` makes the kernel ignore setuid bits and file capabilities | none |
+| cannot reach the system D-Bus, so no `systemctl`, `run0`, `machinectl`, `busctl --system` or other request to systemd, polkit or system services | every job unit has `InaccessiblePaths=/run/dbus/system_bus_socket` (also `/var/run/...`); polkit takes group membership from the user database, not from the job's groups, so dropping groups alone would not stop it | `job_system_dbus = true` |
+| does not have the groups `docker`, `lxd`, `incus-admin`, `libvirt`, `disk`, `sudo`, `wheel`, `admin` (root daemons' sockets, raw block devices) | the helper drops them from the supplementary groups | `job_denied_groups` |
+| cannot open device nodes except the standard pseudo devices and its assigned GPUs' | `DevicePolicy=closed` with `DeviceAllow=` ([GPU isolation](#gpu-isolation)) | `gpu_device_isolation` |
+
+Each switch weakens one guarantee; `puzuz doctor` warns when `job_system_dbus = true`. What puzuz
+does not limit: whatever the owner's uid itself may do (files, user services over the session bus,
+network access), the amount of CPU, memory or disk a job uses, and sockets of other services
+that check credentials on their own (for example a daemon socket that allows any user).
+Varlink services of newer systemd versions (`/run/systemd/io.systemd.*`) remain reachable; those
+that act on a user's behalf check polkit and the caller's uid themselves.
 
 ## Priority and fair share
 

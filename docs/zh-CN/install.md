@@ -17,6 +17,7 @@
 - [配置](#configuration)
 - [管理员](#administrators)
 - [谁可以运行作业](#who-jobs-may-run-as)
+- [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)
 - [优先级与公平共享](#priority-and-fair-share)
 - [GPU 检测](#gpu-detection)
 - [GPU 隔离](#gpu-isolation)
@@ -1030,6 +1031,7 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/puzu
 | `criu_restore_timeout_secs` | 未设置 | helper | 可选，单独限制 `criu restore`；未设置时只适用期限 |
 | `fork_guard` | `true` | helper | 向作业预加载 fork guard（见 README 的限制一节） |
 | `gpu_device_isolation` | `true` | helper | 每个作业单元只能打开所分配 GPU 的设备节点（`DevicePolicy=closed`）；`false` 关闭此功能（见 [GPU 隔离](#gpu-isolation)） |
+| `job_system_dbus` | `false` | helper | `true` 允许作业访问系统 D-Bus（systemd、polkit）；默认情况下作业单元无法访问它（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
 | `job_min_uid` | `/etc/login.defs` 的 `UID_MIN`，没有则为 `1000` | helper | 拒绝 uid 小于此值的用户的作业（见 [谁可以运行作业](#who-jobs-may-run-as)） |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | helper | 等同 root 的组：从作业的附加组中去掉；主组为其中之一的作业会被拒绝 |
 | `job_allowed_users` | `[]`（所有人） | helper | 非空时，只有列出的用户（按名称）可以运行作业 |
@@ -1092,6 +1094,28 @@ job_allowed_users`。`puzuz status` 将其显示为 `Failed to spawn`，`puzuz l
 `puzuz status --json` 会显示原因。被拒绝的恢复按恢复失败处理（见 [恢复失败](#restore-failures)），作业保持
 已检查点状态。`puzuz doctor` 会显示生效的策略（最小 uid 及其来源、拒绝的组以及其中哪些在主机上存在、允许
 的用户），helper 启动时也会将其写入日志。更改这些键后请重启 helper。
+
+<a id="what-a-job-can-and-cannot-do"></a>
+## 作业能做什么、不能做什么
+
+作业以其所有者身份运行，可以对文件、网络和所分配的 GPU 做所有者能做的事。puzuz 保证作业无法获得更多权限，
+即使所有者在 puzuz 之外可以（有 `NOPASSWD` 规则的 `sudo` 成员、`docker` 成员，或 polkit 信任的组的成员）。
+从检查点恢复的作业同样如此：恢复的单元以相同方式设置，恢复的进程保持其凭据。e2e 场景 19 会在检查点和恢复
+前后检查下面的每一项。
+
+| 作业…… | 原因 | 开关 |
+| --- | --- | --- |
+| 以所有者的 uid 和主 gid 运行，绝不以 root 运行 | helper 拒绝 uid 0、系统账户和被拒绝的主组（[谁可以运行作业](#who-jobs-may-run-as)） | `job_min_uid`、`job_denied_groups`、`job_allowed_users` |
+| 没有任何 capability（`CapInh`、`CapPrm`、`CapEff`、`CapBnd`、`CapAmb` 全为 0），且 `NoNewPrivs: 1` | shim 在运行命令前清空边界集并设置 `no_new_privs` | 无 |
+| 无法通过 `sudo`、`su`、`pkexec` 或其他 setuid / 文件 capability 程序获得特权 | 在 `no_new_privs` 下内核会忽略 setuid 位和文件 capability | 无 |
+| 无法访问系统 D-Bus，因此无法执行 `systemctl`、`run0`、`machinectl`、`busctl --system` 或其他对 systemd、polkit、系统服务的请求 | 每个作业单元都有 `InaccessiblePaths=/run/dbus/system_bus_socket`（以及 `/var/run/...`）；polkit 从用户数据库而不是作业的组判断组成员关系，仅去掉组无法阻止它 | `job_system_dbus = true` |
+| 不具有 `docker`、`lxd`、`incus-admin`、`libvirt`、`disk`、`sudo`、`wheel`、`admin` 组（root 守护进程的套接字、原始块设备） | helper 将它们从附加组中去掉 | `job_denied_groups` |
+| 除标准伪设备和所分配 GPU 的设备节点外，无法打开任何设备节点 | `DevicePolicy=closed` 加 `DeviceAllow=`（[GPU 隔离](#gpu-isolation)） | `gpu_device_isolation` |
+
+每个开关都会削弱一项保证；`job_system_dbus = true` 时 `puzuz doctor` 会发出警告。puzuz 不限制的内容：所有者的
+uid 本身能做的事（文件、通过会话总线的用户服务、网络访问）、作业使用的 CPU、内存或磁盘量，以及自行检查凭据的
+其他服务的套接字（例如允许任何用户的守护进程套接字）。较新 systemd 的 Varlink 服务（`/run/systemd/io.systemd.*`）
+仍可访问；代表用户执行操作的服务会自行检查 polkit 和调用者的 uid。
 
 <a id="priority-and-fair-share"></a>
 ## 优先级与公平共享

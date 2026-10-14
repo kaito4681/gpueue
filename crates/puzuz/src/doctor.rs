@@ -351,6 +351,32 @@ fn check_gpu_isolation(config: &Config, nixos: bool) -> Check {
     .hint(format!("unless you need it off (e.g. for MIG), {how}"))
 }
 
+/// `job_system_dbus`: whether jobs may reach the system D-Bus (systemd, polkit).
+fn check_job_system_dbus(config: &Config, nixos: bool) -> Check {
+    const NAME: &str = "job d-bus";
+    if !config.job_system_dbus {
+        return Check::ok(
+            NAME,
+            "blocked: job units cannot reach the system D-Bus (no systemctl, run0, pkexec or \
+             other polkit-authorized actions from jobs)",
+        );
+    }
+    let how = if nixos {
+        format!("set `services.puzuz.settings.job_system_dbus = false`, then `{REBUILD}`")
+    } else {
+        format!(
+            "remove `job_system_dbus = true` from {DEFAULT_CONFIG_PATH} and \
+             `sudo systemctl restart {HELPER_UNIT}`"
+        )
+    };
+    Check::warn(
+        NAME,
+        "allowed (job_system_dbus = true): jobs can ask systemd and polkit for actions; \
+         polkit rules that trust a group apply to the jobs of its members",
+    )
+    .hint(format!("unless jobs need it, {how}"))
+}
+
 /// The helper's job credential policy: the minimum uid and where it comes from, the denied
 /// groups (and which of them exist here), the allowed users.
 fn check_job_policy(sys: &dyn System, config: &Config) -> Check {
@@ -496,6 +522,7 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     checks.push(check_helper_binary(sys, nixos));
     checks.push(check_helper_settings(sys, &config, nixos));
     checks.push(check_gpu_isolation(&config, nixos));
+    checks.push(check_job_system_dbus(&config, nixos));
     checks.push(check_job_policy(sys, &config));
     if let Some(check) = check_daemon_write_paths(sys, &config, nixos) {
         checks.push(check);

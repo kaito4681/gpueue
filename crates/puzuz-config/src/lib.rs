@@ -33,6 +33,7 @@
 //! nvidia_smi_path = "nvidia-smi"
 //! cuda_checkpoint_mode = "manual"
 //! gpu_device_isolation = true
+//! job_system_dbus = false
 //! checkpoint_deadline_base_secs = 180
 //! checkpoint_deadline_secs_per_gib = 30
 //! fork_guard = true
@@ -147,6 +148,14 @@ pub struct Config {
     /// jobs get no NVIDIA device. `false` leaves device access alone (only
     /// `CUDA_VISIBLE_DEVICES` selects the GPUs).
     pub gpu_device_isolation: bool,
+    /// Let jobs reach the system D-Bus (helper only). `false` (the
+    /// default) makes `/run/dbus/system_bus_socket` inaccessible in every
+    /// job unit (`InaccessiblePaths=`), so a job cannot ask systemd,
+    /// polkit or other system services for anything (`systemctl`, `run0`,
+    /// `pkexec`, `machinectl`, ...). polkit decides group membership from
+    /// the user database, not from the job's (reduced) groups, so its
+    /// rules would otherwise apply to jobs as to their owners' sessions.
+    pub job_system_dbus: bool,
     /// Fixed part of the deadline of a whole checkpoint or restore of a
     /// job, in seconds (helper only). The deadline is
     /// `checkpoint_deadline_base_secs + checkpoint_deadline_secs_per_gib *
@@ -378,6 +387,7 @@ impl Default for Config {
             nvidia_smi_path: PathBuf::from("nvidia-smi"),
             cuda_checkpoint_mode: CudaCheckpointMode::Manual,
             gpu_device_isolation: true,
+            job_system_dbus: false,
             checkpoint_deadline_base_secs: 180,
             checkpoint_deadline_secs_per_gib: 30,
             criu_dump_timeout_secs: None,
@@ -640,6 +650,7 @@ mod tests {
         assert_eq!(config.checkpoint_deadline_secs_per_gib, 30);
         assert!(config.fork_guard);
         assert!(config.gpu_device_isolation);
+        assert!(!config.job_system_dbus);
         assert_eq!(config.job_min_uid, None);
         assert_eq!(
             config.job_denied_groups,
@@ -763,6 +774,7 @@ mod tests {
             nvidia_smi_path = "/opt/nvidia-smi"
             cuda_checkpoint_mode = "plugin"
             gpu_device_isolation = false
+            job_system_dbus = true
             criu_dump_timeout_secs = 60
             criu_restore_timeout_secs = 90
             checkpoint_deadline_base_secs = 20
@@ -809,6 +821,7 @@ mod tests {
         assert_eq!(config.nvidia_smi_path, PathBuf::from("/opt/nvidia-smi"));
         assert_eq!(config.cuda_checkpoint_mode, CudaCheckpointMode::Plugin);
         assert!(!config.gpu_device_isolation);
+        assert!(config.job_system_dbus);
         assert_eq!(config.criu_dump_timeout_secs, Some(60));
         assert_eq!(config.criu_restore_timeout_secs, Some(90));
         assert_eq!(config.checkpoint_deadline_base_secs, 20);
