@@ -742,9 +742,12 @@ Checkpoints need CRIU 4.2 or newer, which is in the official repositories
 
 The PKGBUILD lives in `packaging/aur/puzuz-bin`. When a release is published as a stable release
 (the `released` event, like the APT repository; never for a draft or a pre-release),
-`.github/workflows/release-aur.yml` runs `scripts/dist/update-aur.sh <version>`, which takes the
-tarballs' checksums from the release's `.sha256` files, computes the checksum of the tag's source
-archive (for the units and snippets), and regenerates `.SRCINFO` in an Arch Linux container.
+`.github/workflows/release-aur.yml` runs `scripts/dist/update-aur.sh <version>`, which downloads
+the release's tarballs and their `.minisig` files, checks them with the tag's
+`packaging/minisign.pub` (and the trusted comment `puzuz v<version> <file>`, as `install.sh` does),
+computes the PKGBUILD's checksums from the verified tarballs and from the tag's source archive (for
+the units and snippets, which no signed asset carries), and regenerates `.SRCINFO` in an Arch
+Linux container.
 It then pushes `PKGBUILD`, `.SRCINFO` and `puzuz-bin.install` to
 `ssh://aur@aur.archlinux.org/puzuz-bin.git`. The release must have both the x86_64 and the aarch64
 tarball. To change the packaging without a new release, bump `pkgrel` in the PKGBUILD and run the

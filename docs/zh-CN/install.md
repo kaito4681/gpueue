@@ -688,9 +688,10 @@ cuda-checkpoint（参见 [cuda-checkpoint](#cuda-checkpoint)）。两者都是�
 
 PKGBUILD 位于 `packaging/aur/puzuz-bin`。当一个发布版本作为稳定版本发布时（与 APT 仓库相同的 `released`
 事件；草稿和预发布版本不会触发），
-`.github/workflows/release-aur.yml` 会运行 `scripts/dist/update-aur.sh <version>`，它从发布版本的 `.sha256`
-文件中获取 tarball 的校验和，计算该标签源码归档的校验和（用于单元和片段），并在 Arch Linux 容器中重新生成
-`.SRCINFO`。然后它将 `PKGBUILD`、`.SRCINFO` 和 `puzuz-bin.install` 推送到
+`.github/workflows/release-aur.yml` 会运行 `scripts/dist/update-aur.sh <version>`，它下载发布版本的 tarball
+及其 `.minisig` 文件，用该标签的 `packaging/minisign.pub` 校验它们（并像 `install.sh` 一样校验 trusted comment
+`puzuz v<version> <file>`），根据校验过的 tarball 和该标签的源码归档（用于单元和片段，签名的资源文件中不包含它们）
+计算 PKGBUILD 的校验和，并在 Arch Linux 容器中重新生成 `.SRCINFO`。然后它将 `PKGBUILD`、`.SRCINFO` 和 `puzuz-bin.install` 推送到
 `ssh://aur@aur.archlinux.org/puzuz-bin.git`。发布版本必须同时包含 x86_64 和 aarch64 的 tarball。
 要在不发布新版本的情况下修改打包，请在 PKGBUILD 中递增 `pkgrel`，并手动运行工作流
 （`gh workflow run release-aur.yml -f version=<X.Y.Z>`）。

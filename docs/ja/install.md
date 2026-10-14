@@ -762,8 +762,10 @@ puzuz doctor
 PKGBUILD は `packaging/aur/puzuz-bin` にあります。リリースが安定版リリースとして公開されると（APT
 リポジトリと同じ `released` イベント。ドラフトやプレリリースでは動きません）、
 `.github/workflows/release-aur.yml` が `scripts/dist/update-aur.sh <version>` を実行します。これは
-リリースの `.sha256` ファイルから tarball のチェックサムを取り、タグのソースアーカイブ（ユニットと断片用）の
-チェックサムを計算し、Arch Linux のコンテナで `.SRCINFO` を再生成します。そして `PKGBUILD`、`.SRCINFO`、
+リリースの tarball とその `.minisig` ファイルをダウンロードし、タグの `packaging/minisign.pub` で（`install.sh`
+と同様に trusted comment `puzuz v<version> <file>` も）確認し、確認した tarball と、タグのソースアーカイブ
+（署名付きのアセットには含まれないユニットと断片用）から PKGBUILD のチェックサムを計算し、Arch Linux の
+コンテナで `.SRCINFO` を再生成します。そして `PKGBUILD`、`.SRCINFO`、
 `puzuz-bin.install` を `ssh://aur@aur.archlinux.org/puzuz-bin.git` に push します。リリースには x86_64 と
 aarch64 の両方の tarball が必要です。新しいリリースなしでパッケージングを変更するには、PKGBUILD の
 `pkgrel` を上げてワークフローを手動で実行します（`gh workflow run release-aur.yml -f version=<X.Y.Z>`）。
