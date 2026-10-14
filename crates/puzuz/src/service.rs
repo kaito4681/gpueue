@@ -444,6 +444,8 @@ fn install_binaries(
             )
         }
     })?;
+    // Nix-built binaries keep loading their loader and libraries from the store.
+    gc_root::check_store_trusted(sys, &[&helper, &exe])?;
     let mut copied = Vec::new();
     let mut staged = Vec::new();
     // Both are written before either is put in place, the helper first: a failure never leaves

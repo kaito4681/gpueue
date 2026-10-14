@@ -820,8 +820,15 @@ Built with Nix outside NixOS (`nix build`, then `sudo ./result/bin/puzuz service
 binaries are copied to `/usr/local/bin` like any other build. They still load their libraries
 from the Nix store, so install also registers the store path as a garbage-collector root,
 `/nix/var/nix/gcroots/puzuz` (with `nix-store --add-root /nix/var/nix/gcroots/puzuz --realise
-<store path>`). If `nix-store` is not found or fails, install warns and prints that command, and
-a root recorded earlier is kept. Whether the root is still needed is decided from the installed
+<store path>`). Only a `nix-store` that nobody but root can replace is run (the one in root's
+`PATH`, else `/nix/var/nix/profiles/default/bin/nix-store` or
+`/run/current-system/sw/bin/nix-store`). If none is found or it fails, install warns and prints
+that command, and a root recorded earlier is kept. Since the helper runs as root with that
+loader and those libraries, install refuses binaries whose loader is in a store someone else can
+change: the loader and every directory above it must be owned by root and not writable by group
+or others, except `/nix/store` itself, which may be group-writable when it is sticky and its
+group is `nixbld` (a multi-user Nix installation; a single-user installation's store belongs to
+its user). Whether the root is still needed is decided from the installed
 binaries themselves (their dynamic loader is in `/nix/store`), so moving a Nix-built copy with
 `--bin-dir` keeps it. `puzuz uninstall` removes the root, and so does installing binaries that
 do not use the store (for example `puzuz update`).

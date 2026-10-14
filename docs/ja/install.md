@@ -840,7 +840,13 @@ NixOS 以外で Nix でビルドした場合（`nix build` のあと `sudo ./res
 バイナリは他のビルドと同じく `/usr/local/bin` にコピーされます。それらはまだ Nix ストアからライブラリを
 読み込むので、install はストアパスをガベージコレクターのルート `/nix/var/nix/gcroots/puzuz` としても登録します
 （`nix-store --add-root /nix/var/nix/gcroots/puzuz --realise <store path>` で）。`nix-store` が見つからないか
-失敗した場合、install は警告を出してそのコマンドを表示し、以前に記録したルートは残します。ルートがまだ必要か
+失敗した場合、install は警告を出してそのコマンドを表示し、以前に記録したルートは残します。実行するのは root 以外
+が置き換えられない `nix-store` だけです（root の `PATH` にあるもの、なければ
+`/nix/var/nix/profiles/default/bin/nix-store` か `/run/current-system/sw/bin/nix-store`）。ヘルパーはその
+ローダーとライブラリで root として動くので、install は他人が変更できるストアにローダーがあるバイナリを拒否
+します。ローダーとその上のすべてのディレクトリが root の所有で、グループやその他から書き込めないことが必要です。
+ただし `/nix/store` 自体は、スティッキーでグループが `nixbld` なら（マルチユーザーの Nix インストール）グループ
+書き込み可でも構いません（シングルユーザーのインストールのストアはそのユーザーのものです）。ルートがまだ必要か
 どうかはインストールされたバイナリそのもの（動的ローダーが `/nix/store` にあるか）から判断されるので、Nix で
 ビルドしたコピーを `--bin-dir` で移動してもルートは保持されます。`puzuz uninstall` はルートを削除し、ストアを
 使わないバイナリ（たとえば `puzuz update`）をインストールしたときも削除されます。

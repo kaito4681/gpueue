@@ -587,6 +587,79 @@ fn the_gc_root_goes_once_the_binaries_no_longer_come_from_the_store() {
 }
 
 #[test]
+fn a_nix_store_root_does_not_own_is_refused() {
+    let sys = nix_build_system();
+    // The interpreter the binaries load (the store path itself exists too).
+    sys.write(NIX_LOADER, "loader");
+    let store = sys.path(Path::new("/nix/store"));
+    // A single-user installation's store: writable by its owner's group (and not sticky).
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(
+        err.contains(&format!(
+            "/home/u/result/bin/puzuz-helper loads its dynamic loader {NIX_LOADER}"
+        )),
+        "{err}"
+    );
+    assert!(err.contains("/nix/store must be owned by root"), "{err}");
+    assert!(err.contains("multi-user Nix installation"), "{err}");
+    assert!(!sys.exists("/usr/local/bin/puzuz-helper"));
+    assert!(!sys.exists("/etc/systemd/system/puzuz-helper.service"));
+    assert!(!sys.ran("systemctl daemon-reload"), "{:?}", sys.commands());
+
+    // A group-writable store path is refused too.
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let glibc = sys.path(Path::new("/nix/store/xyz-glibc-2.40"));
+    std::fs::set_permissions(&glibc, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(
+        err.contains("/nix/store/xyz-glibc-2.40 must be owned by root"),
+        "{err}"
+    );
+    std::fs::set_permissions(&glibc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The store of a multi-user installation (sticky, group nixbld) is accepted.
+    let gid = std::fs::metadata(&store).unwrap().gid();
+    sys.write("/etc/group", &format!("nixbld:x:{gid}:nixbld1\n"));
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o1775)).unwrap();
+    run_install(&sys, &opts()).unwrap();
+    assert_eq!(read_bytes(&sys, "/usr/local/bin/puzuz"), elf(NIX_LOADER));
+}
+
+#[test]
+fn a_nix_store_binary_others_can_replace_is_not_run() {
+    let sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    let nix_store = sys.path(Path::new("/usr/bin/nix-store"));
+    std::fs::set_permissions(&nix_store, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(!sys.ran("nix-store"), "{:?}", sys.commands());
+    assert!(
+        out.contains("warning: did not run /usr/bin/nix-store as root"),
+        "{out}"
+    );
+    assert!(out.contains("sudo nix-store --add-root"), "{out}");
+    assert_eq!(receipt(&sys).gc_root, None);
+
+    // A trusted one in the default profile is used instead.
+    let sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    std::fs::set_permissions(
+        sys.path(Path::new("/usr/bin/nix-store")),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    sys.write_exe("/nix/var/nix/profiles/default/bin/nix-store", "");
+    run_install(&sys, &opts()).unwrap();
+    assert!(
+        sys.ran("nix-store --add-root /nix/var/nix/gcroots/puzuz"),
+        "{:?}",
+        sys.commands()
+    );
+    assert_eq!(receipt(&sys).gc_root, Some(PathBuf::from(GC_ROOT)));
+}
+
+#[test]
 fn bin_dir_installs_copies() {
     let mut sys = FakeSystem::new();
     sys.exe = PathBuf::from("/home/u/target/release/puzuz");

@@ -762,8 +762,12 @@ sudo target/release/puzuz service install
 在 NixOS 以外用 Nix 构建时（`nix build`，然后 `sudo ./result/bin/puzuz service install`），二进制
 文件会像其他构建一样被复制到 `/usr/local/bin`。它们仍从 Nix store 加载库，因此安装时还会把该
 store 路径注册为垃圾回收根 `/nix/var/nix/gcroots/puzuz`（通过 `nix-store --add-root /nix/var/nix/gcroots/puzuz --realise
-<store path>`）。如果找不到 `nix-store` 或它执行失败，安装会发出警告并打印该命令，之前记录的
-根会被保留。是否仍需要该根，是根据已安装的二进制文件本身判断的（其动态加载器位于
+<store path>`）。只会运行除 root 外无人能替换的 `nix-store`（root 的 `PATH` 中的那个，否则为
+`/nix/var/nix/profiles/default/bin/nix-store` 或 `/run/current-system/sw/bin/nix-store`）。如果找不到
+`nix-store` 或它执行失败，安装会发出警告并打印该命令，之前记录的根会被保留。由于 helper 以 root
+身份使用该加载器和这些库运行，安装会拒绝其加载器位于他人可修改的 store 中的二进制文件：加载器及其
+上方的每个目录都必须归 root 所有，且组和其他用户不可写；`/nix/store` 本身例外，当它设置了粘滞位且
+所属组为 `nixbld` 时（多用户 Nix 安装）可以组可写（单用户安装的 store 属于该用户）。是否仍需要该根，是根据已安装的二进制文件本身判断的（其动态加载器位于
 `/nix/store` 中），因此用 `--bin-dir` 移动 Nix 构建的副本时它会被保留。`puzuz uninstall` 会删除
 该根，安装不使用 store 的二进制文件（例如 `puzuz update`）也会删除它。
 
