@@ -3262,9 +3262,9 @@ async fn nice_site_shares_and_group_priority_authorization() {
     let id = alice.add(&request).await;
     assert_eq!(alice.job(id).await.nice, 10);
 
-    // Users may set nice >= 0 on their own jobs only.
+    // Users may raise the nice value of their own jobs only.
     let reply = alice
-        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 0 }))
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 20 }))
         .await;
     assert_eq!(bulk_results(&reply), [(id.0, None)]);
     let reply = alice
@@ -3409,4 +3409,167 @@ async fn restarted_copy_does_not_inherit_a_negative_nice() {
         panic!("no new job: {result:?}");
     };
     assert_eq!(alice.job(new_id).await.nice, 0);
+}
+
+/// `uid`'s raw usage as `GET /v1/shares` shows it (0 if not listed).
+async fn raw_usage(client: &Client, uid: u32) -> f64 {
+    let shares: puzuz_protocol::api::SharesResponse = client.get("/v1/shares").await.json();
+    shares
+        .users
+        .iter()
+        .find(|u| u.uid == Uid(uid))
+        .map_or(0.0, |u| u.raw_usage)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_running_time_is_billed() {
+    // The default calculation period (5 min) never passes here: all usage
+    // comes from jobs leaving the running state.
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let id = alice.add(&job_request("train", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Pausing charges the run so far (CPU-only: billing 1 per second).
+    assert_eq!(
+        alice.action(id, "pause", json!({})).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Paused).await;
+    let paused = raw_usage(&alice, ALICE).await;
+    assert!((0.5..2.0).contains(&paused), "{paused}");
+    // Paused time is not billed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(raw_usage(&alice, ALICE).await, paused);
+
+    // Resumed, then checkpointed: the second run is charged.
+    assert_eq!(
+        alice.action(id, "start", json!(null)).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Running).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        alice.action(id, "checkpoint", json!(null)).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Checkpointed).await;
+    let checkpointed = raw_usage(&alice, ALICE).await;
+    assert!(
+        (0.3..1.5).contains(&(checkpointed - paused)),
+        "{paused} -> {checkpointed}"
+    );
+
+    // Waiting checkpointed, waiting to be restored and being removed while
+    // waiting cost nothing, although the job's started_at is old.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let other = bob.add(&job_request("other", &[])).await;
+    bob.wait_state(other, &JobState::Running).await;
+    assert_eq!(
+        alice.action(id, "restore", json!({})).await.status,
+        StatusCode::OK
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(matches!(
+        alice.job(id).await.state,
+        JobState::RestoreQueued { .. }
+    ));
+    // (Killing it is refused: it does not run; it can only be removed.)
+    assert_eq!(
+        alice.action(id, "kill", json!({})).await.status,
+        StatusCode::CONFLICT
+    );
+    let reply = alice
+        .call(Method::DELETE, &format!("/v1/jobs/{id}"), None)
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(raw_usage(&alice, ALICE).await, checkpointed);
+    h.exit(other, 0).await;
+    bob.wait_state(other, &done(JobResult::Success)).await;
+    assert!(raw_usage(&bob, BOB).await > 0.0);
+
+    // A restored job is billed from the restore on, before any calculation.
+    let id = alice.add(&job_request("again", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    alice.action(id, "checkpoint", json!(null)).await;
+    alice.wait_state(id, &JobState::Checkpointed).await;
+    let before = raw_usage(&alice, ALICE).await;
+    alice.action(id, "restore", json!({})).await;
+    alice.wait_state(id, &JobState::Running).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    h.exit(id, 0).await;
+    alice.wait_state(id, &done(JobResult::Success)).await;
+    let after = raw_usage(&alice, ALICE).await;
+    assert!(
+        (0.3..1.5).contains(&(after - before)),
+        "{before} -> {after}"
+    );
+
+    // Usage and run records survive a restart.
+    h.stop().await;
+    h.start(0).await;
+    assert!(raw_usage(&h.client(ADMIN), ALICE).await >= after * 0.99);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn users_may_only_raise_nice_values() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let id = alice
+        .add(&AddJobRequest {
+            stashed: true,
+            ..job_request("x", &[])
+        })
+        .await;
+    let reply = h
+        .client(ADMIN)
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 10000 }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(id.0, None)]);
+    let reply = alice
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 0 }))
+        .await;
+    let response: BulkJobResponse = reply.json();
+    let puzuz_protocol::api::ActionOutcome::Error { error } = &response.results[0].outcome else {
+        panic!("{response:?}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    assert!(error.message.contains("10000"), "{}", error.message);
+    let reply = alice
+        .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 20000 }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(id.0, None)]);
+    assert_eq!(alice.job(id).await.nice, 20000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_in_place_drops_administrators_grants() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let admin = h.client(ADMIN);
+    let id = alice.add(&job_request("x", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    for (path, body) in [
+        ("/v1/jobs/nice", json!({ "ids": [id.0], "nice": -5 })),
+        ("/v1/jobs/site", json!({ "ids": [id.0], "site": 3 })),
+        ("/v1/jobs/top", json!({ "ids": [id.0] })),
+    ] {
+        assert_eq!(bulk_results(&admin.post(path, body).await), [(id.0, None)]);
+    }
+    h.exit(id, 0).await;
+    alice.wait_state(id, &done(JobResult::Success)).await;
+    // Keep it queued: the default group runs one job at a time.
+    let blocker = alice.add(&job_request("block", &[])).await;
+    alice.wait_state(blocker, &JobState::Running).await;
+    let reply = alice
+        .action(id, "restart", json!({ "in_place": true }))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(alice.job(id).await.nice, 0);
+    let response: puzuz_protocol::api::PriorityResponse = alice.get("/v1/priority").await.json();
+    let p = response.jobs.iter().find(|p| p.id == id).unwrap();
+    assert_eq!((p.nice, p.site), (0, 0));
 }

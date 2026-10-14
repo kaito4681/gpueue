@@ -199,30 +199,35 @@ impl Client {
     }
 
     // -----------------------------------------------------------------------
-    // Groups, GPUs, daemon
+    // Priority and fair share
     // -----------------------------------------------------------------------
 
-    /// `GET /v1/groups`.
+    /// `POST /v1/jobs/nice`.
     pub async fn nice(&self, request: &NiceRequest) -> Result<BulkJobResponse> {
         self.json(&Route::NiceJobs, "", Some(request)).await
     }
 
+    /// `POST /v1/jobs/top`.
     pub async fn top(&self, request: &TopRequest) -> Result<BulkJobResponse> {
         self.json(&Route::TopJobs, "", Some(request)).await
     }
 
+    /// `POST /v1/jobs/site`.
     pub async fn site(&self, request: &SiteRequest) -> Result<BulkJobResponse> {
         self.json(&Route::SiteJobs, "", Some(request)).await
     }
 
+    /// `GET /v1/priority`.
     pub async fn priority(&self) -> Result<PriorityResponse> {
         self.json(&Route::Priority, "", None::<&()>).await
     }
 
+    /// `GET /v1/shares`.
     pub async fn shares(&self) -> Result<SharesResponse> {
         self.json(&Route::ListShares, "", None::<&()>).await
     }
 
+    /// `PUT /v1/shares/{uid}`.
     pub async fn set_shares(&self, uid: Uid, shares: u32) -> Result<()> {
         self.empty(
             &Route::SetShares(uid),
@@ -232,12 +237,18 @@ impl Client {
         .await
     }
 
+    /// `PUT /v1/groups/{name}/priority`.
     pub async fn set_group_priority(&self, name: &str, priority: u32) -> Result<Group> {
         let route = Route::SetGroupPriority(name.to_owned());
         self.json(&route, "", Some(&SetGroupPriorityRequest { priority }))
             .await
     }
 
+    // -----------------------------------------------------------------------
+    // Groups, GPUs, daemon
+    // -----------------------------------------------------------------------
+
+    /// `GET /v1/groups`.
     pub async fn list_groups(&self) -> Result<ListGroupsResponse> {
         self.json(&Route::ListGroups, "", None::<&()>).await
     }

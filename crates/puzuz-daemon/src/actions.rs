@@ -189,12 +189,7 @@ impl Core {
         if let Some(gpu) = spec.gpus.iter().find(|g| !seen.insert(**g)) {
             return Err(Failure::bad_request(format!("GPU {gpu} is listed twice")));
         }
-        if spec.nice < 0 && !caller.is_admin {
-            return Err(Failure::new(
-                ErrorCode::PermissionDenied,
-                "only administrators may set a negative nice value",
-            ));
-        }
+        authz::require_nice_value(&caller, 0, spec.nice)?;
         let helper_ready = self.helper_ready();
         let now = now_ms();
         let core = self.clone();
