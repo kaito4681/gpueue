@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use puzuz_core::authz::{self, AdminOperation};
 use puzuz_core::lifecycle::{self, Action, Effect, Transition};
 use puzuz_core::model::{Caller, Gpu, GpuIndex, Group, Job, JobId, JobState, Timestamp};
-use puzuz_core::storage::{JobFilter, StoreOps};
+use puzuz_core::scheduler::{self, LaunchWait};
+use puzuz_core::storage::{JobFilter, StoreOps, Tx};
 use puzuz_protocol::api::{
     ActionOutcome, AddJobRequest, AddJobResponse, BulkJobRequest, BulkJobResponse, CleanRequest,
     CleanResponse, CreateGroupRequest, ErrorCode, GpuJob, GpuView, JobAction, JobActionResult,
@@ -15,7 +16,7 @@ use puzuz_protocol::api::{
 };
 
 use crate::error::{ApiResult, Failure};
-use crate::state::{Core, JobInfo, Retried, needs_helper, now_ms, targets_live_process};
+use crate::state::{Core, Force, JobInfo, Retried, needs_helper, now_ms, targets_live_process};
 
 fn lifecycle_action(action: &JobAction) -> Action {
     match action {
@@ -52,12 +53,15 @@ fn transition_for(
 }
 
 /// What a successful [`Core::job_action`] reports.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ActionDone {
     /// The job created by `restart` (unless in place).
     pub new_id: Option<JobId>,
     /// The launch the action asked for waits for the helper to connect.
     pub launch_pending: bool,
+    /// The launch the action asked for (a non-administrator's) waits in
+    /// line for a GPU slot or its paused group, and why.
+    pub waiting: Option<LaunchWait>,
 }
 
 impl ActionDone {
@@ -65,8 +69,28 @@ impl ActionDone {
         ActionOutcome::Ok {
             new_id: self.new_id,
             launch_pending: self.launch_pending,
+            waiting: self.waiting,
         }
     }
+}
+
+/// Whether the launch an action asked for waits in line: for the helper
+/// to connect (`pending`), or, for a non-administrator, for a GPU slot or
+/// a paused group (`waiting`).
+#[derive(Debug, Default)]
+struct LaunchState {
+    pending: bool,
+    waiting: Option<LaunchWait>,
+}
+
+/// How a launching action launches its job.
+enum LaunchPlan {
+    /// Right away, with the action's own transition.
+    Now,
+    /// It waits in line, ahead of the queue (the helper is not connected,
+    /// or, with `Some`, a non-administrator's launch waits for a GPU slot
+    /// or a paused group).
+    Queue(Option<LaunchWait>),
 }
 
 /// A launch (`Spawn` or `Restore`) among the effects.
@@ -139,12 +163,19 @@ impl Core {
                     .map(|job| JobInfo {
                         checkpoint: checkpoints.remove(&job.id),
                         error: errors.remove(&job.id),
+                        waiting: None,
                         job,
                     })
                     .collect::<Vec<_>>())
             })
             .await?;
-        Ok(infos.iter().map(|info| info.view(&caller)).collect())
+        Ok(infos
+            .into_iter()
+            .map(|mut info| {
+                info.waiting = self.launch_wait(info.job.id);
+                info.view(&caller)
+            })
+            .collect())
     }
 
     pub async fn job_info(&self, id: JobId) -> ApiResult<JobInfo> {
@@ -153,6 +184,10 @@ impl Core {
             None => Ok(None),
         })
         .await?
+        .map(|mut info| {
+            info.waiting = self.launch_wait(id);
+            info
+        })
         .ok_or_else(|| job_not_found(id))
     }
 
@@ -161,9 +196,11 @@ impl Core {
     // -----------------------------------------------------------------
 
     /// `POST /v1/jobs`. With `immediate` the job starts right away,
-    /// ignoring slots; while the helper is not connected it is added as
-    /// queued instead and started (still ignoring slots) as soon as the
-    /// helper is back, which the response points out.
+    /// ignoring its group's slots (an administrator's also GPU slots and a
+    /// paused group); while the helper is not connected, or a
+    /// non-administrator's job has to wait for a GPU slot or its paused
+    /// group, it is added as queued instead and started ahead of the queue
+    /// as soon as it may, which the response points out.
     pub async fn add_job(
         self: &Arc<Self>,
         caller: Caller,
@@ -193,7 +230,7 @@ impl Core {
         let helper_ready = self.helper_ready();
         let now = now_ms();
         let core = self.clone();
-        let (job, effects) = self
+        let (job, effects, waiting) = self
             .write(move |tx, ch| {
                 if tx.get_group(&spec.group)?.is_none() {
                     return Err(puzuz_core::Error::GroupNotFound(spec.group.clone()).into());
@@ -235,20 +272,27 @@ impl Core {
                 let mut job = tx.insert_job(caller.uid, &spec, &state, now)?;
                 ch.added(job.id);
                 let mut effects = Vec::new();
+                let mut waiting = None;
                 if request.immediate {
-                    let t = if helper_ready {
-                        lifecycle::start(&job)?
-                    } else {
-                        lifecycle::queue_for_launch(&job, now)?
+                    let force = Force::of(&caller);
+                    let t = match core.launch_plan(tx, &job, force, helper_ready, now)? {
+                        LaunchPlan::Now => lifecycle::start(&job)?,
+                        LaunchPlan::Queue(wait) => {
+                            waiting = wait;
+                            lifecycle::queue_for_launch(&job, now)?
+                        }
                     };
                     core.apply_in_tx(tx, &mut job, &t, now, ch)?;
                     // Also when starting now: should the helper not start
                     // it after all (it is stopping), it is retried the same
                     // way.
-                    core.force_launch(job.id);
+                    core.force_launch(job.id, force);
+                    if let Some(wait) = &waiting {
+                        core.set_launch_wait(job.id, wait.clone());
+                    }
                     effects = t.effects;
                 }
-                Ok((job, effects))
+                Ok((job, effects, waiting))
             })
             .await?;
         let mut launch_pending = request.immediate && !helper_ready;
@@ -264,6 +308,7 @@ impl Core {
         Ok(AddJobResponse {
             id: job.id,
             launch_pending,
+            waiting,
         })
     }
 
@@ -281,10 +326,13 @@ impl Core {
     /// that point (so it fails cleanly if the spawn failed).
     ///
     /// Launching actions (`start` of a queued or stashed job, `restore
-    /// --immediate`, `restart --immediate`) ignore slots. While the helper
-    /// is not connected they do not fail: the job is queued (or queued for
-    /// restore) and launched, still ignoring slots, as soon as the helper
-    /// is back ([`ActionDone::launch_pending`]). Actions on a live process
+    /// --immediate`, `restart --immediate`) skip the queue and ignore the
+    /// group's slots; an administrator's also GPU slots and a paused group,
+    /// anybody else's wait for those ([`ActionDone::waiting`], see
+    /// [`Core::launch_plan`]). While the helper is not connected they do
+    /// not fail: the job is queued (or queued for restore) and launched,
+    /// still ahead of the queue, as soon as the helper is back
+    /// ([`ActionDone::launch_pending`]). Actions on a live process
     /// (`start` of a paused job, `pause`, `kill`, `checkpoint`) need the
     /// helper and fail with `helper_unavailable` instead.
     pub async fn job_action(
@@ -295,7 +343,7 @@ impl Core {
         removed_together: Vec<JobId>,
     ) -> ApiResult<ActionDone> {
         self.reject_if_shutting_down()?;
-        let (job, effects, copy, launch_pending) = loop {
+        let (job, effects, copy, launch) = loop {
             let step = self
                 .job_action_tx(caller, id, action.clone(), removed_together.clone())
                 .await?;
@@ -305,7 +353,7 @@ impl Core {
                 None => self.wait_for_launch(id).await?,
             }
         };
-        let mut launch_pending = launch_pending;
+        let mut launch_pending = launch.pending;
         let result = self.run_launch_effects(&job, &effects).await;
         if let Some((copy, effects)) = &copy {
             // Run even if the first effects failed: the copy may be launching.
@@ -315,6 +363,7 @@ impl Core {
         Ok(ActionDone {
             new_id: copy.map(|(copy, _)| copy.id),
             launch_pending,
+            waiting: launch.waiting,
         })
     }
 
@@ -384,7 +433,7 @@ impl Core {
     /// nothing, when the action targets the live process and the job's
     /// launch is still in flight. Otherwise returns the job and the effects
     /// to run, the job created by `restart` and its effects, and whether a
-    /// launch waits for the helper.
+    /// launch waits in line ([`LaunchState`]).
     #[allow(clippy::type_complexity)]
     async fn job_action_tx(
         self: &Arc<Self>,
@@ -392,7 +441,7 @@ impl Core {
         id: JobId,
         action: JobAction,
         removed_together: Vec<JobId>,
-    ) -> ApiResult<Option<(Job, Vec<Effect>, Option<(Job, Vec<Effect>)>, bool)>> {
+    ) -> ApiResult<Option<(Job, Vec<Effect>, Option<(Job, Vec<Effect>)>, LaunchState)>> {
         let helper_ready = self.helper_ready();
         let now = now_ms();
         let core = self.clone();
@@ -411,14 +460,20 @@ impl Core {
                 let launch = launches(&transition.effects);
                 // A launch waits for the helper instead of failing.
                 let launch_pending = !helper_ready && (launch || immediate_copy);
-                if launch && !helper_ready {
+                if launch || immediate_copy {
+                    core.require_gpus_available(&job.spec.gpus)?;
+                }
+                let force = Force::of(&caller);
+                let mut waiting = None;
+                if launch
+                    && let LaunchPlan::Queue(wait) =
+                        core.launch_plan(tx, &job, force, helper_ready, now)?
+                {
                     transition = lifecycle::queue_for_launch(&job, now)?;
+                    waiting = wait;
                 }
                 if !helper_ready && transition.effects.iter().any(needs_helper) {
                     return Err(Core::helper_unavailable());
-                }
-                if launch || immediate_copy {
-                    core.require_gpus_available(&job.spec.gpus)?;
                 }
                 if action == JobAction::Remove {
                     let all = tx.list_jobs(&JobFilter::all())?;
@@ -441,28 +496,42 @@ impl Core {
                     // Also when launching now: should the helper not start
                     // it after all (it is stopping), it is retried the same
                     // way.
-                    core.force_launch(id);
+                    core.force_launch(id, force);
+                    if let Some(wait) = &waiting {
+                        core.set_launch_wait(id, wait.clone());
+                    }
                 }
                 let copy = match copy {
                     Some(mut copy) if immediate_copy => {
-                        core.force_launch(copy.id);
-                        if helper_ready {
-                            let start = lifecycle::start(&copy)?;
-                            core.apply_in_tx(tx, &mut copy, &start, now, ch)?;
-                            Some((copy, start.effects))
-                        } else {
-                            Some((copy, Vec::new()))
+                        core.force_launch(copy.id, force);
+                        match core.launch_plan(tx, &copy, force, helper_ready, now)? {
+                            LaunchPlan::Now => {
+                                let start = lifecycle::start(&copy)?;
+                                core.apply_in_tx(tx, &mut copy, &start, now, ch)?;
+                                Some((copy, start.effects))
+                            }
+                            LaunchPlan::Queue(wait) => {
+                                if let Some(wait) = &wait {
+                                    core.set_launch_wait(copy.id, wait.clone());
+                                }
+                                waiting = wait;
+                                Some((copy, Vec::new()))
+                            }
                         }
                     }
                     Some(copy) => Some((copy, Vec::new())),
                     None => None,
                 };
+                let launch = LaunchState {
+                    pending: launch_pending,
+                    waiting,
+                };
                 if action == JobAction::Remove {
                     tx.remove_job(id)?;
                     ch.removed(id);
-                    return Ok(Some((snapshot, transition.effects, copy, launch_pending)));
+                    return Ok(Some((snapshot, transition.effects, copy, launch)));
                 }
-                Ok(Some((job, transition.effects, copy, launch_pending)))
+                Ok(Some((job, transition.effects, copy, launch)))
             })
             .await
     }
@@ -776,6 +845,53 @@ impl Core {
     // -----------------------------------------------------------------
     // GPUs
     // -----------------------------------------------------------------
+
+    /// How a launching action (`start` of a queued or stashed job, `add
+    /// --immediate`, `restore --immediate`, `restart --immediate`) with
+    /// `force` launches `job`: right away, or waiting in line while the
+    /// helper is not connected or, for a non-administrator, while one of
+    /// its GPUs has no free slot or its group is paused (decided like the
+    /// scheduler would, with the job forced: see
+    /// [`scheduler::Reserved::forced`]).
+    fn launch_plan(
+        &self,
+        tx: &Tx<'_>,
+        job: &Job,
+        force: Force,
+        helper_ready: bool,
+        now: Timestamp,
+    ) -> ApiResult<LaunchPlan> {
+        if !helper_ready {
+            return Ok(LaunchPlan::Queue(None));
+        }
+        if force == Force::IgnoreLimits {
+            return Ok(LaunchPlan::Now);
+        }
+        let mut queued = job.clone();
+        lifecycle::queue_for_launch(job, now)?.apply(&mut queued, now);
+        let mut jobs = tx.list_unfinished_jobs()?;
+        jobs.retain(|j| j.id != job.id);
+        jobs.push(queued);
+        let groups = tx.list_groups()?;
+        let gpus: Vec<Gpu> = tx
+            .list_gpus()?
+            .into_iter()
+            .filter(|gpu| self.gpu_available(gpu.index))
+            .collect();
+        let mut reserved = self.orphan_reservations();
+        reserved.forced = self.queue_jumping_launches();
+        reserved.forced.insert(job.id);
+        let plan = scheduler::plan_with(now, &jobs, &groups, &gpus, &reserved);
+        if plan.start.contains(&job.id) || plan.restore.contains(&job.id) {
+            return Ok(LaunchPlan::Now);
+        }
+        let wait = plan
+            .waiting
+            .into_iter()
+            .find(|(id, _)| *id == job.id)
+            .map_or(LaunchWait::Unavailable, |(_, wait)| wait);
+        Ok(LaunchPlan::Queue(Some(wait)))
+    }
 
     /// Rejects launching on (or submitting for) a GPU that was not detected
     /// at start-up. Jobs already queued for one simply wait.

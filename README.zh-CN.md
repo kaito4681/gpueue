@@ -144,7 +144,7 @@ puzuz follow 0        # stream the output, like tail -f
 ```sh
 puzuz checkpoint 0    # save job 0 to disk and stop it; frees the GPU. State: Checkpointed
 puzuz restore 0       # queue it again; it resumes once its group and GPUs have a free slot
-puzuz restore -i 0    # ...or resume right away, ignoring slot limits
+puzuz restore -i 0    # ...or resume right away, ahead of the queue (see "GPU slots")
 ```
 
 恢复后的作业从创建检查点的那一刻继续运行。它保留原来的作业 id，其输出会追加到同一个日志中。
@@ -187,6 +187,7 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | `send` | 向任务的 stdin 发送输入 | 不支持：作业的 stdin 是 `/dev/null`。请让命令以非交互方式运行。 |
 | `shutdown` | 终止所有任务并停止守护进程 | 仅限管理员。为所有运行中的作业创建检查点，然后停止守护进程。检查点被拒绝的作业会继续运行。`--no-checkpoint` 则改为终止它们。 |
 | `restart` | 已结束的任务 | 也适用于 `Checkpointed` 作业：它们作为新作业从头开始，镜像会被保留 |
+| `start <id>`、`add -i`、`restart -i`（以及 `restore -i`） | 忽略所有限制，立即启动任务 | 跳过队列和组的 `parallel` 限制，但会等待作业的 GPU 出现空闲槽位、等待暂停的组被恢复；只有管理员的即时启动会忽略所有限制（参见 [GPU 槽位](#gpu-slots)） |
 | `reset`、`-a/--all`、`-g/--group` | 所有任务 | 你自己的作业。管理员作用于所有人的作业。 |
 | `pause/start/kill -a`、`-g` | 同时暂停/继续这些组 | 只有管理员会暂停/继续组；对其他用户而言，组保持原样 |
 | 用语 | "task" | "job"。为了兼容，保留了 `--print-task-id` 等选项名。 |
@@ -202,7 +203,7 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | `add --gpu <LIST>` | 作业运行所用的 GPU，例如 `0` 或 `0,1`。不指定时作业仅使用 CPU（`CUDA_VISIBLE_DEVICES` 为空）。 |
 | `add --no-checkpoint` | 从不为该作业创建检查点；关机时将其终止 |
 | `checkpoint [IDS] [-g GROUP] [-a]` | 保存运行中的作业并停止它们 |
-| `restore [IDS] [-g GROUP] [-a] [-i]` | 继续运行 `Checkpointed` 作业（`-i`：立即运行，忽略空闲槽位） |
+| `restore [IDS] [-g GROUP] [-a] [-i]` | 继续运行 `Checkpointed` 作业（`-i`：与 `start` 一样，排在队列前面立即运行） |
 | `gpu [-j]`、`gpu parallel <N> [--gpu LIST]` | 列出 GPU，或设置每块 GPU 的作业数上限（管理员） |
 | `add --nice <N>`、`nice <IDS>... <N>` | 将作业的优先级降低 `N`（Slurm 的 nice；负值仅限管理员） |
 | `top <IDS>...` | 将作业移到你自己队列的最前面（Slurm 的 `scontrol top`） |
@@ -247,6 +248,8 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - `checkpoint_size_bytes`、`details`、`details.last_error`、作业的 `nice` 以及组的
   `priority` 在不适用（或为 0）时省略。
   对于其他用户的作业，`label` 为 null，`details` 不存在，`reason` 为 `"<redacted>"`。
+- `waiting` 只出现在由非管理员立即启动、但正在等待 GPU 槽位或其暂停的组的排队作业上：
+  `{"reason": "gpu_slots", "gpus": [0]}`、`{"reason": "group_paused"}` 或 `{"reason": "unavailable"}`。
 - `puzuz log --json` 输出 `{"<id>": {"job": <job>, "output": "..."}}`。`puzuz group --json`
   输出 `{"groups": [...]}`。`puzuz gpu --json` 输出
   `{"gpus": [{"index", "uuid", "name", "memory_total_bytes", "driver_version", "parallel",
@@ -283,6 +286,8 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   普通用户运行 `pause/start/kill -g` 或 `-a` 时，只有其自己的作业受影响，任何组的暂停状态都不会改变
   （此时 `pause --wait` 什么也不做）。输出会说明发生的是哪种情况
   （`All groups are being paused.` 或 `Your jobs are being paused: 3, 4`）。
+- **管理员的即时启动**（`start <id>`、`add -i`、`restart -i`、`restore -i`）会忽略 GPU 槽位和暂停的组；
+  其他用户的即时启动则会等待它们（参见 [GPU 槽位](#gpu-slots)）。
 - 管理员是 root 以及 `puzuz-admin` 组的成员（主组或附加组均可）。每次请求都会进行检查，因此
   `usermod -aG puzuz-admin <user>` 会立即生效。
 
@@ -298,6 +303,11 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   `CUDA_DEVICE_ORDER=PCI_BUS_ID` 的顺序相同。在作业内部，`CUDA_VISIBLE_DEVICES` 列出所申请的
   GPU，因此程序看到的是 `cuda:0`、`cuda:1`……
 - 组的行为与 pueue 相同（`default` 组初始为 `parallel 1`）。两种限制同时生效。
+- 立即启动（`start <id>`、`add -i`、`restart -i`、`restore -i`）与 pueue 一样会跳过队列和组的 `parallel`
+  限制，但不会跳过 GPU 槽位和暂停的组：如果作业的某个 GPU 没有空闲槽位，或者它的组已暂停，作业会等待，
+  并在情况改变后立即先于其他所有排队作业启动。命令会说明这一点，`status` 会显示例如
+  `Queued (waiting for a GPU slot)`。只有管理员的即时启动会忽略 GPU 槽位和暂停的组，因此普通用户无法让
+  GPU 超出管理员设定的限制。
 - GPU 在守护进程启动时通过 NVML 检测（配置中的 `[[gpus]]` 列表只是后备）。添加或移除 GPU 后请重启
   `puzuz.service`。`puzuz doctor` 会将守护进程检测到的内容与 `nvidia-smi` 进行比较。
 

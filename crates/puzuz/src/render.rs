@@ -11,7 +11,8 @@ use puzuz_core::authz::REDACTED;
 use puzuz_core::model::{DEFAULT_GROUP, Group, JobId, JobResult, JobState};
 use puzuz_core::priority::PriorityType;
 use puzuz_protocol::api::{
-    ActionOutcome, GpuView, JobActionResult, JobView, OrphanJob, PriorityResponse, SharesResponse,
+    ActionOutcome, GpuView, JobActionResult, JobView, LaunchWait, OrphanJob, PriorityResponse,
+    SharesResponse,
 };
 
 use crate::clock::{Clock, human_bytes};
@@ -51,6 +52,11 @@ impl RenderCtx {
 /// and colors, plus the puzuz checkpoint states).
 pub fn state_text(job: &JobView) -> (String, Color) {
     match &job.state {
+        JobState::Queued { .. } | JobState::RestoreQueued { .. } if job.waiting.is_some() => {
+            let name = state_name(&job.state);
+            let why = job.waiting.as_ref().map_or("", launch_wait_short);
+            (format!("{name} ({why})"), Color::Yellow)
+        }
         JobState::Queued { .. } => ("Queued".into(), Color::Yellow),
         JobState::Stashed { .. } => ("Stashed".into(), Color::Yellow),
         JobState::Running => ("Running".into(), Color::Green),
@@ -94,6 +100,48 @@ pub fn state_text(job: &JobView) -> (String, Color) {
             JobResult::Lost => ("Lost".into(), Color::Red),
         },
     }
+}
+
+/// Why a forced launch waits, in a few words (for the status table).
+fn launch_wait_short(wait: &LaunchWait) -> &'static str {
+    match wait {
+        LaunchWait::GpuSlots { .. } => "waiting for a GPU slot",
+        LaunchWait::GroupPaused => "waiting, group paused",
+        LaunchWait::Unavailable => "waiting, GPU or group unavailable",
+    }
+}
+
+/// Why a forced launch waits, as a sentence part ("as soon as ...").
+fn launch_wait_until(wait: &LaunchWait) -> String {
+    match wait {
+        LaunchWait::GpuSlots { gpus } => {
+            let list: Vec<String> = gpus.iter().map(|g| g.to_string()).collect();
+            let (noun, verb) = if gpus.len() == 1 {
+                ("GPU", "has")
+            } else {
+                ("GPUs", "have")
+            };
+            format!(
+                "{noun} {} {verb} a free slot (see `puzuz gpu`)",
+                list.join(", ")
+            )
+        }
+        LaunchWait::GroupPaused => "its group is resumed (it is paused)".into(),
+        LaunchWait::Unavailable => {
+            "its group and all of its GPUs are available (see `puzuz group` and `puzuz gpu`)".into()
+        }
+    }
+}
+
+/// Said when a job was to be started (or restored) right away but waits in
+/// line: only administrators' immediate launches ignore GPU slots and
+/// paused groups.
+pub fn launch_wait_note(id: JobId, wait: &LaunchWait) -> String {
+    format!(
+        "Job {id} will start ahead of the queue as soon as {} \
+         (only the group's parallel limit is skipped).",
+        launch_wait_until(wait)
+    )
 }
 
 /// The last error the daemon recorded for the job (owner's view only).
@@ -619,12 +667,16 @@ pub fn action_report(
     for result in &succeeded {
         if let ActionOutcome::Ok {
             new_id,
-            launch_pending: true,
+            launch_pending,
+            waiting,
         } = &result.outcome
         {
-            report
-                .stdout
-                .push(launch_pending_note(new_id.unwrap_or(result.id)));
+            let id = new_id.unwrap_or(result.id);
+            if *launch_pending {
+                report.stdout.push(launch_pending_note(id));
+            } else if let Some(wait) = waiting {
+                report.stdout.push(launch_wait_note(id, wait));
+            }
         }
     }
 
@@ -655,6 +707,19 @@ fn log_state_text(job: &JobView) -> (String, Color) {
         JobState::Running => ("running".into(), Color::Yellow),
         JobState::Checkpointing => ("checkpointing".into(), Color::Yellow),
         JobState::Checkpointed => ("checkpointed".into(), Color::Cyan),
+        JobState::RestoreQueued { .. } | JobState::Queued { .. } if job.waiting.is_some() => {
+            let what = if matches!(job.state, JobState::Queued { .. }) {
+                "queued"
+            } else {
+                "queued for restore"
+            };
+            let until = job
+                .waiting
+                .as_ref()
+                .map(launch_wait_until)
+                .unwrap_or_default();
+            (format!("{what}, starts as soon as {until}"), Color::Yellow)
+        }
         JobState::RestoreQueued { .. } => ("queued for restore".into(), Color::Yellow),
         JobState::Restoring => ("restoring".into(), Color::Yellow),
         JobState::Terminating { .. } => ("terminating".into(), Color::Red),

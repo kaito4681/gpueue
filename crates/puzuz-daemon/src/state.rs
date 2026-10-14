@@ -98,6 +98,9 @@ pub struct JobInfo {
     pub checkpoint: Option<CheckpointRecord>,
     /// The last error recorded for the job (a failed restore).
     pub error: Option<JobError>,
+    /// Why the job, a forced launch, waits in line (see
+    /// [`Core::launch_wait`]).
+    pub waiting: Option<scheduler::LaunchWait>,
 }
 
 impl JobInfo {
@@ -108,6 +111,7 @@ impl JobInfo {
             job,
             checkpoint,
             error,
+            waiting: None,
         })
     }
 
@@ -115,6 +119,7 @@ impl JobInfo {
     /// error (owner and administrators only) filled in.
     pub fn view(&self, caller: &Caller) -> JobView {
         let mut view = JobView::for_caller(&self.job, caller);
+        view.waiting = self.waiting.clone();
         if let Some(record) = &self.checkpoint
             && record.status == CheckpointStatus::Complete
         {
@@ -254,6 +259,41 @@ fn is_launch_state(state: &JobState) -> bool {
             | JobState::Running
             | JobState::Restoring
     )
+}
+
+/// How far a forced launch (see [`Core::force_launch`]) may ignore limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Force {
+    /// An administrator's: launched right away, ignoring the group's and
+    /// the GPUs' slots and a paused group.
+    IgnoreLimits,
+    /// Anybody else's: ahead of the queue and ignoring the group's
+    /// `parallel` limit (and dependencies), but waiting for a free slot on
+    /// its GPUs and for its group to be resumed (see
+    /// [`scheduler::Reserved::forced`]).
+    JumpQueue,
+}
+
+impl Force {
+    /// The force `caller`'s launching actions have.
+    pub fn of(caller: &Caller) -> Self {
+        if caller.is_admin {
+            Force::IgnoreLimits
+        } else {
+            Force::JumpQueue
+        }
+    }
+}
+
+/// Swaps the entries of `a` and `b` in `map`.
+fn swap_entries<V>(map: &mut HashMap<JobId, V>, a: JobId, b: JobId) {
+    let (va, vb) = (map.remove(&a), map.remove(&b));
+    if let Some(v) = va {
+        map.insert(b, v);
+    }
+    if let Some(v) = vb {
+        map.insert(a, v);
+    }
 }
 
 /// Whether an effect acts on the job's live process, which the helper only
@@ -434,13 +474,18 @@ pub struct Core {
     /// lost or timed out), with the state that launch put them in
     /// (`Running` or `Restoring`); see [`Core::spawn_lost_check`].
     unconfirmed_launches: Mutex<HashMap<JobId, JobState>>,
-    /// Jobs to launch regardless of free slots (`start`, `add
-    /// --immediate`, `restore --immediate`, `restart --immediate`), kept
-    /// until they leave the queued, running and restoring states. While
-    /// one is queued (the helper was not connected, or did not start it),
-    /// the scheduler launches it as soon as it can, ignoring slots. Kept in
-    /// memory only: after a daemon restart such a job waits for a slot.
-    forced: Mutex<HashSet<JobId>>,
+    /// Jobs to launch ahead of the queue (`start`, `add --immediate`,
+    /// `restore --immediate`, `restart --immediate`) and how far they may
+    /// ignore limits ([`Force`]), kept until they leave the queued, running
+    /// and restoring states. While one is queued (the helper was not
+    /// connected or did not start it, or a non-administrator's launch waits
+    /// for a GPU slot or a paused group), the scheduler launches it as soon
+    /// as it may. Kept in memory only: after a daemon restart such a job
+    /// waits in line like any other.
+    forced: Mutex<HashMap<JobId, Force>>,
+    /// Why forced launches that wait in line cannot launch yet, as of the
+    /// last scheduling round (shown by `status`).
+    launch_waits: Mutex<HashMap<JobId, scheduler::LaunchWait>>,
     /// See [`LaunchCheckHook`].
     launch_check_hook: Mutex<Option<LaunchCheckHook>>,
     /// Checkpoint size warnings (see [`crate::usage`]).
@@ -485,7 +530,8 @@ impl Core {
             launches: Launches::default(),
             launch_slots: Semaphore::new(MAX_CONCURRENT_LAUNCHES),
             unconfirmed_launches: Mutex::new(HashMap::new()),
-            forced: Mutex::new(HashSet::new()),
+            forced: Mutex::new(HashMap::new()),
+            launch_waits: Mutex::new(HashMap::new()),
             launch_check_hook: Mutex::new(None),
             size_warnings: Mutex::default(),
         })
@@ -558,10 +604,33 @@ impl Core {
         }
     }
 
-    /// Marks `id` to be launched regardless of free slots (see
-    /// [`Core::forced`]).
-    pub fn force_launch(&self, id: JobId) {
-        self.forced.lock().unwrap().insert(id);
+    /// Marks `id` to be launched ahead of the queue, ignoring the limits
+    /// `force` allows (see [`Core::forced`]).
+    pub fn force_launch(&self, id: JobId, force: Force) {
+        self.forced.lock().unwrap().insert(id, force);
+    }
+
+    /// The forced launches that wait for GPU slots and paused groups
+    /// ([`Force::JumpQueue`]).
+    pub(crate) fn queue_jumping_launches(&self) -> HashSet<JobId> {
+        self.forced
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, force)| **force == Force::JumpQueue)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Records why forced launch `id` waits in line (see
+    /// [`Core::launch_waits`]).
+    pub(crate) fn set_launch_wait(&self, id: JobId, wait: scheduler::LaunchWait) {
+        self.launch_waits.lock().unwrap().insert(id, wait);
+    }
+
+    /// Why forced launch `id` waits in line, if it does.
+    pub fn launch_wait(&self, id: JobId) -> Option<scheduler::LaunchWait> {
+        self.launch_waits.lock().unwrap().get(&id).cloned()
     }
 
     /// Testing only: see [`LaunchCheckHook`].
@@ -623,7 +692,7 @@ impl Core {
                             s.get_job(id)?.map(|job| job.state),
                             Some(JobState::Queued { .. } | JobState::RestoreQueued { .. })
                         );
-                        if waiting && core.forced.lock().unwrap().contains(&id) {
+                        if waiting && core.forced.lock().unwrap().contains_key(&id) {
                             Retried::Pending
                         } else {
                             Retried::No
@@ -713,17 +782,11 @@ impl Core {
 
     /// Swaps what is kept in memory under the ids of two jobs `switch`
     /// swaps (inside the transaction that swaps them in the database): the
-    /// "launch regardless of slots" mark and the launch records.
+    /// "launch ahead of the queue" mark, why it waits, and the launch
+    /// records.
     pub(crate) fn swap_in_memory(&self, a: JobId, b: JobId) {
-        let mut forced = self.forced.lock().unwrap();
-        let (has_a, has_b) = (forced.remove(&a), forced.remove(&b));
-        if has_a {
-            forced.insert(b);
-        }
-        if has_b {
-            forced.insert(a);
-        }
-        drop(forced);
+        swap_entries(&mut self.forced.lock().unwrap(), a, b);
+        swap_entries(&mut self.launch_waits.lock().unwrap(), a, b);
         self.launches.swap(a, b);
     }
 
@@ -901,7 +964,10 @@ impl Core {
         let mut seen = HashSet::new();
         let removed: HashSet<JobId> = changes.removed.iter().copied().collect();
         let load = |id: JobId| match store.get_job(id) {
-            Ok(Some(job)) => JobInfo::load(store, job).ok().map(Arc::new),
+            Ok(Some(job)) => JobInfo::load(store, job).ok().map(|mut info| {
+                info.waiting = self.launch_wait(id);
+                Arc::new(info)
+            }),
             _ => None,
         };
         for &id in &changes.added {
@@ -975,6 +1041,12 @@ impl Core {
             }
             if !is_launch_state(&job.state) {
                 self.forced.lock().unwrap().remove(&job.id);
+            }
+            if !matches!(
+                job.state,
+                JobState::Queued { .. } | JobState::RestoreQueued { .. }
+            ) {
+                self.launch_waits.lock().unwrap().remove(&job.id);
             }
             if restored {
                 // The job runs again; an earlier failed attempt is history.
@@ -1201,7 +1273,7 @@ impl Core {
     /// since: it must still be in `launched` (`Running` after a spawn,
     /// `Restoring` after a restore) and, if given, have the `started_at`
     /// that identifies the launch. Returns whether it was requeued. A job
-    /// that was to be launched regardless of slots stays so.
+    /// that was to be launched ahead of the queue stays so.
     async fn requeue_unstarted(
         self: &Arc<Self>,
         id: JobId,
@@ -2091,20 +2163,24 @@ impl Core {
                 // Finished jobs only matter as dependencies.
                 let mut jobs = tx.list_unfinished_jobs()?;
                 let groups = tx.list_groups()?;
-                let reserved = core.orphan_reservations();
+                let mut reserved = core.orphan_reservations();
                 let mut launched = Vec::new();
-                // Forced launches first, ignoring slots; they still take
-                // theirs, which the plan below accounts for.
-                let forced: HashSet<JobId> = {
+                let forced: HashMap<JobId, Force> = {
                     let mut forced = core.forced.lock().unwrap();
-                    forced.retain(|id| {
+                    forced.retain(|id, _| {
                         jobs.iter()
                             .any(|j| j.id == *id && is_launch_state(&j.state))
                     });
                     forced.clone()
                 };
+                // An administrator's forced launches first, ignoring every
+                // limit; they still take their slots, which the plan below
+                // accounts for.
                 if launch {
-                    for job in jobs.iter_mut().filter(|j| forced.contains(&j.id)) {
+                    for job in jobs
+                        .iter_mut()
+                        .filter(|j| forced.get(&j.id) == Some(&Force::IgnoreLimits))
+                    {
                         let queued = matches!(
                             job.state,
                             JobState::Queued { .. } | JobState::RestoreQueued { .. }
@@ -2126,6 +2202,13 @@ impl Core {
                     .into_iter()
                     .filter(|gpu| core.gpu_available(gpu.index))
                     .collect();
+                // Everybody else's go first in the plan, within GPU slots
+                // and unpaused groups.
+                reserved.forced = forced
+                    .iter()
+                    .filter(|(_, force)| **force == Force::JumpQueue)
+                    .map(|(id, _)| *id)
+                    .collect::<HashSet<_>>();
                 let fairshare = core.fairshare_factors();
                 let input = scheduler::PriorityInput {
                     params: &core.priority_params,
@@ -2134,6 +2217,13 @@ impl Core {
                 };
                 let plan =
                     scheduler::plan_prioritized(now, &jobs, &groups, &gpus, &reserved, &input);
+                {
+                    let mut waits = core.launch_waits.lock().unwrap();
+                    waits.clear();
+                    if launch {
+                        waits.extend(plan.waiting.iter().cloned());
+                    }
+                }
                 let mut by_id: HashMap<JobId, Job> = jobs.into_iter().map(|j| (j.id, j)).collect();
                 for id in &plan.enqueue {
                     let Some(job) = by_id.get_mut(id) else {
@@ -2145,7 +2235,7 @@ impl Core {
                 }
                 for id in &plan.dependency_failed {
                     // A forced start ignores dependencies.
-                    if forced.contains(id) {
+                    if forced.contains_key(id) {
                         continue;
                     }
                     let Some(job) = by_id.get_mut(id) else {

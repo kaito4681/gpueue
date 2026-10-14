@@ -40,7 +40,13 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
 2. **Scheduling.** A queued job starts when its group has a free slot and every requested GPU has
    a free slot. Candidates are considered in priority order (see
    [Priority and fair share](#priority-and-fair-share)). The daemon then asks the helper to spawn
-   it.
+   it. Immediate launches (`start <id>`, `add -i`, `restart -i`, `restore -i`) are marked as
+   forced, in memory. An administrator's is launched at once, ignoring every limit. Anybody else's
+   is part of the plan (`scheduler::Reserved::forced`): it goes before every other candidate and
+   skips the group's `parallel` limit and its dependencies, but it still needs a free slot on each
+   of its GPUs and an unpaused group. The action checks this in the same transaction, so a launch
+   that fits starts right away and one that does not is queued with the reason
+   (`scheduler::LaunchWait`), which the reply and the job's view (`waiting`) carry.
 3. **Daemon → helper.** The daemon keeps one connection to `/run/puzuz/helper.sock` and exchanges
    newline-delimited JSON. A Hello message checks the protocol version first. Then come requests
    with ids, and numbered events from the helper (job exited, checkpoint or restore finished).

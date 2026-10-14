@@ -220,7 +220,10 @@ pub fn pause(job: &Job) -> Result<Transition, Error> {
 }
 
 /// `start`: resume a paused job, or start a queued/stashed job immediately
-/// regardless of free slots (as pueue does).
+/// regardless of its group's free slots (as pueue does). Whether the start
+/// may also ignore GPU slots and a paused group is the daemon's decision:
+/// only administrators' do; anybody else's waits for them in line (see
+/// [`queue_for_launch`] and [`crate::scheduler::Reserved::forced`]).
 ///
 /// Checkpointed jobs are rejected: they are resumed by [`restore`].
 pub fn start(job: &Job) -> Result<Transition, Error> {
@@ -427,7 +430,8 @@ pub fn checkpoint(job: &Job) -> Result<Transition, Error> {
 }
 
 /// `restore`: put a checkpointed job back in line, or with `immediate`
-/// restore it right away regardless of free slots.
+/// restore it right away regardless of free slots (for a non-administrator
+/// the daemon checks GPU slots and a paused group first, see [`start`]).
 pub fn restore(job: &Job, immediate: bool, now: Timestamp) -> Result<Transition, Error> {
     match job.state {
         JobState::Checkpointed if immediate => {
@@ -490,8 +494,10 @@ pub fn dispatch(job: &Job) -> Result<Transition, Error> {
 /// keep the job waiting for a slot instead. A queued job stays queued, a
 /// stashed one is enqueued, and a checkpointed one waits to be restored.
 /// The daemon then launches it as soon as the helper is back; with
-/// `start`, `add --immediate` or `restore --immediate` it does so
-/// regardless of free slots, as if the helper had been there.
+/// `start`, `add --immediate` or `restore --immediate` it does so ahead of
+/// the queue, as if the helper had been there. The same transition keeps a
+/// non-administrator's forced launch in line while its GPUs have no free
+/// slot or its group is paused.
 pub fn queue_for_launch(job: &Job, now: Timestamp) -> Result<Transition, Error> {
     match job.state {
         JobState::Queued { .. } | JobState::RestoreQueued { .. } => Ok(Transition::unchanged()),

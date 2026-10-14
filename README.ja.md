@@ -153,7 +153,7 @@ puzuz follow 0        # stream the output, like tail -f
 ```sh
 puzuz checkpoint 0    # save job 0 to disk and stop it; frees the GPU. State: Checkpointed
 puzuz restore 0       # queue it again; it resumes once its group and GPUs have a free slot
-puzuz restore -i 0    # ...or resume right away, ignoring slot limits
+puzuz restore -i 0    # ...or resume right away, ahead of the queue (see "GPU slots")
 ```
 
 リストアされたジョブは、チェックポイントされた瞬間から処理を続けます。ジョブ ID は変わらず、出力は同じログに
@@ -204,6 +204,7 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 | `send` | タスクの stdin に入力を送る | 非対応：ジョブの stdin は `/dev/null` です。コマンドを非対話的にしてください。 |
 | `shutdown` | 全タスクを kill してデーモンを停止 | 管理者のみ。実行中の全ジョブをチェックポイントしてからデーモンを停止します。チェックポイントが拒否されたジョブは動き続けます。`--no-checkpoint` を付けると代わりに kill します。 |
 | `restart` | 終了したタスク | `Checkpointed` のジョブにも使えます。新しいジョブとして最初からやり直し、イメージは残ります。 |
+| `start <id>`、`add -i`、`restart -i`（と `restore -i`） | すべての上限を無視してすぐにタスクを開始 | 待ち行列とグループの `parallel` の上限は飛ばしますが、ジョブの GPU に空きスロットができるのと、一時停止中のグループが再開されるのは待ちます。すべての上限を無視できるのは管理者だけです（[GPU スロット](#gpu-slots)を参照） |
 | `reset`、`-a/--all`、`-g/--group` | 全タスク | 自分のジョブ。管理者は全員のジョブに作用します。 |
 | `pause/start/kill -a`、`-g` | グループも一時停止/再開 | グループを一時停止/再開するのは管理者だけです。それ以外のユーザーの場合、グループはそのままです。 |
 | 用語 | "task" | "job"。`--print-task-id` などのオプション名は互換性のためにそのままです。 |
@@ -219,7 +220,7 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 | `add --gpu <LIST>` | ジョブを実行する GPU。例：`0` や `0,1`。指定しなければ CPU のみのジョブになります（`CUDA_VISIBLE_DEVICES` は空）。 |
 | `add --no-checkpoint` | このジョブは決してチェックポイントしません。シャットダウン時には終了されます |
 | `checkpoint [IDS] [-g GROUP] [-a]` | 実行中のジョブを保存して停止します |
-| `restore [IDS] [-g GROUP] [-a] [-i]` | `Checkpointed` のジョブを再開します（`-i`：空きスロットを無視してすぐに） |
+| `restore [IDS] [-g GROUP] [-a] [-i]` | `Checkpointed` のジョブを再開します（`-i`：`start` と同じく、待ち行列より先にすぐ） |
 | `gpu [-j]`、`gpu parallel <N> [--gpu LIST]` | GPU の一覧を表示するか、GPU ごとのジョブ数の上限を設定します（管理者） |
 | `add --nice <N>`、`nice <IDS>... <N>` | ジョブの優先度を `N` だけ下げます（Slurm の nice。負の値は管理者のみ） |
 | `top <IDS>...` | ジョブを自分のキューの先頭に移します（Slurm の `scontrol top`） |
@@ -264,6 +265,9 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   `lost` のいずれかです。
 - `checkpoint_size_bytes`、`details`、`details.last_error`、ジョブの `nice`、グループの `priority` は
   該当しない場合（または 0 の場合）は省略されます。他のユーザーのジョブでは、`label` は null、`details` はなく、`reason` は `"<redacted>"` です。
+- `waiting` は、管理者以外がすぐに実行しようとしたものの GPU スロットか一時停止中のグループを待っている
+  キュー中のジョブにだけ付きます：`{"reason": "gpu_slots", "gpus": [0]}`、`{"reason": "group_paused"}`、
+  `{"reason": "unavailable"}` のいずれかです。
 - `puzuz log --json` は `{"<id>": {"job": <job>, "output": "..."}}` を出力します。`puzuz group --json` は
   `{"groups": [...]}` を出力します。`puzuz gpu --json` は
   `{"gpus": [{"index", "uuid", "name", "memory_total_bytes", "driver_version", "parallel",
@@ -304,6 +308,8 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   `pause/start/kill -g` や `-a` を実行した場合は、自分のジョブだけが対象になり、どのグループの一時停止
   状態も変わりません（このとき `pause --wait` は何もしません）。どちらになったかは出力で分かります
   （`All groups are being paused.` と `Your jobs are being paused: 3, 4`）。
+- **管理者の即時実行**（`start <id>`、`add -i`、`restart -i`、`restore -i`）は GPU スロットと一時停止中の
+  グループを無視します。それ以外のユーザーの即時実行はこれらを待ちます（[GPU スロット](#gpu-slots)を参照）。
 - 管理者は root と `puzuz-admin` グループのメンバー（プライマリまたは補助グループ）です。チェックは
   リクエストごとに行われるので、`usermod -aG puzuz-admin <user>` はすぐに反映されます。
 
@@ -320,6 +326,12 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   として見えます。
 - グループは pueue と同じように動作します（`default` グループは `parallel 1` で始まります）。両方の上限が
   適用されます。
+- すぐに実行する操作（`start <id>`、`add -i`、`restart -i`、`restore -i`）は、pueue と同じく待ち行列と
+  グループの `parallel` の上限を飛ばしますが、GPU スロットと一時停止中のグループは飛ばしません。ジョブの
+  GPU のどれかに空きスロットがないか、グループが一時停止中なら、ジョブは待ち、それが解消されしだい待っている
+  ほかのどのジョブよりも先に開始します。コマンドはそのことを表示し、`status` には
+  `Queued (waiting for a GPU slot)` などと表示されます。GPU スロットと一時停止中のグループを無視できるのは
+  管理者の即時実行だけなので、管理者が決めた上限を超えて一般ユーザーが GPU を使うことはできません。
 - GPU はデーモンの起動時に NVML で検出されます（設定の `[[gpus]]` のリストはフォールバックにすぎません）。
   GPU を追加・取り外ししたら `puzuz.service` を再起動してください。`puzuz doctor` はデーモンが検出したものと
   `nvidia-smi` を比較します。

@@ -465,8 +465,15 @@ impl App {
         } else {
             format!("New job added (id {id}).")
         };
-        if response.launch_pending {
-            let note = render::launch_pending_note(id);
+        let note = if response.launch_pending {
+            Some(render::launch_pending_note(id))
+        } else {
+            response
+                .waiting
+                .as_ref()
+                .map(|wait| render::launch_wait_note(id, wait))
+        };
+        if let Some(note) = note {
             if print_task_id {
                 // Keep stdout to the bare id for scripts.
                 eprintln!("{note}");
