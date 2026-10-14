@@ -106,7 +106,8 @@ curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.s
 ```
 
 脚本来自管道时，选项写在 `bash -s --` 之后（例如 `... | sudo bash -s -- --version 0.2.0`）；
-使用下载好的副本时，选项写在文件名之后（`sudo bash install.sh --version 0.2.0`）：
+使用下载好的副本时，选项写在文件名之后（`sudo bash install.sh --version 0.2.0`；如何在以 root 运行前校验其
+签名，见[手动验证发布版本](#verifying-a-release-by-hand)）：
 
 | 选项 | 含义 |
 | --- | --- |
@@ -130,7 +131,8 @@ aarch64 且 glibc 为 2.34 或更高版本，以及 puzuz 是否并非由包管�
 
 1. 查找发布版本（`/repos/kaito4681/puzuz/releases/latest` 或 `/releases/tags/v<X>`），
 2. 将 `puzuz-v<X>-<target>.tar.gz`（`x86_64-unknown-linux-gnu` 或 `aarch64-unknown-linux-gnu`）
-   及其 `.sha256` 文件下载到临时目录并校验校验和，
+   及其 `.sha256` 文件下载到临时目录（只用 HTTPS，重定向也是如此），确认 `.sha256` 文件是按名称给出的该
+   tarball 的校验和，并校验校验和，
 3. 如果安装了 `minisign`，还会用内置于脚本中的发布密钥（`packaging/minisign.pub`）校验 `.minisig` 签名。
    没有 `minisign` 时，它会提示签名未经校验，
 4. 解压 tarball（拒绝链接以及指向其外部的路径），运行新的 `puzuz service install`
@@ -154,11 +156,21 @@ Alma Linux 上可以改用 [.rpm](#installing-the-fedorarhelrocky-package)，在
 每个发布版本针对每个目标（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`）都包含
 `puzuz-v<X>-<target>.tar.gz` 及其 `.sha256` 和 `.minisig` 文件；软件包 `puzuz_<X>_amd64.deb`、
 `puzuz_<X>_arm64.deb`、`puzuz-<X>-1.x86_64.rpm` 和 `puzuz-<X>-1.aarch64.rpm` 也各自带有这两种文件；
-另外还有 `install.sh`。要自己校验 tarball（或软件包）：
+另外还有 `install.sh` 及其 `install.sh.minisig`。要自己校验 tarball（或软件包）：
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -p packaging/minisign.pub
+```
+
+`curl ... | sudo bash` 会直接运行下载到的内容。要先校验 `install.sh`，请将它与签名一起下载，用发布密钥
+（`packaging/minisign.pub`）验证，然后运行校验过的副本：
+
+```sh
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/latest/download/install.sh.minisig
+minisign -Vm install.sh -p packaging/minisign.pub
+sudo bash install.sh
 ```
 
 <a id="the-release-signing-key-maintainers"></a>
@@ -276,9 +288,13 @@ sudo apt purge puzuz     # also delete /etc/puzuz and the APT repository entry a
 和 `Release.gpg`、公钥 `puzuz.gpg` 以及 `puzuz.sources`。当某个发布版本**作为稳定版本发布**时
 （`released` 事件：发布一个稳定版本，或将预发布版本转为稳定版本），`.github/workflows/release-apt.yml` 会通过
 `scripts/dist/apt-repo.sh github <tag>` 更新它：添加该发布版本的 `.deb` 文件（先用该标签所在提交中的公钥
-校验其校验和与 minisign 签名），按架构只保留最新的五个版本（按 Debian 版本顺序）并删除其余版本，
+校验其校验和与 minisign 签名），将仓库中已有的软件包与已签名的索引核对（`InRelease` 必须能用
+`packaging/apt/puzuz-archive-keyring.gpg` 验证，且每个 `.deb` 的 SHA256 必须与已签名的 `Packages` 中列出的
+一致；不一致时作业失败且不做任何更改；被中断的运行留下的、索引中未列出的 `.deb` 会被丢弃），
+按架构只保留最新的五个版本（按 Debian 版本顺序）并删除其余版本，
 重新生成并签名索引（并从保留的最新软件包中复制出 `puzuz.gpg` 和 `puzuz.sources`），然后先上传软件包、
-最后上传索引，`InRelease` 放在最末；旧的 `.deb` 文件在此之后删除。如果 `apt` 发布版本不存在，它会创建之。
+最后上传索引，`InRelease` 放在最末；旧的 `.deb` 文件在此之后删除。每次上传最多尝试三次；如果仍无法上传索引，
+会恢复之前的索引文件，作业失败并提示重新运行。如果 `apt` 发布版本不存在，它会创建之。
 发布什么由 `apt-repo.sh` 决定：草稿、预发布版本以及非 `v*` 的标签会被跳过并给出提示。索引不包含 `by-hash`
 文件（它们需要子目录，而发布版本资源文件的名称不能包含 `/`），因此存在上文所述的短暂窗口。
 
@@ -405,7 +421,9 @@ sudo dnf remove puzuz
 | `packages.<system>.helper-tests` | puzuz-helper 的测试可执行文件（只构建，不运行），供 `helper-tests` 检查使用 |
 | `checks.<system>.*` | `home-manager`（模块求值），以及在 x86_64 上需要 KVM 的两个 NixOS VM 测试：`nixos`（该模块）和 `helper-tests`（所有 puzuz-helper 测试，包括沙箱化的软件包构建所跳过的那些） |
 
-要跟随发布版本，请使用 `github:kaito4681/puzuz/stable`：`stable` 分支会移动到每个发布标签（不包括预发布版本）。
+要跟随发布版本，请使用 `github:kaito4681/puzuz/stable`：当某个发布版本作为稳定版本发布、且是最高版本时，
+`stable` 分支会移动到它的标签（绝不会移动到草稿、预发布版本或旧系列的补丁版本；见
+`.github/workflows/release-nix.yml`）。
 单纯的 `github:kaito4681/puzuz` 则是开发头部（`main`）。
 
 <a id="nixos"></a>
@@ -649,7 +667,8 @@ cuda-checkpoint（参见 [cuda-checkpoint](#cuda-checkpoint)）。两者都是�
 <a id="the-aur-package-maintainers"></a>
 ### AUR 软件包（维护者）
 
-PKGBUILD 位于 `packaging/aur/puzuz-bin`。当一个发布版本（非预发布版本）发布时，
+PKGBUILD 位于 `packaging/aur/puzuz-bin`。当一个发布版本作为稳定版本发布时（与 APT 仓库相同的 `released`
+事件；草稿和预发布版本不会触发），
 `.github/workflows/release-aur.yml` 会运行 `scripts/dist/update-aur.sh <version>`，它从发布版本的 `.sha256`
 文件中获取 tarball 的校验和，计算该标签源码归档的校验和（用于单元和片段），并在 Arch Linux 容器中重新生成
 `.SRCINFO`。然后它将 `PKGBUILD`、`.SRCINFO` 和 `puzuz-bin.install` 推送到

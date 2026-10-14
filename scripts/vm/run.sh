@@ -237,4 +237,7 @@ echo "=== timings"
 printf '%s\n' "${TIMINGS[@]}"
 echo "=== summary"
 printf '%s\n' "${RESULTS[@]}"
-! printf '%s\n' "${RESULTS[@]}" | grep -q '^FAIL'
+# Not `printf | grep -q`: grep -q exits on the first match, printf may then
+# die of SIGPIPE, and pipefail plus `!` would turn a FAIL into success.
+summary="$(printf '%s\n' "${RESULTS[@]}")"
+! grep -q '^FAIL' <<<"$summary"

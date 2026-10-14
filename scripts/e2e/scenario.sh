@@ -188,12 +188,15 @@ s1_lifecycle() {
 }
 
 s2_authz() {
-    local id
+    local id out
     id=$(add alice -- 'sleep 300')
     wait_state "$id" running
     [ "$(q bob "job($id).get('details') is None and job($id)['owner'] == 1000")" = true ] \
         || fail "bob sees alice's job unredacted"
-    ! pz bob status | grep -q 'sleep 300' || fail "bob's status shows alice's command"
+    # The negated checks capture the output first: with `! cmd | grep -q`, a
+    # failing cmd (or one killed by SIGPIPE) would pass the check.
+    out=$(pz bob status) || fail "bob's status failed"
+    ! grep -q 'sleep 300' <<<"$out" || fail "bob's status shows alice's command"
     ! pz bob log "$id" >/dev/null 2>&1 || fail "bob can read alice's log"
     ! pz bob kill "$id" 2>/dev/null || fail "bob can kill alice's job"
     ! pz bob remove "$id" 2>/dev/null || fail "bob can remove alice's job"
@@ -783,7 +786,7 @@ job_mountinfo() {
 }
 
 s15_prepare() {
-    local id name f
+    local id name f out
     need_mounts
     pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
     mkdir -p "$STATE"
@@ -795,8 +798,9 @@ s15_prepare() {
     # still get the filesystem (the shim triggers it) and not an empty
     # directory or a dead automount point.
     systemctl stop data.mount
-    findmnt -n /data | grep -q autofs || fail "/data is not an automount point"
-    ! findmnt -n /data | grep -q ext4 || fail "/data is still mounted"
+    out=$(findmnt -n /data) || fail "findmnt /data failed"
+    grep -q autofs <<<"$out" || fail "/data is not an automount point"
+    ! grep -q ext4 <<<"$out" || fail "/data is still mounted"
     mjob data-before /home/alice /data/alice/m-before.txt 'sleep 1;' >/dev/null
     mjob home /home/alice /home/alice/m-home.txt >/dev/null
     mjob data /data/alice /data/alice/m-data.txt >/dev/null
@@ -830,10 +834,10 @@ s15_prepare() {
     # The job started before the trigger sees the filesystem itself on
     # /data, not the automount point.
     id=$(head -n1 "$STATE/mounts" | cut -d' ' -f1)
-    job_mountinfo "$id" | grep ' /data ' | grep -q ' - ext4 ' \
-        || fail "the job's /data is not the automounted ext4"
-    ! job_mountinfo "$id" | grep ' /data ' | grep -q autofs \
-        || fail "the job's namespace still has the automount point"
+    out=$(job_mountinfo "$id") || fail "cannot read the mountinfo of job $id"
+    out=$(grep ' /data ' <<<"$out") || fail "the job has no /data"
+    grep -q ' - ext4 ' <<<"$out" || fail "the job's /data is not the automounted ext4"
+    ! grep -q autofs <<<"$out" || fail "the job's namespace still has the automount point"
     # Before the reboot: a checkpoint and restore of the job on /data.
     id=$(awk '$2 == "data" {print $1}' "$STATE/mounts")
     pz alice checkpoint "$id" >/dev/null || fail "checkpoint"
