@@ -849,12 +849,14 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             if record.phase == RecordPhase::Live && record.dumping {
                 // The helper stopped while `criu dump` might run. If the
                 // dump succeeded, the job's processes are gone and the
-                // image is all that is left of it.
-                // (A unit that still runs was not dumped: a successful dump
-                // ends its init, and with it the unit.)
+                // image is all that is left of it, even if systemd does not
+                // report its unit ended yet (deactivating). A new dump never
+                // replaces a checkpoint (see `CheckpointDir::prepare`), so a
+                // successful dump in the directory is this dump unless it
+                // is the image the job was restored from.
                 record.dumping = false;
                 let dumped = match dir.status() {
-                    _ if state == UnitState::Running => None,
+                    _ if was_restored_from(&dir) => None,
                     DirStatus::Complete(meta) => Some(Ok(meta.size_bytes)),
                     _ if dir.is_unfinalized_dump() => {
                         Some(finish_dump(&*self.host, &dir, None).map(|m| m.size_bytes))
@@ -946,9 +948,11 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             match state {
                 UnitState::Running => {
                     // A restore finished, but the helper stopped before it
-                    // removed the image.
+                    // removed the image (or removing it failed). Only that
+                    // image: anything else may be the only copy of the job.
                     if record.unit_kind == UnitKind::Restored
                         && matches!(dir.status(), DirStatus::Complete(_))
+                        && was_restored_from(&dir)
                     {
                         eprintln!(
                             "puzuz-helper: removing the image of the restored job {}",
@@ -2383,6 +2387,13 @@ fn unfinalized_reason(dir: &CheckpointDir, error: &str) -> String {
          helper starts again",
         dir.root().display()
     )
+}
+
+/// Whether a job was restored from the image in `dir`: `criu restore`
+/// writes its log and pidfile into it. A new dump starts in a fresh
+/// directory (see [`CheckpointDir::prepare`]), so its image never has them.
+fn was_restored_from(dir: &CheckpointDir) -> bool {
+    dir.restore_log().exists() || dir.restore_pidfile().exists()
 }
 
 /// Finalize a dump that succeeded: the [`layout::DUMPED_MARKER`], the

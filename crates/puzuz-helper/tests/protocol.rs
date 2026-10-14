@@ -2228,6 +2228,183 @@ async fn a_restore_that_cannot_be_recorded_is_undone_and_keeps_the_image() {
     assert_eq!(c.running().await, [(JobId(3), RunningPhase::Running)]);
 }
 
+/// Checkpoints restored job 3 again, then puts the record back into its
+/// state during the dump (as a helper that stopped right after CRIU exited
+/// would leave it) and starts a unit of the job's last name, as systemd may
+/// still report the dumped unit (deactivating). Returns the job's files.
+async fn redump_restored_job_and_stop(env: &Env, c: &mut Client) -> puzuz_helper::jobs::JobFiles {
+    let image_dir = env.base().join("3");
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(3),
+            image_dir,
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::CheckpointFinished {
+                outcome: CheckpointOutcome::Success { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    c.request(Request::AckEvents {
+        up_to: EventSeq(u64::MAX),
+    })
+    .await;
+    let _ = env.stop.send(true);
+    let files = puzuz_helper::jobs::JobFiles::new(&env.root.join("state/jobs"), JobId(3));
+    let mut record = files.read_record().unwrap();
+    assert_eq!(record.unit_kind, puzuz_helper::jobs::UnitKind::Restored);
+    record.phase = puzuz_helper::jobs::RecordPhase::Live;
+    record.dumping = true;
+    files.write_record(&record).unwrap();
+    files
+}
+
+/// Starts a unit named `unit` that the fake launcher reports as running.
+async fn start_unit(env: &Env, unit: &str) {
+    env.launcher
+        .restore(&puzuz_helper::launcher::RestoreSpec {
+            job: JobId(3),
+            unit: unit.into(),
+            command: puzuz_checkpoint::CommandSpec::new("criu"),
+            pidfile: env.root.join("unused.pid"),
+            timeout: Duration::from_secs(1),
+            criu_root: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// A restored job checkpointed again, with the helper stopping after the
+/// dump but before it recorded it: the new image is the only copy of the
+/// job and is kept, even if its unit still looks running at the next start.
+#[tokio::test]
+async fn a_new_dump_of_a_restored_job_survives_a_helper_restart() {
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 3).await;
+    assert_eq!(
+        c.request(restore_req(3, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+    assert!(matches!(
+        c.event().await.event,
+        Event::RestoreFinished {
+            outcome: RestoreOutcome::Success { .. },
+            ..
+        }
+    ));
+    let files = redump_restored_job_and_stop(&env, &mut c).await;
+    drop(c);
+    start_unit(&env, "puzuz-job-3-r1.service").await;
+    env.restart().await;
+    let mut c = env.client().await;
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::CheckpointFinished {
+                job: JobId(3),
+                outcome: CheckpointOutcome::Success { .. },
+            }
+        ),
+        "{ev:?}"
+    );
+    let dir = CheckpointDir::for_job(&env.base(), 3);
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    let record = files.read_record().unwrap();
+    assert_eq!(record.phase, puzuz_helper::jobs::RecordPhase::Checkpointed);
+    assert!(!record.dumping);
+    assert!(c.running().await.is_empty());
+    assert!(
+        env.launcher.unit(JobId(3)).is_none(),
+        "dumped unit released"
+    );
+    // And it restores from the new image.
+    assert_eq!(
+        c.request(restore_req(3, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+    assert!(matches!(
+        c.event().await.event,
+        Event::RestoreFinished {
+            outcome: RestoreOutcome::Success { .. },
+            ..
+        }
+    ));
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// The image a job was restored from, left behind because removing it
+/// failed, is not taken for a new dump of the job: a helper that stopped
+/// while a dump (refused because of that image) was set up finds the job
+/// running and adopts it.
+#[tokio::test]
+async fn the_image_a_running_job_was_restored_from_is_not_a_new_dump() {
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 3).await;
+    let saved = env.root.join("saved-image");
+    copy_dir(&image_dir, &saved);
+    assert_eq!(
+        c.request(restore_req(3, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+    assert!(matches!(
+        c.event().await.event,
+        Event::RestoreFinished {
+            outcome: RestoreOutcome::Success { .. },
+            ..
+        }
+    ));
+    c.request(Request::AckEvents {
+        up_to: EventSeq(u64::MAX),
+    })
+    .await;
+    drop(c);
+    let _ = env.stop.send(true);
+    // What criu restore leaves in the image it restored from.
+    copy_dir(&saved, &image_dir);
+    std::fs::write(
+        CheckpointDir::for_job(&env.base(), 3).restore_log(),
+        "(00.1) Restore finished successfully\n",
+    )
+    .unwrap();
+    let files = puzuz_helper::jobs::JobFiles::new(&env.root.join("state/jobs"), JobId(3));
+    let mut record = files.read_record().unwrap();
+    record.dumping = true;
+    files.write_record(&record).unwrap();
+    env.restart().await;
+    let mut c = env.client().await;
+    c.no_event().await;
+    assert_eq!(c.running().await, [(JobId(3), RunningPhase::Running)]);
+    assert!(!files.read_record().unwrap().dumping);
+    assert_eq!(
+        CheckpointDir::for_job(&env.base(), 3).status(),
+        DirStatus::Missing,
+        "the stale image is removed"
+    );
+}
+
 /// An interrupted restore whose unit is gone (the helper stopped before it
 /// started it, or systemd already cleaned it up) is reported too, once.
 #[tokio::test]
