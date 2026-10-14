@@ -288,6 +288,24 @@ impl Harness {
         panic!("job {id} never reached the helper");
     }
 
+    /// Waits until the fake helper has received `count` signals. The daemon
+    /// records a state change before it runs the change's effects, so a
+    /// job pausing on its own (restored or reverted to `Paused`) shows as
+    /// `Paused` a moment before its SIGSTOP reaches the helper; unlike an
+    /// API action, nothing else waits for that signal.
+    async fn wait_signals(&self, count: usize) {
+        for _ in 0..250 {
+            if self.helper.signals().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "the helper never got {count} signals: {:?}",
+            self.helper.signals()
+        );
+    }
+
     /// The job's process exits with `code` (once it has been spawned).
     async fn exit(&self, id: JobId, code: i32) {
         self.wait_spawned(id).await;
@@ -946,6 +964,7 @@ async fn lost_checkpoint_requests_do_not_leave_jobs_checkpointing() {
     alice
         .wait_for(id, "paused again", |j| j.state == JobState::Paused)
         .await;
+    h.wait_signals(3).await;
     assert_eq!(h.helper.jobs()[&id].phase, RunningPhase::Stopped);
     assert_eq!(
         h.helper.signals(),
@@ -1056,6 +1075,7 @@ async fn a_job_paused_before_its_checkpoint_is_restored_paused() {
         .await;
     assert_eq!(reply.status, StatusCode::OK);
     alice.wait_state(id, &JobState::Paused).await;
+    h.wait_signals(3).await;
     assert_eq!(
         h.helper.signals(),
         [
@@ -1129,6 +1149,7 @@ async fn a_job_paused_at_an_os_shutdown_is_restored_paused() {
     }
     alice.wait_state(paused, &JobState::Paused).await;
     alice.wait_state(running, &JobState::Running).await;
+    h.wait_signals(2).await;
     assert_eq!(
         h.helper.signals(),
         [(paused, signal::SIGSTOP), (paused, signal::SIGSTOP)]
@@ -2261,6 +2282,52 @@ async fn spawns_refused_by_a_stopping_helper_are_requeued() {
     for &id in &ids {
         alice.wait_state(id, &JobState::Running).await;
     }
+    h.stop().await;
+}
+
+/// e2e scenario 6 (helper restart) flake: a spawn refused by a stopping
+/// helper left the job `Running` for another second although nothing ran,
+/// so a check of the job's state right after the restart passed while the
+/// spawn was still to be retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawn_refused_by_a_stopping_helper_is_queued_until_retried() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(2).await;
+    let alice = h.client(ALICE);
+    h.helper.hold_launches();
+    h.helper.refuse_launches(2);
+    let first = alice.add(&job_request("first", &[])).await;
+    let second = alice.add(&job_request("second", &[])).await;
+    let refused = tokio::time::Instant::now();
+
+    // Back in line right away, not shown as running while nothing runs.
+    for id in [first, second] {
+        let deadline = refused + Duration::from_millis(500);
+        loop {
+            let state = alice.job(id).await.state;
+            if matches!(state, JobState::Queued { .. }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "job {id} is still {state:?} after the helper refused it"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    // Offered again only after a pause (not in a tight loop), then started.
+    h.helper.wait_held(2).await;
+    assert!(
+        refused.elapsed() >= Duration::from_millis(900),
+        "retried after {:?}",
+        refused.elapsed()
+    );
+    h.helper.release_launches();
+    for id in [first, second] {
+        h.wait_spawned(id).await;
+        alice.wait_state(id, &JobState::Running).await;
+    }
+    assert_eq!(h.helper.spawned().len(), 2);
     h.stop().await;
 }
 

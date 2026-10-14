@@ -318,6 +318,10 @@ const RETRY_SETTLE_WAIT: Duration = Duration::from_millis(500);
 /// request went unanswered (see [`Core::checkpoint_lost_check`]).
 const CHECKPOINT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long the scheduler launches nothing after a helper refused (or
+/// abandoned) a launch because it is stopping (see [`Core::pause_launches`]).
+const STOPPING_HELPER_PAUSE: Duration = Duration::from_secs(1);
+
 /// Spawn/restore requests the scheduler has outstanding at most.
 const MAX_CONCURRENT_LAUNCHES: usize = 8;
 
@@ -488,6 +492,9 @@ pub struct Core {
     launch_waits: Mutex<HashMap<JobId, scheduler::LaunchWait>>,
     /// See [`LaunchCheckHook`].
     launch_check_hook: Mutex<Option<LaunchCheckHook>>,
+    /// The scheduler launches nothing before this instant (see
+    /// [`Core::pause_launches`]).
+    launches_paused_until: Mutex<Option<tokio::time::Instant>>,
     /// Checkpoint size warnings (see [`crate::usage`]).
     pub(crate) size_warnings: Mutex<SizeWarnings>,
 }
@@ -533,6 +540,7 @@ impl Core {
             forced: Mutex::new(HashMap::new()),
             launch_waits: Mutex::new(HashMap::new()),
             launch_check_hook: Mutex::new(None),
+            launches_paused_until: Mutex::new(None),
             size_warnings: Mutex::default(),
         })
     }
@@ -631,6 +639,37 @@ impl Core {
     /// Why forced launch `id` waits in line, if it does.
     pub fn launch_wait(&self, id: JobId) -> Option<scheduler::LaunchWait> {
         self.launch_waits.lock().unwrap().get(&id).cloned()
+    }
+
+    /// A helper refused or abandoned a launch because it is stopping: the
+    /// job goes back in line right away (so that it is not shown as running
+    /// while nothing runs), and the scheduler launches nothing for
+    /// [`STOPPING_HELPER_PAUSE`], until that helper is likely gone, rather
+    /// than offering the job to it again in a tight loop. Every job is
+    /// paused, not just this one: the stopping helper would refuse the
+    /// others too, and a lower-priority job must not take the slot of the
+    /// one put back in line.
+    fn pause_launches(self: &Arc<Self>) {
+        let until = tokio::time::Instant::now() + STOPPING_HELPER_PAUSE;
+        {
+            let mut paused = self.launches_paused_until.lock().unwrap();
+            *paused = Some(paused.map_or(until, |p| p.max(until)));
+        }
+        let core = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = core.cancel.cancelled() => {}
+                _ = tokio::time::sleep_until(until) => core.wake_scheduler(),
+            }
+        });
+    }
+
+    /// Whether launches are paused (see [`Core::pause_launches`]).
+    fn launches_paused(&self) -> bool {
+        self.launches_paused_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| tokio::time::Instant::now() < until)
     }
 
     /// Testing only: see [`LaunchCheckHook`].
@@ -1219,14 +1258,10 @@ impl Core {
             ) => {
                 // The helper is stopping: nothing was started (it refuses
                 // new spawns, and abandons those systemd had not begun to
-                // start). Not the job's fault; put it back in line once
-                // that helper is likely gone, rather than offering it
-                // again in a tight loop.
+                // start). Not the job's fault; put it back in line now,
+                // and offer it again once that helper is likely gone.
                 tracing::info!(job = %job.id, "the helper is stopping; requeueing the job");
-                tokio::select! {
-                    _ = self.cancel.cancelled() => {}
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                }
+                self.pause_launches();
                 let requeued = self
                     .requeue_unstarted(job.id, Some(job.started_at), JobState::Running)
                     .await?;
@@ -1646,13 +1681,10 @@ impl Core {
                 },
             ) => {
                 // As for spawns (see `Core::spawn_job`): nothing was
-                // restored and it is not the job's fault; wait for that
-                // helper to go away, then put the job back in line.
+                // restored and it is not the job's fault; put the job back
+                // in line, to be offered again once that helper is gone.
                 tracing::info!(job = %job.id, "the helper is stopping; requeueing the restore");
-                tokio::select! {
-                    _ = self.cancel.cancelled() => {}
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                }
+                self.pause_launches();
                 let requeued = self
                     .requeue_unstarted(job.id, Some(job.started_at), JobState::Restoring)
                     .await?;
@@ -1899,6 +1931,7 @@ impl Core {
                         // failure. (A restore already given up as
                         // interrupted stays as it is.)
                         tracing::info!(job = %job, "restore abandoned by the helper ({reason}); requeueing it");
+                        self.pause_launches();
                         if let Err(e) = self.requeue_unstarted(job, None, JobState::Restoring).await
                         {
                             tracing::warn!(job = %job, "cannot requeue the job: {}", e.0.message);
@@ -2155,7 +2188,7 @@ impl Core {
     }
 
     pub async fn schedule_once(self: &Arc<Self>) -> ApiResult<()> {
-        let launch = !self.is_shutting_down() && self.helper_ready();
+        let launch = !self.is_shutting_down() && self.helper_ready() && !self.launches_paused();
         let now = now_ms();
         let core = self.clone();
         let launched = self

@@ -456,7 +456,7 @@ Linux; nothing is downloaded from the GitHub releases. Its outputs:
 | `nixosModules.default` | the NixOS module `services.puzuz` (see [NixOS](#nixos)) |
 | `homeManagerModules.default` | the home-manager module `programs.puzuz` (see [home-manager](#home-manager)) |
 | `packages.<system>.helper-tests` | the puzuz-helper test executables (built, not run), for the `helper-tests` check |
-| `checks.<system>.*` | `home-manager` (module evaluation) and, on x86_64, two NixOS VM tests that need KVM: `nixos` (the module) and `helper-tests` (every puzuz-helper test, including those the sandboxed package build skips) |
+| `checks.<system>.*` | `home-manager` (module evaluation) and, on x86_64, two NixOS VM tests that need KVM: `nixos` (the module) and `helper-tests` (every puzuz-helper test; the package build itself runs no tests, since the helper's job-spawning tests cannot pass in the Nix build sandbox) |
 
 Use `github:kaito4681/puzuz/stable` to follow releases: the `stable` branch moves to a release's
 tag when the release is published as a stable release, if it is the highest version (never to a
