@@ -133,12 +133,15 @@ binary decides the rest before it installs anything. It then:
 
 1. looks up the release (`/repos/kaito4681/puzuz/releases/latest`, or `/releases/tags/v<X>`),
 2. downloads `puzuz-v<X>-<target>.tar.gz` (`x86_64-unknown-linux-gnu` or
-   `aarch64-unknown-linux-gnu`) and its `.sha256` file into a
+   `aarch64-unknown-linux-gnu`) and its `.sha256` and `.minisig` files into a
    temporary directory (over HTTPS only, also for redirects), checks that the `.sha256` file is
    the checksum of that tarball by name, and checks the checksum,
-3. if `minisign` is installed, also checks the `.minisig` signature against the release key built
-   into the script (`packaging/minisign.pub`). Without `minisign` it says that the signature was
-   not checked,
+3. checks the `.minisig` signature against the release key built into the script
+   (`packaging/minisign.pub`). It uses the `minisign` in `PATH`; without one it downloads the
+   static minisign 0.12 release from GitHub into the temporary directory, checks it against the
+   SHA-256 checksum built into the script (the same pin as `scripts/dist/get-minisign.sh`), and
+   uses that. If that download fails, it stops and asks you to install `minisign` from your
+   distribution (e.g. `sudo apt install minisign`) and re-run it; the signature is never skipped,
 4. extracts the tarball (refusing links and paths outside it), runs the new
    `puzuz service install` (which keeps the directory of the current installation, else uses
    `/usr/local/bin`; `--bin-dir` is passed on only if you gave it), and prints its
@@ -1511,8 +1514,9 @@ rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or
    release's, it stops with that error; if they are (only the final checks failed), it warns and
    goes on.
 
-`install.sh` (run again, optionally with `--version`) works too and does the same, except that it
-checks the signature only when `minisign` is installed.
+`install.sh` (run again, optionally with `--version`) works too and does the same; it checks the
+signature with the `minisign` in `PATH`, or downloads a pinned one (see
+[Running the installer](#running-the-installer)).
 
 `service install` (and so both ways above) replaces the binaries and units and restarts both
 services if anything changed. The configuration file is kept.

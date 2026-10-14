@@ -3,7 +3,12 @@
 # aarch64 as this machine; both are in the same release tarball) into
 # DIR and prints its path. Used by the release workflow, the distribution
 # tests and gen-signing-key.sh, so none of them depends on a distribution
-# package of minisign.
+# package of minisign. The checked release tarball stays in DIR (the
+# distribution test serves it to install.sh).
+#
+# scripts/install.sh pins the same version and checksum (it downloads this
+# tarball when minisign is not installed); a unit test in crates/puzuz keeps
+# the two in sync.
 #
 # Usage: scripts/dist/get-minisign.sh DIR
 set -euo pipefail
@@ -23,13 +28,16 @@ arm64) arch=aarch64 ;;
 esac
 mkdir -p "$dir"
 bin="$dir/minisign"
+archive="$dir/minisign-$version-linux.tar.gz"
+if [ ! -f "$archive" ] || ! echo "$sha256  $archive" | sha256sum -c --quiet - >/dev/null 2>&1; then
+    curl -fsSL --retry 3 -o "$archive.part" "$url"
+    echo "$sha256  $archive.part" | sha256sum -c --quiet - >&2
+    mv "$archive.part" "$archive"
+fi
 if [ ! -x "$bin" ]; then
-    archive="$dir/minisign-$version-linux.tar.gz"
-    curl -fsSL --retry 3 -o "$archive" "$url"
-    echo "$sha256  $archive" | sha256sum -c --quiet - >&2
     tar -C "$dir" -xzf "$archive" "minisign-linux/$arch/minisign" 2>/dev/null
     mv "$dir/minisign-linux/$arch/minisign" "$bin"
-    rm -rf "$dir/minisign-linux" "$archive"
+    rm -rf "$dir/minisign-linux"
     chmod 0755 "$bin"
 fi
 echo "$bin"
