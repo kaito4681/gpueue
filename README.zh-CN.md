@@ -151,8 +151,9 @@ puzuz restore -i 0    # ...or resume right away, ahead of the queue (see "GPU sl
 恢复后的作业从创建检查点的那一刻继续运行。它保留原来的作业 id，其输出会追加到同一个日志中。
 
 暂停的作业同样可以创建检查点，重启时也是如此。它恢复后仍处于暂停状态，并继续占用其 GPU 槽位，用
-`puzuz start` 即可让它继续运行。CRIU 和 cuda-checkpoint 需要一个正在运行的进程，因此在转储期间以及恢复之后的
-短暂时间内，作业会运行片刻。检查点正在进行时，`puzuz pause` 会被拒绝。
+`puzuz start` 即可让它继续运行。CRIU 和 cuda-checkpoint 需要一个正在运行的进程，因此在转储期间作业会运行片刻。
+恢复会让它保持停止状态，因此在 `puzuz start` 之前它不会执行任何代码（哪怕片刻）。检查点正在进行时，
+`puzuz pause` 会被拒绝。
 
 <a id="what-happens-on-reboot"></a>
 ### 重启时会发生什么

@@ -1418,7 +1418,9 @@ cuda-checkpoint。启用方法：
 DataLoader worker 能够创建检查点：没有它，插件模式同样会在这些进程上失败
 （`handle_device_vma plugin failed`、`Can't handle non-regular mapping`）。无论哪种模式，fork guard
 都会预加载到每个作业中。两种模式下，暂停的作业都会为转储而恢复运行，因为 cuda-checkpoint 在
-已停止的进程上会挂起。
+已停止的进程上会挂起。两种模式下它们都以停止状态恢复：在插件模式下，CRIU 的插件先恢复 CUDA 状态，
+然后 helper 的恢复 hook 停止这些进程；在手动模式下，helper 在运行 cuda-checkpoint 期间只让 CUDA
+恢复线程（通过 `ptrace`）运行。
 
 <a id="filesystems-and-mounts"></a>
 ## 文件系统和挂载

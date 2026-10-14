@@ -1563,7 +1563,10 @@ Both modes behave the same for users. In both, the fork guard is what makes PyTo
 workers forked from a CUDA process checkpointable: without it, plugin mode fails on them as well
 (`handle_device_vma plugin failed`, `Can't handle non-regular mapping`). The guard is preloaded
 into every job regardless of the mode. Paused jobs are resumed for the dump in both modes, because
-cuda-checkpoint hangs on a stopped process.
+cuda-checkpoint hangs on a stopped process. They are restored stopped in both modes: in plugin
+mode CRIU's plugin restores the CUDA state before the helper's restore hook stops the processes,
+and in manual mode the helper lets only the CUDA restore threads run (with `ptrace`) while it runs
+cuda-checkpoint.
 
 ## Filesystems and mounts
 

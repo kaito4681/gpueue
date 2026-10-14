@@ -157,8 +157,9 @@ is appended to the same log.
 
 A paused job can be checkpointed as well, also on a reboot. It is restored paused, still holding
 its GPU slots, and `puzuz start` resumes it. CRIU and cuda-checkpoint need a running process, so
-the job runs for a moment during the dump and right after the restore. `puzuz pause` is refused
-while a checkpoint is in progress.
+the job runs for a moment during the dump. The restore leaves it stopped, so it runs nothing (not
+even for a moment) until `puzuz start`. `puzuz pause` is refused while a checkpoint is in
+progress.
 
 ### What happens on reboot
 

@@ -163,8 +163,9 @@ puzuz restore -i 0    # ...or resume right away, ahead of the queue (see "GPU sl
 
 一時停止中のジョブもチェックポイントできます（再起動時も同様です）。一時停止したままリストアされ、GPU
 スロットも保持したままです。`puzuz start` で再開します。CRIU と cuda-checkpoint は実行中のプロセスを
-必要とするため、ダンプの間とリストアの直後に、ジョブは一瞬だけ動きます。チェックポイントの処理中は
-`puzuz pause` は拒否されます。
+必要とするため、ダンプの間はジョブが一瞬だけ動きます。リストアは停止したままのジョブを戻すので、
+`puzuz start` までジョブは（一瞬たりとも）何も実行しません。チェックポイントの処理中は `puzuz pause` は
+拒否されます。
 
 <a id="what-happens-on-reboot"></a>
 ### 再起動時に何が起きるか
