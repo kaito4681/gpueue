@@ -145,12 +145,13 @@ jobs:
             (umask 077; printf '%s\n' "$APT_GPG_PRIVATE_KEY" >"$key")
             scripts/dist/sign-rpm.sh "$key" "$keyring" dist/*.rpm
             rm -f "$key"
-            for rpm in dist/*.rpm; do
-              (cd dist && sha256sum "$(basename "$rpm")" >"$(basename "$rpm").sha256")
-            done
           else
             echo "::warning::APT_GPG_PRIVATE_KEY is not set (or the APT key is the test key); the .rpm files are not GPG-signed"
           fi
+          # Signed or not, every .rpm gets its .sha256 (of the final file).
+          for rpm in dist/*.rpm; do
+            (cd dist && sha256sum "$(basename "$rpm")" >"$(basename "$rpm").sha256")
+          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rpm-signed
