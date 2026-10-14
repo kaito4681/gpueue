@@ -1682,12 +1682,18 @@ impl Core {
     async fn process_helper_event(self: &Arc<Self>, event: hp::Event, seq: u64) {
         use lifecycle::{Event as E, ExitStatus as X};
         let mark = move |tx: &dyn StoreOps, _: &Job| tx.set_helper_event_seq(seq);
-        // An orphan's process is gone once it exited or was dumped.
+        // An orphan's process is gone once it exited or was dumped (also
+        // when the dump is not finalized yet).
         match &event {
             hp::Event::JobExited { job, .. }
             | hp::Event::CheckpointFinished {
                 job,
-                outcome: CheckpointOutcome::Success { .. },
+                outcome:
+                    CheckpointOutcome::Success { .. }
+                    | CheckpointOutcome::Failed {
+                        code: Some(HelperErrorCode::CheckpointUnfinalized),
+                        ..
+                    },
             } => {
                 self.forget_orphan(*job);
             }
