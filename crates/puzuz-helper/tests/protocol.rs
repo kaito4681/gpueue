@@ -2268,3 +2268,48 @@ async fn dump_counts_private_tmpfs_and_refuses_reuseport_sockets() {
     assert_eq!(c.running().await, [(JobId(3), RunningPhase::Running)]);
     assert!(env.exec.lock().unwrap().actions.is_empty());
 }
+
+/// The files a job holds are listed again by the `post-dump` hook of
+/// `criu dump`, while CRIU has the job stopped: a file the job opened after
+/// the helper's list (made while it ran) is recorded as held too, with its
+/// attributes, so that a restore after a reboot recognises it (e2e scenario
+/// 15: a job that creates a state file on sshfs every few moments).
+#[tokio::test]
+async fn files_opened_just_before_the_dump_are_held() {
+    use puzuz_helper::access::HeldFile;
+    use puzuz_helper::engine::{DUMP_HOOK_SCRIPT, MOUNTS_FILE, SavedMounts};
+    use std::os::unix::fs::MetadataExt;
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let early = env.base().join("early.txt");
+    let late = env.base().join("late.txt");
+    std::fs::create_dir_all(env.base()).unwrap();
+    std::fs::write(&early, "a").unwrap();
+    std::fs::write(&late, "b").unwrap();
+    let held = |p: &Path| {
+        let m = std::fs::metadata(p).unwrap();
+        HeldFile {
+            path: p.to_str().unwrap().to_owned(),
+            dev: m.dev(),
+            ino: m.ino(),
+            attrs: None,
+        }
+    };
+    env.host.set_dump_hazards(DumpHazards {
+        held_files: vec![held(&early)],
+        ..Default::default()
+    });
+    env.exec.lock().unwrap().dump_hook_held = Some(vec![held(&early), held(&late)]);
+    spawn_and_dump(&env, &mut c, 3).await;
+    let dir = CheckpointDir::for_job(&env.base(), 3);
+    let script = std::fs::read_to_string(dir.root().join(DUMP_HOOK_SCRIPT)).unwrap();
+    assert!(script.contains(" dump-hook "), "{script}");
+    let saved: SavedMounts =
+        serde_json::from_slice(&std::fs::read(dir.root().join(MOUNTS_FILE)).unwrap()).unwrap();
+    let files = saved.held_files();
+    assert_eq!(files.len(), 2, "{files:?}");
+    for (f, p) in files.iter().zip([&early, &late]) {
+        assert_eq!(Path::new(&f.path), p.as_path());
+        assert!(f.attrs.is_some(), "{f:?}");
+    }
+}

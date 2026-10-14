@@ -811,10 +811,14 @@ s15_prepare() {
     if mountpoint -q /nfs; then
         # Also a state file of its own, replaced every few steps (a rename
         # on the network filesystem). /nfs exports /srv/ext4/export, hence
-        # another prefix than the ext4 job's.
+        # another prefix than the ext4 job's. A new state file is created
+        # and kept open all the time, so the dump finds the job holding one
+        # it created after the helper listed the job's files before the
+        # dump (on sshfs it shows as root's: the restore must recognise it
+        # as held at the dump, see `puzuz-helper dump-hook`).
         rm -f /nfs/n-*
         mjob sshfs /nfs /nfs/n-nfs.txt \
-            '(while :; do date +%s%N >/nfs/n-state.tmp && mv /nfs/n-state.tmp /nfs/n-state; sleep 0.3; done) &' \
+            '(while :; do exec 5>/nfs/n-state.tmp; date +%s%N >&5; mv /nfs/n-state.tmp /nfs/n-state; done) &' \
             >/dev/null
         for _ in $(seq 50); do [ -s /nfs/n-nfs.txt ] && break; sleep 0.2; done
         stat -c %i /nfs/n-nfs.txt >"$STATE/nfs-ino" 2>/dev/null || true

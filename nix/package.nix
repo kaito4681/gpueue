@@ -33,6 +33,7 @@ let
     "dump_refuses_without_free_space_and_keeps_a_stopped_job_stopped"
     "exit_events_are_persisted_replayed_and_acked"
     "failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first"
+    "files_opened_just_before_the_dump_are_held"
     "nix_gc_roots_follow_jobs_and_their_checkpoints"
     "plugin_mode_refuses_to_dump_cuda_jobs_without_the_plugin"
     "recovery_readopts_running_jobs_and_reports_exits"
