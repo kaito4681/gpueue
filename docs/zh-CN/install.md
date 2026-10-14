@@ -142,7 +142,9 @@ aarch64 且 glibc 为 2.34 或更高版本，以及 puzuz 是否并非由包管�
 3. 用内置于脚本中的发布密钥（`packaging/minisign.pub`）校验 `.minisig` 签名。它使用 `PATH` 中的
    `minisign`；如果没有，就从 GitHub 将 minisign 0.12 的静态二进制发布包下载到临时目录，用内置于脚本中的
    SHA-256 校验和（与 `scripts/dist/get-minisign.sh` 相同）校验后使用。如果下载失败，它会停止，并提示你
-   从发行版安装 `minisign`（例如 `sudo apt install minisign`）后重新运行；签名校验绝不会被跳过，
+   从发行版安装 `minisign`（例如 `sudo apt install minisign`）后重新运行；签名校验绝不会被跳过。
+   签名的 trusted comment 必须是所请求的发布版本和 tarball 的 `puzuz <tag> <file>`，因此以较新名称提供的
+   旧发布版本的（签名有效的）tarball 会被拒绝，
 4. 解压 tarball（拒绝链接以及指向其外部的路径），运行新的 `puzuz service install`
    （它沿用当前安装所在的目录，否则使用 `/usr/local/bin`；只有你指定了 `--bin-dir` 时才会传递该选项），
    并打印其 `puzuz doctor` 报告，
@@ -171,6 +173,10 @@ Alma Linux 上可以改用 [.rpm](#installing-the-fedorarhelrocky-package)，在
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 ```
+
+minisign 会打印签名的 trusted comment（它受签名保护），其中写明发布版本和文件
+（`Trusted comment: puzuz v0.1.0 puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`）。请确认它就是你要下载的
+发布版本和文件。
 
 `curl ... | sudo bash` 会直接运行下载到的内容。要先校验 `install.sh`，请将它与签名一起下载，用发布密钥
 （`packaging/minisign.pub`）验证，然后运行校验过的副本：
@@ -1575,7 +1581,8 @@ sudo puzuz update --version 0.2.0 --yes
    发布版本以修复这对二进制文件。只有通过 `--version` 明确指定时才会安装较旧的版本，
 3. 请求确认（`-y/--yes` 跳过确认），
 4. 将 tarball、`.sha256` 和 `.minisig` 下载到 `/var/lib/puzuz/update`（root，0700），用 `puzuz`
-   内置的发布密钥验证 minisign 签名，并校验校验和，
+   内置的发布密钥验证 minisign 签名（与 `install.sh` 一样，其 trusted comment 必须是该发布版本的
+   `puzuz <tag> <file>`），并校验校验和，
 5. 解压 tarball（仅限普通文件和目录），并询问新的 `puzuz` 支持哪个数据库模式（schema）。无法
    打开守护进程数据库的发布版本（模式变更之前的旧版本）会在任何更改之前被拒绝，
 6. 针对已安装的目录运行新的 `puzuz service install`，删除 Nix 构建安装的 Nix GC 根（发布版本的

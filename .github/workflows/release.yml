@@ -195,7 +195,8 @@ jobs:
       # dist/<name>.{tar.gz,deb,rpm}.minisig, install.sh with its
       # install.sh.minisig and RPM-GPG-KEY-puzuz (when attached) with its
       # RPM-GPG-KEY-puzuz.minisig, checked against packaging/minisign.pub
-      # (the key built into `puzuz`).
+      # (the key built into `puzuz`). The trusted comment names the tag and
+      # the file; install.sh and `puzuz update` require exactly that.
       - name: Sign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}

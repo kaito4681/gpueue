@@ -146,7 +146,9 @@ binary decides the rest before it installs anything. It then:
    static minisign 0.12 release from GitHub into the temporary directory, checks it against the
    SHA-256 checksum built into the script (the same pin as `scripts/dist/get-minisign.sh`), and
    uses that. If that download fails, it stops and asks you to install `minisign` from your
-   distribution (e.g. `sudo apt install minisign`) and re-run it; the signature is never skipped,
+   distribution (e.g. `sudo apt install minisign`) and re-run it; the signature is never skipped.
+   The signature's trusted comment must be `puzuz <tag> <file>` for the requested release and
+   tarball, so an older release's (validly signed) tarball served under a newer name is refused,
 4. extracts the tarball (refusing links and paths outside it), runs the new
    `puzuz service install` (which keeps the directory of the current installation, else uses
    `/usr/local/bin`; `--bin-dir` is passed on only if you gave it), and prints its
@@ -179,6 +181,10 @@ To check a tarball (or a package) yourself:
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 ```
+
+minisign prints the signature's trusted comment, which the signature covers: it names the release
+and the file (`Trusted comment: puzuz v0.1.0 puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`). Check
+that it is the release and file you meant to download.
 
 `curl ... | sudo bash` runs whatever the download contains. To check `install.sh` first, download
 it with its signature, verify it with the release key (`packaging/minisign.pub`), and run the
@@ -1741,7 +1747,8 @@ rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or
    repair the pair. An older version is installed only when asked for with `--version`,
 3. asks for confirmation (`-y/--yes` skips it),
 4. downloads the tarball, `.sha256` and `.minisig` into `/var/lib/puzuz/update` (root, 0700),
-   checks the minisign signature with the release key built into `puzuz`, and the checksum,
+   checks the minisign signature with the release key built into `puzuz` (its trusted comment
+   must be `puzuz <tag> <file>` of that release, as with `install.sh`), and the checksum,
 5. extracts the tarball (regular files and directories only) and asks the new `puzuz` which
    database schema it supports. A release that cannot open the daemon's database (an older one,
    from before a schema change) is refused before anything changes,

@@ -165,7 +165,8 @@ curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.s
    ディレクトリにダウンロードし、スクリプトに組み込まれた SHA-256 チェックサム（`scripts/dist/get-minisign.sh`
    と同じもの）で確認してから使います。このダウンロードに失敗すると、ディストリビューションから `minisign` を
    インストールして（例: `sudo apt install minisign`）再実行するよう伝えて止まります。署名の確認を省くことは
-   ありません。
+   ありません。署名の trusted comment は、要求したリリースと tarball の `puzuz <tag> <file>` でなければ
+   なりません。これにより、古いリリースの（正しく署名された）tarball を新しい名前で配っても拒否されます。
 4. tarball を展開し（リンクや tarball の外を指すパスは拒否します）、新しい `puzuz service install` を実行し
    （現在のインストール先のディレクトリを維持し、なければ `/usr/local/bin` を使います。`--bin-dir` は指定
    した場合にだけ渡されます）、その `puzuz doctor` のレポートを表示します。
@@ -198,6 +199,10 @@ Arch Linux では公開後に [AUR パッケージ](#arch-linux-aur) を使え�
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 ```
+
+minisign は署名の trusted comment（署名の対象に含まれます）を表示します。これはリリースとファイルを
+示します（`Trusted comment: puzuz v0.1.0 puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`）。ダウンロード
+しようとしたリリースとファイルであることを確認してください。
 
 `curl ... | sudo bash` はダウンロードした内容をそのまま実行します。先に `install.sh` を確認するには、署名と
 一緒にダウンロードし、リリース鍵（`packaging/minisign.pub`）で検証してから、確認したファイルを実行します。
@@ -1737,7 +1742,8 @@ sudo puzuz update --version 0.2.0 --yes
    指定されたときだけインストールします。
 3. 確認を求めます（`-y/--yes` で省略できます）。
 4. tarball、`.sha256`、`.minisig` を `/var/lib/puzuz/update`（root、0700）にダウンロードし、`puzuz` に組み込まれた
-   リリース鍵で minisign の署名を、そしてチェックサムを確認します。
+   リリース鍵で minisign の署名を（`install.sh` と同様に、その trusted comment がそのリリースの
+   `puzuz <tag> <file>` であることも）、そしてチェックサムを確認します。
 5. tarball を展開し（通常ファイルとディレクトリのみ）、新しい `puzuz` に対応するデータベースのスキーマを
    問い合わせます。デーモンのデータベースを開けないリリース（スキーマ変更より前の古いもの）は、何かを変更する
    前に拒否されます。

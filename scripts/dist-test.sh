@@ -57,7 +57,8 @@ mkdir -p "$stage/keys" "$stage/releases"
 "$minisign" -G -W -p "$stage/keys/other.pub" -s "$stage/keys/other.key" >/dev/null
 
 # release TAG SOURCE_TAG KEY: a release TAG holding SOURCE_TAG's binaries,
-# repackaged under TAG's name and signed with KEY.
+# repackaged under TAG's name and signed with KEY, with the trusted comment
+# of .github/workflows/release.yml ("puzuz <tag> <file>").
 release() {
     local tag="$1" src="$2" key="$3" work
     local from="puzuz-$src-$target" to="puzuz-$tag-$target"
@@ -69,7 +70,7 @@ release() {
     rm -rf "$work"
     (cd "$stage/releases/$tag" && sha256sum "$to.tar.gz" >"$to.tar.gz.sha256")
     "$minisign" -S -s "$stage/keys/$key.key" -m "$stage/releases/$tag/$to.tar.gz" \
-        -t "puzuz $tag"
+        -t "puzuz $tag $to.tar.gz"
     cp "$root/scripts/install.sh" "$stage/releases/$tag/install.sh"
 }
 release "v$v1" "v$v1" release
@@ -100,9 +101,21 @@ symlink_release() {
         tar --no-recursion -T - -czf "$stage/releases/$tag/$to.tar.gz")
     rm -rf "$work"
     (cd "$stage/releases/$tag" && sha256sum "$to.tar.gz" >"$to.tar.gz.sha256")
-    "$minisign" -S -s "$stage/keys/release.key" -m "$stage/releases/$tag/$to.tar.gz" -t "puzuz $tag"
+    "$minisign" -S -s "$stage/keys/release.key" -m "$stage/releases/$tag/$to.tar.gz" -t "puzuz $tag $to.tar.gz"
 }
 symlink_release
+# v1's tarball and signature, untouched, renamed as a newer release's (with a
+# matching checksum): the signature is valid, but its trusted comment names v1.
+replay_release() {
+    local tag="v$version-test.replay"
+    local from="puzuz-v$v1-$target" to="puzuz-$tag-$target"
+    mkdir -p "$stage/releases/$tag"
+    cp "$stage/releases/v$v1/$from.tar.gz" "$stage/releases/$tag/$to.tar.gz"
+    cp "$stage/releases/v$v1/$from.tar.gz.minisig" "$stage/releases/$tag/$to.tar.gz.minisig"
+    (cd "$stage/releases/$tag" && sha256sum "$to.tar.gz" >"$to.tar.gz.sha256")
+    cp "$root/scripts/install.sh" "$stage/releases/$tag/install.sh"
+}
+replay_release
 echo "v$v1" >"$stage/releases/latest"
 
 cp "$root/scripts/install.sh" "$root/scripts/dist/fake_github.py" "$root/scripts/dist/scenario.sh" \

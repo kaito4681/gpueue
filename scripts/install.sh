@@ -521,8 +521,14 @@ verify() {
     if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_UPDATE_PUBKEY_FILE:-}" ]; then
         key=(-p "$PUZUZ_UPDATE_PUBKEY_FILE")
     fi
-    "$MINISIGN" -V -q "${key[@]}" -m "$WORK/$tarball" -x "$WORK/$tarball.minisig" >/dev/null ||
+    # -Q prints the trusted comment, which the signature covers. The release
+    # workflow signs with "puzuz <tag> <file>": requiring exactly that keeps
+    # an older (validly signed) release from being served under a newer name.
+    local comment want="puzuz $TAG $tarball"
+    comment="$("$MINISIGN" -V -Q "${key[@]}" -m "$WORK/$tarball" -x "$WORK/$tarball.minisig")" ||
         die "bad signature on $tarball; not installing it"
+    [ "$comment" = "$want" ] ||
+        die "the signature of $tarball is for another file (trusted comment \"$comment\", expected \"$want\"); not installing it"
     info "verified the minisign signature"
 }
 
