@@ -2,7 +2,8 @@
 # helper (puzuz-helper.service). Keys marked [helper] are used by the helper,
 # [both] by both, [cli] by the puzuz command; unmarked keys are the daemon's.
 #
-# Created by `puzuz service install`, which never overwrites this file.
+# Created by `puzuz service install`, the packages (.deb, .rpm, AUR) or the NixOS module; none
+# of them overwrites an existing file.
 # Every key is optional and unknown keys are ignored. A commented line
 # `# key = value` shows the key's default. Lines indented below `# Example:`
 # are examples, not defaults: keys that are unset by default, and the [[gpus]]
@@ -80,8 +81,9 @@
 # size for a restore. When it passes, the running tool (with all its child
 # processes) is killed; a checkpoint is rolled back and the job keeps running,
 # a restore is abandoned (the restored processes are killed, the image is
-# kept). Measured on an NVMe disk: ~1-2 s per GiB, so the default leaves a
-# 15x margin for slow disks and busy hosts (see docs/install.md).
+# kept). Measured on an NVMe disk: ~1.5-2.5 s per GiB end to end, so the
+# default leaves a margin of more than 10x for slow disks and busy hosts (see
+# docs/install.md).
 # checkpoint_deadline_base_secs = 180
 # checkpoint_deadline_secs_per_gib = 30
 

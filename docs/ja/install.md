@@ -203,9 +203,11 @@ sudo bash install.sh
 
 リリースは `.github/workflows/release.yml` で、リポジトリのシークレット `MINISIGN_SECRET_KEY` と
 `MINISIGN_PASSWORD` に保存された minisign の秘密鍵で署名されます。公開鍵は `puzuz` に組み込まれる
-`packaging/minisign.pub` と、`scripts/install.sh` の `MINISIGN_PUBKEY` です。本物の鍵が作られるまで
-リポジトリにはテスト用の鍵が入っており、リリースのワークフローはその鍵では実行を拒否します。本物の鍵を一度
-だけ作るには次のようにします。
+`packaging/minisign.pub` と、`scripts/install.sh` の `MINISIGN_PUBKEY` です。使用中の鍵は本物のリリース鍵
+（ID `21E8F80CBA3FE3CA`）です。鍵をローテーションするとき（鍵の漏えいやメンテナーの交代）は、次のように新しい鍵
+ペアを作り、公開鍵を 2 か所とも同じコミットで差し替え、2 つのシークレットを更新します。インストール済みの
+`puzuz` は古い公開鍵を持っており、新しい鍵で署名されたリリースを検証できないので、`install.sh` での手動の
+再インストールが必要です。
 
 ```sh
 scripts/dist/gen-signing-key.sh        # asks for a password; writes the secret key under ~
@@ -1568,3 +1570,5 @@ OS のシャットダウンや再起動の間に、ダンプが失敗したか�
   せん。元のドライバーと GPU でリストアしてください。plugin モードでは GPU の UUID も一致する必要があります。
   manual モードでは同じモデルの別のカードは再マップされます。
 - `not enough free GPU memory`：他のジョブが GPU を使っています。待つか、GPU を空けてください。
+- プロセスが開いていたファイル、またはその実行ファイルやライブラリが変更または削除されています（`restore.log` を
+  参照）。同じパスに元に戻してください。

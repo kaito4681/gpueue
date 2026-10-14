@@ -29,13 +29,21 @@
   `--option system-features "kvm nixos-test"`. Tests that cannot
   pass in the Nix sandbox are listed in `nix/package.nix`. Published stable releases move the `stable` branch
   (`.github/workflows/release-nix.yml`). The module generates its units from `packaging/`.
-- CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, an MSRV check (`rust-version`),
-  shellcheck and the CPU e2e on pull requests; pushing a `v<version>` tag builds the release
-  tarball and a draft GitHub release (`.github/workflows/release.yml`).
+- CI (`.github/workflows/ci.yml`, on pull requests) has these jobs: `lint` (fmt, clippy), `test`,
+  `msrv` (`rust-version`), `shellcheck`, the CPU e2e, `service-install`, `dist-build` and `dist`
+  (tarball and `install.sh`), `deb`, `rpm`, `apt-repo` and `nix`. Pushing a `v<version>` tag runs
+  `.github/workflows/release.yml`, which builds and signs the tarballs, `.deb` and `.rpm`
+  packages and attaches them, with `install.sh` and `RPM-GPG-KEY-puzuz`, to a draft GitHub
+  release. Publishing the release triggers `release-apt.yml` (APT repository) and `release-aur.yml`
+  (AUR); the tag itself triggers `release-nix.yml` (moves the `stable` branch).
+- Other test scripts: `scripts/service-install-test.sh` (`puzuz service install` / `status` /
+  `uninstall` and `doctor`), `scripts/helper-systemd-test.sh` (the helper alone under systemd),
+  `scripts/measure-checkpoint.sh` (times each checkpoint step; not a pass/fail test).
 - Distribution test (`scripts/install.sh` against a fake GitHub API, two test versions of the
   tree): `scripts/dist-test.sh` (`PUZUZ_DIST_BASE=ubuntu:22.04|ubuntu:24.04|debian:12`, default
-  ubuntu:26.04). The release signing key is created once with `scripts/dist/gen-signing-key.sh`;
-  `packaging/minisign.pub` is a test key until then.
+  ubuntu:26.04). The release signing key (`packaging/minisign.pub`, id 21E8F80CBA3FE3CA) is the
+  real one; to rotate it, create a new pair with `scripts/dist/gen-signing-key.sh` (see
+  `docs/install.md`).
 - AUR package (`packaging/aur/puzuz-bin`): `scripts/dist/aur-test.sh` builds and installs it in
   an Arch Linux container with systemd; `scripts/dist/update-aur.sh <version>` points it at a
   release (run by `.github/workflows/release-aur.yml`).

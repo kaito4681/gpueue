@@ -5,8 +5,8 @@
 //! respective items and summarized here:
 //!
 //! - Global options: pueue's `-c/--config` and `-p/--profile` are not offered. puzuz talks to a
-//!   single system-wide daemon whose configuration lives in `/etc/puzuz/config.toml` and is only
-//!   read by the daemon. Instead, `--socket` (or `PUZUZ_SOCKET`) overrides the daemon socket.
+//!   single system-wide daemon whose configuration lives in `/etc/puzuz/config.toml`, read by the
+//!   daemon, the helper, `doctor` and the CLI's update settings. Instead, `--socket` (or `PUZUZ_SOCKET`) overrides the daemon socket.
 //! - `send` is parsed but always fails: jobs run with stdin connected to `/dev/null`.
 //! - `edit` and `env` are parsed but not implemented yet.
 //! - `shutdown` checkpoints all jobs before stopping (`--no-checkpoint` kills them instead).
@@ -15,7 +15,7 @@
 //!   (`{"groups": [...], "jobs": [...]}`, job views without their environment), not pueue's
 //!   state dump.
 //! - puzuz extensions: `add --gpu/--no-checkpoint`, `checkpoint`, `restore`, `gpu`, `daemon`,
-//!   `service`, `doctor` and `update`.
+//!   `service`, `uninstall`, `doctor` and `update`.
 
 use std::{fmt, path::PathBuf, str::FromStr};
 
@@ -669,7 +669,7 @@ pub enum SubCommand {
     /// non-zero status if any check fails.
     Doctor,
 
-    /// (puzuz) Update puzuz itself (administrators).
+    /// (puzuz) Update puzuz itself (root; without root it only checks).
     ///
     /// Downloads a release from GitHub, checks its signature and checksum, and installs it into
     /// the installed directory with its own `puzuz service install`. Running jobs keep
