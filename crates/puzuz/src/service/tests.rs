@@ -330,6 +330,66 @@ fn moving_the_installation_removes_the_previous_copies() {
 }
 
 #[test]
+fn moving_to_another_name_of_the_same_directory_keeps_the_binaries() {
+    // Merged /usr: /bin is a symlink to usr/bin.
+    let sys = build_dir_system();
+    sys.mkdir("/usr/bin");
+    std::os::unix::fs::symlink("usr/bin", sys.path(Path::new("/bin"))).unwrap();
+    let at = |dir: &str| InstallOptions {
+        bin_dir: Some(PathBuf::from(dir)),
+        ..opts()
+    };
+    run_install(&sys, &at("/usr/bin")).unwrap();
+    let out = run_install(&sys, &at("/bin")).unwrap();
+    assert!(!out.contains("removed /usr/bin"), "{out}");
+    assert_eq!(sys.read("/usr/bin/puzuz").unwrap(), "new puzuz");
+    assert_eq!(sys.read("/usr/bin/puzuz-helper").unwrap(), "new helper");
+    assert_eq!(
+        receipt(&sys).copied,
+        paths(&["/bin/puzuz", "/bin/puzuz-helper"])
+    );
+    // And back.
+    let out = run_install(&sys, &at("/usr/bin")).unwrap();
+    assert!(!out.contains("removed /bin"), "{out}");
+    assert_eq!(sys.read("/usr/bin/puzuz-helper").unwrap(), "new helper");
+
+    // Even when the previous receipt's directory is not recognised as the same one, a
+    // previous copy that is the same file as a new binary is not removed.
+    let sys = build_dir_system();
+    sys.mkdir("/usr/bin");
+    std::os::unix::fs::symlink("usr/bin", sys.path(Path::new("/bin"))).unwrap();
+    sys.write_exe("/usr/bin/puzuz", "new puzuz");
+    sys.write_exe("/usr/bin/puzuz-helper", "new helper");
+    let previous = Receipt {
+        version: "0.0.1".to_owned(),
+        bin_dir: PathBuf::from("/nonexistent/bin"),
+        copied: paths(&["/nonexistent/bin/puzuz"]),
+        ..Receipt::default()
+    };
+    let binaries = Binaries {
+        bin_dir: PathBuf::from("/bin"),
+        changed: false,
+        copied: paths(&["/bin/puzuz", "/bin/puzuz-helper"]),
+        store_path: None,
+    };
+    let stale = write_receipt(&sys, Some(&previous), &binaries, (None, None)).unwrap();
+    assert_eq!(stale, paths(&["/nonexistent/bin/puzuz"]));
+    sys.mkdir("/opt/old");
+    std::fs::hard_link(
+        sys.path(Path::new("/usr/bin/puzuz")),
+        sys.path(Path::new("/opt/old/puzuz")),
+    )
+    .unwrap();
+    let previous = Receipt {
+        bin_dir: PathBuf::from("/opt/old"),
+        copied: paths(&["/opt/old/puzuz"]),
+        ..previous
+    };
+    let stale = write_receipt(&sys, Some(&previous), &binaries, (None, None)).unwrap();
+    assert!(stale.is_empty(), "{stale:?}");
+}
+
+#[test]
 fn an_invalid_receipt_stops_the_install() {
     let sys = build_dir_system();
     let untrusted =
@@ -574,6 +634,42 @@ fn bin_dir_installs_copies() {
 }
 
 #[test]
+fn an_identical_binary_behind_a_symlink_is_replaced() {
+    let mut sys = FakeSystem::new();
+    sys.exe = PathBuf::from("/home/u/target/release/puzuz");
+    sys.write_exe("/home/u/target/release/puzuz", "new puzuz");
+    sys.write_exe("/home/u/target/release/puzuz-helper", "new helper");
+    sys.mkdir("/usr/local/bin");
+    // Same contents, but the user can change what root's helper runs.
+    std::os::unix::fs::symlink(
+        sys.path(Path::new("/home/u/target/release/puzuz-helper")),
+        sys.path(Path::new("/usr/local/bin/puzuz-helper")),
+    )
+    .unwrap();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(
+        out.contains("installed /usr/local/bin/puzuz-helper"),
+        "{out}"
+    );
+    let meta =
+        std::fs::symlink_metadata(sys.path(Path::new("/usr/local/bin/puzuz-helper"))).unwrap();
+    assert!(meta.file_type().is_file());
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "new helper"
+    );
+    // The user's build was not written through the symlink.
+    assert_eq!(
+        sys.read("/home/u/target/release/puzuz-helper").unwrap(),
+        "new helper"
+    );
+
+    // A root-owned regular file with the same contents and mode is kept.
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(!out.contains("installed /usr/local/bin"), "{out}");
+}
+
+#[test]
 fn bin_dir_equal_to_the_binary_location_copies_nothing() {
     let sys = system();
     let options = InstallOptions {
@@ -588,7 +684,13 @@ fn bin_dir_equal_to_the_binary_location_copies_nothing() {
 #[test]
 fn bad_bin_dirs_and_missing_helper_are_rejected() {
     let sys = system();
-    for dir in ["relative/bin", "/opt/my bin", "/opt/%h"] {
+    for dir in [
+        "relative/bin",
+        "/opt/my bin",
+        "/opt/%h",
+        "/usr/local/../bin",
+        "/usr/./bin",
+    ] {
         let options = InstallOptions {
             no_start: false,
             bin_dir: Some(PathBuf::from(dir)),
@@ -927,6 +1029,97 @@ fn uninstall_warns_about_running_jobs() {
     let err = run_uninstall(&sys, true, true).unwrap_err();
     assert!(err.contains("puzuz-job-3.service"), "{err}");
     assert!(sys.exists("/var/lib/puzuz/logs"));
+}
+
+#[test]
+fn purge_refuses_when_running_jobs_cannot_be_listed() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write("/var/lib/puzuz/logs/1000/7.log", "log");
+    sys.respond(
+        "systemctl list-units",
+        CmdOutput::failed("", "Failed to connect to bus"),
+    );
+    let err = run_uninstall(&sys, true, true).unwrap_err();
+    assert!(
+        err.contains("cannot tell whether jobs are still running"),
+        "{err}"
+    );
+    assert!(err.contains("Failed to connect to bus"), "{err}");
+    assert!(sys.exists("/var/lib/puzuz/logs/1000/7.log"));
+    assert!(sys.exists("/etc/systemd/system/puzuz.service"));
+
+    // Without --purge nothing of the jobs is deleted: a warning is enough.
+    let out = run_uninstall(&sys, false, false).unwrap();
+    assert!(
+        out.contains("warning: cannot tell whether jobs are still running"),
+        "{out}"
+    );
+    assert!(sys.exists("/var/lib/puzuz/logs/1000/7.log"));
+}
+
+#[test]
+fn purge_never_follows_symlinks_in_user_directories() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    // What a user can plant in their own log directory.
+    sys.write("/etc/passwd", "root:x:0:0");
+    sys.write("/srv/secret/file", "kept");
+    sys.write("/var/lib/puzuz/logs/1000/7.log", "log");
+    sys.mkdir("/var/lib/puzuz/logs/1000/nested/deeper");
+    let link = |target: &str, at: &str| {
+        std::os::unix::fs::symlink(sys.path(Path::new(target)), sys.path(Path::new(at))).unwrap();
+    };
+    link("/etc", "/var/lib/puzuz/logs/1000/d");
+    link("/etc/passwd", "/var/lib/puzuz/logs/1000/passwd");
+    link("/srv/secret", "/var/lib/puzuz/logs/1000/nested/deeper/s");
+    link("/does/not/exist", "/var/lib/puzuz/logs/1000/dangling");
+    // A purge directory that is itself a symlink is removed, not followed.
+    std::fs::remove_dir_all(sys.path(Path::new("/run/puzuz"))).ok();
+    sys.mkdir("/run");
+    link("/srv/secret", "/run/puzuz");
+
+    let out = run_uninstall(&sys, true, true).unwrap();
+    assert!(!sys.exists("/var/lib/puzuz"), "{out}");
+    assert!(
+        sys.path(Path::new("/run/puzuz"))
+            .symlink_metadata()
+            .is_err()
+    );
+    assert_eq!(sys.read("/etc/passwd").unwrap(), "root:x:0:0");
+    assert_eq!(sys.read("/srv/secret/file").unwrap(), "kept");
+    assert!(out.contains("removed /var/lib/puzuz\n"), "{out}");
+}
+
+#[test]
+fn purge_reports_a_purge_directory_that_is_a_mount_point_as_kept() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write("/var/lib/puzuz/daemon/state.sqlite", "db");
+    sys.write("/var/lib/puzuz/checkpoints/mnt/image", "on another mount");
+    sys.write(
+        "/proc/self/mountinfo",
+        "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+         91 22 8:2 / /var/lib/puzuz rw - ext4 /dev/sda2 rw\n\
+         92 91 8:3 / /var/lib/puzuz/checkpoints/mnt rw - ext4 /dev/sda3 rw\n",
+    );
+    let out = run_uninstall(&sys, true, true).unwrap();
+    assert!(
+        out.contains("kept /var/lib/puzuz (a mount point; deleted what was in it)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("kept /var/lib/puzuz/checkpoints/mnt (a mount point"),
+        "{out}"
+    );
+    assert!(!out.contains("removed /var/lib/puzuz\n"), "{out}");
+    assert!(sys.exists("/var/lib/puzuz"));
+    assert!(!sys.exists("/var/lib/puzuz/daemon"));
+    assert_eq!(
+        sys.read("/var/lib/puzuz/checkpoints/mnt/image").unwrap(),
+        "on another mount"
+    );
+    assert!(out.contains("removed /etc/puzuz\n"), "{out}");
 }
 
 #[test]
@@ -1705,6 +1898,8 @@ fn an_unowned_unit_next_to_installed_units_needs_no_force() {
         "dpkg-query -S",
         CmdOutput::failed("", "dpkg-query: no path found matching pattern\n"),
     );
+    sys.missing("rpm");
+    sys.missing("pacman");
     assert_eq!(install_method::detect(&sys).keyword(), "service-install");
     let out = run_install(&sys, &opts()).unwrap();
     assert!(out.contains("warning: no package owns"), "{out}");

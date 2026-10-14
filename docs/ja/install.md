@@ -86,7 +86,10 @@ sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpo
 `criu`、`cuda-checkpoint`、`nvidia-smi` を root として実行するので、それらの絶対パスは root の所有でなければ
 なりません。root が所有するシンボリックリンクはたどられ、リンク先も同じように確認されます。また
 `/nix/store`（root の所有、sticky、グループ `nixbld`）はグループ書き込み可能ですが受け入れられるので、NixOS の
-`/run/current-system/sw/bin/criu` のようなパスも使えます。
+`/run/current-system/sw/bin/criu` のようなパスも使えます。root として実行した `puzuz doctor` も、これらの
+プログラムを実行する前に同じ規則を適用します。規則を満たさないプログラムは実行せずに FAIL として報告し
+（パスを含まない名前は systemd のデフォルトの `PATH` から探します）、設定ファイル自体が所有者の確認に失敗した
+場合は、そのファイルが指定するプログラムを一つも実行しません。
 
 <a id="installing-with-installsh"></a>
 ## install.sh でのインストール
@@ -793,7 +796,8 @@ sudo target/release/puzuz service install
 
 `--bin-dir DIR` で別の場所にインストールできます。`puzuz-helper` は root として動くので、そのディレクトリと
 すべての親は root の所有で、グループやその他のユーザーが書き込めない必要があります（まだ存在しない
-ディレクトリはモード 0755 で作成されます）。それ以外は install が拒否します。`--no-start` はサービスを開始も
+ディレクトリはモード 0755 で作成されます）。それ以外と、`.` や `..` を含むパスは install が拒否します。
+`--no-start` はサービスを開始も
 再起動もせずに有効化します。`--force` は、`puzuz service install` が書いたのではないユニット、sysusers.d、
 tmpfiles.d のファイルを上書きします（手順 2 を参照）。
 
@@ -817,11 +821,15 @@ NixOS 以外で Nix でビルドした場合（`nix build` のあと `sudo ./res
 
 `puzuz service install` は何度実行しても安全です（たとえばアップグレードのあと）。次のことを行います。
 
-1. `puzuz` と `puzuz-helper` が上で選んだディレクトリにまだなければコピーし（モード 0755、アトミックに置き換え）、
+1. `puzuz` と `puzuz-helper` を上で選んだディレクトリにコピーし（同じ内容の root 所有の通常ファイルが既に
+   あればそのまま使い、それ以外、たとえばビルドディレクトリへのシンボリックリンクは置き換えます。モード 0755、
+   アトミックに置き換え）、
    それらがストアから来たものなら Nix の GC ルートを登録し、`/var/lib/puzuz/install-receipt`（root、0644）を
    書き込みます。レシートにはディレクトリ、コピーしたバイナリ（その場で使う場合はなし）、バージョン、GC
    ルートが記録され、`puzuz uninstall` はまさにそれらを削除します。（`--bin-dir` で）別のディレクトリに
-   再インストールすると、前回作ったコピーは削除されます。レシートが存在するのに使えない場合（root の所有で
+   再インストールすると、前回作ったコピーは削除されます。同じディレクトリの別名（`/usr` が統合された
+   システムでの `/usr/bin` に対する `/bin` など）は同じディレクトリとみなされ、新しいバイナリと同じファイルで
+   あるコピーは削除されません。レシートが存在するのに使えない場合（root の所有で
    ない、他のユーザーが書き込める、内容が不正）、install は何も変更せずに止まります。ファイルを直すか、
    記載内容を確認してから削除してください。
 2. バイナリに組み込まれたパッケージングのテンプレートから次のファイルを書き込みます。各ファイルは
@@ -872,7 +880,7 @@ puzuz は、`puzuz.service` と `puzuz-helper.service` それぞれのユニッ�
 | インストール方法 | 判別方法 |
 | --- | --- |
 | `puzuz service install` | インストールのマーカー行で始まる `/etc/systemd/system/<unit>` |
-| ディストリビューションのパッケージ | `dpkg-query -S`、`rpm -qf`、`pacman -Qo` が所有者を示す `/usr/lib/systemd/system/<unit>`（または `/lib/systemd/system/...`）（`/usr` が統合されたシステムでは dpkg が `/lib` のほうを登録していることがあるので、両方のパスで問い合わせます。最初に確定的な答えを返したツールで決まります）。どのツールも答えられない場合（インストールされていない、またはロックされたデータベースなどでどれも失敗した場合）、そのユニットは出所不明のパッケージとみなされます |
+| ディストリビューションのパッケージ | `dpkg-query -S`、`rpm -qf`、`pacman -Qo` が所有者を示す `/usr/lib/systemd/system/<unit>`（または `/lib/systemd/system/...`）（`/usr` が統合されたシステムでは dpkg が `/lib` のほうを登録していることがあるので、両方のパスが存在すれば両方で問い合わせます。ディストリビューション自身のパッケージマネージャーから先に問い合わせます）。所有者を示したツールがあればそれで決まり、インストールされているすべてのツールがどのパッケージも所有していないと答えたときだけ、所有者のないユニットとみなされます。どのツールも答えられない場合（インストールされていない、またはロックされたデータベースなどでどれかが失敗した場合）、そのユニットは出所不明のパッケージとみなされます |
 | 所有者のないユニット | パッケージマネージャーが所有されていないと確定的に報告する（`no path found matching pattern`、`is not owned by any package`、`No package owns`）そうしたユニット。削除したパッケージの残りか、手動で（`make install`）そこにコピーされたもの |
 | Nix | `/nix/store` を指す `/etc/systemd/system/<unit>`（NixOS の `services.puzuz` モジュール、system-manager）、または `/nix/store` を指すか `/nix/store` のバイナリを実行するパッケージのユニット |
 | 手動 | マーカーのない `/etc/systemd/system/<unit>` で、パッケージのユニットがないもの（`ExecStart=` が `/nix/store` 以下の場合も含む） |
@@ -1318,7 +1326,7 @@ automount ポイントをトリガーしながら）確認し、なければ分�
 | --- | --- |
 | `install.sh`（またはリリースの `puzuz service install`） | `sudo puzuz update` |
 | `.deb` | `sudo apt update && sudo apt upgrade`（またはリリースの新しい `.deb` を `sudo apt install ./puzuz_<new version>_<arch>.deb` でインストール） |
-| `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>`（dnf リポジトリはまだありません） |
+| `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>`（openSUSE では `sudo zypper install <URL>`。dnf リポジトリはまだありません） |
 | ソースからビルド | `cargo build --release -p puzuz -p puzuz-helper` のあと `sudo target/release/puzuz service install` |
 | Nix ビルドからの `puzuz service install`（NixOS 以外） | 同じ `nix build` と `service install` をもう一度（[Nix でのインストール](#installing-with-nix) を参照） |
 | AUR パッケージ `puzuz-bin`（公開後。それまで Arch は `install.sh` と `sudo puzuz update` を使います） | `yay -Syu`（任意の AUR ヘルパー）のあと `sudo systemctl restart puzuz-helper.service puzuz.service`。`puzuz update` は拒否します |
@@ -1339,7 +1347,9 @@ sudo puzuz update --version 0.2.0 --yes
 `install.sh --save-token` が書き込む `/etc/puzuz/github-token`（root、0600）です。その後、次のことを行います。
 
 1. puzuz が `puzuz service install` でインストールされたこと（パッケージ、Nix、手動ではなく、両方のユニットが
-   それに属していること）と、インストールされたバイナリ（`puzuz.service` の `ExecStart=` にあるディレクトリ）
+   それに属していること。別の方法でインストールされたヘルパーのユニットは何もダウンロードする前に拒否し、
+   ヘルパーのユニットがなければインストールが書き込みます）と、インストールされたバイナリ（`puzuz.service` の
+   `ExecStart=` にあるディレクトリ）
    として実行されていることを確認します。
 2. 最新のリリース（または `--version`）を調べ、自分のバージョンと比較します。最新であれば何もしません。古い
    バージョンは `--version` で指定されたときだけインストールします。
@@ -1351,7 +1361,9 @@ sudo puzuz update --version 0.2.0 --yes
    前に拒否されます。
 6. インストール先のディレクトリに対して新しい `puzuz service install` を実行し、Nix でビルドしたインストールの
    Nix GC ルートを削除し（リリースのバイナリはストアを必要としません）、デーモンが新しいバージョンで動いて
-   ヘルパーに接続するまで待ってから、ダウンロードしたものを削除します。
+   ヘルパーに接続するまで待ってから、ダウンロードしたものを削除します。`service install` が失敗した場合、
+   `puzuz update` はインストールされたバイナリを調べます。リリースのものになっていなければそのエラーで止まり、
+   なっていれば（最後の確認だけが失敗した場合）警告して続けます。
 
 `install.sh`（必要なら `--version` を付けて再実行）でも同じことができます。ただし署名を確認するのは `minisign`
 がインストールされている場合だけです。
@@ -1406,11 +1418,14 @@ sudo puzuz uninstall --purge    # also delete /etc/puzuz, /var/lib/puzuz, /run/p
 - インストール済みの `puzuz` が `puzuz uninstall` より古い場合、`install.sh --uninstall` はその
   `service uninstall` を実行してから、ユニットのディレクトリにある `puzuz` と `puzuz-helper` を削除します。
 - 実行中のジョブはそれぞれのユニットで動き続けます。`uninstall` はそれについて警告し、`--purge` は
-  `puzuz-job-*` ユニットがアクティブな間は実行を拒否します。先に `sudo systemctl stop 'puzuz-job-*'` で停止
+  `puzuz-job-*` ユニットがアクティブな間と、systemd がそれらを列挙できないときは実行を拒否します。先に
+  `sudo systemctl stop 'puzuz-job-*'` で停止
   するか、アンインストールの前にチェックポイントか kill してください。
 - `--purge` は確認を求めます（`-y/--yes` で省略できます）。マウントポイント（たとえば `/run/puzuz-helper` 以下の
   `/` のバインドマウント）の中には降りていきません。それらは報告されるので、手動でアンマウントして削除して
-  ください。
+  ください。削除するディレクトリ自体がマウントポイントの場合（たとえば独立したファイルシステム上の
+  `/var/lib/puzuz`）は、中身を削除してディレクトリは残します。削除はシンボリックリンクを決してたどりません
+  （ユーザーが自分のログディレクトリに置いたものも含みます）。
 - システムユーザー `puzuz` とグループ `puzuz-admin` は常に残ります。
 
 <a id="troubleshooting"></a>
@@ -1446,6 +1461,7 @@ sudo ls /var/lib/puzuz/checkpoints/failed-logs/   # dump.log of failed dumps (ne
 | `config` | invalid configuration | TOML を直してください。この状態ではデーモンは起動しません。 |
 | `config` | not readable by others / not searchable by others (WARN) | `sudo chmod 755 /etc/puzuz; sudo chmod 644 /etc/puzuz/config.toml`：デーモンは `puzuz` として動きます |
 | `criu` | not found, or too old | CRIU 4.2 以降をインストールするか、`criu_path` を設定します |
+| `criu`、`cuda-checkpoint`、`gpus` | was not run as root（root 以外が置き換えられる、または設定ファイルが所有者の確認に失敗した） | プログラムとそのディレクトリを root の所有にし、グループやその他のユーザーが書き込めないようにするか、先に `config` の問題を直します |
 | `cuda-checkpoint` | not found, or lacks `--action lock/checkpoint/restore/unlock` | r570 以降のドライバー用のバイナリを `/usr/local/bin` にインストールします |
 | `cuda-checkpoint` | version X but the driver is Y | ドライバーのメジャーバージョンに合った cuda-checkpoint を使います |
 | `cuda plugin` | `cuda_checkpoint_mode` is `"plugin"` but `/usr/lib/criu/cuda_plugin.so` is missing | プラグインをインストールする（[CUDA プラグインモード](#cuda-plugin-mode) を参照）か、manual モードを使います |

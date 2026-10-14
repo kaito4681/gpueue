@@ -11,6 +11,12 @@ repository.workspace = true
 name = "puzuz"
 path = "src/main.rs"
 
+[features]
+# Test builds only (scripts/dist/build-test-versions.sh): `puzuz update` honours
+# PUZUZ_RELEASE_API_URL (a fake GitHub API) and PUZUZ_UPDATE_PUBKEY_FILE (another release key).
+# Never enabled in releases.
+test-hooks = []
+
 [dependencies]
 puzuz-core.workspace = true
 puzuz-protocol = { workspace = true, features = ["client"] }
@@ -26,7 +32,7 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
 serde.workspace = true
 serde_json.workspace = true
 comfy-table.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = ["dir"] }
 ureq.workspace = true
 minisign-verify.workspace = true
 sha2.workspace = true

@@ -70,7 +70,10 @@ You can put it somewhere else and set `cuda_checkpoint_path` in `/etc/puzuz/conf
 paths of `criu`, `cuda-checkpoint` and `nvidia-smi` must be owned by root, because the helper runs
 them as root. Symlinks owned by root are followed and their targets checked the same way, and
 `/nix/store` (owned by root, sticky, group `nixbld`) is accepted although it is group-writable, so
-paths like `/run/current-system/sw/bin/criu` on NixOS work.
+paths like `/run/current-system/sw/bin/criu` on NixOS work. `puzuz doctor` run as root applies the
+same rule before it runs one of these programs: it reports a FAIL instead of running one that
+fails it (bare names are looked up in systemd's default `PATH`), and it runs none of the programs
+a configuration file names if that file failed its own ownership check.
 
 ## Installing with install.sh
 
@@ -774,7 +777,8 @@ sudo target/release/puzuz service install
 
 `--bin-dir DIR` installs somewhere else. Because `puzuz-helper` runs as root, the directory and
 every parent must be owned by root and not group- or world-writable (directories that do not
-exist yet are created with mode 0755); install refuses anything else. `--no-start` enables the
+exist yet are created with mode 0755); install refuses anything else, and a path with `.` or `..`
+components. `--no-start` enables the
 services without starting or restarting them. `--force` overwrites unit, sysusers.d and
 tmpfiles.d files that `puzuz service install` did not write (see step 2).
 
@@ -801,11 +805,16 @@ daemon and the helper connection) are ignored.
 following:
 
 1. Copies `puzuz` and `puzuz-helper` into the directory chosen above unless they are already
-   there (mode 0755, replaced atomically), registers the Nix GC root if they come from the
+   there as regular files owned by root with the same contents (anything else, such as a symlink
+   to a build directory, is replaced; mode 0755, replaced atomically), registers the Nix GC root
+   if they come from the
    store, and writes `/var/lib/puzuz/install-receipt` (root, 0644). The receipt records the
    directory, the binaries it copied (none when they are used in place), the version and the GC
    root, so that `puzuz uninstall` removes exactly those. A re-install into another directory
-   (with `--bin-dir`) removes the copies the previous one made. If the receipt exists but cannot
+   (with `--bin-dir`) removes the copies the previous one made; another name of the same
+   directory (such as `/bin` for `/usr/bin` on merged-`/usr` systems) counts as the same
+   directory, and a copy that is the same file as a new binary is never removed. If the receipt
+   exists but cannot
    be used (not owned by root, writable by others, or not valid), install stops without
    changing anything: fix the file, or delete it after checking what it lists.
 2. Writes these files from the packaging templates built into the binary. Each file starts with
@@ -859,7 +868,7 @@ the units with drop-ins (`sudo systemctl edit puzuz-helper.service`). Edits to t
 | Install method | Recognized by |
 | --- | --- |
 | `puzuz service install` | `/etc/systemd/system/<unit>` starting with the install marker line |
-| distribution package | `/usr/lib/systemd/system/<unit>` (or `/lib/systemd/system/...`) that `dpkg-query -S`, `rpm -qf` or `pacman -Qo` names an owner for (asked under both paths, since dpkg may have registered the `/lib` one on merged-`/usr` systems; the first tool with a definite answer decides). If no tool can answer (none installed, or each fails, e.g. with a locked database), the unit counts as a package of unknown origin |
+| distribution package | `/usr/lib/systemd/system/<unit>` (or `/lib/systemd/system/...`) that `dpkg-query -S`, `rpm -qf` or `pacman -Qo` names an owner for (asked under both paths where both exist, since dpkg may have registered the `/lib` one on merged-`/usr` systems; the distribution's own package manager first). A tool that names an owner decides; the unit counts as unowned only when every installed tool says that no package owns it. If no tool can answer (none installed, or one fails, e.g. with a locked database), the unit counts as a package of unknown origin |
 | unowned unit | such a unit that a package manager definitely reports as not owned (`no path found matching pattern`, `is not owned by any package`, `No package owns`): left over from a removed package, or copied there by hand (`make install`) |
 | Nix | `/etc/systemd/system/<unit>` resolving into `/nix/store` (the NixOS `services.puzuz` module, system-manager), or a packaged unit that resolves into or runs a binary from `/nix/store` |
 | by hand | `/etc/systemd/system/<unit>` without the marker, and no packaged unit (also when its `ExecStart=` is below `/nix/store`) |
@@ -1312,7 +1321,7 @@ and its "update" line says when a newer release exists):
 | --- | --- |
 | `install.sh` (or `puzuz service install` of a release) | `sudo puzuz update` |
 | the `.deb` | `sudo apt update && sudo apt upgrade` (or install a newer `.deb` from a release with `sudo apt install ./puzuz_<new version>_<arch>.deb`) |
-| the `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>` (no dnf repository yet) |
+| the `.rpm` | `sudo dnf upgrade <URL of puzuz-<new version>-1.<arch>.rpm>` (`sudo zypper install <URL>` on openSUSE; no dnf repository yet) |
 | built from source | `cargo build --release -p puzuz -p puzuz-helper`, then `sudo target/release/puzuz service install` |
 | `puzuz service install` from a Nix build (not NixOS) | the same `nix build` and `service install` again (see [Installing with Nix](#installing-with-nix)) |
 | the AUR package `puzuz-bin` (once published; until then Arch uses `install.sh` and `sudo puzuz update`) | `yay -Syu` (any AUR helper), then `sudo systemctl restart puzuz-helper.service puzuz.service`; `puzuz update` refuses |
@@ -1332,7 +1341,8 @@ rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or
 `/etc/puzuz/github-token` (root, 0600), which `install.sh --save-token` writes. It then:
 
 1. checks that puzuz was installed by `puzuz service install` (not by a package, Nix or by
-   hand, and that both units belong to it) and
+   hand, and that both units belong to it: a helper unit installed another way is refused
+   before anything is downloaded, a missing one is written by the install) and
    that it runs as the installed binary (the directory in `puzuz.service`'s `ExecStart=`),
 2. looks up the latest release (or `--version`) and compares it with its own version. Nothing
    happens when it is up to date. An older version is installed only when asked for with
@@ -1345,7 +1355,10 @@ rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or
    from before a schema change) is refused before anything changes,
 6. runs the new `puzuz service install` for the installed directory, removes the Nix GC root of
    a Nix-built installation (the release's binaries do not need the store), waits until the
-   daemon runs the new version and is connected to the helper, and deletes the download.
+   daemon runs the new version and is connected to the helper, and deletes the download. If
+   `service install` fails, `puzuz update` looks at the installed binaries: if they are not the
+   release's, it stops with that error; if they are (only the final checks failed), it warns and
+   goes on.
 
 `install.sh` (run again, optionally with `--version`) works too and does the same, except that it
 checks the signature only when `minisign` is installed.
@@ -1405,11 +1418,14 @@ runs it. `--purge` asks for confirmation on the terminal. When there is no termi
 - `install.sh --uninstall` with an installed `puzuz` older than `puzuz uninstall` runs its
   `service uninstall` and then deletes `puzuz` and `puzuz-helper` from the units' directory.
 - Running jobs keep running in their own units. `uninstall` warns about them, and `--purge`
-  refuses to run while any `puzuz-job-*` unit is active. Stop them first with
+  refuses to run while any `puzuz-job-*` unit is active, or when systemd cannot list them. Stop
+  them first with
   `sudo systemctl stop 'puzuz-job-*'`, or checkpoint/kill them before uninstalling.
 - `--purge` asks for confirmation (`-y/--yes` skips it). It does not descend into mount points
   (for example the bind mount of `/` below `/run/puzuz-helper`). Those are reported for you to
-  unmount and delete by hand.
+  unmount and delete by hand. A purge directory that is itself a mount point (for example
+  `/var/lib/puzuz` on its own filesystem) is emptied and kept. The deletion never follows
+  symlinks, including ones users place in their log directories.
 - The system user `puzuz` and the group `puzuz-admin` are always kept.
 
 ## Troubleshooting
@@ -1442,6 +1458,7 @@ stopped until `sudo systemctl start puzuz` or the next boot.
 | `config` | invalid configuration | fix the TOML. The daemon does not start with it. |
 | `config` | not readable by others / not searchable by others (WARN) | `sudo chmod 755 /etc/puzuz; sudo chmod 644 /etc/puzuz/config.toml`: the daemon runs as `puzuz` |
 | `criu` | not found, or too old | install CRIU 4.2 or newer, or set `criu_path` |
+| `criu`, `cuda-checkpoint`, `gpus` | was not run as root (someone other than root could replace it, or the configuration failed the trust check) | make the program and its directories owned by root and not group- or world-writable, or fix the `config` check first |
 | `cuda-checkpoint` | not found, or lacks `--action lock/checkpoint/restore/unlock` | install the binary for a driver of r570 or newer into `/usr/local/bin` |
 | `cuda-checkpoint` | version X but the driver is Y | use the cuda-checkpoint that matches the driver's major version |
 | `cuda plugin` | `cuda_checkpoint_mode` is `"plugin"` but `/usr/lib/criu/cuda_plugin.so` is missing | install the plugin (see [CUDA plugin mode](#cuda-plugin-mode)) or use the manual mode |

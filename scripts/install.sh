@@ -481,8 +481,10 @@ verify() {
     info "verified the SHA-256 checksum"
     if command -v minisign >/dev/null 2>&1; then
         local key=(-P "$MINISIGN_PUBKEY")
-        # Test-only: another public key file.
-        [ -n "${PUZUZ_UPDATE_PUBKEY_FILE:-}" ] && key=(-p "$PUZUZ_UPDATE_PUBKEY_FILE")
+        # Test-only: another public key file (ignored without PUZUZ_TEST_HOOKS=1).
+        if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_UPDATE_PUBKEY_FILE:-}" ]; then
+            key=(-p "$PUZUZ_UPDATE_PUBKEY_FILE")
+        fi
         minisign -V -q "${key[@]}" -m "$WORK/$tarball" -x "$WORK/$tarball.minisig" >/dev/null ||
             die "bad signature on $tarball; not installing it"
         info "verified the minisign signature"
@@ -672,8 +674,13 @@ do_uninstall() {
 
 main() {
     parse_args "$@"
-    # Test-only override of the GitHub API (a fake release server).
-    API_URL="${PUZUZ_RELEASE_API_URL:-https://api.github.com}"
+    API_URL="https://api.github.com"
+    # Test-only override of the GitHub API (a fake release server); ignored
+    # without PUZUZ_TEST_HOOKS=1, so that an inherited environment (sudo -E)
+    # cannot send the token elsewhere.
+    if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_RELEASE_API_URL:-}" ]; then
+        API_URL="$PUZUZ_RELEASE_API_URL"
+    fi
     check_root
     WORK="$(mktemp -d)"
     trap 'rm -rf "$WORK"' EXIT
