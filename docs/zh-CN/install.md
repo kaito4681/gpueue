@@ -16,6 +16,7 @@
 - [验证](#verifying)
 - [配置](#configuration)
 - [管理员](#administrators)
+- [谁可以运行作业](#who-jobs-may-run-as)
 - [优先级与公平共享](#priority-and-fair-share)
 - [GPU 检测](#gpu-detection)
 - [GPU 隔离](#gpu-isolation)
@@ -1029,6 +1030,9 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/puzu
 | `criu_restore_timeout_secs` | 未设置 | helper | 可选，单独限制 `criu restore`；未设置时只适用期限 |
 | `fork_guard` | `true` | helper | 向作业预加载 fork guard（见 README 的限制一节） |
 | `gpu_device_isolation` | `true` | helper | 每个作业单元只能打开所分配 GPU 的设备节点（`DevicePolicy=closed`）；`false` 关闭此功能（见 [GPU 隔离](#gpu-isolation)） |
+| `job_min_uid` | `/etc/login.defs` 的 `UID_MIN`，没有则为 `1000` | helper | 拒绝 uid 小于此值的用户的作业（见 [谁可以运行作业](#who-jobs-may-run-as)） |
+| `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | helper | 等同 root 的组：从作业的附加组中去掉；主组为其中之一的作业会被拒绝 |
+| `job_allowed_users` | `[]`（所有人） | helper | 非空时，只有列出的用户（按名称）可以运行作业 |
 | `gpu_detection` | `"auto"` | 守护进程 | `"auto"`：NVML，失败时退回 `[[gpus]]`。`"static"`：只用 `[[gpus]]`。 |
 | `nvml_library` | 未设置 | 守护进程 | NVML 库的路径或名称；默认先用 `libnvidia-ml.so.1`，再用 `libnvidia-ml.so` |
 | `update_source` | `"github:kaito4681/puzuz"` | CLI | `puzuz update` 和 `puzuz doctor` 查找发布版本的位置：`github:<owner>/<repo>` |
@@ -1052,6 +1056,42 @@ sudo usermod -aG puzuz-admin alice
 ```
 
 守护进程在每次请求时（通过 NSS）查询组成员关系，因此更改立即生效，无需重新登录。
+
+<a id="who-jobs-may-run-as"></a>
+## 谁可以运行作业
+
+root helper 以所有者身份启动每个作业，因此由它决定运行谁的作业；守护进程无法改变这一点。除了从不以 root
+（uid 0 或 gid 0）或所有者不属于的组运行作业之外，helper 对每次启动和每次恢复应用三项设置：
+
+- `job_min_uid`：uid 小于此值的用户会被拒绝。未设置时为 `/etc/login.defs` 的 `UID_MIN`（大多数发行版为
+  1000），文件中没有有效的 `UID_MIN` 时为 1000。这样系统账户（`www-data`、`postgres`、守护进程自己的
+  `puzuz` 用户等）就不能运行作业。
+- `job_denied_groups`：其成员无需密码即可以 root 身份行事的组。它们会从作业的附加组中去掉，因此属于
+  `docker` 的用户的作业在没有 `docker` 的情况下运行；去掉了哪些组会记录在 helper 的日志中
+  （不会改动作业的输出）。主组为其中之一的作业会被拒绝，进程带有其中之一的检查点也会被拒绝恢复（CRIU 会恢复该组）。
+  每次启动和恢复时在 `/etc/group` 中查找这些名称，其中没有的名称会被忽略。gid 0 总是会被去掉。默认值及
+  包含每个组的原因：
+
+  | 组 | 为什么等同 root |
+  | --- | --- |
+  | `docker` | 通过 Docker 套接字可以启动绑定挂载 `/` 并以 root 运行的容器 |
+  | `lxd`、`incus-admin` | 通过 LXD/Incus 可以做同样的事（特权容器、主机挂载）；不包括 Incus 受限的 `incus` 组 |
+  | `libvirt` | 管理 `qemu:///system`，可以把主机的块设备和目录交给其虚拟机 |
+  | `disk` | 可以直接读写块设备，也就是读写其上的所有文件 |
+  | `sudo`、`wheel`、`admin` | sudo 权限：sudo 通常会询问密码，无人值守的作业无法输入，但 `NOPASSWD` 规则或缓存的凭据会让作业成为 root |
+
+  因为不等同 root 而未包括的组：`shadow`（密码哈希，至多被离线破解）、`adm`（日志）、`kvm`，以及
+  `video`/`render`（设备；GPU 作业需要后两者）。请添加在你的主机上等同 root 的组（例如 `microk8s`），或去掉
+  某个组让作业重新可以使用它（例如 `job_denied_groups = ["lxd", "incus-admin", "libvirt", "disk", "sudo",
+  "wheel", "admin"]` 让作业可以使用 Docker）。
+- `job_allowed_users`：非空时，只有列出的用户（按名称）可以运行作业。
+
+被拒绝的作业启动失败，原因以 `puzuz refuses to run jobs as <user>:` 开头，后面是例如 `uid 999 is below
+job_min_uid 1000 (UID_MIN in /etc/login.defs)`、`primary group docker is in job_denied_groups` 或 `not in
+job_allowed_users`。`puzuz status` 将其显示为 `Failed to spawn`，`puzuz log <id>` 和
+`puzuz status --json` 会显示原因。被拒绝的恢复按恢复失败处理（见 [恢复失败](#restore-failures)），作业保持
+已检查点状态。`puzuz doctor` 会显示生效的策略（最小 uid 及其来源、拒绝的组以及其中哪些在主机上存在、允许
+的用户），helper 启动时也会将其写入日志。更改这些键后请重启 helper。
 
 <a id="priority-and-fair-share"></a>
 ## 优先级与公平共享
@@ -1594,6 +1634,11 @@ refused:` 开头），其所有者会收到警告。
 
 恢复失败时，作业保持 `Checkpointed` 状态并保留其镜像，因此你可以修复原因后再次运行
 `puzuz restore`。所有者会在下次执行命令时收到警告。
+
+- `puzuz refuses to run jobs as <user>: ...`：作业的所有者或组被 `job_min_uid`、`job_denied_groups`
+  或 `job_allowed_users` 拒绝（见 [谁可以运行作业](#who-jobs-may-run-as)）；`the checkpointed job ran with
+  the groups ["docker"], which are in job_denied_groups` 表示作业在带有现在被拒绝的组时创建了检查点。
+  请更改设置（并重启 helper）或删除该作业。
 
 - `the checkpoint of job N was dumped but not finalized, and finalizing it failed again: ...`：转储
   已成功，但 helper 无法写入检查点的元数据（见 [检查点存储](#checkpoint-storage)），通常是因为

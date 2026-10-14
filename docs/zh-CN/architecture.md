@@ -141,13 +141,20 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 <a id="other-privilege-boundaries"></a>
 ## 其他权限边界
 
+- <a id="job-credentials"></a>运行谁的作业由 helper 而不是守护进程决定，因此被攻破的守护进程也无法绕过。
+  每次启动和恢复时，helper 通过 NSS 查找所有者，并以代码为 `policy_denied` 的错误拒绝 uid 0、gid 0、所有者
+  不属于的组、低于 `job_min_uid`（默认为 `/etc/login.defs` 的 `UID_MIN`）的用户、不在非空的
+  `job_allowed_users` 中的用户，以及属于 `job_denied_groups`（`docker`、`disk`、`sudo` 等等同 root 的组，在
+  `/etc/group` 中查找）的作业组；其消息（`puzuz refuses to run jobs as <user>: <reason>`）会成为作业的启动
+  失败原因或恢复错误。作业的附加组由 helper 自己计算（`initgroups` 会设置的组，去掉被拒绝的组和 gid 0）并
+  传给 shim；被去掉的组会记录在 helper 的日志中。检查点进程带有被拒绝的组时会拒绝恢复，恢复后的
+  检查也只允许所有者的组中去掉被拒绝的组后的那些。见 [谁可以运行作业](install.md#who-jobs-may-run-as)。
 - helper 通过一个私有的、归 root 所有的暂存目录（只通过文件描述符使用）把它的套接字绑定到守护进程用户所拥有的
   `/run/puzuz` 中。它一次只服务一个守护进程会话（新会话会取代旧会话），最多允许少量连接等待其 Hello，
   并限制一个会话的队列和进行中请求的数量。
-- shim 在降低权限之前以 root 身份处理作业的挂载命名空间。它首先查找所有者的组（NSS 会按路径加载库），
-  并且只通过文件描述符移动和卸离挂载（包括 `/run` 和 `/media` 下的易失挂载），这些文件描述符只经由只有 root
+- shim 在降低权限之前以 root 身份处理作业的挂载命名空间。它只通过文件描述符移动和卸离挂载（包括 `/run` 和 `/media` 下的易失挂载），这些文件描述符只经由只有 root
   能修改的目录、且不跟随符号链接地获取一次，因此所有者无法把挂载操作重定向到系统目录上。位于其他人可以修改的
-  目录下的挂载会保持不动。
+  目录下的挂载会保持不动。附加组由 helper 传入（见上文），因此 shim 不会再次查找。
 - 启动时，helper 会在其 `PATH` 中查找一次以名称给出的程序（`criu`、`cuda-checkpoint`、`nvidia-smi`），
   要求找到的文件与以绝对路径给出的程序一样，归 root 所有且只能经由只有 root 能修改的目录到达，此后一直使用
   该绝对路径。

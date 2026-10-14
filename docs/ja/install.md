@@ -29,6 +29,7 @@ docs/<lang>/ go up two levels (../../packaging/...). Code blocks are copied unch
 - [確認](#verifying)
 - [設定](#configuration)
 - [管理者](#administrators)
+- [ジョブを実行できるユーザー](#who-jobs-may-run-as)
 - [優先度とフェアシェア](#priority-and-fair-share)
 - [GPU の検出](#gpu-detection)
 - [GPU の分離](#gpu-isolation)
@@ -1122,6 +1123,9 @@ sudo systemctl restart puzuz-helper.service puzuz.service
 | `criu_restore_timeout_secs` | 未設定 | ヘルパー | `criu restore` 単体の任意の上限。未設定なら期限だけが適用されます |
 | `fork_guard` | `true` | ヘルパー | ジョブに fork ガードをプリロードします（README の制限事項を参照） |
 | `gpu_device_isolation` | `true` | ヘルパー | 各ジョブのユニットが開けるデバイスノードを、割り当てた GPU のものに限ります（`DevicePolicy=closed`）。`false` で無効になります（[GPU の分離](#gpu-isolation) を参照） |
+| `job_min_uid` | `/etc/login.defs` の `UID_MIN`、なければ `1000` | ヘルパー | uid がこれより小さいユーザーのジョブを拒否します（[ジョブを実行できるユーザー](#who-jobs-may-run-as)を参照） |
+| `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | ヘルパー | root 相当のグループ。ジョブの補助グループから外し、プライマリグループがこれらのいずれかであるジョブは拒否します |
+| `job_allowed_users` | `[]`（全員） | ヘルパー | 空でなければ、ここに（名前で）挙げたユーザーだけがジョブを実行できます |
 | `gpu_detection` | `"auto"` | デーモン | `"auto"`：NVML、失敗したら `[[gpus]]`。`"static"`：`[[gpus]]` のみ。 |
 | `nvml_library` | 未設定 | デーモン | NVML ライブラリのパスまたは名前。デフォルトでは `libnvidia-ml.so.1`、次に `libnvidia-ml.so` |
 | `update_source` | `"github:kaito4681/puzuz"` | CLI | `puzuz update` と `puzuz doctor` がリリースを探す場所：`github:<owner>/<repo>` |
@@ -1147,6 +1151,46 @@ sudo usermod -aG puzuz-admin alice
 
 デーモンはリクエストごとに（NSS を通して）グループを調べるので、変更はログインし直さなくてもすぐに反映
 されます。
+
+<a id="who-jobs-may-run-as"></a>
+## ジョブを実行できるユーザー
+
+root ヘルパーがすべてのジョブをその所有者として起動するので、誰のジョブを実行するかはヘルパーが決めます。
+デーモンにはそれを変えられません。ジョブを root（uid 0 や gid 0）や所有者が属していないグループで実行しない
+ことに加えて、ヘルパーはすべての起動とリストアに 3 つの設定を適用します。
+
+- `job_min_uid`：uid がこれより小さいユーザーは拒否されます。未設定のときは `/etc/login.defs` の `UID_MIN`
+  （ほとんどのディストリビューションで 1000）、ファイルに有効な `UID_MIN` がなければ 1000 です。これにより
+  システムアカウント（`www-data`、`postgres`、デーモン自身の `puzuz` ユーザーなど）はジョブを実行できません。
+- `job_denied_groups`：メンバーがパスワードなしで root として振る舞えるグループです。これらはジョブの補助
+  グループから外されるので、`docker` に属するユーザーのジョブは `docker` なしで実行されます。どのグループを
+  外したかはヘルパーのジャーナルに記録されます（ジョブの出力には何も加えません）。プライマリグループがこれらの
+  いずれかであるジョブは拒否され、プロセスがこれらのいずれかを持っていたチェックポイントのリストアも拒否
+  されます（CRIU はそのグループを復元してしまうため）。名前は起動とリストアのたびに `/etc/group` で調べ、
+  そこにない名前は無視します。gid 0 は常に外されます。既定値とそれぞれを含める理由は次のとおりです。
+
+  | グループ | root 相当である理由 |
+  | --- | --- |
+  | `docker` | Docker のソケットから、`/` をバインドマウントして root で動くコンテナを起動できる |
+  | `lxd`、`incus-admin` | LXD/Incus で同じことができる（特権コンテナ、ホストのマウント）。Incus の制限付きの `incus` グループは含めていない |
+  | `libvirt` | `qemu:///system` を管理でき、その VM にホストのブロックデバイスやディレクトリを渡せる |
+  | `disk` | ブロックデバイスに直接読み書きでき、つまりその上のすべてのファイルを読み書きできる |
+  | `sudo`、`wheel`、`admin` | sudo の権限。sudo は通常パスワードを尋ね、無人のジョブはそれを入力できないが、`NOPASSWD` の規則やキャッシュされた認証があればジョブが root になれてしまう |
+
+  root に相当しないので含めていないもの：`shadow`（パスワードハッシュ。せいぜいオフラインで解析される）、
+  `adm`（ログ）、`kvm`、`video`/`render`（デバイス。GPU ジョブには後の 2 つが必要）。ホストで root 相当になる
+  グループ（例：`microk8s`）を追加するか、ジョブに使わせたいグループを外してください（例：
+  `job_denied_groups = ["lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` でジョブが
+  Docker を使えるようになります）。
+- `job_allowed_users`：空でなければ、（名前で）挙げたユーザーだけがジョブを実行できます。
+
+拒否されたジョブは、`puzuz refuses to run jobs as <user>:` で始まり、たとえば `uid 999 is below job_min_uid
+1000 (UID_MIN in /etc/login.defs)`、`primary group docker is in job_denied_groups`、`not in
+job_allowed_users` が続く理由で起動に失敗します。`puzuz status` には `Failed to spawn` と表示され、
+`puzuz log <id>` と `puzuz status --json` で理由が分かります。拒否されたリストアはリストアの失敗として扱われ
+（[リストアの失敗](#restore-failures)を参照）、ジョブはチェックポイント済みのままです。`puzuz doctor` は有効な
+ポリシー（最小 uid とその出どころ、拒否するグループとそのうちホストに存在するもの、許可するユーザー）を表示し、
+ヘルパーも起動時にログに記録します。これらのキーを変えたらヘルパーを再起動してください。
 
 <a id="priority-and-fair-share"></a>
 ## 優先度とフェアシェア
@@ -1737,6 +1781,12 @@ OS のシャットダウンや再起動の間に、ダンプが失敗したか�
 
 リストアが失敗してもジョブは `Checkpointed` のままで、イメージも残るので、原因を直してもう一度
 `puzuz restore` を実行できます。所有者は次にコマンドを実行したときに警告を受けます。
+
+- `puzuz refuses to run jobs as <user>: ...`：ジョブの所有者またはグループが `job_min_uid`、
+  `job_denied_groups`、`job_allowed_users` によって拒否されました（[ジョブを実行できるユーザー](#who-jobs-may-run-as)
+  を参照）。`the checkpointed job ran with the groups ["docker"], which are in job_denied_groups` は、
+  いまは拒否されるグループを持ったままジョブがチェックポイントされたことを示します。設定を変える（そして
+  ヘルパーを再起動する）か、ジョブを削除してください。
 
 - `the checkpoint of job N was dumped but not finalized, and finalizing it failed again: ...`：ダンプは
   成功しましたが、ヘルパーがチェックポイントのメタデータを書き込めませんでした（[チェックポイントの保存先](#checkpoint-storage)

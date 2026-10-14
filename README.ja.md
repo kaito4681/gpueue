@@ -288,6 +288,13 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 - 各ジョブは、それを追加したユーザーのものです。そのユーザーの uid、gid、補助グループで、`no_new_privs` を
   設定し、すべてのケーパビリティを落とした状態で実行されます。コマンドは追加したときのディレクトリで、
   `puzuz add` を実行したときの環境変数で実行されます。
+- root ヘルパーは、システムアカウント（uid が `job_min_uid` 未満。既定は `/etc/login.defs` の `UID_MIN`）、
+  `job_allowed_users` が設定されているときにそこに含まれないユーザー、プライマリグループが root 相当の
+  グループ（`job_denied_groups`。既定は `docker`、`lxd`、`incus-admin`、`libvirt`、`disk`、`sudo`、
+  `wheel`、`admin`）であるユーザーのジョブを拒否します。これらのグループはすべてのジョブの補助グループから
+  外されるので、所有者が Docker や sudo を使えてもジョブからは使えません（外したグループはヘルパーのジャーナルに記録されます）。
+  拒否されたジョブは `puzuz refuses to run jobs as <user>: <reason>` という理由で起動に失敗します。
+  [ジョブを実行できるユーザー](docs/ja/install.md#who-jobs-may-run-as)を参照してください。
 - **所有者または管理者のみ：** ジョブの変更（`kill`、`pause`、`start`、`remove`、`checkpoint`、
   `restore`、`restart`、`stash`、`enqueue`、`switch` など）と、そのコマンド、作業ディレクトリ、環境変数、
   ラベル、失敗の理由、ログの閲覧。同様に、`add --after` は呼び出し元が削除できるジョブ（自分のジョブ、

@@ -561,6 +561,42 @@ fn gpu_isolation_is_shown() {
 }
 
 #[test]
+fn job_policy_shows_the_minimum_uid_source_and_denied_groups() {
+    let (sys, _sockets) = healthy();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job policy"), Level::Info);
+    let shown = message(&report, "job policy");
+    assert!(shown.contains("uid >= 1000 (built-in fallback)"), "{shown}");
+    assert!(shown.contains("docker (absent)"), "{shown}");
+    assert!(shown.contains("allowed users: every user"), "{shown}");
+
+    sys.write("/etc/login.defs", "# UID_MIN 1\nUID_MIN 2000\n");
+    sys.write("/etc/group", "docker:x:999:alice\nsudo:x:27:\n");
+    let report = run(&sys, None);
+    let shown = message(&report, "job policy");
+    assert!(
+        shown.contains("uid >= 2000 (UID_MIN in /etc/login.defs)"),
+        "{shown}"
+    );
+    assert!(shown.contains("docker (gid 999)"), "{shown}");
+    assert!(shown.contains("sudo (gid 27)"), "{shown}");
+    assert!(shown.contains("wheel (absent)"), "{shown}");
+
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!(
+            "job_min_uid = 1500\njob_denied_groups = []\njob_allowed_users = [\"alice\"]\n{CONFIG}"
+        ),
+    );
+    let shown = message(&run(&sys, None), "job policy").to_owned();
+    assert_eq!(
+        shown,
+        "jobs run as uid >= 1500 (job_min_uid in the configuration); denied groups: none; \
+         allowed users: alice"
+    );
+}
+
+#[test]
 fn kernel_checks() {
     let (sys, _sockets) = healthy();
     sys.write("/proc/sys/kernel/osrelease", "5.4.0\n");

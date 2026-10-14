@@ -268,6 +268,12 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - 守护进程通过内核报告的套接字对端 uid（`SO_PEERCRED`）识别调用者。客户端无法冒充他人。
 - 每个作业属于添加它的用户。它以该用户的 uid、gid 和附加组运行，设置了 `no_new_privs`，并丢弃全部 capability。
   命令在添加作业时所在的目录中运行，使用 `puzuz add` 调用时的环境变量。
+- root helper 拒绝以下用户的作业：系统账户（uid 小于 `job_min_uid`，默认为 `/etc/login.defs` 的
+  `UID_MIN`）、设置了 `job_allowed_users` 时不在其中的用户，以及主组为等同 root 的组的用户
+  （`job_denied_groups`，默认为 `docker`、`lxd`、`incus-admin`、`libvirt`、`disk`、`sudo`、`wheel`、
+  `admin`）。这些组会从每个作业的附加组中去掉，因此即使所有者能使用 Docker 或 sudo，作业也不能
+  （helper 的日志会记录去掉了哪些组）。被拒绝的作业以 `puzuz refuses to run jobs as <user>: <reason>` 为原因启动失败。
+  见 [谁可以运行作业](docs/zh-CN/install.md#who-jobs-may-run-as)。
 - **仅限所有者或管理员：** 更改作业（`kill`、`pause`、`start`、`remove`、
   `checkpoint`、`restore`、`restart`、`stash`、`enqueue`、`switch` 等），以及查看其命令、
   工作目录、环境变量、标签、失败原因和日志。同样，`add --after` 只接受调用者能够删除的作业

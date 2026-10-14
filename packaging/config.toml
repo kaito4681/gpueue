@@ -108,6 +108,27 @@
 # statically linked programs.
 # fork_guard = true
 
+# [helper] Who jobs may run as (checked for every spawn and restore; uid 0 is
+# always refused). Jobs of users below job_min_uid are refused. Unset by
+# default: UID_MIN of /etc/login.defs, or 1000 when it has none.
+# Example:
+#   job_min_uid = 1000
+
+# [helper] Groups that give root-equivalent power. They are dropped from a
+# job's supplementary groups (the helper's journal records it), and a job whose primary
+# group is one of them is refused, as is restoring a checkpoint taken with
+# one. Names are looked up in /etc/group; names not listed there are ignored;
+# gid 0 is always dropped. Why each is listed: docker, lxd, incus-admin and
+# libvirt start containers or VMs with host mounts or devices as root; disk
+# gives raw access to block devices; sudo, wheel and admin give sudo rights
+# (NOPASSWD rules or cached credentials would let an unattended job become
+# root). Remove a group (e.g. docker) to let jobs use it again.
+# job_denied_groups = ["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]
+
+# [helper] If not empty, only these users (by name) may run jobs; others are
+# refused. Empty: every user with uid >= job_min_uid.
+# job_allowed_users = []
+
 # [cli] Where `puzuz update` and `puzuz doctor` look for releases:
 # "github:<owner>/<repo>" (the GitHub releases of that repository).
 # update_source = "github:kaito4681/puzuz"

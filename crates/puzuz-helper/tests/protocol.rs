@@ -1109,6 +1109,61 @@ async fn restore_checks_the_images_paths_first() {
 }
 
 #[tokio::test]
+async fn job_policy_refuses_spawns_and_restores() {
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    env.host.add_user(uid(), "tester", gid(), &[gid(), 4242]);
+    env.host.set_process_groups(Some(vec![gid(), 4242]));
+    // Dumped before the policy denied group 4242.
+    let image_dir = spawn_and_dump(&env, &mut c, 3).await;
+
+    let group_file = env.root.join("group");
+    std::fs::write(&group_file, "docker:x:4242:tester\n").unwrap();
+    let policy = |min_uid: u32| puzuz_helper::validate::JobPolicy {
+        min_uid,
+        min_uid_source: puzuz_config::job_policy::MinUidSource::Config,
+        denied_groups: vec!["docker".into()],
+        allowed_users: vec![],
+        group_file: group_file.clone(),
+    };
+    let mut cfg = with_mode(config(&env.root, uid()), &env.root, env.mode);
+    cfg.job_policy = policy(uid() + 1);
+    env.restart_with(cfg.clone()).await;
+    let mut c = env.client().await;
+    let r = c.request(Request::Spawn(env.spawn_req(1))).await;
+    assert_eq!(err_code(&r), HelperErrorCode::PolicyDenied, "{r:?}");
+    let ResponseResult::Error { message, .. } = r else {
+        unreachable!()
+    };
+    assert_eq!(
+        message,
+        format!(
+            "puzuz refuses to run jobs as tester: uid {} is below job_min_uid {} (job_min_uid \
+             in the configuration)",
+            uid(),
+            uid() + 1
+        )
+    );
+
+    cfg.job_policy = policy(1);
+    env.restart_with(cfg).await;
+    let mut c = env.client().await;
+    // The denied group is dropped from a new job ...
+    let r = c.request(Request::Spawn(env.spawn_req(1))).await;
+    assert!(matches!(r, ResponseResult::Spawned { .. }), "{r:?}");
+    // ... but CRIU would restore it into the checkpointed one.
+    let r = c.request(restore_req(3, &image_dir)).await;
+    assert_eq!(err_code(&r), HelperErrorCode::PolicyDenied, "{r:?}");
+    let ResponseResult::Error { message, .. } = r else {
+        unreachable!()
+    };
+    assert!(
+        message.contains("[\"docker\"]") && message.contains("job_denied_groups"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
 async fn restore_refuses_groups_the_owner_left_since_the_dump() {
     let env = Env::new().await;
     let mut c = env.client().await;

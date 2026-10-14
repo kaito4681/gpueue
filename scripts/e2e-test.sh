@@ -81,7 +81,7 @@ only="${only//,/ }"
 # GPU scenarios without PUZUZ_E2E_GPU=1 (they would be skipped silently).
 for n in $only; do
     case "$n" in
-    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17) ;;
+    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17 | 18) ;;
     9 | 11 | 12 | 14)
         if [ "${PUZUZ_E2E_GPU:-}" != 1 ]; then
             echo "scenario $n needs PUZUZ_E2E_GPU=1" >&2

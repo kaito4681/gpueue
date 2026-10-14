@@ -322,6 +322,10 @@ pub enum HelperErrorCode {
     /// restore or at its next start, so the job counts as checkpointed.
     CheckpointUnfinalized,
     Internal,
+    /// The helper's job credential policy (`job_min_uid`,
+    /// `job_denied_groups`, `job_allowed_users`) refuses to run jobs as the
+    /// job's owner or group; the message says why.
+    PolicyDenied,
     /// A code added by a newer peer. Never sent by this version.
     #[serde(other)]
     Unknown,

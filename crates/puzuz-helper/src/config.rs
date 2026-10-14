@@ -85,6 +85,10 @@ pub struct HelperConfig {
     /// Restrict every job unit's device access to its assigned GPUs (see
     /// [`crate::devices`]).
     pub gpu_device_isolation: bool,
+    /// Who jobs may run as. The default is
+    /// [`JobPolicy::permissive`](crate::validate::JobPolicy::permissive)
+    /// (for tests); [`HelperConfig::resolve`] sets the configured one.
+    pub job_policy: crate::validate::JobPolicy,
 }
 
 impl Default for HelperConfig {
@@ -108,6 +112,7 @@ impl Default for HelperConfig {
             fork_guard_dir: Some(PathBuf::from(DEFAULT_FORK_GUARD_DIR)),
             job_preload: None,
             gpu_device_isolation: true,
+            job_policy: crate::validate::JobPolicy::permissive(),
         }
     }
 }
@@ -160,6 +165,11 @@ impl HelperConfig {
                 .unwrap_or(Duration::from_secs(file.grace_secs)),
             fork_guard_dir: file.fork_guard.then(|| file.data_dir.join("lib")),
             gpu_device_isolation: file.gpu_device_isolation,
+            job_policy: crate::validate::JobPolicy::from_config(
+                file,
+                Path::new(puzuz_config::job_policy::LOGIN_DEFS_PATH),
+                Path::new(puzuz_config::job_policy::GROUP_FILE_PATH),
+            ),
             ..HelperConfig::default()
         };
         let ck = &mut cfg.checkpoint;
@@ -413,6 +423,26 @@ mod tests {
             Overrides::default(),
         );
         assert!(!r.config.gpu_device_isolation);
+    }
+
+    #[test]
+    fn job_policy_comes_from_the_file() {
+        let r = HelperConfig::resolve(
+            &file(
+                "job_min_uid = 1500\njob_denied_groups = [\"docker\"]\njob_allowed_users = [\"a\"]\n",
+            ),
+            Overrides::default(),
+        );
+        let p = &r.config.job_policy;
+        assert_eq!(p.min_uid, 1500);
+        assert_eq!(p.denied_groups, ["docker"]);
+        assert_eq!(p.allowed_users, ["a"]);
+        assert_eq!(p.group_file, Path::new("/etc/group"));
+        let r = HelperConfig::resolve(&puzuz_config::Config::default(), Overrides::default());
+        assert_eq!(
+            r.config.job_policy.denied_groups,
+            puzuz_config::job_policy::DEFAULT_JOB_DENIED_GROUPS
+        );
     }
 
     #[test]

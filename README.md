@@ -281,6 +281,13 @@ columns, and `Checkpointed` jobs show the image size.
 - Each job belongs to the user who added it. It runs with that user's uid, gid and supplementary
   groups, with `no_new_privs` set and all capabilities dropped. The command runs in the directory
   it was added from, with the environment of the `puzuz add` invocation.
+- The root helper refuses jobs of system accounts (uid below `job_min_uid`, by default `UID_MIN`
+  of `/etc/login.defs`), of users missing from `job_allowed_users` when it is set, and of users
+  whose primary group is root-equivalent (`job_denied_groups`: `docker`, `lxd`, `incus-admin`,
+  `libvirt`, `disk`, `sudo`, `wheel`, `admin` by default). Those groups are left out of every
+  job's supplementary groups, so a job cannot use Docker or sudo even if its owner can (the
+  helper's journal records what it left out). A refused job fails to spawn with `puzuz refuses to run jobs as <user>: <reason>`.
+  See [Who jobs may run as](docs/install.md#who-jobs-may-run-as).
 - **Owner or administrator only:** changing a job (`kill`, `pause`, `start`, `remove`,
   `checkpoint`, `restore`, `restart`, `stash`, `enqueue`, `switch`, ...) and seeing its command,
   working directory, environment, label, failure reasons and log. Likewise, `add --after` only

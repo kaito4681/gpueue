@@ -184,16 +184,28 @@ restore as failed, also when the unit is already gone; the image is kept.
 
 ## Other privilege boundaries
 
+- <a id="job-credentials"></a>The helper, not the daemon, decides whose jobs run, so a
+  compromised daemon cannot get around it. For every spawn and restore it looks the owner up
+  through NSS and refuses uid 0, gid 0, groups the owner is not in, users below `job_min_uid`
+  (default `UID_MIN` of `/etc/login.defs`), users missing from a non-empty `job_allowed_users`,
+  and a job group listed in `job_denied_groups` (root-equivalent groups such as `docker`, `disk`
+  or `sudo`, looked up in `/etc/group`), with an error of code `policy_denied` whose message
+  (`puzuz refuses to run jobs as <user>: <reason>`) becomes the job's spawn failure or restore
+  error. It computes the job's supplementary groups itself (what `initgroups` would set, without
+  denied groups and gid 0) and passes them to the shim; the helper's journal records the groups it
+  left out. A restore is refused when the checkpointed processes had a denied
+  group, and the check after the restore allows only the owner's groups minus the denied ones. See
+  [Who jobs may run as](install.md#who-jobs-may-run-as).
 - The helper binds its socket in `/run/puzuz`, which the daemon user owns, through a private
   root-owned staging directory that it uses only by file descriptor. It serves one daemon session
   at a time (a new one replaces the old), at most a few connections waiting for their Hello, and
   bounds the queues and requests in flight of a session.
-- The shim works on the job's mount namespace as root before it drops privileges. It looks up the
-  owner's groups first (NSS loads libraries by path), and it moves and detaches mounts (including
+- The shim works on the job's mount namespace as root before it drops privileges. It moves and detaches mounts (including
   the volatile ones below `/run` and `/media`) only through file descriptors, reached once
   through directories that only root can change and without following symlinks, so the owner
   cannot redirect a mount operation onto a system directory. A mount below a directory that
-  someone else can change is left alone.
+  someone else can change is left alone. The supplementary groups come from the helper (see
+  above), so the shim does not look them up again.
 - At start-up the helper looks up programs given by name (`criu`, `cuda-checkpoint`,
   `nvidia-smi`) once in its `PATH`, requires the file found, like a program given by an
   absolute path, to belong to root and to be reached only through directories that only root can

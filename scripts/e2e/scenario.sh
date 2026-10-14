@@ -2,7 +2,9 @@
 # Full-stack scenarios; runs inside the systemd container as root (see
 # scripts/e2e-test.sh). Users act through the real CLI with runuser:
 # alice (1000) and bob (1001) are regular users, carol (1002) is in
-# puzuz-admin; scenario 17 adds dave (1003), a user without usage.
+# puzuz-admin; scenario 17 adds dave (1003), a user without usage, and
+# scenario 18 svcacct (990, a system account) and dockeruser (1004, primary
+# group docker).
 #
 # Usage: scenario.sh main | reboot-prepare | reboot-verify | lib
 # Prints "PASS <scenario>" / "FAIL <scenario>: <reason>" per scenario and
@@ -1052,6 +1054,43 @@ s17_priority() {
     [ "$(started_at "$x2")" -le "$(started_at "$x1")" ] || fail "the niced job $x1 did not start last"
 }
 
+s18_job_policy() {
+    local id log groups journal
+    # A system account (uid below UID_MIN of /etc/login.defs, or 1000).
+    getent passwd 990 >/dev/null || useradd -m -u 990 -s /bin/sh svcacct
+    id=$(add svcacct -- 'echo should not run')
+    wait_state "$id" done/failed_to_spawn
+    # The log header (with the reason) goes to stderr.
+    log=$(pz svcacct log "$id" 2>&1) || fail "log failed"
+    echo "$log"
+    grep -q 'puzuz refuses to run jobs as svcacct: uid 990 is below job_min_uid' <<<"$log" \
+        || fail "the log does not show the refusal"
+
+    # A denied supplementary group is left out (the helper's journal says so).
+    groupadd -f docker
+    usermod -aG docker alice
+    id=$(add alice -- 'echo groups=$(id -Gn)')
+    PZ_TIMEOUT=30 pz alice wait "$id" >/dev/null || fail "wait failed"
+    expect_state "$id" done/success
+    log=$(pz alice log --full "$id") || fail "log failed"
+    echo "$log"
+    journal=$(journalctl -u puzuz-helper.service -o cat)
+    grep -q "job $id of alice: leaving out the supplementary groups \\[.*\"docker\"" <<<"$journal" \
+        || fail "the helper's journal does not say that docker was left out"
+    groups=$(sed -n 's/^groups=//p' <<<"$log")
+    [ -n "$groups" ] || fail "the job printed no groups"
+    ! grep -qw docker <<<"$groups" || fail "the job runs with the docker group: $groups"
+    gpasswd -d alice docker >/dev/null
+
+    # A denied primary group refuses the job.
+    getent passwd 1004 >/dev/null || useradd -m -u 1004 -g docker -s /bin/sh dockeruser
+    id=$(add dockeruser -- 'echo should not run')
+    wait_state "$id" done/failed_to_spawn
+    log=$(pz dockeruser log "$id" 2>&1) || fail "log failed"
+    grep -q 'puzuz refuses to run jobs as dockeruser: primary group docker is in job_denied_groups' \
+        <<<"$log" || fail "the log does not show the refusal: $log"
+}
+
 case "${1:-main}" in
 main)
     run "1 add/status/log/follow/wait" s1_lifecycle
@@ -1064,6 +1103,7 @@ main)
     run "10 many jobs at once" s10_burst
     run "13 checkpoint of a paused job" s13_paused_checkpoint
     run "17 multifactor priority (fair share, nice, top)" s17_priority
+    run "18 job credential policy" s18_job_policy
     if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers

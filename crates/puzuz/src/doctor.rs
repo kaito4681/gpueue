@@ -351,6 +351,45 @@ fn check_gpu_isolation(config: &Config, nixos: bool) -> Check {
     .hint(format!("unless you need it off (e.g. for MIG), {how}"))
 }
 
+/// The helper's job credential policy: the minimum uid and where it comes from, the denied
+/// groups (and which of them exist here), the allowed users.
+fn check_job_policy(sys: &dyn System, config: &Config) -> Check {
+    use puzuz_config::job_policy;
+    const NAME: &str = "job policy";
+    let (min_uid, source) = job_policy::effective_min_uid(
+        config.job_min_uid,
+        &sys.path(Path::new(job_policy::LOGIN_DEFS_PATH)),
+    );
+    let groups = std::fs::read_to_string(sys.path(Path::new(job_policy::GROUP_FILE_PATH)))
+        .unwrap_or_default();
+    let present = job_policy::resolve_group_names(&groups, &config.job_denied_groups);
+    let denied = if config.job_denied_groups.is_empty() {
+        "none".to_owned()
+    } else {
+        config
+            .job_denied_groups
+            .iter()
+            .map(|name| match present.iter().find(|(n, _)| n == name) {
+                Some((_, gid)) => format!("{name} (gid {gid})"),
+                None => format!("{name} (absent)"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let allowed = if config.job_allowed_users.is_empty() {
+        format!("every user with uid >= {min_uid}")
+    } else {
+        config.job_allowed_users.join(", ")
+    };
+    Check::info(
+        NAME,
+        format!(
+            "jobs run as uid >= {min_uid} ({}); denied groups: {denied}; allowed users: {allowed}",
+            source.describe()
+        ),
+    )
+}
+
 /// The `--flags` (without values) of a command line.
 fn flags_of(argv: &[String]) -> Vec<String> {
     argv.iter()
@@ -457,6 +496,7 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     checks.push(check_helper_binary(sys, nixos));
     checks.push(check_helper_settings(sys, &config, nixos));
     checks.push(check_gpu_isolation(&config, nixos));
+    checks.push(check_job_policy(sys, &config));
     if let Some(check) = check_daemon_write_paths(sys, &config, nixos) {
         checks.push(check);
     }

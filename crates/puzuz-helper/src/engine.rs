@@ -448,10 +448,17 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         if self.is_shutting_down() {
             return error(HelperErrorCode::ShuttingDown, "the helper is shutting down");
         }
-        let creds = match validate::check_spawn(&*self.host, &req) {
+        let creds = match validate::check_spawn(&*self.host, &self.cfg.job_policy, &req) {
             Ok(c) => c,
             Err(r) => return r.into(),
         };
+        if !creds.dropped.is_empty() {
+            eprintln!(
+                "puzuz-helper: job {} of {}: leaving out the supplementary groups {:?} \
+                 (job_denied_groups)",
+                req.job.0, creds.user.name, creds.dropped
+            );
+        }
         let files = JobFiles::new(&self.cfg.jobs_dir(), req.job);
         let record = JobRecord {
             job: req.job,
@@ -1365,10 +1372,32 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 "the checkpoint belongs to another job or user",
             ));
         }
-        let creds = validate::check_credentials(&*self.host, record.uid, record.gid, None)?;
+        let creds = validate::check_credentials(
+            &*self.host,
+            &self.cfg.job_policy,
+            record.uid,
+            record.gid,
+            None,
+        )?;
         // CRIU restores the groups the job had at the dump (older images
-        // did not record them; the check after the restore covers those).
+        // did not record them; the check after the restore covers those,
+        // denied groups included: they are not in `allowed_gids`).
         if let Some(groups) = &record.dump_groups {
+            let denied: Vec<String> = groups
+                .iter()
+                .filter(|g| creds.is_denied(**g))
+                .map(|g| creds.denied_name(*g))
+                .collect();
+            if !denied.is_empty() {
+                return Err(validate::Rejection::policy(
+                    &creds.user.name,
+                    format!(
+                        "the checkpointed job ran with the groups {denied:?}, which are in \
+                         job_denied_groups; it cannot be restored"
+                    ),
+                )
+                .into());
+            }
             let gone: Vec<u32> = groups
                 .iter()
                 .copied()
@@ -1385,10 +1414,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 ));
             }
         }
-        let mut allowed_gids = creds.user.groups.clone();
-        allowed_gids.push(creds.user.gid);
-        allowed_gids.sort_unstable();
-        allowed_gids.dedup();
+        let allowed_gids = creds.allowed_gids();
         self.check_image_paths(&dir, &record, &allowed_gids)?;
         // CRIU fails with "Can't stat mountpoint" / "Failed to open_tree"
         // when a mount point of the job's namespace or the host path of an
