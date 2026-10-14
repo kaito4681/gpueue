@@ -67,21 +67,35 @@ pub async fn job_log(
     } else {
         None
     };
-    // The log is opened anew for each read: the owner controls its
-    // directory, see `crate::logfile`.
+    // The log is opened once for the request, without trusting its
+    // directory (see `crate::logfile`); one that does not exist yet is
+    // opened once it does (`follow`). Fail now rather than with an empty
+    // body if the log is not a log.
     let owner = info.job.owner;
-    let start = match query.tail {
-        Some(lines) => tail_start(&core, owner, id, lines).await?,
-        None => 0,
+    let file = match open_log(&core, owner, id).await {
+        Ok(file) => Some(file),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(cannot_read(e)),
+    };
+    let (file, start) = match (file, query.tail) {
+        (Some(file), Some(lines)) => {
+            let (file, start) = tail_start(&core, file, lines).await?;
+            (Some(file), start)
+        }
+        (file, _) => (file, 0),
     };
     let (tx, rx) = mpsc::channel::<Bytes>(8);
-    // Fail now rather than with an empty body if the log is not a log.
-    if let Err(e) = open_log(&core, owner, id).await
-        && e.kind() != io::ErrorKind::NotFound
-    {
-        return Err(cannot_read(e));
-    }
-    tokio::spawn(produce(core, id, owner, start, query.follow, tx, permit));
+    let file = file.map(tokio::fs::File::from_std);
+    tokio::spawn(produce(
+        core,
+        id,
+        owner,
+        file,
+        start,
+        query.follow,
+        tx,
+        permit,
+    ));
     let stream = futures::stream::unfold(rx, |mut rx| async move {
         rx.recv()
             .await
@@ -105,8 +119,13 @@ pub fn too_many_streams() -> Failure {
     )
 }
 
-/// Where the last `lines` lines of the log start (see [`tail_offset`]).
-async fn tail_start(core: &Arc<Core>, owner: Uid, id: JobId, lines: u64) -> ApiResult<u64> {
+/// Where the last `lines` lines of the log `file` start (see
+/// [`tail_offset`]), and the file back.
+async fn tail_start(
+    core: &Arc<Core>,
+    mut file: std::fs::File,
+    lines: u64,
+) -> ApiResult<(std::fs::File, u64)> {
     // Waiting for a turn ends with the request.
     let _turn = core
         .tail_scans
@@ -117,19 +136,13 @@ async fn tail_start(core: &Arc<Core>, owner: Uid, id: JobId, lines: u64) -> ApiR
     // stops the scan.
     let cancel = CancellationToken::new();
     let _stop_on_drop = cancel.clone().drop_guard();
-    let core = core.clone();
     tokio::task::spawn_blocking(move || {
-        tail_offset(core.open_log(owner, id)?, lines, MAX_TAIL_SCAN, &cancel)
+        let start = tail_offset(&mut file, lines, MAX_TAIL_SCAN, &cancel)?;
+        Ok((file, start))
     })
     .await
     .map_err(|e| Failure::internal(e.to_string()))?
-    .or_else(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            Ok(0)
-        } else {
-            Err(cannot_read(e))
-        }
-    })
+    .map_err(cannot_read)
 }
 
 fn cannot_read(e: io::Error) -> Failure {
@@ -142,12 +155,11 @@ fn cannot_read(e: io::Error) -> Failure {
 }
 
 /// See [`Core::open_log`].
-async fn open_log(core: &Arc<Core>, owner: Uid, id: JobId) -> io::Result<tokio::fs::File> {
+async fn open_log(core: &Arc<Core>, owner: Uid, id: JobId) -> io::Result<std::fs::File> {
     let core = core.clone();
     tokio::task::spawn_blocking(move || core.open_log(owner, id))
         .await
         .map_err(io::Error::other)?
-        .map(tokio::fs::File::from_std)
 }
 
 /// Offset where the last `lines` lines of the file start. A trailing
@@ -155,7 +167,7 @@ async fn open_log(core: &Arc<Core>, owner: Uid, id: JobId) -> io::Result<tokio::
 /// bytes at most: if they hold fewer lines, they are where the output
 /// starts. Gives up once `cancel` fires.
 fn tail_offset(
-    mut file: std::fs::File,
+    file: &mut std::fs::File,
     lines: u64,
     max_scan: u64,
     cancel: &CancellationToken,
@@ -232,10 +244,14 @@ fn notice(event: Result<DaemonEvent, broadcast::error::RecvError>, id: JobId) ->
     }
 }
 
+/// Streams the log from `offset` on: from `file`, the log opened by
+/// [`job_log`], or (`None`: there was none yet) once it exists.
+#[allow(clippy::too_many_arguments)]
 async fn produce(
     core: Arc<Core>,
     id: JobId,
     owner: Uid,
+    file: Option<tokio::fs::File>,
     mut offset: u64,
     follow: bool,
     tx: mpsc::Sender<Bytes>,
@@ -244,7 +260,12 @@ async fn produce(
 ) {
     // Subscribed before the first state check, so no change is missed.
     let mut events = core.subscribe();
-    let mut file: Option<tokio::fs::File> = None;
+    let mut file = file;
+    if let Some(f) = file.as_mut()
+        && f.seek(SeekFrom::Start(offset)).await.is_err()
+    {
+        return;
+    }
     let mut buf = vec![0u8; CHUNK];
     let mut last_round = false;
     let mut check_state = true;
@@ -252,7 +273,8 @@ async fn produce(
     loop {
         if file.is_none() {
             match open_log(&core, owner, id).await {
-                Ok(mut f) => {
+                Ok(f) => {
+                    let mut f = tokio::fs::File::from_std(f);
                     if f.seek(SeekFrom::Start(offset)).await.is_err() {
                         return;
                     }
@@ -331,7 +353,12 @@ mod tests {
         let path = dir.path().join("log");
         let never = CancellationToken::new();
         let tail_offset = |path: &std::path::Path, lines| {
-            tail_offset(std::fs::File::open(path).unwrap(), lines, 1 << 20, &never)
+            tail_offset(
+                &mut std::fs::File::open(path).unwrap(),
+                lines,
+                1 << 20,
+                &never,
+            )
         };
         std::fs::write(&path, "a\nbb\nccc\n").unwrap();
         assert_eq!(tail_offset(&path, 1).unwrap(), 5);
@@ -355,18 +382,32 @@ mod tests {
         file.set_len(len).unwrap();
         let never = CancellationToken::new();
         let started = Instant::now();
-        let at = tail_offset(std::fs::File::open(&path).unwrap(), 10, 4 << 20, &never).unwrap();
+        let at = tail_offset(
+            &mut std::fs::File::open(&path).unwrap(),
+            10,
+            4 << 20,
+            &never,
+        )
+        .unwrap();
         assert_eq!(at, len - (4 << 20));
         assert!(started.elapsed().as_secs() < 5);
         // Lines found within the window are honoured.
         std::fs::write(&path, b"x\n".repeat(100)).unwrap();
-        let tail = |lines| tail_offset(std::fs::File::open(&path).unwrap(), lines, 10, &never);
+        let tail = |lines| tail_offset(&mut std::fs::File::open(&path).unwrap(), lines, 10, &never);
         assert_eq!(tail(2).unwrap(), 196);
         assert_eq!(tail(3).unwrap(), 194);
         assert_eq!(tail(10).unwrap(), 190);
 
         let cancelled = CancellationToken::new();
         cancelled.cancel();
-        assert!(tail_offset(std::fs::File::open(&path).unwrap(), 3, 1 << 20, &cancelled).is_err());
+        assert!(
+            tail_offset(
+                &mut std::fs::File::open(&path).unwrap(),
+                3,
+                1 << 20,
+                &cancelled
+            )
+            .is_err()
+        );
     }
 }

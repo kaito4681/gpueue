@@ -171,21 +171,20 @@ enum Incoming {
 
 /// Decodes one line. Undecodable lines are returned as such rather than
 /// failing, so that one bad line does not break the connection (the helper
-/// would replay an undecodable event after every reconnect).
+/// would replay an undecodable event after every reconnect). Only those
+/// are parsed a second time, as any JSON value.
 fn decode_incoming(line: &[u8]) -> Incoming {
-    let value: serde_json::Value = match decode_line(line) {
-        Ok(value) => value,
-        Err(e) => {
-            return Incoming::Undecodable {
-                value: None,
-                error: e.to_string(),
-            };
-        }
+    let error = match decode_line::<HelperMessage>(line) {
+        Ok(message) => return Incoming::Message(message),
+        Err(e) => e,
     };
-    match serde_json::from_value(value.clone()) {
-        Ok(message) => Incoming::Message(message),
-        Err(e) => Incoming::Undecodable {
+    match decode_line::<serde_json::Value>(line) {
+        Ok(value) => Incoming::Undecodable {
             value: Some(value),
+            error: error.to_string(),
+        },
+        Err(e) => Incoming::Undecodable {
+            value: None,
             error: e.to_string(),
         },
     }

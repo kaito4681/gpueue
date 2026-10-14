@@ -238,6 +238,18 @@ impl Changes {
     }
 }
 
+/// What [`Core::notice_loop`] tracks of the helper's events.
+struct HelperEvents {
+    /// The sequence number of the last event applied, as recorded in the
+    /// database (by the notice loop only).
+    last: u64,
+    /// Between a (re)connect and its [`HelperNotice::Connected`]: the
+    /// events are the helper's replay of those not acknowledged.
+    replaying: bool,
+    /// Replayed events held back (see [`Core::receive_helper_event`]).
+    held: Vec<(hp::EventSeq, Option<hp::Event>)>,
+}
+
 /// Whether an effect needs the helper.
 pub fn needs_helper(effect: &Effect) -> bool {
     matches!(
@@ -1787,8 +1799,14 @@ impl Core {
 
     /// Applies a runtime event to a job. `pre` runs in the same transaction
     /// before the transition, only if the event is valid for the job's
-    /// state (so replayed duplicates are ignored as a whole).
-    pub async fn handle_event<P>(self: &Arc<Self>, id: JobId, event: lifecycle::Event, pre: P)
+    /// state (so replayed duplicates are ignored as a whole). Returns
+    /// whether the event applied (and `pre` was committed with it).
+    pub async fn handle_event<P>(
+        self: &Arc<Self>,
+        id: JobId,
+        event: lifecycle::Event,
+        pre: P,
+    ) -> bool
     where
         P: FnOnce(&dyn StoreOps, &Job) -> Result<(), StorageError> + Send + 'static,
     {
@@ -1803,7 +1821,8 @@ impl Core {
         event: lifecycle::Event,
         started_at: Option<Option<Timestamp>>,
         pre: P,
-    ) where
+    ) -> bool
+    where
         P: FnOnce(&dyn StoreOps, &Job) -> Result<(), StorageError> + Send + 'static,
     {
         let core = self.clone();
@@ -1836,15 +1855,20 @@ impl Core {
             Ok(Some((job, effects))) => {
                 let _ = self.run_effects(&job, &effects).await;
                 self.reap_pending(id).await;
+                true
             }
-            Ok(None) => {}
-            Err(e) => tracing::error!(job = %id, "cannot record a job event: {}", e.0.message),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::error!(job = %id, "cannot record a job event: {}", e.0.message);
+                false
+            }
         }
     }
 
     /// Applies helper event `seq` (see [`Core::apply_helper_event`]); its
     /// sequence number is recorded in the transaction that applies it.
-    async fn process_helper_event(self: &Arc<Self>, event: hp::Event, seq: u64) {
+    /// Returns whether it was (`false`: the event did not apply).
+    async fn process_helper_event(self: &Arc<Self>, event: hp::Event, seq: u64) -> bool {
         use lifecycle::{Event as E, ExitStatus as X};
         let mark = move |tx: &dyn StoreOps, _: &Job| tx.set_helper_event_seq(seq);
         // An orphan's process is gone once it exited or was dumped (also
@@ -1871,7 +1895,7 @@ impl Core {
                     hp::ExitStatus::Signaled { signal } => E::Exited(X::Signal(signal)),
                     hp::ExitStatus::Unknown => E::Lost,
                 };
-                self.handle_event(job, event, mark).await;
+                self.handle_event(job, event, mark).await
             }
             hp::Event::CheckpointFinished { job, outcome } => {
                 let now = now_ms();
@@ -1922,32 +1946,35 @@ impl Core {
                     ),
                 };
                 let core = self.clone();
-                self.handle_event(job, event, move |tx, current| {
-                    mark(tx, current)?;
-                    // The record of a dump the daemon asked for exists since
-                    // then; one the helper made on its own (OS shutdown)
-                    // replaces any older record, so its `paused` flag is
-                    // the job's state now.
-                    if current.state == JobState::Checkpointing && tx.get_checkpoint(job)?.is_some()
-                    {
-                        tx.set_checkpoint_status(job, status, size, reason.as_deref())
-                    } else {
-                        tx.put_checkpoint(&CheckpointRecord {
-                            size_bytes: size,
-                            status,
-                            failure_reason: reason,
-                            ..core.new_checkpoint_record(
-                                current,
-                                current.state == JobState::Paused,
-                                now,
-                            )
-                        })
-                    }
-                })
-                .await;
+                let recorded = self
+                    .handle_event(job, event, move |tx, current| {
+                        mark(tx, current)?;
+                        // The record of a dump the daemon asked for exists since
+                        // then; one the helper made on its own (OS shutdown)
+                        // replaces any older record, so its `paused` flag is
+                        // the job's state now.
+                        if current.state == JobState::Checkpointing
+                            && tx.get_checkpoint(job)?.is_some()
+                        {
+                            tx.set_checkpoint_status(job, status, size, reason.as_deref())
+                        } else {
+                            tx.put_checkpoint(&CheckpointRecord {
+                                size_bytes: size,
+                                status,
+                                failure_reason: reason,
+                                ..core.new_checkpoint_record(
+                                    current,
+                                    current.state == JobState::Paused,
+                                    now,
+                                )
+                            })
+                        }
+                    })
+                    .await;
                 if succeeded {
                     self.note_new_checkpoint(job).await;
                 }
+                recorded
             }
             hp::Event::RestoreFinished { job, outcome } => {
                 let event = match outcome {
@@ -1966,11 +1993,11 @@ impl Core {
                         {
                             tracing::warn!(job = %job, "cannot requeue the job: {}", e.0.message);
                         }
-                        return;
+                        return false;
                     }
                     RestoreOutcome::Failed { reason, .. } => E::RestoreFailed { reason },
                 };
-                self.handle_event(job, event, mark).await;
+                self.handle_event(job, event, mark).await
             }
         }
     }
@@ -2140,7 +2167,8 @@ impl Core {
     }
 
     /// The sequence number of the last helper event applied (0 if none,
-    /// or if it cannot be read).
+    /// or if it cannot be read). Read once by [`Core::notice_loop`], the
+    /// only writer, which keeps it up to date in [`HelperEvents::last`].
     async fn last_helper_event(&self) -> u64 {
         match self.read(|s| s.helper_event_seq()).await {
             Ok(last) => last,
@@ -2152,31 +2180,44 @@ impl Core {
     }
 
     /// Applies helper event `seq` (`None`: undecodable, only recorded) and
-    /// records it as applied.
+    /// records it as applied, in the transaction that applies it or, if
+    /// the event did not apply (to the job, any more), on its own.
     ///
     /// The helper keeps its sequence numbers across restarts. Should an
     /// event that is not a replayed duplicate (see
     /// [`Core::receive_helper_event`]) still come with a number not above
     /// the last one applied (the helper's state was reset), the numbering
     /// starts over from it.
-    async fn apply_helper_event(self: &Arc<Self>, seq: u64, event: Option<hp::Event>) {
-        let last = self.last_helper_event().await;
-        if seq <= last {
+    async fn apply_helper_event(
+        self: &Arc<Self>,
+        cursor: &mut HelperEvents,
+        seq: u64,
+        event: Option<hp::Event>,
+    ) {
+        if seq <= cursor.last {
             tracing::warn!(
                 seq,
-                last,
+                last = cursor.last,
                 "the helper's event numbering went back (was its state reset?); following it"
             );
         }
-        if let Some(event) = event {
-            self.process_helper_event(event, seq).await;
+        let mut recorded = match event {
+            Some(event) => self.process_helper_event(event, seq).await,
+            None => false,
+        };
+        if !recorded {
+            match self
+                .write(move |tx, _| Ok(tx.set_helper_event_seq(seq)?))
+                .await
+            {
+                Ok(()) => recorded = true,
+                Err(e) => {
+                    tracing::error!(seq, "cannot record the helper event: {}", e.0.message)
+                }
+            }
         }
-        // Also when the event did not apply to the job (any more).
-        if let Err(e) = self
-            .write(move |tx, _| Ok(tx.set_helper_event_seq(seq)?))
-            .await
-        {
-            tracing::error!(seq, "cannot record the helper event: {}", e.0.message);
+        if recorded {
+            cursor.last = seq;
         }
     }
 
@@ -2194,42 +2235,40 @@ impl Core {
     }
 
     /// Handles helper event `seq` (`None`: undecodable): applies,
-    /// counts and acknowledges it, unless it is held back in `held`.
+    /// counts and acknowledges it, unless it is held back.
     ///
     /// The helper replays the events the daemon has not acknowledged after
     /// every reconnect, and the daemon acknowledges an event only after
     /// applying it, so a replay may repeat events applied already. Applying
     /// one again would be wrong for some, e.g. a refused dump of a job that
     /// has been running since would mark it as terminating. During a replay
-    /// (`replaying`: between a (re)connect and its
-    /// [`HelperNotice::Connected`]) events up to the last one applied are
-    /// therefore held back: they were applied already if the replay goes
-    /// on past the last one applied, or ends there. A replay that ends
-    /// below it comes from a helper whose numbering was reset, whose
+    /// (see [`HelperEvents::replaying`]) events up to the last one applied
+    /// are therefore held back: they were applied already if the replay
+    /// goes on past the last one applied, or ends there. A replay that
+    /// ends below it comes from a helper whose numbering was reset, whose
     /// events are new (see [`Core::end_replay`]).
     async fn receive_helper_event(
         self: &Arc<Self>,
+        cursor: &mut HelperEvents,
         seq: hp::EventSeq,
         event: Option<hp::Event>,
-        replaying: bool,
-        held: &mut Vec<(hp::EventSeq, Option<hp::Event>)>,
     ) {
-        if replaying {
-            if seq.0 <= self.last_helper_event().await {
-                held.push((seq, event));
+        if cursor.replaying {
+            if seq.0 <= cursor.last {
+                cursor.held.push((seq, event));
                 return;
             }
-            if !held.is_empty() {
+            if !cursor.held.is_empty() {
                 // Acknowledged with this event.
                 tracing::debug!(
-                    count = held.len(),
+                    count = cursor.held.len(),
                     "skipping replayed helper events applied already"
                 );
-                self.events_handled(held.len());
-                held.clear();
+                self.events_handled(cursor.held.len());
+                cursor.held.clear();
             }
         }
-        self.apply_helper_event(seq.0, event).await;
+        self.apply_helper_event(cursor, seq.0, event).await;
         self.events_handled(1);
         self.ack_helper_events(seq).await;
     }
@@ -2238,28 +2277,28 @@ impl Core {
     /// [`Core::receive_helper_event`]) at its end: duplicates if the
     /// replay reached the last event applied, otherwise the helper's
     /// numbering was reset and they are applied.
-    async fn end_replay(self: &Arc<Self>, held: &mut Vec<(hp::EventSeq, Option<hp::Event>)>) {
-        let Some(&(up_to, _)) = held.last() else {
+    async fn end_replay(self: &Arc<Self>, cursor: &mut HelperEvents) {
+        cursor.replaying = false;
+        let Some(&(up_to, _)) = cursor.held.last() else {
             return;
         };
-        let last = self.last_helper_event().await;
-        if up_to.0 >= last {
+        if up_to.0 >= cursor.last {
             tracing::debug!(
-                count = held.len(),
+                count = cursor.held.len(),
                 "skipping replayed helper events applied already"
             );
-            self.events_handled(held.len());
-            held.clear();
+            self.events_handled(cursor.held.len());
+            cursor.held.clear();
             self.ack_helper_events(up_to).await;
             return;
         }
         tracing::warn!(
-            last,
+            last = cursor.last,
             replayed_up_to = up_to.0,
             "the helper's event numbering was reset (was its state wiped?); applying its replayed events"
         );
-        for (seq, event) in std::mem::take(held) {
-            self.apply_helper_event(seq.0, event).await;
+        for (seq, event) in std::mem::take(&mut cursor.held) {
+            self.apply_helper_event(cursor, seq.0, event).await;
             self.events_handled(1);
             self.ack_helper_events(seq).await;
         }
@@ -2267,10 +2306,12 @@ impl Core {
 
     /// Consumes helper notices until the daemon stops.
     pub async fn notice_loop(self: Arc<Self>, mut notices: mpsc::UnboundedReceiver<HelperNotice>) {
-        // Events before the first `Connected` are a replay, too.
-        let mut replaying = true;
-        // See `Core::receive_helper_event`.
-        let mut held = Vec::new();
+        let mut cursor = HelperEvents {
+            last: self.last_helper_event().await,
+            // Events before the first `Connected` are a replay, too.
+            replaying: true,
+            held: Vec::new(),
+        };
         loop {
             let notice = tokio::select! {
                 _ = self.cancel.cancelled() => return,
@@ -2279,13 +2320,8 @@ impl Core {
             let Some(notice) = notice else { return };
             match notice {
                 HelperNotice::Event(envelope) => {
-                    self.receive_helper_event(
-                        envelope.seq,
-                        Some(envelope.event),
-                        replaying,
-                        &mut held,
-                    )
-                    .await;
+                    self.receive_helper_event(&mut cursor, envelope.seq, Some(envelope.event))
+                        .await;
                 }
                 HelperNotice::UndecodableEvent { seq, error } => {
                     tracing::warn!(
@@ -2293,20 +2329,18 @@ impl Core {
                         "skipping a helper event this daemon cannot decode \
                          (is the helper newer than the daemon?): {error}"
                     );
-                    self.receive_helper_event(seq, None, replaying, &mut held)
-                        .await;
+                    self.receive_helper_event(&mut cursor, seq, None).await;
                 }
                 HelperNotice::Connected { version, running } => {
-                    replaying = false;
-                    self.end_replay(&mut held).await;
+                    self.end_replay(&mut cursor).await;
                     tracing::info!(%version, live = running.len(), "reconciling with the helper");
                     self.reconcile(running).await;
                 }
                 HelperNotice::Disconnected => {
-                    replaying = true;
+                    cursor.replaying = true;
                     // Not acknowledged: replayed again after the reconnect.
-                    self.events_handled(held.len());
-                    held.clear();
+                    self.events_handled(cursor.held.len());
+                    cursor.held.clear();
                     self.reconciled.store(false, Ordering::SeqCst);
                 }
             }
