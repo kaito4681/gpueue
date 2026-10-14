@@ -1,8 +1,10 @@
 //! Free-space precheck for the image directory.
 //!
-//! A checkpoint image is roughly "host RAM in use + VRAM in use" and is not
-//! compressed, so a dump is only attempted when at least `(rss + vram) * 1.2`
-//! bytes are available on the target filesystem.
+//! A checkpoint image is roughly "host RAM in use + VRAM in use" (plus the
+//! contents of the job's private tmpfs mounts and deleted files saved in
+//! it) and is not compressed, so a dump is only attempted when at least
+//! `(rss + vram) * 1.2` bytes are available on the target filesystem, with
+//! those extra bytes counted as RSS.
 
 use std::io;
 use std::path::Path;
@@ -47,6 +49,26 @@ pub fn check_free_space(
 pub fn available_bytes(path: &Path) -> io::Result<u64> {
     let st = rustix::fs::statvfs(path)?;
     Ok(st.f_bavail.saturating_mul(st.f_frsize))
+}
+
+/// Bytes in use on the tmpfs mounted at `path` (`(f_blocks - f_bfree) *
+/// f_bsize`), or `None` when `path` is not on tmpfs. CRIU saves the
+/// contents of a tmpfs that a dumped mount namespace has of its own in the
+/// image, so they need room there as well.
+pub fn tmpfs_used_bytes(path: &Path) -> io::Result<Option<u64>> {
+    let st = rustix::fs::statfs(path)?;
+    #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+    let ty = i128::from(st.f_type);
+    if ty != TMPFS_MAGIC {
+        return Ok(None);
+    }
+    #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+    let (blocks, free, bsize) = (
+        u64::try_from(st.f_blocks).unwrap_or(0),
+        u64::try_from(st.f_bfree).unwrap_or(0),
+        u64::try_from(st.f_bsize).unwrap_or(0),
+    );
+    Ok(Some(blocks.saturating_sub(free).saturating_mul(bsize)))
 }
 
 /// Whether `path` lives on tmpfs (not allowed as an image location: images
@@ -96,5 +118,15 @@ mod tests {
         is_tmpfs(&dir).unwrap();
         assert!(!is_tmpfs(Path::new("/proc")).unwrap());
         assert!(available_bytes(Path::new("/definitely/not/here")).is_err());
+        assert_eq!(tmpfs_used_bytes(Path::new("/proc")).unwrap(), None);
+        // /dev/shm is a tmpfs on most systems (and in the test container).
+        if is_tmpfs(Path::new("/dev/shm")).unwrap_or(false) {
+            let before = tmpfs_used_bytes(Path::new("/dev/shm")).unwrap().unwrap();
+            let f = Path::new("/dev/shm").join(format!("puzuz-space-{}", std::process::id()));
+            std::fs::write(&f, vec![1u8; 1 << 20]).unwrap();
+            let after = tmpfs_used_bytes(Path::new("/dev/shm")).unwrap().unwrap();
+            std::fs::remove_file(&f).unwrap();
+            assert!(after >= before + (1 << 20) - 4096, "{before} -> {after}");
+        }
     }
 }

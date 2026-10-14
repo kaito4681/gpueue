@@ -263,6 +263,29 @@ pub fn check_root_owned_path(path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// `PATH` of a process that has none (systemd's default for services).
+pub const DEFAULT_SERVICE_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Where a program given by name (`criu`) is found in `path_env` (a
+/// `PATH` value): the first executable regular file `<dir>/<name>`, looked
+/// up in the absolute directories only, in order (symlinks followed, the
+/// returned path is the unresolved `<dir>/<name>`). `None` if there is
+/// none or `name` is not a bare name.
+pub fn find_program(name: &Path, path_env: &std::ffi::OsStr) -> Option<PathBuf> {
+    let mut comps = name.components();
+    if !matches!(
+        (comps.next(), comps.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
+        return None;
+    }
+    std::env::split_paths(path_env)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0))
+}
+
 impl Config {
     /// Reads `path` for a process running as root (the helper): refuses a
     /// file that is not an absolute path, is or is reached through a
@@ -351,6 +374,26 @@ mod tests {
     fn write(path: &Path, text: &str, mode: u32) {
         std::fs::write(path, text).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn programs_are_found_in_absolute_path_entries_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        write(&a.join("tool"), "", 0o644); // not executable
+        write(&b.join("tool"), "", 0o755);
+        std::fs::create_dir(b.join("dir")).unwrap();
+        let path =
+            std::env::join_paths(["relative", a.to_str().unwrap(), b.to_str().unwrap()]).unwrap();
+        assert_eq!(find_program(Path::new("tool"), &path), Some(b.join("tool")));
+        assert_eq!(find_program(Path::new("dir"), &path), None);
+        assert_eq!(find_program(Path::new("missing"), &path), None);
+        assert_eq!(find_program(Path::new("b/tool"), &path), None);
+        assert_eq!(find_program(Path::new("/bin/sh"), &path), None);
+        assert_eq!(find_program(Path::new(".."), &path), None);
     }
 
     #[test]

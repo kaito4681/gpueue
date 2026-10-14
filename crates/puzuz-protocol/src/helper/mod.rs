@@ -316,6 +316,11 @@ pub enum HelperErrorCode {
     /// could not be restored, not enough free space, ...). The job keeps
     /// running as it was; the message says why.
     CheckpointRefused,
+    /// In a failed [`CheckpointOutcome`]: the dump succeeded (the job's
+    /// processes are gone), but the helper could not finalize the
+    /// checkpoint. The image is kept; the helper finalizes it before a
+    /// restore or at its next start, so the job counts as checkpointed.
+    CheckpointUnfinalized,
     Internal,
     /// A code added by a newer peer. Never sent by this version.
     #[serde(other)]
@@ -386,10 +391,11 @@ pub enum CheckpointOutcome {
     /// for administrators and `reason` names its path.
     Failed {
         reason: String,
-        /// Why, when the dump was not attempted. Only
-        /// `checkpoint_refused` so far: the pre-checks failed before the
-        /// job was touched, and it keeps running as it was. Absent from
-        /// older helpers.
+        /// Why, when it is not an attempted dump that CRIU rolled back:
+        /// `checkpoint_refused` when the pre-checks failed before the job
+        /// was touched (it keeps running as it was), and
+        /// `checkpoint_unfinalized` when the dump succeeded but the image
+        /// is not finalized yet. Absent from older helpers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<HelperErrorCode>,
     },
@@ -409,6 +415,15 @@ impl CheckpointOutcome {
         CheckpointOutcome::Failed {
             reason: reason.into(),
             code: Some(HelperErrorCode::CheckpointRefused),
+        }
+    }
+
+    /// A dump that succeeded but could not be finalized (see
+    /// [`HelperErrorCode::CheckpointUnfinalized`]).
+    pub fn unfinalized(reason: impl Into<String>) -> Self {
+        CheckpointOutcome::Failed {
+            reason: reason.into(),
+            code: Some(HelperErrorCode::CheckpointUnfinalized),
         }
     }
 

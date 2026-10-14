@@ -473,9 +473,34 @@ async fn spawn_validates_and_sets_cuda_env() {
         ),
         HelperErrorCode::JobNotFound
     );
+    // TSTP and ALRM are forwarded to the job; signals the shim cannot
+    // forward (a fault signal, a real-time signal) are refused.
+    for sig in [20, 14] {
+        assert_eq!(
+            c.request(Request::Signal {
+                job: JobId(1),
+                signal: sig
+            })
+            .await,
+            ResponseResult::Ok
+        );
+    }
+    for sig in [11, 17, 34, 64] {
+        assert_eq!(
+            err_code(
+                &c.request(Request::Signal {
+                    job: JobId(1),
+                    signal: sig
+                })
+                .await
+            ),
+            HelperErrorCode::InvalidRequest,
+            "signal {sig}"
+        );
+    }
     assert_eq!(
         env.launcher.unit(JobId(1)).unwrap().signals,
-        [signal::SIGSTOP]
+        [signal::SIGSTOP, 20, 14]
     );
 }
 
@@ -952,7 +977,7 @@ async fn restore_checks_the_images_paths_first() {
         .into_iter()
         .filter_map(|r| match r {
             VerifyRequest::Paths(p) => Some(p.paths),
-            VerifyRequest::Restored(_) => None,
+            VerifyRequest::Restored(_) | VerifyRequest::Exist(_) => None,
         })
         .flatten()
         .collect();
@@ -1964,4 +1989,282 @@ async fn a_stopping_helper_reports_an_abandoned_restore_as_not_started() {
         DirStatus::Complete(_)
     ));
     assert!(c.running().await.is_empty());
+}
+
+/// The restore checks run off the async workers (an access check stuck on
+/// a filesystem that does not answer leaves the helper responsive), and
+/// the job is claimed before them: its checkpoint cannot be deleted while
+/// it is checked. A failed check releases the claim.
+#[tokio::test]
+async fn restore_checks_do_not_block_the_helper_and_hold_off_deletes() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 3).await;
+    let images = CheckpointDir::for_job(&env.base(), 3).images_dir();
+    std::fs::write(
+        images.join("files.img"),
+        files_image(&["/home/alice/x/data"], &[]),
+    )
+    .unwrap();
+    env.host.hold_access_checks(true);
+    let restore = c.send_request(restore_req(3, &image_dir)).await;
+    for _ in 0..500 {
+        if !env.host.verified().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!env.host.verified().is_empty(), "the check never started");
+    // Still answering while the check hangs.
+    assert_eq!(c.running().await, [(JobId(3), RunningPhase::Restoring)]);
+    let del = Request::DeleteCheckpoint {
+        job: JobId(3),
+        image_dir: image_dir.clone(),
+    };
+    assert_eq!(
+        err_code(&c.request(del.clone()).await),
+        HelperErrorCode::Busy
+    );
+    assert!(matches!(
+        CheckpointDir::for_job(&env.base(), 3).status(),
+        DirStatus::Complete(_)
+    ));
+    // The check fails: the claim goes, and the delete works.
+    env.host.set_access_problems(
+        vec!["/home/alice/x/data: a directory on the way is a symlink".into()],
+        vec![],
+    );
+    env.host.hold_access_checks(false);
+    let r = c.response(restore).await;
+    assert_eq!(err_code(&r), HelperErrorCode::PermissionDenied, "{r:?}");
+    assert!(c.running().await.is_empty());
+    assert_eq!(c.request(del).await, ResponseResult::Ok);
+}
+
+/// After a successful `criu dump` the job's processes are gone: a failure
+/// to finalize the checkpoint keeps the image, reports it apart, and the
+/// next restore finalizes it.
+#[tokio::test]
+async fn a_dump_that_cannot_be_finalized_keeps_its_image() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(4))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    // Writing the COMPLETE marker fails (its temporary file cannot be
+    // created).
+    env.exec.lock().unwrap().after_dump = Some(|images| {
+        std::fs::create_dir(images.parent().unwrap().join("COMPLETE.tmp")).unwrap();
+    });
+    let image_dir = env.base().join("4");
+    assert_eq!(
+        c.request(Request::Checkpoint {
+            job: JobId(4),
+            image_dir: image_dir.clone(),
+            options: Default::default(),
+        })
+        .await,
+        ResponseResult::Accepted
+    );
+    let ev = c.event().await;
+    let Event::CheckpointFinished {
+        outcome:
+            CheckpointOutcome::Failed {
+                reason,
+                code: Some(HelperErrorCode::CheckpointUnfinalized),
+            },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert!(reason.contains("image is kept"), "{reason}");
+    let dir = CheckpointDir::for_job(&env.base(), 4);
+    assert!(dir.is_unfinalized_dump(), "{:?}", dir.status());
+    assert!(c.running().await.is_empty());
+    assert!(
+        env.launcher.unit(JobId(4)).is_none(),
+        "the unit is released"
+    );
+    // A spawn of the same id is refused (the job is checkpointed).
+    assert_eq!(
+        err_code(&c.request(Request::Spawn(env.spawn_req(4))).await),
+        HelperErrorCode::Busy
+    );
+    // Still failing: the restore fails and keeps the image.
+    let r = c.request(restore_req(4, &image_dir)).await;
+    assert_eq!(err_code(&r), HelperErrorCode::Internal, "{r:?}");
+    assert!(dir.is_unfinalized_dump());
+    // Fixed: the restore finalizes it first.
+    std::fs::remove_dir(dir.root().join("COMPLETE.tmp")).unwrap();
+    assert_eq!(
+        c.request(restore_req(4, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::RestoreFinished {
+                outcome: RestoreOutcome::Success { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+}
+
+/// A helper that stopped between a successful `criu dump` and the end of
+/// its finalization: the next start finalizes the image and reports the
+/// checkpoint, instead of removing the "incomplete" directory and
+/// reporting the job as exited.
+#[tokio::test]
+async fn a_dump_interrupted_before_its_finalization_is_finished_at_start() {
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(5))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    // Make the finalization fail, then turn it into a "crash": put the
+    // record and the directory back into the state right after CRIU
+    // exited.
+    env.exec.lock().unwrap().after_dump = Some(|images| {
+        std::fs::create_dir(images.parent().unwrap().join("COMPLETE.tmp")).unwrap();
+    });
+    c.request(Request::Checkpoint {
+        job: JobId(5),
+        image_dir: env.base().join("5"),
+        options: Default::default(),
+    })
+    .await;
+    c.event().await;
+    c.request(Request::AckEvents {
+        up_to: EventSeq(u64::MAX),
+    })
+    .await;
+    drop(c);
+    let _ = env.stop.send(true);
+    let dir = CheckpointDir::for_job(&env.base(), 5);
+    std::fs::remove_dir(dir.root().join("COMPLETE.tmp")).unwrap();
+    std::fs::remove_file(dir.dumped_marker_path()).unwrap();
+    std::fs::write(dir.dump_log(), "(00.5) Dumping finished successfully\n").unwrap();
+    let files = puzuz_helper::jobs::JobFiles::new(&env.root.join("state/jobs"), JobId(5));
+    let mut record = files.read_record().unwrap();
+    record.phase = puzuz_helper::jobs::RecordPhase::Live;
+    record.dumping = true;
+    files.write_record(&record).unwrap();
+    env.restart().await;
+    let mut c = env.client().await;
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::CheckpointFinished {
+                job: JobId(5),
+                outcome: CheckpointOutcome::Success { .. },
+            }
+        ),
+        "{ev:?}"
+    );
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    let record = files.read_record().unwrap();
+    assert_eq!(record.phase, puzuz_helper::jobs::RecordPhase::Checkpointed);
+    assert!(!record.dumping);
+    assert!(c.running().await.is_empty());
+}
+
+/// An interrupted restore whose unit is gone (the helper stopped before it
+/// started it, or systemd already cleaned it up) is reported too, once.
+#[tokio::test]
+async fn an_interrupted_restore_without_its_unit_is_reported() {
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 3).await;
+    c.request(Request::AckEvents {
+        up_to: EventSeq(u64::MAX),
+    })
+    .await;
+    drop(c);
+    let _ = env.stop.send(true);
+    let files = puzuz_helper::jobs::JobFiles::new(&env.root.join("state/jobs"), JobId(3));
+    let mut record = files.read_record().unwrap();
+    record.restores = 1;
+    record.unit = "puzuz-job-3-r1.service".into();
+    record.restoring = true;
+    files.write_record(&record).unwrap();
+    env.restart().await;
+    let mut c = env.client().await;
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            &ev.event,
+            Event::RestoreFinished {
+                job: JobId(3),
+                outcome: RestoreOutcome::Failed { .. }
+            }
+        ),
+        "{ev:?}"
+    );
+    assert!(!files.read_record().unwrap().restoring);
+    c.request(Request::AckEvents {
+        up_to: EventSeq(u64::MAX),
+    })
+    .await;
+    drop(c);
+    env.restart().await;
+    let mut c = env.client().await;
+    c.no_event().await;
+    assert_eq!(
+        c.request(restore_req(3, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+}
+
+#[tokio::test]
+async fn dump_counts_private_tmpfs_and_refuses_reuseport_sockets() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(3))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    let checkpoint = Request::Checkpoint {
+        job: JobId(3),
+        image_dir: env.base().join("3"),
+        options: Default::default(),
+    };
+    // RSS is 1 MiB (FakeHost): 2 MiB free are enough without the tmpfs
+    // contents, not with them.
+    env.host.set_available(2 << 20);
+    env.host.set_private_tmpfs_bytes(4 << 20);
+    let r = c.request(checkpoint.clone()).await;
+    let ResponseResult::Error {
+        code: HelperErrorCode::CheckpointRefused,
+        message,
+    } = r
+    else {
+        panic!("{r:?}")
+    };
+    assert!(message.contains("private tmpfs"), "{message}");
+    env.host.set_private_tmpfs_bytes(0);
+    env.host.set_dump_hazards(DumpHazards {
+        reuseport_sockets: vec!["0.0.0.0:8080".into()],
+        ..Default::default()
+    });
+    let r = c.request(checkpoint).await;
+    let ResponseResult::Error {
+        code: HelperErrorCode::CheckpointRefused,
+        message,
+    } = r
+    else {
+        panic!("{r:?}")
+    };
+    assert!(
+        message.contains("SO_REUSEPORT") && message.contains("0.0.0.0:8080"),
+        "{message}"
+    );
+    assert_eq!(c.running().await, [(JobId(3), RunningPhase::Running)]);
+    assert!(env.exec.lock().unwrap().actions.is_empty());
 }

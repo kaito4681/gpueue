@@ -59,6 +59,16 @@ pub struct JobRecord {
     /// still be in each. Only in the copy kept with the image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dump_groups: Option<Vec<u32>>,
+    /// Set (phase `Live`) while `criu dump` may run: a helper that stops
+    /// before it recorded the outcome finds out at its next start whether
+    /// the dump succeeded (see [`puzuz_checkpoint::layout::CheckpointDir::is_unfinalized_dump`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dumping: bool,
+    /// Set (phase `Checkpointed`) while a restore runs: a helper that stops
+    /// before it recorded the outcome reports the restore as failed at its
+    /// next start.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restoring: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,6 +366,8 @@ mod tests {
             unit: "puzuz-job-5.service".into(),
             restores: 0,
             dump_groups: None,
+            dumping: false,
+            restoring: false,
         };
         files.write_record(&rec).unwrap();
 

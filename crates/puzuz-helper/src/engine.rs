@@ -426,7 +426,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 image_dir,
                 options,
             } => self.checkpoint(job, &image_dir, options).await,
-            Request::Restore(r) => self.restore(r),
+            Request::Restore(r) => self.restore(r).await,
             Request::DeleteCheckpoint { job, image_dir } => {
                 self.delete_checkpoint(job, &image_dir).await
             }
@@ -464,6 +464,8 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             unit: unit_name(req.job),
             restores: 0,
             dump_groups: None,
+            dumping: false,
+            restoring: false,
         };
         {
             let mut table = self.table();
@@ -634,6 +636,16 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 format!("invalid signal {sig}"),
             );
         }
+        // Anything else would reach the job's root shim instead of the job
+        // (see `crate::shim::FORWARDED`).
+        if !matches!(sig, signal::SIGSTOP | signal::SIGCONT | signal::SIGKILL)
+            && !crate::shim::is_forwardable(sig)
+        {
+            return error(
+                HelperErrorCode::InvalidRequest,
+                format!("signal {sig} cannot be sent to a job"),
+            );
+        }
         let unit = match self
             .table()
             .get(&job)
@@ -781,12 +793,13 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
     // -- recovery ---------------------------------------------------------
 
     /// Rebuild the job table after a (re)start: re-adopt running units,
-    /// report jobs that exited while the helper was away, drop incomplete
-    /// checkpoints.
+    /// report jobs that exited while the helper was away and restores and
+    /// dumps it did not see to the end, finalize successful dumps it left
+    /// unfinalized, drop other incomplete checkpoints.
     pub async fn recover(&self) -> io::Result<()> {
         let records = jobs::scan(&self.cfg.jobs_dir())?;
         let mut known = Vec::new();
-        for (files, record) in records {
+        for (files, mut record) in records {
             let job = record.job;
             known.push(record.unit.clone());
             let state = self
@@ -795,20 +808,71 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 .await
                 .map_err(|e| io::Error::other(format!("querying {}: {e}", record.unit)))?;
             let dir = CheckpointDir::for_job(&self.cfg.checkpoint_base, job.0);
+            if record.phase == RecordPhase::Live && record.dumping {
+                // The helper stopped while `criu dump` might run. If the
+                // dump succeeded, the job's processes are gone and the
+                // image is all that is left of it.
+                // (A unit that still runs was not dumped: a successful dump
+                // ends its init, and with it the unit.)
+                record.dumping = false;
+                let dumped = match dir.status() {
+                    _ if state == UnitState::Running => None,
+                    DirStatus::Complete(meta) => Some(Ok(meta.size_bytes)),
+                    _ if dir.is_unfinalized_dump() => {
+                        Some(finish_dump(&*self.host, &dir, None).map(|m| m.size_bytes))
+                    }
+                    _ => None,
+                };
+                if let Some(result) = dumped {
+                    eprintln!(
+                        "puzuz-helper: job {} was dumped when the helper stopped; it is \
+                         checkpointed",
+                        job.0
+                    );
+                    record.phase = RecordPhase::Checkpointed;
+                    files.write_record(&record)?;
+                    if state != UnitState::Gone {
+                        let _ = self.launcher.release(&record.unit).await;
+                    }
+                    let outcome = match result {
+                        Ok(size) => CheckpointOutcome::Success {
+                            image_size_bytes: size,
+                        },
+                        Err(e) => {
+                            let reason = unfinalized_reason(&dir, &e);
+                            eprintln!("puzuz-helper: checkpoint of job {}: {reason}", job.0);
+                            CheckpointOutcome::unfinalized(reason)
+                        }
+                    };
+                    self.emit(Event::CheckpointFinished { job, outcome });
+                    continue;
+                }
+                // The dump did not succeed: the job ran on (or exited).
+                files.write_record(&record)?;
+            }
             if record.phase == RecordPhase::Checkpointed {
-                if state == UnitState::Running && record.restores > 0 {
-                    // The helper died during a restore, before it was
-                    // recorded as done: criu may still be running, or the
-                    // restored tasks may not have been checked yet (see
-                    // `crate::access::run_restore_hook`), or their CUDA state not restored
-                    // and unlocked. Kill the tree and report the restore as
-                    // failed; the image is kept for another try.
+                // The helper stopped during a restore, before it recorded
+                // the outcome (older helpers did not set `restoring`; a
+                // restore unit that still runs tells for them).
+                if record.restoring || state == UnitState::Running && record.restores > 0 {
+                    // criu may still be running, or the restored tasks may
+                    // not have been checked yet (see
+                    // `crate::access::run_restore_hook`), or their CUDA
+                    // state not restored and unlocked. Kill the tree and
+                    // report the restore as failed; the image is kept for
+                    // another try.
                     eprintln!(
                         "puzuz-helper: job {} was being restored when the helper stopped; \
                          killing {} (the image is kept)",
                         job.0, record.unit
                     );
-                    let _ = self.launcher.signal(&record.unit, signal::SIGKILL).await;
+                    if state == UnitState::Running {
+                        let _ = self.launcher.signal(&record.unit, signal::SIGKILL).await;
+                    }
+                    record.restoring = false;
+                    if let Err(e) = files.write_record(&record) {
+                        eprintln!("puzuz-helper: updating the record of job {}: {e}", job.0);
+                    }
                     self.emit(Event::RestoreFinished {
                         job,
                         outcome: RestoreOutcome::failed(
@@ -822,8 +886,22 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 if state != UnitState::Gone {
                     let _ = self.launcher.release(&record.unit).await;
                 }
-                if !matches!(dir.status(), DirStatus::Complete(_)) {
-                    let _ = files.remove();
+                match dir.status() {
+                    DirStatus::Complete(_) => {}
+                    // Kept even if it cannot be finalized now: a restore
+                    // tries again.
+                    _ if dir.is_unfinalized_dump() => {
+                        if let Err(e) = finish_dump(&*self.host, &dir, None) {
+                            eprintln!(
+                                "puzuz-helper: finalizing the checkpoint of job {}: {e}; the \
+                                 image is kept",
+                                job.0
+                            );
+                        }
+                    }
+                    _ => {
+                        let _ = files.remove();
+                    }
                 }
                 continue;
             }
@@ -872,8 +950,21 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         }
         for (id, status) in layout::scan(&self.cfg.checkpoint_base)? {
             if let DirStatus::Incomplete(reason) = status {
+                let dir = CheckpointDir::for_job(&self.cfg.checkpoint_base, id);
+                // A successful dump holds the only copy of its job: never
+                // removed here.
+                if dir.is_unfinalized_dump() {
+                    match finish_dump(&*self.host, &dir, None) {
+                        Ok(_) => eprintln!("puzuz-helper: finalized the checkpoint of job {id}"),
+                        Err(e) => eprintln!(
+                            "puzuz-helper: finalizing the checkpoint of job {id}: {e}; the \
+                             image is kept"
+                        ),
+                    }
+                    continue;
+                }
                 eprintln!("puzuz-helper: removing incomplete checkpoint of job {id}: {reason:?}");
-                let _ = CheckpointDir::for_job(&self.cfg.checkpoint_base, id).remove();
+                let _ = dir.remove();
             }
         }
         // GC roots of jobs that have no record any more (see
@@ -1012,6 +1103,17 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             Err(e) => Err(e.to_string()),
         };
 
+        // A helper that stops while `criu dump` runs finds out at its next
+        // start whether the dump succeeded (see `Self::recover`).
+        let mut dumping = entry.record.clone();
+        dumping.dumping = true;
+        let init_pid = init_pid.and_then(|pid| {
+            entry
+                .files
+                .write_record(&dumping)
+                .map(|()| pid)
+                .map_err(|e| format!("writing the job record: {e}"))
+        });
         let result = match init_pid {
             Err(reason) => Err(DumpError::Refused(reason)),
             Ok(init_pid) => {
@@ -1045,12 +1147,23 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             }
         };
 
-        match result {
-            Ok(meta) => {
+        let dumped = match result {
+            Ok(meta) => Ok(CheckpointOutcome::Success {
+                image_size_bytes: meta.size_bytes,
+            }),
+            Err(DumpError::Unfinalized(reason)) => {
+                eprintln!("puzuz-helper: checkpoint of job {}: {reason}", job.0);
+                Ok(CheckpointOutcome::unfinalized(reason))
+            }
+            Err(e) => Err(e),
+        };
+        match dumped {
+            Ok(outcome) => {
                 // Record the dump first: the dumped unit ends `failed`
                 // (137), which must not be mistaken for the job failing.
                 let mut record = entry.record;
                 record.phase = RecordPhase::Checkpointed;
+                record.dumping = false;
                 if let Err(e) = entry.files.write_record(&record) {
                     eprintln!("puzuz-helper: recording checkpoint of job {}: {e}", job.0);
                 }
@@ -1058,11 +1171,12 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 if let Err(e) = self.launcher.release(&unit).await {
                     eprintln!("puzuz-helper: releasing {unit} after dump: {e}");
                 }
-                CheckpointOutcome::Success {
-                    image_size_bytes: meta.size_bytes,
-                }
+                outcome
             }
             Err(e) => {
+                if let Err(e) = entry.files.write_record(&entry.record) {
+                    eprintln!("puzuz-helper: updating the record of job {}: {e}", job.0);
+                }
                 self.unclaim(job, was_stopped);
                 if was_stopped {
                     let _ = self.launcher.signal(&unit, signal::SIGSTOP).await;
@@ -1079,6 +1193,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                         eprintln!("puzuz-helper: checkpoint of job {} failed: {reason}", job.0);
                         CheckpointOutcome::failed(reason)
                     }
+                    DumpError::Unfinalized(_) => unreachable!("handled above"),
                 }
             }
         }
@@ -1086,18 +1201,21 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
 
     // -- restore ----------------------------------------------------------
 
-    fn restore(self: &Arc<Self>, req: RestoreRequest) -> ResponseResult {
+    async fn restore(self: &Arc<Self>, req: RestoreRequest) -> ResponseResult {
         // Counted before the check (see `Self::spawn`).
         let guard = self.inflight.enter();
         if self.is_shutting_down() {
             return error(HelperErrorCode::ShuttingDown, "the helper is shutting down");
         }
         let job = req.job;
-        let (record, meta, allowed_gids) = match self.check_restore(&req) {
-            Ok(v) => v,
-            Err(res) => return res,
-        };
+        if let Err(r) = validate::check_image_dir(&self.cfg.checkpoint_base, job, &req.image_dir) {
+            return r.into();
+        }
         let files = JobFiles::new(&self.cfg.jobs_dir(), job);
+        // Claimed before the checks, so that the checkpoint cannot be
+        // deleted (which refuses live jobs) while it is checked or
+        // restored; the entry's record is replaced by the image's once the
+        // checks passed.
         {
             let mut table = self.table();
             if table.contains_key(&job) {
@@ -1106,12 +1224,48 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             table.insert(
                 job,
                 Entry {
-                    record: record.clone(),
+                    record: JobRecord {
+                        job,
+                        uid: req.uid,
+                        gid: puzuz_protocol::helper::Gid(u32::MAX),
+                        log_path: Default::default(),
+                        gpus: req.gpus.clone(),
+                        no_checkpoint: false,
+                        phase: RecordPhase::Checkpointed,
+                        unit_kind: UnitKind::Restored,
+                        unit: String::new(),
+                        restores: 0,
+                        dump_groups: None,
+                        dumping: false,
+                        restoring: true,
+                    },
                     files: files.clone(),
                     phase: Phase::Restoring,
                     pid: None,
                 },
             );
+        }
+        // The checks block (on the GPU tools, the access-check child, the
+        // mounts), so they run off the async workers.
+        let this = self.clone();
+        let checked_req = req.clone();
+        let checked = tokio::task::spawn_blocking(move || this.check_restore(&checked_req))
+            .await
+            .unwrap_or_else(|e| {
+                Err(error(
+                    HelperErrorCode::Internal,
+                    format!("the restore checks panicked: {e}"),
+                ))
+            });
+        let (record, meta, allowed_gids) = match checked {
+            Ok(v) => v,
+            Err(res) => {
+                self.table().remove(&job);
+                return res;
+            }
+        };
+        if let Some(e) = self.table().get_mut(&job) {
+            e.record = record.clone();
         }
         let this = self.clone();
         tokio::spawn(async move {
@@ -1135,6 +1289,19 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         let dir = CheckpointDir::for_job(&self.cfg.checkpoint_base, req.job.0);
         let meta = match dir.status() {
             DirStatus::Complete(meta) => *meta,
+            // A successful dump the helper could not finalize then.
+            _ if dir.is_unfinalized_dump() => {
+                finish_dump(&*self.host, &dir, None).map_err(|e| {
+                    error(
+                        HelperErrorCode::Internal,
+                        format!(
+                            "the checkpoint of job {} was dumped but not finalized, and \
+                             finalizing it failed again: {e}; the image is kept",
+                            req.job.0
+                        ),
+                    )
+                })?
+            }
             other => {
                 return Err(error(
                     HelperErrorCode::InvalidRequest,
@@ -1189,11 +1356,35 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         if let Ok(bytes) = fs::read(dir.root().join(MOUNTS_FILE))
             && let Ok(mounts) = serde_json::from_slice::<SavedMounts>(&bytes)
         {
-            let missing: Vec<&str> = mounts
+            let required: Vec<String> = mounts
                 .required_paths()
                 .into_iter()
-                .filter(|m| fs::symlink_metadata(m).is_err())
+                .map(str::to_owned)
                 .collect();
+            // The list is from before the dump; the image says which of
+            // those files the job still had open when it was dumped.
+            let in_image = crate::images::read_paths(&dir.images_dir())
+                .ok()
+                .flatten()
+                .map(|p| p.files);
+            let used: Vec<String> = mounts
+                .open_files()
+                .iter()
+                .filter(|f| in_image.as_ref().is_none_or(|i| i.contains(f)))
+                .cloned()
+                .collect();
+            // Looked up in a child process with a deadline: a filesystem
+            // that does not answer (an NFS server that is down) must not
+            // hold up the helper.
+            let mut lookup = required.clone();
+            lookup.extend(used.iter().filter(|f| !required.contains(f)).cloned());
+            let absent = self.host.missing_paths(&lookup).map_err(|e| {
+                error(
+                    HelperErrorCode::Internal,
+                    format!("checking the paths the checkpoint depends on: {e}"),
+                )
+            })?;
+            let missing: Vec<&String> = required.iter().filter(|p| absent.contains(p)).collect();
             if !missing.is_empty() {
                 return Err(error(
                     HelperErrorCode::InvalidRequest,
@@ -1224,18 +1415,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     ),
                 ));
             }
-            // The list is from before the dump; the image says which of
-            // those files the job still had open when it was dumped.
-            let in_image = crate::images::read_paths(&dir.images_dir())
-                .ok()
-                .flatten()
-                .map(|p| p.files);
-            let gone: Vec<&String> = mounts
-                .open_files()
-                .iter()
-                .filter(|f| in_image.as_ref().is_none_or(|i| i.contains(f)))
-                .filter(|f| fs::symlink_metadata(f).is_err())
-                .collect();
+            let gone: Vec<&String> = used.iter().filter(|f| absent.contains(f)).collect();
             if !gone.is_empty() {
                 return Err(error(
                     HelperErrorCode::InvalidRequest,
@@ -1478,9 +1658,21 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         record.restores += 1;
         record.unit = restore_unit_name(job, record.restores);
         record.phase = RecordPhase::Checkpointed;
+        record.restoring = true;
         if let Err(e) = files.write_record(&record) {
             return fail(self, format!("writing the job record: {e}"));
         }
+        // From here on a failure also clears the record's `restoring` flag
+        // (an interrupted restore is reported by `Self::recover`).
+        let mut cleared = record.clone();
+        cleared.restoring = false;
+        let fail = |this: &Self, reason: String| {
+            if let Err(e) = files.write_record(&cleared) {
+                eprintln!("puzuz-helper: updating the record of job {}: {e}", job.0);
+            }
+            this.table().remove(&job);
+            RestoreOutcome::failed(reason)
+        };
         let unit = record.unit.clone();
         let _ = fs::remove_file(dir.restore_pidfile());
         // Restore in the mode the image was dumped in, even if the
@@ -1545,7 +1737,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 // Abandoned by a stopping helper before systemd started the
                 // unit: nothing ran and the image is untouched. Not a
                 // failure of the restore; the daemon queues the job again.
-                self.table().remove(&job);
+                let _ = fail(self, String::new());
                 return RestoreOutcome::Failed {
                     reason: e.to_string(),
                     code: Some(HelperErrorCode::ShuttingDown),
@@ -1608,6 +1800,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
 
         record.phase = RecordPhase::Live;
         record.unit_kind = UnitKind::Restored;
+        record.restoring = false;
         if let Err(e) = files.write_record(&record) {
             eprintln!("puzuz-helper: recording restore of job {}: {e}", job.0);
         }
@@ -1764,6 +1957,10 @@ pub enum DumpError {
     /// The dump was attempted and failed (CRIU rolled back). The reason
     /// names the preserved CRIU log, if any.
     Failed(String),
+    /// The dump succeeded (the job's processes are gone), but the
+    /// checkpoint could not be finalized; the image is kept (see
+    /// [`finish_dump`]).
+    Unfinalized(String),
 }
 
 /// What [`precheck_dump`] learned, for the dump that follows.
@@ -1850,16 +2047,41 @@ pub fn precheck_dump<H: HostProbe + ?Sized>(
         .map_err(|e| format!("reading the job's open files: {e}"))?;
     if !hazards.bound_sockets.is_empty() {
         return Err(format!(
-            "the job has Unix sockets bound to {:?} on the host's filesystems; a restore would \
-             make CRIU create, unlink and chown those paths as root, so such a job cannot be \
-             checkpointed (bind sockets below /tmp, which is the job's own)",
+            "the job has Unix sockets bound to {:?} on the host's filesystems (or to relative \
+             names, which lead there too); a restore would make CRIU create, unlink and chown \
+             those paths as root, so such a job cannot be checkpointed (bind sockets to an \
+             absolute path below /tmp, which is the job's own, or to an abstract name)",
             hazards.bound_sockets
         ));
     }
-    // Deleted files are saved in the image (see `dump_job`).
+    if !hazards.reuseport_sockets.is_empty() {
+        return Err(format!(
+            "the job has internet sockets with SO_REUSEPORT ({}); CRIU would restore them as \
+             root's, which lets them share the port with a root service and receive part of \
+             its connections, so such a job cannot be checkpointed (do not set SO_REUSEPORT, \
+             or run the job with --no-checkpoint)",
+            hazards.reuseport_sockets.join(", ")
+        ));
+    }
+    // Deleted files are saved in the image (see `dump_job`), and so are the
+    // contents of the job's own tmpfs mounts.
     let ghosts: u64 = hazards.deleted_files.iter().map(|(_, s)| s).sum();
+    let tmpfs = host
+        .private_tmpfs_bytes(init_pid, private)
+        .map_err(|e| format!("measuring the job's /tmp and /dev/shm: {e}"))?;
     let available = host.available_bytes(base).map_err(|e| e.to_string())?;
-    space::check_free_space(rss + ghosts, meta.vram_bytes, available).map_err(|e| e.to_string())?;
+    space::check_free_space(
+        rss.saturating_add(ghosts).saturating_add(tmpfs),
+        meta.vram_bytes,
+        available,
+    )
+    .map_err(|e| {
+        if tmpfs > 0 {
+            format!("{e} (including {tmpfs} bytes in the job's private tmpfs mounts {private:?})")
+        } else {
+            e.to_string()
+        }
+    })?;
     let groups = host
         .process_groups(&host_pids)
         .map_err(|e| format!("reading the job's credentials: {e}"))?;
@@ -1961,6 +2183,37 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     let dir = CheckpointDir::for_job(base, record.job.0);
     dir.prepare()
         .map_err(|e| DumpError::Refused(format!("preparing {}: {e}", dir.root().display())))?;
+    // What a restore needs besides CRIU's images, written before the dump:
+    // once it succeeded, the image is all that is left of the job, and it
+    // can always be finalized from these (see `finish_dump`).
+    let pre = || -> Result<(), String> {
+        let mut owner = record.clone();
+        owner.phase = RecordPhase::Checkpointed;
+        owner.dump_groups = groups;
+        owner.dumping = false;
+        owner.restoring = false;
+        let owner_json = serde_json::to_vec_pretty(&owner).map_err(|e| e.to_string())?;
+        write_atomic(&dir.root().join(OWNER_FILE), &owner_json).map_err(|e| e.to_string())?;
+        let saved = SavedMounts::Full {
+            mount_points: mounts,
+            external_sources: Vec::new(),
+            source_mounts: Vec::new(),
+            open_files,
+            held_files: hazards.held_files.clone(),
+        };
+        let mounts_json = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
+        write_atomic(&dir.root().join(MOUNTS_FILE), &mounts_json).map_err(|e| e.to_string())?;
+        // A draft without the size; `finalize` rewrites it.
+        let meta_json = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
+        write_atomic(&dir.meta_path(), &meta_json).map_err(|e| e.to_string())
+    };
+    if let Err(e) = pre() {
+        let _ = dir.remove();
+        return Err(DumpError::Refused(format!(
+            "writing the checkpoint's metadata to {}: {e}",
+            dir.root().display()
+        )));
+    }
     let target = DumpTarget {
         tree_root_pid: init_pid,
         images_dir: dir.images_dir(),
@@ -2014,32 +2267,109 @@ pub fn dump_job<H: HostProbe + ?Sized>(
         }
         return Err(DumpError::Failed(discard_failed_dump(base, &dir, reason)));
     }
-    let finish = || -> Result<CheckpointMeta, String> {
-        let mut owner = record.clone();
-        owner.phase = RecordPhase::Checkpointed;
-        owner.dump_groups = groups;
-        let owner_json = serde_json::to_vec_pretty(&owner).map_err(|e| e.to_string())?;
-        write_atomic(&dir.root().join(OWNER_FILE), &owner_json).map_err(|e| e.to_string())?;
-        let external_sources = fs::read_to_string(dir.dump_log())
-            .map(|log| probe::criu_external_mounts(&log))
-            .unwrap_or_default();
-        let saved = SavedMounts::Full {
-            mount_points: mounts,
-            source_mounts: host.source_mounts(&external_sources).unwrap_or_default(),
-            external_sources,
-            open_files,
-            held_files: {
-                // The job is gone now: its files no longer change.
-                let mut held = hazards.held_files;
-                crate::access::complete_held_files(&mut held);
-                held
-            },
-        };
-        let mounts_json = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
-        write_atomic(&dir.root().join(MOUNTS_FILE), &mounts_json).map_err(|e| e.to_string())?;
-        dir.finalize(meta).map_err(|e| e.to_string())
+    // The dump succeeded and the job's processes are gone: from here on the
+    // image is never deleted. Writing the rest of the metadata is retried;
+    // if it still fails, the image stays as an unfinalized dump that a
+    // restore or the helper's next start finalizes (see `finish_dump`).
+    let mut last = String::new();
+    for attempt in 0..FINALIZE_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(FINALIZE_RETRY_DELAY);
+        }
+        match finish_dump(host, &dir, Some(meta.clone())) {
+            Ok(meta) => return Ok(meta),
+            Err(e) => {
+                eprintln!(
+                    "puzuz-helper: finalizing the checkpoint of job {} (attempt {}): {e}",
+                    record.job.0,
+                    attempt + 1
+                );
+                last = e;
+            }
+        }
+    }
+    Err(DumpError::Unfinalized(unfinalized_reason(&dir, &last)))
+}
+
+/// How often [`dump_job`] tries to finalize a successful dump.
+const FINALIZE_ATTEMPTS: u32 = 3;
+const FINALIZE_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// The reason reported for a dump that succeeded but could not be finalized.
+fn unfinalized_reason(dir: &CheckpointDir, error: &str) -> String {
+    format!(
+        "the job was dumped (its processes are stopped), but finalizing the checkpoint failed: \
+         {error}; the image is kept in {} and is finalized before it is restored or when the \
+         helper starts again",
+        dir.root().display()
+    )
+}
+
+/// Finalize a dump that succeeded: the [`layout::DUMPED_MARKER`], the
+/// external mounts from CRIU's log and the attributes of the held files in
+/// [`MOUNTS_FILE`], then `meta.json` with the image's size and the
+/// `COMPLETE` marker. `meta` defaults to the draft `meta.json` written
+/// before the dump. Idempotent, so it also repairs a dump that a helper
+/// left unfinalized ([`CheckpointDir::is_unfinalized_dump`]); it never
+/// removes anything.
+pub fn finish_dump<H: HostProbe + ?Sized>(
+    host: &H,
+    dir: &CheckpointDir,
+    meta: Option<CheckpointMeta>,
+) -> Result<CheckpointMeta, String> {
+    if let DirStatus::Complete(meta) = dir.status() {
+        return Ok(*meta);
+    }
+    let meta = match meta {
+        Some(m) => m,
+        None => dir
+            .read_meta()
+            .map_err(|e| format!("reading the draft {}: {e}", layout::META_FILE))?,
     };
-    finish().map_err(|reason| DumpError::Failed(discard_failed_dump(base, &dir, reason)))
+    if !dir.dumped_marker_path().is_file() {
+        dir.mark_dumped()
+            .map_err(|e| format!("writing {}: {e}", layout::DUMPED_MARKER))?;
+    }
+    if !dir.root().join(OWNER_FILE).is_file() {
+        return Err(format!("{OWNER_FILE} is missing"));
+    }
+    let path = dir.root().join(MOUNTS_FILE);
+    let saved = match fs::read(&path) {
+        Ok(b) => serde_json::from_slice::<SavedMounts>(&b)
+            .map_err(|e| format!("reading {MOUNTS_FILE}: {e}"))?,
+        Err(e) => return Err(format!("reading {MOUNTS_FILE}: {e}")),
+    };
+    let saved = match saved {
+        SavedMounts::Full {
+            mount_points,
+            mut external_sources,
+            mut source_mounts,
+            open_files,
+            mut held_files,
+        } => {
+            if external_sources.is_empty() {
+                external_sources = fs::read_to_string(dir.dump_log())
+                    .map(|log| probe::criu_external_mounts(&log))
+                    .unwrap_or_default();
+            }
+            if source_mounts.is_empty() && !external_sources.is_empty() {
+                source_mounts = host.source_mounts(&external_sources).unwrap_or_default();
+            }
+            // The job is gone now: its files no longer change.
+            crate::access::complete_held_files(&mut held_files);
+            SavedMounts::Full {
+                mount_points,
+                external_sources,
+                source_mounts,
+                open_files,
+                held_files,
+            }
+        }
+        old @ SavedMounts::MountPoints(_) => old,
+    };
+    let mounts_json = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
+    write_atomic(&path, &mounts_json).map_err(|e| format!("writing {MOUNTS_FILE}: {e}"))?;
+    dir.finalize(meta).map_err(|e| e.to_string())
 }
 
 /// After a failed dump: keep CRIU's log for administrators under

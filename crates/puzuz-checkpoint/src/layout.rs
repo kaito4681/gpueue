@@ -6,7 +6,9 @@
 //!     dump.log       criu dump log
 //!     restore.log    criu restore log
 //!     restore.pid    host PID of the restored tree root (criu --pidfile)
-//!     meta.json      CheckpointMeta, written once the dump succeeded
+//!     meta.json      CheckpointMeta (a draft before the dump, final with
+//!                    the size once the dump succeeded)
+//!     DUMPED         written as soon as `criu dump` succeeded
 //!     COMPLETE       completion marker, written last
 //! <base>/failed-logs/
 //!     <job id>-<unix ms>.log   dump.log of a failed dump (newest kept)
@@ -14,8 +16,11 @@
 //!
 //! Both `meta.json` and `COMPLETE` are written via write-to-temp + fsync +
 //! rename + directory fsync, so a crash at any point leaves either a complete
-//! directory or one without the marker (which is treated as incomplete and
-//! cleaned up on start).
+//! directory or one without the marker, which is incomplete. An incomplete
+//! directory whose dump succeeded ([`CheckpointDir::is_unfinalized_dump`])
+//! holds the only copy of the job's state (its processes are gone) and is
+//! finalized again rather than removed; any other incomplete directory is
+//! cleaned up on start.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -34,6 +39,11 @@ pub const RESTORE_LOG: &str = "restore.log";
 pub const RESTORE_PIDFILE: &str = "restore.pid";
 /// File CRIU always writes into a successful image set.
 pub const CRIU_INVENTORY: &str = "inventory.img";
+/// Marker written right after `criu dump` succeeded (see
+/// [`CheckpointDir::is_unfinalized_dump`]).
+pub const DUMPED_MARKER: &str = "DUMPED";
+/// What CRIU logs (at `-v3` and above) when a dump succeeded.
+pub const CRIU_DUMP_SUCCESS: &str = "Dumping finished successfully";
 
 /// Directory under the checkpoint base that keeps the CRIU logs of failed
 /// dumps (the checkpoint directory itself is removed).
@@ -191,6 +201,11 @@ pub enum DirStatus {
 pub enum LayoutError {
     #[error("checkpoint directory {0} already holds a complete checkpoint")]
     AlreadyComplete(PathBuf),
+    #[error(
+        "checkpoint directory {0} holds a successful dump that is not finalized yet; \
+         restore or delete it first"
+    )]
+    Unfinalized(PathBuf),
     #[error("meta.json job id {found} does not match directory job id {expected}")]
     JobIdMismatch { expected: u64, found: u64 },
     #[error("invalid meta.json: {0}")]
@@ -239,12 +254,46 @@ impl CheckpointDir {
     pub fn restore_pidfile(&self) -> PathBuf {
         self.root.join(RESTORE_PIDFILE)
     }
+    pub fn dumped_marker_path(&self) -> PathBuf {
+        self.root.join(DUMPED_MARKER)
+    }
+
+    /// Record that `criu dump` succeeded (before anything else is written
+    /// after it).
+    pub fn mark_dumped(&self) -> io::Result<()> {
+        write_atomic(&self.dumped_marker_path(), b"criu dump succeeded\n")
+    }
+
+    /// Whether the directory holds a dump that succeeded but was not
+    /// finalized (no `COMPLETE` marker): the job's processes are gone, so
+    /// the image must be kept and finalized again. That is the case when
+    /// CRIU's `inventory.img` and the draft `meta.json` exist and either
+    /// the [`DUMPED_MARKER`] does (written right after CRIU exited
+    /// successfully) or CRIU's log says the dump finished successfully (a
+    /// helper that stopped before it wrote the marker).
+    pub fn is_unfinalized_dump(&self) -> bool {
+        if !matches!(self.status(), DirStatus::Incomplete(_)) {
+            return false;
+        }
+        if !self.images_dir().join(CRIU_INVENTORY).is_file()
+            || !self.read_meta().is_ok_and(|m| m.job_id == self.job_id)
+        {
+            return false;
+        }
+        self.dumped_marker_path().is_file()
+            || fs::read_to_string(self.dump_log()).is_ok_and(|l| l.contains(CRIU_DUMP_SUCCESS))
+    }
 
     /// Create a fresh, empty directory (mode 0700) for a new dump. Refuses to
-    /// touch a complete checkpoint; anything incomplete is wiped first.
+    /// touch a complete checkpoint or an unfinalized successful dump
+    /// ([`Self::is_unfinalized_dump`]); anything else incomplete is wiped
+    /// first.
     pub fn prepare(&self) -> Result<(), LayoutError> {
         match self.status() {
             DirStatus::Complete(_) => return Err(LayoutError::AlreadyComplete(self.root.clone())),
+            DirStatus::Incomplete(_) if self.is_unfinalized_dump() => {
+                return Err(LayoutError::Unfinalized(self.root.clone()));
+            }
             DirStatus::Incomplete(_) => fs::remove_dir_all(&self.root)?,
             DirStatus::Missing => {}
         }
@@ -646,6 +695,39 @@ mod tests {
 
         fake_dump(&d);
         assert!(matches!(d.status(), DirStatus::Complete(_)));
+    }
+
+    #[test]
+    fn unfinalized_dumps_are_recognized_and_kept() {
+        let tmp = TempDir::new();
+        let d = CheckpointDir::for_job(tmp.path(), 4);
+        d.prepare().unwrap();
+        // A draft meta and CRIU's images, but no sign the dump succeeded:
+        // an ordinary incomplete directory.
+        fs::write(d.meta_path(), serde_json::to_vec(&meta(4)).unwrap()).unwrap();
+        fake_dump(&d);
+        assert!(!d.is_unfinalized_dump());
+        // CRIU says it succeeded (a helper that stopped before the marker).
+        fs::write(
+            d.dump_log(),
+            "(00.1) Writing stats\n(00.2) Dumping finished successfully\n",
+        )
+        .unwrap();
+        assert!(d.is_unfinalized_dump());
+        assert!(matches!(d.prepare(), Err(LayoutError::Unfinalized(_))));
+        // The marker alone is enough too.
+        fs::write(d.dump_log(), "log").unwrap();
+        assert!(!d.is_unfinalized_dump());
+        d.mark_dumped().unwrap();
+        assert!(d.is_unfinalized_dump());
+        // Without CRIU's inventory it is not a usable image.
+        fs::remove_file(d.images_dir().join(CRIU_INVENTORY)).unwrap();
+        assert!(!d.is_unfinalized_dump());
+        fake_dump(&d);
+        // Once finalized it is complete, no longer "unfinalized".
+        d.finalize(meta(4)).unwrap();
+        assert!(matches!(d.status(), DirStatus::Complete(_)));
+        assert!(!d.is_unfinalized_dump());
     }
 
     #[test]

@@ -71,8 +71,14 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    uid, gid and groups with `no_new_privs`, opens the log
    (`/var/lib/puzuz/logs/<uid>/<id>.log`) and the working directory as the owner, and runs the
    command through `sh -c`. The environment is the client's, plus `CUDA_VISIBLE_DEVICES`,
-   `CUDA_DEVICE_ORDER=PCI_BUS_ID` and the fork guard in `LD_PRELOAD`.
-6. **Checkpoint.** The helper checks free space and the mounts. If a check fails, it refuses the
+   `CUDA_DEVICE_ORDER=PCI_BUS_ID` and the fork guard in `LD_PRELOAD`. Signals for the job (TERM,
+   INT, HUP, QUIT, USR1, USR2, TSTP, ALRM, WINCH and the other non-fault signals) go to the
+   unit's main process, the outer shim (or, after a restore, the init), and are forwarded to the
+   job's process group; STOP, CONT and KILL go to every process of the unit. The helper refuses
+   any other signal, which would reach the root shim instead of the job.
+6. **Checkpoint.** The helper checks free space (for RSS and VRAM, deleted files saved in the
+   image and the contents of the job's `/tmp` and `/dev/shm`), the mounts and the job's sockets.
+   If a check fails, it refuses the
    dump before touching the job, which keeps running, and the `checkpoint` request fails with the
    reason (a refusal found only when the dump is due is reported with the outcome instead, and the
    daemon warns the owner). In manual mode it then runs
@@ -80,8 +86,14 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    `criu dump` of the namespace's init with `--tcp-close` and the image directory under
    `/var/lib/puzuz/checkpoints/<id>/`. In plugin mode it runs only `criu dump`, with CRIU's
    default plugin directory, and CRIU's `cuda_plugin.so` calls cuda-checkpoint (in plugin mode a
-   CUDA job is refused when the plugin is missing). It writes `meta.json` (including the mode)
-   and the `COMPLETE` marker last. A successful dump stops the process. If the dump fails, CRIU
+   CUDA job is refused when the plugin is missing). Before the dump it writes what a restore needs
+   besides CRIU's images (the owner record, the job's mounts and files, a draft `meta.json`);
+   right after a successful dump a `DUMPED` marker, then the external mounts from CRIU's log,
+   the final `meta.json` (including the mode) and the `COMPLETE` marker last. A successful dump
+   stops the process, so from then on the image is never deleted: if finishing it fails, the
+   helper retries, keeps the image and reports the checkpoint as not finalized (the daemon counts
+   the job as checkpointed); it finalizes the image before restoring it or when it starts again,
+   also after a crash between the dump and the marker. If the dump fails, CRIU
    leaves the process running and the daemon then terminates it. The helper moves CRIU's
    `dump.log` to `/var/lib/puzuz/checkpoints/failed-logs/` and removes the image directory.
    A **paused** job is resumed (SIGCONT) before the dump, because cuda-checkpoint hangs on a
@@ -89,7 +101,10 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    pauses it again (SIGSTOP) as soon as it is restored, or when the dump is refused. The job
    therefore runs for a moment during the dump and right after the restore. `pause` is refused
    while a dump is in progress.
-7. **Restore.** The helper checks the GPU model, driver, free VRAM and mounts: the paths CRIU
+7. **Restore.** The helper claims the job (a delete of its checkpoint is refused from then on)
+   and checks, off its request loop and with every file system lookup in a child process with a
+   deadline (so that an NFS server that is down cannot hold it up), the GPU model, driver, free
+   VRAM and mounts: the paths CRIU
    binds must exist, the filesystems they were on at the dump (recorded in `helper-mounts.json`)
    must be mounted at the same place with the same type (automount points are triggered), and
    the files and working directories the job had open must exist. It starts a
@@ -111,7 +126,11 @@ hold a root file opened with the dump-time mode. The helper therefore:
 
 - **at the dump** refuses a job with Unix sockets bound on the host's filesystems (CRIU binds,
   unlinks and chowns those paths as root on restore; sockets below the job's own `/tmp` are
-  fine), saves deleted files on the host's filesystems in the image instead of linking them
+  fine, and a socket bound to a relative name counts as bound on the host, since `/proc` does
+  not tell in which directory), refuses a job with internet sockets that have `SO_REUSEPORT`
+  (CRIU creates sockets as root before it restores the job's credentials, so the restored socket
+  would be root's and could join the `SO_REUSEPORT` group of a root service on the same port;
+  confirmed with CRIU 4.2), saves deleted files on the host's filesystems in the image instead of linking them
   back with `--link-remap` (which CRIU does as root, by path, while the dump runs), and records
   the groups the job runs with;
 - **before the restore** refuses it if the owner left one of those groups, if the image has a
@@ -150,7 +169,7 @@ moment can make such a transient file appear in another directory.
 
 After a crash of the helper during a restore, its next start kills whatever the restore unit
 runs (it was not checked, and in manual mode its CUDA state may not be restored) and reports the
-restore as failed; the image is kept.
+restore as failed, also when the unit is already gone; the image is kept.
 
 ## Other privilege boundaries
 
@@ -159,9 +178,15 @@ restore as failed; the image is kept.
   at a time (a new one replaces the old), at most a few connections waiting for their Hello, and
   bounds the queues and requests in flight of a session.
 - The shim works on the job's mount namespace as root before it drops privileges. It looks up the
-  owner's groups first (NSS loads libraries by path), and it moves mounts only through file
-  descriptors, reached once through directories that only root can change and without following
-  symlinks, so the owner cannot redirect a mount onto a system directory.
+  owner's groups first (NSS loads libraries by path), and it moves and detaches mounts (including
+  the volatile ones below `/run` and `/media`) only through file descriptors, reached once
+  through directories that only root can change and without following symlinks, so the owner
+  cannot redirect a mount operation onto a system directory. A mount below a directory that
+  someone else can change is left alone.
+- At start-up the helper looks up programs given by name (`criu`, `cuda-checkpoint`,
+  `nvidia-smi`) once in its `PATH`, requires the file found, like a program given by an
+  absolute path, to belong to root and to be reached only through directories that only root can
+  change, and uses that absolute path from then on.
 - At start-up the helper refuses directories it writes to or loads code from (including
   `<data_dir>/criu-no-plugins`, passed to `criu -L`, and the fork guard's `<data_dir>/lib`) unless
   they and their parents belong to root.

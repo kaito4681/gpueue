@@ -7,8 +7,8 @@
 //!    triggers the host's automount points, unshares a PID and a mount
 //!    namespace, starts
 //!    `puzuz-helper shim-init <job dir>` — PID 1 of the new namespace —
-//!    forwards SIGTERM/SIGINT/SIGHUP/SIGQUIT/SIGUSR1/SIGUSR2 to it, waits
-//!    for it and writes `init-status`.
+//!    forwards the signals of [`FORWARDED`] (SIGTERM, SIGINT, SIGTSTP,
+//!    SIGALRM, ...) to it, waits for it and writes `init-status`.
 //! 2. Init (`shim-init`), still root:
 //!    - becomes a session leader inside the namespace (CRIU refuses a
 //!      session leader outside it),
@@ -28,7 +28,7 @@
 //!    - drops privileges: supplementary groups → gid → bounding set → uid →
 //!      `no_new_privs`,
 //!    - opens the log and enters the cwd with the owner's permissions only,
-//!      starts the job in its own process group, forwards termination
+//!      starts the job in its own process group, forwards the same
 //!      signals to that group, reaps every child, and when the job exits
 //!      writes `exit-status`, kills what is left in the namespace and exits
 //!      with the job's status (128 + signal for a signal).
@@ -64,15 +64,42 @@ pub use crate::mounts::{path_under, unescape_octal};
 /// Exit code of the shim when it could not start the job.
 pub const SHIM_FAILURE: i32 = 125;
 
-/// Signals forwarded towards the job.
-const FORWARDED: [Signal; 6] = [
-    Signal::SIGTERM,
-    Signal::SIGINT,
+/// Signals the outer shim and the namespace init forward towards the job.
+///
+/// Every signal the helper accepts for a job is either here or sent by
+/// systemd to every process of the unit (STOP, CONT, KILL; see
+/// [`crate::launcher::systemd::signal_target`]); the helper refuses the
+/// rest ([`is_forwardable`]). A signal missing here would hit the root
+/// outer shim itself (TSTP would stop it, ALRM end it and with it the
+/// job's unit), and a namespace init without a handler drops it.
+/// Synchronous fault signals (SEGV, BUS, ...) and the real-time signals
+/// are not forwarded.
+pub const FORWARDED: [Signal; 19] = [
     Signal::SIGHUP,
+    Signal::SIGINT,
     Signal::SIGQUIT,
+    Signal::SIGABRT,
     Signal::SIGUSR1,
     Signal::SIGUSR2,
+    Signal::SIGPIPE,
+    Signal::SIGALRM,
+    Signal::SIGTERM,
+    Signal::SIGTSTP,
+    Signal::SIGTTIN,
+    Signal::SIGTTOU,
+    Signal::SIGURG,
+    Signal::SIGXCPU,
+    Signal::SIGXFSZ,
+    Signal::SIGVTALRM,
+    Signal::SIGPROF,
+    Signal::SIGWINCH,
+    Signal::SIGPWR,
 ];
+
+/// Whether the shim forwards `sig` to the job (see [`FORWARDED`]).
+pub fn is_forwardable(sig: i32) -> bool {
+    FORWARDED.iter().any(|s| *s as i32 == sig)
+}
 
 #[derive(Debug)]
 struct Failure {
@@ -721,6 +748,55 @@ fn flatten_automounts() -> Result<(), String> {
     Ok(())
 }
 
+/// Detach the mounts that `plan` prunes (volatile ones such as `/run/*`
+/// and `/media/*`), deepest first.
+///
+/// Like [`remove_hidden_mounts`], by descriptor only (see [`mountfd`]):
+/// mount points such as `/run/user/<uid>/doc` lie below directories that
+/// their owner can change, and a path resolved again by `umount2` could be
+/// redirected (`UMOUNT_NOFOLLOW` only covers the last component). Each
+/// mount is reached once through directories only root controls and
+/// detached only if it is the mount mountinfo listed. One below a
+/// directory that someone else controls is left alone, but it goes with
+/// its parent mount when that is pruned too (detaching is recursive).
+fn prune_mounts(plan: &MountPlan) -> Result<(), String> {
+    let targets: Vec<(u64, String)> = read_mount_tree()?
+        .entries()
+        .iter()
+        .filter(|m| plan.prunes(&m.mount_point))
+        .map(|m| (m.id, m.mount_point.clone()))
+        .collect();
+    if targets.is_empty() {
+        return Ok(());
+    }
+    // Mountinfo lists parents (and the lower of stacked mounts) first. A
+    // mount already gone with its parent no longer resolves to its id.
+    for (id, path) in targets.iter().rev() {
+        let Ok((parent, name)) = mountfd::open_parent(path) else {
+            continue;
+        };
+        if let Ok(fd) = mountfd::open_at(&parent, &name)
+            && mountfd::mnt_id(&fd) == Ok(*id)
+            && let Err(e) = mountfd::detach(&fd)
+        {
+            eprintln!("puzuz shim: detaching {path}: {e}");
+        }
+    }
+    let now = read_mount_tree()?;
+    let left: Vec<&str> = targets
+        .iter()
+        .filter(|(id, _)| now.get(*id).is_some())
+        .map(|(_, p)| p.as_str())
+        .collect();
+    if !left.is_empty() {
+        eprintln!(
+            "puzuz shim: left the volatile mounts {left:?} in place (below directories that \
+             someone other than root can change); the job may not be restorable after a reboot"
+        );
+    }
+    Ok(())
+}
+
 fn setup_mounts(plan: &MountPlan) -> Result<(), String> {
     // From here on the namespace is fixed: later host mounts do not show
     // up, so the job's view is the one that is dumped.
@@ -744,12 +820,7 @@ fn setup_mounts(plan: &MountPlan) -> Result<(), String> {
     )
     .map_err(|e| format!("mounting /proc: {e}"))?;
     remove_hidden_mounts()?;
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
-        .map_err(|e| format!("reading mountinfo: {e}"))?;
-    // Deepest first; mounts already gone with a parent fail harmlessly.
-    for m in mounts_to_prune(&mountinfo, plan).iter().rev() {
-        let _ = umount2(m.as_str(), MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW);
-    }
+    prune_mounts(plan)?;
     flatten_automounts()?;
     for t in &plan.tmpfs {
         mount(
