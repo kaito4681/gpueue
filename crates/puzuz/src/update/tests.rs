@@ -50,12 +50,13 @@ fn release_json(tag: &str) -> String {
     .to_string()
 }
 
-/// A root-run system where `service install` installed puzuz into /usr/local/bin, the daemon
-/// runs this version, and the fake API's latest release is v9.0.0.
+/// A root-run system where `service install` installed puzuz and puzuz-helper into
+/// /usr/local/bin, the daemon runs this version, and the fake API's latest release is v9.0.0.
 fn system() -> FakeSystem {
     let mut sys = FakeSystem::new();
     sys.exe = PathBuf::from("/usr/local/bin/puzuz");
     sys.write_exe("/usr/local/bin/puzuz", "old puzuz");
+    sys.write_exe("/usr/local/bin/puzuz-helper", "old helper");
     sys.write(
         "/etc/systemd/system/puzuz.service",
         &format!("{MARKER}\n[Service]\nExecStart=/usr/local/bin/puzuz daemon\n"),
@@ -792,6 +793,117 @@ fn installed_binaries_with_failed_checks_are_a_warning() {
         "{out}"
     );
     assert!(out.contains("puzuz is now 9.0.0"), "{out}");
+}
+
+/// Copies the release's `names` into /usr/local/bin, as an interrupted `service install` may
+/// have.
+fn install_from_release(sys: &FakeSystem, names: &[&str]) {
+    let release = tempfile::tempdir().unwrap();
+    let dir = extract(TARBALL, release.path(), NAME).unwrap();
+    for name in names {
+        std::fs::copy(
+            dir.join(name),
+            sys.path(&Path::new("/usr/local/bin").join(name)),
+        )
+        .unwrap();
+    }
+}
+
+fn run_as(sys: &FakeSystem, current: &str, options: &UpdateOptions) -> Result<String> {
+    let mut out = Vec::new();
+    update_from(sys, options, &Version::parse(current).unwrap(), &mut out)?;
+    Ok(String::from_utf8(out).unwrap())
+}
+
+#[test]
+fn a_partly_replaced_pair_is_reported() {
+    let sys = system();
+    // `service install` replaced puzuz, then failed before the helper.
+    install_from_release(&sys, &["puzuz"]);
+    sys.respond(
+        "puzuz service install",
+        CmdOutput::failed("", "error: writing /usr/local/bin/puzuz-helper: EIO\n"),
+    );
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(
+        err.contains("after replacing only puzuz in /usr/local/bin: puzuz-helper is not the one of puzuz 9.0.0"),
+        "{err}"
+    );
+    assert!(
+        err.contains("Run `sudo /usr/local/bin/puzuz update` again"),
+        "{err}"
+    );
+    assert!(!err.contains("were not replaced"), "{err}");
+    assert!(sys.sleeps.borrow().is_empty(), "{:?}", sys.sleeps.borrow());
+}
+
+#[test]
+fn update_reinstalls_a_release_whose_helper_is_older() {
+    // The release's puzuz runs next to the helper of 8.0.0.
+    let sys = system();
+    install_from_release(&sys, &["puzuz"]);
+    sys.respond(
+        "puzuz-helper --version",
+        CmdOutput::ok("puzuz-helper 8.0.0\n"),
+    );
+    let out = run_as(&sys, "9.0.0", &opts(false, None)).unwrap();
+    assert!(
+        out.contains(
+            "puzuz 9.0.0 is up to date, but /usr/local/bin/puzuz-helper is version 8.0.0; \
+             reinstalling puzuz 9.0.0."
+        ),
+        "{out}"
+    );
+    assert!(installed(&sys), "{:?}", sys.commands());
+    assert!(out.contains("puzuz is now 9.0.0."), "{out}");
+
+    // A missing helper is reinstalled too.
+    let sys = system();
+    std::fs::remove_file(sys.path(Path::new("/usr/local/bin/puzuz-helper"))).unwrap();
+    let out = run_as(&sys, "9.0.0", &opts(false, None)).unwrap();
+    assert!(
+        out.contains("/usr/local/bin/puzuz-helper is missing; reinstalling"),
+        "{out}"
+    );
+    assert!(installed(&sys));
+
+    // The question says what happens.
+    let mut sys = system();
+    sys.respond(
+        "puzuz-helper --version",
+        CmdOutput::ok("puzuz-helper 8.0.0\n"),
+    );
+    sys.confirm_answer = false;
+    let options = UpdateOptions {
+        yes: false,
+        ..opts(false, None)
+    };
+    run_as(&sys, "9.0.0", &options).unwrap_err();
+    assert!(
+        sys.prompts.borrow()[0].starts_with("Reinstall puzuz 9.0.0?"),
+        "{:?}",
+        sys.prompts.borrow()
+    );
+    sys.euid = 1000;
+    // Without root it only says so.
+    let out = run_as(&sys, "9.0.0", &opts(false, None)).unwrap();
+    assert!(
+        out.contains("is version 8.0.0; run `sudo puzuz update` to reinstall puzuz 9.0.0"),
+        "{out}"
+    );
+    assert!(!installed(&sys));
+}
+
+#[test]
+fn a_matching_helper_is_up_to_date() {
+    let sys = system();
+    sys.respond(
+        "puzuz-helper --version",
+        CmdOutput::ok("puzuz-helper 9.0.0\n"),
+    );
+    let out = run_as(&sys, "9.0.0", &opts(false, None)).unwrap();
+    assert_eq!(out, "puzuz 9.0.0 is up to date.\n");
+    assert!(!installed(&sys));
 }
 
 #[test]

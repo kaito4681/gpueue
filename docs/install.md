@@ -1634,8 +1634,9 @@ rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or
    before anything is downloaded, a missing one is written by the install) and
    that it runs as the installed binary (the directory in `puzuz.service`'s `ExecStart=`),
 2. looks up the latest release (or `--version`) and compares it with its own version. Nothing
-   happens when it is up to date. An older version is installed only when asked for with
-   `--version`,
+   happens when it is up to date, unless the installed `puzuz-helper` is missing or reports
+   another version (an interrupted earlier update): then the release is installed again to
+   repair the pair. An older version is installed only when asked for with `--version`,
 3. asks for confirmation (`-y/--yes` skips it),
 4. downloads the tarball, `.sha256` and `.minisig` into `/var/lib/puzuz/update` (root, 0700),
    checks the minisign signature with the release key built into `puzuz`, and the checksum,
@@ -1645,16 +1646,18 @@ rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or
 6. runs the new `puzuz service install` for the installed directory, removes the Nix GC root of
    a Nix-built installation (the release's binaries do not need the store), waits until the
    daemon runs the new version and is connected to the helper, and deletes the download. If
-   `service install` fails, `puzuz update` looks at the installed binaries: if they are not the
-   release's, it stops with that error; if they are (only the final checks failed), it warns and
-   goes on.
+   `service install` fails, `puzuz update` looks at each installed binary: if neither is the
+   release's, it stops with that error; if only one is, it stops and says to run it again
+   (which repairs the pair); if both are (only the final checks failed), it warns and goes on.
 
 `install.sh` (run again, optionally with `--version`) works too and does the same; it checks the
 signature with the `minisign` in `PATH`, or downloads a pinned one (see
 [Running the installer](#running-the-installer)).
 
 `service install` (and so both ways above) replaces the binaries and units and restarts both
-services if anything changed. The configuration file is kept.
+services if anything changed. It writes both binaries first and then puts them in place, the
+helper first; if one cannot be put in place, the other is restored, so a failure (a full disk,
+for example) never leaves a new `puzuz` next to an old `puzuz-helper`. The configuration file is kept.
 
 - **Running jobs are not affected.** They run in their own systemd units
   (`puzuz-job-<id>.service`, or `puzuz-job-<id>-r<n>.service` after a restore). A new daemon picks

@@ -1498,6 +1498,154 @@ fn install_does_not_follow_a_planted_temporary_file() {
     assert!(!sys.exists("/usr/local/bin/.puzuz-helper.puzuz-install"));
 }
 
+/// A build directory with new binaries and an installation of old ones in /usr/local/bin.
+fn old_installation() -> (FakeSystem, InstallOptions) {
+    let sys = build_dir_system();
+    sys.write_exe("/usr/local/bin/puzuz", "old puzuz");
+    sys.write_exe("/usr/local/bin/puzuz-helper", "old helper");
+    let options = InstallOptions {
+        bin_dir: Some(PathBuf::from("/usr/local/bin")),
+        ..opts()
+    };
+    (sys, options)
+}
+
+/// No temporary or backup files are left in /usr/local/bin.
+fn assert_no_leftovers(sys: &FakeSystem) {
+    let left: Vec<String> = std::fs::read_dir(sys.path(Path::new("/usr/local/bin")))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with('.') && name != ".puzuz-helper.puzuz-install")
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_failed_helper_write_leaves_both_old_binaries() {
+    let (sys, options) = old_installation();
+    // Writing the helper's temporary file fails (as on ENOSPC or EIO): a non-empty directory
+    // is in its place, which cannot be removed like a file, even by root.
+    sys.write(
+        "/usr/local/bin/.puzuz-helper.puzuz-install/blocker",
+        "not a file",
+    );
+    let err = run_install(&sys, &options).unwrap_err();
+    assert!(err.contains("writing /usr/local/bin/puzuz-helper"), "{err}");
+    assert!(
+        err.contains("the binaries in /usr/local/bin were not changed"),
+        "{err}"
+    );
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "old puzuz");
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "old helper"
+    );
+    assert!(!sys.exists("/usr/local/bin/.puzuz.puzuz-install"));
+    assert_no_leftovers(&sys);
+    assert!(!sys.ran("systemctl daemon-reload"), "{:?}", sys.commands());
+
+    // Once the obstacle is gone, both are replaced.
+    std::fs::remove_dir_all(sys.path(Path::new("/usr/local/bin/.puzuz-helper.puzuz-install")))
+        .unwrap();
+    let out = run_install(&sys, &options).unwrap();
+    assert!(out.contains("installed /usr/local/bin/puzuz\n"), "{out}");
+    assert!(
+        out.contains("installed /usr/local/bin/puzuz-helper\n"),
+        "{out}"
+    );
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "new puzuz");
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "new helper"
+    );
+    assert_no_leftovers(&sys);
+}
+
+#[test]
+fn a_failure_after_the_helper_was_replaced_restores_it() {
+    let (sys, options) = old_installation();
+    // The helper is put in place first; then puzuz cannot be (a non-empty directory took its
+    // place), so the helper is rolled back.
+    std::fs::remove_file(sys.path(Path::new("/usr/local/bin/puzuz"))).unwrap();
+    sys.write("/usr/local/bin/puzuz/blocker", "not a file");
+    let err = run_install(&sys, &options).unwrap_err();
+    assert!(err.contains("writing /usr/local/bin/puzuz:"), "{err}");
+    assert!(
+        err.contains("restored the previous /usr/local/bin/puzuz-helper"),
+        "{err}"
+    );
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "old helper"
+    );
+    assert!(sys.exists("/usr/local/bin/puzuz/blocker"));
+    assert!(!sys.exists("/usr/local/bin/.puzuz.puzuz-install"));
+    assert!(!sys.exists("/usr/local/bin/.puzuz-helper.puzuz-install"));
+    assert_no_leftovers(&sys);
+}
+
+/// Stages new contents for /usr/local/bin/puzuz-helper and /usr/local/bin/puzuz.
+fn stage_both(sys: &FakeSystem) -> Vec<Staged> {
+    ["puzuz-helper", "puzuz"]
+        .iter()
+        .map(|name| {
+            let path = Path::new("/usr/local/bin").join(name);
+            stage_file(sys, &path, format!("new {name}").as_bytes(), 0o755)
+                .unwrap()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// A rename that fails for the second file, as on EIO.
+fn rename_failing_for_puzuz(from: &Path, to: &Path) -> io::Result<()> {
+    if to.ends_with("bin/puzuz") {
+        return Err(io::Error::from_raw_os_error(nix::libc::EIO));
+    }
+    std::fs::rename(from, to)
+}
+
+#[test]
+fn a_failed_rename_rolls_back_the_binaries_already_replaced() {
+    let (sys, _) = old_installation();
+    let staged = stage_both(&sys);
+    let err = commit_staged_with(&sys, &staged, &rename_failing_for_puzuz).unwrap_err();
+    assert!(err.contains("writing /usr/local/bin/puzuz:"), "{err}");
+    assert!(
+        err.contains("restored the previous /usr/local/bin/puzuz-helper"),
+        "{err}"
+    );
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "old puzuz");
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "old helper"
+    );
+    assert_eq!(mode(&sys, "/usr/local/bin/puzuz-helper"), 0o755);
+    assert!(!sys.exists("/usr/local/bin/.puzuz-helper.puzuz-install"));
+    assert!(!sys.exists("/usr/local/bin/.puzuz.puzuz-install"));
+    assert_no_leftovers(&sys);
+
+    // A first install has nothing to restore: the new helper is removed again.
+    let sys = build_dir_system();
+    sys.mkdir("/usr/local/bin");
+    let staged = stage_both(&sys);
+    commit_staged_with(&sys, &staged, &rename_failing_for_puzuz).unwrap_err();
+    assert!(!sys.exists("/usr/local/bin/puzuz-helper"));
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    assert_no_leftovers(&sys);
+
+    // Without a failure both are replaced and the backups are gone.
+    let (sys, _) = old_installation();
+    let staged = stage_both(&sys);
+    commit_staged(&sys, &staged).unwrap();
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "new puzuz");
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "new puzuz-helper"
+    );
+    assert_no_leftovers(&sys);
+}
+
 /// Runs the install in a child process with umask 077 (the umask is process-wide, so it must
 /// not change under the other tests).
 #[test]

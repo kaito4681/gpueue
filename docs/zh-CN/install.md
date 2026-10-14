@@ -1489,8 +1489,9 @@ sudo puzuz update --version 0.2.0 --yes
 1. 检查 puzuz 是否由 `puzuz service install` 安装（而不是由软件包、Nix 或手工安装，且两个单元都
    属于它：以其他方式安装的 helper 单元会在下载任何内容之前被拒绝，缺失的 helper 单元由安装写入），
    以及它是否作为已安装的二进制文件运行（`puzuz.service` 的 `ExecStart=` 中的目录），
-2. 查找最新的发布版本（或 `--version` 指定的版本）并与自身版本比较。已是最新时什么也不做。
-   只有通过 `--version` 明确指定时才会安装较旧的版本，
+2. 查找最新的发布版本（或 `--version` 指定的版本）并与自身版本比较。已是最新时什么也不做，
+   除非已安装的 `puzuz-helper` 缺失或报告的是另一个版本（之前的更新被中断）：此时会重新安装该
+   发布版本以修复这对二进制文件。只有通过 `--version` 明确指定时才会安装较旧的版本，
 3. 请求确认（`-y/--yes` 跳过确认），
 4. 将 tarball、`.sha256` 和 `.minisig` 下载到 `/var/lib/puzuz/update`（root，0700），用 `puzuz`
    内置的发布密钥验证 minisign 签名，并校验校验和，
@@ -1498,14 +1499,16 @@ sudo puzuz update --version 0.2.0 --yes
    打开守护进程数据库的发布版本（模式变更之前的旧版本）会在任何更改之前被拒绝，
 6. 针对已安装的目录运行新的 `puzuz service install`，删除 Nix 构建安装的 Nix GC 根（发布版本的
    二进制文件不需要 store），等待守护进程运行新版本并连接到 helper，然后删除下载的文件。如果
-   `service install` 失败，`puzuz update` 会检查已安装的二进制文件：若它们不是该发布版本的文件，
-   就以该错误停止；若是（只有最后的检查失败），就发出警告并继续。
+   `service install` 失败，`puzuz update` 会逐个检查已安装的二进制文件：若两者都不是该发布版本的
+   文件，就以该错误停止；若只有一个是，就停止并提示再运行一次（再次运行会修复这对二进制文件）；
+   若两者都是（只有最后的检查失败），就发出警告并继续。
 
 `install.sh`（再次运行，可选 `--version`）同样可用，效果相同；它用 `PATH` 中的 `minisign` 验证签名，
 或者下载一个固定版本的 minisign（参见[运行安装程序](#running-the-installer)）。
 
 `service install`（因此上述两种方式都是）会替换二进制文件和单元，并在有任何变化时重启两个
-服务。配置文件会被保留。
+服务。它先写入两个二进制文件，再从 helper 开始依次放到位；如果其中一个无法放到位，另一个会被
+恢复，因此失败（例如磁盘已满）时绝不会留下新的 `puzuz` 与旧的 `puzuz-helper` 并存。配置文件会被保留。
 
 - **正在运行的作业不受影响。** 它们运行在各自的 systemd 单元中（`puzuz-job-<id>.service`，恢复
   后为 `puzuz-job-<id>-r<n>.service`）。新的守护进程从数据库中读取状态，新的 helper 会重新找到

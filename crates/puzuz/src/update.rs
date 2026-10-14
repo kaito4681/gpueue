@@ -560,9 +560,19 @@ fn service_install_bin_dir(detection: &Detection, repo: &str) -> Result<PathBuf>
 
 /// `puzuz update`. Without root it only checks (like `--check`).
 pub fn update(sys: &dyn System, options: &UpdateOptions, out: &mut dyn Write) -> Result<()> {
+    update_from(sys, options, &current_version(), out)
+}
+
+/// [`update`] run by puzuz `current` (tests pretend to be the release they serve).
+fn update_from(
+    sys: &dyn System,
+    options: &UpdateOptions,
+    current: &Version,
+    out: &mut dyn Write,
+) -> Result<()> {
     let config = doctor::load_config(sys).config;
     let wanted = options.version.as_deref().map(parse_version).transpose()?;
-    let current = current_version();
+    let current = current.clone();
     let method = install_method::detect(sys);
     let repo = release_repo(&config);
     // Installing needs an installation this command may change, run from its binary: refuse
@@ -579,9 +589,37 @@ pub fn update(sys: &dyn System, options: &UpdateOptions, out: &mut dyn Write) ->
     let release = client.release(wanted.as_ref(), API_TIMEOUT)?;
     let target = release.version()?;
 
+    // An interrupted `service install` of an older release may have left the release's puzuz
+    // next to an older puzuz-helper: reinstalling the release repairs that.
+    let mut repair = false;
     if target == current {
-        writeln!(out, "puzuz {current} is up to date.").ok();
-        return Ok(());
+        let installed_dir = bin_dir
+            .clone()
+            .or_else(|| service_install_bin_dir(&method, &repo).ok());
+        let mismatch = installed_dir.and_then(|dir| helper_mismatch(sys, &dir, &current));
+        match (mismatch, &bin_dir) {
+            (None, _) => {
+                writeln!(out, "puzuz {current} is up to date.").ok();
+                return Ok(());
+            }
+            (Some(mismatch), None) => {
+                writeln!(
+                    out,
+                    "puzuz {current} is up to date, but {mismatch}; run `sudo puzuz update` to \
+                     reinstall puzuz {current}."
+                )
+                .ok();
+                return Ok(());
+            }
+            (Some(mismatch), Some(_)) => {
+                writeln!(
+                    out,
+                    "puzuz {current} is up to date, but {mismatch}; reinstalling puzuz {current}."
+                )
+                .ok();
+                repair = true;
+            }
+        }
     }
     if wanted.is_none() && target < current {
         writeln!(
@@ -609,11 +647,13 @@ pub fn update(sys: &dyn System, options: &UpdateOptions, out: &mut dyn Write) ->
     };
 
     if !options.yes {
-        let verb = if downgrade { "Downgrade" } else { "Update" };
-        let prompt = format!(
-            "{verb} puzuz from {current} to {target}? Running jobs keep running; the services \
-             restart."
-        );
+        let question = if repair {
+            format!("Reinstall puzuz {target}?")
+        } else {
+            let verb = if downgrade { "Downgrade" } else { "Update" };
+            format!("{verb} puzuz from {current} to {target}?")
+        };
+        let prompt = format!("{question} Running jobs keep running; the services restart.");
         if !sys.confirm(&prompt) {
             return Err("aborted; nothing was changed".to_owned());
         }
@@ -627,6 +667,7 @@ pub fn update(sys: &dyn System, options: &UpdateOptions, out: &mut dyn Write) ->
             client: &client,
             config: &config,
             release: &release,
+            current: &current,
             target: &target,
             downgrade,
             bin_dir: &bin_dir,
@@ -684,6 +725,8 @@ struct InstallPlan<'a> {
     client: &'a Client<'a>,
     config: &'a Config,
     release: &'a Release,
+    /// The running (installed) puzuz.
+    current: &'a Version,
     target: &'a Version,
     downgrade: bool,
     bin_dir: &'a Path,
@@ -750,13 +793,30 @@ fn install_release(sys: &dyn System, plan: &InstallPlan<'_>, out: &mut dyn Write
         // `service install` also fails when it installed everything but its final doctor
         // report has a failure. Whether the units' binaries are now the release's tells the
         // two apart (also for releases that exit with 1 in both cases).
-        if !binaries_installed(sys, &plan.work.join(&name), plan.bin_dir) {
+        let release_dir = plan.work.join(&name);
+        let (replaced, kept): (Vec<&str>, Vec<&str>) = BINARIES
+            .into_iter()
+            .partition(|binary| binary_installed(sys, &release_dir, plan.bin_dir, binary));
+        if replaced.is_empty() {
             return Err(format!(
                 "`{} service install` failed (see above); the binaries in {} were not replaced \
                  (still puzuz {})",
                 new_puzuz.display(),
                 plan.bin_dir.display(),
-                current_version()
+                plan.current
+            ));
+        }
+        if !kept.is_empty() {
+            let installed = plan.bin_dir.join("puzuz");
+            return Err(format!(
+                "`{} service install` failed (see above) after replacing only {} in {}: {} is \
+                 not the one of puzuz {}. Run `sudo {} update` again to install both",
+                new_puzuz.display(),
+                replaced.join(" and "),
+                plan.bin_dir.display(),
+                kept.join(" and "),
+                plan.target,
+                installed.display()
             ));
         }
         writeln!(
@@ -777,17 +837,39 @@ fn install_release(sys: &dyn System, plan: &InstallPlan<'_>, out: &mut dyn Write
     Ok(())
 }
 
-/// Whether `puzuz` and `puzuz-helper` in `bin_dir` are the ones extracted to `release_dir`.
-fn binaries_installed(sys: &dyn System, release_dir: &Path, bin_dir: &Path) -> bool {
-    ["puzuz", "puzuz-helper"].iter().all(|name| {
-        match (
-            std::fs::read(sys.path(&release_dir.join(name))),
-            std::fs::read(sys.path(&bin_dir.join(name))),
-        ) {
-            (Ok(new), Ok(installed)) => new == installed,
-            _ => false,
-        }
-    })
+/// The binaries a release installs.
+const BINARIES: [&str; 2] = ["puzuz", "puzuz-helper"];
+
+/// Whether the binary `name` in `bin_dir` is the one extracted to `release_dir`.
+fn binary_installed(sys: &dyn System, release_dir: &Path, bin_dir: &Path, name: &str) -> bool {
+    match (
+        std::fs::read(sys.path(&release_dir.join(name))),
+        std::fs::read(sys.path(&bin_dir.join(name))),
+    ) {
+        (Ok(new), Ok(installed)) => new == installed,
+        _ => false,
+    }
+}
+
+/// Why the puzuz-helper in `bin_dir` is not the one of puzuz `current`, if it is not: it is
+/// missing, or `puzuz-helper --version` names another version. (An answer that cannot be
+/// parsed is not taken as a mismatch.)
+fn helper_mismatch(sys: &dyn System, bin_dir: &Path, current: &Version) -> Option<String> {
+    let helper = bin_dir.join("puzuz-helper");
+    if !sys.path(&helper).exists() {
+        return Some(format!("{} is missing", helper.display()));
+    }
+    let output = sys
+        .run(&helper.to_string_lossy(), &["--version"])
+        .ok()
+        .filter(|output| output.success)?;
+    // "puzuz-helper 0.2.0"
+    let version = output
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .and_then(|text| Version::parse(text).ok())?;
+    (version != *current).then(|| format!("{} is version {version}", helper.display()))
 }
 
 /// Asks the new binary what it is and which database schema it supports, and refuses a release
