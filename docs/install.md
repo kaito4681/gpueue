@@ -171,7 +171,8 @@ below.
 Each release has, for each target (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`),
 `puzuz-v<X>-<target>.tar.gz` with `.sha256` and `.minisig` files, the packages
 `puzuz_<X>_amd64.deb`, `puzuz_<X>_arm64.deb`, `puzuz-<X>-1.x86_64.rpm` and
-`puzuz-<X>-1.aarch64.rpm` with the same two files each, and `install.sh` with `install.sh.minisig`.
+`puzuz-<X>-1.aarch64.rpm` with the same two files each, `install.sh` with `install.sh.minisig`, and,
+when the `.rpm` files are GPG-signed, `RPM-GPG-KEY-puzuz` with `RPM-GPG-KEY-puzuz.minisig`.
 To check a tarball (or a package) yourself:
 
 ```sh
@@ -410,10 +411,13 @@ new enough, the 3.19 of RHEL/Rocky/Alma 9 is not, so checkpointing there needs a
 
 **Verifying.** Like every release asset, the `.rpm` has `.sha256` and `.minisig` files (see
 [Verifying a release by hand](#verifying-a-release-by-hand)). Releases built with the GPG key also
-sign the `.rpm` itself, and attach that key as `RPM-GPG-KEY-puzuz` (the APT repository's key):
+sign the `.rpm` itself, and attach that key as `RPM-GPG-KEY-puzuz` (the APT repository's key),
+minisign-signed like the other assets. Check the key file with the release key before importing it:
 
 ```sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz.minisig
+minisign -Vm RPM-GPG-KEY-puzuz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 gpg --show-keys RPM-GPG-KEY-puzuz                   # E53970325A397378537BC77620B6B72F9F5585C2
 sudo rpm --import RPM-GPG-KEY-puzuz
 rpm -K puzuz-0.1.0-1.x86_64.rpm                     # "digests signatures OK"

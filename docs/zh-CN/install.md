@@ -164,7 +164,8 @@ Alma Linux 上可以改用 [.rpm](#installing-the-fedorarhelrocky-package)，在
 每个发布版本针对每个目标（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`）都包含
 `puzuz-v<X>-<target>.tar.gz` 及其 `.sha256` 和 `.minisig` 文件；软件包 `puzuz_<X>_amd64.deb`、
 `puzuz_<X>_arm64.deb`、`puzuz-<X>-1.x86_64.rpm` 和 `puzuz-<X>-1.aarch64.rpm` 也各自带有这两种文件；
-另外还有 `install.sh` 及其 `install.sh.minisig`。要自己校验 tarball（或软件包）：
+另外还有 `install.sh` 及其 `install.sh.minisig`；`.rpm` 经过 GPG 签名的发布版本还带有 `RPM-GPG-KEY-puzuz`
+及其 `RPM-GPG-KEY-puzuz.minisig`。要自己校验 tarball（或软件包）：
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
@@ -381,10 +382,13 @@ Fedora 的 CRIU（4.2）足够新，RHEL/Rocky/Alma 9 的 3.19 则不够，因�
 
 **验证。** 与所有发布版本资源文件一样，`.rpm` 带有 `.sha256` 和 `.minisig` 文件（参见
 [手动验证发布版本](#verifying-a-release-by-hand)）。使用 GPG 密钥构建的发布版本还会对 `.rpm` 本身签名，
-并将该密钥作为 `RPM-GPG-KEY-puzuz` 附上（即 APT 仓库的密钥）：
+并将该密钥作为 `RPM-GPG-KEY-puzuz` 附上（即 APT 仓库的密钥）。该密钥文件与其他资源文件一样带有 minisign
+签名，导入前请先用发布密钥校验它：
 
 ```sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz.minisig
+minisign -Vm RPM-GPG-KEY-puzuz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 gpg --show-keys RPM-GPG-KEY-puzuz                   # E53970325A397378537BC77620B6B72F9F5585C2
 sudo rpm --import RPM-GPG-KEY-puzuz
 rpm -K puzuz-0.1.0-1.x86_64.rpm                     # "digests signatures OK"

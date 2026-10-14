@@ -190,7 +190,8 @@ Arch Linux では公開後に [AUR パッケージ](#arch-linux-aur) を使え�
 各リリースには、ターゲット（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`）ごとに
 `.sha256` と `.minisig` ファイル付きの `puzuz-v<X>-<target>.tar.gz`、同じ 2 つのファイルがそれぞれに付いた
 パッケージ `puzuz_<X>_amd64.deb`、`puzuz_<X>_arm64.deb`、`puzuz-<X>-1.x86_64.rpm`、
-`puzuz-<X>-1.aarch64.rpm`、そして `install.sh.minisig` 付きの `install.sh` があります。tarball（または
+`puzuz-<X>-1.aarch64.rpm`、`install.sh.minisig` 付きの `install.sh`、そして `.rpm` が GPG 署名されている
+リリースでは `RPM-GPG-KEY-puzuz.minisig` 付きの `RPM-GPG-KEY-puzuz` があります。tarball（または
 パッケージ）を自分で確認するには次のようにします。
 
 ```sh
@@ -429,10 +430,13 @@ CRIU が必要です（[CRIU](#criu) を参照）。ジョブの実行は CRIU �
 
 **検証。** 他のリリースアセットと同様に、`.rpm` にも `.sha256` と `.minisig` ファイルがあります
 （[リリースを手動で検証する](#verifying-a-release-by-hand) を参照）。GPG 鍵でビルドされたリリースでは
-`.rpm` 自体にも署名され、その鍵（APT リポジトリの鍵）が `RPM-GPG-KEY-puzuz` として添付されます。
+`.rpm` 自体にも署名され、その鍵（APT リポジトリの鍵）が `RPM-GPG-KEY-puzuz` として添付されます。この鍵ファイルも
+他のアセットと同様に minisign で署名されているので、インポートする前にリリース鍵で確認してください。
 
 ```sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz.minisig
+minisign -Vm RPM-GPG-KEY-puzuz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 gpg --show-keys RPM-GPG-KEY-puzuz                   # E53970325A397378537BC77620B6B72F9F5585C2
 sudo rpm --import RPM-GPG-KEY-puzuz
 rpm -K puzuz-0.1.0-1.x86_64.rpm                     # "digests signatures OK"
