@@ -743,7 +743,8 @@ sudo target/release/puzuz service install
 
 1. 重新安装或更新时，使用当前 `service install` 安装所在的目录；
 2. 否则，如果 `puzuz` 二进制文件所在目录是 `/usr/bin` 或 `/usr/local/bin`，则使用该目录
-   （就地使用，不复制任何文件）；
+   （就地使用，不复制任何文件；此时两个二进制文件以及其中符号链接解析经过的所有路径都必须
+   归 root 所有，且组和其他用户不可写）；
 3. 否则使用 `/usr/local/bin`，并将 `puzuz` 和 `puzuz-helper` 复制到那里（会给出提示）。这是
    管理员自行安装软件的常用位置：包管理器不会触碰它，而且它在 systemd 和所有用户的默认
    `PATH` 中。

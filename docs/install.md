@@ -799,7 +799,8 @@ sudo target/release/puzuz service install
 
 1. the directory of the current `service install` installation, when re-installing or updating,
 2. else the directory the `puzuz` binary is in, if that is `/usr/bin` or `/usr/local/bin`
-   (used in place, nothing is copied),
+   (used in place, nothing is copied; both binaries, and anything a symlink there resolves
+   through, must then be owned by root and not group- or world-writable),
 3. else `/usr/local/bin`, where `puzuz` and `puzuz-helper` are copied (it says so). That is the
    usual place for software the administrator installs: package managers leave it alone, and it
    is in systemd's and every user's default `PATH`.

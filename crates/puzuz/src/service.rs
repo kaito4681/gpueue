@@ -455,9 +455,19 @@ fn install_binaries(
             let target = bin_dir.join(name);
             // Used in place, also under another name of the same directory (/bin and /usr/bin
             // on merged /usr) — but not through a symlink or a file root does not own.
-            if sys.path(source) == sys.path(&target)
-                || (same_file(sys, source, &target) && root_owned_regular_file(sys, &target))
-            {
+            if sys.path(source) == sys.path(&target) {
+                // Run as root from where it is: nobody but root may be able to replace it (nor
+                // what a symlink there points to).
+                check_root_owned_chain(sys, &target).map_err(|err| {
+                    format!(
+                        "{} would be used in place and run as root, but {err}; make it a file \
+                         only root can change",
+                        target.display()
+                    )
+                })?;
+                continue;
+            }
+            if same_file(sys, source, &target) && root_owned_regular_file(sys, &target) {
                 continue;
             }
             let bytes = std::fs::read(sys.path(source))

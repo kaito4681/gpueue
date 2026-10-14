@@ -743,6 +743,60 @@ fn an_identical_binary_behind_a_symlink_is_replaced() {
 }
 
 #[test]
+fn binaries_used_in_place_must_be_root_owned_and_protected() {
+    // A group-writable helper in /usr/bin.
+    let sys = system();
+    let helper = sys.path(Path::new("/usr/bin/puzuz-helper"));
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(
+        err.contains("/usr/bin/puzuz-helper would be used in place and run as root"),
+        "{err}"
+    );
+    assert!(
+        err.contains("/usr/bin/puzuz-helper must be owned by root"),
+        "{err}"
+    );
+    assert!(!sys.exists("/etc/systemd/system/puzuz-helper.service"));
+    assert!(!sys.ran("systemctl daemon-reload"), "{:?}", sys.commands());
+
+    // A root-owned symlink into a directory others can write to.
+    let sys = system();
+    sys.write_exe("/home/u/bin/puzuz-helper", "helper binary");
+    std::fs::set_permissions(
+        sys.path(Path::new("/home/u")),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    std::fs::remove_file(sys.path(Path::new("/usr/bin/puzuz-helper"))).unwrap();
+    std::os::unix::fs::symlink(
+        sys.path(Path::new("/home/u/bin/puzuz-helper")),
+        sys.path(Path::new("/usr/bin/puzuz-helper")),
+    )
+    .unwrap();
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(
+        err.contains("/usr/bin/puzuz-helper would be used in place"),
+        "{err}"
+    );
+    assert!(
+        err.contains("/home/u (which /usr/bin/puzuz-helper resolves through) must be owned"),
+        "{err}"
+    );
+    assert!(!sys.exists("/etc/systemd/system/puzuz-helper.service"));
+    assert!(!sys.ran("systemctl daemon-reload"), "{:?}", sys.commands());
+
+    // Protected, it is used in place.
+    std::fs::set_permissions(
+        sys.path(Path::new("/home/u")),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    run_install(&sys, &opts()).unwrap();
+    assert!(receipt(&sys).copied.is_empty());
+}
+
+#[test]
 fn bin_dir_equal_to_the_binary_location_copies_nothing() {
     let sys = system();
     let options = InstallOptions {
