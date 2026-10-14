@@ -604,6 +604,39 @@ mod tests {
         );
     }
 
+    /// The shim's masks (empty tmpfs on /run/dbus and /run/systemd, with
+    /// single files and directories bound from the host's /run below the
+    /// latter) are the job's own and not FUSE or network mounts: never
+    /// dead, even though the helper's namespace lacks the tmpfs.
+    #[test]
+    fn ignores_the_shims_masks() {
+        let job = MountTree::parse(
+            "\
+100 99 8:1 / / rw - ext4 /dev/sda1 rw
+101 100 0:25 / /run rw - tmpfs tmpfs rw
+102 101 0:90 / /run/dbus rw - tmpfs tmpfs rw
+103 101 0:91 / /run/systemd rw - tmpfs tmpfs rw
+104 103 0:25 /systemd/journal/socket /run/systemd/journal/socket rw - tmpfs tmpfs rw
+105 103 0:25 /systemd/userdb /run/systemd/userdb rw - tmpfs tmpfs rw
+106 100 0:60 / /nfs rw - fuse.sshfs host:/export rw
+",
+        );
+        let helper = MountTree::parse(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:25 / /run rw - tmpfs tmpfs rw\n",
+        );
+        let remote = remote_mounts(&job, &helper);
+        assert_eq!(
+            remote
+                .iter()
+                .map(|m| m.mount_point.as_str())
+                .collect::<Vec<_>>(),
+            ["/nfs"]
+        );
+        let dead = dead_mounts(&job, &remote, &[None]);
+        assert_eq!(dead.dead.len(), 1);
+        assert!(dead.below.is_empty(), "{:?}", dead.below);
+    }
+
     #[test]
     fn finds_what_depends_on_a_dead_mount() {
         let job = MountTree::parse(JOB);
