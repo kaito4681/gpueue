@@ -987,6 +987,127 @@ s16_verify() {
     wait_state "$id" 'done/*'
 }
 
+# s20: a FUSE mount dies while jobs run (its sshfs is killed: the mount
+# stays on the host but does not answer; then it is unmounted, as sshfs
+# does when its connection drops, but the jobs' namespaces keep their
+# copies). Jobs that do not use it are still checkpointed, at once and at
+# the shutdown, and restored: the mount is left out of the image and comes
+# back as an empty, inaccessible directory while the filesystem is not
+# back, and as the host's mount once it is. A job whose working directory
+# is on it is refused with a reason naming the mount, and keeps running.
+RNFS=/rnfs
+mount_rnfs() {
+    local disk=/var/lib/puzuz-e2e-disk
+    mkdir -p "$RNFS"
+    sshfs -o allow_other,default_permissions,IdentityFile="$disk/ssh/id",StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,LogLevel=ERROR \
+        root@127.0.0.1:/srv/ext4/export "$RNFS" || fail "sshfs on $RNFS"
+}
+# cjob <cwd> <file>: a counter job of alice's with its cwd in <cwd> that
+# appends to <file>; prints the id.
+cjob() {
+    (cd "$1" && runuser -u alice -- puzuz --color never add -p -g free -- \
+        "exec 3>>$2; i=0; while :; do echo \$i >&3; i=\$((i+1)); sleep 0.2; done")
+}
+# live_pid <id>: host PID of the init of the job's namespace, restored or
+# not.
+active_unit() {
+    systemctl list-units --no-legend --plain --state=active "puzuz-job-$1.service" \
+        "puzuz-job-$1-r*.service" | awk 'NR == 1 {print $1}'
+}
+has_active_unit() { [ -n "$(active_unit "$1")" ]; }
+live_pid() {
+    local unit pid
+    wait_for 30 "an active unit of job $1" has_active_unit "$1"
+    unit=$(active_unit "$1")
+    pid=$(systemctl show -p MainPID --value "$unit")
+    case "$unit" in
+    *-r*) echo "$pid" ;;
+    *) pgrep -P "$pid" | head -n1 ;;
+    esac
+}
+# rnfs_in <id>: the filesystem type the job has on $RNFS.
+rnfs_in() {
+    awk -v mp="$RNFS" '$5 == mp {for (i = 7; i <= NF; i++) if ($i == "-") {print $(i + 1); exit}}' \
+        "/proc/$(live_pid "$1")/mountinfo"
+}
+rnfs_dead() { ! timeout 5 stat -f "$RNFS" >/dev/null 2>&1; }
+
+s20_prepare() {
+    local u s d n i err
+    need_mounts
+    if ! command -v sshfs >/dev/null || ! pgrep -x sshd >/dev/null; then
+        [ "${PUZUZ_E2E_REQUIRE_SSHFS:-}" != 1 ] || fail "sshfs is missing, and PUZUZ_E2E_REQUIRE_SSHFS=1"
+        echo "SKIP 20 a dead FUSE mount: sshfs is not available"
+        return 0
+    fi
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    mkdir -p "$STATE"
+    rm -f "$STATE/s20" /home/alice/m20-*.txt
+    mountpoint -q "$RNFS" || mount_rnfs
+    u=$(cjob /home/alice /home/alice/m20-u.txt)
+    s=$(cjob /home/alice /home/alice/m20-s.txt)
+    d=$(cjob "$RNFS" /home/alice/m20-d.txt)
+    for i in "$u" "$s" "$d"; do wait_state "$i" running; done
+    sleep 1
+    # The FUSE daemon dies: the mount stays, but does not answer.
+    pkill -9 -f "sshfs .* $RNFS\$" || fail "no sshfs for $RNFS"
+    wait_for 10 "$RNFS to stop answering" rnfs_dead
+    # A job started now gets the dead mount too.
+    n=$(cjob /home/alice /home/alice/m20-n.txt)
+    wait_state "$n" running
+    [ "$(rnfs_in "$n")" = fuse.sshfs ] || fail "job $n has no $RNFS"
+    sleep 1
+    # Checkpointed and restored on this boot: the job gets an empty,
+    # inaccessible directory on $RNFS (the host's mount does not answer).
+    pz alice checkpoint "$u" >/dev/null || fail "checkpoint $u"
+    restore_continues "$u" /home/alice/m20-u.txt
+    [ "$(rnfs_in "$u")" != fuse.sshfs ] || fail "the restored job $u got the dead mount back"
+    ! nsenter -t "$(live_pid "$u")" -m runuser -u alice -- ls "$RNFS" 2>/dev/null \
+        || fail "the placeholder on $RNFS of job $u is accessible to alice"
+    # The job working in it is refused, with the mount named, and runs on.
+    err=$(pz alice checkpoint "$d" 2>&1) && fail "the checkpoint of job $d was not refused"
+    echo "checkpoint of job $d: $err"
+    grep -q "$RNFS (fuse.sshfs) does not answer" <<<"$err" || fail "the refusal does not name $RNFS: $err"
+    grep -q "the working directory $RNFS" <<<"$err" || fail "the refusal does not say why: $err"
+    expect_state "$d" running
+    # Gone from the host now (sshfs unmounts it when its connection drops);
+    # the jobs' namespaces keep their copies, which the shutdown dumps.
+    umount -l "$RNFS"
+    echo "$u $s $d $n" >"$STATE/s20"
+}
+s20_verify() {
+    local u s d n i err
+    [ -f "$STATE/s20" ] || { echo "SKIP 20 a dead FUSE mount: not prepared"; return 0; }
+    read -r u s d n <"$STATE/s20"
+    ! mountpoint -q "$RNFS" || fail "$RNFS is mounted"
+    for i in "$u" "$s" "$n"; do wait_state "$i" checkpointed 30; done
+    # The shutdown did not dump the job that uses the mount, and says why.
+    wait_state "$d" 'done/*' 30
+    err=$(q carol "job($d)['details'].get('last_error')")
+    echo "job $d at the shutdown: $(st "$d"): $err"
+    grep -q "$RNFS (fuse.sshfs) is no longer mounted on the host" <<<"$err" \
+        || fail "the shutdown's refusal of job $d does not name $RNFS: $err"
+    [ ! -e "$CKPT/$d/COMPLETE" ] || fail "job $d has an image"
+    # The new container has no $RNFS directory (a real reboot keeps it):
+    # the restore needs the mount point.
+    if [ ! -e "$RNFS" ]; then
+        restore_refused "$n" "mount points .*$RNFS.* left out of the checkpoint"
+        mkdir "$RNFS"
+    fi
+    # The filesystem is not back: an empty, inaccessible directory.
+    restore_continues "$n" /home/alice/m20-n.txt
+    [ "$(rnfs_in "$n")" != fuse.sshfs ] || fail "job $n has a FUSE mount on $RNFS"
+    # Back: the host's mount.
+    mount_rnfs
+    restore_continues "$s" /home/alice/m20-s.txt
+    [ "$(rnfs_in "$s")" = fuse.sshfs ] || fail "job $s did not get $RNFS back"
+    # Dumped with the placeholder of its first restore.
+    restore_continues "$u" /home/alice/m20-u.txt
+    pz alice kill "$u" "$s" "$n" >/dev/null
+    for i in "$u" "$s" "$n"; do wait_state "$i" 'done/*'; done
+    umount "$RNFS" || umount -l "$RNFS"
+}
+
 # Many jobs at once: `add --immediate` from several CLIs in parallel races
 # the scheduler, so the helper gets concurrent spawns; then again while the
 # helper restarts. No job may fail to spawn or get lost.
@@ -1340,12 +1461,14 @@ reboot-prepare)
     run "7 reboot (prepare)" s7_prepare
     run "15 mounts across a reboot (prepare)" s15_prepare
     run "16 a mount missing after a reboot (prepare)" s16_prepare
+    run "20 a dead FUSE mount (prepare)" s20_prepare
     ;;
 reboot-verify)
     # 16 first: until it mounts /data again, every restore is refused.
     run "16 a mount missing after a reboot" s16_verify
     run "7 reboot" s7_verify
     run "15 mounts across a reboot" s15_verify
+    run "20 a dead FUSE mount" s20_verify
     ;;
 # Only defines the helpers above (sourced by scripts/vm/guest.sh).
 lib) ;;

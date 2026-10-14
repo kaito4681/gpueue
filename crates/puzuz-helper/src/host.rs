@@ -11,6 +11,7 @@ use puzuz_checkpoint::exec::run_with_timeout;
 use puzuz_checkpoint::{CommandSpec, probe, procfs, space};
 
 use crate::access::{VerifyReply, VerifyRequest};
+use crate::deadmounts::{DeadMounts, DetachedMount};
 use crate::mounts::{MountTree, SourceMount};
 
 /// One process of a job.
@@ -77,6 +78,26 @@ pub trait HostProbe: Send + Sync + 'static {
     fn unreachable_mounts(&self, _pid: u32) -> io::Result<Vec<String>> {
         Ok(Vec::new())
     }
+    /// FUSE and network mounts of the namespace of `init_pid` that are gone
+    /// from the host or do not answer, and what of the processes
+    /// `host_pids` depends on them (see [`crate::deadmounts`]). Must not
+    /// block on such a filesystem.
+    fn dead_mounts(&self, _init_pid: u32, _host_pids: &[u32]) -> io::Result<DeadMounts> {
+        Ok(DeadMounts::default())
+    }
+    /// For each of `mounts` (detached at dump time), what a restore binds
+    /// in its place: the host's mount at its mount point if the filesystem
+    /// is mounted there again and answers, else `placeholder`.
+    fn detached_sources(
+        &self,
+        mounts: &[DetachedMount],
+        placeholder: &Path,
+    ) -> io::Result<Vec<String>> {
+        Ok(vec![
+            placeholder.to_string_lossy().into_owned();
+            mounts.len()
+        ])
+    }
     /// Where the external mount sources `paths` live in the helper's own
     /// namespace (see [`SourceMount`]), recorded at dump time.
     fn source_mounts(&self, _paths: &[String]) -> io::Result<Vec<SourceMount>> {
@@ -124,6 +145,16 @@ pub trait HostProbe: Send + Sync + 'static {
         Ok(paths
             .iter()
             .filter(|p| fs::symlink_metadata(p).is_err())
+            .cloned()
+            .collect())
+    }
+    /// Which of `paths`, mount points of mounts detached at the dump, are
+    /// missing on this host (see [`crate::deadmounts::mount_point_missing`]);
+    /// in a child process with a deadline like [`Self::missing_paths`].
+    fn missing_mount_points(&self, paths: &[String]) -> io::Result<Vec<String>> {
+        Ok(paths
+            .iter()
+            .filter(|p| crate::deadmounts::mount_point_missing(Path::new(p)))
             .cloned()
             .collect())
     }
@@ -209,6 +240,16 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     fn unreachable_mounts(&self, pid: u32) -> io::Result<Vec<String>> {
         (**self).unreachable_mounts(pid)
     }
+    fn dead_mounts(&self, init_pid: u32, host_pids: &[u32]) -> io::Result<DeadMounts> {
+        (**self).dead_mounts(init_pid, host_pids)
+    }
+    fn detached_sources(
+        &self,
+        mounts: &[DetachedMount],
+        placeholder: &Path,
+    ) -> io::Result<Vec<String>> {
+        (**self).detached_sources(mounts, placeholder)
+    }
     fn source_mounts(&self, paths: &[String]) -> io::Result<Vec<SourceMount>> {
         (**self).source_mounts(paths)
     }
@@ -232,6 +273,9 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     }
     fn missing_paths(&self, paths: &[String]) -> io::Result<Vec<String>> {
         (**self).missing_paths(paths)
+    }
+    fn missing_mount_points(&self, paths: &[String]) -> io::Result<Vec<String>> {
+        (**self).missing_mount_points(paths)
     }
 }
 
@@ -279,6 +323,94 @@ impl SystemHost {
             .map(|o| o.stdout)
             .map_err(|e| io::Error::other(format!("{spec}: {e}")))
     }
+}
+
+impl SystemHost {
+    /// [`crate::deadmounts::probe_paths`] in a `verify-access` child, with
+    /// a deadline: one entry per path, `None` if its filesystem answered.
+    fn probe(&self, paths: &[String]) -> io::Result<Vec<Option<String>>> {
+        use crate::deadmounts::PROBE_TIMEOUT;
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let req = VerifyRequest::Probe(crate::access::ProbeCheck {
+            paths: paths.to_vec(),
+            timeout_ms: u64::try_from(PROBE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+        });
+        let reply = crate::access::run_verify_child(
+            &self.helper_exe,
+            &req,
+            PROBE_TIMEOUT + Duration::from_secs(10),
+        )
+        .map_err(io::Error::other)?;
+        if reply.len() != paths.len() {
+            return Err(io::Error::other(format!(
+                "the mount probe answered {} of {} paths",
+                reply.len(),
+                paths.len()
+            )));
+        }
+        Ok(reply
+            .into_iter()
+            .map(|r| (!r.is_empty()).then_some(r))
+            .collect())
+    }
+}
+
+/// What process `pid` holds (see [`crate::deadmounts::ProcessFiles`]),
+/// from `/proc` only: links are read, never followed, so a filesystem that
+/// does not answer cannot block this. A process that is gone holds
+/// nothing.
+pub fn process_files(proc_root: &Path, pid: u32) -> crate::deadmounts::ProcessFiles {
+    use crate::deadmounts::{ProcessFiles, parse_fdinfo_mnt_id, parse_maps};
+    let dir = proc_root.join(pid.to_string());
+    let link = |name: &str| {
+        fs::read_link(dir.join(name))
+            .ok()
+            .map(|t| t.to_string_lossy().into_owned())
+    };
+    let mut out = ProcessFiles {
+        cwd: link("cwd"),
+        root: link("root"),
+        exe: link("exe"),
+        maps: fs::read_to_string(dir.join("maps"))
+            .map(|m| parse_maps(&m))
+            .unwrap_or_default(),
+        ..ProcessFiles::default()
+    };
+    let mut sockets = Vec::new();
+    for entry in fs::read_dir(dir.join("fd")).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(fd) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(target) = fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.to_string_lossy().into_owned();
+        if let Some(ino) = target
+            .strip_prefix("socket:[")
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            sockets.push(ino);
+            continue;
+        }
+        let mnt_id = fs::read_to_string(dir.join("fdinfo").join(&name))
+            .ok()
+            .and_then(|t| parse_fdinfo_mnt_id(&t));
+        out.fds.push((fd, mnt_id, target));
+    }
+    if !sockets.is_empty()
+        && let Ok(table) = fs::read_to_string(dir.join("net/unix"))
+    {
+        for (ino, path) in parse_net_unix(&table) {
+            if sockets.contains(&ino) && path.starts_with('/') && !out.sockets.contains(&path) {
+                out.sockets.push(path);
+            }
+        }
+    }
+    out
 }
 
 /// The files on the host's filesystems that the processes `host_pids`
@@ -460,6 +592,79 @@ impl HostProbe for SystemHost {
             &MountTree::parse(&job),
             &MountTree::parse(&own),
         ))
+    }
+
+    fn dead_mounts(&self, init_pid: u32, host_pids: &[u32]) -> io::Result<DeadMounts> {
+        use crate::deadmounts::{dead_mount_users, dead_mounts, remote_mounts};
+        let job = MountTree::parse(&fs::read_to_string(
+            self.proc_root.join(init_pid.to_string()).join("mountinfo"),
+        )?);
+        let own = MountTree::parse(&fs::read_to_string(self.proc_root.join("self/mountinfo"))?);
+        let remote = remote_mounts(&job, &own);
+        // Only the ones the host still has need asking; `/proc/<pid>/root`
+        // leads to them through the job's namespace.
+        let asked: Vec<String> = remote
+            .iter()
+            .filter(|m| m.on_host)
+            .map(|m| {
+                self.proc_root
+                    .join(init_pid.to_string())
+                    .join("root")
+                    .join(m.mount_point.trim_start_matches('/'))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let mut answers = self.probe(&asked)?.into_iter();
+        let answers: Vec<Option<String>> = remote
+            .iter()
+            .map(|m| {
+                if m.on_host {
+                    answers.next().flatten()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut dead = dead_mounts(&job, &remote, &answers);
+        if !dead.dead.is_empty() {
+            let procs: Vec<_> = host_pids
+                .iter()
+                .map(|pid| process_files(&self.proc_root, *pid))
+                .collect();
+            dead.used = dead_mount_users(&job, &dead, &procs);
+        }
+        Ok(dead)
+    }
+
+    fn detached_sources(
+        &self,
+        mounts: &[DetachedMount],
+        placeholder: &Path,
+    ) -> io::Result<Vec<String>> {
+        use crate::deadmounts::is_back;
+        let own = MountTree::parse(&fs::read_to_string(self.proc_root.join("self/mountinfo"))?);
+        let back: Vec<String> = mounts
+            .iter()
+            .filter(|m| is_back(m, &own))
+            .map(|m| m.mount_point.clone())
+            .collect();
+        let answers = self.probe(&back)?;
+        let placeholder = placeholder.to_string_lossy().into_owned();
+        Ok(mounts
+            .iter()
+            .map(|m| {
+                let alive = back
+                    .iter()
+                    .zip(&answers)
+                    .any(|(p, a)| p == &m.mount_point && a.is_none());
+                if alive {
+                    m.mount_point.clone()
+                } else {
+                    placeholder.clone()
+                }
+            })
+            .collect())
     }
 
     fn source_mounts(&self, paths: &[String]) -> io::Result<Vec<SourceMount>> {
@@ -653,6 +858,18 @@ impl HostProbe for SystemHost {
         }
         self.run_verify(&VerifyRequest::Exist(crate::access::ExistCheck {
             paths: paths.to_vec(),
+            mount_points: false,
+        }))
+        .map_err(io::Error::other)
+    }
+
+    fn missing_mount_points(&self, paths: &[String]) -> io::Result<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.run_verify(&VerifyRequest::Exist(crate::access::ExistCheck {
+            paths: paths.to_vec(),
+            mount_points: true,
         }))
         .map_err(io::Error::other)
     }

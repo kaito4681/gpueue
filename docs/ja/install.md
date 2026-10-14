@@ -1550,6 +1550,9 @@ CRIU はリストア時に、ジョブの名前空間のすべてのマウント
 ジョブが開いているファイルと作業ディレクトリを記録します。リストアの前に、それらがまだあることを（途中の
 automount ポイントをトリガーしながら）確認し、なければ分かりやすいエラーで拒否します（[リストアの失敗](#restore-failures)
 を参照）。イメージは残るので、ファイルシステムをマウントしてもう一度 `puzuz restore` を実行できます。
+例外は、ジョブのダンプ時に既になくなっている、または応答しない FUSE やネットワークのファイルシステムです。
+それを使っていないジョブは、それを除いてダンプされます（[応答しなくなったネットワークと FUSE のファイルシステム](#network-and-fuse-filesystems-that-stop-answering)
+を参照）。
 
 リストアされたジョブが動き出す前に、ヘルパーは、その所有者がジョブの各ファイルを、ジョブが開いているのと同じ
 方法で、同じパスから、シンボリックリンクなしで開けることを確認します（[リストアとパス](architecture.md#restores-and-paths)
@@ -1571,7 +1574,7 @@ automount ポイントをトリガーしながら）確認し、なければ分�
 （`root@server:`、`allow_other,default_permissions`）ではリストアが拒否されます。所有者がジョブと同じように
 ファイルを開けるファイルシステム（通常の場合）では、変更は問題になりません。
 
-擬似的な再起動をまたいで（`scripts/e2e-test.sh`、シナリオ 15 と 16）、ジョブの作業ディレクトリと開いている
+擬似的な再起動をまたいで（`scripts/e2e-test.sh`、シナリオ 15、16、20）、ジョブの作業ディレクトリと開いている
 ファイルを次のそれぞれに置いてテストしました。
 
 | マウント | 再起動後のリストア |
@@ -1582,6 +1585,8 @@ automount ポイントをトリガーしながら）確認し、なければ分�
 | `x-systemd.automount`（トリガーの前と後に開始したジョブ。リストア時にはまだトリガーされていない） | 動作する：リストアの事前チェックがトリガーする |
 | FUSE のネットワークファイルシステム（ファイルが root のものとして見えるように、root が `allow_other,default_permissions` でマウントした sshfs）。ジョブがそこで自分のファイルを書き込み・リネームし、再起動後は inode 番号が変わる | リストアの前に FUSE デーモンが再び動いていれば動作する |
 | 再起動後にマウントされていないファイルシステム（fstab のエントリーがない、NFS サーバーが停止している） | 拒否：`<path> needs <type> on <mount point>` |
+| ジョブの実行中にデーモンが死んだ FUSE ファイルシステム（sshfs を kill：マウントは残るが応答しない。その後ホストでアンマウント）と、それを使っていないジョブ | 動作する：それを除いてチェックポイントされ（同じブート中でも）、ファイルシステムが再びマウントされるまではそこに空のアクセスできないディレクトリを、その後はファイルシステムそのものを得る |
+| 同上で、ジョブの作業ディレクトリがその上にある | チェックポイントされない（シャットダウン時も）：`the job depends on a filesystem that is gone or does not answer: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
 | 管理者がマウントした tmpfs（例：`/scratch`）にジョブのファイルや作業ディレクトリがある | 拒否：再起動後は中身が消えています。tmpfs は再起動を生き延びる必要のないジョブにだけ使ってください。同じブート中のリストアは動作します。 |
 
 テストしていないもの、または対応していないもの：
@@ -1590,7 +1595,7 @@ automount ポイントをトリガーしながら）確認し、なければ分�
   込めないためです。上記のチェックでは、NFS は他のファイルシステムと同じように扱われます。ヘルパーの開始前に
   マウントされ、シャットダウン時にヘルパーがジョブをダンプしたあとでアンマウントされるように、`/etc/fstab`
   （`_netdev` または `x-systemd.automount`）からマウントしてください（`puzuz-helper.service` は
-  `remote-fs.target` のあとに順序付けられています）。ジョブが開いていたファイルはパスで開き直されるので、
+  `remote-fs.target`、`network.target`、`network-online.target` のあとに順序付けられています）。ジョブが開いていたファイルはパスで開き直されるので、
   サーバー上にまだ存在している必要があります。
 - **autofs の間接マップ**（autofs デーモンが `/net/<host>` や `/home/<user>` を必要に応じてマウントするもの）：
   ジョブの開始時にマウントされていたキーはジョブから見えますが、あとで初めてアクセスされたキーは見えません
@@ -1598,6 +1603,56 @@ automount ポイントをトリガーしながら）確認し、なければ分�
 - **リムーバブルメディアと `/run`：** ジョブからはまったく見えません。
 - 再起動後に同じパスに再びマウントできないファイルシステム（ブート ID やランダムな名前を含むパス）は、それが
   マウントされていた間に開始したすべてのジョブをリストア不能にします。
+
+<a id="network-and-fuse-filesystems-that-stop-answering"></a>
+### 応答しなくなったネットワークと FUSE のファイルシステム
+
+ジョブの名前空間は、ジョブの開始時にマウントされていたすべての FUSE とネットワークのファイルシステムを、
+ジョブが使うかどうかにかかわらず含みます。CRIU はそうしたマウントを、リストア時にホストのマウントを再び
+バインドすることでしか保存できません。ジョブの実行中にそれがなくなると、ヘルパーは各ダンプの前にそれに気付き
+ます。FUSE デーモンが終了した場合（SSH 接続が切れた sshfs はホスト上の自分のマウントをアンマウントしますが、
+各ジョブには死んだコピーが残ります）や、応答しない場合（サーバーが停止している）です。FUSE やネットワークの
+マウント（`fuse.*`、`nfs`、`nfs4`、`cifs`、`smb3`、`9p`、`ceph`、`glusterfs` など）は、ホストにもう
+ないか、その上の `statfs` が接続エラー（`ENOTCONN`、`EIO`、`ESTALE` など）で失敗するか、5 秒以内に戻らない
+（応答しない NFS サーバーがヘルパーを止めないよう、子プロセスで確認します）と、死んだものとみなされます。
+
+- 死んだマウントを使っているジョブ（そこで開いているファイル、作業ディレクトリやルートディレクトリ、実行
+  ファイル、マップしているファイル、そこにバインドされた Unix ソケットがある）は**チェックポイントされません**。
+  ダンプはジョブに触れる前に拒否され（[チェックポイントの失敗](#checkpoint-failures) を参照）、理由には
+  マウントとジョブがそこに持っているものが示されます。例：`the job depends on a filesystem that is gone or
+  does not answer: /nfs (fuse.sshfs) is no longer mounted on the host; the job uses it: the working
+  directory /nfs/run`。ファイルシステムを再びマウントしてから、チェックポイントしてください。シャットダウン時に
+  は、そうしたジョブは systemd に停止され、その理由とともに `Checkpoint failed` と表示されます。
+- **それ以外のジョブは、そのマウントを除いてチェックポイントされます**。リストア時、そのマウントポイントには、
+  同じタイプのファイルシステムがそこにマウントされていて応答すればそのファイルシステムが、そうでなければ
+  ジョブが開けない空のディレクトリ（root のもの、モード 0、`/var/lib/puzuz/checkpoints/detached-mount`）が
+  与えられます。ジョブがホスト上でマウントポイントの下にあるものを見ることはありません。死んだマウントの下の
+  マウントは除かれます。リストアにはマウントポイントのディレクトリ自体が必要です。それがなくなっている場合
+  （ブート時に作られるマウントポイント）、ディレクトリが再び存在するまでリストアは拒否されます。
+
+ヘルパーは除いた各マウントをログに記録します（`journalctl -u puzuz-helper`：`job N: /nfs (fuse.sshfs) is no
+longer mounted on the host; the job does not use it, so it is checkpointed without it`）。
+
+シャットダウン時、`puzuz-helper.service` は `remote-fs.target`、`network-online.target`、`network.target`
+より先に停止し（ジョブをダンプし）ます。そのため `/etc/fstab` のマウントとネットワークはダンプが終わるまで
+残ります。**ログインセッション**の中で動く FUSE デーモンは別です。ユーザーが SSH 経由で開始した sshfs や、
+ローカルの sshfs を提供する `sftp-server` は、シャットダウンの最初にサービスと並行して、セッション
+（`session-<n>.scope`）とともに停止されます。サービスは、logind がログインごとに作るユニットに対して自分を
+順序付けることはできませんが、すべてのセッションスコープ向けのドロップインで、ヘルパーがジョブをダンプし
+終えてから systemd がセッションを終わらせるようにできます。
+
+```ini
+# /etc/systemd/system/session-.scope.d/50-puzuz.conf
+[Unit]
+Before=puzuz-helper.service
+```
+
+`systemctl daemon-reload` を実行し、`systemctl show -p Before session-<n>.scope` でセッションを確認して
+ください。シャットダウンは、ユーザーのプロセスを止める前にダンプを待つようになります。ユーザーの
+`systemd --user` サービスのプロセスは `user@<uid>.service` で動き、同時に停止されます。
+`/etc/systemd/system/user@.service.d/50-puzuz.conf` に同じ行を書けば、それらも対象になります。puzuz は
+これらのドロップインをインストールしません。ドロップインがなければ、そうしたマウントのデーモンが先に
+なくなったときに、それを使うジョブはチェックポイントされず、他のジョブはされます。
 
 <a id="upgrading"></a>
 ## アップグレード
@@ -1792,6 +1847,10 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
   ソケットを作り直すので、リストアされた `SO_REUSEPORT` のソケットは root のものになり、同じポートの root の
   サービスのグループに加わって（その接続の一部を受け取って）しまう可能性があります。プログラムで
   `SO_REUSEPORT` を無効にするか、ジョブを `--no-checkpoint` で実行してください。
+- `the job depends on a filesystem that is gone or does not answer: <mount point> (<type>) ...; the job
+  uses it: ...`：ジョブが使っている FUSE やネットワークのファイルシステムが、ホストにもうマウントされていない
+  か、応答しません。再びマウントして（sshfs を再起動する、NFS サーバーを戻す）、もう一度チェックポイントして
+  ください。[応答しなくなったネットワークと FUSE のファイルシステム](#network-and-fuse-filesystems-that-stop-answering) を参照してください。
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`：ジョブのマウント
   名前空間が別のマウントの下に隠れたマウントに依存しているので、決してリストアできません。ジョブを実行し直して
   ください（`puzuz restart`）。新しいジョブには整理された名前空間が与えられます。
@@ -1845,6 +1904,10 @@ OS のシャットダウンや再起動の間に、ダンプが失敗したか�
   マウントポイントのディレクトリをバインドし、ジョブはその下のファイルシステムに書き込み続けることになります。
   マウントして（`systemctl start data.mount`、`mount -a`、NFS サーバーを起動する、など）もう一度リストアして
   ください。[ファイルシステムとマウント](#filesystems-and-mounts) を参照してください。
+- `the mount points [...] of filesystems that were left out of the checkpoint (they were gone or did not
+  answer at the dump) are missing on this host`：CRIU には何かをマウントするためのディレクトリが必要です。
+  それを作成して（またはそこにファイルシステムをマウントして）もう一度リストアしてください。
+  [応答しなくなったネットワークと FUSE のファイルシステム](#network-and-fuse-filesystems-that-stop-answering) を参照してください。
 - `files or directories the job used are missing on this host: [...]`：ジョブが開いていたファイルや作業
   ディレクトリがなくなっています。典型的には、それらが再起動後に空になる tmpfs（`/scratch`）上にあった場合です。
   ジョブはリストアできません。削除してください（`puzuz remove`）。

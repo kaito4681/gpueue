@@ -94,6 +94,15 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    any other signal, which would reach the root shim instead of the job.
 6. **Checkpoint.** The helper checks free space (for RSS and VRAM, deleted files saved in the
    image and the contents of the job's `/tmp` and `/dev/shm`), the mounts and the job's sockets.
+   FUSE and network mounts of the job's namespace that the host no longer has, or whose `statfs`
+   fails with a connection error or does not return within 5 s (asked in a child process), are
+   dead: a job with an open file, its working or root directory, its executable, a mapping or a
+   bound Unix socket on one is refused with a reason that names the mount. For any other job the
+   helper passes them to CRIU as external mounts with keys of its own
+   (`--external mnt[<mount point>]:puzuz-detached-<n>`, mounts below them with `--skip-mnt`) and
+   records them in `helper-mounts.json`, so that one dead filesystem does not keep every job
+   from being checkpointed (see
+   [Network and FUSE filesystems that stop answering](install.md#network-and-fuse-filesystems-that-stop-answering)).
    If a check fails, it refuses the
    dump before touching the job, which keeps running, and the `checkpoint` request fails with the
    reason (a refusal found only when the dump is due is reported with the outcome instead, and the
@@ -124,7 +133,10 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    VRAM and mounts: the paths CRIU
    binds must exist, the filesystems they were on at the dump (recorded in `helper-mounts.json`)
    must be mounted at the same place with the same type (automount points are triggered), and
-   the files and working directories the job had open must exist. It starts a
+   the files and working directories the job had open must exist. A mount left out at the dump
+   is bound from the host's mount at the same place if a filesystem of the same type is mounted
+   there again and answers, and otherwise from an empty, root-owned directory of mode 0
+   (`/var/lib/puzuz/checkpoints/detached-mount`); its mount point must exist. It starts a
    new unit `puzuz-job-<id>-r<n>.service` that runs `criu restore --root` on a bind mount of `/`
    (`/run/puzuz-helper/criu-root`), with the device access of the GPUs of the restore. In manual
    mode it then runs cuda-checkpoint `restore` and

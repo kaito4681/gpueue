@@ -1098,7 +1098,7 @@ async fn restore_checks_the_images_paths_first() {
         .into_iter()
         .filter_map(|r| match r {
             VerifyRequest::Paths(p) => Some(p.paths),
-            VerifyRequest::Restored(_) | VerifyRequest::Exist(_) => None,
+            VerifyRequest::Restored(_) | VerifyRequest::Exist(_) | VerifyRequest::Probe(_) => None,
         })
         .flatten()
         .collect();
@@ -1722,6 +1722,145 @@ async fn dump_refuses_a_job_that_depends_on_a_hidden_mount() {
             ..
         }
     ));
+}
+
+/// A FUSE mount that is gone from the host (its daemon exited) is left out
+/// of the dump of a job that does not use it, and restored as an empty,
+/// inaccessible directory while it is not back (once its mount point
+/// exists); mounts below it are left out. A job that uses it is not
+/// dumped, and the reason names the mount.
+#[tokio::test]
+async fn dead_mounts_are_detached_unless_the_job_uses_them() {
+    use puzuz_helper::deadmounts::{DeadMount, DeadMounts, DetachedMount, PLACEHOLDER_DIR};
+    use puzuz_helper::engine::{MOUNTS_FILE, SavedMounts};
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let mp = env.root.join("nfs").to_str().unwrap().to_owned();
+    let below = format!("{mp}/x");
+    let dead = DeadMounts {
+        dead: vec![DeadMount {
+            id: 101,
+            mount_point: mp.clone(),
+            fstype: "fuse.sshfs".into(),
+            dev: "0:60".into(),
+            why: "is no longer mounted on the host".into(),
+        }],
+        below: vec![below.clone()],
+        used: Vec::new(),
+    };
+    env.host.set_dead_mounts(dead.clone());
+    // A restore needs every recorded mount point on the host: neither the
+    // detached one nor the one below it is recorded.
+    env.host
+        .set_mount_points(vec!["/".into(), mp.clone(), below.clone()]);
+    let image_dir = spawn_and_dump(&env, &mut c, 5).await;
+    let args = env.exec.lock().unwrap().dump_args.clone();
+    let args = args.last().unwrap();
+    let pair = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
+    assert!(
+        pair("--external", &format!("mnt[{mp}]:puzuz-detached-0")),
+        "{args:?}"
+    );
+    assert!(pair("--skip-mnt", &below), "{args:?}");
+    let saved: SavedMounts = serde_json::from_slice(
+        &std::fs::read(
+            CheckpointDir::for_job(&env.base(), 5)
+                .root()
+                .join(MOUNTS_FILE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        saved.detached_mounts(),
+        [DetachedMount {
+            mount_point: mp.clone(),
+            fstype: "fuse.sshfs".into(),
+            key: "puzuz-detached-0".into(),
+            why: "is no longer mounted on the host".into(),
+        }]
+    );
+    assert_eq!(saved.required_paths(), ["/"]);
+
+    // CRIU needs the mount point itself.
+    let r = c.request(restore_req(5, &image_dir)).await;
+    let ResponseResult::Error {
+        code: HelperErrorCode::InvalidRequest,
+        message,
+    } = r
+    else {
+        panic!("{r:?}")
+    };
+    assert!(
+        message.contains(&format!(
+            "the mount points [\"{mp}\"] of filesystems that were left out of the checkpoint"
+        )),
+        "{message}"
+    );
+    std::fs::create_dir(&mp).unwrap();
+    let r = c.request(restore_req(5, &image_dir)).await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::RestoreFinished {
+                outcome: RestoreOutcome::Success { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    let placeholder = env.base().join(PLACEHOLDER_DIR);
+    let restored = env.launcher.restored();
+    let args = restored[0].command.args_lossy();
+    let want = format!("mnt[puzuz-detached-0]:{}", placeholder.display());
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--external" && w[1] == want),
+        "{args:?}"
+    );
+    let mode = std::fs::metadata(&placeholder)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0);
+
+    // A job that uses the mount.
+    let mut used = dead;
+    used.used = vec![(mp.clone(), format!("the working directory {mp}/run"))];
+    env.host.set_dead_mounts(used);
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(6))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    let dumps = env.exec.lock().unwrap().dump_args.len();
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(6),
+            image_dir: env.base().join("6"),
+            options: Default::default(),
+        })
+        .await;
+    let ResponseResult::Error {
+        code: HelperErrorCode::CheckpointRefused,
+        message,
+    } = r
+    else {
+        panic!("{r:?}")
+    };
+    assert!(
+        message.contains(&format!(
+            "{mp} (fuse.sshfs) is no longer mounted on the host; the job uses it: the working \
+             directory {mp}/run"
+        )),
+        "{message}"
+    );
+    assert_eq!(env.exec.lock().unwrap().dump_args.len(), dumps);
+    assert!(!env.base().join("6").exists());
+    assert_eq!(c.running().await.len(), 2, "both jobs run");
+    std::fs::set_permissions(&placeholder, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[tokio::test]

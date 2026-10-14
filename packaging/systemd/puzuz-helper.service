@@ -7,7 +7,14 @@ Documentation=https://github.com/kaito4681/puzuz
 # Job units (puzuz-job-<id>.service) are created with
 # Before=puzuz-helper.service, so they are stopped only after the helper
 # has finished its dumps.
+# network.target and network-online.target (ordering only, nothing is
+# pulled in): the network stays up during the dumps also for network and
+# FUSE filesystems that are not mount units (an sshfs started by hand).
+# Login sessions (session-*.scope) cannot be ordered from here; see
+# docs/install.md, "Network and FUSE filesystems". A filesystem that is
+# gone or does not answer anyway only affects the jobs that use it.
 After=local-fs.target remote-fs.target dbus.service systemd-tmpfiles-setup.service
+After=network.target network-online.target
 After=nvidia-persistenced.service nvidia-fabricmanager.service
 Requires=dbus.service
 RequiresMountsFor=/var/lib/puzuz

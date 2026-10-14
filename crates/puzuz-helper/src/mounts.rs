@@ -141,6 +141,16 @@ impl MountTree {
         self.by_id.get(&id).map(|&i| &self.entries[i])
     }
 
+    /// Id of the namespace's root mount.
+    pub fn root_id(&self) -> Option<u64> {
+        self.root.map(|r| self.entries[r].id)
+    }
+
+    /// Whether `ancestor` is `id` or one of its ancestors.
+    pub fn is_at_or_below(&self, id: u64, ancestor: u64) -> bool {
+        self.ancestors(id).contains(&ancestor)
+    }
+
     /// The mounts a lookup of `path` passes through, from the root mount to
     /// the mount that `path` ends up in.
     pub fn resolve(&self, path: &str) -> Vec<u64> {
