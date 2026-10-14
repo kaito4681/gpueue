@@ -417,8 +417,9 @@ pub fn check_switch(a: &Job, b: &Job) -> Result<(), Error> {
 /// A paused job is resumed first (`SignalContinue`, then `Checkpoint`):
 /// `cuda-checkpoint` hangs on a stopped process and CRIU would record it
 /// as stopped anyway. The daemon remembers that it was paused (the
-/// checkpoint record's `paused` flag) and pauses it again with
-/// [`keep_paused`] once it is restored, or when the dump is refused.
+/// checkpoint record's `paused` flag), asks the helper to restore it
+/// stopped, and keeps it `Paused` with [`keep_paused`] once it is restored
+/// (or when the dump is refused).
 pub fn checkpoint(job: &Job) -> Result<Transition, Error> {
     match job.state {
         JobState::Running => Ok(Transition::to(JobState::Checkpointing).with(Effect::Checkpoint)),
@@ -563,7 +564,11 @@ pub enum Event {
     CheckpointRefused {
         reason: String,
     },
-    RestoreSucceeded,
+    /// `stopped`: the helper left the restored processes stopped (the
+    /// daemon asked for it because the job was paused when it was dumped).
+    RestoreSucceeded {
+        stopped: bool,
+    },
     RestoreFailed {
         reason: String,
     },
@@ -581,7 +586,7 @@ impl Event {
             Event::CheckpointSucceeded => "marked as checkpointed",
             Event::CheckpointFailed { .. } => "marked as checkpoint failed",
             Event::CheckpointRefused { .. } => "marked as checkpoint refused",
-            Event::RestoreSucceeded => "marked as restored",
+            Event::RestoreSucceeded { .. } => "marked as restored",
             Event::RestoreFailed { .. } => "marked as restore failed",
             Event::Lost => "marked as lost",
         }
@@ -664,16 +669,12 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
             .with(Effect::DeleteCheckpointImage)
         }
 
-        (Event::RestoreSucceeded, JobState::Restoring) => {
-            Transition::to(JobState::Running).with(Effect::DeleteCheckpointImage)
-        }
+        (Event::RestoreSucceeded { stopped }, JobState::Restoring) => restored(*stopped),
         // The restore was given up as interrupted (`Lost` below, e.g. after
         // a helper or daemon restart) but did finish: the helper runs the
         // job, so follow it. The helper only restores on request, so a
         // checkpointed job never gets this otherwise.
-        (Event::RestoreSucceeded, JobState::Checkpointed) => {
-            Transition::to(JobState::Running).with(Effect::DeleteCheckpointImage)
-        }
+        (Event::RestoreSucceeded { stopped }, JobState::Checkpointed) => restored(*stopped),
         (Event::RestoreFailed { reason }, JobState::Restoring) => {
             Transition::to(JobState::Checkpointed).with(Effect::RecordRestoreError(reason.clone()))
         }
@@ -699,21 +700,42 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
     Ok(transition)
 }
 
+/// A restored job runs; one whose processes the helper left stopped is
+/// continued.
+fn restored(stopped: bool) -> Transition {
+    let t = Transition::to(JobState::Running).with(Effect::DeleteCheckpointImage);
+    if stopped {
+        t.with(Effect::SignalContinue)
+    } else {
+        t
+    }
+}
+
 /// Adjust the transition of `event` for a job that was paused when its
 /// checkpoint began (it was resumed for the dump, see [`checkpoint`]):
 /// where the job would run again without the user asking for it, after a
-/// successful restore or a refused dump, it is paused again instead
-/// (`Paused` plus [`Effect::SignalStop`], after the transition's own
-/// effects). The process runs for the moment between the restore and the
-/// stop. Other transitions are returned unchanged.
+/// successful restore or a refused dump, it is `Paused` instead. A restore
+/// that left the processes stopped needs nothing more (its
+/// [`Effect::SignalContinue`] is dropped); otherwise (a refused dump, or a
+/// helper that predates stopped restores) [`Effect::SignalStop`] is added
+/// after the transition's own effects, and the process runs for the moment
+/// before the stop. Other transitions are returned unchanged.
 pub fn keep_paused(event: &Event, mut transition: Transition) -> Transition {
     let resumes = matches!(
         event,
-        Event::RestoreSucceeded | Event::CheckpointRefused { .. }
+        Event::RestoreSucceeded { .. } | Event::CheckpointRefused { .. }
     ) && transition.next == Some(JobState::Running);
     if resumes {
         transition.next = Some(JobState::Paused);
-        transition.effects.push(Effect::SignalStop);
+        if let Some(i) = transition
+            .effects
+            .iter()
+            .position(|e| *e == Effect::SignalContinue)
+        {
+            transition.effects.remove(i);
+        } else {
+            transition.effects.push(Effect::SignalStop);
+        }
     }
     transition
 }
@@ -1407,9 +1429,18 @@ mod tests {
     #[test]
     fn restore_events() {
         let restoring = job(1, JobState::Restoring);
-        let t = on_event(&restoring, &Event::RestoreSucceeded).unwrap();
+        let ok = Event::RestoreSucceeded { stopped: false };
+        let t = on_event(&restoring, &ok).unwrap();
         assert_eq!(t.next, Some(JobState::Running));
         assert_eq!(t.effects, vec![Effect::DeleteCheckpointImage]);
+        // Processes left stopped (not asked for, as the job was not paused)
+        // are continued.
+        let t = on_event(&restoring, &Event::RestoreSucceeded { stopped: true }).unwrap();
+        assert_eq!(t.next, Some(JobState::Running));
+        assert_eq!(
+            t.effects,
+            vec![Effect::DeleteCheckpointImage, Effect::SignalContinue]
+        );
 
         let t = on_event(
             &restoring,
@@ -1426,7 +1457,7 @@ mod tests {
         assert!(!t.effects.contains(&Effect::DeleteCheckpointImage));
         // A success reported after the restore was given up as interrupted
         // brings the job back to running.
-        let t = on_event(&job(1, JobState::Checkpointed), &Event::RestoreSucceeded).unwrap();
+        let t = on_event(&job(1, JobState::Checkpointed), &ok).unwrap();
         assert_eq!(t.next, Some(JobState::Running));
         assert_eq!(t.effects, vec![Effect::DeleteCheckpointImage]);
 
@@ -1482,7 +1513,7 @@ mod tests {
             .unwrap()
             .apply(&mut j, 30);
         restore(&j, true, 40).unwrap().apply(&mut j, 40);
-        on_event(&j, &Event::RestoreSucceeded)
+        on_event(&j, &Event::RestoreSucceeded { stopped: false })
             .unwrap()
             .apply(&mut j, 50);
         assert_eq!(j.state, JobState::Running);
@@ -1506,10 +1537,14 @@ mod tests {
     #[test]
     fn keep_paused_pauses_a_restored_or_refused_job_again() {
         let restoring = job(1, JobState::Restoring);
-        let t = keep_paused(
-            &Event::RestoreSucceeded,
-            on_event(&restoring, &Event::RestoreSucceeded).unwrap(),
-        );
+        // Left stopped by the helper: nothing to signal.
+        let stopped = Event::RestoreSucceeded { stopped: true };
+        let t = keep_paused(&stopped, on_event(&restoring, &stopped).unwrap());
+        assert_eq!(t.next, Some(JobState::Paused));
+        assert_eq!(t.effects, vec![Effect::DeleteCheckpointImage]);
+        // Resumed by a helper that predates stopped restores: stopped again.
+        let running = Event::RestoreSucceeded { stopped: false };
+        let t = keep_paused(&running, on_event(&restoring, &running).unwrap());
         assert_eq!(t.next, Some(JobState::Paused));
         assert_eq!(
             t.effects,
@@ -1517,11 +1552,10 @@ mod tests {
         );
         // Also a late success of a restore given up as interrupted.
         let checkpointed = job(1, JobState::Checkpointed);
-        let t = keep_paused(
-            &Event::RestoreSucceeded,
-            on_event(&checkpointed, &Event::RestoreSucceeded).unwrap(),
-        );
-        assert_eq!(t.next, Some(JobState::Paused));
+        for event in [stopped, running] {
+            let t = keep_paused(&event, on_event(&checkpointed, &event).unwrap());
+            assert_eq!(t.next, Some(JobState::Paused));
+        }
 
         let refused = Event::CheckpointRefused { reason: "x".into() };
         let t = keep_paused(

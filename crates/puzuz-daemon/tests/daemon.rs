@@ -290,9 +290,10 @@ impl Harness {
 
     /// Waits until the fake helper has received `count` signals. The daemon
     /// records a state change before it runs the change's effects, so a
-    /// job pausing on its own (restored or reverted to `Paused`) shows as
-    /// `Paused` a moment before its SIGSTOP reaches the helper; unlike an
-    /// API action, nothing else waits for that signal.
+    /// job pausing on its own (reverted to `Paused`, or restored by a helper
+    /// that ignores `leave_stopped`) shows as `Paused` a moment before its
+    /// SIGSTOP reaches the helper; unlike an API action, nothing else waits
+    /// for that signal.
     async fn wait_signals(&self, count: usize) {
         for _ in 0..250 {
             if self.helper.signals().len() >= count {
@@ -1053,7 +1054,8 @@ async fn replayed_helper_events_are_applied_once() {
 }
 
 /// A job paused when it is checkpointed is resumed for the dump (CRIU and
-/// cuda-checkpoint need it running) and paused again once restored, still
+/// cuda-checkpoint need it running) and restored stopped (the helper is
+/// asked to leave it stopped, so no signal follows the restore), still
 /// holding its GPU. One running when checkpointed comes back running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_paused_before_its_checkpoint_is_restored_paused() {
@@ -1075,14 +1077,13 @@ async fn a_job_paused_before_its_checkpoint_is_restored_paused() {
         .await;
     assert_eq!(reply.status, StatusCode::OK);
     alice.wait_state(id, &JobState::Paused).await;
-    h.wait_signals(3).await;
+    assert_eq!(h.helper.restore_requests(), [(id, true)]);
+    // Effects run right after the state is recorded; give a stray signal
+    // the time to arrive.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         h.helper.signals(),
-        [
-            (id, signal::SIGSTOP),
-            (id, signal::SIGCONT),
-            (id, signal::SIGSTOP)
-        ]
+        [(id, signal::SIGSTOP), (id, signal::SIGCONT)]
     );
     assert_eq!(h.helper.jobs()[&id].phase, RunningPhase::Stopped);
     assert!(!h.helper.has_image(id));
@@ -1113,9 +1114,49 @@ async fn a_job_paused_before_its_checkpoint_is_restored_paused() {
     alice.wait_state(id, &JobState::Running).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(alice.job(id).await.state, JobState::Running);
-    assert_eq!(h.helper.signals().len(), 4, "{:?}", h.helper.signals());
+    assert_eq!(
+        h.helper.signals(),
+        [
+            (id, signal::SIGSTOP),
+            (id, signal::SIGCONT),
+            (id, signal::SIGCONT)
+        ]
+    );
+    assert_eq!(h.helper.restore_requests(), [(id, true), (id, false)]);
     assert_eq!(h.helper.jobs()[&id].phase, RunningPhase::Running);
 
+    h.stop().await;
+}
+
+/// A helper that predates stopped restores ignores `leave_stopped` and
+/// resumes the job; the daemon then stops it itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_job_resumed_by_an_older_helper_is_stopped_again() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let id = alice.add(&job_request("a", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+    alice.action(id, "pause", json!({})).await;
+    alice.wait_state(id, &JobState::Paused).await;
+    alice.action(id, "checkpoint", json!(null)).await;
+    alice.wait_state(id, &JobState::Checkpointed).await;
+    h.helper.set_ignore_leave_stopped(true);
+    alice
+        .action(id, "restore", json!({"immediate": true}))
+        .await;
+    alice.wait_state(id, &JobState::Paused).await;
+    h.wait_signals(3).await;
+    assert_eq!(h.helper.restore_requests(), [(id, true)]);
+    assert_eq!(
+        h.helper.signals(),
+        [
+            (id, signal::SIGSTOP),
+            (id, signal::SIGCONT),
+            (id, signal::SIGSTOP)
+        ]
+    );
+    assert_eq!(h.helper.jobs()[&id].phase, RunningPhase::Stopped);
     h.stop().await;
 }
 
@@ -1149,11 +1190,16 @@ async fn a_job_paused_at_an_os_shutdown_is_restored_paused() {
     }
     alice.wait_state(paused, &JobState::Paused).await;
     alice.wait_state(running, &JobState::Running).await;
-    h.wait_signals(2).await;
-    assert_eq!(
-        h.helper.signals(),
-        [(paused, signal::SIGSTOP), (paused, signal::SIGSTOP)]
-    );
+    let mut requests = h.helper.restore_requests();
+    requests.sort();
+    let mut expected = [(paused, true), (running, false)];
+    expected.sort();
+    assert_eq!(requests, expected);
+    // Restored stopped: no signal after the restore, only the pause.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(h.helper.signals(), [(paused, signal::SIGSTOP)]);
+    assert_eq!(h.helper.jobs()[&paused].phase, RunningPhase::Stopped);
+    assert_eq!(h.helper.jobs()[&running].phase, RunningPhase::Running);
     h.stop().await;
 }
 
