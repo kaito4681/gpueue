@@ -210,6 +210,7 @@ pub fn pending_priorities(
     now: Timestamp,
     jobs: &[Job],
     groups: &[Group],
+    gpus: &[Gpu],
     reserved: &Reserved,
     input: &PriorityInput<'_>,
 ) -> Vec<JobPriority> {
@@ -220,6 +221,7 @@ pub fn pending_priorities(
         &prepared.status,
         &prepared.candidates,
         groups,
+        gpus,
         input,
     )
 }
@@ -297,6 +299,31 @@ fn prepare<'a>(
     }
 }
 
+/// How `job`'s age is counted (see [`priority::Eligibility`]): since when
+/// it is eligible, and whether it could launch now if a slot were free.
+///
+/// "Could launch now" uses the same conditions as the launch loop of
+/// [`plan_inner`], except free slots: the group exists and is not paused,
+/// every GPU of `spec.gpus` is in `gpus` (detected), and (queued jobs)
+/// every dependency is done. A job waiting for a busy group or GPU slot is
+/// ordinary queueing and counts as launchable.
+fn eligibility(
+    job: &Job,
+    now: Timestamp,
+    status: &HashMap<JobId, Status>,
+    by_id: &HashMap<JobId, &Job>,
+    groups: &HashMap<&str, &Group>,
+    gpus: &HashSet<GpuIndex>,
+) -> priority::Eligibility {
+    let since = eligible_since(job, now, status, by_id);
+    let launchable = since.is_some()
+        && groups
+            .get(job.spec.group.as_str())
+            .is_some_and(|g| !g.paused)
+        && job.spec.gpus.iter().all(|idx| gpus.contains(idx));
+    priority::Eligibility { since, launchable }
+}
+
 /// When `job` became eligible to start (for the age factor): when it was
 /// queued, or when its last dependency finished; `None` while a
 /// dependency has not finished successfully.
@@ -334,19 +361,22 @@ fn order(
     jobs: &[Job],
     status: &HashMap<JobId, Status>,
     candidates: &[&Job],
-    groups: &[Group],
+    group_list: &[Group],
+    gpu_list: &[Gpu],
     input: &PriorityInput<'_>,
 ) -> Vec<JobPriority> {
     let by_id: HashMap<JobId, &Job> = jobs.iter().map(|j| (j.id, j)).collect();
+    let groups: HashMap<&str, &Group> = group_list.iter().map(|g| (g.name.as_str(), g)).collect();
+    let gpus: HashSet<GpuIndex> = gpu_list.iter().map(|g| g.index).collect();
     let ctx = priority::Context {
         params: input.params,
         now,
         fairshare: input.fairshare,
-        groups,
+        groups: group_list,
         resources: input.resources,
     };
     priority::prioritize(candidates, &ctx, |job| {
-        eligible_since(job, now, status, &by_id)
+        eligibility(job, now, status, &by_id, &groups, &gpus)
     })
 }
 
@@ -370,6 +400,7 @@ fn plan_inner(
         ..Plan::default()
     };
 
+    let gpu_list = gpus;
     let groups: HashMap<&str, &Group> = group_list.iter().map(|g| (g.name.as_str(), g)).collect();
     let gpus: HashMap<GpuIndex, &Gpu> = gpus.iter().map(|g| (g.index, g)).collect();
 
@@ -385,7 +416,7 @@ fn plan_inner(
 
     match input {
         Some(input) => {
-            let ordered = order(now, jobs, &status, &candidates, group_list, input);
+            let ordered = order(now, jobs, &status, &candidates, group_list, gpu_list, input);
             let by_id: HashMap<JobId, &Job> = candidates.iter().map(|j| (j.id, *j)).collect();
             candidates = ordered.iter().map(|p| by_id[&p.id]).collect();
         }
@@ -1331,6 +1362,7 @@ mod tests {
             NOW,
             &jobs,
             &[group(DEFAULT_GROUP, 0)],
+            &[],
             &Reserved::default(),
             &input,
         );
@@ -1338,6 +1370,65 @@ mod tests {
         assert_eq!(p.iter().map(|p| p.id.0).collect::<Vec<_>>(), [3, 2]);
         assert!((p[1].factors.age - 0.1).abs() < 1e-9);
         assert!((p[0].factors.age - 0.3).abs() < 1e-9);
+    }
+
+    /// The review scenario of the "age bank": user 1 has an 8-day-old job
+    /// that cannot launch and a new job first in their own order (`-o
+    /// 10`); user 2 has a 3-day-old job. One CPU slot is free.
+    fn parked_job_scenario(parked: J, groups: &[Group], gpus: &[Gpu]) -> (Plan, Vec<JobPriority>) {
+        const DAY: Timestamp = 24 * 60 * 60 * 1000;
+        let jobs: Vec<Job> = vec![
+            parked.owner(1).at(NOW - 8 * DAY).0,
+            job(2, queued()).owner(1).prio(10).at(NOW).0,
+            job(3, queued()).owner(2).at(NOW - 3 * DAY).0,
+            job(4, JobState::Running).owner(3).group("gpu").gpus(&[0]).0,
+        ];
+        let params = Params::default();
+        let fairshare = HashMap::new();
+        let input = PriorityInput {
+            params: &params,
+            fairshare: &fairshare,
+            resources: Resources {
+                gpus: gpus.len() as u32,
+                cpus: 8,
+            },
+        };
+        let reserved = Reserved::default();
+        (
+            plan_prioritized(NOW, &jobs, groups, gpus, &reserved, &input),
+            pending_priorities(NOW, &jobs, groups, gpus, &reserved, &input),
+        )
+    }
+
+    #[test]
+    fn jobs_that_cannot_launch_lend_no_age() {
+        let age = |p: &[JobPriority], id: u64| p.iter().find(|p| p.id.0 == id).unwrap().factors.age;
+        let groups = [group(DEFAULT_GROUP, 1), paused("held", 0), group("gpu", 0)];
+        let gpus = [gpu(0, 1)];
+        for (what, parked) in [
+            ("paused group", job(1, queued()).group("held")),
+            ("missing group", job(1, queued()).group("gone")),
+            ("undetected GPU", job(1, queued()).group("gpu").gpus(&[7])),
+        ] {
+            let (plan, p) = parked_job_scenario(parked, &groups, &gpus);
+            assert_eq!(plan.start, ids(&[3]), "{what}");
+            assert_eq!(age(&p, 2), 0.0, "{what}");
+            assert!((age(&p, 3) - 3.0 / 7.0).abs() < 1e-9, "{what}");
+            // The parked job keeps its own age for when it can launch.
+            assert_eq!(age(&p, 1), 1.0, "{what}");
+        }
+        // Once the group is resumed the parked job pools its age again:
+        // the owner's first job gets it.
+        let resumed = [group(DEFAULT_GROUP, 1), group("held", 0), group("gpu", 0)];
+        let (_, p) = parked_job_scenario(job(1, queued()).group("held"), &resumed, &gpus);
+        assert_eq!(age(&p, 2), 1.0);
+        assert_eq!(age(&p, 1), 0.0);
+        // Waiting for a busy GPU is ordinary queueing: the job could launch
+        // as soon as the slot frees, so it pools its age.
+        let (plan, p) =
+            parked_job_scenario(job(1, queued()).group("gpu").gpus(&[0]), &groups, &gpus);
+        assert_eq!(age(&p, 2), 1.0);
+        assert_eq!(plan.start, ids(&[2]));
     }
 
     #[test]
@@ -1371,7 +1462,7 @@ mod tests {
             resources: Resources::default(),
         };
         let groups = [group(DEFAULT_GROUP, 0)];
-        let listed: HashSet<u64> = pending_priorities(NOW, &jobs, &groups, &reserved, &input)
+        let listed: HashSet<u64> = pending_priorities(NOW, &jobs, &groups, &[], &reserved, &input)
             .iter()
             .map(|p| p.id.0)
             .collect();

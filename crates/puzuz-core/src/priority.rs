@@ -44,15 +44,22 @@
 //! owner's order is: jobs moved to the top first (most recent `top` first),
 //! then higher `-o` priority, then lower id ([`owner_order`]).
 //!
-//! It is applied through the age factor: the ages of a user's eligible
-//! pending jobs (those whose dependencies are done) are handed out in the
-//! owner's order, oldest age to the first job; jobs that cannot start yet
-//! keep an age of 0 and take no age from runnable jobs. The
-//! sum of the user's priorities is unchanged, so other users are not
-//! affected, and among jobs of one user that differ in nothing else (the
-//! common case: same group, no nice or site factor, job size not weighted)
-//! the owner's order decides. Remaining ties are broken by the owner's
-//! order, then by id.
+//! It is applied through the age factor: the ages of a user's pending jobs
+//! that could launch now (see [`Eligibility::launchable`]) are pooled and
+//! handed out in the owner's order, oldest age to the first of them. A job
+//! that cannot launch now (its group is missing or paused, one of its GPUs
+//! was not detected, or a dependency has not finished) neither lends nor
+//! borrows: it keeps its own age, so an old job parked in a paused group
+//! cannot lift the owner's newest job above other users' jobs, and it joins
+//! the pool with its full age once it can launch. A job waiting for a
+//! dependency has an age of 0 (its age counts from when the dependency
+//! finished). Waiting for a free group or GPU slot is ordinary queueing:
+//! such a job can launch and pools its age. The sum of the priorities of a
+//! user's launchable jobs is unchanged, so other users are not affected,
+//! and among jobs of one user that differ in nothing else (the common case:
+//! same group, no nice or site factor, job size not weighted) the owner's
+//! order decides. Remaining ties are broken by the owner's order, then by
+//! id.
 //!
 //! With `priority_type = "basic"` jobs are ordered as in pueue: higher `-o`
 //! priority first, then lower id; nice, site factors and `top` are ignored.
@@ -327,6 +334,22 @@ pub struct Context<'a> {
     pub resources: Resources,
 }
 
+/// How [`prioritize`] counts a pending job's age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eligibility {
+    /// When the job became eligible to start: when it was queued, or when
+    /// its last dependency finished. `None` while a dependency has not
+    /// finished (its age is then 0).
+    pub since: Option<Timestamp>,
+    /// Whether the job could launch now if a slot were free: its group
+    /// exists and is not paused, every GPU it asks for was detected and
+    /// (queued jobs) every dependency is done. Only these jobs pool their
+    /// ages in their owner's order (see [the owner's
+    /// order](self#the-owners-order)). Waiting for a busy group or GPU slot
+    /// does not make a job unlaunchable.
+    pub launchable: bool,
+}
+
 /// The order of one user's jobs: moved to the top first (most recent
 /// `top` first), then higher `-o` priority, then lower id.
 pub fn owner_order(a: &Job, b: &Job) -> Ordering {
@@ -368,15 +391,14 @@ fn job_size_factor(job: &Job, resources: Resources, favor_small: bool) -> f64 {
 }
 
 /// Orders the pending jobs `candidates` for launching and returns their
-/// priorities in that order (highest first). `eligible_since` gives when
-/// a job became eligible to start, or `None` while it is not (its age
-/// factor is then 0).
+/// priorities in that order (highest first). `eligibility` tells how each
+/// job's age is counted ([`Eligibility`]).
 ///
 /// See the [module documentation](self) for the rules.
 pub fn prioritize(
     candidates: &[&Job],
     ctx: &Context<'_>,
-    eligible_since: impl Fn(&Job) -> Option<Timestamp>,
+    eligibility: impl Fn(&Job) -> Eligibility,
 ) -> Vec<JobPriority> {
     let params = ctx.params;
     if params.kind == PriorityType::Basic {
@@ -402,9 +424,11 @@ pub fn prioritize(
             .collect();
     }
 
-    // Raw ages, then handed out in each owner's order.
+    // Raw ages, then pooled and handed out in each owner's order.
+    let eligibility: HashMap<JobId, Eligibility> =
+        candidates.iter().map(|j| (j.id, eligibility(j))).collect();
     let age_of = |job: &Job| -> f64 {
-        let Some(since) = eligible_since(job) else {
+        let Some(since) = eligibility[&job.id].since else {
             return 0.0;
         };
         if params.max_age_ms <= 0 {
@@ -420,19 +444,23 @@ pub fn prioritize(
     let mut rank: HashMap<JobId, usize> = HashMap::with_capacity(candidates.len());
     for jobs in by_owner.values_mut() {
         jobs.sort_by(|a, b| owner_order(a, b));
-        // Only eligible jobs trade ages; the others stay at 0.
-        let eligible: Vec<&Job> = jobs
+        // Only jobs that could launch now pool their ages; the others keep
+        // their own (0 while a dependency is unfinished).
+        let pooled: Vec<&Job> = jobs
             .iter()
             .copied()
-            .filter(|job| eligible_since(job).is_some())
+            .filter(|job| {
+                let e = eligibility[&job.id];
+                e.launchable && e.since.is_some()
+            })
             .collect();
-        let mut ages: Vec<f64> = eligible.iter().map(|job| age_of(job)).collect();
+        let mut ages: Vec<f64> = pooled.iter().map(|job| age_of(job)).collect();
         ages.sort_by(|a, b| b.total_cmp(a));
-        for (job, age_value) in eligible.iter().zip(ages) {
+        for (job, age_value) in pooled.iter().zip(ages) {
             age.insert(job.id, age_value);
         }
         for (i, job) in jobs.iter().enumerate() {
-            age.entry(job.id).or_insert(0.0);
+            age.entry(job.id).or_insert_with(|| age_of(job));
             rank.insert(job.id, i);
         }
     }

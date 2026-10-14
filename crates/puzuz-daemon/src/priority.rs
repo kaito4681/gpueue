@@ -243,18 +243,18 @@ impl Core {
             .read(move |s| {
                 let jobs = s.list_unfinished_jobs()?;
                 let groups = s.list_groups()?;
-                let gpus = s
+                let gpus: Vec<_> = s
                     .list_gpus()?
                     .into_iter()
                     .filter(|gpu| core.gpu_available(gpu.index))
-                    .count();
+                    .collect();
                 let input = PriorityInput {
                     params: &core.priority_params,
                     fairshare: &fairshare,
-                    resources: core.priority_resources(gpus),
+                    resources: core.priority_resources(gpus.len()),
                 };
                 Ok(scheduler::pending_priorities(
-                    now, &jobs, &groups, &reserved, &input,
+                    now, &jobs, &groups, &gpus, &reserved, &input,
                 ))
             })
             .await?;

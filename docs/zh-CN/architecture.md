@@ -231,7 +231,7 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 [docs/install.md](install.md#priority-and-fair-share)）。其工作划分与调度器的其他部分相同：
 
 - `puzuz-core::priority` 是纯逻辑的：各因子、公式、所有者自己的顺序（top、`-o` 优先级、id；通过按此顺序
-  分配用户可开始作业的等待时间来实现）、经典的 fair-share 因子 `2^(-U/S)`、衰减、作业的计费以及重置周期的边界
+  分配用户现在就能启动（组存在且未暂停、GPU 已检测到、依赖已完成）的作业汇总起来的等待时间来实现）、经典的 fair-share 因子 `2^(-U/S)`、衰减、作业的计费以及重置周期的边界
   （根据守护进程传入的本地 UTC 偏移计算）。`scheduler::plan_prioritized` 用它对候选作业排序，然后原样应用
   通常的槽位、暂停和依赖规则，因此放不下的高优先级作业永远不会阻塞排在它后面的作业。`plan`/`plan_with`
   保持 pueue 的顺序（也用于 `priority_type = "basic"`）。`scheduler::pending_priorities`（`puzuz prio`

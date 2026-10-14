@@ -305,7 +305,8 @@ The order of queued jobs is Slurm's multifactor priority (the formula and settin
 scheduler:
 
 - `puzuz-core::priority` is pure: the factors, the formula, the owner's order (top, `-o`
-  priority, id; applied by handing out the ages of a user's eligible jobs in that order), the
+  priority, id; applied by pooling the ages of a user's jobs that could launch now, i.e. group
+  present and not paused, GPUs detected, dependencies done, and handing them out in that order), the
   classic fair-share
   factor `2^(-U/S)`, the decay, the billing of a job and the reset-period boundaries (computed
   from the local UTC offset the daemon passes in). `scheduler::plan_prioritized` orders the
