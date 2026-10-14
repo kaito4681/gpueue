@@ -1700,12 +1700,14 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
     }
 
     /// Writes the request of [`crate::access::run_restore_hook`] for this
-    /// restore and returns the `--action-script` that runs it.
+    /// restore and returns the `--action-script` that runs it. `stop`: the
+    /// hook also stops the tasks before CRIU lets them go.
     fn prepare_restore_check(
         &self,
         record: &JobRecord,
         files: &JobFiles,
         allowed_gids: Vec<u32>,
+        stop: bool,
     ) -> Result<String, String> {
         use std::os::unix::fs::MetadataExt;
         let exempt = fs::metadata(files.exit_status())
@@ -1726,6 +1728,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             .and_then(|b| serde_json::from_slice::<SavedMounts>(&b).ok())
             .map(|m| m.held_files().to_vec())
             .unwrap_or_default(),
+            stop,
         };
         let request = files.dir().join(RESTORE_CHECK_FILE);
         let _ = fs::remove_file(crate::access::hook_result_path(&request));
@@ -1819,8 +1822,12 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         let mut ck = self.cfg.checkpoint.clone();
         ck.mode = meta.mode;
         // CRIU resumes the restored tasks only after this hook has checked
-        // what it opened for them (see `crate::access`).
-        match self.prepare_restore_check(&record, &files, allowed_gids) {
+        // what it opened for them (see `crate::access`). A job that stays
+        // paused is stopped by the hook instead, so it does not run at all:
+        // CRIU's own `--leave-stopped` would stop the tasks before its CUDA
+        // plugin restores them, which then cannot work.
+        let stopped = req.leave_stopped;
+        match self.prepare_restore_check(&record, &files, allowed_gids, stopped) {
             Ok(script) => {
                 ck.criu.extra_restore_args.push("--action-script".into());
                 ck.criu.extra_restore_args.push(script.into());
@@ -1978,13 +1985,32 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             let saved = meta.gpus.clone();
             let ck2 = ck.clone();
             let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                let host_pids = host.resolve_ns_pids(pid, &wanted)?;
+                let mut host_pids = Vec::new();
+                for p in host.resolve_ns_pids(pid, &wanted)? {
+                    if !host_pids.contains(&p) {
+                        host_pids.push(p);
+                    }
+                }
                 let map = device_map(&*host, &saved, &gpus)?;
-                let steps = plan::restore_cuda_plan(&ck2, &host_pids, map.as_ref());
-                let mut exec = factory();
-                run_plan_until(&mut *exec, steps, Some(&deadline))
-                    .map(|_| ())
-                    .map_err(|f| format!("CUDA restore failed: {f}"))
+                let run = |steps| {
+                    let mut exec = factory();
+                    run_plan_until(&mut *exec, steps, Some(&deadline))
+                        .map(|_| ())
+                        .map_err(|f| format!("CUDA restore failed: {f}"))
+                };
+                if !stopped {
+                    return run(plan::restore_cuda_plan(&ck2, &host_pids, map.as_ref()));
+                }
+                // The tree is stopped (by the restore hook): only the
+                // threads that serve cuda-checkpoint run meanwhile.
+                let mut steps = Some(plan::restore_cuda_plan_stopped(
+                    &ck2,
+                    &host_pids,
+                    map.as_ref(),
+                ));
+                host.with_cuda_threads_running(&host_pids, &mut || {
+                    run(steps.take().unwrap_or_default())
+                })
             })
             .await
             .unwrap_or_else(|e| Err(format!("restore task panicked: {e}")));
@@ -1995,6 +2021,10 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 let _ = self.launcher.release(&unit).await;
                 return fail(self, past_deadline(reason));
             }
+        }
+
+        if stopped {
+            self.confirm_stopped(job, &unit, pid).await;
         }
 
         record.phase = RecordPhase::Live;
@@ -2018,13 +2048,49 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         }
         if let Some(e) = self.table().get_mut(&job) {
             e.record = record;
-            e.phase = Phase::Running;
+            e.phase = if stopped {
+                Phase::Stopped
+            } else {
+                Phase::Running
+            };
             e.pid = Some(pid);
         }
         if let Err(e) = dir.remove() {
             eprintln!("puzuz-helper: removing the image of job {}: {e}", job.0);
         }
-        RestoreOutcome::Success { pid }
+        RestoreOutcome::Success { pid, stopped }
+    }
+
+    /// A restore that was to leave the job stopped: every thread of it
+    /// should be stopped by now (the restore hook stopped the tree before
+    /// CRIU let it go). Should one not be, after a moment to settle, the
+    /// job is stopped the way `pause` stops it.
+    async fn confirm_stopped(&self, job: JobId, unit: &str, init: u32) {
+        let mut running = Vec::new();
+        for _ in 0..100 {
+            running = match self.host.unstopped_threads(init) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!(
+                        "puzuz-helper: checking that the restored job {} is stopped: {e}",
+                        job.0
+                    );
+                    return;
+                }
+            };
+            if running.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        eprintln!(
+            "puzuz-helper: threads {running:?} of the restored job {} are not stopped; \
+             stopping it",
+            job.0
+        );
+        if let Err(e) = self.launcher.signal(unit, signal::SIGSTOP).await {
+            eprintln!("puzuz-helper: stopping the restored job {}: {e}", job.0);
+        }
     }
 
     // -- shutdown ---------------------------------------------------------

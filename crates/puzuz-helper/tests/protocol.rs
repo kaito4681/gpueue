@@ -733,6 +733,7 @@ async fn checkpoint_then_restore() {
             uid: Uid(uid),
             image_dir: image_dir.clone(),
             gpus: vec![GpuIndex(0)],
+            leave_stopped: false,
         })
     };
     assert_eq!(
@@ -763,13 +764,17 @@ async fn checkpoint_then_restore() {
     assert_eq!(c.request(restore(uid())).await, ResponseResult::Accepted);
     let ev = c.event().await;
     let Event::RestoreFinished {
-        outcome: RestoreOutcome::Success { pid },
+        outcome: RestoreOutcome::Success {
+            pid,
+            stopped: false,
+        },
         ..
     } = ev.event
     else {
         panic!("{ev:?}")
     };
     assert_eq!(c.running().await, [(job, RunningPhase::Running)]);
+    assert!(env.host.cuda_released().is_empty());
     assert_eq!(env.launcher.unit(job).unwrap().pid, pid);
     assert_eq!(
         dir.status(),
@@ -852,6 +857,7 @@ async fn units_may_open_only_their_gpus() {
             uid: Uid(uid()),
             image_dir,
             gpus: vec![GpuIndex(1), GpuIndex(0)],
+            leave_stopped: false,
         }))
         .await;
     assert_eq!(r, ResponseResult::Accepted);
@@ -903,6 +909,132 @@ async fn units_may_open_only_their_gpus() {
     assert_eq!(env.launcher.spawned()[3].devices, None);
 }
 
+/// A job paused (stopped) when it was dumped is restored stopped when the
+/// daemon asks for it: the restore hook stops the tasks before CRIU lets
+/// them go, the CUDA state is restored with only the restore threads
+/// running (no runnable check, which a stopped process fails), and the
+/// helper sends no signal of its own. A later SIGCONT resumes it, and its
+/// exit is reported as usual.
+#[tokio::test]
+async fn a_job_paused_at_its_dump_is_restored_stopped() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let job = JobId(3);
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(3))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    let signal_job = |signal| Request::Signal { job, signal };
+    assert_eq!(
+        c.request(signal_job(signal::SIGSTOP)).await,
+        ResponseResult::Ok
+    );
+    env.host.set_cuda_pids(vec![10_001]);
+    let image_dir = env.base().join("3");
+    let r = c
+        .request(Request::Checkpoint {
+            job,
+            image_dir: image_dir.clone(),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    assert!(matches!(
+        c.event().await.event,
+        Event::CheckpointFinished {
+            outcome: CheckpointOutcome::Success { .. },
+            ..
+        }
+    ));
+    env.exec.lock().unwrap().actions.clear();
+
+    let r = c
+        .request(Request::Restore(RestoreRequest {
+            job,
+            uid: Uid(uid()),
+            image_dir,
+            gpus: vec![GpuIndex(0)],
+            leave_stopped: true,
+        }))
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    let Event::RestoreFinished {
+        outcome: RestoreOutcome::Success { pid, stopped: true },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert_eq!(c.running().await, [(job, RunningPhase::Stopped)]);
+    let check: puzuz_helper::access::RestoredCheck = serde_json::from_slice(
+        &std::fs::read(env.root.join("state/jobs/3/restore-check.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(check.stop, "the restore hook stops the tasks");
+    assert_eq!(env.host.cuda_released(), [vec![pid]]);
+    assert_eq!(
+        env.exec.lock().unwrap().actions,
+        [
+            Some(Action::CudaRestore { pid }),
+            Some(Action::CudaUnlock { pid }),
+        ]
+    );
+    let unit = env.launcher.unit(job).unwrap();
+    assert_eq!(unit.name, "puzuz-job-3-r1.service");
+    assert!(unit.signals.is_empty(), "{:?}", unit.signals);
+
+    // `puzuz start`.
+    assert_eq!(
+        c.request(signal_job(signal::SIGCONT)).await,
+        ResponseResult::Ok
+    );
+    assert_eq!(c.running().await, [(job, RunningPhase::Running)]);
+    assert_eq!(env.launcher.unit(job).unwrap().signals, [signal::SIGCONT]);
+    env.launcher.exit(job, ExitStatus::Exited { code: 0 });
+    assert!(matches!(
+        c.event().await.event,
+        Event::JobExited {
+            status: ExitStatus::Exited { code: 0 },
+            ..
+        }
+    ));
+}
+
+/// Should a task of a job restored stopped still run once `criu restore`
+/// is done, the helper stops the job itself.
+#[tokio::test]
+async fn a_restored_job_that_did_not_stop_is_stopped() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 5).await;
+    env.host.set_unstopped_threads(vec![(10_005, 10_006)]);
+    let Request::Restore(mut req) = restore_req(5, &image_dir) else {
+        unreachable!()
+    };
+    req.leave_stopped = true;
+    assert_eq!(
+        c.request(Request::Restore(req)).await,
+        ResponseResult::Accepted
+    );
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::RestoreFinished {
+                outcome: RestoreOutcome::Success { stopped: true, .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    assert_eq!(c.running().await, [(JobId(5), RunningPhase::Stopped)]);
+    assert_eq!(
+        env.launcher.unit(JobId(5)).unwrap().signals,
+        [signal::SIGSTOP]
+    );
+}
+
 /// Spawns job `job` and checkpoints it successfully; the image directory.
 async fn spawn_and_dump(env: &Env, c: &mut Client, job: u64) -> PathBuf {
     assert!(matches!(
@@ -938,6 +1070,7 @@ fn restore_req(job: u64, image_dir: &Path) -> Request {
         uid: Uid(uid()),
         image_dir: image_dir.to_owned(),
         gpus: vec![GpuIndex(0)],
+        leave_stopped: false,
     })
 }
 
@@ -1405,6 +1538,7 @@ async fn restore_uses_the_mode_of_the_image() {
                 uid: Uid(uid()),
                 image_dir,
                 gpus: vec![GpuIndex(0)],
+                leave_stopped: false,
             }))
             .await;
         assert_eq!(r, ResponseResult::Accepted);
@@ -2052,6 +2186,7 @@ async fn shutdown_checkpoints_everything_except_no_checkpoint_jobs() {
                 uid: Uid(uid()),
                 image_dir: env.base().join("10"),
                 gpus: vec![],
+                leave_stopped: false,
             }))
             .await
         ),
@@ -2144,6 +2279,7 @@ async fn concurrent_spawns_and_restores() {
             uid: Uid(uid()),
             image_dir: env.base().join(r.to_string()),
             gpus: vec![GpuIndex(0)],
+            leave_stopped: false,
         }));
         requests.push(Request::Spawn(env.spawn_req(s)));
         requests.push(Request::ListRunning);
@@ -2236,6 +2372,7 @@ async fn a_stopping_helper_abandons_queued_launches_and_refuses_new_ones() {
                 uid: Uid(uid()),
                 image_dir: env.base().join("7"),
                 gpus: vec![],
+                leave_stopped: false,
             }))
             .await
         ),
@@ -2284,6 +2421,7 @@ async fn a_stopping_helper_reports_an_abandoned_restore_as_not_started() {
         uid: Uid(uid()),
         image_dir,
         gpus: vec![],
+        leave_stopped: false,
     });
     assert_eq!(c.request(request).await, ResponseResult::Accepted);
     tokio::time::sleep(Duration::from_millis(100)).await;

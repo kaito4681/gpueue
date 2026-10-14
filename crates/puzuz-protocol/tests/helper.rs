@@ -114,9 +114,23 @@ fn other_requests_golden() {
                 uid: Uid(1000),
                 image_dir: "/var/lib/puzuz/checkpoints/7".into(),
                 gpus: vec![GpuIndex(0)],
+                leave_stopped: false,
             }),
         ),
         r#"{"type":"request","id":4,"op":"restore","job":7,"uid":1000,"image_dir":"/var/lib/puzuz/checkpoints/7","gpus":[0]}"#,
+    );
+    assert_golden_line(
+        &request(
+            4,
+            Request::Restore(RestoreRequest {
+                job: JobId(7),
+                uid: Uid(1000),
+                image_dir: "/var/lib/puzuz/checkpoints/7".into(),
+                gpus: vec![],
+                leave_stopped: true,
+            }),
+        ),
+        r#"{"type":"request","id":4,"op":"restore","job":7,"uid":1000,"image_dir":"/var/lib/puzuz/checkpoints/7","gpus":[],"leave_stopped":true}"#,
     );
     assert_golden_line(
         &request(5, Request::ListRunning),
@@ -240,6 +254,27 @@ fn events_golden() {
         ),
         r#"{"type":"event","seq":43,"event":"restore_finished","job":7,"outcome":{"result":"failed","reason":"GPU model changed"}}"#,
     );
+    for (stopped, golden) in [
+        (
+            false,
+            r#"{"type":"event","seq":47,"event":"restore_finished","job":7,"outcome":{"result":"success","pid":42}}"#,
+        ),
+        (
+            true,
+            r#"{"type":"event","seq":47,"event":"restore_finished","job":7,"outcome":{"result":"success","pid":42,"stopped":true}}"#,
+        ),
+    ] {
+        assert_golden_line(
+            &event(
+                47,
+                Event::RestoreFinished {
+                    job: JobId(7),
+                    outcome: RestoreOutcome::Success { pid: 42, stopped },
+                },
+            ),
+            golden,
+        );
+    }
     assert_golden_line(
         &event(
             44,
@@ -478,6 +513,7 @@ fn variant_samples() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             uid: Uid(1000),
             image_dir: "/i".into(),
             gpus: vec![],
+            leave_stopped: false,
         }),
         Request::DeleteCheckpoint {
             job,
@@ -525,7 +561,10 @@ fn variant_samples() -> Vec<(&'static str, &'static str, serde_json::Value)> {
         out.push(("CheckpointOutcome", "result", json(outcome)));
     }
     for outcome in [
-        RestoreOutcome::Success { pid: 1 },
+        RestoreOutcome::Success {
+            pid: 1,
+            stopped: false,
+        },
         RestoreOutcome::failed("x"),
     ] {
         out.push(("RestoreOutcome", "result", json(outcome)));

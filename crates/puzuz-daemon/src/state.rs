@@ -1671,6 +1671,7 @@ impl Core {
             uid: job.owner,
             image_dir: self.image_dir(job.id),
             gpus: job.spec.gpus.clone(),
+            leave_stopped: false,
         };
         match self.helper.restore(request).await {
             Ok(()) => Ok(()),

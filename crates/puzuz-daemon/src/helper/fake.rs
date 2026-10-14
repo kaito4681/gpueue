@@ -603,7 +603,10 @@ impl FakeHelper {
                             },
                         );
                         s.launched.insert(job, (request.uid, request.gpus.clone()));
-                        RestoreOutcome::Success { pid }
+                        RestoreOutcome::Success {
+                            pid,
+                            stopped: false,
+                        }
                     }
                     FakeOutcome::Fail(reason) | FakeOutcome::Refuse(reason) => {
                         RestoreOutcome::failed(reason)
