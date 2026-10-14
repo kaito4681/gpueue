@@ -161,9 +161,40 @@ ALTER TABLE checkpoints
     ADD COLUMN paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1));
 "#;
 
+/// Version 6: multifactor priority (see [`crate::priority`]).
+///
+/// - `jobs.nice` (subtracted from the priority), `jobs.site_factor` (added
+///   by administrators) and `jobs.top_seq` (set by `puzuz top`; `NULL` for
+///   jobs never moved to the top). Existing jobs keep their `priority`,
+///   which now orders their owner's jobs only.
+/// - `groups.priority`, the partition factor's input.
+/// - `user_shares`: shares set by administrators (users without a row have
+///   the default, 1).
+/// - `user_usage`: decayed usage per user in billing-seconds. `REAL`
+///   because decay makes it fractional.
+/// - `meta` gains `usage_calc_at`, `usage_reset_at` and `next_top_seq`
+///   when they are first needed.
+/// - `jobs_by_finished_at` finds the jobs that finished since the last
+///   usage calculation without reading the whole history.
+const V6: &str = r#"
+ALTER TABLE jobs ADD COLUMN nice INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN site_factor INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN top_seq INTEGER CHECK (top_seq >= 0);
+CREATE INDEX jobs_by_finished_at ON jobs (finished_at);
+ALTER TABLE groups ADD COLUMN priority INTEGER NOT NULL DEFAULT 0 CHECK (priority >= 0);
+CREATE TABLE user_shares (
+    uid    INTEGER PRIMARY KEY NOT NULL,
+    shares INTEGER NOT NULL CHECK (shares >= 0)
+) STRICT;
+CREATE TABLE user_usage (
+    uid   INTEGER PRIMARY KEY NOT NULL,
+    usage REAL NOT NULL CHECK (usage >= 0)
+) STRICT;
+"#;
+
 /// All migrations, in order. The schema version after migrating is
 /// `MIGRATIONS.len()`.
-pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
+pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
 
 /// The schema version this build of puzuz writes.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

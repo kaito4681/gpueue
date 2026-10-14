@@ -21,6 +21,7 @@ fn spec(command: &str) -> JobSpec {
         priority: 0,
         label: None,
         no_checkpoint: false,
+        nice: 0,
     }
 }
 
@@ -40,6 +41,7 @@ fn full_spec() -> JobSpec {
         priority: -5,
         label: Some("exp-42".to_owned()),
         no_checkpoint: true,
+        nice: 0,
     }
 }
 
@@ -717,6 +719,7 @@ fn default_group_exists_after_migration() {
             name: DEFAULT_GROUP.to_owned(),
             parallel: 1,
             paused: false,
+            priority: 0,
         }]
     );
 }
@@ -730,7 +733,8 @@ fn group_create_configure_and_list() {
         Group {
             name: "gpu".to_owned(),
             parallel: 2,
-            paused: false
+            paused: false,
+            priority: 0,
         }
     );
     assert!(matches!(
@@ -746,7 +750,8 @@ fn group_create_configure_and_list() {
         Group {
             name: "gpu".to_owned(),
             parallel: 8,
-            paused: true
+            paused: true,
+            priority: 0,
         }
     );
     store.set_group_paused("gpu", false).unwrap();
@@ -1519,4 +1524,166 @@ fn version_three_database_flattens_job_results() {
         .unwrap();
     assert_eq!(running, r#"{"state":"running"}"#);
     assert_eq!(store.next_job_id().unwrap(), JobId(old_rows.len() as u64));
+}
+
+// ----- multifactor priority -----
+
+#[test]
+fn version_five_database_gains_priority_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    {
+        let conn = Connection::open(&path).unwrap();
+        for sql in &migrations::MIGRATIONS[..5] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO groups (name, parallel, paused) VALUES ('gpu', 2, 1);
+               INSERT INTO jobs (id, owner_uid, command, cwd, group_name, priority, state,
+                                 state_data, created_at)
+               VALUES (0, 1000, 'x', x'2f', 'gpu', 7, 'queued',
+                       '{"state":"queued","enqueued_at":5}', 1);
+               UPDATE meta SET value = 1 WHERE key = 'next_job_id';"#,
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let job = store.get_job(JobId(0)).unwrap().unwrap();
+    // The old priority is kept (it now orders the owner's jobs).
+    assert_eq!(job.spec.priority, 7);
+    assert_eq!(job.spec.nice, 0);
+    assert_eq!(job.site_factor, 0);
+    assert_eq!(job.top_seq, None);
+    let group = store.get_group("gpu").unwrap().unwrap();
+    assert_eq!((group.parallel, group.paused, group.priority), (2, true, 0));
+    assert!(store.list_user_shares().unwrap().is_empty());
+    assert!(store.list_user_usage().unwrap().is_empty());
+    assert_eq!(store.usage_calc_at().unwrap(), None);
+    assert_eq!(store.usage_reset_at().unwrap(), None);
+}
+
+#[test]
+fn nice_site_factor_and_top_are_stored() {
+    let store = Store::open_in_memory().unwrap();
+    let mut s = spec("a");
+    s.nice = 5;
+    let a = store.insert_job(Uid(1), &s, &queued(0), 0).unwrap();
+    assert_eq!(a.spec.nice, 5);
+    let b = store.insert_job(Uid(1), &spec("b"), &queued(0), 0).unwrap();
+    let c = store.insert_job(Uid(1), &spec("c"), &queued(0), 0).unwrap();
+    assert_eq!(store.get_job(a.id).unwrap().unwrap().spec.nice, 5);
+
+    store.set_job_nice(a.id, -3).unwrap();
+    store.set_job_site_factor(b.id, 100).unwrap();
+    assert_eq!(store.get_job(a.id).unwrap().unwrap().spec.nice, -3);
+    assert_eq!(store.get_job(b.id).unwrap().unwrap().site_factor, 100);
+    assert_domain(
+        store.set_job_nice(JobId(99), 1).unwrap_err(),
+        Error::JobNotFound(JobId(99)),
+    );
+    assert_domain(
+        store.set_job_site_factor(JobId(99), 1).unwrap_err(),
+        Error::JobNotFound(JobId(99)),
+    );
+
+    // The first id gets the highest sequence number; later calls go above.
+    store.move_jobs_to_top(&[b.id, a.id]).unwrap();
+    let seq = |id| store.get_job(id).unwrap().unwrap().top_seq;
+    assert!(seq(b.id) > seq(a.id));
+    assert_eq!(seq(c.id), None);
+    store.move_jobs_to_top(&[c.id]).unwrap();
+    assert!(seq(c.id) > seq(b.id));
+    // A missing job changes nothing.
+    let before = (seq(a.id), seq(b.id), seq(c.id));
+    assert_domain(
+        store.move_jobs_to_top(&[a.id, JobId(99)]).unwrap_err(),
+        Error::JobNotFound(JobId(99)),
+    );
+    assert_eq!((seq(a.id), seq(b.id), seq(c.id)), before);
+
+    // They move with the job on `switch`.
+    let (top_b, top_c) = (seq(b.id), seq(c.id));
+    store.swap_job_ids(b.id, c.id).unwrap();
+    assert_eq!(seq(b.id), top_c);
+    assert_eq!(seq(c.id), top_b);
+    assert_eq!(store.get_job(c.id).unwrap().unwrap().site_factor, 100);
+}
+
+#[test]
+fn group_priority_is_stored() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_group("gpu", 1).unwrap();
+    store.set_group_priority("gpu", 10).unwrap();
+    assert_eq!(store.get_group("gpu").unwrap().unwrap().priority, 10);
+    let groups = store.list_groups().unwrap();
+    assert_eq!(
+        groups.iter().map(|g| g.priority).collect::<Vec<_>>(),
+        [0, 10]
+    );
+    assert_domain(
+        store.set_group_priority("nope", 1).unwrap_err(),
+        Error::GroupNotFound("nope".into()),
+    );
+}
+
+#[test]
+fn shares_usage_and_times_are_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    {
+        let store = Store::open(&path).unwrap();
+        store.set_user_shares(Uid(1000), 3).unwrap();
+        store.set_user_shares(Uid(1001), 0).unwrap();
+        store.set_user_shares(Uid(1000), 4).unwrap();
+        store
+            .replace_user_usage(&BTreeMap::from([
+                (Uid(1000), 12.5),
+                (Uid(1001), 0.0),
+                (Uid(1002), f64::NAN),
+            ]))
+            .unwrap();
+        store.set_usage_calc_at(42).unwrap();
+        store.set_usage_reset_at(7).unwrap();
+    }
+    // Kept across restarts.
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.list_user_shares().unwrap(),
+        BTreeMap::from([(Uid(1000), 4), (Uid(1001), 0)])
+    );
+    // Zero and invalid usage is not stored.
+    assert_eq!(
+        store.list_user_usage().unwrap(),
+        BTreeMap::from([(Uid(1000), 12.5)])
+    );
+    assert_eq!(store.usage_calc_at().unwrap(), Some(42));
+    assert_eq!(store.usage_reset_at().unwrap(), Some(7));
+    store.replace_user_usage(&BTreeMap::new()).unwrap();
+    assert!(store.list_user_usage().unwrap().is_empty());
+}
+
+#[test]
+fn jobs_finished_since() {
+    let store = Store::open_in_memory().unwrap();
+    let done = JobState::Done {
+        result: JobResult::Success,
+    };
+    let a = store.insert_job(Uid(1), &spec("a"), &queued(0), 0).unwrap();
+    let b = store.insert_job(Uid(1), &spec("b"), &queued(0), 0).unwrap();
+    let _c = store.insert_job(Uid(1), &spec("c"), &queued(0), 0).unwrap();
+    store
+        .update_job_state(a.id, &done, Some(1), Some(10))
+        .unwrap();
+    store
+        .update_job_state(b.id, &done, Some(1), Some(20))
+        .unwrap();
+    let ids: Vec<JobId> = store
+        .list_jobs_finished_since(10)
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+        .collect();
+    assert_eq!(ids, [b.id]);
 }

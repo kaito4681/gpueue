@@ -9,19 +9,20 @@ fn group_row(row: &Row<'_>) -> rusqlite::Result<Group> {
         name: row.get(0)?,
         parallel: row.get(1)?,
         paused: row.get(2)?,
+        priority: row.get(3)?,
     })
 }
 
 pub(super) fn list(conn: &Connection) -> Result<Vec<Group>> {
     Ok(conn
-        .prepare_cached("SELECT name, parallel, paused FROM groups ORDER BY name")?
+        .prepare_cached("SELECT name, parallel, paused, priority FROM groups ORDER BY name")?
         .query_map([], group_row)?
         .collect::<rusqlite::Result<_>>()?)
 }
 
 pub(super) fn get(conn: &Connection, name: &str) -> Result<Option<Group>> {
     Ok(conn
-        .prepare_cached("SELECT name, parallel, paused FROM groups WHERE name = ?1")?
+        .prepare_cached("SELECT name, parallel, paused, priority FROM groups WHERE name = ?1")?
         .query_row([name], group_row)
         .optional()?)
 }
@@ -40,6 +41,7 @@ pub(super) fn create(conn: &Connection, name: &str, parallel: u32) -> Result<Gro
         name: name.to_owned(),
         parallel,
         paused: false,
+        priority: 0,
     })
 }
 
@@ -61,6 +63,13 @@ pub(super) fn set_paused(conn: &Connection, name: &str, paused: bool) -> Result<
     let changed = conn
         .prepare_cached("UPDATE groups SET paused = ?2 WHERE name = ?1")?
         .execute(params![name, paused])?;
+    not_found_if_unchanged(changed, name)
+}
+
+pub(super) fn set_priority(conn: &Connection, name: &str, priority: u32) -> Result<()> {
+    let changed = conn
+        .prepare_cached("UPDATE groups SET priority = ?2 WHERE name = ?1")?
+        .execute(params![name, priority])?;
     not_found_if_unchanged(changed, name)
 }
 
