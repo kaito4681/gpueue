@@ -1820,6 +1820,9 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             Ok(d) => d,
             Err(e) => return fail(self, e),
         };
+        // The directories the shim hid behind a tmpfs must exist again as
+        // mount points (`/run` is empty after a reboot).
+        crate::jobs::ensure_restore_mount_points(&self.cfg.mounts);
         let spec = RestoreSpec {
             job,
             unit: unit.clone(),

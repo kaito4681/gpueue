@@ -1128,6 +1128,32 @@ s18_job_policy() {
 # block device) cannot do any of it, before and after a checkpoint/restore.
 # Each way is first shown to work for the same user outside puzuz.
 E2E_DOCKER_SOCK=/run/e2e-docker.sock
+E2E_LISTENERS=
+# late_sockets <job> <n>: as root, listen on new sockets in /run/dbus and
+# /run/systemd (also journal/ and resolve/) after job <job> started, and
+# add them to the list scenario 19's job checks.
+late_sockets() {
+    local dir sock
+    for dir in /run/dbus /run/systemd /run/systemd/journal /run/systemd/resolve; do
+        mkdir -p "$dir"
+        sock=$dir/e2e-late-$2
+        rm -f "$sock"
+        python3 -c '
+import os, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+os.chmod(sys.argv[1], 0o666)
+s.listen(16)
+while True:
+    s.accept()[0].close()' "$sock" &
+        E2E_LISTENERS="$E2E_LISTENERS $!"
+        wait_for 10 "the late socket $sock" test -S "$sock"
+        runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' \
+            "$sock" || fail "eve cannot connect to $sock outside puzuz"
+        echo "$sock" >>/home/eve/e2e-late-sockets
+    done
+    echo "control: eve can connect to the late sockets (round $2) outside puzuz"
+}
 s19_no_escalation() {
     local id log dev uid gid out r
     getent group sudo >/dev/null || groupadd sudo
@@ -1136,7 +1162,7 @@ s19_no_escalation() {
     usermod -aG sudo,docker,disk eve
     uid=$(id -u eve)
     gid=$(id -g eve)
-    rm -f /home/eve/round2
+    rm -f /home/eve/round1 /home/eve/round2 /home/eve/e2e-late-sockets
 
     # A unit only root (or polkit) may start; it leaves a marker.
     cat >/etc/systemd/system/e2e-escalate.service <<'EOF'
@@ -1174,10 +1200,12 @@ EOF
     fi
 
     # systemd's Varlink services: every socket under /run/systemd except
-    # journal/, resolve/ and userdb/ must be out of a job's reach; two
-    # polkit-authorized calls are shown to work for eve outside puzuz.
+    # the kept log and resolution sockets and userdb/ must be out of a
+    # job's reach; two polkit-authorized calls are shown to work for eve
+    # outside puzuz.
     find /run/systemd -type s \
-        -not -path '/run/systemd/journal/*' -not -path '/run/systemd/resolve/*' \
+        -not -path /run/systemd/journal/socket -not -path /run/systemd/journal/stdout \
+        -not -path /run/systemd/journal/dev-log -not -path /run/systemd/resolve/io.systemd.Resolve \
         -not -path '/run/systemd/userdb/*' >/home/eve/e2e-varlink-sockets
     echo "Varlink and other sockets under /run/systemd: $(tr '\n' ' ' </home/eve/e2e-varlink-sockets)"
     rm -f /home/eve/e2e-cred-decrypt.json
@@ -1222,19 +1250,26 @@ while True:
         || fail "eve cannot open $dev outside puzuz"
     echo "control: eve can open $dev outside puzuz"
 
+    : >/home/eve/e2e-late-sockets
+    chown eve: /home/eve/e2e-late-sockets
     id=$(add eve -- "bash /e2e/escalation_checks.sh $uid $gid $E2E_DOCKER_SOCK $dev /home/eve")
     wait_state "$id" running
+    # Sockets that appear after the job started: in the spawned job ...
+    late_sockets "$id" 1
+    runuser -u eve -- touch /home/eve/round1
     wait_for 120 "the first round of checks" grep -q '^round 1 done$' "$LOGS/$uid/$id.log"
     pz eve checkpoint "$id" || fail "checkpoint"
     wait_state "$id" checkpointed 120
     pz eve restore "$id" || fail "restore"
     wait_state "$id" running 120
-    # The restored job's namespace still has the bus socket covered.
-    out=$(grep ' /run/dbus/system_bus_socket ' \
+    # The restored job's namespace still hides /run/dbus and /run/systemd.
+    out=$(grep -E ' /run/(dbus|systemd) ' \
         "/proc/$(systemctl show -p MainPID --value "puzuz-job-$id-r1.service")/mountinfo" || true)
-    echo "restored job's mount over the bus socket: $out"
-    grep -q '/systemd/inaccessible/sock /run/dbus/system_bus_socket ' <<<"$out" \
-        || fail "the restored job's namespace does not cover the system bus socket"
+    echo "restored job's mounts on /run/dbus and /run/systemd: $out"
+    grep -q ' /run/dbus .* - tmpfs ' <<<"$out" || fail "the restored job's namespace does not hide /run/dbus"
+    grep -q ' /run/systemd .* - tmpfs ' <<<"$out" || fail "the restored job's namespace does not hide /run/systemd"
+    # ... and in the restored one.
+    late_sockets "$id" 2
     runuser -u eve -- touch /home/eve/round2
     wait_state "$id" 'done/*' 120
     expect_state "$id" done/success
@@ -1268,7 +1303,13 @@ while True:
     [ "$(grep -c '^ok connect to /run/systemd/' <<<"$log")" = $((2 * $(grep -c . /home/eve/e2e-varlink-sockets))) ] \
         || fail "not every Varlink socket was tried and refused in both rounds"
     [ ! -e /run/e2e-escalated ] || fail "a job started the root-only unit"
+    # Round 1 checks the sockets created before it, round 2 all of them.
+    [ "$(grep -c '^ok late socket .* hidden$' <<<"$log")" = $((3 * $(grep -c . /home/eve/e2e-late-sockets) / 2)) ] \
+        || fail "not every late socket was hidden"
 
+    for r in $E2E_LISTENERS; do kill "$r" 2>/dev/null || true; done
+    rm -f /run/dbus/e2e-late-* /run/systemd/e2e-late-* /run/systemd/journal/e2e-late-* \
+        /run/systemd/resolve/e2e-late-*
     kill %1 2>/dev/null || true
     losetup -d "$dev" || true
     rm -f "$E2E_DOCKER_SOCK" /etc/sudoers.d/e2e-eve /etc/polkit-1/rules.d/10-e2e-sudo.rules

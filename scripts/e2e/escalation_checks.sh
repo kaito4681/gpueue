@@ -6,8 +6,9 @@
 # <detail>" otherwise, and "round <n> done" at the end of round <n>.
 #
 # Usage: escalation_checks.sh <uid> <gid> <docker socket> <block device> <home>
-# Round 1 runs at once; round n (n > 1) when <home>/round<n> appears (after
-# the job has been checkpointed and restored). The job ends after round 2.
+# Round n runs when <home>/round<n> appears: round 1 in the spawned job,
+# round 2 after the job has been checkpointed and restored. The job ends
+# after round 2.
 set -u
 
 uid=$1 gid=$2 docker_sock=$3 blockdev=$4 home=$5
@@ -83,6 +84,22 @@ s.connect(sys.argv[1])' "$sock"
     fi
     must_fail_if systemd-dissect "systemd-dissect --mount (mountfsd)" \
         systemd-dissect --mount --mkdir /usr/lib/os-release "$home/e2e-dissect"
+    # Sockets the host created after the job started (listed by the
+    # scenario before each round), in /run/dbus and /run/systemd: neither
+    # visible nor reachable.
+    while read -r sock; do
+        [ -n "$sock" ] || continue
+        if [ -e "$sock" ]; then
+            bad "late socket $sock hidden" "the job sees it"
+        else
+            ok "late socket $sock hidden"
+        fi
+        must_fail "connect to the late socket $sock" python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])' "$sock"
+    done <"$home/e2e-late-sockets"
+
     # What stays: logging and name resolution.
     [ -S /run/systemd/journal/socket ] && ok "journal socket reachable" \
         || bad "journal socket reachable" "missing"
@@ -108,8 +125,8 @@ s.connect(sys.argv[1])' "$sock"
     done
 }
 
-checks
-echo "round 1 done"
-until [ -e "$home/round2" ]; do sleep 0.2; done
-checks
-echo "round 2 done"
+for round in 1 2; do
+    until [ -e "$home/round$round" ]; do sleep 0.2; done
+    checks
+    echo "round $round done"
+done

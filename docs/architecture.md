@@ -77,10 +77,11 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    the automounted filesystems). The init makes the mounts private and mounts a fresh `/proc`. It removes mounts hidden under other mounts and mounts that do not survive a
    reboot (`/run/*`, `/media/*`), replaces each automounted filesystem stacked on its `autofs`
    mount with a plain copy, and mounts private tmpfs on `/tmp` and `/dev/shm`. Unless
-   `job_system_dbus = true`, it bind-mounts systemd's inaccessible socket node over the system
-   D-Bus socket and, unless `job_systemd_varlink = true`, hides `/run/systemd` behind a tmpfs that
-   keeps only `journal/`, `resolve/` and `userdb/`, so the job cannot ask systemd or polkit for
-   anything over D-Bus or Varlink; CRIU dumps these mounts and recreates them on restore (see
+   `job_system_dbus = true`, it hides `/run/dbus` behind an empty tmpfs and, unless
+   `job_systemd_varlink = true`, hides `/run/systemd` behind a tmpfs that holds only journald's log
+   sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/`, so the job cannot
+   ask systemd or polkit for anything over D-Bus or Varlink, also once new sockets appear there;
+   CRIU dumps these mounts and recreates them on restore (see
    [What a job can and cannot do](install.md#what-a-job-can-and-cannot-do)). Then it drops to
    the owner's
    uid, gid and groups with `no_new_privs`, opens the log

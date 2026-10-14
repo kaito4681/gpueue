@@ -150,9 +150,9 @@ pub struct Config {
     /// `CUDA_VISIBLE_DEVICES` selects the GPUs).
     pub gpu_device_isolation: bool,
     /// Let jobs reach the system D-Bus (helper only). `false` (the
-    /// default) covers `/run/dbus/system_bus_socket` in every job's mount
-    /// namespace with systemd's inaccessible socket node (the shim
-    /// bind-mounts it; CRIU recreates it on restore), so a job cannot ask systemd,
+    /// default) hides `/run/dbus` in every job's mount namespace behind an
+    /// empty tmpfs (the shim mounts it, creating the directory if needed;
+    /// CRIU recreates it on restore), so a job cannot ask systemd,
     /// polkit or other system services for anything (`systemctl`, `run0`,
     /// `pkexec`, `machinectl`, ...). polkit decides group membership from
     /// the user database, not from the job's (reduced) groups, so its
@@ -160,7 +160,8 @@ pub struct Config {
     pub job_system_dbus: bool,
     /// Let jobs reach systemd's Varlink services under `/run/systemd`
     /// (helper only). `false` (the default) hides `/run/systemd` from jobs
-    /// except `journal`, `resolve` and `userdb`: services such as
+    /// except journald's log sockets, resolved's resolution socket and
+    /// `resolv.conf` files, and `userdb`: services such as
     /// `io.systemd.Manager` (reload, reexecute), `io.systemd.Credentials`
     /// (decrypting system credentials), mountfsd, nsresourced, machined
     /// or logind authorize callers through polkit without the D-Bus

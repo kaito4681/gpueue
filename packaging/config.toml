@@ -81,15 +81,16 @@
 # selects the GPUs (needed for MIG, see docs/install.md).
 # gpu_device_isolation = true
 
-# [helper] Let jobs reach the system D-Bus. false (the default): the system bus
-# socket (/run/dbus/system_bus_socket) is covered with an inaccessible node in
-# every job's mount namespace, also after a restore, so jobs cannot ask
+# [helper] Let jobs reach the system D-Bus. false (the default): /run/dbus is
+# hidden behind an empty tmpfs in every job's mount namespace, also after a
+# restore and also for a bus socket that appears later, so jobs cannot ask
 # systemd or polkit for anything (systemctl, run0, pkexec, machinectl, ...),
 # whatever polkit rules allow the owner's groups.
 # job_system_dbus = false
 
 # [helper] Let jobs reach systemd's Varlink services. false (the default):
-# /run/systemd is hidden from jobs except journal/, resolve/ and userdb/, so
+# /run/systemd is hidden from jobs except journald's log sockets, resolved's
+# resolution socket and resolv.conf files, and userdb/, so
 # polkit-authorized Varlink methods (io.systemd.Manager reload/reexecute,
 # io.systemd.Credentials decryption, mountfsd, nsresourced, machined, ...)
 # are out of reach as well.

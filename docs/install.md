@@ -1120,8 +1120,8 @@ Every `*_secs` key is at most one year (31536000).
 | `criu_restore_timeout_secs` | unset | helper | optional cap on `criu restore` alone; unset: only the deadline applies |
 | `fork_guard` | `true` | helper | preload the fork guard into jobs (see the README's limitations) |
 | `gpu_device_isolation` | `true` | helper | each job unit may open only its assigned GPUs' device nodes (`DevicePolicy=closed`); `false` turns this off (see [GPU isolation](#gpu-isolation)) |
-| `job_system_dbus` | `false` | helper | `true` lets jobs reach the system D-Bus (systemd, polkit); by default it is inaccessible in job units (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
-| `job_systemd_varlink` | `false` | helper | `true` lets jobs reach systemd's Varlink services under `/run/systemd`; by default the directory is hidden from jobs except `journal/`, `resolve/` and `userdb/` (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
+| `job_system_dbus` | `false` | helper | `true` lets jobs reach the system D-Bus (systemd, polkit); by default `/run/dbus` is hidden from jobs (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
+| `job_systemd_varlink` | `false` | helper | `true` lets jobs reach systemd's Varlink services under `/run/systemd`; by default the directory is hidden from jobs except journald's log sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/` (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_min_uid` | `UID_MIN` of `/etc/login.defs`, else `1000` | helper | jobs of users with a smaller uid are refused (see [Who jobs may run as](#who-jobs-may-run-as)) |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | helper | root-equivalent groups: dropped from jobs' supplementary groups; a job whose primary group is one of them is refused |
 | `job_allowed_users` | `[]` (everyone) | helper | if not empty, only these users (by name) may run jobs |
@@ -1207,8 +1207,8 @@ and after a checkpoint and restore.
 | runs with its owner's uid and primary gid, never root | the helper refuses uid 0, system accounts and denied primary groups ([Who jobs may run as](#who-jobs-may-run-as)) | `job_min_uid`, `job_denied_groups`, `job_allowed_users` |
 | has no capabilities (`CapInh`, `CapPrm`, `CapEff`, `CapBnd` and `CapAmb` are all 0) and `NoNewPrivs: 1` | the shim empties the bounding set and sets `no_new_privs` before it runs the command | none |
 | cannot gain privileges with `sudo`, `su`, `pkexec` or any other setuid or file-capability program | `no_new_privs` makes the kernel ignore setuid bits and file capabilities | none |
-| cannot reach the system D-Bus, so no `systemctl`, `run0`, `machinectl`, `busctl --system` or other request to systemd, polkit or system services | the shim bind-mounts systemd's inaccessible socket node (`/run/systemd/inaccessible/sock`) over `/run/dbus/system_bus_socket` (also `/var/run/...` if separate) in the job's mount namespace, and CRIU recreates that mount on restore; polkit takes group membership from the user database, not from the job's groups, so dropping groups alone would not stop it | `job_system_dbus = true` |
-| cannot reach systemd's Varlink services (`io.systemd.Manager` reload and reexecute, `io.systemd.Credentials` decryption of system credentials, mountfsd, nsresourced, machined, logind, networkd, sysupdate, ...), which authorize unprivileged callers through polkit without D-Bus | the shim hides `/run/systemd` behind an empty tmpfs that keeps only the host's `journal/` (logging), `resolve/` (name resolution; its query monitor socket is covered) and `userdb/` (user lookups), plus an empty `system/`; CRIU saves and recreates this on restore | `job_systemd_varlink = true` |
+| cannot reach the system D-Bus, so no `systemctl`, `run0`, `machinectl`, `busctl --system` or other request to systemd, polkit or system services | the shim hides `/run/dbus` (also `/var/run/dbus` if `/var/run` is not a link to `/run`) behind an empty root-owned tmpfs in the job's mount namespace, creating the directory if the host has none yet, so a bus socket that appears later is out of reach as well; CRIU saves the tmpfs and recreates it on restore; polkit takes group membership from the user database, not from the job's groups, so dropping groups alone would not stop it | `job_system_dbus = true` |
+| cannot reach systemd's Varlink services (`io.systemd.Manager` reload and reexecute, `io.systemd.Credentials` decryption of system credentials, mountfsd, nsresourced, machined, logind, networkd, sysupdate, ...), which authorize unprivileged callers through polkit without D-Bus | the shim hides `/run/systemd` behind an empty root-owned tmpfs that holds only journald's log sockets (`journal/socket`, `journal/stdout`, `journal/dev-log`), resolved's `resolve/io.systemd.Resolve`, `resolve/stub-resolv.conf` and `resolve/resolv.conf` (bound one by one, so sockets created there later stay out of reach), the `userdb/` directory (user and group lookups only, see below) and an empty `system/`; CRIU saves and recreates this on restore | `job_systemd_varlink = true` |
 | does not have the groups `docker`, `lxd`, `incus-admin`, `libvirt`, `disk`, `sudo`, `wheel`, `admin` (root daemons' sockets, raw block devices) | the helper drops them from the supplementary groups | `job_denied_groups` |
 | cannot open device nodes except the standard pseudo devices and its assigned GPUs' | `DevicePolicy=closed` with `DeviceAllow=` ([GPU isolation](#gpu-isolation)) | `gpu_device_isolation` |
 
@@ -1216,12 +1216,18 @@ Each switch weakens one guarantee; `puzuz doctor` warns when `job_system_dbus = 
 does not limit: whatever the owner's uid itself may do (files, user services over the session bus,
 network access), the amount of CPU, memory or disk a job uses, and sockets of other services
 that check credentials on their own (for example a daemon socket that allows any user).
-Other root sockets outside `/run/systemd` stay reachable but do not grant anything to an
-unprivileged caller: `/run/systemd/private` and udev's `/run/udev/io.systemd.Udev` only accept
-root (socket modes 0700 and 0644), polkit's `/run/polkit/agent-helper.socket` only completes a
-polkit authentication that a client started over D-Bus (which a job cannot reach), and the system
-bus listens on no other address (`<listen>unix:path=/run/dbus/system_bus_socket</listen>` only).
-A Varlink service started after the job (its socket created later) is not hidden from it.
+The job's mounts are private (no propagation from the host), so a socket the host creates later
+in `/run/dbus`, in `/run/systemd` or in its `journal/` and `resolve/` subdirectories does not show
+up in the job, before or after a restore (e2e scenario 19 checks this). The one directory bound
+whole is `userdb/`: services there implement only `io.systemd.UserDatabase` (`GetUserRecord`,
+`GetGroupRecord`, `GetMemberships`), read-only lookups that `getent` answers anyway, so a socket
+added there later grants nothing. Other root sockets stay reachable but grant nothing to an
+unprivileged caller: udev's `/run/udev/io.systemd.Udev` only accepts root (socket mode 0644),
+polkit's `/run/polkit/agent-helper.socket` only completes a polkit authentication that a client
+started over D-Bus (which a job cannot reach), and the system bus listens on no other address
+(`<listen>unix:path=/run/dbus/system_bus_socket</listen>` only). Name resolution keeps working,
+but a job sees `resolv.conf` as it was when the job started (the files are bound, and resolved
+replaces them on changes).
 
 ## Priority and fair share
 
