@@ -58,10 +58,12 @@ rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../crates
       # Embedded with include_str!: unit templates, config, release key, maintainer
-      # scripts, install.sh, deb-check.sh (the last ones by the marker test).
+      # scripts, install.sh, deb-check.sh (the last ones by the marker test),
+      # get-minisign.sh (by the minisign pin test).
       ../packaging
       ../scripts/install.sh
       ../scripts/dist/deb-check.sh
+      ../scripts/dist/get-minisign.sh
       ../README.md
       ../LICENSE
       ../docs
