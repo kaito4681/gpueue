@@ -36,6 +36,7 @@ pub(crate) fn job(id: u64, state: JobState) -> JobView {
         gpus: vec![],
         dependencies: vec![],
         priority: 0,
+        nice: 0,
         label: None,
         no_checkpoint: false,
         state,
@@ -61,6 +62,7 @@ fn group(name: &str, parallel: u32, paused: bool) -> Group {
         name: name.into(),
         parallel,
         paused,
+        priority: 0,
     }
 }
 
@@ -526,4 +528,130 @@ fn state_texts() {
             "Queued"
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Priority and fair share
+// ---------------------------------------------------------------------------
+
+fn weights() -> puzuz_protocol::api::PriorityWeights {
+    puzuz_protocol::api::PriorityWeights {
+        age: 1000,
+        fairshare: 10000,
+        job_size: 0,
+        partition: 0,
+        tres: String::new(),
+    }
+}
+
+#[test]
+fn priority_table() {
+    use puzuz_core::priority::{Factors, JobPriority, PriorityType, Weighted};
+    let response = PriorityResponse {
+        priority_type: PriorityType::Multifactor,
+        weights: weights(),
+        jobs: vec![JobPriority {
+            id: JobId(4),
+            owner: Uid(2000),
+            group: "default".into(),
+            priority: 10_499.6,
+            factors: Factors::default(),
+            weighted: Weighted {
+                age: 500.4,
+                fairshare: 10_000.0,
+                ..Weighted::default()
+            },
+            site: 0,
+            nice: 1,
+        }],
+    };
+    let out = priorities(&response, &ctx());
+    assert!(
+        out.starts_with("Weights: age 1000, fairshare 10000, jobsize 0, partition 0\n"),
+        "{out}"
+    );
+    for header in [
+        "Priority",
+        "Age",
+        "Fairshare",
+        "JobSize",
+        "Partition",
+        "TRES",
+        "Nice",
+    ] {
+        assert!(out.contains(header), "{out}");
+    }
+    let row = out.lines().find(|l| l.contains("bob")).unwrap();
+    let cells: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(
+        cells,
+        [
+            "4", "bob", "default", "10500", "0", "500", "10000", "0", "0", "0", "1"
+        ]
+    );
+
+    let empty = PriorityResponse {
+        jobs: vec![],
+        ..response.clone()
+    };
+    assert!(priorities(&empty, &ctx()).ends_with("No pending jobs."));
+    let basic = PriorityResponse {
+        priority_type: PriorityType::Basic,
+        ..response
+    };
+    let out = priorities(&basic, &ctx());
+    assert!(out.contains("\"basic\""), "{out}");
+    assert!(!out.contains("Fairshare"), "{out}");
+}
+
+#[test]
+fn share_table() {
+    use puzuz_core::priority::{ResetPeriod, UserShare};
+    let response = SharesResponse {
+        users: vec![
+            UserShare {
+                uid: Uid(1000),
+                shares: 1,
+                norm_shares: 0.5,
+                raw_usage: 3600.4,
+                effective_usage: 0.75,
+                fairshare: 0.125,
+                active: true,
+            },
+            UserShare {
+                uid: Uid(2000),
+                shares: 3,
+                norm_shares: 0.75,
+                raw_usage: 0.0,
+                effective_usage: 0.0,
+                fairshare: 1.0,
+                active: false,
+            },
+        ],
+        decay_half_life_secs: 604_800,
+        calc_period_secs: 300,
+        usage_reset_period: ResetPeriod::None,
+        billing_weights: "CPU=1,GRES/gpu=10".into(),
+        usage_calc_at: None,
+    };
+    let out = shares(&response, &ctx());
+    let alice: Vec<&str> = out
+        .lines()
+        .find(|l| l.contains("alice"))
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        alice,
+        ["alice", "1", "0.500000", "3600", "0.750000", "0.125000"]
+    );
+    assert!(out.contains("bob (inactive)"), "{out}");
+    assert!(
+        out.ends_with(
+            "billing CPU=1,GRES/gpu=10), half-life 7d, recalculated every 5m, reset: none."
+        ),
+        "{out}"
+    );
+    assert_eq!(human_secs(90), "90s");
+    assert_eq!(human_secs(7200), "2h");
 }

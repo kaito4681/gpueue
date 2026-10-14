@@ -11,13 +11,13 @@ use puzuz_core::model::{DEFAULT_GROUP, Group, JobId, JobResult, JobState};
 use puzuz_protocol::api::{
     BulkJobRequest, BulkJobResponse, CleanRequest, CreateGroupRequest, EnqueueOptions, ErrorCode,
     Event, JobAction, JobSelector, JobView, KillOptions, ListJobsQuery, ListJobsResponse, LogQuery,
-    PauseOptions, ResetRequest, RestartOptions, RestoreOptions, SetGpusParallelRequest,
-    ShutdownRequest, StashOptions, SwitchRequest,
+    NiceRequest, PauseOptions, ResetRequest, RestartOptions, RestoreOptions,
+    SetGpusParallelRequest, ShutdownRequest, SiteRequest, StashOptions, SwitchRequest, TopRequest,
 };
 use puzuz_protocol::client::{Client, ClientError};
 use serde::Serialize;
 
-use crate::cli::{GpuCommand, GroupCommand, SubCommand, WaitTargetStatus};
+use crate::cli::{GpuCommand, GroupCommand, ShareCommand, SubCommand, WaitTargetStatus};
 use crate::query::Query;
 use crate::render::{self, RenderCtx, StatusInput};
 use crate::requests::{self, AddArgs};
@@ -111,6 +111,7 @@ impl App {
                 group,
                 after,
                 priority,
+                nice,
                 label,
                 print_task_id,
                 gpu,
@@ -129,6 +130,7 @@ impl App {
                     group: group.as_deref(),
                     after: &after,
                     priority,
+                    nice,
                     label: label.as_deref(),
                     gpu: &gpu,
                     no_checkpoint,
@@ -346,6 +348,37 @@ impl App {
                     .await
             }
             SubCommand::Gpu { json, cmd } => self.gpu(json, cmd).await,
+            SubCommand::Prio { task_ids, json } => self.prio(&task_ids, json).await,
+            SubCommand::Nice { task_ids, nice } => {
+                let response = self
+                    .client
+                    .nice(&NiceRequest {
+                        ids: requests::job_ids(&task_ids),
+                        nice,
+                    })
+                    .await?;
+                self.report(&response, &format!("Nice value set to {nice} for jobs"))
+            }
+            SubCommand::Top { task_ids } => {
+                let response = self
+                    .client
+                    .top(&TopRequest {
+                        ids: requests::job_ids(&task_ids),
+                    })
+                    .await?;
+                self.report(&response, "Moved to the top of their owner's queue")
+            }
+            SubCommand::Site { task_ids, site } => {
+                let response = self
+                    .client
+                    .site(&SiteRequest {
+                        ids: requests::job_ids(&task_ids),
+                        site,
+                    })
+                    .await?;
+                self.report(&response, &format!("Site factor set to {site} for jobs"))
+            }
+            SubCommand::Share { json, cmd } => self.share(json, cmd).await,
             other => Err(format!("`{}` is not implemented yet", other.name()).into()),
         }
     }
@@ -390,6 +423,13 @@ impl App {
             &self.ctx.style,
         );
         report.stdout.extend(messages.note);
+        report.print()?;
+        Ok(exit(report.ok))
+    }
+
+    /// Prints the per-job report of `nice`, `top` and `site`.
+    fn report(&self, response: &BulkJobResponse, message: &str) -> Result<ExitCode> {
+        let report = render::action_report(&response.results, message, None, &self.ctx.style);
         report.print()?;
         Ok(exit(report.ok))
     }
@@ -591,6 +631,10 @@ impl App {
                 self.client.delete_group(&name).await?;
                 outln!("Group \"{name}\" has been removed")?;
             }
+            Some(GroupCommand::Priority { name, priority }) => {
+                self.client.set_group_priority(&name, priority).await?;
+                outln!("Priority of group \"{name}\" set to {priority}")?;
+            }
         }
         Ok(ExitCode::SUCCESS)
     }
@@ -624,6 +668,44 @@ impl App {
                     }
                     None => outln!("Parallel jobs setting for all GPUs set to {parallel}")?,
                 }
+            }
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+
+    // -----------------------------------------------------------------------
+    // prio, share
+    // -----------------------------------------------------------------------
+
+    async fn prio(&self, task_ids: &[usize], json: bool) -> Result<ExitCode> {
+        let mut response = self.client.priority().await?;
+        if !task_ids.is_empty() {
+            let ids = requests::job_ids(task_ids);
+            response.jobs.retain(|job| ids.contains(&job.id));
+        }
+        if json {
+            outln!("{}", to_json(&response))?;
+        } else {
+            outln!("{}", render::priorities(&response, &self.ctx))?;
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+
+    async fn share(&self, json: bool, cmd: Option<ShareCommand>) -> Result<ExitCode> {
+        match cmd {
+            None => {
+                let response = self.client.shares().await?;
+                if json {
+                    outln!("{}", to_json(&response))?;
+                } else {
+                    outln!("{}", render::shares(&response, &self.ctx))?;
+                }
+            }
+            Some(ShareCommand::Set { user, shares }) => {
+                let uid =
+                    crate::users::uid_of(&user).ok_or_else(|| format!("unknown user {user:?}"))?;
+                self.client.set_shares(uid, shares).await?;
+                outln!("Shares of {user} set to {shares}")?;
             }
         }
         Ok(ExitCode::SUCCESS)

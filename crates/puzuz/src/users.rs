@@ -49,6 +49,17 @@ impl UserNames {
     }
 }
 
+/// The uid of a user name, or of a number given as is.
+pub fn uid_of(user: &str) -> Option<Uid> {
+    if let Ok(uid) = user.parse::<u32>() {
+        return Some(Uid(uid));
+    }
+    nix::unistd::User::from_name(user)
+        .ok()
+        .flatten()
+        .map(|user| Uid(user.uid.as_raw()))
+}
+
 fn lookup(uid: Uid) -> Option<String> {
     nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid.0))
         .ok()
