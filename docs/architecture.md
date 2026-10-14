@@ -151,8 +151,12 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    only the CUDA restore threads of the processes running, as CRIU's plugin does: it attaches to
    these threads with `ptrace`, lets them run, holds back any signal that reaches them (it is sent
    to the process again afterwards, so it stays pending), and stops and detaches them again; the
-   rest of the job stays stopped throughout. The helper reports the job as restored stopped and
-   the daemon sends it no signal. A helper that predates this resumes the job anyway, and the
+   rest of the job stays stopped throughout. It attaches only once the processes are fully
+   stopped and only to threads of those processes in the job's cgroup (checked once attached),
+   never blocks waiting for a thread, and kills the job if a thread does not stop again within a
+   few seconds. Should any thread of the job still run after the restore, the restore fails: the
+   job is killed and the image kept. The helper reports the job as restored stopped and the
+   daemon sends it no signal. A helper that predates this resumes the job anyway, and the
    daemon then stops it (SIGSTOP).
    CRIU re-opens the job's files as root by their dump-time paths, so the restore is guarded
    against an owner who changes those paths after the dump (see

@@ -1002,13 +1002,40 @@ async fn a_job_paused_at_its_dump_is_restored_stopped() {
 }
 
 /// Should a task of a job restored stopped still run once `criu restore`
-/// is done, the helper stops the job itself.
+/// is done (job code has run), the restore fails: the job is killed and
+/// the image kept for another try.
 #[tokio::test]
-async fn a_restored_job_that_did_not_stop_is_stopped() {
+async fn a_restored_job_that_did_not_stop_is_killed() {
     let env = Env::new().await;
     let mut c = env.client().await;
     let image_dir = spawn_and_dump(&env, &mut c, 5).await;
     env.host.set_unstopped_threads(vec![(10_005, 10_006)]);
+    let Request::Restore(mut req) = restore_req(5, &image_dir) else {
+        unreachable!()
+    };
+    req.leave_stopped = true;
+    assert_eq!(
+        c.request(Request::Restore(req)).await,
+        ResponseResult::Accepted
+    );
+    let ev = c.event().await;
+    let Event::RestoreFinished {
+        outcome: RestoreOutcome::Failed { reason, code: None },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert!(reason.contains("did not stop"), "{reason}");
+    assert!(reason.contains("the image is kept"), "{reason}");
+    assert!(c.running().await.is_empty());
+    assert!(env.launcher.unit(JobId(5)).is_none(), "unit released");
+    assert!(matches!(
+        CheckpointDir::for_job(&env.base(), 5).status(),
+        DirStatus::Complete(_)
+    ));
+    // It can be restored again once it stops as it should.
+    env.host.set_unstopped_threads(Vec::new());
     let Request::Restore(mut req) = restore_req(5, &image_dir) else {
         unreachable!()
     };
@@ -1029,10 +1056,6 @@ async fn a_restored_job_that_did_not_stop_is_stopped() {
         "{ev:?}"
     );
     assert_eq!(c.running().await, [(JobId(5), RunningPhase::Stopped)]);
-    assert_eq!(
-        env.launcher.unit(JobId(5)).unwrap().signals,
-        [signal::SIGSTOP]
-    );
 }
 
 /// Spawns job `job` and checkpoints it successfully; the image directory.

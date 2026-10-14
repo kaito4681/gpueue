@@ -159,10 +159,12 @@ pub trait HostProbe: Send + Sync + 'static {
             .collect())
     }
     /// Runs `restore`, the CUDA restore of the processes `cuda_pids` of a
-    /// stopped job, with only their CUDA restore threads running: the job
-    /// stays stopped and runs none of its own code (see [`crate::traced`]).
+    /// stopped job (namespace init `init_pid`), with only their CUDA restore
+    /// threads running: the job stays stopped and runs none of its own code
+    /// (see [`crate::traced`]).
     fn with_cuda_threads_running(
         &self,
+        _init_pid: u32,
         _cuda_pids: &[u32],
         restore: &mut (dyn FnMut() -> Result<(), String> + Send),
     ) -> Result<(), String> {
@@ -276,10 +278,11 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     }
     fn with_cuda_threads_running(
         &self,
+        init_pid: u32,
         cuda_pids: &[u32],
         restore: &mut (dyn FnMut() -> Result<(), String> + Send),
     ) -> Result<(), String> {
-        (**self).with_cuda_threads_running(cuda_pids, restore)
+        (**self).with_cuda_threads_running(init_pid, cuda_pids, restore)
     }
     fn unstopped_threads(&self, init_pid: u32) -> io::Result<Vec<(u32, u32)>> {
         (**self).unstopped_threads(init_pid)
@@ -602,6 +605,7 @@ impl HostProbe for SystemHost {
 
     fn with_cuda_threads_running(
         &self,
+        init_pid: u32,
         cuda_pids: &[u32],
         restore: &mut (dyn FnMut() -> Result<(), String> + Send),
     ) -> Result<(), String> {
@@ -618,7 +622,7 @@ impl HostProbe for SystemHost {
                 .map_err(|_| format!("{what} printed {:?}", out.stdout.trim()))?;
             threads.push((pid, tid));
         }
-        crate::traced::with_threads_running(&threads, restore)?
+        crate::traced::with_threads_running(init_pid, &threads, restore)?
     }
 
     fn unstopped_threads(&self, init_pid: u32) -> io::Result<Vec<(u32, u32)>> {

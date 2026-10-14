@@ -2008,7 +2008,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     &host_pids,
                     map.as_ref(),
                 ));
-                host.with_cuda_threads_running(&host_pids, &mut || {
+                host.with_cuda_threads_running(pid, &host_pids, &mut || {
                     run(steps.take().unwrap_or_default())
                 })
             })
@@ -2023,8 +2023,16 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             }
         }
 
-        if stopped {
-            self.confirm_stopped(job, &unit, pid).await;
+        // The job was to stay paused; should it run after all, it is not
+        // passed off as restored stopped: it is killed and the image kept.
+        if stopped && let Err(reason) = self.confirm_stopped(pid).await {
+            eprintln!("puzuz-helper: restore of job {}: {reason}", job.0);
+            let _ = self.launcher.signal(&unit, signal::SIGKILL).await;
+            let _ = self.launcher.release(&unit).await;
+            return fail(
+                self,
+                format!("{reason}; the restored job was killed and the image is kept"),
+            );
         }
 
         record.phase = RecordPhase::Live;
@@ -2063,34 +2071,23 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
 
     /// A restore that was to leave the job stopped: every thread of it
     /// should be stopped by now (the restore hook stopped the tree before
-    /// CRIU let it go). Should one not be, after a moment to settle, the
-    /// job is stopped the way `pause` stops it.
-    async fn confirm_stopped(&self, job: JobId, unit: &str, init: u32) {
+    /// CRIU let it go). `Err` if one still is not after a moment to settle
+    /// (then job code has run), or if this cannot be checked.
+    async fn confirm_stopped(&self, init: u32) -> Result<(), String> {
         let mut running = Vec::new();
         for _ in 0..100 {
-            running = match self.host.unstopped_threads(init) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!(
-                        "puzuz-helper: checking that the restored job {} is stopped: {e}",
-                        job.0
-                    );
-                    return;
-                }
-            };
+            running = self
+                .host
+                .unstopped_threads(init)
+                .map_err(|e| format!("checking that the restored job is stopped failed: {e}"))?;
             if running.is_empty() {
-                return;
+                return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        eprintln!(
-            "puzuz-helper: threads {running:?} of the restored job {} are not stopped; \
-             stopping it",
-            job.0
-        );
-        if let Err(e) = self.launcher.signal(unit, signal::SIGSTOP).await {
-            eprintln!("puzuz-helper: stopping the restored job {}: {e}", job.0);
-        }
+        Err(format!(
+            "threads {running:?} of the restored job did not stop although it was paused"
+        ))
     }
 
     // -- shutdown ---------------------------------------------------------

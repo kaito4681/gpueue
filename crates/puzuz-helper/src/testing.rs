@@ -189,6 +189,7 @@ impl HostProbe for FakeHost {
 
     fn with_cuda_threads_running(
         &self,
+        _init_pid: u32,
         cuda_pids: &[u32],
         restore: &mut (dyn FnMut() -> Result<(), String> + Send),
     ) -> Result<(), String> {
