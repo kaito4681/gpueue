@@ -652,8 +652,8 @@ pub enum SubCommand {
     /// (puzuz) Set the nice value of jobs (like Slurm's nice option): it is subtracted from
     /// their priority.
     ///
-    /// Users may set values of 0 or more on their own jobs; administrators may set any value,
-    /// including negative ones, on any job.
+    /// Users may only raise the nice value of their own jobs (never below 0); administrators
+    /// may set any value, including negative ones, on any job.
     #[command(allow_negative_numbers = true)]
     Nice {
         /// The ids of the jobs.
