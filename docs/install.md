@@ -1177,22 +1177,26 @@ Each factor is between 0 and 1:
 - **TRES:** for each resource weighted in `priority_weight_tres` (`CPU`, `GRES/gpu`), the job's
   request divided by the machine's total.
 
-**Usage.** Every `priority_calc_period_secs` (and when the daemon starts) the daemon adds, for
-every running job, its billing (from `tres_billing_weights`, by default 1 per CPU plus 10 per
-GPU) times the seconds it ran since the last calculation to its owner's usage, including jobs
-that finished in between. Paused, checkpointed and queued jobs are not charged, and a job is
-charged at most two periods per calculation, so time the daemon was not running is not billed.
-At the same time all usage decays with a half-life of `priority_decay_half_life_secs` (0: no
-decay). Usage is kept in the database across restarts and reset as `priority_usage_reset_period`
+**Usage.** Only the time a job spends running is billed: its billing (from
+`tres_billing_weights`, by default 1 per CPU plus 10 per GPU) times the seconds it ran is added
+to its owner's usage. A job is charged when it stops running (it is paused, checkpointed, exits,
+is killed or lost) and, while it runs, every `priority_calc_period_secs` (and when the daemon
+starts). Time spent queued, paused, checkpointed or waiting to be restored costs nothing, and one
+charge covers at most two calculation periods, so time the daemon was not running is not billed.
+Every calculation also decays all usage with a half-life of `priority_decay_half_life_secs` (0:
+no decay). The scheduler uses fair-share factors computed at each calculation and when shares
+change; a user who submits their first job in between counts as having no usage until the next
+calculation. Usage is kept in the database across restarts and reset as `priority_usage_reset_period`
 says (`"now"` resets it whenever the daemon starts; the calendar periods reset at 00:00 local
 time, weeks on Sunday). Usage below 0.001 billing-seconds is dropped.
 
 **A user's own order.** pueue's `-o/--priority`, `puzuz switch` and `puzuz top` only order the
 jobs of one user, like HTCondor's `condor_prio` and Slurm's `scontrol top`: the order is jobs
 moved to the top first (the most recent `top` first), then higher `-o` priority, then lower id.
-puzuz applies it by handing out the ages of a user's pending jobs in that order (the oldest age
-to the first job), so the sum of the user's priorities, and every other user's position, stays
-the same. Remaining ties go by the user's order, then by id. **This is a change from pueue,**
+puzuz applies it by handing out the ages of a user's pending jobs that can start (their
+dependencies are done) in that order (the oldest age to the first job), so the sum of the user's
+priorities, and every other user's position, stays the same; a job waiting for a dependency
+keeps an age of 0. Remaining ties go by the user's order, then by id. **This is a change from pueue,**
 where a higher `-o` priority wins over every other job. `priority_type = "basic"` restores
 pueue's order (higher `-o` priority first, then lower id, for all jobs; nice, site factors, `top`
 and fair share are then ignored).
@@ -1203,14 +1207,16 @@ and fair share are then ignored).
 | --- | --- | --- |
 | `puzuz prio [IDS] [--json]` | everyone | `sprio`: each pending job in scheduling order with its priority and weighted factors (no commands are shown) |
 | `puzuz share [--json]` | everyone | `sshare`: shares, normalised shares, raw and effective usage and fair-share factor per user |
-| `puzuz add --nice N`, `puzuz nice <IDS>... <N>` | owner (`N >= 0`), administrators (any `N`) | `--nice`, `scontrol update nice=` |
+| `puzuz add --nice N`, `puzuz nice <IDS>... <N>` | owner (only raising it, never below 0), administrators (any `N`) | `--nice`, `scontrol update nice=` |
 | `puzuz top <IDS>...` | owner (with `enable_user_top`), administrators | `scontrol top` |
 | `puzuz site <IDS>... <N>` | administrators | the site factor |
 | `puzuz share set <USER> <N>` | administrators | `sacctmgr modify user set fairshare=` |
 | `puzuz group priority <GROUP> <N>` | administrators | partition `PriorityJobFactor` |
 
-A restarted copy of a job keeps a nice value of 0 or more, but not a negative one or the site
-factor. `puzuz status --json` shows a job's `nice` and a group's `priority` when they are not 0.
+As in Slurm, users may only raise a nice value, so they cannot undo a value an administrator
+set. A restarted job, a copy or `restart --in-place`, keeps a nice value of 0 or more, but not a
+negative one, the site factor or its `top` position. `puzuz prio` lists exactly the jobs the
+scheduler considers, in its order. `puzuz status --json` shows a job's `nice` and a group's `priority` when they are not 0.
 
 Upgrading from a release without priorities migrates the database to schema version 6: existing
 jobs keep their `-o` priority, which from then on orders only their owner's jobs, and usage

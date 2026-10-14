@@ -272,7 +272,7 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   重复给出的依赖只记录一次。
 - **所有人：** 查看作业的存在、其所有者、组、GPU、状态、优先级、依赖和时间（`status`、`gpu`），
   等待中作业的优先级因子（`prio`）以及所有人的 fair-share 用量（`share`）。由此可以看到谁在使用哪块 GPU。
-- **所有者：** 值为 0 或以上的 `nice`，以及 `top`（除非设置了 `enable_user_top = false`）。
+- **所有者：** 调高 `nice`（不能低于 0），以及 `top`（除非设置了 `enable_user_top = false`）。
 - **仅限管理员：** `share set`、`group priority`、`site`、负值的 `nice`、对其他用户作业执行 `top`、
   `group add/remove`、`parallel`、`gpu parallel`、暂停或继续整个组
   （`pause/start/kill -g` 针对一个组，`pause/start/kill -a` 针对所有组）、

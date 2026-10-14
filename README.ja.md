@@ -293,7 +293,7 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 - **全員：** ジョブが存在すること、その所有者、グループ、GPU、状態、優先度、依存関係、時刻の閲覧
   （`status`、`gpu`）、待機中のジョブの優先度の要素（`prio`）、全員のフェアシェアの使用量（`share`）。
   これで誰がどの GPU を使っているかが分かります。
-- **所有者：** 0 以上の値での `nice` と、`top`（`enable_user_top = false` でない場合）。
+- **所有者：** `nice` を上げること（0 未満にはできません）と、`top`（`enable_user_top = false` でない場合）。
 - **管理者のみ：** `share set`、`group priority`、`site`、負の値の `nice`、他のユーザーのジョブの `top`、
   `group add/remove`、`parallel`、`gpu parallel`、グループ全体の一時停止や再開
   （1 つのグループには `pause/start/kill -g`、全グループには `pause/start/kill -a`）、`shutdown`、他の

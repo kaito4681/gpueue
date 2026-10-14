@@ -286,7 +286,7 @@ columns, and `Checkpointed` jobs show the image size.
 - **Everyone:** seeing that a job exists, its owner, group, GPUs, state, priority, dependencies and
   times (`status`, `gpu`), the priority factors of pending jobs (`prio`) and everyone's fair-share
   usage (`share`). This shows who is using which GPU.
-- **Owner:** `nice` with values of 0 or more, and `top` (unless `enable_user_top = false`).
+- **Owner:** raising `nice` (never below 0), and `top` (unless `enable_user_top = false`).
 - **Administrators only:** `share set`, `group priority`, `site`, negative `nice`, `top` of other
   users' jobs, `group add/remove`, `parallel`, `gpu parallel`, pausing or resuming
   whole groups (`pause/start/kill -g` for one group, `pause/start/kill -a` for all groups),

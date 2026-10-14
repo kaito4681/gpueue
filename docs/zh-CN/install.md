@@ -1083,18 +1083,20 @@ priority = site factor
   为组设置优先级；该因子是这个优先级除以所有组中最高的优先级（所有组的优先级都为 0 时为 0）。
 - **TRES：** 对于 `priority_weight_tres` 中加权的每种资源（`CPU`、`GRES/gpu`），作业的申请量除以机器的总量。
 
-**用量。** 每隔 `priority_calc_period_secs`（以及守护进程启动时），守护进程会针对每个运行中的作业，
-将其计费值（来自 `tres_billing_weights`，默认为每个 CPU 1 加上每块 GPU 10）乘以自上次计算以来运行的秒数，
-计入其所有者的用量，其中也包括在此期间结束的作业。暂停、已创建检查点和排队中的作业不计费，并且每次计算
-对一个作业最多计入两个周期，因此守护进程未运行的时间不会被计费。与此同时，所有用量以
-`priority_decay_half_life_secs` 为半衰期衰减（0：不衰减）。用量保存在数据库中，重启后仍然保留，并按
+**用量。** 只有作业运行的时间会被计费：作业的计费值（来自 `tres_billing_weights`，默认为每个 CPU 1 加上
+每块 GPU 10）乘以其运行的秒数，计入其所有者的用量。作业在停止运行时（被暂停、创建检查点、退出、被 kill 或
+丢失时）计费，运行期间则每隔 `priority_calc_period_secs`（以及守护进程启动时）计费一次。排队、暂停、已创建
+检查点或等待恢复的时间不计费，并且一次计费最多覆盖两个计算周期，因此守护进程未运行的时间不会被计费。
+每次计算还会让所有用量以 `priority_decay_half_life_secs` 为半衰期衰减（0：不衰减）。调度器使用在每次计算时
+以及份额变更时算出的 fair-share 因子；在此期间提交第一个作业的用户，在下一次计算之前视为没有用量。用量保存在数据库中，重启后仍然保留，并按
 `priority_usage_reset_period` 的设置重置（`"now"` 在每次守护进程启动时重置；按日历的周期在本地时间 00:00
 重置，按周的周期在周日重置）。低于 0.001 计费秒的用量会被丢弃。
 
 **用户自己的顺序。** pueue 的 `-o/--priority`、`puzuz switch` 和 `puzuz top` 只对同一个用户的作业排序，
 与 HTCondor 的 `condor_prio` 和 Slurm 的 `scontrol top` 一样：顺序是先排被移到最前面的作业（最近一次 `top`
-的在前），然后是 `-o` 优先级较高的，然后是 id 较小的。puzuz 通过按这个顺序分配该用户等待中作业的等待时间
-（最长的等待时间分给第一个作业）来实现它，因此该用户的优先级之和以及其他每个用户的位置都保持不变。剩余的
+的在前），然后是 `-o` 优先级较高的，然后是 id 较小的。puzuz 通过按这个顺序分配该用户等待中且可以开始
+（其依赖已完成）的作业的等待时间（最长的等待时间分给第一个作业）来实现它，因此该用户的优先级之和以及其他
+每个用户的位置都保持不变；等待依赖的作业的等待时间保持为 0。剩余的
 平局先按该用户的顺序、再按 id 决定。**这是与 pueue 的不同之处，**在 pueue 中，`-o` 优先级较高的作业胜过所有
 其他作业。`priority_type = "basic"` 可恢复 pueue 的顺序（对所有作业先按 `-o` 优先级从高到低、再按 id 从小到大；
 此时 nice、site 因子、`top` 和 fair share 都被忽略）。
@@ -1105,14 +1107,15 @@ priority = site factor
 | --- | --- | --- |
 | `puzuz prio [IDS] [--json]` | 所有人 | `sprio`：按调度顺序列出每个等待中的作业及其优先级和加权后的因子（不显示命令） |
 | `puzuz share [--json]` | 所有人 | `sshare`：每个用户的份额、归一化份额、原始用量和有效用量以及 fair-share 因子 |
-| `puzuz add --nice N`、`puzuz nice <IDS>... <N>` | 所有者（`N >= 0`）、管理员（任意 `N`） | `--nice`、`scontrol update nice=` |
+| `puzuz add --nice N`、`puzuz nice <IDS>... <N>` | 所有者（只能调高，不能低于 0）、管理员（任意 `N`） | `--nice`、`scontrol update nice=` |
 | `puzuz top <IDS>...` | 所有者（需 `enable_user_top`）、管理员 | `scontrol top` |
 | `puzuz site <IDS>... <N>` | 管理员 | site 因子 |
 | `puzuz share set <USER> <N>` | 管理员 | `sacctmgr modify user set fairshare=` |
 | `puzuz group priority <GROUP> <N>` | 管理员 | partition 的 `PriorityJobFactor` |
 
-作业被 restart 后得到的副本会保留 0 或以上的 nice 值，但不会保留负的 nice 值和 site 因子。
-`puzuz status --json` 会在作业的 `nice` 和组的 `priority` 不为 0 时显示它们。
+与 Slurm 一样，用户只能调高 nice 值，因此无法撤销管理员设置的值。被 restart 的作业（无论是副本还是
+`restart --in-place`）会保留 0 或以上的 nice 值，但不会保留负的 nice 值、site 因子或其 `top` 位置。
+`puzuz prio` 按调度器的顺序列出的正是调度器所考虑的作业。`puzuz status --json` 会在作业的 `nice` 和组的 `priority` 不为 0 时显示它们。
 
 从没有优先级功能的发布版本升级时，数据库会迁移到 schema 版本 6：已有作业保留其 `-o` 优先级，从此它只对
 其所有者的作业排序，用量从零开始。旧的发布版本无法打开迁移后的数据库（`puzuz update` 会拒绝安装它们）。

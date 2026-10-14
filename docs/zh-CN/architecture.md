@@ -179,16 +179,18 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 [docs/install.md](install.md#priority-and-fair-share)）。其工作划分与调度器的其他部分相同：
 
 - `puzuz-core::priority` 是纯逻辑的：各因子、公式、所有者自己的顺序（top、`-o` 优先级、id；通过按此顺序
-  分配用户的等待时间来实现）、经典的 fair-share 因子 `2^(-U/S)`、衰减、作业的计费以及重置周期的边界
+  分配用户可开始作业的等待时间来实现）、经典的 fair-share 因子 `2^(-U/S)`、衰减、作业的计费以及重置周期的边界
   （根据守护进程传入的本地 UTC 偏移计算）。`scheduler::plan_prioritized` 用它对候选作业排序，然后原样应用
   通常的槽位、暂停和依赖规则，因此放不下的高优先级作业永远不会阻塞排在它后面的作业。`plan`/`plan_with`
-  保持 pueue 的顺序（也用于 `priority_type = "basic"`）。
-- 存储中保存 `jobs.nice`、`jobs.site_factor`、`jobs.top_seq`、`groups.priority`、`user_shares` 和
-  `user_usage` 表，并在 `meta` 中保存上次计算和重置用量的时间（schema 版本 6）。
-- 守护进程在调度事务中读取份额和用量（就在它已经读取的未结束作业旁边的两个小表；不加载已结束的作业），并每隔
-  `priority_calc_period_secs` 运行一次用量任务：在一个事务中，它按自上次计算以来的时间衰减每个用户的用量，
-  加上运行中作业以及此后结束的作业（通过 `finished_at` 上的索引找到）的计费值 × 秒数，执行到期的重置，并唤醒
-  调度器。每次计算对一个作业最多计入两个周期，因此守护进程停机的时间不会被计费。
+  保持 pueue 的顺序（也用于 `priority_type = "basic"`）。`scheduler::pending_priorities`（`puzuz prio`
+  背后的实现）使用相同的候选选择，因此它列出的正是调度计划所考虑的作业。
+- 存储中保存 `jobs.nice`、`jobs.site_factor`、`jobs.top_seq`、`jobs.run_since`、`groups.priority`、
+  `user_shares` 和 `user_usage` 表，并在 `meta` 中保存上次计算和重置用量的时间（schema 版本 6）。
+- 只有运行时间会被计费。每次状态变化都经过守护进程中的同一个地方（`Core::apply_in_tx`），它在作业开始运行时
+  设置 `jobs.run_since`，在作业停止运行时于同一事务中将此后的时间计入其所有者的用量。用量任务每隔
+  `priority_calc_period_secs` 运行一次：在一个事务中，它按自上次计算以来的时间衰减每个用户的用量，对运行中的
+  作业计费到当前时刻（推进它们的 `run_since`），执行到期的重置，并重新计算 fair-share 因子，守护进程会缓存这些
+  因子。调度过程使用该缓存，不读取用量表。一次计费最多覆盖两个周期，因此守护进程停机的时间不会被计费。
 - API 增加了 `GET /v1/priority`（等待中的作业及其因子，不含命令，所有人可用）、
   `GET /v1/shares`、`PUT /v1/shares/{uid}` 和 `PUT /v1/groups/{name}/priority`（管理员），
   以及 `POST /v1/jobs/nice`、`/v1/jobs/top` 和 `/v1/jobs/site`，它们像批量端点一样按作业报告结果。
