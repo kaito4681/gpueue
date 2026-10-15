@@ -103,6 +103,14 @@ struct State {
     hold_checkpoints: bool,
     /// Checkpoint requests currently held.
     held_checkpoints: usize,
+    /// Connections so far (see [`HelperState::session`]).
+    session: u64,
+    /// How often the event numbering was reset (the epoch is one more).
+    epoch_resets: u64,
+    /// Report no event epoch, as helpers that predate it.
+    no_event_epoch: bool,
+    /// Answer `list_running` with this error, this many times.
+    list_failures: usize,
 }
 
 impl State {
@@ -137,16 +145,22 @@ impl State {
             .collect()
     }
 
-    /// Replays unacknowledged events, then reports the live jobs, as the
-    /// real helper connection does.
+    /// Starts a new session: reports it, replays unacknowledged events,
+    /// then reports the live jobs, as the real helper connection does.
     fn announce(&mut self) {
+        self.session += 1;
         let Some(tx) = &self.notices else { return };
+        let _ = tx.send(HelperNotice::Session {
+            session: self.session,
+            event_epoch: (!self.no_event_epoch).then_some(self.epoch_resets + 1),
+        });
         for event in &self.unacked {
             if tx.send(HelperNotice::Event(event.clone())).is_ok() {
                 self.delivered += 1;
             }
         }
         let _ = tx.send(HelperNotice::Connected {
+            session: self.session,
             version: "fake".to_owned(),
             running: self.running(),
         });
@@ -486,6 +500,53 @@ impl FakeHelper {
         self.with(|s| {
             s.next_seq = 0;
             s.unacked.clear();
+            s.epoch_resets += 1;
+        });
+    }
+
+    /// Report no event epoch in later sessions (`true`), as helpers that
+    /// predate it do.
+    pub fn set_no_event_epoch(&self, none: bool) {
+        self.with(|s| s.no_event_epoch = none);
+    }
+
+    /// Fail the next `count` `list_running` requests (with a timeout).
+    pub fn fail_list_running(&self, count: usize) {
+        self.with(|s| s.list_failures = count);
+    }
+
+    /// Starts a new session without the daemon having seen the previous
+    /// one end: the helper is connected again before the daemon handles
+    /// the `Disconnected` (here: before it is even sent), and nothing of
+    /// the new session has been delivered yet. Returns the notices of the
+    /// old session's end and the new session, for the test to deliver
+    /// (see [`FakeHelper::deliver`]).
+    pub fn reconnect_silently(&self) -> Vec<HelperNotice> {
+        self.with(|s| {
+            let tx = s.notices.take();
+            let (capture, mut rx) = mpsc::unbounded_channel();
+            s.notices = Some(capture);
+            let _ = s.notices.as_ref().unwrap().send(HelperNotice::Disconnected);
+            s.connected = true;
+            s.lose_held = false;
+            s.announce();
+            s.notices = tx;
+            let mut captured = Vec::new();
+            while let Ok(notice) = rx.try_recv() {
+                captured.push(notice);
+            }
+            captured
+        })
+    }
+
+    /// Sends `notices` on the notice channel.
+    pub fn deliver(&self, notices: Vec<HelperNotice>) {
+        self.with(|s| {
+            if let Some(tx) = &s.notices {
+                for notice in notices {
+                    let _ = tx.send(notice);
+                }
+            }
         });
     }
 
@@ -727,6 +788,7 @@ impl Helper for FakeHelper {
         let connected = self.with(|s| s.connected);
         HelperState {
             connected,
+            session: self.with(|s| s.session),
             version: connected.then(|| "fake".to_owned()),
             missing_programs: Vec::new(),
             programs: Vec::new(),
@@ -787,7 +849,14 @@ impl Helper for FakeHelper {
     }
 
     fn list_running(&self) -> BoxFuture<'_, HelperResult<Vec<RunningJob>>> {
-        let result = self.with(|s| s.check_connected().map(|()| s.running()));
+        let result = self.with(|s| {
+            s.check_connected()?;
+            if s.list_failures > 0 {
+                s.list_failures -= 1;
+                return Err(HelperError::Timeout);
+            }
+            Ok(s.running())
+        });
         async move { result }.boxed()
     }
 

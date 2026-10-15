@@ -63,12 +63,21 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    Events are persisted and replayed until the daemon acknowledges them, so nothing is lost while
    the daemon is down. The daemon stores the number of the last event it applied with its effect
    and skips replayed events up to it, so an event is applied once even if the daemon stopped
-   before acknowledging it. A replay that ends below that number comes from a helper whose state
-   was reset (its numbering started over), so its events are applied. An event it cannot decode (from a newer helper) is logged and
+   before acknowledging it. An event the daemon cannot record (its database is busy, full or
+   failing) is not acknowledged: the daemon tries it again, waiting longer each time, and applies
+   the events after it only once it is recorded. The helper's Hello carries the epoch of its
+   event numbering, which changes when the helper's state is wiped and its numbering starts
+   over; the daemon then applies the helper's events as new, whatever their numbers. (From a
+   helper that reports no epoch, a replay that ends below the last number applied is taken for
+   such a reset.) An event it cannot decode (from a newer helper) is logged and
    acknowledged rather than ending the connection. After a reconnect both sides reconcile their
    lists of jobs: a job the helper no longer runs is lost, and a job the daemon believes is being
    checkpointed but the helper runs normally lost its checkpoint request and goes back to running
-   (or paused) with a failed checkpoint. If that checkpoint request is still unanswered, or was
+   (or paused) with a failed checkpoint. Should the outcome of that dump arrive after all (the
+   helper resumes a job before it reports a failed dump), it is applied: a dump CRIU attempted
+   terminates the job, as after any failed dump, and a refused one leaves it alone. The daemon
+   launches jobs only once it has reconciled the current connection; should the helper not
+   answer its request for the live jobs, it asks again. If that checkpoint request is still unanswered, or was
    answered since the previous reconnect, the list may predate it, so the daemon checks again once
    the answer is in. A checkpoint request that times out is followed up the same way. Before the daemon marks a job lost because the helper no longer knows it, it applies
    every event the helper sent before saying so, so a job that has just exited keeps its result.
@@ -147,7 +156,8 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    the job as checkpointed); it finalizes the image before restoring it or when it starts again,
    also after a crash between the dump and the marker, even if systemd still reports the dumped
    unit as active. If the dump fails, CRIU
-   leaves the process running and the daemon then terminates it. The helper moves CRIU's
+   leaves the process running and the daemon then terminates it. A failed dump with an error
+   code the daemon does not know (from a newer helper) counts as refused: the job keeps running. The helper moves CRIU's
    `dump.log` to `/var/lib/gpueue/checkpoints/failed-logs/` and removes the image directory.
    A **paused** job is resumed (SIGCONT) before the dump, because cuda-checkpoint hangs on a
    stopped process, so it runs for a moment during the dump. The daemon records in the

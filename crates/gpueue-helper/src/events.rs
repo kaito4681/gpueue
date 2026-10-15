@@ -4,7 +4,12 @@
 //! and stay there until the daemon acknowledges them with `ack_events`.
 //! `state.json` remembers the acknowledged sequence number and the next one
 //! to hand out, so sequence numbers keep increasing across helper restarts
-//! even when the log has been compacted to nothing.
+//! even when the log has been compacted to nothing. It also holds the
+//! queue's epoch, a random number picked when the queue starts out (or when
+//! a `state.json` from before epochs is first read), which the Hello
+//! reports: should the state directory be wiped, the numbering starts over
+//! under a new epoch, and the daemon knows that the sequence numbers are
+//! new.
 //!
 //! Crash safety: an append that was cut short leaves an unparsable last line,
 //! which is ignored on load (the event was never sent, because sending
@@ -30,6 +35,20 @@ struct StoreState {
     acked: u64,
     /// The next sequence number to hand out (at least 1).
     next: u64,
+    /// See the [module documentation](self); 0 until one is picked.
+    #[serde(default)]
+    epoch: u64,
+}
+
+/// A new epoch: nonzero, and small enough for the daemon to store as a
+/// signed 64-bit integer.
+fn new_epoch() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = nanos ^ u64::from(std::process::id()).rotate_left(40);
+    (mixed & i64::MAX as u64).max(1)
 }
 
 /// The on-disk event queue. Not thread-safe by itself; the helper wraps it
@@ -78,6 +97,10 @@ impl EventStore {
             Err(e) => return Err(e),
         }
         state.next = state.next.max(state.acked + 1).max(1);
+        if state.epoch == 0 {
+            // Persisted by the compaction below.
+            state.epoch = new_epoch();
+        }
         pending.sort_by_key(|e| e.seq);
         pending.dedup_by_key(|e| e.seq);
 
@@ -115,6 +138,11 @@ impl EventStore {
     /// The highest acknowledged sequence number (0 if none).
     pub fn acked(&self) -> EventSeq {
         EventSeq(self.state.acked)
+    }
+
+    /// The queue's epoch (see the [module documentation](self)).
+    pub fn epoch(&self) -> u64 {
+        self.state.epoch
     }
 
     /// The sequence number the next event will get.
@@ -231,5 +259,32 @@ mod tests {
         let s = EventStore::open(dir.path()).unwrap();
         assert_eq!(s.pending().len(), 1);
         assert_eq!(s.next_seq(), EventSeq(3));
+    }
+
+    /// The epoch stays with the queue and changes when it starts over; a
+    /// `state.json` from before epochs gets one.
+    #[test]
+    fn epoch_is_kept_until_the_state_is_wiped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = EventStore::open(dir.path()).unwrap();
+        let epoch = s.epoch();
+        assert!(epoch > 0 && epoch <= i64::MAX as u64);
+        s.append(exited(1, 0)).unwrap();
+        s.ack(EventSeq(1)).unwrap();
+        drop(s);
+        assert_eq!(EventStore::open(dir.path()).unwrap().epoch(), epoch);
+
+        write_atomic(&dir.path().join(STATE_FILE), br#"{"acked":1,"next":2}"#).unwrap();
+        let s = EventStore::open(dir.path()).unwrap();
+        let upgraded = s.epoch();
+        assert!(upgraded > 0);
+        assert_eq!(s.next_seq(), EventSeq(2));
+        drop(s);
+        assert_eq!(EventStore::open(dir.path()).unwrap().epoch(), upgraded);
+
+        // A wiped queue starts under a new epoch.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let wiped = tempfile::tempdir().unwrap();
+        assert_ne!(EventStore::open(wiped.path()).unwrap().epoch(), upgraded);
     }
 }

@@ -644,6 +644,17 @@ pub trait StoreOps: sealed::Sealed {
         meta::set_helper_event_seq(self.conn(), seq)
     }
 
+    /// The epoch of the helper's event numbering that
+    /// [`helper_event_seq`](StoreOps::helper_event_seq) belongs to, if the
+    /// helper reported one (see `gpueue_protocol::helper::Hello::event_epoch`).
+    fn helper_event_epoch(&self) -> Result<Option<u64>> {
+        meta::helper_event_epoch(self.conn())
+    }
+
+    fn set_helper_event_epoch(&self, epoch: u64) -> Result<()> {
+        meta::set_helper_event_epoch(self.conn(), epoch)
+    }
+
     // ----- job errors -----
 
     /// Records `message` as the last error of `job_id`, replacing any

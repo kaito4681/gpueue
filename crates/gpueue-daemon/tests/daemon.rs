@@ -269,6 +269,16 @@ impl Harness {
         })
         .await
         .unwrap();
+        // Until it has reconciled with the helper, the daemon queues even
+        // an administrator's immediate launches instead of launching them;
+        // tests start once it is ready (or, with the helper away, after a
+        // while).
+        for _ in 0..250 {
+            if daemon.helper_ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         self.daemon = Some(daemon);
     }
 
@@ -2511,7 +2521,10 @@ async fn a_spawn_refused_by_a_stopping_helper_is_queued_until_retried() {
     let second = alice.add(&job_request("second", &[])).await;
 
     // Offered again only after a pause (not in a tight loop); the retries
-    // are held.
+    // are held. One of the two held requests is the retry of the job the
+    // last refusal hit, which waits for the pause that refusal set (the
+    // scheduler checks the pause under the database lock, so a pass that
+    // began before the refusal does not relaunch the job at once).
     h.helper.wait_held(2).await;
     let since_refusal = h.helper.last_refusal().unwrap().elapsed();
     assert!(

@@ -6,15 +6,17 @@
 //!
 //! Besides request/response calls, a helper delivers [`HelperNotice`]s on
 //! the channel returned by [`Helper::connect`]:
+//! - [`HelperNotice::Session`]: a connection has been established (sent
+//!   before anything else of that connection);
 //! - [`HelperNotice::Event`]: job events, possibly replayed after a
 //!   reconnect (the daemon acknowledges them with [`Helper::ack_events`]
 //!   once recorded, and must handle duplicates: it remembers the sequence
 //!   number of the last event it applied and skips replays up to it);
 //! - [`HelperNotice::UndecodableEvent`]: an event that could not be
 //!   decoded, only to be acknowledged;
-//! - [`HelperNotice::Connected`]: the connection is (re)established and every
-//!   replayed event sent before it has been delivered; carries the helper's
-//!   live jobs so the daemon can reconcile its database;
+//! - [`HelperNotice::Connected`]: every replayed event of the connection
+//!   has been delivered; carries the helper's live jobs so the daemon can
+//!   reconcile its database;
 //! - [`HelperNotice::Disconnected`].
 
 mod client;
@@ -58,7 +60,15 @@ pub enum HelperError {
 /// See the [module documentation](self).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelperNotice {
+    /// Connection `session` (see [`HelperState::session`]) has begun; its
+    /// replayed events follow. `event_epoch`: see
+    /// [`gpueue_protocol::helper::Hello::event_epoch`].
+    Session {
+        session: u64,
+        event_epoch: Option<u64>,
+    },
     Connected {
+        session: u64,
         version: String,
         running: Vec<RunningJob>,
     },
@@ -78,6 +88,9 @@ pub enum HelperNotice {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HelperState {
     pub connected: bool,
+    /// Numbers the connections, from 1 (0: never connected). The daemon
+    /// may only launch jobs once it has reconciled the current one.
+    pub session: u64,
     pub version: Option<String>,
     /// See [`gpueue_protocol::helper::Hello::missing_programs`].
     pub missing_programs: Vec<String>,
