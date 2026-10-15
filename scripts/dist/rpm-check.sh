@@ -48,7 +48,10 @@ for f in /usr/bin/gpueue /usr/bin/gpueue-helper \
     /usr/lib/systemd/system/gpueue.service /usr/lib/systemd/system/gpueue-helper.service \
     /usr/lib/sysusers.d/gpueue.conf /usr/lib/tmpfiles.d/gpueue.conf /etc/gpueue /etc/gpueue/config.toml \
     /usr/share/bash-completion/completions/gpueue /usr/share/zsh/site-functions/_gpueue \
-    /usr/share/fish/vendor_completions.d/gpueue.fish /usr/share/licenses/gpueue/LICENSE; do
+    /usr/share/fish/vendor_completions.d/gpueue.fish /usr/share/licenses/gpueue/LICENSE \
+    /usr/lib/systemd/system/reboot.target.d/gpueue.conf /usr/lib/systemd/system/poweroff.target.d/gpueue.conf \
+    /usr/lib/systemd/system/halt.target.d/gpueue.conf /usr/lib/systemd/system/kexec.target.d/gpueue.conf \
+    /usr/lib/systemd/system/soft-reboot.target.d/gpueue.conf; do
     grep -q "^$f " /tmp/contents || fail "$f is not in the package"
 done
 grep -qx '/etc/gpueue/config.toml cn' /tmp/contents || fail "config.toml is not %config(noreplace)"
@@ -104,7 +107,8 @@ dnf remove -y gpueue 2>&1 | tee /tmp/remove.out
 rpm -q gpueue >/dev/null 2>&1 && fail "still installed"
 must_not_exist /usr/bin/gpueue /usr/bin/gpueue-helper /usr/lib/systemd/system/gpueue.service \
     /etc/systemd/system/multi-user.target.wants/gpueue.service \
-    /etc/systemd/system/multi-user.target.wants/gpueue-helper.service
+    /etc/systemd/system/multi-user.target.wants/gpueue-helper.service \
+    /usr/lib/systemd/system/reboot.target.d/gpueue.conf
 must_exist /etc/gpueue/config.toml.rpmsave /var/lib/gpueue/logs/1000/job.log
 must_not_exist /var/lib/gpueue/package-removed
 getent passwd gpueue >/dev/null || fail "the user gpueue was deleted (it may own files in /var/lib/gpueue)"

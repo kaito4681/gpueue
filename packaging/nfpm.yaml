@@ -48,6 +48,25 @@ contents:
   - src: packaging/systemd/gpueue-helper.service
     dst: /usr/lib/systemd/system/gpueue-helper.service
     file_info: { mode: 0644 }
+  # Raises JobTimeoutSec= of the shutdown targets, which otherwise force the
+  # machine down 30 minutes into a shutdown, also in the middle of the
+  # helper's dumps (see the file). Keep the list in sync with
+  # SHUTDOWN_TARGETS in crates/gpueue/src/service.rs.
+  - src: packaging/systemd/shutdown-target-timeout.conf
+    dst: /usr/lib/systemd/system/reboot.target.d/gpueue.conf
+    file_info: { mode: 0644 }
+  - src: packaging/systemd/shutdown-target-timeout.conf
+    dst: /usr/lib/systemd/system/poweroff.target.d/gpueue.conf
+    file_info: { mode: 0644 }
+  - src: packaging/systemd/shutdown-target-timeout.conf
+    dst: /usr/lib/systemd/system/halt.target.d/gpueue.conf
+    file_info: { mode: 0644 }
+  - src: packaging/systemd/shutdown-target-timeout.conf
+    dst: /usr/lib/systemd/system/kexec.target.d/gpueue.conf
+    file_info: { mode: 0644 }
+  - src: packaging/systemd/shutdown-target-timeout.conf
+    dst: /usr/lib/systemd/system/soft-reboot.target.d/gpueue.conf
+    file_info: { mode: 0644 }
   - src: packaging/sysusers.d/gpueue.conf
     dst: /usr/lib/sysusers.d/gpueue.conf
     file_info: { mode: 0644 }

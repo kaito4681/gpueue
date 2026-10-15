@@ -306,6 +306,7 @@ minisign -Vm "gpueue_${arch}.deb" -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp
 | --- | --- |
 | `/usr/bin/gpueue`, `/usr/bin/gpueue-helper` | 二进制文件 |
 | `/usr/lib/systemd/system/gpueue.service`, `gpueue-helper.service` | 单元（`ExecStart=/usr/bin/...`） |
+| `/usr/lib/systemd/system/<target>.d/gpueue.conf` | 调高 `reboot.target`、`poweroff.target`、`halt.target`、`kexec.target` 和 `soft-reboot.target` 的 `JobTimeoutSec=` 的 drop-in（见 [关机超时](#shutdown-timeouts)） |
 | `/usr/lib/sysusers.d/gpueue.conf`, `/usr/lib/tmpfiles.d/gpueue.conf` | `gpueue` 用户、`gpueue-admin` 组、各目录 |
 | `/etc/gpueue/config.toml` | 默认配置（conffile：升级时保留你的修改） |
 | `/etc/apt/sources.list.d/gpueue.sources`, `/etc/apt/keyrings/gpueue.gpg` | gpueue APT 仓库及其签名密钥（conffile，见下文） |
@@ -585,7 +586,8 @@ CLI、`gpueue` 系统用户、`gpueue-admin` 组、`/etc/gpueue/config.toml` 以
 `shell`，因此 `settings` 中的值优先。NixOS 上的注意事项：
 
 - **单元。** `gpueue.service` 和 `gpueue-helper.service` 是该模块所在 flake 修订版本中 `packaging/systemd`
-  里的文件，其 `ExecStart=` 指向 store；tmpfiles.d 条目为 `packaging/tmpfiles.d/gpueue.conf`。如果你把
+  里的文件，其 `ExecStart=` 指向 store；tmpfiles.d 条目为 `packaging/tmpfiles.d/gpueue.conf`。调高关机目标
+  `JobTimeoutSec=` 的 drop-in（见 [关机超时](#shutdown-timeouts)）也来自那里。如果你把
   `package` 设为另一个修订版本，单元仍然来自模块的修订版本；请让两者保持一致。
 - **配置文件。** helper 以 root 身份运行，只读取除 root 外无人可修改的普通文件，绝不读取符号链接。
   因此该模块让 NixOS 将文件复制到 `/etc/gpueue/config.toml`（模式 0644，属于 root），而不是链接到 store。
@@ -742,7 +744,8 @@ cd gpueue-bin
 makepkg -si
 ```
 
-它会安装 `/usr/bin/gpueue` 和 `/usr/bin/gpueue-helper`、`/usr/lib/systemd/system` 中的单元、`/usr/lib` 中的
+它会安装 `/usr/bin/gpueue` 和 `/usr/bin/gpueue-helper`、`/usr/lib/systemd/system` 中的单元及关机目标的 drop-in
+（见 [关机超时](#shutdown-timeouts)）、`/usr/lib` 中的
 `sysusers.d` 和 `tmpfiles.d` 片段、默认的 `/etc/gpueue/config.toml`（如果你修改过，升级和移除时都会保留），
 以及 bash、zsh 和 fish 的补全。pacman 的 systemd 钩子会创建 `gpueue` 用户、`gpueue-admin` 组和各目录。
 按照 Arch 的惯例，服务不会自动启用或启动：
@@ -889,7 +892,11 @@ store 路径注册为垃圾回收根 `/nix/var/nix/gcroots/gpueue`（通过 `nix
      只允许访问 NVML 所需的 NVIDIA 设备（来自
      [packaging/systemd/gpueue.service](../../packaging/systemd/gpueue.service)），
    - `/etc/sysusers.d/gpueue.conf`，定义系统用户 `gpueue` 和组 `gpueue-admin`，
-   - `/etc/tmpfiles.d/gpueue.conf`，定义下面列出的目录。
+   - `/etc/tmpfiles.d/gpueue.conf`，定义下面列出的目录，
+   - `reboot.target`、`poweroff.target`、`halt.target`、`kexec.target` 和 `soft-reboot.target` 的
+     `/etc/systemd/system/<target>.d/gpueue.conf`，用于延长关机可用的时间（来自
+     [packaging/systemd/shutdown-target-timeout.conf](../../packaging/systemd/shutdown-target-timeout.conf)；
+     见 [关机超时](#shutdown-timeouts)）。
 3. 针对该文件运行 `systemd-sysusers`，必要时运行 `groupadd --system gpueue-admin`。
 4. 针对该文件运行 `systemd-tmpfiles --create`，创建：
 
@@ -990,12 +997,47 @@ sudo systemctl restart gpueue.service
 当配置的目录位于单元实际生效的 `ReadWritePaths=` 之外时，`gpueue doctor` 会发出警告
 （`daemon write paths`）。
 
-helper 的 `TimeoutStopSec=30min` 是系统关机时为所有作业创建检查点的初始时间预算。转储期间，
-helper 会不断向 systemd 申请更多时间（`EXTEND_TIMEOUT_USEC`），但最多只到当前转储的期限
-加上其回滚时间为止（见 [检查点超时](#checkpoint-timeouts)），因此卡住的转储不会无限期地阻碍
-关机。作业逐个转储。对于忽略延长请求的 systemd 版本，按期限允许的速率（30 s/GiB）计算，
-30 分钟大约可覆盖总计 50 GiB 的 RSS + VRAM，按实测的 NVMe 磁盘速度（约 2.5 s/GiB）则可覆盖
-数百 GiB；如果你的作业更大或磁盘更慢，请在 drop-in 中调高该值。
+<a id="shutdown-timeouts"></a>
+### 关机超时
+
+系统关机时，helper 为作业创建检查点可用的时间受 systemd 的两个超时限制：
+
+- **helper 的 `TimeoutStopSec=30min`** 是转储所有作业的初始时间预算。转储期间，helper 会不断向
+  systemd 申请更多时间（`EXTEND_TIMEOUT_USEC`），但最多只到当前转储的期限加上其回滚时间为止
+  （见 [检查点超时](#checkpoint-timeouts)），因此卡住的转储不会无限期地阻碍关机。作业逐个转储。
+- **关机目标**（`reboot.target`、`poweroff.target`、`halt.target`、`kexec.target`、`soft-reboot.target`）
+  **的 `JobTimeoutSec=`** 是整个关机过程的上限。它从关机进入队列的那一刻开始计时，一旦超过，systemd
+  会立即强制关闭机器（`JobTimeoutAction=reboot-force` 等），即使正处于 `criu dump` 之中也是如此，
+  该作业因此不会留下检查点。无论是 `TimeoutStopSec=` 还是 helper 的延长请求，都无法让关机持续得比它更久。
+  systemd 将其设为 30 分钟；gpueue 的每种安装方式（`.deb` 和 `.rpm`、AUR 软件包、NixOS 模块以及
+  `gpueue service install`）都会添加一个 drop-in `<target>.d/gpueue.conf`（来自
+  [packaging/systemd/shutdown-target-timeout.conf](../../packaging/systemd/shutdown-target-timeout.conf)），
+  将其调高到 **2 小时**。
+
+按期限允许的速率（30 s/GiB）计算，2 小时大约可覆盖总计 200 GiB 的 RSS + VRAM，按实测的 NVMe 磁盘速度
+（约 2.5 s/GiB）则可覆盖数 TiB。可以这样查看当前生效的值：
+
+```sh
+systemctl show -p TimeoutStopUSec gpueue-helper.service
+systemctl show -p JobTimeoutUSec reboot.target poweroff.target halt.target kexec.target
+```
+
+如果你的作业更大或磁盘更慢，请同时调高两者，并让 `JobTimeoutSec=` 始终大于 `TimeoutStopSec=` 加上其他
+服务停止所需的时间。位于 `/etc`、且文件名排序在 `gpueue.conf` 之后的 drop-in（例如 `systemctl edit`
+写入的 `override.conf`）优先生效：
+
+```sh
+sudo systemctl edit gpueue-helper.service
+# [Service]
+# TimeoutStopSec=2h
+for target in reboot poweroff halt kexec soft-reboot; do
+  sudo mkdir -p /etc/systemd/system/$target.target.d
+  printf '[Unit]\nJobTimeoutSec=4h\n' | sudo tee /etc/systemd/system/$target.target.d/override.conf
+done
+sudo systemctl daemon-reload
+```
+
+`JobTimeoutSec=infinity` 会取消上限，但这样一来，因其他原因卡住的关机也永远不会自行结束。
 
 <a id="checkpoint-timeouts"></a>
 ### 检查点超时

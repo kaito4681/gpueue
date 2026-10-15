@@ -141,6 +141,134 @@ fn install_restarts_after_a_unit_changed() {
     assert!(sys.ran("systemctl try-restart gpueue-helper.service gpueue.service"));
 }
 
+/// A systemd time span of the packaged files (`30min`, `2h`, `90s`) in seconds.
+fn timespan_secs(value: &str) -> u64 {
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let number: u64 = number.parse().unwrap_or_else(|_| panic!("{value}"));
+    number
+        * match unit {
+            "" | "s" => 1,
+            "min" => 60,
+            "h" => 3600,
+            _ => panic!("unexpected unit in {value}"),
+        }
+}
+
+/// The value of the first `key=` line of a unit file.
+fn unit_setting<'a>(unit: &'a str, key: &str) -> &'a str {
+    unit.lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("no {key}= in the unit"))
+}
+
+#[test]
+fn shutdown_targets_wait_longer_than_the_helper_stops() {
+    // The targets' job timeout runs from when the shutdown is queued and caps everything that
+    // follows, so it must leave the helper its whole stop budget and more.
+    let job_timeout = timespan_secs(unit_setting(SHUTDOWN_TIMEOUT_DROP_IN, "JobTimeoutSec"));
+    let stop_timeout = timespan_secs(unit_setting(HELPER_UNIT_TEMPLATE, "TimeoutStopSec"));
+    assert!(
+        job_timeout >= 2 * stop_timeout,
+        "JobTimeoutSec={job_timeout}s, TimeoutStopSec={stop_timeout}s"
+    );
+    assert!(SHUTDOWN_TIMEOUT_DROP_IN.contains("\n[Unit]\nJobTimeoutSec="));
+}
+
+#[test]
+fn the_packages_ship_the_same_shutdown_drop_ins() {
+    // packaging/nix/nixos-module.nix has the same list, but is not part of the Nix package's
+    // source, so it cannot be read here.
+    let nfpm = include_str!("../../../../packaging/nfpm.yaml");
+    for target in SHUTDOWN_TARGETS {
+        let dst = format!("dst: /usr/lib/systemd/system/{target}.d/{SHUTDOWN_DROP_IN_NAME}\n");
+        assert!(nfpm.contains(&dst), "nfpm.yaml lacks {dst}");
+    }
+    let names = SHUTDOWN_TARGETS
+        .iter()
+        .map(|target| target.trim_end_matches(".target"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let pkgbuild = include_str!("../../../../packaging/aur/gpueue-bin/PKGBUILD");
+    assert!(
+        pkgbuild.contains(&format!("for target in {names}; do\n")),
+        "the PKGBUILD does not install the drop-ins for {names}"
+    );
+}
+
+#[test]
+fn install_writes_the_shutdown_target_drop_ins() {
+    let sys = system();
+    let out = run_install(&sys, &opts()).unwrap();
+    for target in SHUTDOWN_TARGETS {
+        let path = format!("/etc/systemd/system/{target}.d/gpueue.conf");
+        let drop_in = sys
+            .read(&path)
+            .unwrap_or_else(|| panic!("{path} is missing"));
+        assert_eq!(drop_in, format!("{MARKER}\n{SHUTDOWN_TIMEOUT_DROP_IN}"));
+        assert_eq!(mode(&sys, &path), 0o644);
+        assert_eq!(
+            mode(&sys, &format!("/etc/systemd/system/{target}.d")),
+            0o755
+        );
+        assert!(out.contains(&format!("installed {path}")), "{out}");
+    }
+}
+
+#[test]
+fn a_changed_drop_in_reloads_without_restarting_the_services() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write(
+        "/etc/systemd/system/reboot.target.d/gpueue.conf",
+        &format!("{MARKER}\n[Unit]\nJobTimeoutSec=1min\n"),
+    );
+    sys.log.borrow_mut().clear();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(
+        out.contains("installed /etc/systemd/system/reboot.target.d/gpueue.conf"),
+        "{out}"
+    );
+    assert!(sys.ran("systemctl daemon-reload"));
+    assert!(!sys.ran("systemctl try-restart"), "{:?}", sys.commands());
+}
+
+#[test]
+fn install_refuses_a_foreign_shutdown_drop_in() {
+    let sys = system();
+    sys.write(
+        "/etc/systemd/system/poweroff.target.d/gpueue.conf",
+        "[Unit]\nJobTimeoutSec=infinity\n",
+    );
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(
+        err.contains("/etc/systemd/system/poweroff.target.d/gpueue.conf was not written"),
+        "{err}"
+    );
+}
+
+#[test]
+fn uninstall_removes_the_shutdown_target_drop_ins() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    // An administrator's own drop-in keeps its directory.
+    sys.write(
+        "/etc/systemd/system/halt.target.d/override.conf",
+        "[Unit]\nJobTimeoutSec=3h\n",
+    );
+    let out = run_uninstall(&sys, false, false).unwrap();
+    for target in SHUTDOWN_TARGETS {
+        let path = format!("/etc/systemd/system/{target}.d/gpueue.conf");
+        assert!(!sys.exists(&path), "{path}");
+        assert!(out.contains(&format!("removed {path}")), "{out}");
+        let dir = format!("/etc/systemd/system/{target}.d");
+        assert_eq!(sys.exists(&dir), *target == "halt.target", "{dir}");
+    }
+    assert!(sys.exists("/etc/systemd/system/halt.target.d/override.conf"));
+}
+
 #[test]
 fn install_without_start_only_enables() {
     let sys = system();

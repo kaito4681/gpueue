@@ -293,7 +293,10 @@ failed and keeps the image as well.
   On SIGTERM the helper asks systemd whether the whole system is stopping. If so, it refuses new
   work, dumps every running job one at a time (except `--no-checkpoint` jobs), keeps extending
   its stop timeout up to the end of the running dump's deadline (plus its rollback), and writes
-  `shutdown-manifest.json`. Every checkpoint and restore has a deadline that scales with the
+  `shutdown-manifest.json`. The whole shutdown is capped by `JobTimeoutSec=` of the shutdown
+  targets (`reboot.target` and the like), after which systemd forces the machine down; gpueue's
+  drop-ins raise it from systemd's 30 minutes to 2 hours (see
+  [Shutdown timeouts](install.md#shutdown-timeouts)). Every checkpoint and restore has a deadline that scales with the
   job's size; when it passes, the tool's whole process tree is killed and a checkpoint is rolled
   back (the job is thawed and its CUDA state restored and unlocked; in plugin mode, where the
   killed CRIU's plugin may have left the CUDA processes locked or checkpointed, the helper asks

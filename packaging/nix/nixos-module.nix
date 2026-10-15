@@ -39,6 +39,14 @@ let
         --replace-fail "ExecStart=/usr/bin/" "ExecStart=${cfg.package}/bin/"
     done
     cp ${../tmpfiles.d/gpueue.conf} "$out/lib/tmpfiles.d/gpueue.conf"
+    # Raises JobTimeoutSec= of the shutdown targets, which otherwise force the
+    # machine down 30 minutes into a shutdown, also in the middle of the
+    # helper's dumps. NixOS links the <unit>.d directories of systemd.packages.
+    for target in reboot poweroff halt kexec soft-reboot; do
+      mkdir -p "$out/lib/systemd/system/$target.target.d"
+      cp ${../systemd/shutdown-target-timeout.conf} \
+        "$out/lib/systemd/system/$target.target.d/gpueue.conf"
+    done
   '';
 
   serviceOverrides = {

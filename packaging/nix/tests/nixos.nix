@@ -101,6 +101,11 @@ pkgs.testers.runNixOSTest {
         machine.succeed("[ $(stat -c %U:%a /etc/gpueue/config.toml) = root:644 ]")
         machine.succeed("grep -q '^criu_path = \"/nix/store/' /etc/gpueue/config.toml")
         assert pz("alice", "service install-method") == "nix"
+        # packaging/systemd/shutdown-target-timeout.conf raises the targets' 30 min.
+        for target in ["reboot", "poweroff", "halt", "kexec"]:
+            machine.succeed(
+                f"systemctl show -p JobTimeoutUSec {target}.target | grep -qx JobTimeoutUSec=2h"
+            )
 
     with subtest("doctor"):
         out = machine.succeed("gpueue doctor 2>&1 || true")

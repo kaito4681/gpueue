@@ -37,6 +37,13 @@ package() {
   # The unit templates already run /usr/bin/gpueue and /usr/bin/gpueue-helper.
   install -Dm0644 -t "${pkgdir}/usr/lib/systemd/system" \
     "${src}/packaging/systemd/gpueue.service" "${src}/packaging/systemd/gpueue-helper.service"
+  # Raises JobTimeoutSec= of the shutdown targets, so that a long shutdown is not forced
+  # down in the middle of the helper's dumps.
+  local target
+  for target in reboot poweroff halt kexec soft-reboot; do
+    install -Dm0644 "${src}/packaging/systemd/shutdown-target-timeout.conf" \
+      "${pkgdir}/usr/lib/systemd/system/${target}.target.d/gpueue.conf"
+  done
   install -Dm0644 "${src}/packaging/sysusers.d/gpueue.conf" "${pkgdir}/usr/lib/sysusers.d/gpueue.conf"
   install -Dm0644 "${src}/packaging/tmpfiles.d/gpueue.conf" "${pkgdir}/usr/lib/tmpfiles.d/gpueue.conf"
   # The helper requires /etc/gpueue and the file to be owned by root and not writable by others.

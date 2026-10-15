@@ -321,6 +321,7 @@ The package contains:
 | --- | --- |
 | `/usr/bin/gpueue`, `/usr/bin/gpueue-helper` | the binaries |
 | `/usr/lib/systemd/system/gpueue.service`, `gpueue-helper.service` | the units (`ExecStart=/usr/bin/...`) |
+| `/usr/lib/systemd/system/<target>.d/gpueue.conf` | drop-ins that raise `JobTimeoutSec=` of `reboot.target`, `poweroff.target`, `halt.target`, `kexec.target` and `soft-reboot.target` (see [Shutdown timeouts](#shutdown-timeouts)) |
 | `/usr/lib/sysusers.d/gpueue.conf`, `/usr/lib/tmpfiles.d/gpueue.conf` | the `gpueue` user, the `gpueue-admin` group, the directories |
 | `/etc/gpueue/config.toml` | the default configuration (a conffile: your edits are kept on upgrades) |
 | `/etc/apt/sources.list.d/gpueue.sources`, `/etc/apt/keyrings/gpueue.gpg` | the gpueue APT repository and its signing key (conffiles, see below) |
@@ -622,8 +623,10 @@ The module sets `criu_path`, `cuda_checkpoint_path`, `nvidia_smi_path`, `nvml_li
 
 - **Units.** `gpueue.service` and `gpueue-helper.service` are the files in `packaging/systemd` of
   the module's flake revision, with `ExecStart=` pointing into the store, and the tmpfiles.d
-  entries are `packaging/tmpfiles.d/gpueue.conf`. If you set `package` to another revision, the
-  units still come from the module's revision; keep the two together.
+  entries are `packaging/tmpfiles.d/gpueue.conf`. The drop-ins that raise the shutdown targets'
+  `JobTimeoutSec=` (see [Shutdown timeouts](#shutdown-timeouts)) come from there too. If you set
+  `package` to another revision, the units still come from the module's revision; keep the two
+  together.
 - **Configuration file.** The helper runs as root and only reads a regular file that nobody but
   root can change, never a symlink. The module therefore has NixOS copy the file into
   `/etc/gpueue/config.toml` (mode 0644, owned by root) instead of linking it into the store.
@@ -799,7 +802,8 @@ makepkg -si
 ```
 
 It installs `/usr/bin/gpueue` and `/usr/bin/gpueue-helper`, the units in
-`/usr/lib/systemd/system`, the `sysusers.d` and `tmpfiles.d` snippets in `/usr/lib`, the default
+`/usr/lib/systemd/system` with the drop-ins for the shutdown targets (see
+[Shutdown timeouts](#shutdown-timeouts)), the `sysusers.d` and `tmpfiles.d` snippets in `/usr/lib`, the default
 `/etc/gpueue/config.toml` (kept on upgrades and removal when you changed it), and completions for
 bash, zsh and fish. pacman's systemd hooks create the `gpueue` user, the `gpueue-admin` group and
 the directories. As usual on Arch, the services are not enabled or started for you:
@@ -967,7 +971,12 @@ following:
      [packaging/systemd/gpueue.service](../packaging/systemd/gpueue.service)),
    - `/etc/sysusers.d/gpueue.conf`, which defines the system user `gpueue` and the group
      `gpueue-admin`,
-   - `/etc/tmpfiles.d/gpueue.conf`, the directories listed below.
+   - `/etc/tmpfiles.d/gpueue.conf`, the directories listed below,
+   - `/etc/systemd/system/<target>.d/gpueue.conf` for `reboot.target`, `poweroff.target`,
+     `halt.target`, `kexec.target` and `soft-reboot.target`, which raise the time a shutdown may
+     take (from
+     [packaging/systemd/shutdown-target-timeout.conf](../packaging/systemd/shutdown-target-timeout.conf);
+     see [Shutdown timeouts](#shutdown-timeouts)).
 3. Runs `systemd-sysusers` for that file and, if needed, `groupadd --system gpueue-admin`.
 4. Runs `systemd-tmpfiles --create` for that file, which creates:
 
@@ -1073,14 +1082,54 @@ sudo systemctl restart gpueue.service
 `gpueue doctor` warns (`daemon write paths`) when a configured directory is outside the unit's
 effective `ReadWritePaths=`.
 
-The helper's `TimeoutStopSec=30min` is the initial budget for checkpointing all jobs when the
-system shuts down. While it dumps, the helper keeps asking systemd for more time
-(`EXTEND_TIMEOUT_USEC`), but only up to the end of the running dump's deadline plus its rollback
-(see [Checkpoint timeouts](#checkpoint-timeouts)), so a stuck dump cannot hold up the shutdown
-forever. Jobs are dumped one after another. With systemd versions that ignore the extension, 30
-minutes covers about 50 GiB of RSS + VRAM in total at the rate the deadline allows (30 s/GiB),
-and several hundred GiB at the measured speed of an NVMe disk (~2.5 s/GiB); raise it in a
-drop-in if your jobs are larger or your disk is slower.
+### Shutdown timeouts
+
+Two systemd timeouts limit how long the helper may spend checkpointing the jobs when the system
+shuts down:
+
+- **The helper's `TimeoutStopSec=30min`** is the initial budget for dumping all jobs. While it
+  dumps, the helper keeps asking systemd for more time (`EXTEND_TIMEOUT_USEC`), but only up to
+  the end of the running dump's deadline plus its rollback (see
+  [Checkpoint timeouts](#checkpoint-timeouts)), so a stuck dump cannot hold up the shutdown
+  forever. Jobs are dumped one after another.
+- **`JobTimeoutSec=` of the shutdown targets** (`reboot.target`, `poweroff.target`,
+  `halt.target`, `kexec.target`, `soft-reboot.target`) caps the whole shutdown. It runs from the
+  moment the shutdown is queued, and when it passes systemd forces the machine down at once
+  (`JobTimeoutAction=reboot-force` and so on), also in the middle of a `criu dump`: that job
+  then has no checkpoint. Neither `TimeoutStopSec=` nor the helper's extensions can make the
+  shutdown last longer. systemd sets it to 30 minutes; every gpueue installation (the `.deb`
+  and `.rpm`, the AUR package, the NixOS module and `gpueue service install`) adds a drop-in,
+  `<target>.d/gpueue.conf` (from
+  [packaging/systemd/shutdown-target-timeout.conf](../packaging/systemd/shutdown-target-timeout.conf)),
+  that raises it to **2 hours**.
+
+2 hours covers about 200 GiB of RSS + VRAM in total at the rate the deadline allows (30 s/GiB),
+and several TiB at the measured speed of an NVMe disk (~2.5 s/GiB). Check the values in effect
+with:
+
+```sh
+systemctl show -p TimeoutStopUSec gpueue-helper.service
+systemctl show -p JobTimeoutUSec reboot.target poweroff.target halt.target kexec.target
+```
+
+If your jobs are larger or your disk is slower, raise both, and keep `JobTimeoutSec=` above
+`TimeoutStopSec=` plus the time the other services need to stop. A drop-in in `/etc` named after
+`gpueue.conf` in sort order (such as `override.conf`, which `systemctl edit` writes) takes
+precedence:
+
+```sh
+sudo systemctl edit gpueue-helper.service
+# [Service]
+# TimeoutStopSec=2h
+for target in reboot poweroff halt kexec soft-reboot; do
+  sudo mkdir -p /etc/systemd/system/$target.target.d
+  printf '[Unit]\nJobTimeoutSec=4h\n' | sudo tee /etc/systemd/system/$target.target.d/override.conf
+done
+sudo systemctl daemon-reload
+```
+
+`JobTimeoutSec=infinity` removes the cap, but then a shutdown that hangs for another reason never
+completes on its own.
 
 ### Checkpoint timeouts
 

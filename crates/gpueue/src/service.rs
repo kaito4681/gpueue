@@ -49,6 +49,20 @@ const DAEMON_UNIT_TEMPLATE: &str = include_str!("../../../packaging/systemd/gpue
 const HELPER_UNIT_TEMPLATE: &str = include_str!("../../../packaging/systemd/gpueue-helper.service");
 const SYSUSERS: &str = include_str!("../../../packaging/sysusers.d/gpueue.conf");
 const TMPFILES: &str = include_str!("../../../packaging/tmpfiles.d/gpueue.conf");
+const SHUTDOWN_TIMEOUT_DROP_IN: &str =
+    include_str!("../../../packaging/systemd/shutdown-target-timeout.conf");
+
+/// The targets whose `JobTimeoutSec=` (30 min, then a forced reboot or poweroff) caps the whole
+/// shutdown, the helper's dumps included; [`SHUTDOWN_TIMEOUT_DROP_IN`] raises it.
+const SHUTDOWN_TARGETS: &[&str] = &[
+    "reboot.target",
+    "poweroff.target",
+    "halt.target",
+    "kexec.target",
+    "soft-reboot.target",
+];
+/// File name of the drop-in in each `<target>.d` directory.
+const SHUTDOWN_DROP_IN_NAME: &str = "gpueue.conf";
 pub const CONFIG_TEMPLATE: &str = include_str!("../../../packaging/config.toml");
 
 /// First line of every file `install` writes; `uninstall` only removes files starting with it.
@@ -90,7 +104,7 @@ fn packaged_files(bin_dir: &Path) -> Vec<InstallFile> {
         contents: format!("{MARKER}\n{body}"),
         mode: 0o644,
     };
-    vec![
+    let mut files = vec![
         file(
             Path::new(UNIT_DIR).join(HELPER_UNIT),
             render_unit(HELPER_UNIT_TEMPLATE, bin_dir),
@@ -101,7 +115,31 @@ fn packaged_files(bin_dir: &Path) -> Vec<InstallFile> {
         ),
         file(PathBuf::from(SYSUSERS_PATH), SYSUSERS.to_owned()),
         file(PathBuf::from(TMPFILES_PATH), TMPFILES.to_owned()),
-    ]
+    ];
+    files.extend(
+        shutdown_drop_ins()
+            .into_iter()
+            .map(|path| file(path, SHUTDOWN_TIMEOUT_DROP_IN.to_owned())),
+    );
+    files
+}
+
+/// The drop-ins raising the shutdown targets' `JobTimeoutSec=`, one per [`SHUTDOWN_TARGETS`].
+fn shutdown_drop_ins() -> Vec<PathBuf> {
+    SHUTDOWN_TARGETS
+        .iter()
+        .map(|target| {
+            Path::new(UNIT_DIR)
+                .join(format!("{target}.d"))
+                .join(SHUTDOWN_DROP_IN_NAME)
+        })
+        .collect()
+}
+
+/// Whether the system path is one of the two service units (not a drop-in or a snippet): a
+/// changed unit needs the services restarted, a changed drop-in of a target only a reload.
+fn is_service_unit(path: &Path) -> bool {
+    path.parent() == Some(Path::new(UNIT_DIR))
 }
 
 /// Points the unit's `ExecStart=` at the binaries in `bin_dir`.
@@ -781,7 +819,7 @@ pub fn install(sys: &dyn System, options: &InstallOptions, out: &mut dyn Write) 
         let changed = write_file(sys, &file.path, file.contents.as_bytes(), file.mode)?;
         let verb = if changed { "installed" } else { "unchanged" };
         writeln!(out, "{verb} {}", file.path.display()).ok();
-        units_changed |= changed && file.path.starts_with(UNIT_DIR);
+        units_changed |= changed && is_service_unit(&file.path);
     }
     let left = receipt::remove_copies(sys, &stale, " (copied by the previous install)", out);
     if !left.is_empty() {
@@ -1100,6 +1138,12 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
             .map_err(io_err(format!("removing {}", file.path.display())))?;
         writeln!(out, "removed {}", file.path.display()).ok();
         removed_units |= file.path.starts_with(UNIT_DIR);
+    }
+    // The `<target>.d` directories `install` created, unless something else is in them.
+    for drop_in in shutdown_drop_ins() {
+        if let Some(dir) = drop_in.parent() {
+            let _ = std::fs::remove_dir(sys.path(dir));
+        }
     }
     if (removed_units || units_present)
         && let Err(err) = run_checked(sys, "systemctl", &["daemon-reload"])
