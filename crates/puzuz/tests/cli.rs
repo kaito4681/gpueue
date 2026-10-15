@@ -92,7 +92,6 @@ fn job(id: u64, state: JobState) -> JobView {
             envs: None,
             last_error: None,
         }),
-        waiting: None,
     }
 }
 

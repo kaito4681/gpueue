@@ -1219,6 +1219,15 @@ priority = site factor
 其他作业。`priority_type = "basic"` 可恢复 pueue 的顺序（对所有作业先按 `-o` 优先级从高到低、再按 id 从小到大；
 此时 nice、site 因子、`top` 和 fair share 都被忽略）。
 
+**立即启动。** 在 pueue 中，对排队中或暂存的作业执行 `start <id>`，以及 `add -i`、`restart -i` 和
+`restore -i`，都会立即启动作业。在 puzuz 中只有管理者的这些操作会这样：其作业会立即启动，忽略组的
+`parallel` 上限、GPU 槽位、已暂停的组和依赖。对其他用户，这些命令会把作业（`restart -i` 为新的副本，
+`restore -i` 为恢复）放到其自己排队中的作业的最前面，与 `puzuz top` 完全相同。之后作业按上面的优先级与
+其他用户的作业竞争，组的 `parallel` 上限、GPU 槽位、已暂停的组和依赖都与其他排队中的作业一样适用；命令会
+说明作业是被排到了自己作业的最前面，而不是被启动，API 的回复中带有 `"queued": "first"`。在
+`enable_user_top = false` 时，或在 `priority_type = "basic"`（不适用所有者的顺序）时，作业不会被移动，
+而是像其他作业一样排队（`"queued": "in_line"`）。对已暂停的作业执行 `start` 仍然是恢复它。
+
 **命令。**
 
 | 命令 | 谁可以使用 | Slurm |

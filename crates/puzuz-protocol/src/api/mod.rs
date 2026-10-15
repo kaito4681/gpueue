@@ -25,8 +25,8 @@ pub use events::{Event, SseDecoder, SseMessage};
 pub use jobs::{
     ActionOutcome, AddJobRequest, AddJobResponse, BulkJobRequest, BulkJobResponse, CleanRequest,
     CleanResponse, EnqueueOptions, JobAction, JobActionResult, JobDetails, JobSelector, JobView,
-    KillOptions, LaunchWait, ListDetails, ListJobsQuery, ListJobsResponse, LogQuery, OrphanJob,
-    PauseOptions, ResetRequest, RestartOptions, RestoreOptions, StashOptions, SwitchRequest,
+    KillOptions, ListDetails, ListJobsQuery, ListJobsResponse, LogQuery, OrphanJob, PauseOptions,
+    QueuedLaunch, ResetRequest, RestartOptions, RestoreOptions, StashOptions, SwitchRequest,
 };
 pub use priority::{
     NiceRequest, PriorityResponse, PriorityWeights, SetGroupPriorityRequest, SetSharesRequest,

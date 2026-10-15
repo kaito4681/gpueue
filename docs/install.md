@@ -1346,6 +1346,18 @@ where a higher `-o` priority wins over every other job. `priority_type = "basic"
 pueue's order (higher `-o` priority first, then lower id, for all jobs; nice, site factors, `top`
 and fair share are then ignored).
 
+**Immediate launches.** In pueue, `start <id>` of a queued or stashed job, `add -i`, `restart -i`
+and `restore -i` start the job right away. In puzuz only administrators' do: their job starts at
+once, ignoring the group's `parallel` limit, GPU slots, a paused group and dependencies. For
+anybody else these commands put the job (for `restart -i`, the new copy; for `restore -i`, the
+restore) first among their own queued jobs, exactly like `puzuz top`. The job then competes with
+other users' jobs by the priority above, and the group's `parallel` limit, GPU slots, a paused
+group and its dependencies apply as for any queued job; the command says that the job was queued
+first among your jobs rather than started, and the API reply carries `"queued": "first"`. With
+`enable_user_top = false`, or with `priority_type = "basic"` (where the owner's order does not
+apply), the job is queued like any other job without being moved (`"queued": "in_line"`).
+`start` of a paused job resumes it, as before.
+
 **Commands.**
 
 | Command | Who | Slurm |

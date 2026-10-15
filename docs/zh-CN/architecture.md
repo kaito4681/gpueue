@@ -37,11 +37,10 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    4 MiB 内查找行首（如果这一范围内的行数不够，就从那里开始输出），并且同时只运行少量这样的扫描。
 2. **调度。** 当排队作业的组有空闲槽位，且其申请的每块 GPU 都有空闲槽位时，该作业启动。
    候选作业按优先级顺序考虑（参见[优先级与公平共享](#priority-and-fair-share)）。守护进程随后请求 helper 创建它。
-   立即启动（`start <id>`、`add -i`、`restart -i`、`restore -i`）的作业会在内存中被标记为"强制"。管理员的
-   强制启动会忽略所有限制立即启动。其他用户的则纳入调度计划（`scheduler::Reserved::forced`）：先于其他所有
-   候选作业考虑，跳过组的 `parallel` 限制和依赖关系，但仍需要其每块 GPU 都有空闲槽位且组未暂停。操作在同一
-   事务中检查这一点，因此能放下的启动会立即开始，放不下的会带着原因（`scheduler::LaunchWait`）排队，原因
-   包含在响应和作业视图（`waiting`）中。
+   管理员的立即启动（`start <id>`、`add -i`、`restart -i`、`restore -i`）的作业会在内存中被标记为"强制"，
+   忽略所有限制立即启动。其他用户的则不是强制的：操作把作业排队（或排队等待恢复），并在同一事务中像
+   `puzuz top` 一样把它移到所有者作业的最前面（`Core::queue_first`；在 `enable_user_top = false` 或
+   `priority_type = "basic"` 时不移动）。之后调度计划像对待其他排队作业一样对待它；响应中的 `queued` 会说明这一点。
 3. **守护进程 → helper。** 守护进程与 `/run/puzuz/helper.sock` 保持一个连接，交换以换行分隔的 JSON。
    首先由 Hello 消息检查协议版本。之后是带 id 的请求，以及来自 helper 的带编号的事件（作业已退出、检查点或恢复已完成）。
    事件会被持久化，并在守护进程确认之前反复重放，因此守护进程停止期间不会丢失任何内容。

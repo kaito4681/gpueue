@@ -149,7 +149,7 @@ puzuz follow 0        # stream the output, like tail -f
 ```sh
 puzuz checkpoint 0    # save job 0 to disk and stop it; frees the GPU. State: Checkpointed
 puzuz restore 0       # queue it again; it resumes once its group and GPUs have a free slot
-puzuz restore -i 0    # ...or resume right away, ahead of the queue (see "GPU slots")
+puzuz restore -i 0    # ...or put it first among your queued jobs (administrators: resume right away; see "Job priority")
 ```
 
 A restored job continues from the moment it was checkpointed. It keeps its job id, and its output
@@ -200,7 +200,7 @@ and does not read pueue's files. These are the differences:
 | `send` | sends input to a task's stdin | not supported: jobs' stdin is `/dev/null`. Make the command non-interactive. |
 | `shutdown` | kills all tasks and stops the daemon | administrators only. Checkpoints all running jobs, then stops the daemon. A job whose checkpoint is refused keeps running. `--no-checkpoint` kills them instead. |
 | `restart` | finished tasks | also works on `Checkpointed` jobs: they start over as a new job, and the image is kept |
-| `start <id>`, `add -i`, `restart -i` (and `restore -i`) | start the task right away, ignoring every limit | skip the queue and the group's `parallel` limit, but wait for a free slot on the job's GPUs and for a paused group to be resumed; only administrators' ignore every limit (see [GPU slots](#gpu-slots)) |
+| `start <id>`, `add -i`, `restart -i` (and `restore -i`) | start the task right away, ignoring every limit | only administrators' start right away, ignoring every limit; anybody else's job is queued first among their own jobs (like `puzuz top`) and waits for its turn like any queued job (see [Job priority](#job-priority)) |
 | `reset`, `-a/--all`, `-g/--group` | all tasks | your own jobs. Administrators act on everyone's. |
 | `pause/start/kill -a`, `-g` | also pause/resume the groups | only administrators pause/resume groups; for others, groups are left as they are |
 | Wording | "task" | "job". Option names such as `--print-task-id` are kept for compatibility. |
@@ -216,7 +216,7 @@ Extra commands and options:
 | `add --gpu <LIST>` | GPUs the job runs on, e.g. `0` or `0,1`. Without it the job is CPU-only (`CUDA_VISIBLE_DEVICES` is empty). |
 | `add --no-checkpoint` | never checkpoint this job; on shutdown it is terminated |
 | `checkpoint [IDS] [-g GROUP] [-a]` | save running jobs and stop them |
-| `restore [IDS] [-g GROUP] [-a] [-i]` | resume `Checkpointed` jobs (`-i`: right away, ahead of the queue, like `start`) |
+| `restore [IDS] [-g GROUP] [-a] [-i]` | resume `Checkpointed` jobs (`-i`: like `start`, right away for administrators, first among your own jobs for anybody else) |
 | `gpu [-j]`, `gpu parallel <N> [--gpu LIST]` | list GPUs, or set the per-GPU job limit (administrators) |
 | `add --nice <N>`, `nice <IDS>... <N>` | lower a job's priority by `N` (Slurm's nice; negative values for administrators only) |
 | `top <IDS>...` | move jobs to the top of your own queue (Slurm's `scontrol top`) |
@@ -320,8 +320,9 @@ columns, and `Checkpointed` jobs show the image size.
   When a regular user runs `pause/start/kill -g` or `-a`, only their own jobs are affected and no
   group's paused state changes (`pause --wait` then does nothing). The output says which happened
   (`All groups are being paused.` versus `Your jobs are being paused: 3, 4`).
-- **Administrators' immediate launches** (`start <id>`, `add -i`, `restart -i`, `restore -i`)
-  ignore GPU slots and paused groups; everybody else's wait for them (see [GPU slots](#gpu-slots)).
+- **Only administrators launch jobs immediately** (`start <id>`, `add -i`, `restart -i`,
+  `restore -i`), ignoring every limit; everybody else's job is queued first among their own jobs
+  (see [Job priority](#job-priority)).
 - Administrators are root and members of the `puzuz-admin` group (primary or supplementary). The
   check is made on every request, so `usermod -aG puzuz-admin <user>` takes effect immediately.
 
@@ -344,12 +345,9 @@ columns, and `Checkpointed` jobs show the image size.
   `gpu_device_isolation = false`, e.g. for MIG (see
   [GPU isolation](docs/install.md#gpu-isolation)).
 - Groups work as in pueue (the `default` group starts with `parallel 1`). Both limits apply.
-- Launching right away (`start <id>`, `add -i`, `restart -i`, `restore -i`) skips the queue and the
-  group's `parallel` limit, as in pueue, but not GPU slots or a paused group: if one of the job's
-  GPUs has no free slot or its group is paused, the job waits and starts ahead of every other
-  queued job as soon as that changes. The command says so, and `status` shows e.g.
-  `Queued (waiting for a GPU slot)`. Only administrators' immediate launches ignore GPU slots and
-  paused groups, so a user cannot push a GPU past the limit an administrator set.
+- GPU slots, the group's `parallel` limit and a paused group apply to every job a regular user
+  launches, also with `start <id>`, `add -i`, `restart -i` or `restore -i` (see
+  [Job priority](#job-priority)); only administrators' immediate launches ignore them.
 - GPUs are detected with NVML when the daemon starts (the `[[gpus]]` list in the configuration is
   only a fallback). Restart `puzuz.service` after adding or removing a GPU. `puzuz doctor`
   compares what the daemon detected with `nvidia-smi`.
@@ -361,7 +359,14 @@ first. The priority follows Slurm's multifactor plugin: by default it is the sum
 factor (users who used less of the machine recently, with usage decaying with a half-life of 7
 days, go first) and an age factor (time spent waiting), minus the job's nice value. Job size,
 group (partition) and per-GPU (TRES) factors can be weighted in as well. Your own `-o`
-priority, `switch` and `puzuz top` reorder only your own jobs. `puzuz prio` shows why a job is
+priority, `switch` and `puzuz top` reorder only your own jobs. So do pueue's immediate launches
+(`start <id>` of a queued or stashed job, `add -i`, `restart -i`, `restore -i`) for anybody but an
+administrator: the job is queued first among your own jobs, exactly like `puzuz top`, and then
+waits for its turn against other users' jobs, within the group's `parallel` limit, GPU slots, a
+paused group and its dependencies; the command says it was queued, not started. With
+`enable_user_top = false` (or `priority_type = "basic"`) it is just queued. `start` of a paused
+job resumes it as before. Administrators' immediate launches start right away, ignoring every
+limit. `puzuz prio` shows why a job is
 where it is, `puzuz share` shows everyone's usage. See
 [Priority and fair share](docs/install.md#priority-and-fair-share) for the formula and the
 settings.

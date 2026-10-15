@@ -2724,7 +2724,7 @@ async fn restores_refused_by_a_stopping_helper_are_requeued_not_failed() {
     let admin = h.client(ADMIN);
     h.helper.set_stopping(true);
 
-    // `restore --immediate`: put back in line (still ahead of the queue), not
+    // `restore --immediate`: put back in line (still regardless of slots), not
     // failed; the reply says the restore is pending.
     let reply = admin
         .action(first, "restore", json!({"immediate": true}))
@@ -2852,7 +2852,7 @@ fn add_immediately(client: &Client, command: &str) -> tokio::task::JoinHandle<Re
 async fn launches_retried_successfully_before_the_action_looks_are_reported_launched() {
     let mut h = Harness::new(0).await;
     let (checkpointed, queued, finished) = launch_targets(&h).await;
-    let alice = h.client(ALICE);
+    let admin = h.client(ADMIN);
     let mut gate = h.gate_launch_checks();
 
     // A stopping helper refuses the launch; the daemon puts the job back in
@@ -2864,9 +2864,9 @@ async fn launches_retried_successfully_before_the_action_looks_are_reported_laun
         (finished, "restart", json!({"immediate": true})),
     ] {
         h.helper.refuse_launches(1);
-        let reply = send_action(&alice, id, action, body);
+        let reply = send_action(&admin, id, action, body);
         let (launched, release) = gate.reached().await;
-        alice.wait_state(launched, &JobState::Running).await;
+        admin.wait_state(launched, &JobState::Running).await;
         h.wait_spawned(launched).await;
         drop(release);
         let reply = reply.await.unwrap();
@@ -2882,9 +2882,9 @@ async fn launches_retried_successfully_before_the_action_looks_are_reported_laun
 
     // `add --immediate` alike.
     h.helper.refuse_launches(1);
-    let reply = add_immediately(&alice, "immediate");
+    let reply = add_immediately(&admin, "immediate");
     let (launched, release) = gate.reached().await;
-    alice.wait_state(launched, &JobState::Running).await;
+    admin.wait_state(launched, &JobState::Running).await;
     h.wait_spawned(launched).await;
     drop(release);
     let reply = reply.await.unwrap();
@@ -2899,7 +2899,7 @@ async fn launches_retried_successfully_before_the_action_looks_are_reported_laun
 async fn launches_still_being_retried_when_the_action_looks_are_pending() {
     let mut h = Harness::new(0).await;
     let (checkpointed, queued, _) = launch_targets(&h).await;
-    let alice = h.client(ALICE);
+    let admin = h.client(ADMIN);
     let mut gate = h.gate_launch_checks();
 
     // The retry is in flight (held by the helper) when the action looks.
@@ -2912,7 +2912,7 @@ async fn launches_still_being_retried_when_the_action_looks_are_pending() {
     .enumerate()
     {
         h.helper.refuse_launches(1);
-        let reply = send_action(&alice, id, action, body);
+        let reply = send_action(&admin, id, action, body);
         let (launched, release) = gate.reached().await;
         assert_eq!(launched, id);
         h.helper.wait_held(held + 1).await;
@@ -2922,7 +2922,7 @@ async fn launches_still_being_retried_when_the_action_looks_are_pending() {
         assert!(launch_pending(&reply), "{action} {id}");
     }
     h.helper.refuse_launches(1);
-    let reply = add_immediately(&alice, "immediate");
+    let reply = add_immediately(&admin, "immediate");
     let (immediate, release) = gate.reached().await;
     h.helper.wait_held(3).await;
     drop(release);
@@ -2931,7 +2931,7 @@ async fn launches_still_being_retried_when_the_action_looks_are_pending() {
     assert!(reply.json::<AddJobResponse>().launch_pending);
     h.helper.release_launches();
     for id in [checkpointed, queued, immediate] {
-        alice.wait_state(id, &JobState::Running).await;
+        admin.wait_state(id, &JobState::Running).await;
         h.wait_spawned(id).await;
     }
     assert_no_restore_error(&h, checkpointed).await;
@@ -3063,6 +3063,8 @@ async fn immediate_launches_wait_for_a_disconnected_helper() {
     let mut h = Harness::new(0).await;
     h.set_default_parallel(2).await;
     let alice = h.client(ALICE);
+    // Only an administrator's launches are immediate.
+    let admin = h.client(ADMIN);
     let checkpointed = h.checkpointed_job().await;
     let blocker = alice.add(&job_request("blocker", &[])).await;
     alice.wait_state(blocker, &JobState::Running).await;
@@ -3084,7 +3086,7 @@ async fn immediate_launches_wait_for_a_disconnected_helper() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // `add --immediate`: created, and pending.
-    let reply = alice
+    let reply = admin
         .post(
             "/v1/jobs",
             serde_json::to_value(AddJobRequest {
@@ -3108,7 +3110,7 @@ async fn immediate_launches_wait_for_a_disconnected_helper() {
         (checkpointed, "restore", json!({"immediate": true})),
         (done_job, "restart", json!({"immediate": true})),
     ] {
-        let reply = alice.action(id, action, body).await;
+        let reply = admin.action(id, action, body).await;
         assert_eq!(reply.status, StatusCode::OK, "{action} {id}");
         let result: Value = reply.json();
         assert_eq!(result["launch_pending"], json!(true), "{action} {id}");
@@ -3212,34 +3214,34 @@ async fn orphans_keep_their_gpus_and_admins_can_kill_them() {
     h.stop().await;
 }
 
-/// `switch` swaps the "launch ahead of the queue" mark with the ids.
+/// `switch` swaps the "launch regardless of slots" mark (an administrator's) with the ids.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn switch_swaps_the_forced_launch_mark() {
     let mut h = Harness::new(0).await;
-    let alice = h.client(ALICE);
-    let busy = alice.add(&job_request("busy", &[])).await;
-    alice.wait_state(busy, &JobState::Running).await;
-    let a = alice.add(&job_request("a", &[])).await;
-    let b = alice.add(&job_request("b", &[])).await;
+    let admin = h.client(ADMIN);
+    let busy = admin.add(&job_request("busy", &[])).await;
+    admin.wait_state(busy, &JobState::Running).await;
+    let a = admin.add(&job_request("a", &[])).await;
+    let b = admin.add(&job_request("b", &[])).await;
 
     // `start a` while the helper is away: a waits, to be launched
-    // ahead of the queue once it is back.
+    // regardless of slots once it is back.
     h.helper.disconnect();
-    let reply = alice.action(a, "start", json!({})).await;
+    let reply = admin.action(a, "start", json!({})).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert!(launch_pending(&reply));
-    let reply = alice
+    let reply = admin
         .post("/v1/jobs/switch", json!({"first": a, "second": b}))
         .await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
-    assert_eq!(alice.job(b).await.details.unwrap().command, "a");
+    assert_eq!(admin.job(b).await.details.unwrap().command, "a");
 
     h.helper.reconnect();
     // The job started with `start` (now `b`) is launched; the other waits
     // for the slot `busy` holds.
-    alice.wait_state(b, &JobState::Running).await;
+    admin.wait_state(b, &JobState::Running).await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(matches!(alice.job(a).await.state, JobState::Queued { .. }));
+    assert!(matches!(admin.job(a).await.state, JobState::Queued { .. }));
     h.stop().await;
 }
 
@@ -3826,103 +3828,151 @@ async fn restart_in_place_drops_administrators_grants() {
     assert_eq!((p.nice, p.site), (0, 0));
 }
 
-fn launch_wait(reply: &Reply) -> Option<puzuz_protocol::api::LaunchWait> {
-    serde_json::from_value(reply.json::<Value>()["waiting"].clone()).ok()
+/// What became of a non-administrator's immediate launch (`queued` in the
+/// reply of an action or of `POST /v1/jobs`).
+fn queued_launch(reply: &Reply) -> Option<puzuz_protocol::api::QueuedLaunch> {
+    serde_json::from_value(reply.json::<Value>()["queued"].clone()).ok()
 }
 
-/// A non-administrator's forced launch skips the queue and the group's
-/// `parallel` limit, but waits for a free slot on its GPUs and for its
-/// group to be resumed; an administrator's ignores both.
+/// `add --immediate` through the API, returning the reply.
+async fn add_immediate(client: &Client, mut request: AddJobRequest) -> Reply {
+    request.immediate = true;
+    let reply = client
+        .post("/v1/jobs", serde_json::to_value(&request).unwrap())
+        .await;
+    assert!(reply.status.is_success(), "{}", reply.status);
+    reply
+}
+
+fn added_id(reply: &Reply) -> JobId {
+    reply.json::<puzuz_protocol::api::AddJobResponse>().id
+}
+
+/// A non-administrator's `add --immediate` is queued first among the
+/// user's own jobs, like `puzuz top`: it does not overtake another user's
+/// job with a higher priority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn users_forced_launches_wait_for_gpu_slots_and_paused_groups() {
-    use puzuz_protocol::api::{AddJobResponse, LaunchWait};
-    let mut h = Harness::new(1).await;
+async fn users_immediate_add_is_queued_first_among_their_jobs() {
+    let mut h = Harness::new(0).await;
     h.set_default_parallel(1).await;
     let alice = h.client(ALICE);
     let bob = h.client(BOB);
     let admin = h.client(ADMIN);
 
-    // The group's limit is skipped: bob's job holds its only slot.
     let busy = bob.add(&job_request("busy", &[])).await;
     bob.wait_state(busy, &JobState::Running).await;
-    let cpu = alice.add(&job_request("cpu", &[])).await;
-    let reply = alice.action(cpu, "start", json!({})).await;
-    assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(launch_wait(&reply), None);
-    assert_eq!(alice.job(cpu).await.state, JobState::Running);
-
-    // GPU slots are not: bob holds GPU 0 (one slot).
-    h.set_default_parallel(0).await;
-    let gpu = bob.add(&job_request("gpu", &[0])).await;
-    bob.wait_state(gpu, &JobState::Running).await;
-    // A queued job with a better priority...
-    let mut request = job_request("better", &[0]);
-    request.spec.priority = 100;
-    let better = alice.add(&request).await;
-    // ... is overtaken by an `add --immediate`, which waits for the slot.
-    let mut request = job_request("forced", &[0]);
-    request.immediate = true;
-    let reply = alice
-        .post("/v1/jobs", serde_json::to_value(&request).unwrap())
+    // Bob's queued job has the better priority.
+    let bobs = bob.add(&job_request("bob's", &[])).await;
+    let reply = admin
+        .post("/v1/jobs/site", json!({ "ids": [bobs.0], "site": 100000 }))
         .await;
-    assert!(reply.status.is_success(), "{}", reply.status);
-    let added: AddJobResponse = reply.json();
-    let forced = added.id;
-    let gpu0 = LaunchWait::GpuSlots {
-        gpus: vec![GpuIndex(0)],
-    };
-    assert_eq!(added.waiting, Some(gpu0.clone()));
-    assert!(!added.launch_pending);
-    let view = alice.job(forced).await;
-    assert!(matches!(view.state, JobState::Queued { .. }));
-    assert_eq!(view.waiting, Some(gpu0.clone()));
-    // Everybody sees why it waits.
-    assert_eq!(bob.job(forced).await.waiting, Some(gpu0.clone()));
+    assert_eq!(bulk_results(&reply), [(bobs.0, None)]);
+    let old = alice.add(&job_request("old", &[])).await;
 
-    h.exit(gpu, 0).await;
-    alice.wait_state(forced, &JobState::Running).await;
-    assert_eq!(alice.job(forced).await.waiting, None);
+    let reply = add_immediate(&alice, job_request("new", &[])).await;
+    let new = added_id(&reply);
+    assert_eq!(
+        queued_launch(&reply),
+        Some(puzuz_protocol::api::QueuedLaunch::First)
+    );
+    assert!(!launch_pending(&reply));
+    assert!(matches!(
+        alice.job(new).await.state,
+        JobState::Queued { .. }
+    ));
+    // First among alice's jobs, after bob's better one.
+    assert_eq!(priority_order(&alice).await, [bobs.0, new.0, old.0]);
+
+    h.exit(busy, 0).await;
+    bob.wait_state(bobs, &JobState::Running).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(matches!(
-        alice.job(better).await.state,
+        alice.job(new).await.state,
         JobState::Queued { .. }
     ));
+    h.exit(bobs, 0).await;
+    alice.wait_state(new, &JobState::Running).await;
+    assert!(matches!(
+        alice.job(old).await.state,
+        JobState::Queued { .. }
+    ));
+    h.stop().await;
+}
 
-    // An administrator's forced launch ignores GPU slots.
-    let admins = admin.add(&job_request("admin's", &[0])).await;
-    let reply = admin.action(admins, "start", json!({})).await;
-    assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(launch_wait(&reply), None);
-    assert_eq!(admin.job(admins).await.state, JobState::Running);
+/// A non-administrator's immediate launches keep the group's `parallel`
+/// limit, a paused group and dependencies, as any queued job does; `start`
+/// of a queued or stashed job and `restart --immediate` queue the job
+/// first among the user's jobs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn users_immediate_launches_keep_every_limit() {
+    use puzuz_protocol::api::QueuedLaunch;
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(1).await;
+    let alice = h.client(ALICE);
+    let admin = h.client(ADMIN);
 
-    // `restart --immediate` waits too: the administrator's job still holds
-    // GPU 0 once `forced` has finished.
-    let reply = alice.action(forced, "kill", json!({})).await;
+    let busy = alice.add(&job_request("busy", &[])).await;
+    alice.wait_state(busy, &JobState::Running).await;
+    // The group's only slot is taken: the CPU job waits.
+    let reply = add_immediate(&alice, job_request("cpu", &[])).await;
+    let cpu = added_id(&reply);
+    assert_eq!(queued_launch(&reply), Some(QueuedLaunch::First));
+    // `start` of a stashed job: queued, and first (the latest `top`).
+    let stashed = alice
+        .add(&AddJobRequest {
+            stashed: true,
+            ..job_request("stashed", &[])
+        })
+        .await;
+    let reply = alice.action(stashed, "start", json!({})).await;
     assert_eq!(reply.status, StatusCode::OK);
-    alice.wait_state(forced, &done(JobResult::Killed)).await;
+    assert_eq!(queued_launch(&reply), Some(QueuedLaunch::First));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(matches!(
+        alice.job(cpu).await.state,
+        JobState::Queued { .. }
+    ));
+    assert!(matches!(
+        alice.job(stashed).await.state,
+        JobState::Queued { .. }
+    ));
+    assert_eq!(priority_order(&alice).await, [stashed.0, cpu.0]);
+    h.exit(busy, 0).await;
+    alice.wait_state(stashed, &JobState::Running).await;
+    assert!(matches!(
+        alice.job(cpu).await.state,
+        JobState::Queued { .. }
+    ));
+    h.exit(stashed, 0).await;
+    alice.wait_state(cpu, &JobState::Running).await;
+
+    // Dependencies are kept: the job waits for `cpu`, even with a free
+    // slot.
+    h.set_default_parallel(0).await;
+    let mut request = job_request("dependant", &[]);
+    request.spec.dependencies = vec![cpu];
+    let reply = add_immediate(&alice, request).await;
+    let dependant = added_id(&reply);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(matches!(
+        alice.job(dependant).await.state,
+        JobState::Queued { .. }
+    ));
+    h.exit(cpu, 0).await;
+    alice.wait_state(dependant, &JobState::Running).await;
+    h.exit(dependant, 0).await;
+    alice.wait_state(dependant, &done(JobResult::Success)).await;
+
+    // `restart --immediate`: the copy is queued (here it can start at once).
     let reply = alice
-        .action(forced, "restart", json!({"immediate": true}))
+        .action(dependant, "restart", json!({"immediate": true}))
         .await;
     assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(launch_wait(&reply), Some(gpu0.clone()));
-    let copy: puzuz_protocol::api::JobActionResult = reply.json();
-    let puzuz_protocol::api::ActionOutcome::Ok {
-        new_id: Some(copy), ..
-    } = copy.outcome
-    else {
-        panic!("no copy: {copy:?}");
-    };
-    assert_eq!(alice.job(copy).await.waiting, Some(gpu0.clone()));
-    h.exit(admins, 0).await;
-    alice.wait_state(copy, &JobState::Running).await;
-    assert!(matches!(
-        alice.job(better).await.state,
-        JobState::Queued { .. }
-    ));
+    assert_eq!(queued_launch(&reply), Some(QueuedLaunch::First));
 
-    // A paused group: the launch waits until the group is resumed.
+    // A paused group keeps the job too.
     let reply = admin
-        .post("/v1/groups", json!({"name": "p", "parallel": 1}))
+        .post("/v1/groups", json!({"name": "p", "parallel": 0}))
         .await;
     assert!(reply.status.is_success(), "{}", reply.status);
     let reply = admin
@@ -3934,35 +3984,60 @@ async fn users_forced_launches_wait_for_gpu_slots_and_paused_groups() {
     assert_eq!(reply.status, StatusCode::OK);
     let mut request = job_request("paused", &[]);
     request.spec.group = "p".into();
-    request.stashed = true;
-    let paused = alice.add(&request).await;
-    let reply = alice.action(paused, "start", json!({})).await;
-    assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(launch_wait(&reply), Some(LaunchWait::GroupPaused));
-    let view = alice.job(paused).await;
-    assert!(matches!(view.state, JobState::Queued { .. }));
-    assert_eq!(view.waiting, Some(LaunchWait::GroupPaused));
+    let paused = added_id(&add_immediate(&alice, request).await);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(matches!(
         alice.job(paused).await.state,
         JobState::Queued { .. }
     ));
-    let reply = admin
-        .post(
-            "/v1/jobs/bulk",
-            json!({"target": {"kind": "group", "group": "p"}, "action": "start"}),
-        )
-        .await;
-    assert_eq!(reply.status, StatusCode::OK);
-    alice.wait_state(paused, &JobState::Running).await;
-
     h.stop().await;
 }
 
-/// `restore --immediate` by a non-administrator waits for a GPU slot too.
+/// An administrator's immediate launches still start right away, past a
+/// full group and a busy GPU.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn users_immediate_restores_wait_for_gpu_slots() {
-    use puzuz_protocol::api::LaunchWait;
+async fn admins_immediate_launches_start_right_away() {
+    let mut h = Harness::new(1).await;
+    h.set_default_parallel(1).await;
+    let bob = h.client(BOB);
+    let admin = h.client(ADMIN);
+    let busy = bob.add(&job_request("busy", &[0])).await;
+    bob.wait_state(busy, &JobState::Running).await;
+    let reply = add_immediate(&admin, job_request("admin's", &[0])).await;
+    assert_eq!(queued_launch(&reply), None);
+    assert_eq!(admin.job(added_id(&reply)).await.state, JobState::Running);
+    // `start` of another user's queued job by an administrator as well.
+    let queued = bob.add(&job_request("queued", &[0])).await;
+    let reply = admin.action(queued, "start", json!({})).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(queued_launch(&reply), None);
+    assert_eq!(bob.job(queued).await.state, JobState::Running);
+    h.stop().await;
+}
+
+/// With `enable_user_top = false` a non-administrator's immediate launch
+/// is queued like any other job, without moving it to the front.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn users_immediate_add_without_user_top_just_queues() {
+    let h = harness_with_priority(0, |p| p.enable_user_top = false).await;
+    h.set_default_parallel(1).await;
+    let alice = h.client(ALICE);
+    let busy = alice.add(&job_request("busy", &[])).await;
+    alice.wait_state(busy, &JobState::Running).await;
+    let old = alice.add(&job_request("old", &[])).await;
+    let reply = add_immediate(&alice, job_request("new", &[])).await;
+    let new = added_id(&reply);
+    assert_eq!(
+        queued_launch(&reply),
+        Some(puzuz_protocol::api::QueuedLaunch::InLine)
+    );
+    assert_eq!(priority_order(&alice).await, [old.0, new.0]);
+}
+
+/// `restore --immediate` by a non-administrator queues the restore first
+/// among the user's jobs; it waits for the GPU slot like any other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn users_immediate_restores_are_queued() {
     let mut h = Harness::new(1).await;
     h.set_default_parallel(0).await;
     let alice = h.client(ALICE);
@@ -3979,13 +4054,14 @@ async fn users_immediate_restores_wait_for_gpu_slots() {
         .action(id, "restore", json!({"immediate": true}))
         .await;
     assert_eq!(reply.status, StatusCode::OK);
-    let gpu0 = LaunchWait::GpuSlots {
-        gpus: vec![GpuIndex(0)],
-    };
-    assert_eq!(launch_wait(&reply), Some(gpu0.clone()));
-    let view = alice.job(id).await;
-    assert!(matches!(view.state, JobState::RestoreQueued { .. }));
-    assert_eq!(view.waiting, Some(gpu0));
+    assert_eq!(
+        queued_launch(&reply),
+        Some(puzuz_protocol::api::QueuedLaunch::First)
+    );
+    assert!(matches!(
+        alice.job(id).await.state,
+        JobState::RestoreQueued { .. }
+    ));
     h.exit(other, 0).await;
     alice.wait_state(id, &JobState::Running).await;
     h.stop().await;

@@ -7,10 +7,25 @@ use puzuz_core::authz;
 use puzuz_core::model::{
     Caller, GpuIndex, Job, JobId, JobResult, JobSpec, JobState, Timestamp, Uid,
 };
-pub use puzuz_core::scheduler::LaunchWait;
 use serde::{Deserialize, Serialize};
 
 use super::ApiError;
+
+/// How the daemon handled a non-administrator's request to launch a job
+/// right away (`start` of a queued or stashed job, `add --immediate`,
+/// `restart --immediate`, `restore --immediate`): only administrators
+/// launch jobs immediately, so the job was queued (for a restore, queued
+/// for restore) and competes with other users' jobs by priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedLaunch {
+    /// First among the caller's own queued jobs, as `puzuz top` does.
+    First,
+    /// Like any other job, without moving it (`enable_user_top = false`,
+    /// or `priority_type = "basic"`, where the owner's order does not
+    /// apply).
+    InLine,
+}
 
 // ---------------------------------------------------------------------------
 // Views
@@ -53,11 +68,6 @@ pub struct JobView {
     /// Owner/admin-only fields; `None` in the redacted view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<JobDetails>,
-    /// A forced launch (`start`, `add --immediate`, `restore --immediate`,
-    /// `restart --immediate` by a non-administrator) that waits in line,
-    /// and why. Filled in by the daemon.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub waiting: Option<LaunchWait>,
 }
 
 /// Fields only the owner and administrators may see.
@@ -125,7 +135,6 @@ impl JobView {
             finished_at: job.finished_at,
             checkpoint_size_bytes: None,
             details: None,
-            waiting: None,
         }
     }
 
@@ -244,7 +253,9 @@ pub struct AddJobRequest {
     /// With `stashed`, enqueue automatically at this time (`--delay`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enqueue_at: Option<Timestamp>,
-    /// Start right away, ignoring group and GPU slots (`--immediate`).
+    /// Start right away, ignoring group and GPU slots (`--immediate`); only
+    /// for administrators, anybody else's job is queued first among their
+    /// own jobs ([`AddJobResponse::queued`]).
     #[serde(default)]
     pub immediate: bool,
 }
@@ -252,15 +263,15 @@ pub struct AddJobRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddJobResponse {
     pub id: JobId,
-    /// `--immediate` while the helper is not connected: the job is queued
-    /// and starts (still ahead of the queue) as soon as the helper is back.
+    /// An administrator's `--immediate` while the helper is not connected:
+    /// the job is queued and starts (still ignoring every limit) as soon as
+    /// the helper is back.
     #[serde(default, skip_serializing_if = "is_false")]
     pub launch_pending: bool,
-    /// `--immediate` by a non-administrator while a GPU of the job has no
-    /// free slot or its group is paused: the job is queued and starts,
-    /// ahead of the queue, as soon as that changes.
+    /// A non-administrator's `--immediate`: the job was queued, not started
+    /// ([`QueuedLaunch`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub waiting: Option<LaunchWait>,
+    pub queued: Option<QueuedLaunch>,
 }
 
 impl AddJobResponse {
@@ -268,7 +279,7 @@ impl AddJobResponse {
         Self {
             id,
             launch_pending: false,
-            waiting: None,
+            queued: None,
         }
     }
 }
@@ -359,7 +370,9 @@ pub struct KillOptions {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreOptions {
-    /// Restore now without waiting for free group/GPU slots (`-i`).
+    /// Restore now without waiting for free group/GPU slots (`-i`); only
+    /// for administrators, anybody else's job is queued for restore first
+    /// among their own jobs.
     #[serde(default)]
     pub immediate: bool,
 }
@@ -461,7 +474,7 @@ impl JobActionResult {
             outcome: ActionOutcome::Ok {
                 new_id: None,
                 launch_pending: false,
-                waiting: None,
+                queued: None,
             },
         }
     }
@@ -486,16 +499,16 @@ pub enum ActionOutcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         new_id: Option<JobId>,
         /// The job (for `restart`, the new one) was to be started or
-        /// restored right away (`start`, `restore --immediate`, `restart
-        /// --immediate`), but the helper is not connected: it is queued and
-        /// launched, still ahead of the queue, as soon as the helper is back.
+        /// restored right away by an administrator (`start`, `restore
+        /// --immediate`, `restart --immediate`), but the helper is not
+        /// connected: it is queued and launched, still ignoring every
+        /// limit, as soon as the helper is back.
         #[serde(default, skip_serializing_if = "is_false")]
         launch_pending: bool,
-        /// The launch is a non-administrator's and a GPU of the job has no
-        /// free slot or its group is paused: it is queued and launched,
-        /// ahead of the queue, as soon as that changes.
+        /// The same request by a non-administrator: the job (for `restart`,
+        /// the new one) was queued, not launched ([`QueuedLaunch`]).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        waiting: Option<LaunchWait>,
+        queued: Option<QueuedLaunch>,
     },
     Error {
         error: ApiError,
