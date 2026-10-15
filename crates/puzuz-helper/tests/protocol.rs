@@ -2924,6 +2924,192 @@ async fn the_image_a_running_job_was_restored_from_is_not_a_new_dump() {
     );
 }
 
+/// Restores job `job` from its image and then puts the image back, with
+/// the log `criu restore` writes into it, as a restore whose removal of the
+/// image failed (or a helper that stopped before it) leaves it.
+async fn restore_and_leave_the_image(env: &Env, c: &mut Client, job: u64) {
+    let image_dir = env.base().join(job.to_string());
+    let saved = env.root.join(format!("saved-image-{job}"));
+    copy_dir(&image_dir, &saved);
+    assert_eq!(
+        c.request(restore_req(job, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+    assert!(matches!(
+        c.event().await.event,
+        Event::RestoreFinished {
+            outcome: RestoreOutcome::Success { .. },
+            ..
+        }
+    ));
+    copy_dir(&saved, &image_dir);
+    std::fs::write(
+        CheckpointDir::for_job(&env.base(), job).restore_log(),
+        "(00.1) Restore finished successfully\n",
+    )
+    .unwrap();
+}
+
+async fn checkpoint_succeeds(c: &mut Client, env: &Env, job: u64) {
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(job),
+            image_dir: env.base().join(job.to_string()),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::CheckpointFinished {
+                outcome: CheckpointOutcome::Success { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+}
+
+/// The image a running job was restored from, left behind, does not
+/// refuse the job's next dump: it is stale and replaced by the new image.
+#[tokio::test]
+async fn a_left_over_image_a_job_was_restored_from_does_not_block_its_next_dump() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    spawn_and_dump(&env, &mut c, 3).await;
+    restore_and_leave_the_image(&env, &mut c, 3).await;
+    checkpoint_succeeds(&mut c, &env, 3).await;
+    let dir = CheckpointDir::for_job(&env.base(), 3);
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    assert!(!dir.restore_log().exists(), "a fresh image");
+    // A complete image the job was not restored from is never replaced.
+    assert_eq!(
+        c.request(restore_req(3, &env.base().join("3"))).await,
+        ResponseResult::Accepted
+    );
+    assert!(matches!(
+        c.event().await.event,
+        Event::RestoreFinished {
+            outcome: RestoreOutcome::Success { .. },
+            ..
+        }
+    ));
+    copy_dir(&env.root.join("saved-image-3"), &env.base().join("3"));
+    assert!(!dir.restore_log().exists());
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(3),
+            image_dir: env.base().join("3"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            &ev.event,
+            Event::CheckpointFinished {
+                outcome: CheckpointOutcome::Failed { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    assert_eq!(c.running().await, [(JobId(3), RunningPhase::Running)]);
+}
+
+/// The image a job was restored from, left behind, goes when the restored
+/// job exits, whether the helper sees it exit or finds it exited at its
+/// next start: the job id may be reused (`restart --in-place`) and dumped
+/// again.
+#[tokio::test]
+async fn a_left_over_image_a_job_was_restored_from_goes_when_the_job_exits() {
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    for job in [3, 4] {
+        spawn_and_dump(&env, &mut c, job).await;
+        restore_and_leave_the_image(&env, &mut c, job).await;
+    }
+    env.launcher.exit(JobId(3), ExitStatus::Exited { code: 0 });
+    let ev = c.event().await;
+    assert!(
+        matches!(ev.event, Event::JobExited { job: JobId(3), .. }),
+        "{ev:?}"
+    );
+    assert_eq!(
+        CheckpointDir::for_job(&env.base(), 3).status(),
+        DirStatus::Missing
+    );
+    c.request(Request::AckEvents {
+        up_to: EventSeq(u64::MAX),
+    })
+    .await;
+    drop(c);
+    let _ = env.stop.send(true);
+    env.launcher.exit(JobId(4), ExitStatus::Exited { code: 0 });
+    env.restart().await;
+    let mut c = env.client().await;
+    let ev = c.event().await;
+    assert!(
+        matches!(ev.event, Event::JobExited { job: JobId(4), .. }),
+        "{ev:?}"
+    );
+    assert_eq!(
+        CheckpointDir::for_job(&env.base(), 4).status(),
+        DirStatus::Missing
+    );
+    // The ids are used again, and their jobs dumped.
+    for job in [3, 4] {
+        spawn_and_dump(&env, &mut c, job).await;
+    }
+}
+
+/// A restore retries removing the image it restored from; one it could not
+/// remove (here: half-way, the `COMPLETE` marker gone) is replaced by the
+/// job's next dump.
+#[tokio::test]
+async fn an_image_a_restore_could_not_remove_is_replaced_by_the_next_dump() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 3).await;
+    let dir = CheckpointDir::for_job(&env.base(), 3);
+    // `criu restore` writes its log into the image (the fake does not).
+    std::fs::write(dir.restore_log(), "(00.1) Restore finished successfully\n").unwrap();
+    let images = dir.images_dir();
+    std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0o555)).unwrap();
+    assert_eq!(
+        c.request(restore_req(3, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+    assert!(matches!(
+        c.event().await.event,
+        Event::RestoreFinished {
+            outcome: RestoreOutcome::Success { .. },
+            ..
+        }
+    ));
+    assert!(dir.images_dir().exists());
+    assert!(!matches!(dir.status(), DirStatus::Complete(_)));
+    std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0o700)).unwrap();
+    checkpoint_succeeds(&mut c, &env, 3).await;
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    assert!(!dir.restore_log().exists());
+
+    // Removed only as far as the `COMPLETE` marker, the image looks like
+    // a dump that was not finalized, which a new dump never replaces;
+    // unless the job was restored from it.
+    restore_and_leave_the_image(&env, &mut c, 3).await;
+    std::fs::remove_file(dir.marker_path()).unwrap();
+    assert!(dir.is_unfinalized_dump());
+    checkpoint_succeeds(&mut c, &env, 3).await;
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    assert!(!dir.restore_log().exists());
+}
+
 /// An interrupted restore whose unit is gone (the helper stopped before it
 /// started it, or systemd already cleaned it up) is reported too, once.
 #[tokio::test]

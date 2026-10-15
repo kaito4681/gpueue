@@ -146,7 +146,9 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    mode it then runs cuda-checkpoint `restore` and
    `unlock` on the CUDA processes. In plugin mode CRIU's plugin does this before `criu restore`
    returns. Each image is restored in the mode it was dumped in, whatever `cuda_checkpoint_mode`
-   says now. The job keeps its id and log, and the image is deleted afterwards.
+   says now. The job keeps its id and log, and the image is deleted afterwards (should that
+   fail, when the job exits or is checkpointed again, or when the helper starts again; an image
+   the job was restored from never refuses its next dump).
    A job that was paused at the dump is restored **stopped**, as `puzuz pause` leaves it: the
    restore hook (see [Restores and paths](#restores-and-paths)) sends SIGSTOP to its processes
    while CRIU still holds them, after CRIU's plugin has restored their CUDA state, so they enter

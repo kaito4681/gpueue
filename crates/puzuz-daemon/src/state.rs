@@ -1147,7 +1147,8 @@ impl Core {
                 settle_launch(settle, self.start_restore(job).await)
             }
             // After a successful restore the helper has already removed the
-            // image (and refuses to touch the directory of a live job). A
+            // image, or removes it when the job exits or is checkpointed
+            // again (and refuses to touch the directory of a live job). A
             // job paused before its dump is `Paused` after the restore.
             Effect::DeleteCheckpointImage
                 if matches!(job.state, JobState::Running | JobState::Paused) =>
