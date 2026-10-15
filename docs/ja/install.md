@@ -191,8 +191,10 @@ Arch Linux では公開後に [AUR パッケージ](#arch-linux-aur) を使え�
 各リリースには、ターゲット（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`）ごとに
 `.sha256` と `.minisig` ファイル付きの `puzuz-v<X>-<target>.tar.gz`、同じ 2 つのファイルがそれぞれに付いた
 パッケージ `puzuz_<X>_amd64.deb`、`puzuz_<X>_arm64.deb`、`puzuz-<X>-1.x86_64.rpm`、
-`puzuz-<X>-1.aarch64.rpm`、`install.sh.minisig` 付きの `install.sh`、そして `.rpm` が GPG 署名されている
-リリースでは `RPM-GPG-KEY-puzuz.minisig` 付きの `RPM-GPG-KEY-puzuz` があります。tarball（または
+`puzuz-<X>-1.aarch64.rpm`、同じパッケージをバージョンなしの名前にしたもの（`puzuz_amd64.deb`、
+`puzuz_arm64.deb`、`puzuz.x86_64.rpm`、`puzuz.aarch64.rpm`。`releases/latest/download/<name>` 用で、
+それぞれに専用の 2 つのファイルが付きます）、`install.sh.minisig` 付きの `install.sh`、そして `.rpm` が
+GPG 署名されているリリースでは `RPM-GPG-KEY-puzuz.minisig` 付きの `RPM-GPG-KEY-puzuz` があります。tarball（または
 パッケージ）を自分で確認するには次のようにします。
 
 ```sh
@@ -239,13 +241,31 @@ git commit packaging/minisign.pub scripts/install.sh
 <a id="installing-the-debianubuntu-package"></a>
 ## Debian/Ubuntu パッケージのインストール
 
-各リリースには、Debian 12 と Ubuntu 22.04、24.04、26.04 向けに、amd64 と arm64 の `.deb` があります
-（どちらかは `dpkg --print-architecture` で分かります）。リリースから `puzuz_<version>_<arch>.deb` を
-ダウンロードし、apt でインストールします。apt は依存するものも一緒に入れます。
+各リリースには、Debian 12 と Ubuntu 22.04、24.04、26.04 向けに、amd64 と arm64 の `.deb` があります。
+最新リリースからこのマシンのアーキテクチャのものをダウンロードし、apt でインストールします。apt は依存する
+ものも一緒に入れます。
 
 ```sh
-sudo apt install ./puzuz_0.1.0_amd64.deb
+arch=$(uname -m | sed 's/^x86_64$/amd64/; s/^aarch64$/arm64/')
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
+sudo apt install "./puzuz_${arch}.deb"
 ```
+
+`releases/latest` は最新の安定版リリースです（プレリリースは飛ばされます）。`puzuz_<arch>.deb` はその
+`puzuz_<version>_<arch>.deb` をバージョンなしの名前にしたコピーです。特定のバージョン用に、バージョン付きの
+ファイルも添付されています（`https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz_0.1.0_amd64.deb`）。インストールする前に
+ダウンロードしたファイルを検証するには次のようにします（[リリースを手動で検証する](#verifying-a-release-by-hand)
+を参照）。
+
+```sh
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb.sha256"
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb.minisig"
+sha256sum -c "puzuz_${arch}.deb.sha256"
+minisign -Vm "puzuz_${arch}.deb" -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+```
+
+trusted comment にはリリースとバージョンなしのファイル名が書かれています
+（`Trusted comment: puzuz v0.1.0 puzuz_amd64.deb`）。
 
 パッケージの内容：
 
@@ -411,14 +431,20 @@ gh secret set APT_GPG_PASSPHRASE -R kaito4681/puzuz
 ## Fedora/RHEL/Rocky パッケージのインストール
 
 各リリースには、Fedora と RHEL 互換の 9 以降（RHEL、Rocky Linux、AlmaLinux。glibc 2.34 以降）向けに、
-x86_64 と aarch64 の `.rpm` があります（どちらかは `uname -m` で分かります）。ダウンロードしたファイルから、
-またはリリースの URL から直接、dnf でインストールします。dnf は依存するものも一緒に入れます。
+x86_64 と aarch64 の `.rpm` があります（どちらかは `uname -m` で分かります）。最新リリースのものを dnf で
+インストールします。dnf は URL を直接受け取れ、依存するものも一緒に入れます。
 
 ```sh
-sudo dnf install ./puzuz-0.1.0-1.x86_64.rpm
-# or
-sudo dnf install https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz-0.1.0-1.x86_64.rpm
+sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
 ```
+
+`.deb` と同様に、`puzuz.<arch>.rpm` は最新の安定版リリースの `puzuz-<version>-1.<arch>.rpm` を
+バージョンなしの名前にしたコピーで、特定のバージョン用にバージョン付きのファイルも添付されています
+（`sudo dnf install https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz-0.1.0-1.x86_64.rpm`）。先に検証するには、
+`puzuz.$(uname -m).rpm` を `.sha256` と `.minisig` ファイルと一緒にダウンロードして
+[`.deb`](#installing-the-debianubuntu-package) と同じように確認し（trusted comment にはバージョンなしの
+ファイル名が書かれています）、確認したファイルを `sudo dnf install "./puzuz.$(uname -m).rpm"` で
+インストールします。
 
 （`v0.2.0-rc.1` のようなプレリリースは `puzuz-0.2.0-rc.1-1.<arch>.rpm` です。パッケージ内のバージョンは
 `0.2.0~rc.1` で、これは `0.2.0` より前に並びます。）
@@ -454,11 +480,12 @@ sudo dnf install --setopt=localpkg_gpgcheck=1 ./puzuz-0.1.0-1.x86_64.rpm
 インストールしてください。dnf は URL を直接受け取れます。
 
 ```sh
-sudo dnf upgrade https://github.com/kaito4681/puzuz/releases/download/v<new version>/puzuz-<new version>-1.x86_64.rpm
+sudo dnf upgrade "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
 ```
 
 新しいリリースがあると、`puzuz doctor`（と `puzuz update --check`）の "update" の行に、マシンの
-アーキテクチャに合ったリリースの URL を使ったこのコマンドと、先に署名を確認する方法が表示されます。
+アーキテクチャに合ったリリースのバージョン付き URL を使った同様のコマンドと、先に署名を確認する方法が
+表示されます。
 アップグレードは動作中のサービスを再起動します。実行中のジョブは動き続けます。
 
 **削除。**

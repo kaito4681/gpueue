@@ -178,6 +178,32 @@ jobs:
           name: rpm-signed
           path: rpm-signed
       - run: cp -f rpm-signed/* dist/
+      # Version-less copies of the packages, so that
+      # releases/latest/download/<name> always gives the newest stable one:
+      # puzuz_<amd64|arm64>.deb and puzuz.<x86_64|aarch64>.rpm (copies of the
+      # final, GPG-signed .rpm files). Each gets its own .sha256 here and its
+      # own .minisig below, whose trusted comment names the copy. The APT
+      # repository (scripts/dist/apt-repo.sh) only takes the versioned
+      # puzuz_<version>_<arch>.deb files.
+      - name: Add version-less package copies
+        run: |
+          cd dist
+          for deb in puzuz_*_*.deb; do
+            alias="puzuz_${deb##*_}"
+            [ ! -e "$alias" ] || { echo "two .deb files for ${alias#puzuz_}"; exit 1; }
+            cp "$deb" "$alias"
+            sha256sum "$alias" >"$alias.sha256"
+          done
+          for rpm in puzuz-*-1.*.rpm; do
+            arch="${rpm%.rpm}"
+            alias="puzuz.${arch##*.}.rpm"
+            [ ! -e "$alias" ] || { echo "two .rpm files for ${arch##*.}"; exit 1; }
+            cp "$rpm" "$alias"
+            sha256sum "$alias" >"$alias.sha256"
+          done
+          for alias in puzuz_amd64.deb puzuz_arm64.deb puzuz.x86_64.rpm puzuz.aarch64.rpm; do
+            [ -f "$alias" ] || { echo "missing $alias"; exit 1; }
+          done
       # The public key the .rpm files are signed with, ASCII-armored as
       # `rpm --import` needs it (the same key as the APT repository's), and
       # signed with minisign below like every other asset.
@@ -192,7 +218,8 @@ jobs:
             gpg --batch --quiet --import "$keyring"
             gpg --batch --armor --export >dist/RPM-GPG-KEY-puzuz
           fi
-      # dist/<name>.{tar.gz,deb,rpm}.minisig, install.sh with its
+      # dist/<name>.{tar.gz,deb,rpm}.minisig (also for the version-less
+      # copies), install.sh with its
       # install.sh.minisig and RPM-GPG-KEY-puzuz (when attached) with its
       # RPM-GPG-KEY-puzuz.minisig, checked against packaging/minisign.pub
       # (the key built into `puzuz`). The trusted comment names the tag and
@@ -243,6 +270,11 @@ jobs:
           sudo dnf install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/puzuz-${TAG#v}-1.x86_64.rpm    # x86_64
           sudo dnf install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/puzuz-${TAG#v}-1.aarch64.rpm   # aarch64
           \`\`\`
+
+          The packages are also attached as \`puzuz_<amd64|arm64>.deb\` and
+          \`puzuz.<x86_64|aarch64>.rpm\`, so that
+          \`https://github.com/$GITHUB_REPOSITORY/releases/latest/download/<name>\` always gives
+          the newest stable release (see docs/install.md).
 
           Running jobs keep running. The tarballs (\`puzuz-$TAG-<target>.tar.gz\`), the
           \`.deb\` and the \`.rpm\` files and \`install.sh\` are signed with minisign

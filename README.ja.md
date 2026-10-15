@@ -79,7 +79,9 @@ cuda-checkpoint はインストールしません。足りない場合はそう�
 Debian と Ubuntu（amd64 または arm64）では、代わりにリリースのパッケージをインストールできます。
 
 ```sh
-sudo apt install ./puzuz_<version>_amd64.deb     # or _arm64.deb
+arch=$(uname -m | sed 's/^x86_64$/amd64/; s/^aarch64$/arm64/')
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
+sudo apt install "./puzuz_${arch}.deb"
 ```
 
 同じサービスをインストールして起動し、`criu` を推奨パッケージとします。また puzuz の APT リポジトリ
@@ -87,15 +89,20 @@ sudo apt install ./puzuz_<version>_amd64.deb     # or _arm64.deb
 バージョンは `sudo apt update && sudo apt upgrade` で入ります。`sudo apt remove puzuz` はサービスを停止し、
 `sudo apt purge puzuz` は /etc/puzuz も削除します。どちらも /var/lib/puzuz と実行中のジョブは残します。
 
-Fedora、RHEL、Rocky、Alma Linux 9 以降（x86_64 または aarch64）では、リリースの .rpm（ファイルまたはその
-URL）をインストールします。
+Fedora、RHEL、Rocky、Alma Linux 9 以降（x86_64 または aarch64）では、リリースの .rpm をインストール
+します（dnf は URL をそのまま受け付けます）。
 
 ```sh
-sudo dnf install ./puzuz-<version>-1.x86_64.rpm   # or -1.aarch64.rpm, or the release URL
+sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
 ```
 
-dnf リポジトリはまだありません（予定、issue #23）。更新するには、新しいリリースの .rpm を
-`sudo dnf upgrade <its URL>` でインストールします。`sudo dnf remove puzuz` はサービスを停止し、
+これらの URL は常に最新の安定版リリースを指します（`releases/latest` はプレリリースを飛ばします）。特定の
+バージョン用に、バージョン付きのファイル（`puzuz_<version>_<arch>.deb`、`puzuz-<version>-1.<arch>.rpm`）
+も添付されています。どのファイルにも `.sha256` と `.minisig` があります
+（[リリースを手動で検証する](docs/ja/install.md#verifying-a-release-by-hand) を参照）。
+
+dnf リポジトリはまだありません（予定、issue #23）。更新するには、同じコマンドを `sudo dnf upgrade`
+で実行します。`sudo dnf remove puzuz` はサービスを停止し、
 /var/lib/puzuz と実行中のジョブは残します。`criu` を推奨パッケージとします。Fedora のものは十分に新しい
 ですが、Rocky/RHEL 9 には 3.19 しかないため、チェックポイントにはより新しい CRIU が必要です（CRIU が
 なくてもジョブは実行できます）。ソースからビルドしたり、Nix flake を使ったりもできます

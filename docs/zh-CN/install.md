@@ -166,6 +166,8 @@ Alma Linux 上可以改用 [.rpm](#installing-the-fedorarhelrocky-package)，在
 每个发布版本针对每个目标（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`）都包含
 `puzuz-v<X>-<target>.tar.gz` 及其 `.sha256` 和 `.minisig` 文件；软件包 `puzuz_<X>_amd64.deb`、
 `puzuz_<X>_arm64.deb`、`puzuz-<X>-1.x86_64.rpm` 和 `puzuz-<X>-1.aarch64.rpm` 也各自带有这两种文件；
+同样的软件包还以不带版本号的名称再附带一份（`puzuz_amd64.deb`、`puzuz_arm64.deb`、`puzuz.x86_64.rpm`、
+`puzuz.aarch64.rpm`，供 `releases/latest/download/<name>` 使用），各自带有自己的这两种文件；
 另外还有 `install.sh` 及其 `install.sh.minisig`；`.rpm` 经过 GPG 签名的发布版本还带有 `RPM-GPG-KEY-puzuz`
 及其 `RPM-GPG-KEY-puzuz.minisig`。要自己校验 tarball（或软件包）：
 
@@ -211,13 +213,29 @@ git commit packaging/minisign.pub scripts/install.sh
 <a id="installing-the-debianubuntu-package"></a>
 ## 安装 Debian/Ubuntu 软件包
 
-每个发布版本都包含面向 amd64 和 arm64 的 `.deb`（可用 `dpkg --print-architecture` 查看架构），适用于
-Debian 12 以及 Ubuntu 22.04、24.04 和 26.04。从发布版本下载 `puzuz_<version>_<arch>.deb`，并用 apt
-安装，apt 会同时拉取其依赖：
+每个发布版本都包含面向 amd64 和 arm64 的 `.deb`，适用于 Debian 12 以及 Ubuntu 22.04、24.04 和 26.04。
+从最新发布版本下载适合本机架构的文件，并用 apt 安装，apt 会同时拉取其依赖：
 
 ```sh
-sudo apt install ./puzuz_0.1.0_amd64.deb
+arch=$(uname -m | sed 's/^x86_64$/amd64/; s/^aarch64$/arm64/')
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
+sudo apt install "./puzuz_${arch}.deb"
 ```
+
+`releases/latest` 是最新的稳定发布版本（会跳过预发布版本），`puzuz_<arch>.deb` 是其
+`puzuz_<version>_<arch>.deb` 的不带版本号的副本。带版本号的文件也一并附带，用于安装特定版本
+（`https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz_0.1.0_amd64.deb`）。要在安装前校验下载的文件（参见
+[手动验证发布版本](#verifying-a-release-by-hand)）：
+
+```sh
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb.sha256"
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb.minisig"
+sha256sum -c "puzuz_${arch}.deb.sha256"
+minisign -Vm "puzuz_${arch}.deb" -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+```
+
+受信任注释（trusted comment）写明了发布版本和不带版本号的文件名
+（`Trusted comment: puzuz v0.1.0 puzuz_amd64.deb`）。
 
 软件包包含：
 
@@ -366,14 +384,19 @@ gh secret set APT_GPG_PASSPHRASE -R kaito4681/puzuz
 ## 安装 Fedora/RHEL/Rocky 软件包
 
 每个发布版本都包含面向 x86_64 和 aarch64 的 `.rpm`（可用 `uname -m` 查看架构），适用于 Fedora 以及 9
-或更高版本的 RHEL 兼容发行版（RHEL、Rocky Linux、AlmaLinux；glibc 2.34 或更高版本）。用 dnf 安装，
-可以从下载的文件安装，也可以直接从发布版本的 URL 安装；dnf 会拉取其依赖：
+或更高版本的 RHEL 兼容发行版（RHEL、Rocky Linux、AlmaLinux；glibc 2.34 或更高版本）。用 dnf 安装最新
+发布版本中的文件；dnf 可以直接接受 URL，并会拉取其依赖：
 
 ```sh
-sudo dnf install ./puzuz-0.1.0-1.x86_64.rpm
-# or
-sudo dnf install https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz-0.1.0-1.x86_64.rpm
+sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
 ```
+
+与 `.deb` 一样，`puzuz.<arch>.rpm` 是最新稳定发布版本的 `puzuz-<version>-1.<arch>.rpm` 的不带版本号的
+副本；带版本号的文件也一并附带，用于安装特定版本
+（`sudo dnf install https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz-0.1.0-1.x86_64.rpm`）。要先校验，请下载
+`puzuz.$(uname -m).rpm` 及其 `.sha256` 和 `.minisig` 文件，按与 [`.deb`](#installing-the-debianubuntu-package)
+相同的方式校验（受信任注释写明了不带版本号的文件名），然后用
+`sudo dnf install "./puzuz.$(uname -m).rpm"` 安装校验过的文件。
 
 （像 `v0.2.0-rc.1` 这样的预发布版本对应 `puzuz-0.2.0-rc.1-1.<arch>.rpm`；在软件包内部其版本为
 `0.2.0~rc.1`，排序在 `0.2.0` 之前。）
@@ -407,11 +430,11 @@ sudo dnf install --setopt=localpkg_gpgcheck=1 ./puzuz-0.1.0-1.x86_64.rpm
 请改为安装发布版本中更新的 `.rpm`；dnf 可以直接接受 URL：
 
 ```sh
-sudo dnf upgrade https://github.com/kaito4681/puzuz/releases/download/v<new version>/puzuz-<new version>-1.x86_64.rpm
+sudo dnf upgrade "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
 ```
 
-当存在更新的发布版本时，`puzuz doctor` 的“update”一行（以及 `puzuz update --check`）会打印这条命令，
-其中带有适合本机架构的发布版本 URL，以及如何先校验签名。升级会重启正在运行的服务。正在运行的作业会继续运行。
+当存在更新的发布版本时，`puzuz doctor` 的“update”一行（以及 `puzuz update --check`）会打印类似的命令，
+其中带有适合本机架构的、带版本号的发布版本 URL，以及如何先校验签名。升级会重启正在运行的服务。正在运行的作业会继续运行。
 
 **移除。**
 

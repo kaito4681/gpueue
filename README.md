@@ -75,7 +75,9 @@ needed (`GH_TOKEN` is used when set; it only raises the API rate limit).
 On Debian and Ubuntu (amd64 or arm64) you can install the package from the release instead:
 
 ```sh
-sudo apt install ./puzuz_<version>_amd64.deb     # or _arm64.deb
+arch=$(uname -m | sed 's/^x86_64$/amd64/; s/^aarch64$/arm64/')
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
+sudo apt install "./puzuz_${arch}.deb"
 ```
 
 It installs and starts the same services and recommends `criu`. It also registers the puzuz APT
@@ -85,14 +87,19 @@ services; `sudo apt purge puzuz` also deletes /etc/puzuz. Both keep /var/lib/puz
 jobs.
 
 On Fedora, RHEL, Rocky and Alma Linux 9+ (x86_64 or aarch64), install the .rpm from the release
-(a file or its URL):
+(dnf takes the URL directly):
 
 ```sh
-sudo dnf install ./puzuz-<version>-1.x86_64.rpm   # or -1.aarch64.rpm, or the release URL
+sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
 ```
 
-There is no dnf repository yet (planned, issue #23): update by installing the newer release's
-.rpm with `sudo dnf upgrade <its URL>`. `sudo dnf remove puzuz` stops the services and keeps
+These URLs always give the newest stable release (`releases/latest` skips pre-releases); the
+versioned files (`puzuz_<version>_<arch>.deb`, `puzuz-<version>-1.<arch>.rpm`) are attached too,
+for a specific version. Every file has `.sha256` and `.minisig` files (see
+[Verifying a release by hand](docs/install.md#verifying-a-release-by-hand)).
+
+There is no dnf repository yet (planned, issue #23): update by running the same command with
+`sudo dnf upgrade`. `sudo dnf remove puzuz` stops the services and keeps
 /var/lib/puzuz and running jobs. It recommends `criu`; Fedora's is new enough, Rocky/RHEL 9 ship
 only 3.19, so checkpointing there needs a newer CRIU (jobs run without it). You can also build
 from source or use the Nix flake (see [docs/install.md](docs/install.md)).

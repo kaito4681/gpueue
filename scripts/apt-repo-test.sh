@@ -343,6 +343,10 @@ ghrelease() { # TAG_VERSION
     mkpkg "$1" amd64 "/w/gh/v$1"
     (cd "/w/gh/v$1" && sha256sum "puzuz_$1_amd64.deb" >"puzuz_$1_amd64.deb.sha256")
     "$MINISIGN" -S -s /w/gh-minisign.key -m "/w/gh/v$1/puzuz_$1_amd64.deb" >/dev/null
+    # The version-less copy release.yml attaches for releases/latest/download.
+    cp "/w/gh/v$1/puzuz_$1_amd64.deb" "/w/gh/v$1/puzuz_amd64.deb"
+    (cd "/w/gh/v$1" && sha256sum puzuz_amd64.deb >puzuz_amd64.deb.sha256)
+    "$MINISIGN" -S -s /w/gh-minisign.key -m "/w/gh/v$1/puzuz_amd64.deb" >/dev/null
 }
 mkdir -p /w/gh
 cp -r prune /w/gh/apt
@@ -350,6 +354,8 @@ for v in 1.0.2 1.0.3; do ghrelease "$v"; done
 "$repo" github v1.0.2
 [ -f /w/gh/apt/puzuz_1.0.2_amd64.deb ] || fail "github: v1.0.2 not uploaded"
 [ ! -e /w/gh/apt/puzuz_0.9.0_amd64.deb ] || fail "github: the pruned package was not deleted"
+[ ! -e /w/gh/apt/puzuz_amd64.deb ] || fail "github: the version-less copy was published"
+[ "$(grep -c '^Filename: puzuz_1.0.2_amd64.deb$' /w/gh/apt/Packages)" = 1 ] || fail "github: v1.0.2 indexed more than once"
 grep -qx 'Filename: puzuz_1.0.2_amd64.deb' /w/gh/apt/Packages || fail "github: v1.0.2 not indexed"
 gpgv --quiet --keyring /w/test-keyring.gpg /w/gh/apt/InRelease 2>/dev/null || fail "github: InRelease"
 ghsnapshot() { (cd /w/gh/apt && sha256sum ./*); }
