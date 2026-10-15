@@ -214,6 +214,19 @@ pub fn run_verify_access() -> i32 {
     }
 }
 
+/// Whether `path` does not exist. One that root may not look at (below a
+/// FUSE mount without `allow_other`, which refuses root with `EACCES`) is
+/// there.
+fn path_missing(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(_) => false,
+        Err(e) => {
+            e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        }
+    }
+}
+
 /// The checks of [`run_verify_access`] that reply with a [`VerifyReply`].
 fn verify(req: Result<VerifyRequest, String>) -> VerifyReply {
     req.and_then(|req| match req {
@@ -226,7 +239,7 @@ fn verify(req: Result<VerifyRequest, String>) -> VerifyReply {
                 if c.mount_points {
                     crate::deadmounts::mount_point_missing(Path::new(p))
                 } else {
-                    fs::symlink_metadata(p).is_err()
+                    path_missing(Path::new(p))
                 }
             })
             .collect()),

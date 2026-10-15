@@ -1133,6 +1133,53 @@ s20_verify() {
     umount "$RNFS" || umount -l "$RNFS"
 }
 
+# s21: a FUSE mount of the job's owner without allow_other (as an
+# AppImage's, or a user's own sshfs): it answers, but refuses root, so CRIU
+# could not bind it on restore. A job that does not use it is checkpointed
+# with the mount left out and restored with an empty, inaccessible
+# directory there; a job working in it is refused, with the mount named,
+# and keeps running.
+PFUSE=/home/alice/pfuse
+s21_private_fuse() {
+    local disk=/var/lib/gpueue-e2e-disk u d err
+    need_mounts
+    if ! command -v sshfs >/dev/null || ! pgrep -x sshd >/dev/null; then
+        [ "${GPUEUE_E2E_REQUIRE_SSHFS:-}" != 1 ] || fail "sshfs is missing, and GPUEUE_E2E_REQUIRE_SSHFS=1"
+        echo "SKIP 21 a FUSE mount that refuses root: sshfs is not available"
+        return 0
+    fi
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    rm -f /home/alice/m21-*.txt
+    install -o alice -m 600 "$disk/ssh/id" /home/alice/.e2e-ssh-id
+    runuser -u alice -- mkdir -p "$PFUSE"
+    runuser -u alice -- sshfs -o IdentityFile=/home/alice/.e2e-ssh-id,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,LogLevel=ERROR \
+        root@127.0.0.1:/srv/ext4/export "$PFUSE" || fail "sshfs of alice on $PFUSE"
+    ! stat "$PFUSE" >/dev/null 2>&1 || fail "root can look at alice's FUSE mount"
+    u=$(cjob /home/alice /home/alice/m21-u.txt)
+    # (Only alice can enter $PFUSE: not `cjob`, which changes into it as root.)
+    d=$(runuser -u alice -- gpueue --color never add -p -g free -w "$PFUSE" -- \
+        "exec 3>>/home/alice/m21-d.txt; i=0; while :; do echo \$i >&3; i=\$((i+1)); sleep 0.2; done")
+    wait_state "$u" running
+    wait_state "$d" running
+    sleep 1
+    pz alice checkpoint "$u" >/dev/null || fail "checkpoint $u"
+    restore_continues "$u" /home/alice/m21-u.txt
+    [ "$(awk -v mp="$PFUSE" '$5 == mp {for (i = 7; i <= NF; i++) if ($i == "-") {print $(i + 1); exit}}' \
+        "/proc/$(live_pid "$u")/mountinfo")" != fuse.sshfs ] \
+        || fail "the restored job $u got the FUSE mount that refuses root"
+    err=$(pz alice checkpoint "$d" 2>&1) && fail "the checkpoint of job $d was not refused"
+    echo "checkpoint of job $d: $err"
+    grep -q "$PFUSE (fuse.sshfs) cannot be accessed by root" <<<"$err" \
+        || fail "the refusal does not name $PFUSE: $err"
+    grep -q "the working directory $PFUSE" <<<"$err" || fail "the refusal does not say why: $err"
+    expect_state "$d" running
+    pz alice kill "$u" "$d" >/dev/null
+    wait_state "$u" 'done/*'
+    wait_state "$d" 'done/*'
+    runuser -u alice -- fusermount3 -u "$PFUSE" 2>/dev/null || umount -l "$PFUSE"
+    rm -f /home/alice/.e2e-ssh-id
+}
+
 # Many jobs at once: `add --immediate` from several CLIs in parallel races
 # the scheduler, so the helper gets concurrent spawns; then again while the
 # helper restarts. No job may fail to spawn or get lost.
@@ -1522,6 +1569,7 @@ reboot-prepare)
     run "15 mounts across a reboot (prepare)" s15_prepare
     run "16 a mount missing after a reboot (prepare)" s16_prepare
     run "20 a dead FUSE mount (prepare)" s20_prepare
+    run "21 a FUSE mount that refuses root" s21_private_fuse
     ;;
 reboot-verify)
     # 16 first: until it mounts /data again, every restore is refused.

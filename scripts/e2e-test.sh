@@ -19,21 +19,22 @@
 #                       scenario.sh, separated by spaces or commas, e.g.
 #                       GPUEUE_E2E_ONLY=1 or GPUEUE_E2E_ONLY="3,7"), e.g. to
 #                       repeat one many times. The reboot scenarios (7, 15,
-#                       16, 20) and the container switch are skipped unless
+#                       16, 20, 21) and the container switch are skipped unless
 #                       one of them is listed.
 #                       Unknown numbers, and GPU scenarios without
 #                       GPUEUE_E2E_GPU=1, are rejected; a run in which no
 #                       scenario executed fails.
 #   GPUEUE_E2E_ONLY_REBOOT=1 same as GPUEUE_E2E_ONLY=7
-#   Scenarios 15, 16 and 20 need the administrator's mounts that
+#   Scenarios 15, 16, 20 and 21 need the administrator's mounts that
 #                       scripts/e2e/mounts.sh sets up at every boot when one
 #                       of them runs (loop-mounted ext4, an automount, tmpfs,
 #                       overlayfs, bind mounts, sshfs if the image has it);
 #                       their contents live on a second volume. Without
 #                       sshfs, scenario 15 prints a SKIP line for its FUSE
-#                       part, and scenario 20 (a FUSE mount whose sshfs is
-#                       killed) is skipped.
-#   GPUEUE_E2E_REQUIRE_SSHFS=1  fail scenarios 15 and 20 instead when sshfs
+#                       part, and scenarios 20 (a FUSE mount whose sshfs is
+#                       killed) and 21 (a user's FUSE mount that refuses
+#                       root) are skipped.
+#   GPUEUE_E2E_REQUIRE_SSHFS=1  fail scenarios 15, 20 and 21 instead when sshfs
 #                       is missing (set in CI)
 #   GPUEUE_E2E_NAME      prefix of the container and volume names
 #                       (default gpueue-e2e), to tell parallel runs apart
@@ -82,7 +83,7 @@ only="${only//,/ }"
 # GPU scenarios without GPUEUE_E2E_GPU=1 (they would be skipped silently).
 for n in $only; do
     case "$n" in
-    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17 | 18 | 19 | 20) ;;
+    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17 | 18 | 19 | 20 | 21) ;;
     9 | 11 | 12 | 14)
         if [ "${GPUEUE_E2E_GPU:-}" != 1 ]; then
             echo "scenario $n needs GPUEUE_E2E_GPU=1" >&2
@@ -97,14 +98,14 @@ for n in $only; do
 done
 # selected <n>: whether scenario <n> runs.
 selected() { [ -z "$only" ] || [[ " $only " == *" $1 "* ]]; }
-reboot_selected() { selected 7 || selected 15 || selected 16 || selected 20; }
-mounts_selected() { selected 15 || selected 16 || selected 20; }
-# Whether a scenario of the main phase (not 7, 15, 16 or 20) is selected.
+reboot_selected() { selected 7 || selected 15 || selected 16 || selected 20 || selected 21; }
+mounts_selected() { selected 15 || selected 16 || selected 20 || selected 21; }
+# Whether a scenario of the main phase (not 7, 15, 16, 20 or 21) is selected.
 main_selected() {
     local n
     [ -z "$only" ] && return 0
     for n in $only; do
-        case "$n" in 7 | 15 | 16 | 20) ;; *) return 0 ;; esac
+        case "$n" in 7 | 15 | 16 | 20 | 21) ;; *) return 0 ;; esac
     done
     return 1
 }
