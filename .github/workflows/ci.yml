@@ -113,9 +113,9 @@ jobs:
   # flake.nix, in parallel jobs: every check, an evaluation of all outputs,
   # the whole test suite with the Nix toolchain outside the build sandbox
   # (the package build runs no tests: those that spawn jobs cannot pass in
-  # the sandbox, which refuses setgid), and builds of puzuz and CRIU. The
+  # the sandbox, which refuses setgid), and builds of gpueue and CRIU. The
   # x86_64 checks include two NixOS VM tests, which need KVM (the NixOS
-  # module, and every puzuz-helper test), so the work there is split over
+  # module, and every gpueue-helper test), so the work there is split over
   # three runners; the aarch64 runner (no VM tests) does it all.
   nix:
     needs: [changes]
@@ -126,7 +126,7 @@ jobs:
       matrix:
         include:
           # The NixOS module test, and the home-manager check, which needs
-          # the same puzuz build; then that package and CRIU (built for the
+          # the same gpueue build; then that package and CRIU (built for the
           # NixOS test) are tried out.
           - name: x86_64 nixos VM
             runner: ubuntu-24.04
@@ -179,13 +179,13 @@ jobs:
       - if: matrix.smoke
         run: |
           nix build -L .#default
-          ./result/bin/puzuz --version
-          ./result/bin/puzuz-helper --help >/dev/null
-          test -s result/share/bash-completion/completions/puzuz.bash
+          ./result/bin/gpueue --version
+          ./result/bin/gpueue-helper --help >/dev/null
+          test -s result/share/bash-completion/completions/gpueue.bash
           nix build -L .#criu -o result-criu
           ./result-criu/bin/criu --version
 
-  # `puzuz service install|uninstall|status` and the install method checks
+  # `gpueue service install|uninstall|status` and the install method checks
   # under systemd in a privileged container.
   service-install:
     runs-on: ubuntu-24.04
@@ -210,7 +210,7 @@ jobs:
           path: target/dist-releases
           retention-days: 3
 
-  # install.sh (and `puzuz update`) against a fake GitHub API, in a systemd
+  # install.sh (and `gpueue update`) against a fake GitHub API, in a systemd
   # container per supported distribution (scripts/dist-test.sh).
   dist:
     runs-on: ubuntu-24.04
@@ -228,8 +228,8 @@ jobs:
           path: target/dist-releases
       - run: scripts/dist-test.sh
         env:
-          PUZUZ_DIST_BASE: ${{ matrix.base }}
-          PUZUZ_DIST_SKIP_BUILD: "1"
+          GPUEUE_DIST_BASE: ${{ matrix.base }}
+          GPUEUE_DIST_SKIP_BUILD: "1"
 
   # The .deb of each architecture (built like release.yml does, but from a
   # debug build), installed, reinstalled, removed and purged in plain
@@ -246,16 +246,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - if: matrix.runner == 'ubuntu-24.04-arm'
         run: scripts/test-in-docker.sh test --workspace --locked
-      - run: scripts/test-in-docker.sh build --locked -p puzuz -p puzuz-helper
+      - run: scripts/test-in-docker.sh build --locked -p gpueue -p gpueue-helper
       - run: scripts/dist/build-package.sh target/docker/debug target/deb
       - run: |
           for base in debian:12 ubuntu:24.04; do
-            PUZUZ_DEB_BASE="$base" scripts/deb-test.sh target/deb/puzuz_*.deb
+            GPUEUE_DEB_BASE="$base" scripts/deb-test.sh target/deb/gpueue_*.deb
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: deb-${{ matrix.runner }}
-          path: target/deb/puzuz_*.deb
+          path: target/deb/gpueue_*.deb
           retention-days: 3
 
   # The APT repository: v1 of the .deb installed, its sources pointed at a
@@ -281,9 +281,9 @@ jobs:
         with:
           name: deb-${{ matrix.runner }}
           path: target/deb
-      - run: scripts/apt-repo-test.sh target/deb/puzuz_*.deb
+      - run: scripts/apt-repo-test.sh target/deb/gpueue_*.deb
         env:
-          PUZUZ_APT_BASES: ${{ matrix.base }}
+          GPUEUE_APT_BASES: ${{ matrix.base }}
 
   # The .rpm of each architecture (built like release.yml does, but from a
   # debug build), installed, upgraded from an older pre-release package and
@@ -298,21 +298,21 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - run: scripts/test-in-docker.sh build --locked -p puzuz -p puzuz-helper
+      - run: scripts/test-in-docker.sh build --locked -p gpueue -p gpueue-helper
       - name: Build the .rpm, and a pre-release of it to upgrade from
         run: |
           . scripts/dist/lib.sh
           version="$(workspace_version .)"
-          PUZUZ_PKG_VERSION="$version-rc.1" scripts/dist/build-package.sh target/docker/debug target/rpm-old rpm
+          GPUEUE_PKG_VERSION="$version-rc.1" scripts/dist/build-package.sh target/docker/debug target/rpm-old rpm
           scripts/dist/build-package.sh target/docker/debug target/rpm rpm
       - run: |
           for base in rockylinux/rockylinux:9 fedora:latest; do
-            PUZUZ_RPM_BASE="$base" scripts/rpm-test.sh target/rpm-old/puzuz-*.rpm target/rpm/puzuz-*.rpm
+            GPUEUE_RPM_BASE="$base" scripts/rpm-test.sh target/rpm-old/gpueue-*.rpm target/rpm/gpueue-*.rpm
           done
       # GPG-signing the .rpm as release.yml's sign-rpm job does.
-      - run: scripts/rpm-sign-test.sh target/rpm/puzuz-*.rpm
+      - run: scripts/rpm-sign-test.sh target/rpm/gpueue-*.rpm
 
-  # The AUR package (packaging/aur/puzuz-bin) from a debug build, built with
+  # The AUR package (packaging/aur/gpueue-bin) from a debug build, built with
   # makepkg, installed, upgraded and removed in an Arch Linux container with
   # systemd (scripts/dist/aur-test.sh).
   aur:
@@ -321,16 +321,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - run: scripts/test-in-docker.sh build --locked -p puzuz -p puzuz-helper
+      - run: scripts/test-in-docker.sh build --locked -p gpueue -p gpueue-helper
       - name: Package the release tarball
         run: |
           . scripts/dist/lib.sh
-          name="puzuz-v$(workspace_version .)-x86_64-unknown-linux-gnu"
+          name="gpueue-v$(workspace_version .)-x86_64-unknown-linux-gnu"
           mkdir -p "target/aur/$name"
-          install -m 0755 target/docker/debug/puzuz target/docker/debug/puzuz-helper "target/aur/$name/"
+          install -m 0755 target/docker/debug/gpueue target/docker/debug/gpueue-helper "target/aur/$name/"
           cp -r README.md LICENSE docs "target/aur/$name/"
           tar -C target/aur -czf "target/aur/$name.tar.gz" "$name"
-      - run: scripts/dist/aur-test.sh target/aur/puzuz-v*.tar.gz
+      - run: scripts/dist/aur-test.sh target/aur/gpueue-v*.tar.gz
 
   # Daemon + helper + CLI under systemd in a privileged container, including
   # a simulated reboot (CPU-only; the GPU scenarios need an NVIDIA GPU).
@@ -343,4 +343,4 @@ jobs:
       - run: scripts/e2e-test.sh
         env:
           # The FUSE part of scenario 15 must not be skipped silently.
-          PUZUZ_E2E_REQUIRE_SSHFS: "1"
+          GPUEUE_E2E_REQUIRE_SSHFS: "1"

@@ -6,10 +6,10 @@ English | [日本語](ja/architecture.md) | [简体中文](zh-CN/architecture.md
 
 | Process | Runs as | Role |
 | --- | --- | --- |
-| `puzuz` (CLI) | the calling user | sends requests to the daemon over HTTP on a Unix socket |
-| `puzuz daemon` (`puzuz.service`) | system user `puzuz`, sandboxed, no capabilities | HTTP API, authorization, scheduler, SQLite state. Decides when jobs start, stop, checkpoint and restore. |
-| `puzuz-helper` (`puzuz-helper.service`) | root | starts jobs as their owner, signals them, and runs CRIU and cuda-checkpoint. Accepts connections only from the daemon's user. |
-| job units (`puzuz-job-<id>.service`, `puzuz-job-<id>-r<n>.service` after the n-th restore) | root shim, then the job owner | one transient systemd service per job |
+| `gpueue` (CLI) | the calling user | sends requests to the daemon over HTTP on a Unix socket |
+| `gpueue daemon` (`gpueue.service`) | system user `gpueue`, sandboxed, no capabilities | HTTP API, authorization, scheduler, SQLite state. Decides when jobs start, stop, checkpoint and restore. |
+| `gpueue-helper` (`gpueue-helper.service`) | root | starts jobs as their owner, signals them, and runs CRIU and cuda-checkpoint. Accepts connections only from the daemon's user. |
+| job units (`gpueue-job-<id>.service`, `gpueue-job-<id>-r<n>.service` after the n-th restore) | root shim, then the job owner | one transient systemd service per job |
 
 The HTTP server and the database run unprivileged. The root helper has a small dependency tree (no
 HTTP server, no SQLite) and validates every request itself: the uid (never 0), the working
@@ -19,20 +19,20 @@ directory.
 ## How a job flows
 
 ```
-puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──NDJSON over /run/puzuz/helper.sock──▶ puzuz-helper
+gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon ──NDJSON over /run/gpueue/helper.sock──▶ gpueue-helper
   (SO_PEERCRED identifies the caller)                (SQLite, scheduler)                                   │ D-Bus
                                                                                                            ▼
-                                                                         systemd: puzuz-job-<id>.service ─▶ shim ─▶ sh -c '<command>'
+                                                                         systemd: gpueue-job-<id>.service ─▶ shim ─▶ sh -c '<command>'
 ```
 
 1. **CLI → daemon.** The CLI sends REST/JSON requests under `/v1` (for example `POST /v1/jobs`) to
-   `/run/puzuz/puzuz.sock`, with an `x-puzuz-version` header. The daemon reads the caller's uid
+   `/run/gpueue/gpueue.sock`, with an `x-gpueue-version` header. The daemon reads the caller's uid
    from `SO_PEERCRED`, checks authorization and stores the job. Logs are streamed as raw bytes and
    state changes as Server-Sent Events (`/v1/events`). Pending warnings, such as a failed dump, come
-   back in an `x-puzuz-warnings` header and the CLI prints them on stderr.
+   back in an `x-gpueue-warnings` header and the CLI prints them on stderr.
    <a id="api-limits"></a>Every user can reach the socket, so the daemon limits what one user keeps
    open: at most 64 connections and 16 streams (`log --follow`, `/v1/events`) per uid, and 4096
-   connections in total (`puzuz.service` raises `LimitNOFILE` well above that). A request over a
+   connections in total (`gpueue.service` raises `LimitNOFILE` well above that). A request over a
    limit is answered with `too_many_requests`. A connection must send its request headers within
    20 seconds, and an idle keep-alive connection is closed after 20 seconds. `log --tail` looks
    for line starts in the last 4 MiB of the log at most (the output starts there if they hold
@@ -43,10 +43,10 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    it. Immediate launches (`start <id>`, `add -i`, `restart -i`, `restore -i`) by an
    administrator are marked as forced, in memory, and launched at once, ignoring every limit.
    Anybody else's are not forced: the action queues the job (or queues it for restore) and, in
-   the same transaction, moves it first among the owner's jobs like `puzuz top`
+   the same transaction, moves it first among the owner's jobs like `gpueue top`
    (`Core::queue_first`; not with `enable_user_top = false` or `priority_type = "basic"`). The
    plan then treats it like any queued job; the reply's `queued` says so.
-3. **Daemon → helper.** The daemon keeps one connection to `/run/puzuz/helper.sock` and exchanges
+3. **Daemon → helper.** The daemon keeps one connection to `/run/gpueue/helper.sock` and exchanges
    newline-delimited JSON. A Hello message checks the protocol version first. Then come requests
    with ids, and numbered events from the helper (job exited, checkpoint or restore finished).
    Events are persisted and replayed until the daemon acknowledges them, so nothing is lost while
@@ -64,10 +64,10 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    <a id="orphans"></a>A job the helper runs that the daemon has as finished, queued, checkpointed
    or not at all (for example after restoring the database from a backup) is an *orphan*. It is
    left running, its GPUs count as taken, and a queued job with its id is not started until it
-   ends. `puzuz status` lists orphans to administrators, `puzuz doctor` warns about them, and an
-   administrator can stop one with `puzuz kill <id>`.
+   ends. `gpueue status` lists orphans to administrators, `gpueue doctor` warns about them, and an
+   administrator can stop one with `gpueue kill <id>`.
 4. **Helper → systemd.** Over D-Bus the helper starts a transient service whose main process is
-   `puzuz-helper shim`. The unit has `Before=puzuz-helper.service` and `KillMode=mixed`, stdin is
+   `gpueue-helper shim`. The unit has `Before=gpueue-helper.service` and `KillMode=mixed`, stdin is
    `/dev/null`, and the stop timeout is `grace_secs`. Each job lives in its own cgroup, outside the
    daemon, the helper and the user's session, so it survives restarts of the daemon and the
    helper and the user logging out. With `gpu_device_isolation` (the default) the unit also has
@@ -89,7 +89,7 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    [What a job can and cannot do](install.md#what-a-job-can-and-cannot-do)). Then it drops to
    the owner's
    uid, gid and groups with `no_new_privs`, opens the log
-   (`/var/lib/puzuz/logs/<uid>/<id>.log`) and the working directory as the owner, and runs the
+   (`/var/lib/gpueue/logs/<uid>/<id>.log`) and the working directory as the owner, and runs the
    command through `sh -c`. The environment is the client's, plus `CUDA_VISIBLE_DEVICES`,
    `CUDA_DEVICE_ORDER=PCI_BUS_ID` and the fork guard in `LD_PRELOAD`. Signals for the job (TERM,
    INT, HUP, QUIT, USR1, USR2, TSTP, ALRM, WINCH and the other non-fault signals) go to the
@@ -103,7 +103,7 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    dead: a job with an open file, its working or root directory, its executable, a mapping or a
    bound Unix socket on one is refused with a reason that names the mount. For any other job the
    helper passes them to CRIU as external mounts with keys of its own
-   (`--external mnt[<mount point>]:puzuz-detached-<n>`, mounts below them with `--skip-mnt`) and
+   (`--external mnt[<mount point>]:gpueue-detached-<n>`, mounts below them with `--skip-mnt`) and
    records them in `helper-mounts.json`, so that one dead filesystem does not keep every job
    from being checkpointed (see
    [Network and FUSE filesystems that stop answering](install.md#network-and-fuse-filesystems-that-stop-answering)).
@@ -113,7 +113,7 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    daemon warns the owner). In manual mode it then runs
    `cuda-checkpoint --action lock` and `checkpoint` on each CUDA process, followed by
    `criu dump` of the namespace's init with `--tcp-close` and the image directory under
-   `/var/lib/puzuz/checkpoints/<id>/`. In plugin mode it runs only `criu dump`, with CRIU's
+   `/var/lib/gpueue/checkpoints/<id>/`. In plugin mode it runs only `criu dump`, with CRIU's
    default plugin directory, and CRIU's `cuda_plugin.so` calls cuda-checkpoint (in plugin mode a
    CUDA job is refused when the plugin is missing). Before the dump it writes what a restore needs
    besides CRIU's images (the owner record, the job's mounts and files, a draft `meta.json`);
@@ -125,11 +125,11 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    also after a crash between the dump and the marker, even if systemd still reports the dumped
    unit as active. If the dump fails, CRIU
    leaves the process running and the daemon then terminates it. The helper moves CRIU's
-   `dump.log` to `/var/lib/puzuz/checkpoints/failed-logs/` and removes the image directory.
+   `dump.log` to `/var/lib/gpueue/checkpoints/failed-logs/` and removes the image directory.
    A **paused** job is resumed (SIGCONT) before the dump, because cuda-checkpoint hangs on a
    stopped process, so it runs for a moment during the dump. The daemon records in the
    checkpoint record that the job was paused and asks the helper to restore it stopped (see
-   step 7), so the restored job runs nothing until `puzuz start`. When the dump is refused, the
+   step 7), so the restored job runs nothing until `gpueue start`. When the dump is refused, the
    daemon pauses it again (SIGSTOP). `pause` is refused while a dump is in progress.
 7. **Restore.** The helper claims the job (a delete of its checkpoint is refused from then on)
    and checks, off its request loop and with every file system lookup in a child process with a
@@ -140,16 +140,16 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    the files and working directories the job had open must exist. A mount left out at the dump
    is bound from the host's mount at the same place if a filesystem of the same type is mounted
    there again and answers, and otherwise from an empty, root-owned directory of mode 0
-   (`/var/lib/puzuz/checkpoints/detached-mount`); its mount point must exist. It starts a
-   new unit `puzuz-job-<id>-r<n>.service` that runs `criu restore --root` on a bind mount of `/`
-   (`/run/puzuz-helper/criu-root`), with the device access of the GPUs of the restore. In manual
+   (`/var/lib/gpueue/checkpoints/detached-mount`); its mount point must exist. It starts a
+   new unit `gpueue-job-<id>-r<n>.service` that runs `criu restore --root` on a bind mount of `/`
+   (`/run/gpueue-helper/criu-root`), with the device access of the GPUs of the restore. In manual
    mode it then runs cuda-checkpoint `restore` and
    `unlock` on the CUDA processes. In plugin mode CRIU's plugin does this before `criu restore`
    returns. Each image is restored in the mode it was dumped in, whatever `cuda_checkpoint_mode`
    says now. The job keeps its id and log, and the image is deleted afterwards (should that
    fail, when the job exits or is checkpointed again, or when the helper starts again; an image
    the job was restored from never refuses its next dump).
-   A job that was paused at the dump is restored **stopped**, as `puzuz pause` leaves it: the
+   A job that was paused at the dump is restored **stopped**, as `gpueue pause` leaves it: the
    restore hook (see [Restores and paths](#restores-and-paths)) sends SIGSTOP to its processes
    while CRIU still holds them, after CRIU's plugin has restored their CUDA state, so they enter
    the stop before they run a single instruction. (CRIU's own `--leave-stopped` stops them before
@@ -189,9 +189,9 @@ hold a root file opened with the dump-time mode. The helper therefore:
   reached by the owner without a symlink on the way (checked as the owner, with
   `openat2(RESOLVE_NO_SYMLINKS)`);
 - **before the restored job runs**, checks what CRIU actually opened: CRIU runs
-  `puzuz-helper verify-restore-hook` as its `pre-resume` action script (`--action-script`),
+  `gpueue-helper verify-restore-hook` as its `pre-resume` action script (`--action-script`),
   when the restored tasks are complete but still stopped under its control; the hook's child
-  process (`puzuz-helper verify-access`) pins every open file, working and root
+  process (`gpueue-helper verify-access`) pins every open file, working and root
   directory, executable and file mapping of the tasks through `/proc`, enters the job's
   mount namespace, drops to the owner, and requires that the owner may access each of them the
   way it is open (`faccessat2` on the pinned file) and reaches it by its path, without
@@ -201,7 +201,7 @@ hold a root file opened with the dump-time mode. The helper therefore:
   needs its path to lead to that very file: a job may hold a file in a way its owner could not
   open it again (created read-only, or on an sshfs mount that shows files as root's), and
   getting that same file back gives it nothing new. The files held are listed before the
-  dump and again by `puzuz-helper dump-hook`, CRIU's `post-dump` action script, which runs
+  dump and again by `gpueue-helper dump-hook`, CRIU's `post-dump` action script, which runs
   while the dumped tasks are still stopped under CRIU's control (so a file the job opened
   just before CRIU stopped it counts too). It is that file if it has the device and
   inode recorded at the dump, or (after a remount, when device numbers change and FUSE
@@ -238,13 +238,13 @@ failed and keeps the image as well.
   (default `UID_MIN` of `/etc/login.defs`), users missing from a non-empty `job_allowed_users`,
   and a job group listed in `job_denied_groups` (root-equivalent groups such as `docker`, `disk`
   or `sudo`, looked up in `/etc/group`), with an error of code `policy_denied` whose message
-  (`puzuz refuses to run jobs as <user>: <reason>`) becomes the job's spawn failure or restore
+  (`gpueue refuses to run jobs as <user>: <reason>`) becomes the job's spawn failure or restore
   error. It computes the job's supplementary groups itself (what `initgroups` would set, without
   denied groups and gid 0) and passes them to the shim; the helper's journal records the groups it
   left out. A restore is refused when the checkpointed processes had a denied
   group, and the check after the restore allows only the owner's groups minus the denied ones. See
   [Who jobs may run as](install.md#who-jobs-may-run-as).
-- The helper binds its socket in `/run/puzuz`, which the daemon user owns, through a private
+- The helper binds its socket in `/run/gpueue`, which the daemon user owns, through a private
   root-owned staging directory that it uses only by file descriptor. It serves one daemon session
   at a time (a new one replaces the old), at most a few connections waiting for their Hello, and
   bounds the queues and requests in flight of a session.
@@ -280,8 +280,8 @@ failed and keeps the image as well.
 ## Shutdown ordering
 
 - **OS shutdown or reboot.** systemd stops units in the reverse order of starting.
-  `puzuz.service` runs `After=puzuz-helper.service`, so the daemon stops first. Stopping the daemon
-  never stops jobs. `puzuz-helper.service` runs after the local and remote filesystems, D-Bus,
+  `gpueue.service` runs `After=gpueue-helper.service`, so the daemon stops first. Stopping the daemon
+  never stops jobs. `gpueue-helper.service` runs after the local and remote filesystems, D-Bus,
   `nvidia-persistenced` and `nvidia-fabricmanager`, so those are still available while it stops.
   On SIGTERM the helper asks systemd whether the whole system is stopping. If so, it refuses new
   work, dumps every running job one at a time (except `--no-checkpoint` jobs), keeps extending
@@ -291,18 +291,18 @@ failed and keeps the image as well.
   back (the job is thawed and its CUDA state restored and unlocked; in plugin mode, where the
   killed CRIU's plugin may have left the CUDA processes locked or checkpointed, the helper asks
   `cuda-checkpoint --get-state` and restores and unlocks them as needed). Paused jobs are dumped too
-  (resumed first), and come back paused (stopped, without running) after `puzuz restore`. Job units are
-  `Before=puzuz-helper.service`, so systemd stops them only after the helper has finished. On the
+  (resumed first), and come back paused (stopped, without running) after `gpueue restore`. Job units are
+  `Before=gpueue-helper.service`, so systemd stops them only after the helper has finished. On the
   next boot the daemon gets the results from the helper's replayed events and marks the jobs
   `Checkpointed`. Jobs whose dump failed or was refused were stopped by systemd. They are marked
   `Checkpoint failed` with the reason, and their owners are warned.
-- **`puzuz shutdown`** (administrators) does not rely on unit ordering. The daemon checkpoints
+- **`gpueue shutdown`** (administrators) does not rely on unit ordering. The daemon checkpoints
   running jobs one at a time (or terminates them with `--no-checkpoint`), waits for them to settle,
   and exits. The helper keeps running. A job whose dump fails is terminated. A job whose dump the
   helper refuses is left running, because terminating it would lose the work. The daemon logs a
-  warning and the owner is warned. Stop it with `puzuz kill` or `puzuz shutdown --no-checkpoint`
+  warning and the owner is warned. Stop it with `gpueue kill` or `gpueue shutdown --no-checkpoint`
   if needed.
-- **`systemctl stop/restart puzuz-helper` or `puzuz`** on its own leaves jobs running.
+- **`systemctl stop/restart gpueue-helper` or `gpueue`** on its own leaves jobs running.
 
 ## Priority and fair share
 
@@ -310,7 +310,7 @@ The order of queued jobs is Slurm's multifactor priority (the formula and settin
 [docs/install.md](install.md#priority-and-fair-share)). The work is split like the rest of the
 scheduler:
 
-- `puzuz-core::priority` is pure: the factors, the formula, the owner's order (top, `-o`
+- `gpueue-core::priority` is pure: the factors, the formula, the owner's order (top, `-o`
   priority, id; applied by pooling the ages of a user's jobs that could launch now, i.e. group
   present and not paused, GPUs detected, dependencies done, and handing them out in that order), the
   classic fair-share
@@ -319,7 +319,7 @@ scheduler:
   candidates with it and then applies the usual slot, pause and dependency rules unchanged, so a
   high-priority job that does not fit never blocks jobs behind it. `plan`/`plan_with` keep pueue's
   order (also used for `priority_type = "basic"`). `scheduler::pending_priorities` (behind
-  `puzuz prio`) uses the same candidate selection, so it lists what the plan considers.
+  `gpueue prio`) uses the same candidate selection, so it lists what the plan considers.
 - The storage keeps `jobs.nice`, `jobs.site_factor`, `jobs.top_seq`, `jobs.run_since`, `groups.priority`, the
   `user_shares` and `user_usage` tables and, in `meta`, when usage was last calculated and reset
   (schema version 6).
@@ -335,17 +335,17 @@ scheduler:
   `GET /v1/shares`, `PUT /v1/shares/{uid}` and `PUT /v1/groups/{name}/priority` (administrators),
   and `POST /v1/jobs/nice`, `/v1/jobs/top` and `/v1/jobs/site`, which report per job like the
   bulk endpoint. Negative nice values, site factors, shares and group priorities are checked in
-  `puzuz-core::authz`.
+  `gpueue-core::authz`.
 
 ## State
 
 | Data | Location | Owner |
 | --- | --- | --- |
-| jobs, groups, GPU slot limits, checkpoint records, pending warnings, fair-share shares and usage | `/var/lib/puzuz/daemon/state.sqlite` (WAL with `synchronous=FULL`, so an acknowledged helper event survives a power failure; schema versioned with `PRAGMA user_version`) | daemon |
-| job records, event queue | `/var/lib/puzuz/helper/` | helper |
-| job output | `/var/lib/puzuz/logs/<uid>/<id>.log` | the helper creates the directory (owned by the user, group `puzuz`, mode 2770). The shim writes the log as the owner. The daemon reads and truncates it without following symlinks and only if it is a regular file owned by the job's owner. |
-| checkpoint images | `/var/lib/puzuz/checkpoints/<id>/` | helper (root only) |
-| configuration | `/etc/puzuz/config.toml` | root |
+| jobs, groups, GPU slot limits, checkpoint records, pending warnings, fair-share shares and usage | `/var/lib/gpueue/daemon/state.sqlite` (WAL with `synchronous=FULL`, so an acknowledged helper event survives a power failure; schema versioned with `PRAGMA user_version`) | daemon |
+| job records, event queue | `/var/lib/gpueue/helper/` | helper |
+| job output | `/var/lib/gpueue/logs/<uid>/<id>.log` | the helper creates the directory (owned by the user, group `gpueue`, mode 2770). The shim writes the log as the owner. The daemon reads and truncates it without following symlinks and only if it is a regular file owned by the job's owner. |
+| checkpoint images | `/var/lib/gpueue/checkpoints/<id>/` | helper (root only) |
+| configuration | `/etc/gpueue/config.toml` | root |
 
 Only the daemon writes the database. The CLI always goes through the daemon.
 
@@ -353,14 +353,14 @@ Only the daemon writes the database. The CLI always goes through the daemon.
 
 | Crate | Contents |
 | --- | --- |
-| `crates/puzuz` | the `puzuz` binary: pueue-compatible CLI, `puzuz daemon`, `service`, `doctor`, `update` (the only crate with an HTTPS client) |
-| `crates/puzuz-core` | domain model, job lifecycle, scheduling decisions, authorization, SQLite storage (no other I/O) |
-| `crates/puzuz-protocol` | wire types: CLI ⇄ daemon (HTTP API and client), daemon ⇄ helper (NDJSON messages) |
-| `crates/puzuz-config` | the `/etc/puzuz/config.toml` schema, shared by the daemon, the helper (with root-ownership checks) and `doctor` |
-| `crates/puzuz-daemon` | the daemon: axum API, scheduler loop, helper client, GPU detection (NVML) |
-| `crates/puzuz-checkpoint` | CRIU and cuda-checkpoint command plans, execution with timeouts and rollback, image layout |
-| `crates/puzuz-helper` | the `puzuz-helper` binary: socket server, job engine, systemd launcher, shim, mount analysis, fork guard (`forkguard/forkguard.c`, embedded in the binary) |
+| `crates/gpueue` | the `gpueue` binary: pueue-compatible CLI, `gpueue daemon`, `service`, `doctor`, `update` (the only crate with an HTTPS client) |
+| `crates/gpueue-core` | domain model, job lifecycle, scheduling decisions, authorization, SQLite storage (no other I/O) |
+| `crates/gpueue-protocol` | wire types: CLI ⇄ daemon (HTTP API and client), daemon ⇄ helper (NDJSON messages) |
+| `crates/gpueue-config` | the `/etc/gpueue/config.toml` schema, shared by the daemon, the helper (with root-ownership checks) and `doctor` |
+| `crates/gpueue-daemon` | the daemon: axum API, scheduler loop, helper client, GPU detection (NVML) |
+| `crates/gpueue-checkpoint` | CRIU and cuda-checkpoint command plans, execution with timeouts and rollback, image layout |
+| `crates/gpueue-helper` | the `gpueue-helper` binary: socket server, job engine, systemd launcher, shim, mount analysis, fork guard (`forkguard/forkguard.c`, embedded in the binary) |
 
 The systemd units, sysusers.d and tmpfiles.d snippets and the default configuration live in
-[`packaging/`](../packaging) and are embedded in the `puzuz` binary for `puzuz service install`.
-The AUR package (`packaging/aur/puzuz-bin`) installs the same files unchanged.
+[`packaging/`](../packaging) and are embedded in the `gpueue` binary for `gpueue service install`.
+The AUR package (`packaging/aur/gpueue-bin`) installs the same files unchanged.

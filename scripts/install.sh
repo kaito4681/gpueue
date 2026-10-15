@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Installs, re-installs (updates) or uninstalls puzuz from its GitHub releases.
+# Installs, re-installs (updates) or uninstalls gpueue from its GitHub releases.
 #
-#   curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
+#   curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.sh | sudo bash
 #   sudo bash install.sh [--version X] [--bin-dir DIR] [--save-token] [--token-file F]
 #   sudo bash install.sh --uninstall [--purge] [--yes]
 #
@@ -9,13 +9,13 @@
 # only the last line runs anything, so a truncated download does nothing.
 set -euo pipefail
 
-REPO="kaito4681/puzuz"
+REPO="kaito4681/gpueue"
 # Set by check_arch: x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu.
 TARGET=""
 MIN_GLIBC="2.34"
 DEFAULT_BIN_DIR="/usr/local/bin"
-TOKEN_FILE_SAVED="/etc/puzuz/github-token"
-INSTALL_MARKER='# Installed by `puzuz service install`; re-running it overwrites this file.'
+TOKEN_FILE_SAVED="/etc/gpueue/github-token"
+INSTALL_MARKER='# Installed by `gpueue service install`; re-running it overwrites this file.'
 # The release signing key; must match packaging/minisign.pub (checked by the
 # release workflow and a unit test).
 MINISIGN_PUBKEY="RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv"
@@ -30,7 +30,7 @@ MINISIGN=""
 
 usage() {
     cat <<EOF
-Install puzuz (the daemon, the root helper and the CLI) from its GitHub releases,
+Install gpueue (the daemon, the root helper and the CLI) from its GitHub releases,
 or uninstall it. Must run as root.
 
 Usage:
@@ -39,16 +39,16 @@ Usage:
 
 Options:
   --version X        install version X (default: the latest release); re-running
-                     with a newer version updates puzuz, running jobs keep running
+                     with a newer version updates gpueue, running jobs keep running
   --bin-dir DIR      install somewhere else than the default (the current
                      installation's directory, else $DEFAULT_BIN_DIR)
   --token-file FILE  read the GitHub token from FILE
   --save-token       save the token to $TOKEN_FILE_SAVED (root, 0600) for
-                     \`puzuz update\`
+                     \`gpueue update\`
   --uninstall        stop and remove the services and the binaries (runs
-                     \`puzuz uninstall\`); keeps /etc/puzuz and /var/lib/puzuz
+                     \`gpueue uninstall\`); keeps /etc/gpueue and /var/lib/gpueue
                      (state, logs, checkpoints)
-  --purge            with --uninstall: also delete /etc/puzuz and /var/lib/puzuz
+  --purge            with --uninstall: also delete /etc/gpueue and /var/lib/gpueue
   -y, --yes          do not ask before purging
   -h, --help         show this help
 
@@ -152,7 +152,7 @@ check_root() {
 }
 
 check_systemd() {
-    [ -d /run/systemd/system ] || die "systemd is not the init system (PID 1); puzuz runs as systemd services"
+    [ -d /run/systemd/system ] || die "systemd is not the init system (PID 1); gpueue runs as systemd services"
 }
 
 # Same mapping as dist_arch in scripts/dist/lib.sh (this script is downloaded
@@ -163,7 +163,7 @@ check_arch() {
     case "$arch" in
     x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
     aarch64 | arm64) TARGET="aarch64-unknown-linux-gnu" ;;
-    *) die "releases exist for x86_64 and aarch64 only (this machine is $arch); build puzuz from source (see docs/install.md)" ;;
+    *) die "releases exist for x86_64 and aarch64 only (this machine is $arch); build gpueue from source (see docs/install.md)" ;;
     esac
 }
 
@@ -175,8 +175,8 @@ version_ge() {
 check_glibc() {
     local version
     version="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')" || true
-    [ -n "$version" ] || die "cannot determine the glibc version (\`getconf GNU_LIBC_VERSION\`); puzuz needs glibc $MIN_GLIBC or newer"
-    version_ge "$version" "$MIN_GLIBC" || die "glibc $version is too old; puzuz needs $MIN_GLIBC or newer (e.g. Ubuntu 22.04, Debian 12, RHEL 9)"
+    [ -n "$version" ] || die "cannot determine the glibc version (\`getconf GNU_LIBC_VERSION\`); gpueue needs glibc $MIN_GLIBC or newer"
+    version_ge "$version" "$MIN_GLIBC" || die "glibc $version is too old; gpueue needs $MIN_GLIBC or newer (e.g. Ubuntu 22.04, Debian 12, RHEL 9)"
 }
 
 # os_release FIELD: a field of os-release(5) (/etc/os-release, else
@@ -193,7 +193,7 @@ os_release() {
 }
 
 # The distribution family (debian, rhel, arch, suse) from ID and ID_LIKE, or
-# nothing. Used for wording only, never to decide how puzuz is installed.
+# nothing. Used for wording only, never to decide how gpueue is installed.
 os_family() {
     local id
     for id in $(os_release ID) $(os_release ID_LIKE); do
@@ -206,47 +206,47 @@ os_family() {
     done
 }
 
-# unit_puzuz UNIT: the puzuz binary that UNIT's ExecStart= runs (after any
+# unit_gpueue UNIT: the gpueue binary that UNIT's ExecStart= runs (after any
 # of systemd's -@:+! prefixes), or nothing.
-unit_puzuz() {
+unit_gpueue() {
     # sed stops at the first match itself: no `| head -n1` (see json_tag).
-    sed -n '\|^ExecStart=[-@:+!]*/[^ ]*/puzuz daemon|{s|^ExecStart=[-@:+!]*\(/[^ ]*/puzuz\) daemon.*|\1|p;q;}' "$1" 2>/dev/null
+    sed -n '\|^ExecStart=[-@:+!]*/[^ ]*/gpueue daemon|{s|^ExecStart=[-@:+!]*\(/[^ ]*/gpueue\) daemon.*|\1|p;q;}' "$1" 2>/dev/null
 }
 
 # The directory of the binaries the `service install` unit runs, or nothing.
 installed_bin_dir() {
     local exe
-    exe="$(unit_puzuz /etc/systemd/system/puzuz.service)"
+    exe="$(unit_gpueue /etc/systemd/system/gpueue.service)"
     [ -z "$exe" ] || dirname "$exe"
 }
 
-# The `puzuz` of an existing installation: the one the daemon unit runs, else
+# The `gpueue` of an existing installation: the one the daemon unit runs, else
 # the one in PATH; nothing if there is none.
-installed_puzuz() {
+installed_gpueue() {
     local unit exe
-    for unit in /etc/systemd/system/puzuz.service /usr/lib/systemd/system/puzuz.service /lib/systemd/system/puzuz.service; do
-        exe="$(unit_puzuz "$unit")"
+    for unit in /etc/systemd/system/gpueue.service /usr/lib/systemd/system/gpueue.service /lib/systemd/system/gpueue.service; do
+        exe="$(unit_gpueue "$unit")"
         if [ -n "$exe" ] && [ -x "$exe" ]; then
             echo "$exe"
             return
         fi
     done
-    command -v puzuz 2>/dev/null || true
+    command -v gpueue 2>/dev/null || true
 }
 
-# Whether /etc/systemd/system/puzuz.service was written by `puzuz service install`.
+# Whether /etc/systemd/system/gpueue.service was written by `gpueue service install`.
 marker_unit_installed() {
-    [ "$(head -n1 /etc/systemd/system/puzuz.service 2>/dev/null)" = "$INSTALL_MARKER" ]
+    [ "$(head -n1 /etc/systemd/system/gpueue.service 2>/dev/null)" = "$INSTALL_MARKER" ]
 }
 
-# installed_method: how an installed puzuz says it is installed (`puzuz
-# service install-method`), or nothing if no puzuz can tell (none installed,
+# installed_method: how an installed gpueue says it is installed (`gpueue
+# service install-method`), or nothing if no gpueue can tell (none installed,
 # or one too old to know the command, or failing).
 installed_method() {
-    local puzuz
-    puzuz="$(installed_puzuz)"
-    [ -n "$puzuz" ] || return 0
-    "$puzuz" service install-method 2>/dev/null || true
+    local gpueue
+    gpueue="$(installed_gpueue)"
+    [ -n "$gpueue" ] || return 0
+    "$gpueue" service install-method 2>/dev/null || true
 }
 
 # package_owner FILE: prints "NAME MANAGER" for the package that owns FILE
@@ -291,22 +291,22 @@ package_hint() {
 
 nix_message() {
     if [ "$(os_release ID)" = nixos ]; then
-        echo "this is NixOS: install puzuz with the \`services.puzuz\` NixOS module instead"
+        echo "this is NixOS: install gpueue with the \`services.gpueue\` NixOS module instead"
     else
-        echo "the puzuz units come from /nix/store: change the Nix configuration that created them instead"
+        echo "the gpueue units come from /nix/store: change the Nix configuration that created them instead"
     fi
 }
 
-# Without an installed puzuz to ask: refuses only what is clearly not ours to
+# Without an installed gpueue to ask: refuses only what is clearly not ours to
 # change (NixOS, units from /nix/store, units a package owns). The new binary
 # decides the rest after the download.
 check_obvious_conflicts() {
     local unit file owner
     [ "$(os_release ID)" != nixos ] || die "$(nix_message)"
     case "$(readlink -m /etc/systemd/system)" in
-    /nix/store/*) die "/etc/systemd/system resolves into /nix/store (managed by Nix); install puzuz through that Nix configuration instead" ;;
+    /nix/store/*) die "/etc/systemd/system resolves into /nix/store (managed by Nix); install gpueue through that Nix configuration instead" ;;
     esac
-    for unit in puzuz.service puzuz-helper.service; do
+    for unit in gpueue.service gpueue-helper.service; do
         if [ -L "/etc/systemd/system/$unit" ]; then
             case "$(readlink -m "/etc/systemd/system/$unit")" in
             /nix/store/*) die "$(nix_message)" ;;
@@ -316,7 +316,7 @@ check_obvious_conflicts() {
             [ -e "$file" ] || continue
             if owner="$(package_owner "$file")"; then
                 # shellcheck disable=SC2086
-                die "puzuz is installed by the distribution package ${owner% *} (${owner#* }: $file); $(package_hint $owner)"
+                die "gpueue is installed by the distribution package ${owner% *} (${owner#* }: $file); $(package_hint $owner)"
             fi
         done
     done
@@ -325,8 +325,8 @@ check_obvious_conflicts() {
 # Packaged-looking units no package owns.
 unowned_units() {
     local file found=()
-    for file in /usr/lib/systemd/system/puzuz.service /usr/lib/systemd/system/puzuz-helper.service \
-        /lib/systemd/system/puzuz.service /lib/systemd/system/puzuz-helper.service; do
+    for file in /usr/lib/systemd/system/gpueue.service /usr/lib/systemd/system/gpueue-helper.service \
+        /lib/systemd/system/gpueue.service /lib/systemd/system/gpueue-helper.service; do
         # On merged-/usr systems /lib is /usr/lib.
         case "$file" in /lib/*) [ /lib -ef /usr/lib ] && continue ;; esac
         [ -e "$file" ] && found+=("$file")
@@ -342,15 +342,15 @@ check_install_method() {
     package)
         family="$(os_family)"
         case "$family" in
-        debian) die "puzuz is installed by a distribution package; update it with \`sudo apt update && sudo apt upgrade\`, or remove it with apt, instead (\`puzuz doctor\` names the package)" ;;
-        *) die "puzuz is installed by a distribution package; update or remove it with your package manager instead (\`puzuz doctor\` names the package)" ;;
+        debian) die "gpueue is installed by a distribution package; update it with \`sudo apt update && sudo apt upgrade\`, or remove it with apt, instead (\`gpueue doctor\` names the package)" ;;
+        *) die "gpueue is installed by a distribution package; update or remove it with your package manager instead (\`gpueue doctor\` names the package)" ;;
         esac
         ;;
     unowned) die "no package owns $(unowned_units) (left over from a removed package, or copied there by hand); delete it and re-run this script" ;;
     # nixos: what `install-method` printed before it said nix.
     nix | nixos) die "$(nix_message)" ;;
-    manual) die "/etc/systemd/system/puzuz.service was not written by \`puzuz service install\`; remove it (or run \`sudo puzuz service install --force\` once) and re-run this script" ;;
-    mixed) die "puzuz is installed in more than one way; run \`puzuz doctor\` and remove all but one first" ;;
+    manual) die "/etc/systemd/system/gpueue.service was not written by \`gpueue service install\`; remove it (or run \`sudo gpueue service install --force\` once) and re-run this script" ;;
+    mixed) die "gpueue is installed in more than one way; run \`gpueue doctor\` and remove all but one first" ;;
     *) die "unknown install method: $1" ;;
     esac
 }
@@ -400,7 +400,7 @@ write_headers() {
         umask 077
         {
             printf 'X-GitHub-Api-Version: 2022-11-28\n'
-            printf 'User-Agent: puzuz-install\n'
+            printf 'User-Agent: gpueue-install\n'
             if [ -n "$token" ]; then
                 printf 'Authorization: Bearer %s\n' "$token"
             fi
@@ -517,14 +517,14 @@ verify() {
         die "SHA-256 checksum mismatch for $tarball; not installing it"
     info "verified the SHA-256 checksum"
     local key=(-P "$MINISIGN_PUBKEY")
-    # Test-only: another public key file (ignored without PUZUZ_TEST_HOOKS=1).
-    if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_UPDATE_PUBKEY_FILE:-}" ]; then
-        key=(-p "$PUZUZ_UPDATE_PUBKEY_FILE")
+    # Test-only: another public key file (ignored without GPUEUE_TEST_HOOKS=1).
+    if [ "${GPUEUE_TEST_HOOKS:-}" = 1 ] && [ -n "${GPUEUE_UPDATE_PUBKEY_FILE:-}" ]; then
+        key=(-p "$GPUEUE_UPDATE_PUBKEY_FILE")
     fi
     # -Q prints the trusted comment, which the signature covers. The release
-    # workflow signs with "puzuz <tag> <file>": requiring exactly that keeps
+    # workflow signs with "gpueue <tag> <file>": requiring exactly that keeps
     # an older (validly signed) release from being served under a newer name.
-    local comment want="puzuz $TAG $tarball"
+    local comment want="gpueue $TAG $tarball"
     comment="$("$MINISIGN" -V -Q "${key[@]}" -m "$WORK/$tarball" -x "$WORK/$tarball.minisig")" ||
         die "bad signature on $tarball; not installing it"
     [ "$comment" = "$want" ] ||
@@ -547,10 +547,10 @@ find_minisign() {
         return
     fi
     local url="$MINISIGN_URL" proto='=https' arch archive="$WORK/minisign.tar.gz" sum
-    # Test-only: another download URL (ignored without PUZUZ_TEST_HOOKS=1).
+    # Test-only: another download URL (ignored without GPUEUE_TEST_HOOKS=1).
     # The checksum below is checked all the same.
-    if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_MINISIGN_TARBALL_URL:-}" ]; then
-        url="$PUZUZ_MINISIGN_TARBALL_URL"
+    if [ "${GPUEUE_TEST_HOOKS:-}" = 1 ] && [ -n "${GPUEUE_MINISIGN_TARBALL_URL:-}" ]; then
+        url="$GPUEUE_MINISIGN_TARBALL_URL"
         case "$url" in http://*) proto='=http,https' ;; esac
     fi
     case "$TARGET" in
@@ -605,7 +605,7 @@ save_token() {
         warn "--save-token: no token to save"
         return
     fi
-    install -d -m 0755 /etc/puzuz
+    install -d -m 0755 /etc/gpueue
     (
         umask 077
         printf '%s\n' "$token" >"$TOKEN_FILE_SAVED.tmp"
@@ -613,7 +613,7 @@ save_token() {
     chown root:root "$TOKEN_FILE_SAVED.tmp"
     chmod 0600 "$TOKEN_FILE_SAVED.tmp"
     mv -f "$TOKEN_FILE_SAVED.tmp" "$TOKEN_FILE_SAVED"
-    info "saved the token to $TOKEN_FILE_SAVED (root only) for \`puzuz update\`"
+    info "saved the token to $TOKEN_FILE_SAVED (root only) for \`gpueue update\`"
 }
 
 # have_program NAME: whether NAME is in systemd's default PATH for services
@@ -626,12 +626,12 @@ have_program() {
     return 1
 }
 
-# Prints how to install what puzuz needs but this script does not install.
+# Prints how to install what gpueue needs but this script does not install.
 print_missing_deps() {
     local hints=()
     if ! have_program criu; then
         case "$(os_family)" in
-        debian) hints+=("criu (checkpointing): \`sudo apt install criu\`; puzuz needs CRIU 4.2 or newer, so on older releases build it from source (see docs/install.md, \"CRIU\")") ;;
+        debian) hints+=("criu (checkpointing): \`sudo apt install criu\`; gpueue needs CRIU 4.2 or newer, so on older releases build it from source (see docs/install.md, \"CRIU\")") ;;
         rhel) hints+=("criu (checkpointing): \`sudo dnf install criu\` (4.2 or newer)") ;;
         arch) hints+=("criu (checkpointing): \`sudo pacman -S criu\`") ;;
         suse) hints+=("criu (checkpointing): \`sudo zypper install criu\` (4.2 or newer)") ;;
@@ -654,7 +654,7 @@ do_install() {
     check_arch
     check_glibc
     local method
-    # An installed puzuz knows best; without one, only the obvious conflicts
+    # An installed gpueue knows best; without one, only the obvious conflicts
     # are refused here, and the downloaded binary decides below.
     method="$(installed_method)"
     if [ -z "$method" ]; then
@@ -672,9 +672,9 @@ do_install() {
     write_headers "$token"
     fetch_release
     local version="${TAG#v}"
-    local name="puzuz-$TAG-$TARGET"
+    local name="gpueue-$TAG-$TARGET"
     local tarball="$name.tar.gz"
-    info "installing puzuz $version from $REPO"
+    info "installing gpueue $version from $REPO"
     download_asset "$WORK/release.json" "$tarball"
     download_asset "$WORK/release.json" "$tarball.sha256"
     download_asset "$WORK/release.json" "$tarball.minisig"
@@ -682,8 +682,8 @@ do_install() {
     verify "$tarball"
     extract "$tarball" "$name"
 
-    local new="$WORK/$name/puzuz"
-    [ -x "$new" ] && [ -x "$WORK/$name/puzuz-helper" ] || die "$tarball lacks puzuz or puzuz-helper"
+    local new="$WORK/$name/gpueue"
+    [ -x "$new" ] && [ -x "$WORK/$name/gpueue-helper" ] || die "$tarball lacks gpueue or gpueue-helper"
     # The new binary decides with its own detection, too.
     check_install_method "$("$new" service install-method)"
 
@@ -697,39 +697,39 @@ do_install() {
     bin_dir="$(installed_bin_dir)"
     [ -n "$bin_dir" ] || bin_dir="${BIN_DIR:-$DEFAULT_BIN_DIR}"
     if [ "$status" -ne 0 ]; then
-        if "$bin_dir/puzuz" service status >/dev/null 2>&1; then
-            warn "puzuz $version is installed and running, but some checks above failed; fix them and re-run \`puzuz doctor\`"
+        if "$bin_dir/gpueue" service status >/dev/null 2>&1; then
+            warn "gpueue $version is installed and running, but some checks above failed; fix them and re-run \`gpueue doctor\`"
         else
             print_missing_deps
-            die "\`puzuz service install\` failed (see above)"
+            die "\`gpueue service install\` failed (see above)"
         fi
     fi
     print_missing_deps
     info ""
-    info "puzuz $version is installed in $bin_dir."
+    info "gpueue $version is installed in $bin_dir."
 }
 
 # --- uninstall -------------------------------------------------------------
 
 do_uninstall() {
-    local method puzuz bin_dir
+    local method gpueue bin_dir
     method="$(installed_method)"
     if [ -z "$method" ] && marker_unit_installed; then
         method=service-install
     fi
     case "$method" in
     service-install) ;;
-    "" | none) die "puzuz is not installed by \`puzuz service install\`; nothing to uninstall" ;;
+    "" | none) die "gpueue is not installed by \`gpueue service install\`; nothing to uninstall" ;;
     *) check_install_method "$method" ;;
     esac
     bin_dir="$(installed_bin_dir)"
     [ -n "$bin_dir" ] || bin_dir="${BIN_DIR:-$DEFAULT_BIN_DIR}"
-    puzuz="$bin_dir/puzuz"
-    [ -x "$puzuz" ] || die "$puzuz not found"
-    # `puzuz uninstall` also removes the binaries `service install` copied. A
-    # puzuz from before it has only `service uninstall`, which keeps them.
+    gpueue="$bin_dir/gpueue"
+    [ -x "$gpueue" ] || die "$gpueue not found"
+    # `gpueue uninstall` also removes the binaries `service install` copied. A
+    # gpueue from before it has only `service uninstall`, which keeps them.
     local args=(uninstall) legacy=0
-    if ! "$puzuz" uninstall --help >/dev/null 2>&1; then
+    if ! "$gpueue" uninstall --help >/dev/null 2>&1; then
         legacy=1
         args=(service uninstall)
     fi
@@ -743,14 +743,14 @@ do_uninstall() {
     fi
     # stdin may be this script (curl | sudo bash): ask on the terminal.
     if [ "$PURGE" = 1 ] && [ "$YES" = 0 ]; then
-        "$puzuz" "${args[@]}" </dev/tty
+        "$gpueue" "${args[@]}" </dev/tty
     else
-        "$puzuz" "${args[@]}" </dev/null
+        "$gpueue" "${args[@]}" </dev/null
     fi
     if [ "$legacy" = 1 ]; then
         # What install.sh installed before the receipt existed.
         local file
-        for file in "$bin_dir/puzuz" "$bin_dir/puzuz-helper"; do
+        for file in "$bin_dir/gpueue" "$bin_dir/gpueue-helper"; do
             if [ -e "$file" ]; then
                 rm -f "$file"
                 info "removed $file"
@@ -763,10 +763,10 @@ main() {
     parse_args "$@"
     API_URL="https://api.github.com"
     # Test-only override of the GitHub API (a fake release server); ignored
-    # without PUZUZ_TEST_HOOKS=1, so that an inherited environment (sudo -E)
+    # without GPUEUE_TEST_HOOKS=1, so that an inherited environment (sudo -E)
     # cannot send the token elsewhere.
-    if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_RELEASE_API_URL:-}" ]; then
-        API_URL="$PUZUZ_RELEASE_API_URL"
+    if [ "${GPUEUE_TEST_HOOKS:-}" = 1 ] && [ -n "${GPUEUE_RELEASE_API_URL:-}" ]; then
+        API_URL="$GPUEUE_RELEASE_API_URL"
     fi
     check_root
     WORK="$(mktemp -d)"

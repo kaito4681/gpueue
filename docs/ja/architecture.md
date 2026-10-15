@@ -8,10 +8,10 @@
 
 | プロセス | 実行ユーザー | 役割 |
 | --- | --- | --- |
-| `puzuz` (CLI) | 呼び出したユーザー | Unix ソケット上の HTTP でデーモンにリクエストを送ります |
-| `puzuz daemon` (`puzuz.service`) | システムユーザー `puzuz`、サンドボックス化、ケーパビリティなし | HTTP API、認可、スケジューラー、SQLite の状態。ジョブをいつ開始・停止・チェックポイント・リストアするかを決めます。 |
-| `puzuz-helper` (`puzuz-helper.service`) | root | ジョブを所有者として起動し、シグナルを送り、CRIU と cuda-checkpoint を実行します。デーモンのユーザーからの接続だけを受け付けます。 |
-| ジョブのユニット（`puzuz-job-<id>.service`、n 回目のリストア後は `puzuz-job-<id>-r<n>.service`） | root の shim、その後ジョブの所有者 | ジョブごとに 1 つの一時的な systemd サービス |
+| `gpueue` (CLI) | 呼び出したユーザー | Unix ソケット上の HTTP でデーモンにリクエストを送ります |
+| `gpueue daemon` (`gpueue.service`) | システムユーザー `gpueue`、サンドボックス化、ケーパビリティなし | HTTP API、認可、スケジューラー、SQLite の状態。ジョブをいつ開始・停止・チェックポイント・リストアするかを決めます。 |
+| `gpueue-helper` (`gpueue-helper.service`) | root | ジョブを所有者として起動し、シグナルを送り、CRIU と cuda-checkpoint を実行します。デーモンのユーザーからの接続だけを受け付けます。 |
+| ジョブのユニット（`gpueue-job-<id>.service`、n 回目のリストア後は `gpueue-job-<id>-r<n>.service`） | root の shim、その後ジョブの所有者 | ジョブごとに 1 つの一時的な systemd サービス |
 
 HTTP サーバーとデータベースは特権なしで動きます。root ヘルパーは依存関係が小さく（HTTP サーバーも SQLite も
 なし）、すべてのリクエストを自分で検証します。uid（0 は決して受け付けない）、所有者の権限で開いた作業
@@ -21,20 +21,20 @@ HTTP サーバーとデータベースは特権なしで動きます。root ヘ�
 ## ジョブの流れ
 
 ```
-puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──NDJSON over /run/puzuz/helper.sock──▶ puzuz-helper
+gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon ──NDJSON over /run/gpueue/helper.sock──▶ gpueue-helper
   (SO_PEERCRED identifies the caller)                (SQLite, scheduler)                                   │ D-Bus
                                                                                                            ▼
-                                                                         systemd: puzuz-job-<id>.service ─▶ shim ─▶ sh -c '<command>'
+                                                                         systemd: gpueue-job-<id>.service ─▶ shim ─▶ sh -c '<command>'
 ```
 
 1. **CLI → デーモン。** CLI は `/v1` 以下の REST/JSON リクエスト（たとえば `POST /v1/jobs`）を
-   `x-puzuz-version` ヘッダー付きで `/run/puzuz/puzuz.sock` に送ります。デーモンは `SO_PEERCRED` から
+   `x-gpueue-version` ヘッダー付きで `/run/gpueue/gpueue.sock` に送ります。デーモンは `SO_PEERCRED` から
    呼び出し元の uid を読み取り、認可を確認してジョブを保存します。ログは生のバイト列として、状態の変化は
    Server-Sent Events（`/v1/events`）としてストリーミングされます。ダンプの失敗などの保留中の警告は
-   `x-puzuz-warnings` ヘッダーで返され、CLI がそれを stderr に表示します。
+   `x-gpueue-warnings` ヘッダーで返され、CLI がそれを stderr に表示します。
    <a id="api-limits"></a>ソケットには全ユーザーが接続できるため、デーモンは 1 人のユーザーが開いたままに
    できるものを制限します。uid ごとに接続は最大 64 本、ストリーム（`log --follow`、`/v1/events`）は最大
-   16 本、接続は全体で最大 4096 本です（`puzuz.service` は `LimitNOFILE` をそれより十分大きくしています）。
+   16 本、接続は全体で最大 4096 本です（`gpueue.service` は `LimitNOFILE` をそれより十分大きくしています）。
    上限を超えたリクエストには `too_many_requests` が返ります。接続は 20 秒以内にリクエストのヘッダーを
    送る必要があり、アイドル状態の keep-alive 接続は 20 秒で閉じられます。`log --tail` が行の先頭を探すのは
    ログの末尾 4 MiB までです（その範囲の行数が足りなければ、そこから出力します）。この走査は同時に少数
@@ -44,10 +44,10 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    を参照）。デーモンはそこでヘルパーにジョブの起動を依頼します。管理者のすぐに実行する操作（`start <id>`、
    `add -i`、`restart -i`、`restore -i`）のジョブには、メモリ上で「強制」の印が付き、すべての上限を無視して
    すぐに起動します。それ以外のユーザーのものは強制されません。操作はジョブをキューに入れ（またはリストア待ちに
-   し）、同じトランザクションの中で `puzuz top` と同じように所有者のジョブの先頭に移します
+   し）、同じトランザクションの中で `gpueue top` と同じように所有者のジョブの先頭に移します
    （`Core::queue_first`。`enable_user_top = false` または `priority_type = "basic"` では移しません）。その後、
    計画はほかのキュー中のジョブと同じように扱います。応答の `queued` がそれを示します。
-3. **デーモン → ヘルパー。** デーモンは `/run/puzuz/helper.sock` への接続を 1 本保持し、改行区切りの JSON を
+3. **デーモン → ヘルパー。** デーモンは `/run/gpueue/helper.sock` への接続を 1 本保持し、改行区切りの JSON を
    やり取りします。最初に Hello メッセージでプロトコルのバージョンを確認します。その後、ID 付きのリクエストと、
    ヘルパーからの番号付きのイベント（ジョブの終了、チェックポイントやリストアの完了）が続きます。イベントは
    永続化され、デーモンが確認応答するまで再送されるので、デーモンが停止している間も何も失われません。デーモンは
@@ -66,10 +66,10 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    <a id="orphans"></a>デーモンが完了・キュー中・チェックポイント済みとしている、またはまったく記録して
    いないジョブをヘルパーが実行している場合（たとえばデータベースをバックアップから戻した後）、そのジョブは
    *孤立ジョブ*（orphan）です。孤立ジョブは実行されたままで、その GPU は使用中として数えられ、同じ ID の
-   キュー中のジョブはそれが終わるまで開始しません。`puzuz status` は管理者に孤立ジョブを表示し、
-   `puzuz doctor` は警告を出します。管理者は `puzuz kill <id>` で停止できます。
-4. **ヘルパー → systemd。** ヘルパーは D-Bus 経由で、メインプロセスが `puzuz-helper shim` である一時的な
-   サービスを開始します。ユニットには `Before=puzuz-helper.service` と `KillMode=mixed` が設定され、stdin は
+   キュー中のジョブはそれが終わるまで開始しません。`gpueue status` は管理者に孤立ジョブを表示し、
+   `gpueue doctor` は警告を出します。管理者は `gpueue kill <id>` で停止できます。
+4. **ヘルパー → systemd。** ヘルパーは D-Bus 経由で、メインプロセスが `gpueue-helper shim` である一時的な
+   サービスを開始します。ユニットには `Before=gpueue-helper.service` と `KillMode=mixed` が設定され、stdin は
    `/dev/null`、停止のタイムアウトは `grace_secs` です。各ジョブはデーモン、ヘルパー、ユーザーのセッションの
    外にある自分専用の cgroup で動くので、デーモンやヘルパーの再起動やユーザーのログアウトを生き延びます。
    `gpu_device_isolation`（デフォルトで有効）のとき、ユニットには `DevicePolicy=closed` と、ジョブの GPU
@@ -85,7 +85,7 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    `job_hidden_socket_dirs` のディレクトリ（既定は、呼び出し元のグループをユーザーデータベースで確かめるデーモンの
    `/run/libvirt` と `/run/cups`）も同じように空の tmpfs で隠します（なければ先に作ります）。CRIU はこのマウントを
    ダンプし、リストアで作り直します（[ジョブにできること・できないこと](install.md#what-a-job-can-and-cannot-do)を参照）。その後、`no_new_privs` を設定して所有者の uid、gid、グループに切り替え、ログ
-   （`/var/lib/puzuz/logs/<uid>/<id>.log`）と作業ディレクトリを所有者として開き、`sh -c` でコマンドを
+   （`/var/lib/gpueue/logs/<uid>/<id>.log`）と作業ディレクトリを所有者として開き、`sh -c` でコマンドを
    実行します。環境変数はクライアントのものに、`CUDA_VISIBLE_DEVICES`、`CUDA_DEVICE_ORDER=PCI_BUS_ID`、
    `LD_PRELOAD` の fork ガードを加えたものです。ジョブへのシグナル（TERM、INT、HUP、QUIT、USR1、USR2、
    TSTP、ALRM、WINCH、その他のフォルト以外のシグナル）は、ユニットのメインプロセスである外側の shim（リストア
@@ -97,14 +97,14 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    戻らないもの（子プロセスで確認します）は死んだものとみなします。その上に開いているファイル、作業
    ディレクトリやルートディレクトリ、実行ファイル、マッピング、バインドされた Unix ソケットを持つジョブは、
    マウントを示す理由とともに拒否します。それ以外のジョブについては、ヘルパー独自のキーを付けた外部マウント
-   として CRIU に渡し（`--external mnt[<mount point>]:puzuz-detached-<n>`、その下のマウントは
+   として CRIU に渡し（`--external mnt[<mount point>]:gpueue-detached-<n>`、その下のマウントは
    `--skip-mnt`）、`helper-mounts.json` に記録します。1 つの死んだファイルシステムのせいで、すべてのジョブが
    チェックポイントできなくなることはありません（[応答しなくなったネットワークと FUSE のファイルシステム](install.md#network-and-fuse-filesystems-that-stop-answering)
    を参照）。チェックが失敗すると、ジョブに触れる前に
    ダンプを拒否し、ジョブは動き続け、`checkpoint` のリクエストは理由とともに失敗します（ダンプを行う時点に
    なって初めて分かった拒否は、代わりに結果として報告され、デーモンが所有者に警告します）。manual モードでは
    次に各 CUDA プロセスに対して `cuda-checkpoint --action lock` と `checkpoint` を実行し、続いて
-   `--tcp-close` と `/var/lib/puzuz/checkpoints/<id>/` 以下のイメージディレクトリを指定して、名前空間の init を
+   `--tcp-close` と `/var/lib/gpueue/checkpoints/<id>/` 以下のイメージディレクトリを指定して、名前空間の init を
    `criu dump` します。plugin モードでは CRIU のデフォルトのプラグインディレクトリで `criu dump` だけを実行し、
    CRIU の `cuda_plugin.so` が cuda-checkpoint を呼び出します（plugin モードでは、プラグインがなければ CUDA の
    ジョブは拒否されます）。ダンプの前に、CRIU のイメージ以外にリストアに必要なもの（所有者の記録、ジョブの
@@ -116,12 +116,12 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    に仕上げます。ダンプとマーカーの間でクラッシュした場合も、systemd がダンプされたユニットをまだ
    アクティブと報告していても同様です。ダンプが失敗すると、CRIU はプロセスを
    実行中のまま残し、デーモンがそれを
-   終了させます。ヘルパーは CRIU の `dump.log` を `/var/lib/puzuz/checkpoints/failed-logs/` に移し、
+   終了させます。ヘルパーは CRIU の `dump.log` を `/var/lib/gpueue/checkpoints/failed-logs/` に移し、
    イメージディレクトリを削除します。
    **一時停止中**のジョブは、ダンプの前に再開（SIGCONT）されます。cuda-checkpoint は停止中のプロセスに対して
    ハングするためで、ジョブはダンプの間に一瞬だけ動きます。デーモンはジョブが一時停止中だったことを
    チェックポイントの記録に残し、停止したままリストアするようヘルパーに求めます（手順 7 を参照）。そのため
-   リストアされたジョブは `puzuz start` まで何も実行しません。ダンプが拒否されたときは、デーモンが再び一時停止
+   リストアされたジョブは `gpueue start` まで何も実行しません。ダンプが拒否されたときは、デーモンが再び一時停止
    （SIGSTOP）させます。ダンプの処理中は `pause` は拒否されます。
 7. **リストア。** ヘルパーはジョブを確保し（以後、そのチェックポイントの削除は拒否されます）、リクエストの
    ループの外で、ファイルシステムの参照はすべて期限付きの子プロセスで行いながら（停止した NFS サーバーで
@@ -130,16 +130,16 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    同じタイプでマウントされていること（automount ポイントはトリガーされます）、ジョブが開いていたファイルと
    作業ディレクトリが存在することです。ダンプ時に除いたマウントは、同じタイプのファイルシステムが同じ場所に
    再びマウントされていて応答すればホストのそのマウントから、そうでなければ root が所有するモード 0 の空の
-   ディレクトリ（`/var/lib/puzuz/checkpoints/detached-mount`）からバインドします。そのマウントポイントは
-   存在している必要があります。次に、`/` のバインドマウント（`/run/puzuz-helper/criu-root`）上で
-   `criu restore --root` を実行する新しいユニット `puzuz-job-<id>-r<n>.service` を、リストア先の GPU の
+   ディレクトリ（`/var/lib/gpueue/checkpoints/detached-mount`）からバインドします。そのマウントポイントは
+   存在している必要があります。次に、`/` のバインドマウント（`/run/gpueue-helper/criu-root`）上で
+   `criu restore --root` を実行する新しいユニット `gpueue-job-<id>-r<n>.service` を、リストア先の GPU の
    デバイスアクセスで開始します。manual モード
    ではその後 CUDA プロセスに対して cuda-checkpoint の `restore` と `unlock` を実行します。plugin モードでは
    `criu restore` が戻る前に CRIU のプラグインがこれを行います。各イメージは、現在の `cuda_checkpoint_mode`
    の値にかかわらず、ダンプしたときのモードでリストアされます。ジョブは ID とログを保ち、イメージはその後
    削除されます（削除に失敗した場合は、ジョブが終了したとき、再びチェックポイントされるとき、またはヘルパーが
    次に起動したときに削除されます。リストア元のイメージが残っていても、そのジョブの次のダンプは拒否されません）。
-   ダンプ時に一時停止中だったジョブは、`puzuz pause` のあとと同じく**停止したまま**リストアされます。
+   ダンプ時に一時停止中だったジョブは、`gpueue pause` のあとと同じく**停止したまま**リストアされます。
    リストアのフック（[リストアとパス](#restores-and-paths) を参照）が、CRIU のプラグインが CUDA の状態を
    リストアしたあと、まだ CRIU がプロセスを押さえている間に SIGSTOP を送るので、プロセスは命令を一つも実行
    しないうちに停止に入ります（CRIU 自身の `--leave-stopped` はプラグインより前に停止させるため、プラグインが
@@ -178,8 +178,8 @@ CRIU は root として動き、リストアするジョブのすべてをダン
   リストアを拒否します。
 - **リストアされたジョブが動き出す前には**、CRIU が実際に開いたものを確認します。CRIU は、リストアされた
   タスクが揃ったもののまだ CRIU の制御下で停止しているときに、`pre-resume` のアクションスクリプト
-  （`--action-script`）として `puzuz-helper verify-restore-hook` を実行します。フックの子プロセス
-  （`puzuz-helper verify-access`）は、タスクの開いているすべてのファイル、作業ディレクトリとルート
+  （`--action-script`）として `gpueue-helper verify-restore-hook` を実行します。フックの子プロセス
+  （`gpueue-helper verify-access`）は、タスクの開いているすべてのファイル、作業ディレクトリとルート
   ディレクトリ、実行ファイル、ファイルマッピングを `/proc` 経由で固定し、ジョブのマウント名前空間に入り、
   所有者に切り替えます。そして、所有者がそれぞれに開かれている方法でアクセスできること（固定したファイルに
   対する `faccessat2`）と、シンボリックリンクなしでそのパスから同じ inode に到達できることを要求します。
@@ -189,7 +189,7 @@ CRIU は root として動き、リストアするジョブのすべてをダン
   いることだけが必要です。ジョブは、所有者が開き直せない形でファイルを保持していることがあり（読み取り専用で
   作成した、ファイルを root のものとして見せる sshfs マウント上にある、など）、その同じファイルを取り戻しても
   新たに得るものはないからです。保持していたファイルはダンプ前に列挙され、さらに CRIU の `post-dump`
-  アクションスクリプトである `puzuz-helper dump-hook` が、ダンプされたタスクがまだ CRIU の制御下で停止して
+  アクションスクリプトである `gpueue-helper dump-hook` が、ダンプされたタスクがまだ CRIU の制御下で停止して
   いる間にもう一度列挙します（そのため、CRIU が停止させる直前にジョブが開いたファイルも含まれます）。
   ダンプ時に記録したデバイスと inode を持っていれば、それはそのファイルです。
   また（再マウント後にデバイス番号が変わり、sshfs のような FUSE ファイルシステムが inode を振り直した場合は）
@@ -222,13 +222,13 @@ CRIU は root として動き、リストアするジョブのすべてをダン
   属していないグループ、`job_min_uid`（既定は `/etc/login.defs` の `UID_MIN`）未満のユーザー、空でない
   `job_allowed_users` に含まれないユーザー、`job_denied_groups`（`docker`、`disk`、`sudo` などの root 相当の
   グループ。`/etc/group` で調べます）に含まれるジョブのグループを、コード `policy_denied` のエラーで拒否します。
-  そのメッセージ（`puzuz refuses to run jobs as <user>: <reason>`）がジョブの起動失敗やリストアのエラーの理由に
+  そのメッセージ（`gpueue refuses to run jobs as <user>: <reason>`）がジョブの起動失敗やリストアのエラーの理由に
   なります。ジョブの補助グループはヘルパー自身が計算し（`initgroups` が設定するものから、拒否するグループと
   gid 0 を除いたもの）、shim に渡します。外したグループはヘルパーのジャーナルに記録されます。
   チェックポイントされたプロセスが拒否するグループを持っていたリストアは拒否され、リストア後の検査も所有者の
   グループから拒否するグループを除いたものしか認めません。[ジョブを実行できるユーザー](install.md#who-jobs-may-run-as)
   を参照してください。
-- ヘルパーは、デーモンのユーザーが所有する `/run/puzuz` に、root が所有する専用のステージングディレクトリを
+- ヘルパーは、デーモンのユーザーが所有する `/run/gpueue` に、root が所有する専用のステージングディレクトリを
   通してソケットをバインドします。このディレクトリはファイルディスクリプタ経由でのみ使います。同時に扱う
   デーモンのセッションは 1 つだけで（新しいセッションが古いものを置き換えます）、Hello を待っている接続は
   数本までに制限し、セッションのキューと処理中のリクエスト数にも上限を設けます。
@@ -261,9 +261,9 @@ CRIU は root として動き、リストアするジョブのすべてをダン
 <a id="shutdown-ordering"></a>
 ## シャットダウンの順序
 
-- **OS のシャットダウンまたは再起動。** systemd はユニットを開始と逆の順序で停止します。`puzuz.service` は
-  `After=puzuz-helper.service` なので、デーモンが先に停止します。デーモンを停止してもジョブが止まることは
-  ありません。`puzuz-helper.service` はローカルとリモートのファイルシステム、D-Bus、`nvidia-persistenced`、
+- **OS のシャットダウンまたは再起動。** systemd はユニットを開始と逆の順序で停止します。`gpueue.service` は
+  `After=gpueue-helper.service` なので、デーモンが先に停止します。デーモンを停止してもジョブが止まることは
+  ありません。`gpueue-helper.service` はローカルとリモートのファイルシステム、D-Bus、`nvidia-persistenced`、
   `nvidia-fabricmanager` のあとに動くので、ヘルパーが停止する間もそれらは利用できます。SIGTERM を受けると、
   ヘルパーはシステム全体が停止中かどうかを systemd に問い合わせます。そうであれば、新しい作業を拒否し、実行中の
   ジョブを 1 つずつダンプし（`--no-checkpoint` のジョブを除く）、実行中のダンプの期限（とそのロールバック）の
@@ -272,17 +272,17 @@ CRIU は root として動き、リストアするジョブのすべてをダン
   チェックポイントはロールバックされます（ジョブは解凍され、CUDA の状態がリストアされてアンロックされます。
   kill された CRIU のプラグインが CUDA プロセスをロック済みやチェックポイント済みのまま残した可能性がある
   plugin モードでは、ヘルパーが `cuda-checkpoint --get-state` で問い合わせ、必要に応じてリストアとアンロックを
-  行います）。一時停止中のジョブも（先に再開してから）ダンプされ、`puzuz restore` のあと一時停止した状態で
-  （停止したまま、何も実行せずに）戻ります。ジョブのユニットは `Before=puzuz-helper.service` なので、systemd はヘルパーが終わってから
+  行います）。一時停止中のジョブも（先に再開してから）ダンプされ、`gpueue restore` のあと一時停止した状態で
+  （停止したまま、何も実行せずに）戻ります。ジョブのユニットは `Before=gpueue-helper.service` なので、systemd はヘルパーが終わってから
   それらを停止します。次の起動時、デーモンはヘルパーの再送イベントから結果を受け取り、ジョブを
   `Checkpointed` にします。ダンプが失敗したか拒否されたジョブは systemd によって停止されています。それらは
   理由とともに `Checkpoint failed` とされ、所有者に警告が出ます。
-- **`puzuz shutdown`**（管理者）はユニットの順序に頼りません。デーモンは実行中のジョブを 1 つずつチェック
+- **`gpueue shutdown`**（管理者）はユニットの順序に頼りません。デーモンは実行中のジョブを 1 つずつチェック
   ポイントし（`--no-checkpoint` なら終了させ）、それらが落ち着くのを待ってから終了します。ヘルパーは動き
   続けます。ダンプが失敗したジョブは終了されます。ヘルパーがダンプを拒否したジョブは、終了させると作業が
   失われるので、動いたまま残されます。デーモンは警告をログに記録し、所有者に警告が出ます。必要なら
-  `puzuz kill` か `puzuz shutdown --no-checkpoint` で停止してください。
-- **`systemctl stop/restart puzuz-helper` や `puzuz`** を単独で実行しても、ジョブは動き続けます。
+  `gpueue kill` か `gpueue shutdown --no-checkpoint` で停止してください。
+- **`systemctl stop/restart gpueue-helper` や `gpueue`** を単独で実行しても、ジョブは動き続けます。
 
 <a id="priority-and-fair-share"></a>
 ## 優先度とフェアシェア
@@ -291,13 +291,13 @@ CRIU は root として動き、リストアするジョブのすべてをダン
 [docs/ja/install.md](install.md#priority-and-fair-share) にあります）。処理はスケジューラーの他の部分と
 同じように分担されています。
 
-- `puzuz-core::priority` は純粋です。要素、計算式、所有者の順序（top、`-o` の優先度、id。ユーザーの今すぐ起動
+- `gpueue-core::priority` は純粋です。要素、計算式、所有者の順序（top、`-o` の優先度、id。ユーザーの今すぐ起動
   できる（グループが存在して一時停止されておらず、GPU が検出され、依存先が完了している）ジョブの待ち時間をまとめてこの順に割り当てることで適用）、古典的なフェアシェアの要素 `2^(-U/S)`、減衰、ジョブの課金量、
   リセット期間の境界（デーモンが渡すローカルの UTC オフセットから計算）を扱います。
   `scheduler::plan_prioritized` はこれで候補を並べ、その後は通常のスロット、一時停止、依存関係のルールを
   そのまま適用します。そのため、収まらない優先度の高いジョブが後ろのジョブを妨げることはありません。
   `plan`/`plan_with` は pueue の順序を保ちます（`priority_type = "basic"` でも使われます）。
-  `scheduler::pending_priorities`（`puzuz prio` の裏側）も同じ候補の選び方を使うので、プランが考慮する
+  `scheduler::pending_priorities`（`gpueue prio` の裏側）も同じ候補の選び方を使うので、プランが考慮する
   ジョブを一覧表示します。
 - ストレージは `jobs.nice`、`jobs.site_factor`、`jobs.top_seq`、`jobs.run_since`、`groups.priority`、
   `user_shares` と `user_usage` のテーブル、そして `meta` に使用量を最後に計算・リセットした時刻を保持します
@@ -312,18 +312,18 @@ CRIU は root として動き、リストアするジョブのすべてをダン
 - API には `GET /v1/priority`（待機中のジョブと要素。コマンドは含まず、全員が使えます）、`GET /v1/shares`、
   `PUT /v1/shares/{uid}`、`PUT /v1/groups/{name}/priority`（管理者）、そして一括操作のエンドポイントと同じく
   ジョブごとに結果を返す `POST /v1/jobs/nice`、`/v1/jobs/top`、`/v1/jobs/site` が加わります。負の nice 値、
-  サイトファクター、シェア、グループの優先度は `puzuz-core::authz` でチェックされます。
+  サイトファクター、シェア、グループの優先度は `gpueue-core::authz` でチェックされます。
 
 <a id="state"></a>
 ## 状態
 
 | データ | 場所 | 所有者 |
 | --- | --- | --- |
-| ジョブ、グループ、GPU スロットの上限、チェックポイントの記録、保留中の警告、フェアシェアのシェアと使用量 | `/var/lib/puzuz/daemon/state.sqlite`（WAL と `synchronous=FULL`。確認応答したヘルパーのイベントは停電でも失われません。スキーマのバージョンは `PRAGMA user_version` で管理） | デーモン |
-| ジョブの記録、イベントキュー | `/var/lib/puzuz/helper/` | ヘルパー |
-| ジョブの出力 | `/var/lib/puzuz/logs/<uid>/<id>.log` | ヘルパーがディレクトリを作成します（ユーザーの所有、グループ `puzuz`、モード 2770）。shim が所有者としてログを書き込みます。デーモンは、シンボリックリンクをたどらず、ジョブの所有者が所有する通常ファイルである場合にのみ、それを読み取り・切り詰めます。 |
-| チェックポイントのイメージ | `/var/lib/puzuz/checkpoints/<id>/` | ヘルパー（root のみ） |
-| 設定 | `/etc/puzuz/config.toml` | root |
+| ジョブ、グループ、GPU スロットの上限、チェックポイントの記録、保留中の警告、フェアシェアのシェアと使用量 | `/var/lib/gpueue/daemon/state.sqlite`（WAL と `synchronous=FULL`。確認応答したヘルパーのイベントは停電でも失われません。スキーマのバージョンは `PRAGMA user_version` で管理） | デーモン |
+| ジョブの記録、イベントキュー | `/var/lib/gpueue/helper/` | ヘルパー |
+| ジョブの出力 | `/var/lib/gpueue/logs/<uid>/<id>.log` | ヘルパーがディレクトリを作成します（ユーザーの所有、グループ `gpueue`、モード 2770）。shim が所有者としてログを書き込みます。デーモンは、シンボリックリンクをたどらず、ジョブの所有者が所有する通常ファイルである場合にのみ、それを読み取り・切り詰めます。 |
+| チェックポイントのイメージ | `/var/lib/gpueue/checkpoints/<id>/` | ヘルパー（root のみ） |
+| 設定 | `/etc/gpueue/config.toml` | root |
 
 データベースに書き込むのはデーモンだけです。CLI は常にデーモンを経由します。
 
@@ -332,14 +332,14 @@ CRIU は root として動き、リストアするジョブのすべてをダン
 
 | クレート | 内容 |
 | --- | --- |
-| `crates/puzuz` | `puzuz` バイナリ：pueue 互換の CLI、`puzuz daemon`、`service`、`doctor`、`update`（HTTPS クライアントを持つ唯一のクレート） |
-| `crates/puzuz-core` | ドメインモデル、ジョブのライフサイクル、スケジューリングの判断、認可、SQLite のストレージ（それ以外の I/O はなし） |
-| `crates/puzuz-protocol` | 通信の型：CLI ⇄ デーモン（HTTP API とクライアント）、デーモン ⇄ ヘルパー（NDJSON のメッセージ） |
-| `crates/puzuz-config` | `/etc/puzuz/config.toml` のスキーマ。デーモン、ヘルパー（root 所有のチェック付き）、`doctor` で共有 |
-| `crates/puzuz-daemon` | デーモン：axum の API、スケジューラーのループ、ヘルパーのクライアント、GPU の検出（NVML） |
-| `crates/puzuz-checkpoint` | CRIU と cuda-checkpoint のコマンドの組み立て、タイムアウトとロールバック付きの実行、イメージのレイアウト |
-| `crates/puzuz-helper` | `puzuz-helper` バイナリ：ソケットサーバー、ジョブエンジン、systemd ランチャー、shim、マウントの解析、fork ガード（`forkguard/forkguard.c`、バイナリに埋め込み） |
+| `crates/gpueue` | `gpueue` バイナリ：pueue 互換の CLI、`gpueue daemon`、`service`、`doctor`、`update`（HTTPS クライアントを持つ唯一のクレート） |
+| `crates/gpueue-core` | ドメインモデル、ジョブのライフサイクル、スケジューリングの判断、認可、SQLite のストレージ（それ以外の I/O はなし） |
+| `crates/gpueue-protocol` | 通信の型：CLI ⇄ デーモン（HTTP API とクライアント）、デーモン ⇄ ヘルパー（NDJSON のメッセージ） |
+| `crates/gpueue-config` | `/etc/gpueue/config.toml` のスキーマ。デーモン、ヘルパー（root 所有のチェック付き）、`doctor` で共有 |
+| `crates/gpueue-daemon` | デーモン：axum の API、スケジューラーのループ、ヘルパーのクライアント、GPU の検出（NVML） |
+| `crates/gpueue-checkpoint` | CRIU と cuda-checkpoint のコマンドの組み立て、タイムアウトとロールバック付きの実行、イメージのレイアウト |
+| `crates/gpueue-helper` | `gpueue-helper` バイナリ：ソケットサーバー、ジョブエンジン、systemd ランチャー、shim、マウントの解析、fork ガード（`forkguard/forkguard.c`、バイナリに埋め込み） |
 
 systemd のユニット、sysusers.d と tmpfiles.d の断片、デフォルトの設定は [`packaging/`](../../packaging) に
-あり、`puzuz service install` のために `puzuz` バイナリに埋め込まれています。AUR パッケージ
-（`packaging/aur/puzuz-bin`）は同じファイルを変更せずにインストールします。
+あり、`gpueue service install` のために `gpueue` バイナリに埋め込まれています。AUR パッケージ
+（`packaging/aur/gpueue-bin`）は同じファイルを変更せずにインストールします。

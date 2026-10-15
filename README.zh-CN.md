@@ -1,10 +1,10 @@
-<a id="puzuz"></a>
-# puzuz
+<a id="gpueue"></a>
+# gpueue
 
 [English](README.md) | [日本語](README.ja.md) | 简体中文
 
 面向多用户共享的单台 Linux 机器的 GPU 作业队列。其 CLI 的用法与
-[pueue](https://github.com/Nukesor/pueue) 相同。puzuz 在此基础上增加了两项功能：GPU 槽位，以及借助
+[pueue](https://github.com/Nukesor/pueue) 相同。gpueue 在此基础上增加了两项功能：GPU 槽位，以及借助
 [CRIU](https://criu.org) 和 NVIDIA [cuda-checkpoint](https://github.com/NVIDIA/cuda-checkpoint)
 对运行中的作业（CPU、内存和 GPU 状态）进行透明的检查点保存与恢复。机器重启时仍在运行的训练会被保存到磁盘，
 并从中断处继续运行，而不必从头开始。
@@ -17,15 +17,15 @@
 > **尚未发布任何版本。** 下面的下载链接、APT 仓库和 `stable` 分支将从第一个版本发布起可用。
 
 <a id="why"></a>
-## 为什么需要 puzuz
+## 为什么需要 gpueue
 
 在共享的 GPU 工作站上，人们通常用 `nohup`、`tmux` 或每个用户各自的 pueue 来运行作业，并在聊天群里争抢 GPU。
-为了更新内核或驱动而重启，会终止所有正在进行的训练。puzuz 提供：
+为了更新内核或驱动而重启，会终止所有正在进行的训练。gpueue 提供：
 
 - **所有人共用一个队列**：一个系统级守护进程调度所有用户的作业，并显示谁在使用哪块 GPU，
 - **GPU 槽位**：作业申请指定的 GPU（`--gpu 0,1`），并且只在这些 GPU 空闲时才启动，
-- **检查点/恢复**：在操作系统关机时、执行 `puzuz shutdown` 时，或通过 `puzuz checkpoint` 按需保存运行中的作业。
-  之后用 `puzuz restore` 继续运行，无需修改你的代码。
+- **检查点/恢复**：在操作系统关机时、执行 `gpueue shutdown` 时，或通过 `gpueue checkpoint` 按需保存运行中的作业。
+  之后用 `gpueue restore` 继续运行，无需修改你的代码。
 
 <a id="features"></a>
 ## 功能
@@ -33,19 +33,19 @@
 - 兼容 pueue 的命令：`add`、`status`、`log`、`follow`、`wait`、`pause`、`start`、`kill`、
   `remove`、`restart`、`clean`、`reset`、`stash`、`enqueue`、`switch`、`group`、`parallel`、
   `shutdown`、`completions`，以及组、依赖（`--after`）、优先级、延迟和标签。
-- GPU 槽位：按 GPU 限制同时运行的作业数（`puzuz gpu parallel`）。每个作业会获得
+- GPU 槽位：按 GPU 限制同时运行的作业数（`gpueue gpu parallel`）。每个作业会获得
   `CUDA_VISIBLE_DEVICES` 和 `CUDA_DEVICE_ORDER=PCI_BUS_ID`。GPU 通过 NVML 检测。
 - 用户之间的公平共享：Slurm 风格的多因子优先级（带衰减用量的 fair share、
-  等待时间、nice、`top`；`puzuz prio` 和 `puzuz share` 显示具体数值）。
+  等待时间、nice、`top`；`gpueue prio` 和 `gpueue share` 显示具体数值）。
 - 对 CPU 和 CUDA 进程进行透明的检查点保存与恢复，包括 DataLoader worker 通过 fork 创建的 PyTorch 作业
   （参见 [fork guard](#limitations)）。
 - 操作系统关机或重启时，自动为所有运行中的作业创建检查点。
 - 多用户：作业以其所有者的身份运行。其他用户可以看到作业的存在，但看不到其命令、环境变量或日志。
-  管理员是 root 和 `puzuz-admin` 组的成员。
-- 权限分离：守护进程（HTTP API、调度器、SQLite）以非特权系统用户 `puzuz` 运行。只有一个小型的 root helper
+  管理员是 root 和 `gpueue-admin` 组的成员。
+- 权限分离：守护进程（HTTP API、调度器、SQLite）以非特权系统用户 `gpueue` 运行。只有一个小型的 root helper
   负责启动作业和运行 CRIU。
 - 作业运行在各自的 systemd 单元中，因此守护进程或 helper 重启时（例如升级期间）作业会继续运行。
-- `puzuz doctor` 检查安装情况，并针对每个问题打印修复命令。
+- `gpueue doctor` 检查安装情况，并针对每个问题打印修复命令。
 
 <a id="quick-start"></a>
 ## 快速开始
@@ -56,86 +56,86 @@
 ### 安装（管理员）
 
 在带有 systemd 且 glibc 为 2.34 或更新版本的 x86_64 或 aarch64 Linux 上（Ubuntu 22.04+、Debian 12+、
-RHEL 9+），安装脚本会下载最新的发布版本、进行校验，并将 puzuz 安装到
+RHEL 9+），安装脚本会下载最新的发布版本、进行校验，并将 gpueue 安装到
 /usr/local/bin：
 
 ```sh
-curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.sh | sudo bash
 ```
 
-安装脚本会设置 systemd 单元、`puzuz` 用户、`puzuz-admin` 组、各个目录以及默认的
-/etc/puzuz/config.toml，启动服务，并打印 `puzuz doctor` 的报告。它不会安装 CRIU 或 cuda-checkpoint；
-如果它们缺失，脚本会提示你。之后用 `sudo puzuz update` 更新（运行中的作业会继续运行）。用
-`sudo puzuz uninstall` 卸载，数据会被保留（加上 `--purge` 则一并删除）。不需要 GitHub token（如果设置了
+安装脚本会设置 systemd 单元、`gpueue` 用户、`gpueue-admin` 组、各个目录以及默认的
+/etc/gpueue/config.toml，启动服务，并打印 `gpueue doctor` 的报告。它不会安装 CRIU 或 cuda-checkpoint；
+如果它们缺失，脚本会提示你。之后用 `sudo gpueue update` 更新（运行中的作业会继续运行）。用
+`sudo gpueue uninstall` 卸载，数据会被保留（加上 `--purge` 则一并删除）。不需要 GitHub token（如果设置了
 `GH_TOKEN` 则会使用它；它只用于提高 API 速率限制）。
 
-在 Debian 和 Ubuntu（amd64 或 arm64）上，也可以改为从 puzuz 的 APT 仓库（位于 GitHub Release `apt` 中）
+在 Debian 和 Ubuntu（amd64 或 arm64）上，也可以改为从 gpueue 的 APT 仓库（位于 GitHub Release `apt` 中）
 安装软件包；这需要 `curl` 和 `ca-certificates`，最新的稳定版本和架构由 apt 自动选择：
 
 ```sh
-sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
-sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
-sudo apt update && sudo apt install puzuz
+sudo curl -fsSLo /etc/apt/keyrings/gpueue.gpg https://github.com/kaito4681/gpueue/releases/download/apt/gpueue.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/gpueue.sources https://github.com/kaito4681/gpueue/releases/download/apt/gpueue.sources
+sudo apt update && sudo apt install gpueue
 ```
 
 或者直接安装最新发布版本的 `.deb`（它会注册同一个仓库）：
 
 ```sh
 arch=$(dpkg --print-architecture)
-curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
-sudo apt install "./puzuz_${arch}.deb"
+curl -fLO "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue_${arch}.deb"
+sudo apt install "./gpueue_${arch}.deb"
 ```
 
 它会安装并启动相同的服务，并推荐安装 `criu`（前提条件参见
 [docs/zh-CN/install.md](docs/zh-CN/install.md#installing-the-debianubuntu-package)）。无论哪种方式，之后的版本
-都通过 `sudo apt update && sudo apt upgrade` 获取。`sudo apt remove puzuz` 会停止服务；`sudo apt purge puzuz`
-还会删除 /etc/puzuz。两者都会保留 /var/lib/puzuz 和运行中的作业。
+都通过 `sudo apt update && sudo apt upgrade` 获取。`sudo apt remove gpueue` 会停止服务；`sudo apt purge gpueue`
+还会删除 /etc/gpueue。两者都会保留 /var/lib/gpueue 和运行中的作业。
 
 在 Fedora、RHEL、Rocky 和 Alma Linux 9+（x86_64 或 aarch64）上，安装发布版本中的 .rpm
 （dnf 可以直接接受 URL）：
 
 ```sh
-sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
+sudo dnf install "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue.$(uname -m).rpm"
 ```
 
 这些 URL 始终指向最新的稳定发布版本（`releases/latest` 会跳过预发布版本）；带版本号的文件
-（`puzuz_<version>_<arch>.deb`、`puzuz-<version>-1.<arch>.rpm`）也一并附带，用于安装特定版本。
+（`gpueue_<version>_<arch>.deb`、`gpueue-<version>-1.<arch>.rpm`）也一并附带，用于安装特定版本。
 每个文件都有 `.sha256` 和 `.minisig` 文件（参见
 [手动验证发布版本](docs/zh-CN/install.md#verifying-a-release-by-hand)）。
 
-目前还没有 dnf 仓库（已在计划中，issue #23）：更新时用 `sudo dnf upgrade` 运行同一条命令。`sudo dnf remove puzuz` 会停止服务，并保留 /var/lib/puzuz 和运行中的作业。它推荐安装 `criu`；
+目前还没有 dnf 仓库（已在计划中，issue #23）：更新时用 `sudo dnf upgrade` 运行同一条命令。`sudo dnf remove gpueue` 会停止服务，并保留 /var/lib/gpueue 和运行中的作业。它推荐安装 `criu`；
 Fedora 的版本足够新，而 Rocky/RHEL 9 只提供 3.19，因此在那里创建检查点需要更新的 CRIU（没有它作业也能运行）。
 你也可以从源码构建，或使用 Nix flake（参见 [docs/zh-CN/install.md](docs/zh-CN/install.md)）。
 
-在 NixOS 上，导入 flake 的模块（`github:kaito4681/puzuz/stable`、`nixosModules.default`）并设置
-`services.puzuz.enable = true`（参见 [NixOS](docs/zh-CN/install.md#nixos)）；home-manager 用户可以通过
+在 NixOS 上，导入 flake 的模块（`github:kaito4681/gpueue/stable`、`nixosModules.default`）并设置
+`services.gpueue.enable = true`（参见 [NixOS](docs/zh-CN/install.md#nixos)）；home-manager 用户可以通过
 `homeManagerModules.default` 添加 CLI 的补全。在其他发行版上使用 Nix（x86_64 或 aarch64）时，构建该 flake，
 然后从构建结果安装服务（它会被复制到 /usr/local/bin，并且不会被 Nix 的垃圾回收清除；参见
 [使用 Nix 安装](docs/zh-CN/install.md#installing-with-nix)）：
 
 ```sh
-nix build github:kaito4681/puzuz/stable
-sudo ./result/bin/puzuz service install
+nix build github:kaito4681/gpueue/stable
+sudo ./result/bin/gpueue service install
 ```
 
-在 Arch Linux（x86_64、aarch64）上，目前请使用上面的安装脚本：AUR 软件包 `puzuz-bin` 尚未发布。
+在 Arch Linux（x86_64、aarch64）上，目前请使用上面的安装脚本：AUR 软件包 `gpueue-bin` 尚未发布。
 CRIU（4.2 或更新版本，用于检查点）位于官方仓库中：
 
 ```sh
 sudo pacman -S criu
-curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.sh | sudo bash
 ```
 
-用 `sudo puzuz update` 更新，用 `sudo puzuz uninstall` 卸载。软件包发布到 AUR 后，你也可以改用任意 AUR
-helper 安装 [`puzuz-bin`](https://aur.archlinux.org/packages/puzuz-bin)（参见
+用 `sudo gpueue update` 更新，用 `sudo gpueue uninstall` 卸载。软件包发布到 AUR 后，你也可以改用任意 AUR
+helper 安装 [`gpueue-bin`](https://aur.archlinux.org/packages/gpueue-bin)（参见
 [docs/zh-CN/install.md](docs/zh-CN/install.md#arch-linux-aur)）。
 
 ```sh
 # Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.
-puzuz doctor
+gpueue doctor
 
 # Optional: make someone an administrator.
-sudo usermod -aG puzuz-admin alice
+sudo usermod -aG gpueue-admin alice
 ```
 
 普通用户无需安装任何东西。
@@ -146,47 +146,47 @@ sudo usermod -aG puzuz-admin alice
 ```sh
 # Queue a job on GPU 0. The command runs through `sh -c` in the current directory, with your
 # environment.
-puzuz add --gpu 0 -l resnet -- 'python train.py --epochs 100'
+gpueue add --gpu 0 -l resnet -- 'python train.py --epochs 100'
 
-puzuz status          # all jobs of all users (others' commands are hidden)
-puzuz gpu             # GPUs, slots in use, and which jobs hold them
-puzuz log 0           # the last lines of job 0's output
-puzuz follow 0        # stream the output, like tail -f
+gpueue status          # all jobs of all users (others' commands are hidden)
+gpueue gpu             # GPUs, slots in use, and which jobs hold them
+gpueue log 0           # the last lines of job 0's output
+gpueue follow 0        # stream the output, like tail -f
 ```
 
 <a id="checkpoint-and-restore"></a>
 ### 检查点与恢复
 
 ```sh
-puzuz checkpoint 0    # save job 0 to disk and stop it; frees the GPU. State: Checkpointed
-puzuz restore 0       # queue it again; it resumes once its group and GPUs have a free slot
-puzuz restore -i 0    # ...or put it first among your queued jobs (administrators: resume right away; see "Job priority")
+gpueue checkpoint 0    # save job 0 to disk and stop it; frees the GPU. State: Checkpointed
+gpueue restore 0       # queue it again; it resumes once its group and GPUs have a free slot
+gpueue restore -i 0    # ...or put it first among your queued jobs (administrators: resume right away; see "Job priority")
 ```
 
 恢复后的作业从创建检查点的那一刻继续运行。它保留原来的作业 id，其输出会追加到同一个日志中。
 
 暂停的作业同样可以创建检查点，重启时也是如此。它恢复后仍处于暂停状态，并继续占用其 GPU 槽位，用
-`puzuz start` 即可让它继续运行。CRIU 和 cuda-checkpoint 需要一个正在运行的进程，因此在转储期间作业会运行片刻。
-恢复会让它保持停止状态，因此在 `puzuz start` 之前它不会执行任何代码（哪怕片刻）。检查点正在进行时，
-`puzuz pause` 会被拒绝。
+`gpueue start` 即可让它继续运行。CRIU 和 cuda-checkpoint 需要一个正在运行的进程，因此在转储期间作业会运行片刻。
+恢复会让它保持停止状态，因此在 `gpueue start` 之前它不会执行任何代码（哪怕片刻）。检查点正在进行时，
+`gpueue pause` 会被拒绝。
 
 <a id="what-happens-on-reboot"></a>
 ### 重启时会发生什么
 
-1. 操作系统关机时，`puzuz-helper.service` 会在文件系统和 NVIDIA 服务之前停止。它逐个为运行中的作业创建检查点。
+1. 操作系统关机时，`gpueue-helper.service` 会在文件系统和 NVIDIA 服务之前停止。它逐个为运行中的作业创建检查点。
    `--no-checkpoint` 作业则直接被终止。
 2. 启动后，这些作业显示为 `Checkpointed`。原本在排队的作业继续排队，并照常启动。
-3. 每个所有者（或管理员）用 `puzuz restore <id>` 或 `puzuz restore -a` 恢复自己的作业。恢复不会自动开始。
+3. 每个所有者（或管理员）用 `gpueue restore <id>` 或 `gpueue restore -a` 恢复自己的作业。恢复不会自动开始。
 
 检查点可能以两种方式出错：
 
 - **被拒绝：** 在触碰作业之前，helper 的检查就失败了（可用空间不足、存在一个永远无法恢复的挂载等）。
-  作业继续运行。`puzuz checkpoint` 会失败并给出原因。如果拒绝发生在应当转储的时刻（例如在 `puzuz shutdown`
-  期间），所有者会在下一次执行 `puzuz` 命令时收到警告。原因会作为作业的最后一条错误显示在
-  `puzuz status` 和 `puzuz log` 中。
+  作业继续运行。`gpueue checkpoint` 会失败并给出原因。如果拒绝发生在应当转储的时刻（例如在 `gpueue shutdown`
+  期间），所有者会在下一次执行 `gpueue` 命令时收到警告。原因会作为作业的最后一条错误显示在
+  `gpueue status` 和 `gpueue log` 中。
 - **失败：** 转储本身失败。CRIU 会让作业继续，但作业已经被冻结过，因此会被停止（先发送 SIGTERM，
   让它有机会保存自己的检查点，`grace_secs` 之后再发送 SIGKILL），并显示为 `Checkpoint failed` 及其原因。
-  所有者会在下一次执行 `puzuz` 命令时收到警告。
+  所有者会在下一次执行 `gpueue` 命令时收到警告。
 
 在操作系统关机或重启期间，systemd 会停止所有无法保存的作业，无论其转储是被拒绝还是失败。启动后，它会显示为
 `Checkpoint failed` 及其原因，并且所有者会收到警告。断电或内核崩溃时不会保存任何内容。
@@ -194,21 +194,21 @@ puzuz restore -i 0    # ...or put it first among your queued jobs (administrator
 <a id="pueue-compatibility-and-differences"></a>
 ## pueue 兼容性与差异
 
-命令名、选项和表格布局遵循 pueue 4.0，因此把 `pueue` 换成 `puzuz` 后，大多数 pueue 的使用习惯和脚本都能继续使用。
-puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的文件。差异如下：
+命令名、选项和表格布局遵循 pueue 4.0，因此把 `pueue` 换成 `gpueue` 后，大多数 pueue 的使用习惯和脚本都能继续使用。
+gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的文件。差异如下：
 
-| 项目 | pueue | puzuz |
+| 项目 | pueue | gpueue |
 | --- | --- | --- |
-| 守护进程 | 每个用户一个，由用户启动（`pueued`） | 整个系统一个，由 systemd 运行（`puzuz daemon`，用户 `puzuz`）。用户从不启动守护进程。 |
-| 选择守护进程 | `-c/--config`、`-p/--profile` | `--socket <path>`（环境变量 `PUZUZ_SOCKET`，默认 `/run/puzuz/puzuz.sock`） |
+| 守护进程 | 每个用户一个，由用户启动（`pueued`） | 整个系统一个，由 systemd 运行（`gpueue daemon`，用户 `gpueue`）。用户从不启动守护进程。 |
+| 选择守护进程 | `-c/--config`、`-p/--profile` | `--socket <path>`（环境变量 `GPUEUE_SOCKET`，默认 `/run/gpueue/gpueue.sock`） |
 | `send` | 向任务的 stdin 发送输入 | 不支持：作业的 stdin 是 `/dev/null`。请让命令以非交互方式运行。 |
 | `shutdown` | 终止所有任务并停止守护进程 | 仅限管理员。为所有运行中的作业创建检查点，然后停止守护进程。检查点被拒绝的作业会继续运行。`--no-checkpoint` 则改为终止它们。 |
 | `restart` | 已结束的任务 | 也适用于 `Checkpointed` 作业：它们作为新作业从头开始，镜像会被保留 |
-| `start <id>`、`add -i`、`restart -i`（以及 `restore -i`） | 忽略所有限制，立即启动任务 | 只有管理员的会忽略所有限制立即启动；其他用户的作业会被排到其自己作业的最前面（与 `puzuz top` 相同），并像其他排队作业一样等待轮到它（参见 [作业优先级](#job-priority)） |
+| `start <id>`、`add -i`、`restart -i`（以及 `restore -i`） | 忽略所有限制，立即启动任务 | 只有管理员的会忽略所有限制立即启动；其他用户的作业会被排到其自己作业的最前面（与 `gpueue top` 相同），并像其他排队作业一样等待轮到它（参见 [作业优先级](#job-priority)） |
 | `reset`、`-a/--all`、`-g/--group` | 所有任务 | 你自己的作业。管理员作用于所有人的作业。 |
 | `pause/start/kill -a`、`-g` | 同时暂停/继续这些组 | 只有管理员会暂停/继续组；对其他用户而言，组保持原样 |
 | 用语 | "task" | "job"。为了兼容，保留了 `--print-task-id` 等选项名。 |
-| `--json` | pueue 的内部状态 | puzuz 自己的格式，见下文 |
+| `--json` | pueue 的内部状态 | gpueue 自己的格式，见下文 |
 | `edit`、`env`、`restart --edit` | 支持 | 接受但尚未实现 |
 | `add -o/--priority`、`switch` | 对守护进程的所有任务排序 | 只对你自己的作业排序；哪个用户的作业先启动由带 fair share 的 Slurm 风格多因子优先级决定（参见[作业优先级](#job-priority)）。`priority_type = "basic"` 可恢复 pueue 的顺序。 |
 | 回调、别名、`pueue.yml` | 支持 | 不可用 |
@@ -229,7 +229,7 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | `site <IDS>... <N>`、`group priority <GROUP> <N>` | 作业的 site 因子、组的优先级（管理员） |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | 管理 systemd 服务；如果最终检查失败，install 以非零状态退出（参见 [docs/zh-CN/install.md](docs/zh-CN/install.md)） |
 | `uninstall [--purge] [--yes]` | 删除服务以及 `service install` 复制的二进制文件（需要 root） |
-| `update [--check] [--version V] [-y]` | 将 puzuz 更新到最新（或指定的）发布版本；需要 root，非 root 时只检查（参见 [docs/zh-CN/install.md](docs/zh-CN/install.md#upgrading)） |
+| `update [--check] [--version V] [-y]` | 将 gpueue 更新到最新（或指定的）发布版本；需要 root，非 root 时只检查（参见 [docs/zh-CN/install.md](docs/zh-CN/install.md#upgrading)） |
 | `doctor` | 检查安装情况 |
 | `daemon` | 在前台运行守护进程（由 systemd 执行） |
 
@@ -239,7 +239,7 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 <a id="json-output"></a>
 ### JSON 输出
 
-`puzuz status --json` 输出 `{"groups": [...], "jobs": [...]}`：
+`gpueue status --json` 输出 `{"groups": [...], "jobs": [...]}`：
 
 ```json
 {
@@ -267,15 +267,15 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   对于其他用户的作业，`label` 为 null，`details` 不存在，`reason` 为 `"<redacted>"`。
 - `waiting` 只出现在由非管理员立即启动、但正在等待 GPU 槽位或其暂停的组的排队作业上：
   `{"reason": "gpu_slots", "gpus": [0]}`、`{"reason": "group_paused"}` 或 `{"reason": "unavailable"}`。
-- `puzuz log --json` 输出 `{"<id>": {"job": <job>, "output": "..."}}`。`puzuz group --json`
-  输出 `{"groups": [...]}`。`puzuz gpu --json` 输出
+- `gpueue log --json` 输出 `{"<id>": {"job": <job>, "output": "..."}}`。`gpueue group --json`
+  输出 `{"groups": [...]}`。`gpueue gpu --json` 输出
   `{"gpus": [{"index", "uuid", "name", "memory_total_bytes", "driver_version", "parallel",
   "used", "jobs": [{"id", "owner"}]}]}`，其中 `"available": false` 表示已消失的 GPU。
-- `puzuz prio --json` 输出 `{"priority_type", "weights": {"age", "fairshare", "job_size",
+- `gpueue prio --json` 输出 `{"priority_type", "weights": {"age", "fairshare", "job_size",
   "partition", "tres"}, "jobs": [{"id", "owner", "group", "priority", "factors": {"age",
   "fairshare", "job_size", "partition", "tres_cpu", "tres_gpu"}, "weighted": {"age", "fairshare",
   "job_size", "partition", "tres"}, "site", "nice"}]}`，作业按调度顺序排列。
-  `puzuz share --json` 输出 `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
+  `gpueue share --json` 输出 `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
   "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
   "usage_reset_period", "billing_weights", "usage_calc_at"}`。
 
@@ -284,12 +284,12 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 
 - 守护进程通过内核报告的套接字对端 uid（`SO_PEERCRED`）识别调用者。客户端无法冒充他人。
 - 每个作业属于添加它的用户。它以该用户的 uid、gid 和附加组运行，设置了 `no_new_privs`，并丢弃全部 capability。
-  命令在添加作业时所在的目录中运行，使用 `puzuz add` 调用时的环境变量。
+  命令在添加作业时所在的目录中运行，使用 `gpueue add` 调用时的环境变量。
 - root helper 拒绝以下用户的作业：系统账户（uid 小于 `job_min_uid`，默认为 `/etc/login.defs` 的
   `UID_MIN`）、设置了 `job_allowed_users` 时不在其中的用户，以及主组为等同 root 的组的用户
   （`job_denied_groups`，默认为 `docker`、`lxd`、`incus-admin`、`libvirt`、`libvirtd`、`disk`、`sudo`、`wheel`、
   `admin`）。这些组会从每个作业的附加组中去掉，因此即使所有者能使用 Docker 或 sudo，作业也不能
-  （helper 的日志会记录去掉了哪些组）。被拒绝的作业以 `puzuz refuses to run jobs as <user>: <reason>` 为原因启动失败。
+  （helper 的日志会记录去掉了哪些组）。被拒绝的作业以 `gpueue refuses to run jobs as <user>: <reason>` 为原因启动失败。
   见 [谁可以运行作业](docs/zh-CN/install.md#who-jobs-may-run-as)。
 - 即使所有者可以成为 root，作业也无法成为 root 或以 root 身份操作：在 `no_new_privs` 下 setuid 程序（`sudo`、
   `su`、`pkexec`）无法获得特权；作业单元无法访问系统 D-Bus，因此无论 polkit 规则授予所有者的组什么权限，
@@ -319,16 +319,16 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   （`All groups are being paused.` 或 `Your jobs are being paused: 3, 4`）。
 - **只有管理员能立即启动作业**（`start <id>`、`add -i`、`restart -i`、`restore -i`），并忽略所有限制；
   其他用户的作业会被排到其自己作业的最前面（参见 [作业优先级](#job-priority)）。
-- 管理员是 root 以及 `puzuz-admin` 组的成员（主组或附加组均可）。每次请求都会进行检查，因此
-  `usermod -aG puzuz-admin <user>` 会立即生效。
+- 管理员是 root 以及 `gpueue-admin` 组的成员（主组或附加组均可）。每次请求都会进行检查，因此
+  `usermod -aG gpueue-admin <user>` 会立即生效。
 
 <a id="gpu-slots"></a>
 ## GPU 槽位
 
-- `puzuz add --gpu 0,1 ...` 只有在其组有空闲槽位且所列的**每一块** GPU 都有空闲槽位时才会启动作业。
+- `gpueue add --gpu 0,1 ...` 只有在其组有空闲槽位且所列的**每一块** GPU 都有空闲槽位时才会启动作业。
   守护进程会拒绝它不认识的 GPU 编号。
 - 默认情况下每块 GPU 同时只允许 1 个作业。管理员可以用
-  `puzuz gpu parallel 2`（所有 GPU）或 `puzuz gpu parallel 2 --gpu 1` 更改。`0` 表示不限制。
+  `gpueue gpu parallel 2`（所有 GPU）或 `gpueue gpu parallel 2 --gpu 1` 更改。`0` 表示不限制。
   槽位按作业计数，而不是按显存。
 - GPU 编号遵循 PCI 总线顺序，与 `nvidia-smi` 和
   `CUDA_DEVICE_ORDER=PCI_BUS_ID` 的顺序相同。在作业内部，`CUDA_VISIBLE_DEVICES` 列出所申请的
@@ -343,7 +343,7 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - GPU 槽位、组的 `parallel` 限制和暂停的组适用于普通用户启动的每个作业，使用 `start <id>`、`add -i`、
   `restart -i` 或 `restore -i` 时也一样（参见 [作业优先级](#job-priority)）；只有管理员的即时启动会忽略它们。
 - GPU 在守护进程启动时通过 NVML 检测（配置中的 `[[gpus]]` 列表只是后备）。添加或移除 GPU 后请重启
-  `puzuz.service`。`puzuz doctor` 会将守护进程检测到的内容与 `nvidia-smi` 进行比较。
+  `gpueue.service`。`gpueue doctor` 会将守护进程检测到的内容与 `nvidia-smi` 进行比较。
 
 <a id="job-priority"></a>
 ## 作业优先级
@@ -351,13 +351,13 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 当多个作业等待相同的槽位时，在能够放入的作业中优先级最高的那个先启动。优先级遵循 Slurm 的 multifactor
 插件：默认情况下，它是 fair-share 因子（最近使用机器较少的用户优先，用量以 7 天的半衰期衰减）与
 等待时间因子（等待的时长）之和，再减去作业的 nice 值。也可以加入作业大小、组（partition）和按 GPU（TRES）
-的因子。你自己的 `-o` 优先级、`switch` 和 `puzuz top` 只会重新排列你自己的作业。非管理员使用 pueue 的
+的因子。你自己的 `-o` 优先级、`switch` 和 `gpueue top` 只会重新排列你自己的作业。非管理员使用 pueue 的
 即时启动（对排队中或暂存作业的 `start <id>`、`add -i`、`restart -i`、`restore -i`）时也是如此：作业会像
-`puzuz top` 一样被排到你自己作业的最前面，之后在组的 `parallel` 限制、GPU 槽位、暂停的组和依赖之下与其他
+`gpueue top` 一样被排到你自己作业的最前面，之后在组的 `parallel` 限制、GPU 槽位、暂停的组和依赖之下与其他
 用户的作业竞争；命令会说明它是被排队而不是被启动。在 `enable_user_top = false`（或
 `priority_type = "basic"`）时，作业只是被排队。对暂停作业执行 `start` 仍然是恢复它。管理员的即时启动会
-忽略所有限制立即启动。`puzuz prio` 显示作业
-为何处于当前位置，`puzuz share` 显示所有人的用量。公式和设置参见
+忽略所有限制立即启动。`gpueue prio` 显示作业
+为何处于当前位置，`gpueue share` 显示所有人的用量。公式和设置参见
 [优先级与公平共享](docs/zh-CN/install.md#priority-and-fair-share)。
 
 <a id="requirements"></a>
@@ -385,7 +385,7 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   要恢复作业，这些文件系统都必须重新挂载到相同的路径；否则恢复会被拒绝，镜像会被保留。
   `/scratch` 这类 tmpfs 上的文件在重启后不会保留。参见
   [文件系统与挂载](docs/zh-CN/install.md#filesystems-and-mounts)。
-- **没有崩溃保护：** 只有在有序关机、`puzuz shutdown` 和 `puzuz checkpoint` 时才会创建检查点。
+- **没有崩溃保护：** 只有在有序关机、`gpueue shutdown` 和 `gpueue checkpoint` 时才会创建检查点。
   断电、内核 panic 或硬重置时不会保存任何内容。暂不支持定期检查点。请继续保存你自己的训练检查点。
 - **Fork guard：** CUDA 进程不经 `exec` 而 fork 出的子进程（例如使用 `fork` 启动方式的 PyTorch
   DataLoader worker）会继承 CRIU 无法保存的 NVIDIA 设备映射。helper 会向每个作业预加载一个小型库
@@ -415,9 +415,9 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
     并且一次写入一个作业。
     在测试中，一个占用 7 GB 显存的作业转储耗时约 10 到 20 秒。
 - **覆盖 `/` 的挂载：** 如果作业的根目录被另一个挂载覆盖，就无法为它创建检查点。
-  puzuz 会拒绝转储并告诉你原因。作业继续运行。
+  gpueue 会拒绝转储并告诉你原因。作业继续运行。
 - 只要作业还存在，检查点镜像就不会被自动删除。在作业成功恢复、被删除（`remove`、`clean`、`reset`）
-  或其转储失败时，镜像会被删除。超过 `checkpoint_size_limit_bytes` 时，puzuz 会发出警告，但不会拒绝。
+  或其转储失败时，镜像会被删除。超过 `checkpoint_size_limit_bytes` 时，gpueue 会发出警告，但不会拒绝。
 - 暂不支持：`edit`、`env`、定期检查点、在保持作业运行的同时创建检查点、不做完整检查点而释放 GPU
   （"GPU suspend"）、Web UI 或 TCP API，以及按显存计数的槽位。
 
@@ -428,19 +428,19 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 
 - 每个 crate 的单元测试和集成测试（`scripts/test-in-docker.sh`）。
 - 在特权 Docker 容器中进行的全栈端到端测试：systemd 259 作为 PID 1、CRIU 4.2，
-  二进制文件通过 `puzuz service install` 安装（`scripts/e2e-test.sh`）。测试涵盖基本的队列操作、
+  二进制文件通过 `gpueue service install` 安装（`scripts/e2e-test.sh`）。测试涵盖基本的队列操作、
   三个用户的授权、组和 GPU 限制、检查点/恢复、守护进程和 helper 的重启、一次性添加大量作业、
-  `puzuz shutdown`，以及模拟重启：用 systemd 关闭容器，并在新容器中恢复作业，其中也包括在独立的 ext4 文件系统、
+  `gpueue shutdown`，以及模拟重启：用 systemd 关闭容器，并在新容器中恢复作业，其中也包括在独立的 ext4 文件系统、
   bind 挂载、`x-systemd.automount`、overlayfs、tmpfs 和 sshfs 上工作的作业，这些挂载会作为新的挂载重新出现。
 - 在 Docker 中使用真实 GPU（驱动 595、手动模式的 CRIU 4.2.1、Python 3.12 上的 PyTorch 2.8）：
   CUDA 计数器以及使用 fork 出的 DataLoader worker 的 PyTorch 训练的检查点/恢复，
-  其结果与未中断的运行完全相同；以及守护进程在打包好的、沙箱化的 `puzuz.service` 中通过 NVML 检测 GPU。
+  其结果与未中断的运行完全相同；以及守护进程在打包好的、沙箱化的 `gpueue.service` 中通过 NVML 检测 GPU。
 - QEMU/KVM 虚拟机的真实操作系统重启和关机（`scripts/vm-reboot-test.sh`）：Ubuntu 26.04、systemd 259 和
-  CRIU 4.2，puzuz 通过 `puzuz service install` 安装，`/var/lib/puzuz` 位于独立的 ext4 磁盘上，运行两个用户的
+  CRIU 4.2，gpueue 通过 `gpueue service install` 安装，`/var/lib/gpueue` 位于独立的 ext4 磁盘上，运行两个用户的
   CPU 作业以及一个 `--no-checkpoint` 作业。场景包括 `systemctl reboot`、`systemctl poweroff` 后重新启动，
-  以及在一个 1 GiB 作业的 `puzuz checkpoint` 仍在进行时重启。每次启动后，上一次启动的 journal 必须显示正确的
+  以及在一个 1 GiB 作业的 `gpueue checkpoint` 仍在进行时重启。每次启动后，上一次启动的 journal 必须显示正确的
   停止顺序（守护进程最先停止，helper 在自身停止之前转储作业，`--no-checkpoint` 作业的 unit 只在 helper 之后
-  停止，最后卸载 `/var/lib/puzuz`），且没有超时或
+  停止，最后卸载 `/var/lib/gpueue`），且没有超时或
   SIGKILL；`--no-checkpoint` 作业必须收到了 SIGTERM；恢复后的作业必须从停止处继续计数。
 
 尚未测试：
@@ -461,15 +461,15 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 <a id="agent-skill"></a>
 ## 面向编码智能体的 Agent Skill
 
-本仓库在 [skills/puzuz](skills/puzuz/SKILL.md) 中提供一个 [Agent Skill](https://agentskills.io)，
-教编码智能体（Claude Code、Codex、Cursor 等）以普通用户身份使用 puzuz：检查守护进程是否在运行、
-以正确的工作目录、环境变量和 `--gpu` 添加作业、跟踪日志、用 `puzuz wait` 等待而不是轮询、
+本仓库在 [skills/gpueue](skills/gpueue/SKILL.md) 中提供一个 [Agent Skill](https://agentskills.io)，
+教编码智能体（Claude Code、Codex、Cursor 等）以普通用户身份使用 gpueue：检查守护进程是否在运行、
+以正确的工作目录、环境变量和 `--gpu` 添加作业、跟踪日志、用 `gpueue wait` 等待而不是轮询、
 pause/kill/restart、checkpoint/restore、`--json` 输出、常见错误，以及安全规则（只操作自己的作业，
 不使用 `sudo` 或管理员命令）。使用 [skills](https://github.com/vercel-labs/skills) CLI 安装：
 
 ```sh
-npx skills add kaito4681/puzuz              # 仅当前项目；加 -g 则对所有项目生效
-npx skills add kaito4681/puzuz -g -a claude-code -y
+npx skills add kaito4681/gpueue              # 仅当前项目；加 -g 则对所有项目生效
+npx skills add kaito4681/gpueue -g -a claude-code -y
 ```
 
 <a id="documentation"></a>
@@ -493,16 +493,16 @@ scripts/e2e-test.sh               # full stack under systemd in a privileged con
 scripts/vm-reboot-test.sh         # real reboot/poweroff of a QEMU/KVM VM with CPU jobs (needs /dev/kvm)
 scripts/service-install-test.sh   # service install / status / uninstall and doctor
 scripts/helper-systemd-test.sh    # the helper alone under systemd
-scripts/dist-test.sh              # install.sh against a fake GitHub API (PUZUZ_DIST_BASE=debian:12 ...)
+scripts/dist-test.sh              # install.sh against a fake GitHub API (GPUEUE_DIST_BASE=debian:12 ...)
 nix build -L .#checks.x86_64-linux.nixos         # NixOS module in a VM (needs KVM)
 nix build -L .#checks.x86_64-linux.home-manager  # home-manager module evaluation
-nix build -L .#checks.x86_64-linux.helper-tests  # all puzuz-helper tests in a VM (needs KVM)
+nix build -L .#checks.x86_64-linux.helper-tests  # all gpueue-helper tests in a VM (needs KVM)
 ```
 
 `scripts/e2e-test.sh` 在文件开头说明了它的环境变量，例如
-`PUZUZ_E2E_ONLY`，以及用于 GPU 场景的 `PUZUZ_E2E_GPU=1`。`PUZUZ_HELPER_GPU=1
+`GPUEUE_E2E_ONLY`，以及用于 GPU 场景的 `GPUEUE_E2E_GPU=1`。`GPUEUE_HELPER_GPU=1
 scripts/helper-systemd-test.sh`（需要 CUDA 基础镜像，参见该脚本）会强制让 GPU 检查点超过其期限，并在转储中途终止
-`criu` / `cuda-checkpoint`，两种 `PUZUZ_HELPER_CUDA_MODE` 均会测试。`scripts/measure-checkpoint.sh`
+`criu` / `cuda-checkpoint`，两种 `GPUEUE_HELPER_CUDA_MODE` 均会测试。`scripts/measure-checkpoint.sh`
 测量每个检查点步骤的耗时。这些脚本都不会在主机上执行任何特权操作。
 
 <a id="license"></a>

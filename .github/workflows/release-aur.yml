@@ -1,18 +1,18 @@
 name: Release to the AUR
 
-# Publishes packaging/aur/puzuz-bin to https://aur.archlinux.org/packages/puzuz-bin when a
+# Publishes packaging/aur/gpueue-bin to https://aur.archlinux.org/packages/gpueue-bin when a
 # release is published as a stable one (`released`, as the APT repository's
 # release-apt.yml: never for a draft or a pre-release, also not by hand):
 # scripts/dist/update-aur.sh sets pkgver and the checksums of the release's tarballs, and
 # the PKGBUILD, .SRCINFO and install file are pushed to
-# ssh://aur@aur.archlinux.org/puzuz-bin.git. A release published with the GITHUB_TOKEN of a
+# ssh://aur@aur.archlinux.org/gpueue-bin.git. A release published with the GITHUB_TOKEN of a
 # workflow does not trigger it; run it by hand then.
 #
 # One-time setup (maintainers; see docs/install.md, "The AUR package"):
 # 1. Create an AUR account at https://aur.archlinux.org and add the public half of a
-#    dedicated SSH key (ssh-keygen -t ed25519 -f aur_puzuz -C puzuz-aur) to it.
+#    dedicated SSH key (ssh-keygen -t ed25519 -f aur_gpueue -C gpueue-aur) to it.
 # 2. Store the private half as the repository secret AUR_SSH_PRIVATE_KEY:
-#    gh secret set AUR_SSH_PRIVATE_KEY -R kaito4681/puzuz < aur_puzuz
+#    gh secret set AUR_SSH_PRIVATE_KEY -R kaito4681/gpueue < aur_gpueue
 # The first push creates the package on the AUR. Without the secret this workflow only
 # prints a notice.
 
@@ -84,11 +84,11 @@ jobs:
 
           aur="$RUNNER_TEMP/aur"
           # An empty repository (before the first push) clones with a warning.
-          git clone ssh://aur@aur.archlinux.org/puzuz-bin.git "$aur"
+          git clone ssh://aur@aur.archlinux.org/gpueue-bin.git "$aur"
           git -C "$aur" checkout -B master
-          cp packaging/aur/puzuz-bin/PKGBUILD packaging/aur/puzuz-bin/.SRCINFO \
-            packaging/aur/puzuz-bin/puzuz-bin.install "$aur/"
-          git -C "$aur" add PKGBUILD .SRCINFO puzuz-bin.install
+          cp packaging/aur/gpueue-bin/PKGBUILD packaging/aur/gpueue-bin/.SRCINFO \
+            packaging/aur/gpueue-bin/gpueue-bin.install "$aur/"
+          git -C "$aur" add PKGBUILD .SRCINFO gpueue-bin.install
           if git -C "$aur" diff --cached --quiet; then
             echo "the AUR package is already at ${VERSION}"
           else

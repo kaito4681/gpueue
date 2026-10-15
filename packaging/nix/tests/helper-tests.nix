@@ -1,4 +1,4 @@
-# Runs every test of puzuz-helper in a NixOS VM, with nothing skipped
+# Runs every test of gpueue-helper in a NixOS VM, with nothing skipped
 # (`nix build .#checks.x86_64-linux.helper-tests`).
 #
 # The package build runs no tests (see `doCheck` in packaging/nix/package.nix): those
@@ -14,7 +14,7 @@ let
   tests = self.packages.${pkgs.stdenv.hostPlatform.system}.helper-tests;
 in
 pkgs.testers.runNixOSTest {
-  name = "puzuz-helper-tests";
+  name = "gpueue-helper-tests";
 
   nodes.machine = {
     users.users.alice.isNormalUser = true;
@@ -36,7 +36,7 @@ pkgs.testers.runNixOSTest {
     for name in binaries:
         with subtest(name):
             cmd = (
-                "cd /tmp && PUZUZ_HELPER_EXE=${tests}/libexec/puzuz-helper "
+                "cd /tmp && GPUEUE_HELPER_EXE=${tests}/libexec/gpueue-helper "
                 f"${tests}/bin/{name} --test-threads=2 --nocapture 2>&1"
             )
             status, out = machine.execute(f"su -l alice -c {shlex.quote(cmd)}")
@@ -52,7 +52,7 @@ pkgs.testers.runNixOSTest {
             skipped = [l for l in out.splitlines() if "skipped: " in l]
             assert not skipped, f"{name}: tests skipped themselves: {skipped}"
 
-    print(f"puzuz-helper tests: {totals}")
+    print(f"gpueue-helper tests: {totals}")
     assert totals["failed"] == 0, totals
   '';
 }

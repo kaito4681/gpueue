@@ -1,6 +1,6 @@
 #!/bin/bash
 # Runs inside the runner container of scripts/vm-reboot-test.sh: prepares
-# (once, cached in /cache) and boots the VM, installs puzuz in it and drives
+# (once, cached in /cache) and boots the VM, installs gpueue in it and drives
 # the reboot scenarios of guest.sh.
 #   /stage/bin  release binaries   /stage/e2e  scripts/e2e   /stage/vm  this directory
 set -euo pipefail
@@ -21,7 +21,7 @@ log() { echo "[$(date +%T)] $*"; }
 die() {
     log "ERROR: $*"
     [ -f "$SERIAL" ] && { echo "--- tail of the serial console"; tail -n 60 "$SERIAL"; }
-    if [ "${PUZUZ_VM_KEEP:-}" = 1 ]; then
+    if [ "${GPUEUE_VM_KEEP:-}" = 1 ]; then
         log "keeping the VM: ssh -F $WORK/ssh_config vm"
         sleep infinity
     fi
@@ -129,13 +129,13 @@ prepare_image() {
     curl -fsSL -o "$dir/SHA256SUMS" "$IMG_BASE/SHA256SUMS"
     curl -fsSL -o "$dir/$IMG_NAME" "$IMG_BASE/$IMG_NAME"
     (cd "$dir" && grep " \*$IMG_NAME\$" SHA256SUMS | sha256sum -c -) || die "checksum mismatch"
-    [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N '' -C puzuz-vm-test -f "$KEY"
+    [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N '' -C gpueue-vm-test -f "$KEY"
     qemu-img convert -O qcow2 "$dir/$IMG_NAME" "$dir/disk.qcow2"
     rm -f "$dir/$IMG_NAME"
     qemu-img resize -q "$dir/disk.qcow2" 8G
 
     mkdir "$dir/seed"
-    printf 'instance-id: puzuz-vm-1\nlocal-hostname: puzuz-vm\n' >"$dir/seed/meta-data"
+    printf 'instance-id: gpueue-vm-1\nlocal-hostname: gpueue-vm\n' >"$dir/seed/meta-data"
     sed "s|@SSH_KEY@|$(cat "$KEY.pub")|" /stage/vm/user-data.yaml >"$dir/seed/user-data"
     xorriso -as genisoimage -quiet -output "$dir/seed.iso" -volid cidata -joliet -rock \
         "$dir/seed/user-data" "$dir/seed/meta-data"
@@ -144,8 +144,8 @@ prepare_image() {
     : >"$SERIAL"
     start_vm "$dir/disk.qcow2" -drive "file=$dir/seed.iso,if=virtio,media=cdrom,readonly=on"
     wait_qemu_exit 1200
-    grep -q 'PUZUZ-PROVISION-OK' "$SERIAL" || die "provisioning failed"
-    grep -E 'PUZUZ-PROVISION' "$SERIAL" | sed 's/^[0-9.]* //'
+    grep -q 'GPUEUE-PROVISION-OK' "$SERIAL" || die "provisioning failed"
+    grep -E 'GPUEUE-PROVISION' "$SERIAL" | sed 's/^[0-9.]* //'
     # Compact the image (zeroed and discarded blocks are dropped).
     qemu-img convert -O qcow2 "$dir/disk.qcow2" "$PREPARED.tmp"
     mv "$PREPARED.tmp" "$PREPARED"
@@ -167,12 +167,12 @@ scenarios=("$@")
 [ "${#scenarios[@]}" -gt 0 ] || scenarios=(reboot poweroff inflight)
 
 qemu-img create -q -f qcow2 -b "$PREPARED" -F qcow2 "$WORK/root.qcow2"
-# /var/lib/puzuz lives on a disk of its own, mounted from /etc/fstab, so
+# /var/lib/gpueue lives on a disk of its own, mounted from /etc/fstab, so
 # that the journal shows when it is unmounted relative to the helper.
 qemu-img create -q -f qcow2 "$WORK/state.qcow2" 6G
 # shellcheck disable=SC2054  # commas belong to the QEMU option values
 STATE_DRIVE=(-drive "file=$WORK/state.qcow2,if=none,id=state,format=qcow2,discard=unmap"
-    -device virtio-blk-pci,drive=state,serial=puzuz-state)
+    -device virtio-blk-pci,drive=state,serial=gpueue-state)
 
 : >"$SERIAL"
 log "booting the VM"
@@ -198,7 +198,7 @@ for s in "${scenarios[@]}"; do
     fi
     t0=$(date +%s.%N)
     # The trigger starts the shutdown itself (for "inflight" right after
-    # `puzuz checkpoint`); the ssh connection is cut by the shutdown.
+    # `gpueue checkpoint`); the ssh connection is cut by the shutdown.
     vm bash /e2e/vm/guest.sh trigger "$s" "$action" || true
     if [ "$action" = poweroff ]; then
         wait_qemu_exit 1800

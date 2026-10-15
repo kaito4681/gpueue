@@ -1,33 +1,33 @@
 #!/bin/bash
-# Installs puzuz inside the systemd container the way an administrator
-# would (`puzuz service install`), with the test's /etc/puzuz/config.toml
+# Installs gpueue inside the systemd container the way an administrator
+# would (`gpueue service install`), with the test's /etc/gpueue/config.toml
 # (which the installer keeps), and creates the admin user. Idempotent: it
 # runs again in the second container of the reboot test, on top of the
-# persisted /var/lib/puzuz.
-#   alice (1000), bob (1001): regular users; carol (1002): puzuz-admin.
+# persisted /var/lib/gpueue.
+#   alice (1000), bob (1001): regular users; carol (1002): gpueue-admin.
 set -euo pipefail
 
-mkdir -p /etc/puzuz
-if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
-    install -m 0644 /e2e/config-gpu.toml /etc/puzuz/config.toml
+mkdir -p /etc/gpueue
+if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
+    install -m 0644 /e2e/config-gpu.toml /etc/gpueue/config.toml
 else
-    install -m 0644 /e2e/config.toml /etc/puzuz/config.toml
+    install -m 0644 /e2e/config.toml /etc/gpueue/config.toml
 fi
-if [ -n "${PUZUZ_E2E_CUDA_MODE:-}" ]; then
+if [ -n "${GPUEUE_E2E_CUDA_MODE:-}" ]; then
     # Top-level key: prepend it, before any [[gpus]] table.
-    { echo "cuda_checkpoint_mode = \"$PUZUZ_E2E_CUDA_MODE\""; cat /etc/puzuz/config.toml; } >/etc/puzuz/config.toml.new
-    mv /etc/puzuz/config.toml.new /etc/puzuz/config.toml
-    chmod 0644 /etc/puzuz/config.toml
+    { echo "cuda_checkpoint_mode = \"$GPUEUE_E2E_CUDA_MODE\""; cat /etc/gpueue/config.toml; } >/etc/gpueue/config.toml.new
+    mv /etc/gpueue/config.toml.new /etc/gpueue/config.toml
+    chmod 0644 /etc/gpueue/config.toml
 fi
 # Exits non-zero when its final checks warn (e.g. no GPUs); the state of
 # the services is checked below.
-/e2e/bin/puzuz service install --bin-dir /usr/local/bin || true
+/e2e/bin/gpueue service install --bin-dir /usr/local/bin || true
 
 getent passwd 1002 >/dev/null || useradd -m -u 1002 -s /bin/sh carol
-usermod -aG puzuz-admin carol
+usermod -aG gpueue-admin carol
 
 for _ in $(seq 100); do
-    [ -S /run/puzuz/puzuz.sock ] && break
+    [ -S /run/gpueue/gpueue.sock ] && break
     sleep 0.1
 done
-systemctl is-active puzuz-helper.service puzuz.service
+systemctl is-active gpueue-helper.service gpueue.service

@@ -43,8 +43,8 @@ jobs:
             echo "::error::the repository secrets MINISIGN_SECRET_KEY and MINISIGN_PASSWORD must be set (scripts/dist/gen-signing-key.sh prints the commands)"
             exit 1
           fi
-          if grep -aq 'TEST KEY' packaging/apt/puzuz-archive-keyring.gpg; then
-            echo "::error::packaging/apt/puzuz-archive-keyring.gpg is the test key; create the APT archive key with scripts/dist/gen-apt-key.sh"
+          if grep -aq 'TEST KEY' packaging/apt/gpueue-archive-keyring.gpg; then
+            echo "::error::packaging/apt/gpueue-archive-keyring.gpg is the test key; create the APT archive key with scripts/dist/gen-apt-key.sh"
             exit 1
           fi
 
@@ -85,21 +85,21 @@ jobs:
           runuser -u builder -- env PATH="$PATH" RUSTUP_HOME="$RUSTUP_HOME" \
             CARGO_HOME=/home/builder/.cargo CARGO_TARGET_DIR=/home/builder/target \
             cargo test --workspace --locked
-      - run: cargo build --release --locked -p puzuz -p puzuz-helper
+      - run: cargo build --release --locked -p gpueue -p gpueue-helper
       - name: Package
         run: |
-          name="puzuz-$TAG-$TARGET"
+          name="gpueue-$TAG-$TARGET"
           mkdir -p "dist/$name"
-          install -m 0755 target/release/puzuz target/release/puzuz-helper "dist/$name/"
+          install -m 0755 target/release/gpueue target/release/gpueue-helper "dist/$name/"
           cp -r README.md LICENSE docs "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
-      # dist/puzuz_<version>_<amd64|arm64>.deb (packaging/nfpm.yaml).
+      # dist/gpueue_<version>_<amd64|arm64>.deb (packaging/nfpm.yaml).
       - name: Build the .deb
         run: |
           deb="$(scripts/dist/build-package.sh target/release dist deb)"
           (cd dist && sha256sum "$(basename "$deb")" >"$(basename "$deb").sha256")
-      # dist/puzuz-<version>-1.<x86_64|aarch64>.rpm (packaging/nfpm.yaml),
+      # dist/gpueue-<version>-1.<x86_64|aarch64>.rpm (packaging/nfpm.yaml),
       # unsigned: the sign-rpm job GPG-signs it, so that the signing key
       # never enters this job, where the dependencies' build scripts ran as
       # root.
@@ -115,7 +115,7 @@ jobs:
 
   # GPG-signs the .rpm files (rpm -K) with the APT repository's key, on a
   # fresh runner that never ran the build (scripts/dist/sign-rpm.sh); the
-  # release job attaches the key's public half as RPM-GPG-KEY-puzuz. Without
+  # release job attaches the key's public half as RPM-GPG-KEY-gpueue. Without
   # the key (or with the test key) they stay unsigned and, like every asset,
   # are covered by their .minisig and .sha256.
   sign-rpm:
@@ -137,7 +137,7 @@ jobs:
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
           RPM_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: |
-          keyring=packaging/apt/puzuz-archive-keyring.gpg
+          keyring=packaging/apt/gpueue-archive-keyring.gpg
           if [ -n "$APT_GPG_PRIVATE_KEY" ] && ! grep -aq 'TEST KEY' "$keyring"; then
             sudo apt-get update -q
             sudo apt-get install -y -q --no-install-recommends rpm
@@ -180,28 +180,28 @@ jobs:
       - run: cp -f rpm-signed/* dist/
       # Version-less copies of the packages, so that
       # releases/latest/download/<name> always gives the newest stable one:
-      # puzuz_<amd64|arm64>.deb and puzuz.<x86_64|aarch64>.rpm (copies of the
+      # gpueue_<amd64|arm64>.deb and gpueue.<x86_64|aarch64>.rpm (copies of the
       # final, GPG-signed .rpm files). Each gets its own .sha256 here and its
       # own .minisig below, whose trusted comment names the copy. The APT
       # repository (scripts/dist/apt-repo.sh) only takes the versioned
-      # puzuz_<version>_<arch>.deb files.
+      # gpueue_<version>_<arch>.deb files.
       - name: Add version-less package copies
         run: |
           cd dist
-          for deb in puzuz_*_*.deb; do
-            alias="puzuz_${deb##*_}"
-            [ ! -e "$alias" ] || { echo "two .deb files for ${alias#puzuz_}"; exit 1; }
+          for deb in gpueue_*_*.deb; do
+            alias="gpueue_${deb##*_}"
+            [ ! -e "$alias" ] || { echo "two .deb files for ${alias#gpueue_}"; exit 1; }
             cp "$deb" "$alias"
             sha256sum "$alias" >"$alias.sha256"
           done
-          for rpm in puzuz-*-1.*.rpm; do
+          for rpm in gpueue-*-1.*.rpm; do
             arch="${rpm%.rpm}"
-            alias="puzuz.${arch##*.}.rpm"
+            alias="gpueue.${arch##*.}.rpm"
             [ ! -e "$alias" ] || { echo "two .rpm files for ${arch##*.}"; exit 1; }
             cp "$rpm" "$alias"
             sha256sum "$alias" >"$alias.sha256"
           done
-          for alias in puzuz_amd64.deb puzuz_arm64.deb puzuz.x86_64.rpm puzuz.aarch64.rpm; do
+          for alias in gpueue_amd64.deb gpueue_arm64.deb gpueue.x86_64.rpm gpueue.aarch64.rpm; do
             [ -f "$alias" ] || { echo "missing $alias"; exit 1; }
           done
       # The public key the .rpm files are signed with, ASCII-armored as
@@ -211,19 +211,19 @@ jobs:
         env:
           HAVE_RPM_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY != '' }}
         run: |
-          keyring=packaging/apt/puzuz-archive-keyring.gpg
+          keyring=packaging/apt/gpueue-archive-keyring.gpg
           if [ "$HAVE_RPM_KEY" = true ] && ! grep -aq 'TEST KEY' "$keyring"; then
             GNUPGHOME="$(mktemp -d)"
             export GNUPGHOME
             gpg --batch --quiet --import "$keyring"
-            gpg --batch --armor --export >dist/RPM-GPG-KEY-puzuz
+            gpg --batch --armor --export >dist/RPM-GPG-KEY-gpueue
           fi
       # dist/<name>.{tar.gz,deb,rpm}.minisig (also for the version-less
       # copies), install.sh with its
-      # install.sh.minisig and RPM-GPG-KEY-puzuz (when attached) with its
-      # RPM-GPG-KEY-puzuz.minisig, checked against packaging/minisign.pub
-      # (the key built into `puzuz`). The trusted comment names the tag and
-      # the file; install.sh and `puzuz update` require exactly that.
+      # install.sh.minisig and RPM-GPG-KEY-gpueue (when attached) with its
+      # RPM-GPG-KEY-gpueue.minisig, checked against packaging/minisign.pub
+      # (the key built into `gpueue`). The trusted comment names the tag and
+      # the file; install.sh and `gpueue update` require exactly that.
       - name: Sign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -238,10 +238,10 @@ jobs:
           (umask 077; printf '%s\n' "$MINISIGN_SECRET_KEY" >"$key")
           install -m 0644 scripts/install.sh dist/install.sh
           files=(dist/*.tar.gz dist/*.deb dist/*.rpm dist/install.sh)
-          [ ! -f dist/RPM-GPG-KEY-puzuz ] || files+=(dist/RPM-GPG-KEY-puzuz)
+          [ ! -f dist/RPM-GPG-KEY-gpueue ] || files+=(dist/RPM-GPG-KEY-gpueue)
           for file in "${files[@]}"; do
             printf '%s\n' "$MINISIGN_PASSWORD" |
-              "$minisign" -S -s "$key" -m "$file" -t "puzuz $TAG $(basename "$file")"
+              "$minisign" -S -s "$key" -m "$file" -t "gpueue $TAG $(basename "$file")"
             "$minisign" -V -p packaging/minisign.pub -m "$file"
           done
           rm -f "$key"
@@ -250,7 +250,7 @@ jobs:
           cat >"$RUNNER_TEMP/notes.md" <<EOF
           ## Install or update (administrators)
 
-          With install.sh (x86_64 and aarch64; later updates with \`sudo puzuz update\`):
+          With install.sh (x86_64 and aarch64; later updates with \`sudo gpueue update\`):
 
           \`\`\`sh
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | sudo bash -s -- --version ${TAG#v}
@@ -259,24 +259,24 @@ jobs:
           On Debian and Ubuntu, the package instead (download the file for your architecture):
 
           \`\`\`sh
-          sudo apt install ./puzuz_${TAG#v}_amd64.deb    # x86_64
-          sudo apt install ./puzuz_${TAG#v}_arm64.deb    # aarch64
+          sudo apt install ./gpueue_${TAG#v}_amd64.deb    # x86_64
+          sudo apt install ./gpueue_${TAG#v}_arm64.deb    # aarch64
           \`\`\`
 
           On Fedora, RHEL, Rocky and Alma Linux, the .rpm (there is no dnf repository yet:
           update an older .rpm installation with \`sudo dnf upgrade\` and the same URL):
 
           \`\`\`sh
-          sudo dnf install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/puzuz-${TAG#v}-1.x86_64.rpm    # x86_64
-          sudo dnf install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/puzuz-${TAG#v}-1.aarch64.rpm   # aarch64
+          sudo dnf install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/gpueue-${TAG#v}-1.x86_64.rpm    # x86_64
+          sudo dnf install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/gpueue-${TAG#v}-1.aarch64.rpm   # aarch64
           \`\`\`
 
-          The packages are also attached as \`puzuz_<amd64|arm64>.deb\` and
-          \`puzuz.<x86_64|aarch64>.rpm\`, so that
+          The packages are also attached as \`gpueue_<amd64|arm64>.deb\` and
+          \`gpueue.<x86_64|aarch64>.rpm\`, so that
           \`https://github.com/$GITHUB_REPOSITORY/releases/latest/download/<name>\` always gives
           the newest stable release (see docs/install.md).
 
-          Running jobs keep running. The tarballs (\`puzuz-$TAG-<target>.tar.gz\`), the
+          Running jobs keep running. The tarballs (\`gpueue-$TAG-<target>.tar.gz\`), the
           \`.deb\` and the \`.rpm\` files and \`install.sh\` are signed with minisign
           (\`.minisig\`, public key in \`packaging/minisign.pub\`); see docs/install.md for
           checking \`install.sh\` before running it, manual installation and uninstalling.

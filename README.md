@@ -1,9 +1,9 @@
-# puzuz
+# gpueue
 
 English | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
 
 A GPU job queue for one Linux machine shared by several users. Its CLI works like
-[pueue](https://github.com/Nukesor/pueue). puzuz adds two things on top: GPU slots, and
+[pueue](https://github.com/Nukesor/pueue). gpueue adds two things on top: GPU slots, and
 transparent checkpoint/restore of running jobs (CPU, memory and GPU state) with
 [CRIU](https://criu.org) and NVIDIA [cuda-checkpoint](https://github.com/NVIDIA/cuda-checkpoint).
 A training run that is still going when the machine reboots is saved to disk and resumes where it
@@ -22,13 +22,13 @@ stopped. It does not start over.
 
 On a shared GPU workstation people usually run jobs with `nohup`, `tmux` or a per-user pueue, and
 they argue over GPUs in chat. A reboot for kernel or driver updates kills every training run.
-puzuz provides:
+gpueue provides:
 
 - **one queue for everyone**: a system-wide daemon schedules all users' jobs and shows who is using
   which GPU,
 - **GPU slots**: a job asks for specific GPUs (`--gpu 0,1`) and only starts when they are free,
-- **checkpoint/restore**: running jobs are saved when the OS shuts down, on `puzuz shutdown`, or on
-  demand with `puzuz checkpoint`. They resume later with `puzuz restore`, with no changes to your
+- **checkpoint/restore**: running jobs are saved when the OS shuts down, on `gpueue shutdown`, or on
+  demand with `gpueue checkpoint`. They resume later with `gpueue restore`, with no changes to your
   code.
 
 ## Features
@@ -36,20 +36,20 @@ puzuz provides:
 - pueue-compatible commands: `add`, `status`, `log`, `follow`, `wait`, `pause`, `start`, `kill`,
   `remove`, `restart`, `clean`, `reset`, `stash`, `enqueue`, `switch`, `group`, `parallel`,
   `shutdown`, `completions`, plus groups, dependencies (`--after`), priorities, delays and labels.
-- GPU slots: per-GPU limits on how many jobs run at once (`puzuz gpu parallel`). Each job gets
+- GPU slots: per-GPU limits on how many jobs run at once (`gpueue gpu parallel`). Each job gets
   `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER=PCI_BUS_ID`. GPUs are detected with NVML.
 - Fair sharing between users: Slurm-style multifactor priority (fair share with decaying usage,
-  age, nice, `top`; `puzuz prio` and `puzuz share` show the numbers).
+  age, nice, `top`; `gpueue prio` and `gpueue share` show the numbers).
 - Transparent checkpoint/restore of CPU and CUDA processes. This includes PyTorch jobs whose
   DataLoader workers are forked (see [fork guard](#limitations)).
 - Automatic checkpoint of all running jobs when the OS shuts down or reboots.
 - Multi-user: jobs run as their owner. Other users can see that a job exists, but not its command,
-  environment or log. Administrators are root and the `puzuz-admin` group.
+  environment or log. Administrators are root and the `gpueue-admin` group.
 - Privilege separation: the daemon (HTTP API, scheduler, SQLite) runs as the unprivileged system
-  user `puzuz`. Only a small root helper starts jobs and runs CRIU.
+  user `gpueue`. Only a small root helper starts jobs and runs CRIU.
 - Jobs run in their own systemd units, so they keep running when the daemon or the helper is
   restarted (for example during an upgrade).
-- `puzuz doctor` checks the installation and prints the command that fixes each problem.
+- `gpueue doctor` checks the installation and prints the command that fixes each problem.
 
 ## Quick start
 
@@ -58,92 +58,92 @@ See [docs/install.md](docs/install.md) for requirements and details.
 ### Install (administrator)
 
 On x86_64 or aarch64 Linux with systemd and glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+,
-RHEL 9+), the installer downloads the latest release, checks it, and installs puzuz into
+RHEL 9+), the installer downloads the latest release, checks it, and installs gpueue into
 /usr/local/bin:
 
 ```sh
-curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.sh | sudo bash
 ```
 
-The installer sets up the systemd units, the `puzuz` user, the `puzuz-admin` group, the
-directories and a default /etc/puzuz/config.toml, starts the services and prints the
-`puzuz doctor` report. It does not install CRIU or cuda-checkpoint; it tells you if they are
-missing. Update later with `sudo puzuz update` (running jobs keep running). Remove it with
-`sudo puzuz uninstall`, which keeps the data (`--purge` deletes it too). A GitHub token is not
+The installer sets up the systemd units, the `gpueue` user, the `gpueue-admin` group, the
+directories and a default /etc/gpueue/config.toml, starts the services and prints the
+`gpueue doctor` report. It does not install CRIU or cuda-checkpoint; it tells you if they are
+missing. Update later with `sudo gpueue update` (running jobs keep running). Remove it with
+`sudo gpueue uninstall`, which keeps the data (`--purge` deletes it too). A GitHub token is not
 needed (`GH_TOKEN` is used when set; it only raises the API rate limit).
 
-On Debian and Ubuntu (amd64 or arm64) you can install the package from the puzuz APT repository
+On Debian and Ubuntu (amd64 or arm64) you can install the package from the gpueue APT repository
 (in the GitHub release `apt`) instead; this needs `curl` and `ca-certificates`, and apt picks the
 newest stable version and the architecture:
 
 ```sh
-sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
-sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
-sudo apt update && sudo apt install puzuz
+sudo curl -fsSLo /etc/apt/keyrings/gpueue.gpg https://github.com/kaito4681/gpueue/releases/download/apt/gpueue.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/gpueue.sources https://github.com/kaito4681/gpueue/releases/download/apt/gpueue.sources
+sudo apt update && sudo apt install gpueue
 ```
 
 Or install the `.deb` of the latest release directly (it registers the same repository):
 
 ```sh
 arch=$(dpkg --print-architecture)
-curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
-sudo apt install "./puzuz_${arch}.deb"
+curl -fLO "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue_${arch}.deb"
+sudo apt install "./gpueue_${arch}.deb"
 ```
 
 It installs and starts the same services and recommends `criu` (see
 [docs/install.md](docs/install.md#installing-the-debianubuntu-package) for the prerequisites).
-Either way, later versions come with `sudo apt update && sudo apt upgrade`. `sudo apt remove puzuz`
-stops the services; `sudo apt purge puzuz` also deletes /etc/puzuz. Both keep /var/lib/puzuz and
+Either way, later versions come with `sudo apt update && sudo apt upgrade`. `sudo apt remove gpueue`
+stops the services; `sudo apt purge gpueue` also deletes /etc/gpueue. Both keep /var/lib/gpueue and
 running jobs.
 
 On Fedora, RHEL, Rocky and Alma Linux 9+ (x86_64 or aarch64), install the .rpm from the release
 (dnf takes the URL directly):
 
 ```sh
-sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
+sudo dnf install "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue.$(uname -m).rpm"
 ```
 
 These URLs always give the newest stable release (`releases/latest` skips pre-releases); the
-versioned files (`puzuz_<version>_<arch>.deb`, `puzuz-<version>-1.<arch>.rpm`) are attached too,
+versioned files (`gpueue_<version>_<arch>.deb`, `gpueue-<version>-1.<arch>.rpm`) are attached too,
 for a specific version. Every file has `.sha256` and `.minisig` files (see
 [Verifying a release by hand](docs/install.md#verifying-a-release-by-hand)).
 
 There is no dnf repository yet (planned, issue #23): update by running the same command with
-`sudo dnf upgrade`. `sudo dnf remove puzuz` stops the services and keeps
-/var/lib/puzuz and running jobs. It recommends `criu`; Fedora's is new enough, Rocky/RHEL 9 ship
+`sudo dnf upgrade`. `sudo dnf remove gpueue` stops the services and keeps
+/var/lib/gpueue and running jobs. It recommends `criu`; Fedora's is new enough, Rocky/RHEL 9 ship
 only 3.19, so checkpointing there needs a newer CRIU (jobs run without it). You can also build
 from source or use the Nix flake (see [docs/install.md](docs/install.md)).
 
-On NixOS, import the flake's module (`github:kaito4681/puzuz/stable`, `nixosModules.default`) and
-set `services.puzuz.enable = true` (see [NixOS](docs/install.md#nixos)); home-manager users can add
+On NixOS, import the flake's module (`github:kaito4681/gpueue/stable`, `nixosModules.default`) and
+set `services.gpueue.enable = true` (see [NixOS](docs/install.md#nixos)); home-manager users can add
 the CLI's completions with `homeManagerModules.default`. With Nix on another distribution
 (x86_64 or aarch64), build the flake and install the service from the result (it is copied to
 /usr/local/bin and kept from Nix's garbage collection; see
 [Installing with Nix](docs/install.md#installing-with-nix)):
 
 ```sh
-nix build github:kaito4681/puzuz/stable
-sudo ./result/bin/puzuz service install
+nix build github:kaito4681/gpueue/stable
+sudo ./result/bin/gpueue service install
 ```
 
-On Arch Linux (x86_64, aarch64), use the installer above for now: the AUR package `puzuz-bin` is
+On Arch Linux (x86_64, aarch64), use the installer above for now: the AUR package `gpueue-bin` is
 not published yet. CRIU (4.2 or newer, for checkpoints) is in the official repositories:
 
 ```sh
 sudo pacman -S criu
-curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.sh | sudo bash
 ```
 
-Update with `sudo puzuz update` and remove with `sudo puzuz uninstall`. Once the package is on
-the AUR, you can install [`puzuz-bin`](https://aur.archlinux.org/packages/puzuz-bin) with any AUR
+Update with `sudo gpueue update` and remove with `sudo gpueue uninstall`. Once the package is on
+the AUR, you can install [`gpueue-bin`](https://aur.archlinux.org/packages/gpueue-bin) with any AUR
 helper instead (see [docs/install.md](docs/install.md#arch-linux-aur)).
 
 ```sh
 # Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.
-puzuz doctor
+gpueue doctor
 
 # Optional: make someone an administrator.
-sudo usermod -aG puzuz-admin alice
+sudo usermod -aG gpueue-admin alice
 ```
 
 Regular users do not need to install anything.
@@ -153,52 +153,52 @@ Regular users do not need to install anything.
 ```sh
 # Queue a job on GPU 0. The command runs through `sh -c` in the current directory, with your
 # environment.
-puzuz add --gpu 0 -l resnet -- 'python train.py --epochs 100'
+gpueue add --gpu 0 -l resnet -- 'python train.py --epochs 100'
 
-puzuz status          # all jobs of all users (others' commands are hidden)
-puzuz gpu             # GPUs, slots in use, and which jobs hold them
-puzuz log 0           # the last lines of job 0's output
-puzuz follow 0        # stream the output, like tail -f
+gpueue status          # all jobs of all users (others' commands are hidden)
+gpueue gpu             # GPUs, slots in use, and which jobs hold them
+gpueue log 0           # the last lines of job 0's output
+gpueue follow 0        # stream the output, like tail -f
 ```
 
 ### Checkpoint and restore
 
 ```sh
-puzuz checkpoint 0    # save job 0 to disk and stop it; frees the GPU. State: Checkpointed
-puzuz restore 0       # queue it again; it resumes once its group and GPUs have a free slot
-puzuz restore -i 0    # ...or put it first among your queued jobs (administrators: resume right away; see "Job priority")
+gpueue checkpoint 0    # save job 0 to disk and stop it; frees the GPU. State: Checkpointed
+gpueue restore 0       # queue it again; it resumes once its group and GPUs have a free slot
+gpueue restore -i 0    # ...or put it first among your queued jobs (administrators: resume right away; see "Job priority")
 ```
 
 A restored job continues from the moment it was checkpointed. It keeps its job id, and its output
 is appended to the same log.
 
 A paused job can be checkpointed as well, also on a reboot. It is restored paused, still holding
-its GPU slots, and `puzuz start` resumes it. CRIU and cuda-checkpoint need a running process, so
+its GPU slots, and `gpueue start` resumes it. CRIU and cuda-checkpoint need a running process, so
 the job runs for a moment during the dump. The restore leaves it stopped, so it runs nothing (not
-even for a moment) until `puzuz start`. `puzuz pause` is refused while a checkpoint is in
+even for a moment) until `gpueue start`. `gpueue pause` is refused while a checkpoint is in
 progress.
 
 ### What happens on reboot
 
-1. When the OS shuts down, `puzuz-helper.service` is stopped before the filesystems and NVIDIA
+1. When the OS shuts down, `gpueue-helper.service` is stopped before the filesystems and NVIDIA
    services. It checkpoints the running jobs one at a time. `--no-checkpoint` jobs are simply
    terminated.
 2. After boot, those jobs are listed as `Checkpointed`. Jobs that were queued stay queued and start
    as usual.
-3. Each owner (or an administrator) resumes their jobs with `puzuz restore <id>` or
-   `puzuz restore -a`. Restores are not started automatically.
+3. Each owner (or an administrator) resumes their jobs with `gpueue restore <id>` or
+   `gpueue restore -a`. Restores are not started automatically.
 
 A checkpoint can go wrong in two ways:
 
 - **Refused:** the helper's checks fail before the job is touched (not enough free space, a mount
-  that could never be restored, ...). The job keeps running. `puzuz checkpoint` fails with the
-  reason. If the refusal only comes when the dump is due (for example during `puzuz shutdown`),
-  the owner is warned on their next `puzuz` command. The reason is the job's last error in
-  `puzuz status` and `puzuz log`.
+  that could never be restored, ...). The job keeps running. `gpueue checkpoint` fails with the
+  reason. If the refusal only comes when the dump is due (for example during `gpueue shutdown`),
+  the owner is warned on their next `gpueue` command. The reason is the job's last error in
+  `gpueue status` and `gpueue log`.
 - **Failed:** the dump itself fails. CRIU puts the job back, but it has been frozen, so it is
   stopped (SIGTERM, which gives it a chance to save its own checkpoint, then SIGKILL after
   `grace_secs`) and shown as `Checkpoint failed` with the reason. The owner is warned on their next
-  `puzuz` command.
+  `gpueue` command.
 
 During an OS shutdown or reboot, systemd stops every job that could not be saved, whether its dump
 was refused or failed. After the boot it is shown as `Checkpoint failed` with the reason, and the
@@ -207,21 +207,21 @@ owner is warned. Nothing is saved on a power loss or a kernel crash.
 ## pueue compatibility and differences
 
 The command names, options and table layout follow pueue 4.0, so most pueue habits and scripts work
-after replacing `pueue` with `puzuz`. puzuz only copies the CLI. It does not speak pueue's protocol
+after replacing `pueue` with `gpueue`. gpueue only copies the CLI. It does not speak pueue's protocol
 and does not read pueue's files. These are the differences:
 
-| Topic | pueue | puzuz |
+| Topic | pueue | gpueue |
 | --- | --- | --- |
-| Daemon | one per user, started by the user (`pueued`) | one for the whole system, run by systemd (`puzuz daemon`, user `puzuz`). Users never start a daemon. |
-| Selecting a daemon | `-c/--config`, `-p/--profile` | `--socket <path>` (env `PUZUZ_SOCKET`, default `/run/puzuz/puzuz.sock`) |
+| Daemon | one per user, started by the user (`pueued`) | one for the whole system, run by systemd (`gpueue daemon`, user `gpueue`). Users never start a daemon. |
+| Selecting a daemon | `-c/--config`, `-p/--profile` | `--socket <path>` (env `GPUEUE_SOCKET`, default `/run/gpueue/gpueue.sock`) |
 | `send` | sends input to a task's stdin | not supported: jobs' stdin is `/dev/null`. Make the command non-interactive. |
 | `shutdown` | kills all tasks and stops the daemon | administrators only. Checkpoints all running jobs, then stops the daemon. A job whose checkpoint is refused keeps running. `--no-checkpoint` kills them instead. |
 | `restart` | finished tasks | also works on `Checkpointed` jobs: they start over as a new job, and the image is kept |
-| `start <id>`, `add -i`, `restart -i` (and `restore -i`) | start the task right away, ignoring every limit | only administrators' start right away, ignoring every limit; anybody else's job is queued first among their own jobs (like `puzuz top`) and waits for its turn like any queued job (see [Job priority](#job-priority)) |
+| `start <id>`, `add -i`, `restart -i` (and `restore -i`) | start the task right away, ignoring every limit | only administrators' start right away, ignoring every limit; anybody else's job is queued first among their own jobs (like `gpueue top`) and waits for its turn like any queued job (see [Job priority](#job-priority)) |
 | `reset`, `-a/--all`, `-g/--group` | all tasks | your own jobs. Administrators act on everyone's. |
 | `pause/start/kill -a`, `-g` | also pause/resume the groups | only administrators pause/resume groups; for others, groups are left as they are |
 | Wording | "task" | "job". Option names such as `--print-task-id` are kept for compatibility. |
-| `--json` | pueue's internal state | puzuz's own schema, described below |
+| `--json` | pueue's internal state | gpueue's own schema, described below |
 | `edit`, `env`, `restart --edit` | supported | accepted but not implemented yet |
 | `add -o/--priority`, `switch` | order all tasks of the daemon | order only your own jobs; which user's job starts first is decided by a Slurm-style multifactor priority with fair share (see [Job priority](#job-priority)). `priority_type = "basic"` restores pueue's order. |
 | Callbacks, aliases, `pueue.yml` | supported | not available |
@@ -242,7 +242,7 @@ Extra commands and options:
 | `site <IDS>... <N>`, `group priority <GROUP> <N>` | a job's site factor, a group's priority (administrators) |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | manage the systemd services; install exits non-zero if the final check fails (see [docs/install.md](docs/install.md)) |
 | `uninstall [--purge] [--yes]` | remove the services and the binaries `service install` copied (root) |
-| `update [--check] [--version V] [-y]` | update puzuz from the latest (or the given) release; needs root, without root it only checks (see [docs/install.md](docs/install.md#upgrading)) |
+| `update [--check] [--version V] [-y]` | update gpueue from the latest (or the given) release; needs root, without root it only checks (see [docs/install.md](docs/install.md#upgrading)) |
 | `doctor` | check the installation |
 | `daemon` | run the daemon in the foreground (systemd does this) |
 
@@ -252,7 +252,7 @@ columns, and `Checkpointed` jobs show the image size.
 
 ### JSON output
 
-`puzuz status --json` prints `{"groups": [...], "jobs": [...]}`:
+`gpueue status --json` prints `{"groups": [...], "jobs": [...]}`:
 
 ```json
 {
@@ -281,16 +281,16 @@ columns, and `Checkpointed` jobs show the image size.
 - `waiting` is present on a queued job that was launched right away by a non-administrator but
   waits for a GPU slot or its paused group: `{"reason": "gpu_slots", "gpus": [0]}`,
   `{"reason": "group_paused"}` or `{"reason": "unavailable"}`.
-- `puzuz log --json` prints `{"<id>": {"job": <job>, "output": "..."}}`. `puzuz group --json`
-  prints `{"groups": [...]}`. `puzuz gpu --json` prints
+- `gpueue log --json` prints `{"<id>": {"job": <job>, "output": "..."}}`. `gpueue group --json`
+  prints `{"groups": [...]}`. `gpueue gpu --json` prints
   `{"gpus": [{"index", "uuid", "name", "memory_total_bytes", "driver_version", "parallel",
   "used", "jobs": [{"id", "owner"}]}]}`, where `"available": false` marks a GPU that has
   disappeared.
-- `puzuz prio --json` prints `{"priority_type", "weights": {"age", "fairshare", "job_size",
+- `gpueue prio --json` prints `{"priority_type", "weights": {"age", "fairshare", "job_size",
   "partition", "tres"}, "jobs": [{"id", "owner", "group", "priority", "factors": {"age",
   "fairshare", "job_size", "partition", "tres_cpu", "tres_gpu"}, "weighted": {"age", "fairshare",
   "job_size", "partition", "tres"}, "site", "nice"}]}`, the jobs in scheduling order.
-  `puzuz share --json` prints `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
+  `gpueue share --json` prints `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
   "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
   "usage_reset_period", "billing_weights", "usage_calc_at"}`.
 
@@ -300,13 +300,13 @@ columns, and `Checkpointed` jobs show the image size.
   client cannot claim to be someone else.
 - Each job belongs to the user who added it. It runs with that user's uid, gid and supplementary
   groups, with `no_new_privs` set and all capabilities dropped. The command runs in the directory
-  it was added from, with the environment of the `puzuz add` invocation.
+  it was added from, with the environment of the `gpueue add` invocation.
 - The root helper refuses jobs of system accounts (uid below `job_min_uid`, by default `UID_MIN`
   of `/etc/login.defs`), of users missing from `job_allowed_users` when it is set, and of users
   whose primary group is root-equivalent (`job_denied_groups`: `docker`, `lxd`, `incus-admin`,
   `libvirt`, `libvirtd`, `disk`, `sudo`, `wheel`, `admin` by default). Those groups are left out of every
   job's supplementary groups, so a job cannot use Docker or sudo even if its owner can (the
-  helper's journal records what it left out). A refused job fails to spawn with `puzuz refuses to run jobs as <user>: <reason>`.
+  helper's journal records what it left out). A refused job fails to spawn with `gpueue refuses to run jobs as <user>: <reason>`.
   See [Who jobs may run as](docs/install.md#who-jobs-may-run-as).
 - A job cannot become root or act as root, even when its owner can: setuid programs (`sudo`,
   `su`, `pkexec`) do not gain privileges under `no_new_privs`, the system D-Bus is inaccessible in
@@ -342,15 +342,15 @@ columns, and `Checkpointed` jobs show the image size.
 - **Only administrators launch jobs immediately** (`start <id>`, `add -i`, `restart -i`,
   `restore -i`), ignoring every limit; everybody else's job is queued first among their own jobs
   (see [Job priority](#job-priority)).
-- Administrators are root and members of the `puzuz-admin` group (primary or supplementary). The
-  check is made on every request, so `usermod -aG puzuz-admin <user>` takes effect immediately.
+- Administrators are root and members of the `gpueue-admin` group (primary or supplementary). The
+  check is made on every request, so `usermod -aG gpueue-admin <user>` takes effect immediately.
 
 ## GPU slots
 
-- `puzuz add --gpu 0,1 ...` starts the job only when its group has a free slot and **every** listed
+- `gpueue add --gpu 0,1 ...` starts the job only when its group has a free slot and **every** listed
   GPU has a free slot. The daemon rejects GPU indices it does not know.
 - Each GPU allows 1 job at a time by default. An administrator changes this with
-  `puzuz gpu parallel 2` (all GPUs) or `puzuz gpu parallel 2 --gpu 1`. `0` means unlimited.
+  `gpueue gpu parallel 2` (all GPUs) or `gpueue gpu parallel 2 --gpu 1`. `0` means unlimited.
   Slots count jobs, not VRAM.
 - GPU indices follow PCI bus order, the same order as `nvidia-smi` and
   `CUDA_DEVICE_ORDER=PCI_BUS_ID`. Inside the job, `CUDA_VISIBLE_DEVICES` lists the requested
@@ -368,7 +368,7 @@ columns, and `Checkpointed` jobs show the image size.
   launches, also with `start <id>`, `add -i`, `restart -i` or `restore -i` (see
   [Job priority](#job-priority)); only administrators' immediate launches ignore them.
 - GPUs are detected with NVML when the daemon starts (the `[[gpus]]` list in the configuration is
-  only a fallback). Restart `puzuz.service` after adding or removing a GPU. `puzuz doctor`
+  only a fallback). Restart `gpueue.service` after adding or removing a GPU. `gpueue doctor`
   compares what the daemon detected with `nvidia-smi`.
 
 ## Job priority
@@ -378,15 +378,15 @@ first. The priority follows Slurm's multifactor plugin: by default it is the sum
 factor (users who used less of the machine recently, with usage decaying with a half-life of 7
 days, go first) and an age factor (time spent waiting), minus the job's nice value. Job size,
 group (partition) and per-GPU (TRES) factors can be weighted in as well. Your own `-o`
-priority, `switch` and `puzuz top` reorder only your own jobs. So do pueue's immediate launches
+priority, `switch` and `gpueue top` reorder only your own jobs. So do pueue's immediate launches
 (`start <id>` of a queued or stashed job, `add -i`, `restart -i`, `restore -i`) for anybody but an
-administrator: the job is queued first among your own jobs, exactly like `puzuz top`, and then
+administrator: the job is queued first among your own jobs, exactly like `gpueue top`, and then
 waits for its turn against other users' jobs, within the group's `parallel` limit, GPU slots, a
 paused group and its dependencies; the command says it was queued, not started. With
 `enable_user_top = false` (or `priority_type = "basic"`) it is just queued. `start` of a paused
 job resumes it as before. Administrators' immediate launches start right away, ignoring every
-limit. `puzuz prio` shows why a job is
-where it is, `puzuz share` shows everyone's usage. See
+limit. `gpueue prio` shows why a job is
+where it is, `gpueue share` shows everyone's usage. See
 [Priority and fair share](docs/install.md#priority-and-fair-share) for the formula and the
 settings.
 
@@ -416,8 +416,8 @@ Details are in [docs/install.md](docs/install.md).
   those filesystems must be mounted again at the same path; otherwise the restore is refused and
   the image is kept. Files on a tmpfs such as `/scratch` do not survive a reboot. See
   [Filesystems and mounts](docs/install.md#filesystems-and-mounts).
-- **No crash safety:** checkpoints are taken only on an orderly shutdown, `puzuz shutdown` and
-  `puzuz checkpoint`. Nothing is saved on a power loss, a kernel panic or a hard reset. Periodic
+- **No crash safety:** checkpoints are taken only on an orderly shutdown, `gpueue shutdown` and
+  `gpueue checkpoint`. Nothing is saved on a power loss, a kernel panic or a hard reset. Periodic
   checkpoints are not available yet. Keep saving your own training checkpoints.
 - **Fork guard:** children that a CUDA process forks without `exec` (for example PyTorch
   DataLoader workers with the `fork` start method) inherit NVIDIA device mappings that CRIU cannot
@@ -454,10 +454,10 @@ Details are in [docs/install.md](docs/install.md).
     `/tmp` and `/dev/shm`, and are written one job at a time.
     In tests, a job with 7 GB of VRAM took about 10 to 20 s to dump.
 - **Mounts covering `/`:** a job whose root directory is covered by another mount cannot be
-  checkpointed. puzuz refuses the dump and tells you why. The job keeps running.
+  checkpointed. gpueue refuses the dump and tells you why. The job keeps running.
 - Checkpoint images are never deleted automatically while their job exists. They are removed when
   the job is restored successfully, removed (`remove`, `clean`, `reset`), or when its dump fails.
-  Above `checkpoint_size_limit_bytes`, puzuz warns but does not refuse.
+  Above `checkpoint_size_limit_bytes`, gpueue warns but does not refuse.
 - Not available yet: `edit`, `env`, periodic checkpoints, checkpointing a job while keeping it
   running, freeing a GPU without a full checkpoint ("GPU suspend"), a web UI or TCP API, and slots
   counted by VRAM.
@@ -468,23 +468,23 @@ Pre-release (version 0.1.0). Tested so far:
 
 - Unit and integration tests for every crate (`scripts/test-in-docker.sh`).
 - Full-stack end-to-end tests in a privileged Docker container with systemd 259 as PID 1, CRIU 4.2
-  and the binaries installed with `puzuz service install` (`scripts/e2e-test.sh`). The tests
+  and the binaries installed with `gpueue service install` (`scripts/e2e-test.sh`). The tests
   cover basic queue operations, three-user authorization, groups and GPU limits,
-  checkpoint/restore, daemon and helper restarts, many jobs added at once, `puzuz shutdown`, and a
+  checkpoint/restore, daemon and helper restarts, many jobs added at once, `gpueue shutdown`, and a
   simulated reboot: the container is shut down with systemd and the jobs are restored in a new
   container, also with jobs working on a separate ext4 filesystem, bind mounts, an
   `x-systemd.automount`, overlayfs, a tmpfs and sshfs that come back as new mounts.
 - With a real GPU in Docker (driver 595, CRIU 4.2.1 in manual mode, PyTorch 2.8 on Python 3.12):
   checkpoint/restore of a CUDA counter and of PyTorch training with forked DataLoader workers,
   with results identical to an uninterrupted run, and NVML GPU detection by the daemon inside the
-  packaged, sandboxed `puzuz.service`.
+  packaged, sandboxed `gpueue.service`.
 - A real OS reboot and power-off of a QEMU/KVM virtual machine (`scripts/vm-reboot-test.sh`):
-  Ubuntu 26.04 with systemd 259 and CRIU 4.2, puzuz installed with `puzuz service install` and
-  `/var/lib/puzuz` on an ext4 disk of its own, CPU jobs of two users plus a `--no-checkpoint` job.
+  Ubuntu 26.04 with systemd 259 and CRIU 4.2, gpueue installed with `gpueue service install` and
+  `/var/lib/gpueue` on an ext4 disk of its own, CPU jobs of two users plus a `--no-checkpoint` job.
   The scenarios are `systemctl reboot`, `systemctl poweroff` followed by a fresh boot, and a reboot
-  while `puzuz checkpoint` of a 1 GiB job is still running. After each boot, the previous boot's
+  while `gpueue checkpoint` of a 1 GiB job is still running. After each boot, the previous boot's
   journal must show the stop order (the daemon stops first, the helper dumps the jobs before it
-  stops, the `--no-checkpoint` job's unit stops only after the helper, and `/var/lib/puzuz` is
+  stops, the `--no-checkpoint` job's unit stops only after the helper, and `/var/lib/gpueue` is
   unmounted last) with no timeout or SIGKILL, the `--no-checkpoint` job must have received
   SIGTERM, and the restored jobs must continue counting where they stopped.
 
@@ -509,16 +509,16 @@ Please report what works and what does not on your hardware.
 ## Agent Skill for coding agents
 
 The repository ships an [Agent Skill](https://agentskills.io) in
-[skills/puzuz](skills/puzuz/SKILL.md) that teaches coding agents (Claude Code, Codex, Cursor and
-others) how to use puzuz as a regular user: checking that the daemon is up, adding jobs with the
-right working directory, environment and `--gpu`, following logs, waiting with `puzuz wait`
+[skills/gpueue](skills/gpueue/SKILL.md) that teaches coding agents (Claude Code, Codex, Cursor and
+others) how to use gpueue as a regular user: checking that the daemon is up, adding jobs with the
+right working directory, environment and `--gpu`, following logs, waiting with `gpueue wait`
 instead of polling, pause/kill/restart, checkpoint/restore, `--json` output, common errors, and
 safety rules (only touch your own jobs, never use `sudo` or administrator commands). Install it
 with the [skills](https://github.com/vercel-labs/skills) CLI:
 
 ```sh
-npx skills add kaito4681/puzuz              # this project only; add -g for all projects
-npx skills add kaito4681/puzuz -g -a claude-code -y
+npx skills add kaito4681/gpueue              # this project only; add -g for all projects
+npx skills add kaito4681/gpueue -g -a claude-code -y
 ```
 
 ## Documentation
@@ -541,17 +541,17 @@ scripts/e2e-test.sh               # full stack under systemd in a privileged con
 scripts/vm-reboot-test.sh         # real reboot/poweroff of a QEMU/KVM VM with CPU jobs (needs /dev/kvm)
 scripts/service-install-test.sh   # service install / status / uninstall and doctor
 scripts/helper-systemd-test.sh    # the helper alone under systemd
-scripts/dist-test.sh              # install.sh against a fake GitHub API (PUZUZ_DIST_BASE=debian:12 ...)
+scripts/dist-test.sh              # install.sh against a fake GitHub API (GPUEUE_DIST_BASE=debian:12 ...)
 nix build -L .#checks.x86_64-linux.nixos         # NixOS module in a VM (needs KVM)
 nix build -L .#checks.x86_64-linux.home-manager  # home-manager module evaluation
-nix build -L .#checks.x86_64-linux.helper-tests  # all puzuz-helper tests in a VM (needs KVM)
+nix build -L .#checks.x86_64-linux.helper-tests  # all gpueue-helper tests in a VM (needs KVM)
 ```
 
 `scripts/e2e-test.sh` documents its environment variables at the top, for example
-`PUZUZ_E2E_ONLY`, and `PUZUZ_E2E_GPU=1` for the GPU scenarios. `PUZUZ_HELPER_GPU=1
+`GPUEUE_E2E_ONLY`, and `GPUEUE_E2E_GPU=1` for the GPU scenarios. `GPUEUE_HELPER_GPU=1
 scripts/helper-systemd-test.sh` (with a CUDA base image, see the script) forces GPU checkpoints
 past their deadline and kills `criu` / `cuda-checkpoint` mid-dump, in either
-`PUZUZ_HELPER_CUDA_MODE`. `scripts/measure-checkpoint.sh` measures how long each checkpoint step
+`GPUEUE_HELPER_CUDA_MODE`. `scripts/measure-checkpoint.sh` measures how long each checkpoint step
 takes. None of the scripts run anything privileged on the host.
 
 ## License

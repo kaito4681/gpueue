@@ -9,7 +9,7 @@
 #
 # Usage: scripts/rpm-sign-test.sh RPM
 # Environment:
-#   PUZUZ_DEB_HTTPS=1  fetch Ubuntu packages over HTTPS, with this machine's CA
+#   GPUEUE_DEB_HTTPS=1  fetch Ubuntu packages over HTTPS, with this machine's CA
 #                      certificates, where port 80 is blocked
 set -euo pipefail
 
@@ -29,9 +29,9 @@ cp "$rpm" "$work/test.rpm"
 
 mounts=()
 setup=""
-if [ "${PUZUZ_DEB_HTTPS:-}" = 1 ]; then
+if [ "${GPUEUE_DEB_HTTPS:-}" = 1 ]; then
     ca=/etc/ssl/certs/ca-certificates.crt
-    [ -f "$ca" ] || { echo "PUZUZ_DEB_HTTPS=1 needs $ca" >&2; exit 1; }
+    [ -f "$ca" ] || { echo "GPUEUE_DEB_HTTPS=1 needs $ca" >&2; exit 1; }
     mounts+=(-v "$ca:/usr/local/share/host-ca.crt:ro")
     setup='sed -i "s|http://|https://|g" /etc/apt/sources.list.d/ubuntu.sources
 echo "Acquire::https::CaInfo \"/usr/local/share/host-ca.crt\";" >/etc/apt/apt.conf.d/99host-ca'
@@ -45,7 +45,7 @@ for k in release other; do
     export GNUPGHOME="/tmp/gnupg-$k"
     mkdir -m 700 "$GNUPGHOME"
     gpg --batch --quiet --pinentry-mode loopback --passphrase test-passphrase \
-        --quick-gen-key "puzuz rpm-sign-test $k key" rsa3072 sign never
+        --quick-gen-key "gpueue rpm-sign-test $k key" rsa3072 sign never
     gpg --batch --pinentry-mode loopback --passphrase test-passphrase --armor \
         --export-secret-keys >"/tmp/$k.asc"
     gpg --batch --export >"/tmp/$k.gpg"

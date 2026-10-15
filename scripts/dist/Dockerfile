@@ -3,7 +3,7 @@
 # (ubuntu:26.04, 24.04, 22.04, debian:12): criu is optional (older releases
 # lack 4.2 or any package), since these tests never checkpoint.
 # Where port 80 is blocked but the image has CA certificates (e.g.
-# puzuz-poc/systemd259:0.1), apt is switched to https.
+# gpueue-poc/systemd259:0.1), apt is switched to https.
 ARG BASE=ubuntu:26.04
 FROM ${BASE}
 RUN set -e; \

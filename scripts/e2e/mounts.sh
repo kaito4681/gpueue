@@ -23,14 +23,14 @@
 # reboot); the file is removed afterwards. Idempotent: running it again
 # mounts what is missing.
 #
-# Every other boot first mounts a small loop image on /media/puzuz-e2e-shift
+# Every other boot first mounts a small loop image on /media/gpueue-e2e-shift
 # (pruned from job namespaces), so that /srv/ext4 gets another loop device,
 # and with it another device number, than at the previous boot.
 #
 # Usage: mounts.sh setup
 set -euo pipefail
 
-DISK=/var/lib/puzuz-e2e-disk
+DISK=/var/lib/gpueue-e2e-disk
 
 skip=()
 if [ -f "$DISK/skip-next-boot" ]; then
@@ -71,8 +71,8 @@ else
 fi
 if ! mounted /srv/ext4 && [ $((boots % 2)) -eq 1 ]; then
     image "$DISK/shift.img" 8M
-    mkdir -p /media/puzuz-e2e-shift
-    mounted /media/puzuz-e2e-shift || mount_loop "$DISK/shift.img" /media/puzuz-e2e-shift
+    mkdir -p /media/gpueue-e2e-shift
+    mounted /media/gpueue-e2e-shift || mount_loop "$DISK/shift.img" /media/gpueue-e2e-shift
 fi
 echo $((boots + 1)) >"$DISK/booted"
 

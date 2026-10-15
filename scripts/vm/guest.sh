@@ -1,7 +1,7 @@
 #!/bin/bash
 # Runs as root inside the VM of scripts/vm-reboot-test.sh (driven by
 # scripts/vm/run.sh over ssh). Reuses the helpers of scripts/e2e/scenario.sh
-# (users: alice, bob, carol = puzuz-admin).
+# (users: alice, bob, carol = gpueue-admin).
 #
 # Usage: guest.sh setup
 #        guest.sh prepare <scenario>            start the jobs
@@ -18,20 +18,20 @@ BIG='exec python3 -u /e2e/vm/bigcounter.py 1024'
 
 setup() {
     local dev
-    # /var/lib/puzuz on a disk of its own (QEMU serial "puzuz-state").
-    dev=$(readlink -f /dev/disk/by-id/virtio-puzuz-state) || fail "no state disk"
-    mkfs.ext4 -q -L puzuz-state "$dev" || fail "mkfs"
-    echo 'LABEL=puzuz-state /var/lib/puzuz ext4 defaults 0 2' >>/etc/fstab
-    mkdir -p /var/lib/puzuz
+    # /var/lib/gpueue on a disk of its own (QEMU serial "gpueue-state").
+    dev=$(readlink -f /dev/disk/by-id/virtio-gpueue-state) || fail "no state disk"
+    mkfs.ext4 -q -L gpueue-state "$dev" || fail "mkfs"
+    echo 'LABEL=gpueue-state /var/lib/gpueue ext4 defaults 0 2' >>/etc/fstab
+    mkdir -p /var/lib/gpueue
     systemctl daemon-reload
-    systemctl start var-lib-puzuz.mount || fail "mounting /var/lib/puzuz"
-    chmod 0755 /var/lib/puzuz
-    rmdir /var/lib/puzuz/lost+found
+    systemctl start var-lib-gpueue.mount || fail "mounting /var/lib/gpueue"
+    chmod 0755 /var/lib/gpueue
+    rmdir /var/lib/gpueue/lost+found
     bash /e2e/install.sh || fail "install"
     pz carol group add free -p 0 || fail "group add"
-    findmnt /var/lib/puzuz
+    findmnt /var/lib/gpueue
     systemctl show -p DefaultTimeoutStopUSec
-    systemctl show -p TimeoutStopUSec puzuz-helper.service puzuz.service
+    systemctl show -p TimeoutStopUSec gpueue-helper.service gpueue.service
 }
 
 # load_ids <scenario>: the job ids of a scenario as variables a, b, c (and big).
@@ -107,7 +107,7 @@ def sysd(text):
 
 
 def unit_re(job):
-    return re.compile(r"puzuz-job-%s(-r\d+)?\.service" % job)
+    return re.compile(r"gpueue-job-%s(-r\d+)?\.service" % job)
 
 
 def unit_stopping(job):
@@ -123,14 +123,14 @@ def unit_gone(job):
                       or "Failed with result" in m or "Main process exited" in m))
 
 
-shutdown = first(sysd("Stopping puzuz.service"))
-daemon_stopped = first(sysd("Stopped puzuz.service"))
-helper_stopping = first(sysd("Stopping puzuz-helper.service"))
-helper_sys = first(lambda i, m: i == "puzuz-helper" and "system shutdown; checkpointing" in m)
-manifest = first(lambda i, m: i == "puzuz-helper" and "shutdown manifest written" in m)
-helper_stopped = first(sysd("Stopped puzuz-helper.service"))
-umount_start = first(sysd("Unmounting var-lib-puzuz.mount"))
-umounted = first(sysd("Unmounted var-lib-puzuz.mount"))
+shutdown = first(sysd("Stopping gpueue.service"))
+daemon_stopped = first(sysd("Stopped gpueue.service"))
+helper_stopping = first(sysd("Stopping gpueue-helper.service"))
+helper_sys = first(lambda i, m: i == "gpueue-helper" and "system shutdown; checkpointing" in m)
+manifest = first(lambda i, m: i == "gpueue-helper" and "shutdown manifest written" in m)
+helper_stopped = first(sysd("Stopped gpueue-helper.service"))
+umount_start = first(sysd("Unmounting var-lib-gpueue.mount"))
+umounted = first(sysd("Unmounted var-lib-gpueue.mount"))
 localfs = first(sysd("Stopped target local-fs.target"))
 journald_last = rows[-1][0] if rows else None
 first_stop = first(lambda i, m: i == "systemd" and m.startswith("Stopping "), (shutdown or 0) - 30)
@@ -144,7 +144,7 @@ if not errors:
     if daemon_stopped > helper_sys:
         errors.append("the helper started dumping before the daemon stopped")
     if not manifest <= helper_stopped:
-        errors.append("puzuz-helper.service stopped before its dumps finished")
+        errors.append("gpueue-helper.service stopped before its dumps finished")
     for job in (a, b):
         gone, stopping = unit_gone(job), unit_stopping(job)
         if gone is None or not helper_sys <= gone <= manifest:
@@ -163,31 +163,31 @@ if not errors:
                   f"{'after' if gone >= helper_sys else 'before'} the helper got SIGTERM")
     last_job = max(filter(None, (unit_gone(j) for j in (a, b, c, big) if j)), default=0)
     if umount_start < helper_stopped or umount_start < last_job:
-        errors.append("/var/lib/puzuz was unmounted before the helper or a job unit stopped")
+        errors.append("/var/lib/gpueue was unmounted before the helper or a job unit stopped")
     if umounted is None:
-        errors.append("/var/lib/puzuz was not unmounted cleanly (no 'Unmounted' line)")
+        errors.append("/var/lib/gpueue was not unmounted cleanly (no 'Unmounted' line)")
 for t, ident, msg in rows:
-    if re.search(r"puzuz", msg) and re.search(r"timed out|Killing process|SIGKILL", msg):
+    if re.search(r"gpueue", msg) and re.search(r"timed out|Killing process|SIGKILL", msg):
         errors.append(f"timeout: [{t}] {msg}")
 
 def rel(t):
     return "-" if t is None or shutdown is None else f"{t - shutdown:+.2f}s"
-print("stop order (relative to 'Stopping puzuz.service'):")
+print("stop order (relative to 'Stopping gpueue.service'):")
 for k, v in [("daemon stopped", daemon_stopped), ("helper: system shutdown, dumping", helper_sys),
-             ("helper: manifest written", manifest), ("puzuz-helper.service stopped", helper_stopped),
+             ("helper: manifest written", manifest), ("gpueue-helper.service stopped", helper_stopped),
              ("no-checkpoint job unit stopping", unit_stopping(c)),
              ("no-checkpoint job unit gone", unit_gone(c)),
-             ("unmounting /var/lib/puzuz", umount_start), ("unmounted /var/lib/puzuz", umounted),
+             ("unmounting /var/lib/gpueue", umount_start), ("unmounted /var/lib/gpueue", umounted),
              ("local-fs.target stopped", localfs), ("last journal line", journald_last)]:
     print(f"  {rel(v):>9}  {k}")
 if first_stop is not None and journald_last is not None:
     print(f"journal: first 'Stopping' to last line {journald_last - first_stop:.2f}s; "
           f"helper stop {rel(helper_stopped)} (dumps {manifest - helper_sys:.2f}s)"
           if manifest and helper_sys else "")
-pat = re.compile(r"puzuz|var-lib-puzuz|local-fs|Unmount|journal|shutdown\.target|final|umount")
+pat = re.compile(r"gpueue|var-lib-gpueue|local-fs|Unmount|journal|shutdown\.target|final|umount")
 print("--- journal excerpt (previous boot, from the shutdown on)")
 for t, ident, msg in rows:
-    if shutdown is not None and t >= shutdown - 1 and (pat.search(msg) or ident.startswith("puzuz")):
+    if shutdown is not None and t >= shutdown - 1 and (pat.search(msg) or ident.startswith("gpueue")):
         print(f"[{t:10.3f}] {ident}: {msg}")
 if errors:
     print("ordering problems:\n  " + "\n  ".join(errors), file=sys.stderr)

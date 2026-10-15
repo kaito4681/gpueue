@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Package test: installs, upgrades and removes the puzuz .rpm in a plain
+# Package test: installs, upgrades and removes the gpueue .rpm in a plain
 # (unprivileged, no systemd as PID 1) Docker container of a supported
 # distribution and checks the result (scripts/dist/rpm-check.sh). This covers
 # the package's metadata and scriptlets; the services themselves are tested by
@@ -11,21 +11,21 @@
 #   container and package them twice with scripts/dist/build-package.sh, as
 #   <version>-rc.1 (0.1.0~rc.1 inside the package) and <version>.
 # Environment:
-#   PUZUZ_RPM_BASE   base image (default rockylinux/rockylinux:9; also
+#   GPUEUE_RPM_BASE   base image (default rockylinux/rockylinux:9; also
 #                    tested: fedora:latest)
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-base="${PUZUZ_RPM_BASE:-rockylinux/rockylinux:9}"
+base="${GPUEUE_RPM_BASE:-rockylinux/rockylinux:9}"
 
 if [ "$#" -eq 0 ]; then
-    "$root/scripts/test-in-docker.sh" build --locked -p puzuz -p puzuz-helper
+    "$root/scripts/test-in-docker.sh" build --locked -p gpueue -p gpueue-helper
     # shellcheck source=scripts/dist/lib.sh
     . "$root/scripts/dist/lib.sh"
     version="$(workspace_version "$root")"
     out="$root/target/rpm-test"
     rm -rf "$out"
-    old="$(PUZUZ_PKG_VERSION="$version-rc.1" "$root/scripts/dist/build-package.sh" "$root/target/docker/debug" "$out" rpm)"
+    old="$(GPUEUE_PKG_VERSION="$version-rc.1" "$root/scripts/dist/build-package.sh" "$root/target/docker/debug" "$out" rpm)"
     new="$("$root/scripts/dist/build-package.sh" "$root/target/docker/debug" "$out" rpm)"
 elif [ "$#" -eq 2 ]; then
     old="$1"

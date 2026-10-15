@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run inside a puzuz job by scenario 19 (scripts/e2e/scenario.sh): tries
+# Run inside a gpueue job by scenario 19 (scripts/e2e/scenario.sh): tries
 # every way the test container offers a member of `sudo`, `docker`,
 # `disk` and `libvirt` to become root or act as root, and checks the job's
 # identity.
@@ -63,7 +63,7 @@ os.open(sys.argv[1], os.O_RDONLY)' "$blockdev"
     # systemd's Varlink services (polkit-authorized without D-Bus): every
     # socket the host has under /run/systemd outside journal/, resolve/
     # and userdb/ (listed by the scenario), and two calls that the polkit
-    # rule lets the owner make outside puzuz.
+    # rule lets the owner make outside gpueue.
     local sock n=0
     while read -r sock; do
         [ -n "$sock" ] || continue

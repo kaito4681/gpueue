@@ -1,47 +1,47 @@
-# Configuration of puzuz: read by the daemon (puzuz.service) and by the root
-# helper (puzuz-helper.service). Keys marked [helper] are used by the helper,
-# [both] by both, [cli] by the puzuz command; unmarked keys are the daemon's.
+# Configuration of gpueue: read by the daemon (gpueue.service) and by the root
+# helper (gpueue-helper.service). Keys marked [helper] are used by the helper,
+# [both] by both, [cli] by the gpueue command; unmarked keys are the daemon's.
 #
-# Created by `puzuz service install`, the packages (.deb, .rpm, AUR) or the NixOS module; none
+# Created by `gpueue service install`, the packages (.deb, .rpm, AUR) or the NixOS module; none
 # of them overwrites an existing file.
 # Every key is optional and unknown keys are ignored. A commented line
 # `# key = value` shows the key's default. Lines indented below `# Example:`
 # are examples, not defaults: keys that are unset by default, and the [[gpus]]
 # list. Restart what uses a changed key:
-# `sudo systemctl restart puzuz-helper.service puzuz.service`.
+# `sudo systemctl restart gpueue-helper.service gpueue.service`.
 # (Restarting the helper leaves running jobs alone.)
 #
 # The helper runs as root and refuses to start unless this file and
-# /etc/puzuz are owned by root and not group/world-writable. Flags on the
-# helper's ExecStart= (see `puzuz-helper serve --help`) override this file.
+# /etc/gpueue are owned by root and not group/world-writable. Flags on the
+# helper's ExecStart= (see `gpueue-helper serve --help`) override this file.
 # Groups and GPU slot limits are not configured here; they are stored in the
-# daemon's database and changed with `puzuz group` and `puzuz gpu parallel`.
+# daemon's database and changed with `gpueue group` and `gpueue gpu parallel`.
 #
 # Paths must be absolute; programs are a bare name (looked up in PATH) or an
 # absolute path. Every *_secs key is at most one year (31536000).
 
 # [both] Base directory of the state database (daemon/state.sqlite), the
 # helper's state (helper/), job logs (logs/) and checkpoint images
-# (checkpoints/). Keep the layout created by /etc/tmpfiles.d/puzuz.conf: the
+# (checkpoints/). Keep the layout created by /etc/tmpfiles.d/gpueue.conf: the
 # helper requires the base directory to be owned by root.
-# data_dir = "/var/lib/puzuz"
+# data_dir = "/var/lib/gpueue"
 
 # Override single locations below data_dir. helper_state_dir [helper],
 # logs_dir and checkpoints_dir [both] must be owned by root.
-# state_db = "/var/lib/puzuz/daemon/state.sqlite"
-# helper_state_dir = "/var/lib/puzuz/helper"
-# logs_dir = "/var/lib/puzuz/logs"
-# checkpoints_dir = "/var/lib/puzuz/checkpoints"
+# state_db = "/var/lib/gpueue/daemon/state.sqlite"
+# helper_state_dir = "/var/lib/gpueue/helper"
+# logs_dir = "/var/lib/gpueue/logs"
+# checkpoints_dir = "/var/lib/gpueue/checkpoints"
 
 # The socket clients connect to (callers are identified by SO_PEERCRED).
-# api_socket = "/run/puzuz/puzuz.sock"
+# api_socket = "/run/gpueue/gpueue.sock"
 
 # [both] The root helper's socket.
-# helper_socket = "/run/puzuz/helper.sock"
+# helper_socket = "/run/gpueue/helper.sock"
 
-# [helper] The system user the daemon runs as (User= of puzuz.service); the
+# [helper] The system user the daemon runs as (User= of gpueue.service); the
 # helper accepts connections only from it.
-# daemon_user = "puzuz"
+# daemon_user = "gpueue"
 
 # [both] Seconds between SIGTERM and SIGKILL when stopping a job.
 # grace_secs = 30
@@ -51,8 +51,8 @@
 
 # Warn when all checkpoint images together exceed this many bytes. Images are
 # never deleted automatically: the owner of a job whose checkpoint crosses the
-# limit is told once, administrators (root, puzuz-admin) on their commands
-# while it is exceeded, and `puzuz doctor` reports it. Unset by default (no
+# limit is told once, administrators (root, gpueue-admin) on their commands
+# while it is exceeded, and `gpueue doctor` reports it. Unset by default (no
 # limit).
 # Example:
 #   checkpoint_size_limit_bytes = 500_000_000_000
@@ -115,7 +115,7 @@
 #   criu_dump_timeout_secs = 3600
 #   criu_restore_timeout_secs = 3600
 
-# [helper] Preload the fork guard (<data_dir>/lib/puzuz-forkguard-*.so) into
+# [helper] Preload the fork guard (<data_dir>/lib/gpueue-forkguard-*.so) into
 # jobs. Children that a CUDA process forks without exec, such as PyTorch
 # DataLoader workers with the default "fork" start method, inherit NVIDIA
 # device mappings that CRIU cannot dump; the guard drops them in the child,
@@ -151,18 +151,18 @@
 # directory of any other such socket, e.g. "/nix/var/nix/daemon-socket" when
 # nix-daemon's trusted-users lists a group or user besides root. Entries are
 # absolute directories at least two levels deep; a missing one is created.
-# `puzuz doctor` warns when a default is left out.
+# `gpueue doctor` warns when a default is left out.
 # job_hidden_socket_dirs = ["/run/libvirt", "/run/cups"]
 
 # [helper] If not empty, only these users (by name) may run jobs; others are
 # refused. Empty: every user with uid >= job_min_uid.
 # job_allowed_users = []
 
-# [cli] Where `puzuz update` and `puzuz doctor` look for releases:
+# [cli] Where `gpueue update` and `gpueue doctor` look for releases:
 # "github:<owner>/<repo>" (the GitHub releases of that repository).
-# update_source = "github:kaito4681/puzuz"
+# update_source = "github:kaito4681/gpueue"
 
-# [cli] Whether `puzuz doctor` asks the release source for a newer version.
+# [cli] Whether `gpueue doctor` asks the release source for a newer version.
 # update_check = true
 
 # How GPUs are found at start-up: "auto" uses NVML and falls back to the
@@ -175,19 +175,19 @@
 #   nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
 
 # GPUs used when NVML is unavailable (or with gpu_detection = "static"). Empty
-# by default; `puzuz service install` appends an entry for each GPU that
+# by default; `gpueue service install` appends an entry for each GPU that
 # `nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv` lists.
-# Keep the list in sync with the hardware (`puzuz doctor` compares the two).
+# Keep the list in sync with the hardware (`gpueue doctor` compares the two).
 # Fields of an entry:
 # - index (required, unique): the GPU's index in PCI bus order, as nvidia-smi
-#   numbers it. `puzuz add --gpu` takes it, and jobs see it in
+#   numbers it. `gpueue add --gpu` takes it, and jobs see it in
 #   CUDA_VISIBLE_DEVICES (with CUDA_DEVICE_ORDER=PCI_BUS_ID).
 # - uuid (default ""): the GPU's UUID. The daemon warns at start-up when a GPU
 #   with a different UUID than before is found at an index.
-# - name (default ""): the model, shown by `puzuz gpu` and recorded with each
+# - name (default ""): the model, shown by `gpueue gpu` and recorded with each
 #   checkpoint; restoring requires the same model.
 # - memory_total_bytes (unset by default): the GPU's memory in bytes, shown by
-#   `puzuz gpu`.
+#   `gpueue gpu`.
 # Example:
 #   [[gpus]]
 #   index = 0
@@ -199,7 +199,7 @@
 # follow Slurm's priority/multifactor plugin; each key is the Slurm parameter
 # in snake_case (PriorityWeightAge is priority_weight_age, ...), with
 # durations in seconds. Keys below the [priority] line belong to the table
-# (up to the next table, such as the [[gpus]] entries `puzuz service install`
+# (up to the next table, such as the [[gpus]] entries `gpueue service install`
 # appends), so keep other keys above it. See "Priority and fair share" in
 # docs/install.md.
 #
@@ -212,9 +212,9 @@
 #   + priority_weight_tres      * TRES factors
 #   - nice
 #
-# Every factor is between 0 and 1. pueue's `-o/--priority`, `puzuz top` and
-# `switch` only order a user's own jobs. `puzuz prio` shows each pending job's
-# factors, `puzuz share` the fair-share state.
+# Every factor is between 0 and 1. pueue's `-o/--priority`, `gpueue top` and
+# `switch` only order a user's own jobs. `gpueue prio` shows each pending job's
+# factors, `gpueue share` the fair-share state.
 # [priority]
 
 # "multifactor", or "basic" for pueue's order (higher -o priority first, then
@@ -226,7 +226,7 @@
 # priority_weight_fairshare = 10000
 # priority_weight_job_size = 0
 # Groups play the role of Slurm partitions: a group's factor is its priority
-# (`puzuz group priority <group> <n>`) over the highest group priority.
+# (`gpueue group priority <group> <n>`) over the highest group priority.
 # priority_weight_partition = 0
 # Per resource (CPU, GRES/gpu): weight × the job's share of the machine's
 # total, e.g. "GRES/gpu=1000". Empty: no TRES factor. PriorityWeightTRES.
@@ -257,7 +257,7 @@
 # tres_billing_weights = "CPU=1.0,GRES/gpu=10.0"
 
 # Users may move their own queued jobs to the top of their queue with
-# `puzuz top` (Slurm's SchedulerParameters=enable_user_top); administrators
+# `gpueue top` (Slurm's SchedulerParameters=enable_user_top); administrators
 # always may. It also decides what a user's `start <id>`, `add -i`,
 # `restart -i` and `restore -i` do: with true the job is queued first among
 # the user's jobs, with false it is just queued (only administrators start

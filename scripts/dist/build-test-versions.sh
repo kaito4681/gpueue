@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# Builds puzuz release tarballs of test versions of the current tree: for each
+# Builds gpueue release tarballs of test versions of the current tree: for each
 # SUFFIX, a copy of the tree with the workspace version set to
 # <version>-<SUFFIX> is built in the toolchain container (as
 # scripts/test-in-docker.sh does) and packaged like .github/workflows/release.yml
 # does, into OUT/v<version>-<SUFFIX>/:
-#   puzuz-v<v>-<this machine's target>.tar.gz and .tar.gz.sha256
+#   gpueue-v<v>-<this machine's target>.tar.gz and .tar.gz.sha256
 # Signing is left to the caller. A SUFFIX written as SUFFIX:migration also
 # gets one more (no-op) database migration, i.e. a newer schema version, so
 # that a later downgrade to an older test version must be refused.
-# The binaries are built with the `test-hooks` feature, which makes `puzuz
-# update` honour PUZUZ_RELEASE_API_URL and PUZUZ_UPDATE_PUBKEY_FILE.
+# The binaries are built with the `test-hooks` feature, which makes `gpueue
+# update` honour GPUEUE_RELEASE_API_URL and GPUEUE_UPDATE_PUBKEY_FILE.
 #
 # Usage: scripts/dist/build-test-versions.sh OUT SUFFIX[:migration]...
 #        (e.g. OUT test.1 test.2:migration)
-# PUZUZ_DIST_PROFILE=release builds optimized binaries (default: dev, faster).
+# GPUEUE_DIST_PROFILE=release builds optimized binaries (default: dev, faster).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 out="${1:?usage: $0 OUT SUFFIX...}"
 shift
 [ "$#" -gt 0 ] || { echo "usage: $0 OUT SUFFIX..." >&2; exit 2; }
-image="${PUZUZ_TEST_IMAGE:-puzuz-test:1.98.1}"
-profile="${PUZUZ_DIST_PROFILE:-dev}"
+image="${GPUEUE_TEST_IMAGE:-gpueue-test:1.98.1}"
+profile="${GPUEUE_DIST_PROFILE:-dev}"
 # shellcheck source=scripts/dist/lib.sh
 . "$root/scripts/dist/lib.sh"
 # The release target of this machine (x86_64 or aarch64), as install.sh picks it.
@@ -50,7 +50,7 @@ for arg in "$@"; do
     sed -i "/^\[workspace.package\]/,/^\[/s/^version = \".*\"/version = \"$version\"/" "$src/Cargo.toml"
     if [ "$arg" != "$suffix" ]; then
         [ "${arg#*:}" = migration ] || { echo "unknown option in $arg" >&2; exit 2; }
-        migrations="$src/crates/puzuz-core/src/storage/migrations.rs"
+        migrations="$src/crates/gpueue-core/src/storage/migrations.rs"
         sed -i 's/^\(pub(crate) const MIGRATIONS: &\[&str\] = &\[.*\)\];$/\1, "CREATE TABLE dist_test_marker (x INTEGER) STRICT;"];/' "$migrations"
         grep -q dist_test_marker "$migrations" || { echo "cannot add a migration" >&2; exit 1; }
     fi
@@ -61,19 +61,19 @@ for arg in "$@"; do
         --user "$(id -u):$(id -g)" \
         -e CARGO_HOME=/cargo \
         -e CARGO_TARGET_DIR=/target \
-        -v puzuz-cargo-home:/cargo \
+        -v gpueue-cargo-home:/cargo \
         -v "$root/target/dist-build":/target \
         -v "$src":/work \
         -w /work \
         "$image" \
-        cargo build --profile "$profile" -p puzuz -p puzuz-helper --features puzuz/test-hooks
+        cargo build --profile "$profile" -p gpueue -p gpueue-helper --features gpueue/test-hooks
 
     dir="$( [ "$profile" = dev ] && echo debug || echo "$profile")"
-    name="puzuz-$tag-$target"
+    name="gpueue-$tag-$target"
     stage="$work/$name"
     rm -rf "$stage"
     mkdir -p "$stage"
-    install -m 0755 "$root/target/dist-build/$dir/puzuz" "$root/target/dist-build/$dir/puzuz-helper" "$stage/"
+    install -m 0755 "$root/target/dist-build/$dir/gpueue" "$root/target/dist-build/$dir/gpueue-helper" "$stage/"
     cp -r "$src/README.md" "$src/LICENSE" "$src/docs" "$stage/"
     mkdir -p "$out/$tag"
     tar -C "$work" -czf "$out/$tag/$name.tar.gz" "$name"

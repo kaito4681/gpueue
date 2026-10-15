@@ -1,4 +1,4 @@
-# Evaluation test of programs.puzuz (`nix build .#checks.<system>.home-manager`).
+# Evaluation test of programs.gpueue (`nix build .#checks.<system>.home-manager`).
 #
 # Evaluates the module with lib.evalModules against stand-ins for the few
 # home-manager options it sets (so the flake needs no home-manager input),
@@ -7,7 +7,7 @@
 { self, pkgs }:
 let
   inherit (pkgs) lib;
-  puzuz = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  gpueue = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
 
   homeManagerStubs = {
     options = {
@@ -41,17 +41,17 @@ let
     }).config;
 
   disabled = eval { };
-  systemCli = eval { programs.puzuz.enable = true; };
+  systemCli = eval { programs.gpueue.enable = true; };
   noFish = eval {
-    programs.puzuz = {
+    programs.gpueue = {
       enable = true;
       enableFishIntegration = false;
     };
   };
   withPackage = eval {
-    programs.puzuz = {
+    programs.gpueue = {
       enable = true;
-      package = puzuz;
+      package = gpueue;
     };
   };
 
@@ -63,13 +63,13 @@ let
 in
 assert disabled.home.packages == [ ] && lib.all (h: h == "") (hooks disabled);
 assert systemCli.home.packages == [ ];
-assert lib.hasInfix "puzuz completions bash" systemCli.programs.bash.initExtra;
-assert lib.hasInfix "puzuz completions zsh" systemCli.programs.zsh.initContent;
-assert lib.hasInfix "puzuz completions fish" systemCli.programs.fish.interactiveShellInit;
+assert lib.hasInfix "gpueue completions bash" systemCli.programs.bash.initExtra;
+assert lib.hasInfix "gpueue completions zsh" systemCli.programs.zsh.initContent;
+assert lib.hasInfix "gpueue completions fish" systemCli.programs.fish.interactiveShellInit;
 assert noFish.programs.fish.interactiveShellInit == "" && noFish.programs.bash.initExtra != "";
 # A package brings its own completion files; no hooks then.
-assert withPackage.home.packages == [ puzuz ] && lib.all (h: h == "") (hooks withPackage);
-pkgs.runCommand "puzuz-home-manager-module"
+assert withPackage.home.packages == [ gpueue ] && lib.all (h: h == "") (hooks withPackage);
+pkgs.runCommand "gpueue-home-manager-module"
   {
     nativeBuildInputs = [
       pkgs.bash
@@ -91,24 +91,24 @@ pkgs.runCommand "puzuz-home-manager-module"
     export HOME=$TMPDIR
     fish --no-execute "$fishInitPath"
 
-    # A "system" puzuz whose completion files are installed next to it, and
+    # A "system" gpueue whose completion files are installed next to it, and
     # that fails when asked to generate them: the hooks must use the files.
     sys=$TMPDIR/system
     mkdir -p "$sys/bin"
-    cp -r ${puzuz}/share "$sys/share"
-    printf '#!/bin/sh\nexit 1\n' > "$sys/bin/puzuz"
-    chmod +x "$sys/bin/puzuz"
+    cp -r ${gpueue}/share "$sys/share"
+    printf '#!/bin/sh\nexit 1\n' > "$sys/bin/gpueue"
+    chmod +x "$sys/bin/gpueue"
     # One that has no completion files: the hooks generate them.
     gen=$TMPDIR/generated
     mkdir -p "$gen/bin"
-    printf '#!/bin/sh\nexec ${puzuz}/bin/puzuz "$@"\n' > "$gen/bin/puzuz"
-    chmod +x "$gen/bin/puzuz"
+    printf '#!/bin/sh\nexec ${gpueue}/bin/gpueue "$@"\n' > "$gen/bin/gpueue"
+    chmod +x "$gen/bin/gpueue"
 
     for dir in "$sys" "$gen"; do
-      PATH=$dir/bin:$PATH bash -c "source $bashInitPath; complete -p puzuz"
+      PATH=$dir/bin:$PATH bash -c "source $bashInitPath; complete -p gpueue"
       PATH=$dir/bin:$PATH zsh -f -c \
-        "autoload -Uz compinit && compinit -u -d $TMPDIR/zcompdump; source $zshInitPath; [[ \''${_comps[puzuz]} == _puzuz ]]"
-      PATH=$dir/bin:$PATH fish -c "source $fishInitPath; complete -c puzuz | grep -q ."
+        "autoload -Uz compinit && compinit -u -d $TMPDIR/zcompdump; source $zshInitPath; [[ \''${_comps[gpueue]} == _gpueue ]]"
+      PATH=$dir/bin:$PATH fish -c "source $fishInitPath; complete -c gpueue | grep -q ."
     done
 
     # Without compinit (no compdef), the zsh hook does nothing and says

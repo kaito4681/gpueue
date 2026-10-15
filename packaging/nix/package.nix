@@ -1,5 +1,5 @@
-# puzuz built from this source tree: `bin/puzuz` (CLI and daemon),
-# `bin/puzuz-helper` (the root helper), shell completions and the docs.
+# gpueue built from this source tree: `bin/gpueue` (CLI and daemon),
+# `bin/gpueue-helper` (the root helper), shell completions and the docs.
 {
   lib,
   stdenv,
@@ -12,7 +12,7 @@ let
 
 in
 rustPlatform.buildRustPackage {
-  pname = "puzuz";
+  pname = "gpueue";
   inherit (cargoToml.workspace.package) version;
 
   # Only what the build reads, so that editing the flake, CI files or tests
@@ -40,12 +40,12 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ../../Cargo.lock;
 
-  # The default workspace member is only `puzuz`; the helper is a separate package.
+  # The default workspace member is only `gpueue`; the helper is a separate package.
   cargoBuildFlags = [
     "-p"
-    "puzuz"
+    "gpueue"
     "-p"
-    "puzuz-helper"
+    "gpueue-helper"
   ];
   cargoTestFlags = [ "--workspace" ];
 
@@ -53,7 +53,7 @@ rustPlatform.buildRustPackage {
   # C compiler (`cc`); nothing else is needed at build time.
   nativeBuildInputs = [ installShellFiles ];
 
-  # No tests in the build: many puzuz-helper tests (those in
+  # No tests in the build: many gpueue-helper tests (those in
   # tests/protocol.rs that start a job) cannot pass in the build sandbox,
   # because the helper makes the job's log directory setgid (mode 2770) and
   # the sandbox's seccomp filter fails setuid and setgid chmods with EPERM.
@@ -61,7 +61,7 @@ rustPlatform.buildRustPackage {
   # Instead CI runs the whole suite with this toolchain outside the sandbox
   # (`nix develop -c cargo test --workspace --locked`, on x86_64 and aarch64),
   # and checks.x86_64-linux.helper-tests (packaging/nix/tests/helper-tests.nix) runs
-  # every puzuz-helper test in a NixOS VM.
+  # every gpueue-helper test in a NixOS VM.
   doCheck = false;
 
   # stdenv adds `-rpath $out/lib` to every link, including the helper's fork
@@ -85,21 +85,21 @@ rustPlatform.buildRustPackage {
   '';
 
   postInstall = ''
-    install -Dm644 -t $out/share/doc/puzuz README.md docs/*.md
-    install -Dm644 -t $out/share/licenses/puzuz LICENSE
+    install -Dm644 -t $out/share/doc/gpueue README.md docs/*.md
+    install -Dm644 -t $out/share/licenses/gpueue LICENSE
   ''
   + lib.optionalString (stdenv.buildPlatform.canExecute stdenv.hostPlatform) ''
-    installShellCompletion --cmd puzuz \
-      --bash <($out/bin/puzuz completions bash) \
-      --zsh <($out/bin/puzuz completions zsh) \
-      --fish <($out/bin/puzuz completions fish)
+    installShellCompletion --cmd gpueue \
+      --bash <($out/bin/gpueue completions bash) \
+      --zsh <($out/bin/gpueue completions zsh) \
+      --fish <($out/bin/gpueue completions fish)
   '';
 
   meta = {
     description = "Multi-user GPU job queue with CRIU and cuda-checkpoint checkpoint/restore";
-    homepage = "https://github.com/kaito4681/puzuz";
+    homepage = "https://github.com/kaito4681/gpueue";
     license = lib.licenses.mit;
-    mainProgram = "puzuz";
+    mainProgram = "gpueue";
     platforms = [
       "x86_64-linux"
       "aarch64-linux"

@@ -1,8 +1,8 @@
-# NixOS VM test of services.puzuz (`nix build .#checks.x86_64-linux.nixos`).
+# NixOS VM test of services.gpueue (`nix build .#checks.x86_64-linux.nixos`).
 #
 # Boots a machine with the module, then:
-#   1. the daemon and the helper run, /etc/puzuz/config.toml is a root-owned
-#      copy, and `puzuz doctor` reports no failure (only GPU warnings);
+#   1. the daemon and the helper run, /etc/gpueue/config.toml is a root-owned
+#      copy, and `gpueue doctor` reports no failure (only GPU warnings);
 #   2. a normal user's job runs with the user's PATH and finishes;
 #   3. a job is checkpointed with CRIU and restored, and keeps counting;
 #   4. a checkpoint keeps the helper that ran the job: a job started by a
@@ -16,26 +16,26 @@
 { self, pkgs }:
 let
   inherit (pkgs) lib;
-  puzuz = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  gpueue = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   # The same binaries at another store path: to NixOS this is an upgrade
-  # (every ExecStart= changes) without building puzuz twice.
-  puzuzCopy = pkgs.runCommand "puzuz-copy-${puzuz.version}" { } ''
-    cp -a ${puzuz} "$out"
+  # (every ExecStart= changes) without building gpueue twice.
+  gpueueCopy = pkgs.runCommand "gpueue-copy-${gpueue.version}" { } ''
+    cp -a ${gpueue} "$out"
   '';
   # Another copy that is in the VM's store but in no system closure (a
   # specialisation is part of the booted system, so GC never deletes it):
   # only a GC root of the helper keeps it.
-  puzuzOld = pkgs.runCommand "puzuz-old-${puzuz.version}" { } ''
-    cp -a ${puzuz} "$out"
+  gpueueOld = pkgs.runCommand "gpueue-old-${gpueue.version}" { } ''
+    cp -a ${gpueue} "$out"
   '';
 in
 pkgs.testers.runNixOSTest {
-  name = "puzuz";
+  name = "gpueue";
 
   nodes.machine = {
     imports = [ self.nixosModules.default ];
 
-    services.puzuz = {
+    services.gpueue = {
       enable = true;
       admins = [ "carol" ];
     };
@@ -47,10 +47,10 @@ pkgs.testers.runNixOSTest {
 
     virtualisation.memorySize = 2048;
     virtualisation.cores = 2;
-    virtualisation.additionalPaths = [ puzuzOld ];
+    virtualisation.additionalPaths = [ gpueueOld ];
 
-    specialisation.upgraded.configuration.services.puzuz.package = puzuzCopy;
-    specialisation.disabled.configuration.services.puzuz.enable = lib.mkForce false;
+    specialisation.upgraded.configuration.services.gpueue.package = gpueueCopy;
+    specialisation.disabled.configuration.services.gpueue.enable = lib.mkForce false;
   };
 
   testScript = ''
@@ -60,7 +60,7 @@ pkgs.testers.runNixOSTest {
     COUNTER = "i=0; while :; do echo $i; i=$((i+1)); sleep 0.2; done"
 
     def pz(user, args):
-        cmd = "puzuz --color never " + args
+        cmd = "gpueue --color never " + args
         return machine.succeed(f"su -l {user} -c {shlex.quote(cmd)}").strip()
 
     def add(user, command):
@@ -92,22 +92,22 @@ pkgs.testers.runNixOSTest {
     base = machine.succeed("readlink -f /run/current-system").strip()
 
     with subtest("daemon and helper run"):
-        machine.wait_for_unit("puzuz-helper.service")
-        machine.wait_for_unit("puzuz.service")
-        machine.wait_for_file("/run/puzuz/puzuz.sock")
+        machine.wait_for_unit("gpueue-helper.service")
+        machine.wait_for_unit("gpueue.service")
+        machine.wait_for_file("/run/gpueue/gpueue.sock")
         # The helper only reads a regular file owned by root, not a link
         # into the store.
-        machine.succeed("test ! -L /etc/puzuz/config.toml")
-        machine.succeed("[ $(stat -c %U:%a /etc/puzuz/config.toml) = root:644 ]")
-        machine.succeed("grep -q '^criu_path = \"/nix/store/' /etc/puzuz/config.toml")
+        machine.succeed("test ! -L /etc/gpueue/config.toml")
+        machine.succeed("[ $(stat -c %U:%a /etc/gpueue/config.toml) = root:644 ]")
+        machine.succeed("grep -q '^criu_path = \"/nix/store/' /etc/gpueue/config.toml")
         assert pz("alice", "service install-method") == "nix"
 
     with subtest("doctor"):
-        out = machine.succeed("puzuz doctor 2>&1 || true")
+        out = machine.succeed("gpueue doctor 2>&1 || true")
         print(out)
         # The VM has no GPU, so the NVIDIA driver and cuda-checkpoint checks
         # warn; nothing may fail.
-        assert "\n0 failed," in out, "puzuz doctor reports failures"
+        assert "\n0 failed," in out, "gpueue doctor reports failures"
 
     with subtest("a user's job runs with the user's PATH"):
         job = add("alice", 'echo "PATH=$PATH"; hello')
@@ -132,25 +132,25 @@ pkgs.testers.runNixOSTest {
         wait_state(job, "done")
 
     with subtest("a checkpoint keeps the helper that ran the job across GC"):
-        dropin = "/run/systemd/system/puzuz-helper.service.d"
+        dropin = "/run/systemd/system/gpueue-helper.service.d"
 
         def restart_helper():
             machine.succeed("systemctl daemon-reload")
-            machine.succeed("systemctl restart puzuz-helper.service")
-            machine.wait_for_unit("puzuz-helper.service")
-            retry(lambda _: "helper: connected" in machine.succeed("puzuz doctor 2>&1 || true"), 60)
+            machine.succeed("systemctl restart gpueue-helper.service")
+            machine.wait_for_unit("gpueue-helper.service")
+            retry(lambda _: "helper: connected" in machine.succeed("gpueue doctor 2>&1 || true"), 60)
 
         machine.succeed(f"mkdir -p {dropin}")
         machine.succeed(
-            f"printf '[Service]\\nExecStart=\\nExecStart=${puzuzOld}/bin/puzuz-helper serve\\n'"
+            f"printf '[Service]\\nExecStart=\\nExecStart=${gpueueOld}/bin/gpueue-helper serve\\n'"
             f" > {dropin}/old.conf"
         )
         restart_helper()
         job = add("alice", COUNTER)
         wait_state(job, "running")
         wait_counting(job, 5)
-        root = f"/nix/var/nix/gcroots/puzuz/job-{job}"
-        assert machine.succeed(f"readlink {root}").strip() == "${puzuzOld}"
+        root = f"/nix/var/nix/gcroots/gpueue/job-{job}"
+        assert machine.succeed(f"readlink {root}").strip() == "${gpueueOld}"
         pz("alice", f"checkpoint {job}")
         wait_state(job, "checkpointed", 120)
         before = last_count(job)
@@ -158,7 +158,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"rm -r {dropin}")
         restart_helper()
         machine.succeed("nix-collect-garbage -d")
-        machine.succeed("test -x ${puzuzOld}/bin/puzuz-helper")
+        machine.succeed("test -x ${gpueueOld}/bin/gpueue-helper")
         pz("alice", f"restore {job}")
         wait_state(job, "running", 120)
         wait_counting(job, before)
@@ -167,20 +167,20 @@ pkgs.testers.runNixOSTest {
         # Gone with the job: now GC may delete the old helper.
         machine.succeed(f"test ! -L {root}")
         machine.succeed("nix-collect-garbage -d")
-        machine.succeed("test ! -e ${puzuzOld}")
+        machine.succeed("test ! -e ${gpueueOld}")
 
     with subtest("switching the package keeps jobs running"):
         job = add("alice", COUNTER)
         wait_state(job, "running")
         wait_counting(job, 5)
         machine.succeed(f"{base}/specialisation/upgraded/bin/switch-to-configuration test")
-        machine.wait_for_unit("puzuz-helper.service")
-        machine.wait_for_unit("puzuz.service")
+        machine.wait_for_unit("gpueue-helper.service")
+        machine.wait_for_unit("gpueue.service")
         machine.succeed(
-            "systemctl show -p ExecStart puzuz-helper.service | grep -q ${puzuzCopy}/bin/puzuz-helper"
+            "systemctl show -p ExecStart gpueue-helper.service | grep -q ${gpueueCopy}/bin/gpueue-helper"
         )
         machine.succeed(
-            "systemctl show -p ExecStart puzuz.service | grep -q ${puzuzCopy}/bin/puzuz"
+            "systemctl show -p ExecStart gpueue.service | grep -q ${gpueueCopy}/bin/gpueue"
         )
         wait_state(job, "running")
         wait_counting(job, last_count(job))
@@ -189,9 +189,9 @@ pkgs.testers.runNixOSTest {
 
     with subtest("enable = false removes the units"):
         machine.succeed(f"{base}/specialisation/disabled/bin/switch-to-configuration test")
-        machine.fail("systemctl cat puzuz.service")
-        machine.fail("systemctl cat puzuz-helper.service")
-        machine.fail("systemctl is-active puzuz-helper.service")
-        machine.succeed("test ! -e /etc/puzuz/config.toml")
+        machine.fail("systemctl cat gpueue.service")
+        machine.fail("systemctl cat gpueue-helper.service")
+        machine.fail("systemctl is-active gpueue-helper.service")
+        machine.succeed("test ! -e /etc/gpueue/config.toml")
   '';
 }

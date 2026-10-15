@@ -1,7 +1,7 @@
 {
-  description = "puzuz: multi-user GPU job queue with checkpoint/restore";
+  description = "gpueue: multi-user GPU job queue with checkpoint/restore";
 
-  # The latest stable branch (Rust 1.95; puzuz needs 1.88 or newer).
+  # The latest stable branch (Rust 1.95; gpueue needs 1.88 or newer).
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
   outputs =
@@ -15,17 +15,17 @@
     in
     {
       packages = forAllSystems (pkgs: rec {
-        puzuz = pkgs.callPackage ./packaging/nix/package.nix { };
-        default = puzuz;
-        # CRIU 4.2.x (nixpkgs has 4.1.1); not a dependency of puzuz.
+        gpueue = pkgs.callPackage ./packaging/nix/package.nix { };
+        default = gpueue;
+        # CRIU 4.2.x (nixpkgs has 4.1.1); not a dependency of gpueue.
         criu = pkgs.callPackage ./packaging/nix/criu.nix { };
-        # The puzuz-helper test executables, for checks.x86_64-linux.helper-tests.
-        helper-tests = pkgs.callPackage ./packaging/nix/helper-tests.nix { inherit puzuz; };
+        # The gpueue-helper test executables, for checks.x86_64-linux.helper-tests.
+        helper-tests = pkgs.callPackage ./packaging/nix/helper-tests.nix { inherit gpueue; };
       });
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.puzuz ];
+          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.gpueue ];
           packages = with pkgs; [
             clippy
             rustfmt
@@ -39,10 +39,10 @@
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt);
 
-      # services.puzuz: the daemon, the root helper and the CLI.
+      # services.gpueue: the daemon, the root helper and the CLI.
       nixosModules.default = import ./packaging/nix/nixos-module.nix { inherit self; };
 
-      # programs.puzuz: the CLI's completions (or the CLI) for one user.
+      # programs.gpueue: the CLI's completions (or the CLI) for one user.
       homeManagerModules.default = import ./packaging/nix/home-manager-module.nix;
 
       checks = forAllSystems (
@@ -51,7 +51,7 @@
           home-manager = import ./packaging/nix/tests/home-manager.nix { inherit self pkgs; };
         }
         # NixOS VM tests (they need KVM): the NixOS module, and every
-        # puzuz-helper test, including those the package build skips.
+        # gpueue-helper test, including those the package build skips.
         // nixpkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
           nixos = import ./packaging/nix/tests/nixos.nix { inherit self pkgs; };
           helper-tests = import ./packaging/nix/tests/helper-tests.nix { inherit self pkgs; };

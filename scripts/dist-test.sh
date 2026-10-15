@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Distribution test: installing, updating and uninstalling puzuz the way an
+# Distribution test: installing, updating and uninstalling gpueue the way an
 # administrator does with scripts/install.sh, against a fake GitHub releases
 # API (scripts/dist/fake_github.py, which like a private repository answers
 # 404 without the token), in a privileged Docker container with systemd as
@@ -9,20 +9,20 @@
 #
 # Usage: scripts/dist-test.sh [--keep]
 # Environment:
-#   PUZUZ_DIST_BASE        base image (default ubuntu:26.04; also tested:
+#   GPUEUE_DIST_BASE        base image (default ubuntu:26.04; also tested:
 #                          ubuntu:24.04, ubuntu:22.04, debian:12); see
 #                          scripts/dist/Dockerfile
-#   PUZUZ_DIST_SKIP_BUILD=1  reuse the release tarballs in target/dist-releases
-#   PUZUZ_DIST_SCENARIOS   scenarios to run (default: all, "17 18")
+#   GPUEUE_DIST_SKIP_BUILD=1  reuse the release tarballs in target/dist-releases
+#   GPUEUE_DIST_SCENARIOS   scenarios to run (default: all, "17 18")
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-base="${PUZUZ_DIST_BASE:-ubuntu:26.04}"
-image="${PUZUZ_DIST_IMAGE:-puzuz-dist:$(tr -c 'a-zA-Z0-9.\n' '-' <<<"$base")}"
-name="puzuz-dist-$$"
+base="${GPUEUE_DIST_BASE:-ubuntu:26.04}"
+image="${GPUEUE_DIST_IMAGE:-gpueue-dist:$(tr -c 'a-zA-Z0-9.\n' '-' <<<"$base")}"
+name="gpueue-dist-$$"
 keep="${1:-}"
 releases="$root/target/dist-releases"
-scenarios="${PUZUZ_DIST_SCENARIOS:-17 18}"
+scenarios="${GPUEUE_DIST_SCENARIOS:-17 18}"
 
 # shellcheck source=scripts/dist/lib.sh
 . "$root/scripts/dist/lib.sh"
@@ -33,7 +33,7 @@ v2="$version-test.2"
 dist_arch
 target="$DIST_TARGET"
 
-if [ "${PUZUZ_DIST_SKIP_BUILD:-}" != 1 ] || [ ! -d "$releases/v$v2" ]; then
+if [ "${GPUEUE_DIST_SKIP_BUILD:-}" != 1 ] || [ ! -d "$releases/v$v2" ]; then
     rm -rf "$releases"
     "$root/scripts/dist/build-test-versions.sh" "$releases" test.1 test.2:migration
 fi
@@ -58,10 +58,10 @@ mkdir -p "$stage/keys" "$stage/releases"
 
 # release TAG SOURCE_TAG KEY: a release TAG holding SOURCE_TAG's binaries,
 # repackaged under TAG's name and signed with KEY, with the trusted comment
-# of .github/workflows/release.yml ("puzuz <tag> <file>").
+# of .github/workflows/release.yml ("gpueue <tag> <file>").
 release() {
     local tag="$1" src="$2" key="$3" work
-    local from="puzuz-$src-$target" to="puzuz-$tag-$target"
+    local from="gpueue-$src-$target" to="gpueue-$tag-$target"
     work="$(mktemp -d)"
     tar -C "$work" -xzf "$releases/$src/$from.tar.gz"
     [ "$from" = "$to" ] || mv "$work/$from" "$work/$to"
@@ -70,26 +70,26 @@ release() {
     rm -rf "$work"
     (cd "$stage/releases/$tag" && sha256sum "$to.tar.gz" >"$to.tar.gz.sha256")
     "$minisign" -S -s "$stage/keys/$key.key" -m "$stage/releases/$tag/$to.tar.gz" \
-        -t "puzuz $tag $to.tar.gz"
+        -t "gpueue $tag $to.tar.gz"
     cp "$root/scripts/install.sh" "$stage/releases/$tag/install.sh"
 }
 release "v$v1" "v$v1" release
 release "v$v2" "v$v2" release
 # A tarball that does not match its checksum.
 release "v$version-test.badsha" "v$v2" release
-echo "corrupted" >>"$stage/releases/v$version-test.badsha/puzuz-v$version-test.badsha-$target.tar.gz"
+echo "corrupted" >>"$stage/releases/v$version-test.badsha/gpueue-v$version-test.badsha-$target.tar.gz"
 # A tarball signed with another key.
 release "v$version-test.badsig" "v$v2" other
 # A checksum file for another file (/dev/null), whose checksum is right.
 release "v$version-test.nullsha" "v$v2" release
 (cd "$stage/releases/v$version-test.nullsha" &&
-    sha256sum /dev/null >"puzuz-v$version-test.nullsha-$target.tar.gz.sha256")
+    sha256sum /dev/null >"gpueue-v$version-test.nullsha-$target.tar.gz.sha256")
 # A tarball (correctly checksummed and signed) holding a symlink right after
 # its top directory, then thousands of files: a check that stops reading the
 # listing at the link (and so kills tar with SIGPIPE) must still refuse it.
 symlink_release() {
     local tag="v$version-test.symlink" work
-    local from="puzuz-v$v2-$target" to="puzuz-$tag-$target"
+    local from="gpueue-v$v2-$target" to="gpueue-$tag-$target"
     work="$(mktemp -d)"
     tar -C "$work" -xzf "$releases/v$v2/$from.tar.gz"
     mv "$work/$from" "$work/$to"
@@ -101,14 +101,14 @@ symlink_release() {
         tar --no-recursion -T - -czf "$stage/releases/$tag/$to.tar.gz")
     rm -rf "$work"
     (cd "$stage/releases/$tag" && sha256sum "$to.tar.gz" >"$to.tar.gz.sha256")
-    "$minisign" -S -s "$stage/keys/release.key" -m "$stage/releases/$tag/$to.tar.gz" -t "puzuz $tag $to.tar.gz"
+    "$minisign" -S -s "$stage/keys/release.key" -m "$stage/releases/$tag/$to.tar.gz" -t "gpueue $tag $to.tar.gz"
 }
 symlink_release
 # v1's tarball and signature, untouched, renamed as a newer release's (with a
 # matching checksum): the signature is valid, but its trusted comment names v1.
 replay_release() {
     local tag="v$version-test.replay"
-    local from="puzuz-v$v1-$target" to="puzuz-$tag-$target"
+    local from="gpueue-v$v1-$target" to="gpueue-$tag-$target"
     mkdir -p "$stage/releases/$tag"
     cp "$stage/releases/v$v1/$from.tar.gz" "$stage/releases/$tag/$to.tar.gz"
     cp "$stage/releases/v$v1/$from.tar.gz.minisig" "$stage/releases/$tag/$to.tar.gz.minisig"
@@ -148,7 +148,7 @@ for scenario in $scenarios; do
     if ! docker exec "$name" bash /dist/scenario.sh "$scenario"; then
         status=1
         echo "--- journal"
-        docker exec "$name" journalctl --no-pager -n 200 -u puzuz.service -u puzuz-helper.service \
+        docker exec "$name" journalctl --no-pager -n 200 -u gpueue.service -u gpueue-helper.service \
             -u fake-github.service || true
         echo "--- fake GitHub requests"
         docker exec "$name" cat /srv/requests.log || true
