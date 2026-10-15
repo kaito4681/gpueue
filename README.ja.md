@@ -492,6 +492,21 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 
 お使いのハードウェアで何が動いて何が動かないか、ぜひ報告してください。
 
+<a id="agent-skill"></a>
+## コーディングエージェント向け Agent Skill
+
+このリポジトリには、コーディングエージェント（Claude Code、Codex、Cursor など）に一般ユーザーとしての
+puzuz の使い方を教える [Agent Skill](https://agentskills.io) が [skills/puzuz](skills/puzuz/SKILL.md)
+に含まれています。内容は、デーモンが動いているかの確認、作業ディレクトリ・環境変数・`--gpu` を正しく
+指定したジョブの追加、ログの追跡、ポーリングの代わりに `puzuz wait` で待つこと、pause/kill/restart、
+checkpoint/restore、`--json` 出力、よくあるエラー、安全のためのルール（自分のジョブだけを操作し、`sudo`
+や管理者コマンドは使わない）です。[skills](https://github.com/vercel-labs/skills) CLI でインストールします。
+
+```sh
+npx skills add kaito4681/puzuz              # このプロジェクトのみ。全プロジェクトなら -g
+npx skills add kaito4681/puzuz -g -a claude-code -y
+```
+
 <a id="documentation"></a>
 ## ドキュメント
 
