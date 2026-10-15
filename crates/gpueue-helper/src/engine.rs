@@ -347,6 +347,11 @@ impl EventBus {
     pub fn ack(&self, up_to: EventSeq) -> io::Result<()> {
         self.lock().ack(up_to)
     }
+
+    /// The event queue's epoch, for the Hello (see [`EventStore::epoch`]).
+    pub fn epoch(&self) -> u64 {
+        self.lock().epoch()
+    }
 }
 
 /// Counts operations that shutdown must wait for.

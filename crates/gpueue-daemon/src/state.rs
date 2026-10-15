@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -290,6 +290,9 @@ struct HelperEvents {
     /// The sequence number of the last event applied, as recorded in the
     /// database (by the notice loop only).
     last: u64,
+    /// The epoch of the helper's event numbering `last` belongs to, as
+    /// recorded in the database (`None`: no helper reported one yet).
+    epoch: Option<u64>,
     /// Between a (re)connect and its [`HelperNotice::Connected`]: the
     /// events are the helper's replay of those not acknowledged.
     replaying: bool,
@@ -360,6 +363,21 @@ pub(crate) const STOP_LAUNCH_WAIT: Duration = Duration::from_secs(10);
 
 /// `log --tail` scans running at once at most (see `api::log`).
 const MAX_TAIL_SCANS: usize = 2;
+
+/// How long the notice loop waits before it tries again to record a helper
+/// event (or to read the database for a reconciliation) after a storage
+/// error; doubled after each failure, up to [`STORAGE_RETRY_MAX`].
+const STORAGE_RETRY_MIN: Duration = Duration::from_millis(200);
+const STORAGE_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/// Identifies a run of a job: when it first started (kept across
+/// checkpoint and restore) and the launch (spawn or restore, see
+/// [`Launches::latest`]) that started the process now running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunId {
+    started_at: Option<Timestamp>,
+    launch: Option<u64>,
+}
 
 /// How long a check that found a job gone from the helper waits for the
 /// helper events received before that answer to be applied (see
@@ -482,8 +500,9 @@ pub struct Core {
     changes: watch::Sender<u64>,
     schedule: Notify,
     shutting_down: AtomicBool,
-    /// Set once the current helper connection has been reconciled.
-    reconciled: AtomicBool,
+    /// The helper connection (see [`crate::helper::HelperState::session`])
+    /// reconciled last; 0 while the current one is not.
+    reconciled: AtomicU64,
     /// Stops every task (daemon exit).
     pub cancel: CancellationToken,
     /// Fired when `gpueue shutdown` has finished.
@@ -523,8 +542,16 @@ pub struct Core {
     launches_stopped: CancellationToken,
     /// Jobs whose spawn or restore request went unanswered (connection
     /// lost or timed out), with the state that launch put them in
-    /// (`Running` or `Restoring`); see [`Core::spawn_lost_check`].
-    unconfirmed_launches: Mutex<HashMap<JobId, JobState>>,
+    /// (`Running` or `Restoring`) and the launch (see
+    /// [`Launches::latest`]); see [`Core::spawn_lost_check`]. Removed once
+    /// the helper lists the job.
+    unconfirmed_launches: Mutex<HashMap<JobId, (JobState, Option<u64>)>>,
+    /// Jobs whose checkpoint request was taken for lost and which were put
+    /// back to running or paused (see [`Core::abandon_lost_checkpoint`]),
+    /// with the `started_at` of their run: should the outcome of that dump
+    /// arrive after all, it is applied as such
+    /// ([`lifecycle::Event::LateCheckpointFailure`]).
+    abandoned_checkpoints: Mutex<HashMap<JobId, Option<Timestamp>>>,
     /// Jobs an administrator launches regardless of every limit (`start`,
     /// `add --immediate`, `restore --immediate`, `restart --immediate`),
     /// kept until they leave the queued, running and restoring states.
@@ -570,7 +597,7 @@ impl Core {
             changes,
             schedule: Notify::new(),
             shutting_down: AtomicBool::new(false),
-            reconciled: AtomicBool::new(false),
+            reconciled: AtomicU64::new(0),
             cancel: CancellationToken::new(),
             shutdown_complete: CancellationToken::new(),
             pending_removal: Mutex::new(BTreeMap::new()),
@@ -584,6 +611,7 @@ impl Core {
             unsent_launches: Mutex::new(HashMap::new()),
             launches_stopped: CancellationToken::new(),
             unconfirmed_launches: Mutex::new(HashMap::new()),
+            abandoned_checkpoints: Mutex::new(HashMap::new()),
             forced: Mutex::new(HashSet::new()),
             launch_check_hook: Mutex::new(None),
             launches_paused_until: Mutex::new(None),
@@ -610,9 +638,14 @@ impl Core {
         }
     }
 
-    /// Whether jobs can be launched and signalled right now.
+    /// Whether jobs can be launched and signalled right now: the helper is
+    /// connected, and this connection has been reconciled (not just an
+    /// earlier one, whose end the notice loop may not have handled yet).
     pub fn helper_ready(&self) -> bool {
-        self.reconciled.load(Ordering::SeqCst) && self.helper.state().connected
+        let state = self.helper.state();
+        state.connected
+            && state.session != 0
+            && self.reconciled.load(Ordering::SeqCst) == state.session
     }
 
     pub fn helper_unavailable() -> Failure {
@@ -1352,7 +1385,7 @@ impl Core {
                 self.unconfirmed_launches
                     .lock()
                     .unwrap()
-                    .insert(job.id, JobState::Running);
+                    .insert(job.id, (JobState::Running, self.launches.latest(job.id)));
                 if matches!(e, HelperError::Timeout) {
                     self.spawn_lost_check(job.id, job.started_at);
                 }
@@ -1425,13 +1458,19 @@ impl Core {
         let core = self.clone();
         let id = job.id;
         let started_at = job.started_at;
+        // Not just `started_at`, which a checkpoint and restore keep: the
+        // SIGKILL is for this process, not for the one of a later restore.
+        let run = RunId {
+            started_at,
+            launch: self.launches.latest(id),
+        };
         let grace = Duration::from_secs(self.config.grace_secs);
         tokio::spawn(async move {
             tokio::select! {
                 _ = core.cancel.cancelled() => return,
                 _ = tokio::time::sleep(grace) => {}
             }
-            if core.still_live(id, started_at).await {
+            if core.still_live_in(id, run).await {
                 tracing::info!(job = %id, "grace period over, sending SIGKILL");
                 if let Err(HelperError::Rejected {
                     code: HelperErrorCode::JobNotFound,
@@ -1451,6 +1490,24 @@ impl Core {
             self.read(move |s| s.get_job(id)).await,
             Ok(Some(job)) if job.state.occupies_slot() && job.started_at == started_at
         )
+    }
+
+    /// Whether the job still holds its slots, and its process is still the
+    /// one of `run` (not restored since).
+    async fn still_live_in(self: &Arc<Self>, id: JobId, run: RunId) -> bool {
+        let core = self.clone();
+        // Under the database lock, under which launches are registered.
+        let current = self
+            .read(move |s| {
+                Ok(s.get_job(id)?
+                    .filter(|job| job.state.occupies_slot())
+                    .map(|job| RunId {
+                        started_at: job.started_at,
+                        launch: core.launches.latest(id),
+                    }))
+            })
+            .await;
+        matches!(current, Ok(Some(current)) if current == run)
     }
 
     /// The helper does not know the job: unless its exit event shows up
@@ -1497,6 +1554,12 @@ impl Core {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
             let unconfirmed = core.unconfirmed_launches.lock().unwrap().remove(&id);
+            // Only for the job's latest launch: an older one was answered
+            // after all (the helper has listed the job since), or the job
+            // has been launched again since.
+            let unconfirmed = unconfirmed
+                .filter(|(_, launch)| *launch == core.launches.latest(id))
+                .map(|(launched, _)| launched);
             if let Some(launched) = unconfirmed {
                 match core.requeue_unstarted(id, Some(started_at), launched).await {
                     Ok(true) => {
@@ -1667,6 +1730,12 @@ impl Core {
             state = job.state.name(),
             "the helper is not checkpointing the job; its checkpoint request was lost"
         );
+        // Or the helper has just resumed the job after a failed dump, and
+        // its outcome is on its way (see `process_helper_event`).
+        self.abandoned_checkpoints
+            .lock()
+            .unwrap()
+            .insert(id, job.started_at);
         let sig = match (&job.state, phase) {
             (JobState::Paused, hp::RunningPhase::Running) => Some(signal::SIGSTOP),
             (JobState::Running, hp::RunningPhase::Stopped) => Some(signal::SIGCONT),
@@ -1806,7 +1875,7 @@ impl Core {
                 self.unconfirmed_launches
                     .lock()
                     .unwrap()
-                    .insert(job.id, JobState::Restoring);
+                    .insert(job.id, (JobState::Restoring, self.launches.latest(job.id)));
                 if matches!(e, HelperError::Timeout) {
                     self.spawn_lost_check(job.id, job.started_at);
                 }
@@ -1871,6 +1940,32 @@ impl Core {
     where
         P: FnOnce(&dyn StoreOps, &Job) -> Result<(), StorageError> + Send + 'static,
     {
+        match self
+            .try_handle_event(id, started_at, move |_| event, pre)
+            .await
+        {
+            Ok(applied) => applied,
+            Err(e) => {
+                tracing::error!(job = %id, "cannot record a job event: {}", e.0.message);
+                false
+            }
+        }
+    }
+
+    /// [`Core::handle_event_in_run`] with the event picked by `choose` for
+    /// the job as it is in the transaction. Fails if the transaction did
+    /// (nothing was changed then; the event may be tried again).
+    async fn try_handle_event<C, P>(
+        self: &Arc<Self>,
+        id: JobId,
+        started_at: Option<Option<Timestamp>>,
+        choose: C,
+        pre: P,
+    ) -> ApiResult<bool>
+    where
+        C: FnOnce(&Job) -> lifecycle::Event + Send + 'static,
+        P: FnOnce(&dyn StoreOps, &Job) -> Result<(), StorageError> + Send + 'static,
+    {
         let core = self.clone();
         let now = now_ms();
         let result = self
@@ -1881,6 +1976,7 @@ impl Core {
                 if started_at.is_some_and(|at| at != job.started_at) {
                     return Ok(None);
                 }
+                let event = choose(&job);
                 let mut transition = match lifecycle::on_event(&job, &event) {
                     Ok(t) => t,
                     Err(e) => {
@@ -1896,25 +1992,23 @@ impl Core {
                 core.apply_in_tx(tx, &mut job, &transition, now, ch)?;
                 Ok(Some((job, transition.effects)))
             })
-            .await;
+            .await?;
         match result {
-            Ok(Some((job, effects))) => {
+            Some((job, effects)) => {
                 let _ = self.run_effects(&job, &effects).await;
                 self.reap_pending(id).await;
-                true
+                Ok(true)
             }
-            Ok(None) => false,
-            Err(e) => {
-                tracing::error!(job = %id, "cannot record a job event: {}", e.0.message);
-                false
-            }
+            None => Ok(false),
         }
     }
 
     /// Applies helper event `seq` (see [`Core::apply_helper_event`]); its
     /// sequence number is recorded in the transaction that applies it.
-    /// Returns whether it was (`false`: the event did not apply).
-    async fn process_helper_event(self: &Arc<Self>, event: hp::Event, seq: u64) -> bool {
+    /// Returns whether it was (`false`: the event did not apply). Fails if
+    /// the database could not record it: nothing was changed, and the
+    /// event is to be tried again.
+    async fn process_helper_event(self: &Arc<Self>, event: hp::Event, seq: u64) -> ApiResult<bool> {
         use lifecycle::{Event as E, ExitStatus as X};
         let mark = move |tx: &dyn StoreOps, _: &Job| tx.set_helper_event_seq(seq);
         // An orphan's process is gone once it exited or was dumped (also
@@ -1941,32 +2035,21 @@ impl Core {
                     hp::ExitStatus::Signaled { signal } => E::Exited(X::Signal(signal)),
                     hp::ExitStatus::Unknown => E::Lost,
                 };
-                self.handle_event(job, event, mark).await
+                self.try_handle_event(job, None, move |_| event, mark).await
             }
             hp::Event::CheckpointFinished { job, outcome } => {
                 let now = now_ms();
                 let succeeded = matches!(outcome, CheckpointOutcome::Success { .. });
-                let (event, status, size, reason) = match outcome {
+                // `late`: how the outcome applies to a job whose checkpoint
+                // request was taken for lost (see `abandoned_checkpoints`).
+                let (event, late, status, size, reason) = match outcome {
                     CheckpointOutcome::Success { image_size_bytes } => (
                         E::CheckpointSucceeded,
+                        None,
                         CheckpointStatus::Complete,
                         Some(image_size_bytes),
                         None,
                     ),
-                    CheckpointOutcome::Failed {
-                        reason,
-                        code: Some(HelperErrorCode::CheckpointRefused),
-                    } => {
-                        let reason = refusal_reason(&reason);
-                        (
-                            E::CheckpointRefused {
-                                reason: reason.clone(),
-                            },
-                            CheckpointStatus::Failed,
-                            None,
-                            Some(reason),
-                        )
-                    }
                     CheckpointOutcome::Failed {
                         reason,
                         code: Some(HelperErrorCode::CheckpointUnfinalized),
@@ -1977,23 +2060,85 @@ impl Core {
                         tracing::warn!(job = %job, "checkpoint not finalized yet: {reason}");
                         (
                             E::CheckpointSucceeded,
+                            None,
                             CheckpointStatus::Complete,
                             None,
                             None,
                         )
                     }
-                    CheckpointOutcome::Failed { reason, .. } => (
+                    // Without a code the dump was attempted and rolled back
+                    // (the job was frozen): it is terminated.
+                    CheckpointOutcome::Failed { reason, code: None } => (
                         E::CheckpointFailed {
                             reason: reason.clone(),
                         },
+                        Some(E::LateCheckpointFailure {
+                            reason: reason.clone(),
+                            attempted: true,
+                        }),
                         CheckpointStatus::Failed,
                         None,
                         Some(reason),
                     ),
+                    // `checkpoint_refused`: the job was not touched. So is
+                    // any other code, which only says why the dump did not
+                    // happen (one this daemon does not know comes from a
+                    // newer helper): killing a healthy job because of a
+                    // code it cannot read would be worse than leaving
+                    // alone a job a dump went wrong with.
+                    CheckpointOutcome::Failed {
+                        reason,
+                        code: Some(code),
+                    } => {
+                        if code != HelperErrorCode::CheckpointRefused {
+                            tracing::warn!(
+                                job = %job,
+                                ?code,
+                                "the helper failed the dump with an unexpected code; \
+                                 taking the job as untouched"
+                            );
+                        }
+                        let reason = refusal_reason(&reason);
+                        (
+                            E::CheckpointRefused {
+                                reason: reason.clone(),
+                            },
+                            Some(E::LateCheckpointFailure {
+                                reason: reason.clone(),
+                                attempted: false,
+                            }),
+                            CheckpointStatus::Failed,
+                            None,
+                            Some(reason),
+                        )
+                    }
+                };
+                let abandoned = self
+                    .abandoned_checkpoints
+                    .lock()
+                    .unwrap()
+                    .get(&job)
+                    .copied();
+                // A late outcome is applied as such, only to the run whose
+                // request was taken for lost and as long as the job is
+                // still back to running or paused (not checkpointing again).
+                let late = late.filter(|_| abandoned.is_some());
+                let choose = move |current: &Job| match late {
+                    Some(late)
+                        if abandoned == Some(current.started_at)
+                            && matches!(current.state, JobState::Running | JobState::Paused) =>
+                    {
+                        tracing::warn!(
+                            job = %job,
+                            "the outcome of the dump taken for lost has arrived; applying it"
+                        );
+                        late
+                    }
+                    _ => event,
                 };
                 let core = self.clone();
                 let recorded = self
-                    .handle_event(job, event, move |tx, current| {
+                    .try_handle_event(job, None, choose, move |tx, current| {
                         mark(tx, current)?;
                         // The record of a dump the daemon asked for exists since
                         // then; one the helper made on its own (OS shutdown)
@@ -2016,11 +2161,13 @@ impl Core {
                             })
                         }
                     })
-                    .await;
+                    .await?;
+                // This was the outcome the entry waited for, or a later one.
+                self.abandoned_checkpoints.lock().unwrap().remove(&job);
                 if succeeded {
                     self.note_new_checkpoint(job).await;
                 }
-                recorded
+                Ok(recorded)
             }
             hp::Event::RestoreFinished { job, outcome } => {
                 let event = match outcome {
@@ -2035,15 +2182,13 @@ impl Core {
                         // interrupted stays as it is.)
                         tracing::info!(job = %job, "restore abandoned by the helper ({reason}); requeueing it");
                         self.pause_launches();
-                        if let Err(e) = self.requeue_unstarted(job, None, JobState::Restoring).await
-                        {
-                            tracing::warn!(job = %job, "cannot requeue the job: {}", e.0.message);
-                        }
-                        return false;
+                        self.requeue_unstarted(job, None, JobState::Restoring)
+                            .await?;
+                        return Ok(false);
                     }
                     RestoreOutcome::Failed { reason, .. } => E::RestoreFailed { reason },
                 };
-                self.handle_event(job, event, mark).await
+                self.try_handle_event(job, None, move |_| event, mark).await
             }
         }
     }
@@ -2068,16 +2213,28 @@ impl Core {
     /// all) only because the list predates the request (or its outcome):
     /// it is left to [`Core::checkpoint_lost_check`] once the request has
     /// settled.
-    pub async fn reconcile(self: &Arc<Self>, running: Vec<RunningJob>) {
+    ///
+    /// `session` is the helper connection the list comes from: jobs are
+    /// launched again once it has been reconciled (see
+    /// [`Core::helper_ready`]). Should the database fail to list the jobs,
+    /// it is asked again until it does.
+    pub async fn reconcile(self: &Arc<Self>, session: u64, running: Vec<RunningJob>) {
         let live: HashMap<JobId, hp::RunningPhase> =
             running.iter().map(|r| (r.job, r.phase)).collect();
-        let jobs = match self.read(|s| s.list_unfinished_jobs()).await {
-            Ok(jobs) => jobs,
-            Err(e) => {
-                tracing::error!("cannot reconcile with the helper: {}", e.0.message);
-                return;
-            }
+        let Some(jobs) = self
+            .retry_storage("list the jobs to reconcile with the helper", || {
+                self.read(|s| s.list_unfinished_jobs())
+            })
+            .await
+        else {
+            return;
         };
+        // The helper knows these jobs: their launches were not lost,
+        // whatever became of their requests.
+        {
+            let mut unconfirmed = self.unconfirmed_launches.lock().unwrap();
+            unconfirmed.retain(|id, _| !live.contains_key(id));
+        }
         let jobs: Vec<Job> = jobs
             .into_iter()
             .filter(|j| j.state.occupies_slot())
@@ -2178,7 +2335,7 @@ impl Core {
             orphans.insert(orphan.job, orphan);
         }
         *self.orphans.lock().unwrap() = orphans;
-        self.reconciled.store(true, Ordering::SeqCst);
+        self.reconciled.store(session, Ordering::SeqCst);
         self.wake_scheduler();
     }
 
@@ -2213,21 +2370,56 @@ impl Core {
     }
 
     /// The sequence number of the last helper event applied (0 if none,
-    /// or if it cannot be read). Read once by [`Core::notice_loop`], the
-    /// only writer, which keeps it up to date in [`HelperEvents::last`].
-    async fn last_helper_event(&self) -> u64 {
-        match self.read(|s| s.helper_event_seq()).await {
+    /// or if it cannot be read) and the epoch it belongs to. Read once by
+    /// [`Core::notice_loop`], the only writer, which keeps them up to date
+    /// in [`HelperEvents`].
+    async fn last_helper_event(&self) -> (u64, Option<u64>) {
+        match self
+            .read(|s| Ok((s.helper_event_seq()?, s.helper_event_epoch()?)))
+            .await
+        {
             Ok(last) => last,
             Err(e) => {
                 tracing::error!("cannot read the last helper event applied: {}", e.0.message);
-                0
+                (0, None)
             }
+        }
+    }
+
+    /// Runs `attempt` until it succeeds, waiting longer after each failure
+    /// (see [`STORAGE_RETRY_MIN`]). `None` if the daemon stops first.
+    async fn retry_storage<T, F, Fut>(&self, what: &str, mut attempt: F) -> Option<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ApiResult<T>>,
+    {
+        let mut delay = STORAGE_RETRY_MIN;
+        loop {
+            match attempt().await {
+                Ok(value) => return Some(value),
+                Err(e) => {
+                    tracing::error!("cannot {what} (trying again in {delay:?}): {}", e.0.message)
+                }
+            }
+            tokio::select! {
+                _ = self.cancel.cancelled() => return None,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(STORAGE_RETRY_MAX);
         }
     }
 
     /// Applies helper event `seq` (`None`: undecodable, only recorded) and
     /// records it as applied, in the transaction that applies it or, if
-    /// the event did not apply (to the job, any more), on its own.
+    /// the event did not apply (to the job, any more), on its own. Returns
+    /// whether it was recorded, and so may be acknowledged.
+    ///
+    /// Should the database fail (busy, full, an I/O error), the transaction
+    /// is rolled back and the event tried again, with a growing delay,
+    /// until it is recorded: acknowledged without, the helper would forget
+    /// it, and a lost exit or dump outcome would leave its job running or
+    /// checkpointing for good. The events after it wait, as they must be
+    /// applied in order.
     ///
     /// The helper keeps its sequence numbers across restarts. Should an
     /// event that is not a replayed duplicate (see
@@ -2239,7 +2431,7 @@ impl Core {
         cursor: &mut HelperEvents,
         seq: u64,
         event: Option<hp::Event>,
-    ) {
+    ) -> bool {
         if seq <= cursor.last {
             tracing::warn!(
                 seq,
@@ -2247,24 +2439,27 @@ impl Core {
                 "the helper's event numbering went back (was its state reset?); following it"
             );
         }
-        let mut recorded = match event {
-            Some(event) => self.process_helper_event(event, seq).await,
-            None => false,
-        };
-        if !recorded {
-            match self
-                .write(move |tx, _| Ok(tx.set_helper_event_seq(seq)?))
-                .await
-            {
-                Ok(()) => recorded = true,
-                Err(e) => {
-                    tracing::error!(seq, "cannot record the helper event: {}", e.0.message)
+        let recorded = self
+            .retry_storage("record a helper event", || {
+                let event = event.clone();
+                async move {
+                    let applied = match event {
+                        Some(event) => self.process_helper_event(event, seq).await?,
+                        None => false,
+                    };
+                    if !applied {
+                        self.write(move |tx, _| Ok(tx.set_helper_event_seq(seq)?))
+                            .await?;
+                    }
+                    Ok(())
                 }
-            }
-        }
+            })
+            .await
+            .is_some();
         if recorded {
             cursor.last = seq;
         }
+        recorded
     }
 
     /// Counts `count` event notices as handled (see
@@ -2292,7 +2487,10 @@ impl Core {
     /// are therefore held back: they were applied already if the replay
     /// goes on past the last one applied, or ends there. A replay that
     /// ends below it comes from a helper whose numbering was reset, whose
-    /// events are new (see [`Core::end_replay`]).
+    /// events are new (see [`Core::end_replay`]). (A helper that reports
+    /// the epoch of its numbering says so before its replay, see
+    /// [`Core::follow_event_epoch`], which tells such a reset apart also
+    /// when its replay goes on past the last event applied.)
     async fn receive_helper_event(
         self: &Arc<Self>,
         cursor: &mut HelperEvents,
@@ -2314,9 +2512,11 @@ impl Core {
                 cursor.held.clear();
             }
         }
-        self.apply_helper_event(cursor, seq.0, event).await;
+        let recorded = self.apply_helper_event(cursor, seq.0, event).await;
         self.events_handled(1);
-        self.ack_helper_events(seq).await;
+        if recorded {
+            self.ack_helper_events(seq).await;
+        }
     }
 
     /// Settles the events a replay held back (see
@@ -2344,16 +2544,57 @@ impl Core {
             "the helper's event numbering was reset (was its state wiped?); applying its replayed events"
         );
         for (seq, event) in std::mem::take(&mut cursor.held) {
-            self.apply_helper_event(cursor, seq.0, event).await;
+            let recorded = self.apply_helper_event(cursor, seq.0, event).await;
             self.events_handled(1);
-            self.ack_helper_events(seq).await;
+            if recorded {
+                self.ack_helper_events(seq).await;
+            }
         }
+    }
+
+    /// A helper connection reported the epoch of its event numbering
+    /// (before its replay). An epoch other than the one recorded means the
+    /// helper's numbering started over: the sequence numbers applied so far
+    /// say nothing about its events, which are all new. Recorded (with the
+    /// sequence number, reset to 0 in that case) before any of them is
+    /// applied.
+    async fn follow_event_epoch(self: &Arc<Self>, cursor: &mut HelperEvents, epoch: u64) {
+        if cursor.epoch == Some(epoch) {
+            return;
+        }
+        let reset = cursor.epoch.is_some();
+        let recorded = self
+            .retry_storage("record the helper's event epoch", || {
+                self.write(move |tx, _| {
+                    tx.set_helper_event_epoch(epoch)?;
+                    if reset {
+                        tx.set_helper_event_seq(0)?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .is_some();
+        if !recorded {
+            return;
+        }
+        if reset {
+            tracing::warn!(
+                last = cursor.last,
+                "the helper's event numbering started over (was its state wiped?); \
+                 applying its events as new"
+            );
+            cursor.last = 0;
+        }
+        cursor.epoch = Some(epoch);
     }
 
     /// Consumes helper notices until the daemon stops.
     pub async fn notice_loop(self: Arc<Self>, mut notices: mpsc::UnboundedReceiver<HelperNotice>) {
+        let (last, epoch) = self.last_helper_event().await;
         let mut cursor = HelperEvents {
-            last: self.last_helper_event().await,
+            last,
+            epoch,
             // Events before the first `Connected` are a replay, too.
             replaying: true,
             held: Vec::new(),
@@ -2365,6 +2606,18 @@ impl Core {
             };
             let Some(notice) = notice else { return };
             match notice {
+                HelperNotice::Session {
+                    session,
+                    event_epoch,
+                } => {
+                    tracing::debug!(session, ?event_epoch, "new helper connection");
+                    cursor.replaying = true;
+                    self.events_handled(cursor.held.len());
+                    cursor.held.clear();
+                    if let Some(epoch) = event_epoch {
+                        self.follow_event_epoch(&mut cursor, epoch).await;
+                    }
+                }
                 HelperNotice::Event(envelope) => {
                     self.receive_helper_event(&mut cursor, envelope.seq, Some(envelope.event))
                         .await;
@@ -2377,17 +2630,21 @@ impl Core {
                     );
                     self.receive_helper_event(&mut cursor, seq, None).await;
                 }
-                HelperNotice::Connected { version, running } => {
+                HelperNotice::Connected {
+                    session,
+                    version,
+                    running,
+                } => {
                     self.end_replay(&mut cursor).await;
                     tracing::info!(%version, live = running.len(), "reconciling with the helper");
-                    self.reconcile(running).await;
+                    self.reconcile(session, running).await;
                 }
                 HelperNotice::Disconnected => {
                     cursor.replaying = true;
                     // Not acknowledged: replayed again after the reconnect.
                     self.events_handled(cursor.held.len());
                     cursor.held.clear();
-                    self.reconciled.store(false, Ordering::SeqCst);
+                    self.reconciled.store(0, Ordering::SeqCst);
                 }
             }
         }
@@ -2419,7 +2676,11 @@ impl Core {
         let launched = self
             .write(move |tx, ch| {
                 // Checked under the database lock (see `Core::stop_launches`).
-                let launch = launch && !core.launches_stopped.is_cancelled();
+                // So is the launch pause: a helper's refusal pauses launches
+                // before its job is put back in line, so a pass that read
+                // the pause before that must not relaunch the job right away.
+                let launch =
+                    launch && !core.launches_stopped.is_cancelled() && !core.launches_paused();
                 // Finished jobs only matter as dependencies. Commands and
                 // environments are not needed to decide (only to launch).
                 let mut jobs = tx.list_unfinished_jobs_brief()?;
@@ -2841,6 +3102,9 @@ impl Core {
 }
 
 #[cfg(test)]
+mod helper_event_tests;
+
+#[cfg(test)]
 mod tests {
     use gpueue_core::model::JobSpec;
 
@@ -2994,7 +3258,7 @@ mod tests {
         let lock = db.lock().unwrap();
         let reconcile = tokio::spawn({
             let core = core.clone();
-            async move { core.reconcile(Vec::new()).await }
+            async move { core.reconcile(1, Vec::new()).await }
         });
         // Reconciliation waits for the database; meanwhile the spawn is
         // answered.

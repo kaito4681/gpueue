@@ -1,10 +1,13 @@
 //! [`HelperClient`]: the real connection to `gpueue-helper`.
 //!
 //! One background task keeps a single connection open and reconnects with
-//! a capped exponential backoff. After each successful Hello it asks the
-//! helper for its live jobs and reports them with
-//! [`HelperNotice::Connected`], after every event the helper sent before
-//! answering (that is, its replay of unacknowledged events).
+//! a capped exponential backoff. After each successful Hello it reports
+//! the new connection with [`HelperNotice::Session`], asks the helper for
+//! its live jobs and reports them with [`HelperNotice::Connected`], after
+//! every event the helper sent before answering (that is, its replay of
+//! unacknowledged events). Should that request fail (no answer in time, an
+//! answer it cannot decode), it is asked again, with a capped backoff,
+//! until the connection ends: until then the daemon launches nothing.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,6 +37,10 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Long operations answer `accepted` right away, so every request should be
 /// answered quickly.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the client waits before it asks again for the live jobs of a
+/// connection after the request failed; doubled after each failure.
+const LIST_RETRY_MIN: Duration = Duration::from_millis(500);
+const LIST_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// Connection to the helper's Unix socket. Cheap to clone.
 #[derive(Clone)]
@@ -51,6 +58,8 @@ struct Inner {
     task: Mutex<Option<CancellationToken>>,
     /// See [`Helper::events_delivered`].
     events_delivered: AtomicU64,
+    /// The number of the latest connection (see [`HelperState::session`]).
+    sessions: AtomicU64,
 }
 
 impl HelperClient {
@@ -65,6 +74,7 @@ impl HelperClient {
                 notices: Mutex::new(None),
                 task: Mutex::new(None),
                 events_delivered: AtomicU64::new(0),
+                sessions: AtomicU64::new(0),
             }),
         }
     }
@@ -237,30 +247,50 @@ async fn session(inner: &Arc<Inner>, stream: UnixStream, cancel: &CancellationTo
             gpueue_protocol::helper::PROTOCOL_VERSION
         );
     }
+    let session_id = inner.sessions.fetch_add(1, Ordering::SeqCst) + 1;
     *inner.writer.lock().await = Some(writer);
     *inner.state.lock().unwrap() = HelperState {
         connected: true,
+        session: session_id,
         version: Some(theirs.binary_version.clone()),
         missing_programs: theirs.missing_programs.clone(),
         programs: theirs.programs.clone(),
     };
     tracing::info!(version = %theirs.binary_version, "connected to the gpueue helper");
+    // Before any event of this connection is read.
+    inner.notify(HelperNotice::Session {
+        session: session_id,
+        event_epoch: theirs.event_epoch,
+    });
 
     // Reconcile once the replayed events have been read (the helper sends
-    // them before answering requests).
+    // them before answering requests). Without its list of live jobs the
+    // daemon cannot launch anything, so a failed request is repeated.
     let reconcile = {
         let inner = inner.clone();
         let version = theirs.binary_version;
         tokio::spawn(async move {
-            match inner.request(Request::ListRunning).await {
-                Ok(ResponseResult::Running { jobs }) => {
-                    inner.notify(HelperNotice::Connected {
-                        version,
-                        running: jobs,
-                    });
+            let mut delay = LIST_RETRY_MIN;
+            loop {
+                match inner.request(Request::ListRunning).await {
+                    Ok(ResponseResult::Running { jobs }) => {
+                        inner.notify(HelperNotice::Connected {
+                            session: session_id,
+                            version,
+                            running: jobs,
+                        });
+                        return;
+                    }
+                    Ok(other) => tracing::warn!(
+                        ?other,
+                        "unexpected answer to list_running; asking again in {delay:?}"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "cannot list the helper's jobs (asking again in {delay:?}): {e}"
+                    ),
                 }
-                Ok(other) => tracing::warn!(?other, "unexpected answer to list_running"),
-                Err(e) => tracing::warn!("cannot list the helper's jobs: {e}"),
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(LIST_RETRY_MAX);
             }
         })
     };
@@ -436,6 +466,12 @@ mod tests {
     /// Accepts one connection, does the Hello, sends the `replay` lines,
     /// then answers requests until the client goes away.
     async fn serve_once(listener: &UnixListener, replay: Vec<Vec<u8>>) {
+        serve_once_with(listener, replay, 0).await
+    }
+
+    /// [`serve_once`], answering the first `bad_lists` `list_running`
+    /// requests with something unexpected.
+    async fn serve_once_with(listener: &UnixListener, replay: Vec<Vec<u8>>, mut bad_lists: usize) {
         let (stream, _) = listener.accept().await.unwrap();
         let (mut reader, mut writer) = stream.into_split();
         let mut buf = LineBuffer::new();
@@ -455,8 +491,12 @@ mod tests {
             Some(DaemonMessage::Hello(_))
         ));
         let send = |m: HelperMessage| encode_line(&m).unwrap();
+        let hello = Hello {
+            event_epoch: Some(77),
+            ..Hello::current()
+        };
         writer
-            .write_all(&send(HelperMessage::Hello(Hello::current())))
+            .write_all(&send(HelperMessage::Hello(hello)))
             .await
             .unwrap();
         for line in replay {
@@ -464,6 +504,10 @@ mod tests {
         }
         while let Some(DaemonMessage::Request(envelope)) = next(&mut reader, &mut buf).await {
             let result = match envelope.request {
+                Request::ListRunning if bad_lists > 0 => {
+                    bad_lists -= 1;
+                    ResponseResult::Ok
+                }
                 Request::ListRunning => ResponseResult::Running {
                     jobs: vec![RunningJob {
                         job: JobId(3),
@@ -515,7 +559,14 @@ mod tests {
             listener
         });
 
-        // The replayed event comes before Connected.
+        // The session comes first, then the replayed event, then Connected.
+        assert_eq!(
+            notices.recv().await.unwrap(),
+            HelperNotice::Session {
+                session: 1,
+                event_epoch: Some(77)
+            }
+        );
         assert!(matches!(
             notices.recv().await.unwrap(),
             HelperNotice::Event(EventEnvelope {
@@ -524,10 +575,16 @@ mod tests {
             })
         ));
         match notices.recv().await.unwrap() {
-            HelperNotice::Connected { running, .. } => assert_eq!(running[0].job, JobId(3)),
+            HelperNotice::Connected {
+                running, session, ..
+            } => {
+                assert_eq!(running[0].job, JobId(3));
+                assert_eq!(session, 1);
+            }
             other => panic!("{other:?}"),
         }
         assert!(client.state().connected);
+        assert_eq!(client.state().session, 1);
 
         let spawn = SpawnRequest {
             job: JobId(9),
@@ -568,8 +625,38 @@ mod tests {
         let server = tokio::spawn(async move { serve_once(&listener, Vec::new()).await });
         assert!(matches!(
             notices.recv().await.unwrap(),
-            HelperNotice::Connected { .. }
+            HelperNotice::Session { session: 2, .. }
         ));
+        assert!(matches!(
+            notices.recv().await.unwrap(),
+            HelperNotice::Connected { session: 2, .. }
+        ));
+        client.close();
+        server.abort();
+    }
+
+    /// A `list_running` that fails is asked again: the daemon gets its
+    /// `Connected` (and so reconciles and launches jobs) all the same.
+    #[tokio::test]
+    async fn a_failed_list_of_live_jobs_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("helper.sock");
+        let client = HelperClient::new(&socket);
+        let mut notices = client.connect();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move { serve_once_with(&listener, Vec::new(), 2).await });
+        assert!(matches!(
+            notices.recv().await.unwrap(),
+            HelperNotice::Session { session: 1, .. }
+        ));
+        let connected = tokio::time::timeout(Duration::from_secs(10), notices.recv())
+            .await
+            .expect("no Connected after the failed list_running")
+            .unwrap();
+        match connected {
+            HelperNotice::Connected { running, .. } => assert_eq!(running[0].job, JobId(3)),
+            other => panic!("{other:?}"),
+        }
         client.close();
         server.abort();
     }
@@ -600,6 +687,10 @@ mod tests {
         replay.push(event_line(good.clone()));
         let server = tokio::spawn(async move { serve_once(&listener, replay).await });
 
+        assert!(matches!(
+            notices.recv().await.unwrap(),
+            HelperNotice::Session { .. }
+        ));
         match notices.recv().await.unwrap() {
             HelperNotice::UndecodableEvent { seq, error } => {
                 assert_eq!(seq, EventSeq(6));

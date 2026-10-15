@@ -237,6 +237,13 @@ impl Daemon {
     /// request failed, before it finds out whether the launch is retried,
     /// so tests can let the retry run (or finish) first.
     #[doc(hidden)]
+    /// Whether the daemon can launch jobs: the helper is connected and the
+    /// connection reconciled (see `Core::helper_ready`). For tests.
+    #[doc(hidden)]
+    pub fn helper_ready(&self) -> bool {
+        self.core.helper_ready()
+    }
+
     pub fn set_launch_check_hook(&self, hook: Option<LaunchCheckHook>) {
         self.core.set_launch_check_hook(hook);
     }

@@ -113,6 +113,13 @@ pub struct Hello {
     /// restarted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_programs: Vec<String>,
+    /// Helper only: identifies the helper's event numbering. It stays the
+    /// same while the helper keeps its event queue (also across restarts)
+    /// and changes when the queue starts over (its state was wiped), so
+    /// the daemon knows that sequence numbers it has applied already may
+    /// come again for new events. Absent from helpers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_epoch: Option<u64>,
     /// Helper only: where it found the programs it uses, when it started
     /// (it never looks them up again), so that `gpueue doctor` can tell
     /// when one was removed or replaced since. Older helpers send none.
@@ -136,6 +143,7 @@ impl Hello {
             protocol_version: PROTOCOL_VERSION,
             binary_version: crate::BINARY_VERSION.to_owned(),
             missing_programs: Vec::new(),
+            event_epoch: None,
             programs: Vec::new(),
         }
     }

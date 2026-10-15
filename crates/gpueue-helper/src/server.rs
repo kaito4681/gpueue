@@ -276,6 +276,7 @@ async fn handle_connection<L: Launcher, H: HostProbe>(
     };
     let ours = Hello {
         missing_programs: helper.config().missing_programs(),
+        event_epoch: Some(helper.events().epoch()),
         programs: helper.config().resolved_programs(),
         ..Hello::current()
     };
