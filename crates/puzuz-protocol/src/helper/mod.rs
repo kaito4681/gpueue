@@ -316,7 +316,8 @@ pub enum HelperErrorCode {
     JobNotFound,
     /// The job is already running (spawn/restore) or busy (checkpoint).
     Busy,
-    /// The helper is shutting down and accepts no new spawns or restores.
+    /// The helper is shutting down and accepts no new spawns, restores or
+    /// checkpoints.
     ShuttingDown,
     SpawnFailed,
     /// The helper declined to dump the job before touching it (its mounts

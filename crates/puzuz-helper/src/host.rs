@@ -10,7 +10,7 @@ use puzuz_checkpoint::command::{CudaCheckpointOptions, cuda_get_restore_tid, cud
 use puzuz_checkpoint::exec::run_with_timeout;
 use puzuz_checkpoint::{CommandSpec, probe, procfs, space};
 
-use crate::access::{VerifyReply, VerifyRequest};
+use crate::access::{FileAttrs, VerifyReply, VerifyRequest};
 use crate::deadmounts::{DeadMounts, DetachedMount};
 use crate::mounts::{MountTree, SourceMount};
 
@@ -157,6 +157,15 @@ pub trait HostProbe: Send + Sync + 'static {
             .filter(|p| crate::deadmounts::mount_point_missing(Path::new(p)))
             .cloned()
             .collect())
+    }
+    /// For each of `files` (held by a job at its dump), the attributes of
+    /// the file its path leads to now if it is the very file (see
+    /// [`crate::access::held_file_attrs`]). Opens the files, which may
+    /// block on a filesystem that does not answer, so the real host asks a
+    /// child process with a deadline (a file it could not look up in time
+    /// has no attributes).
+    fn held_file_attrs(&self, files: &[HeldFile]) -> io::Result<Vec<Option<FileAttrs>>> {
+        Ok(files.iter().map(crate::access::held_file_attrs).collect())
     }
     /// Runs `restore`, the CUDA restore of the processes `cuda_pids` of a
     /// stopped job (namespace init `init_pid`), with only their CUDA restore
@@ -305,6 +314,9 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     fn missing_mount_points(&self, paths: &[String]) -> io::Result<Vec<String>> {
         (**self).missing_mount_points(paths)
     }
+    fn held_file_attrs(&self, files: &[HeldFile]) -> io::Result<Vec<Option<FileAttrs>>> {
+        (**self).held_file_attrs(files)
+    }
 }
 
 /// The real host.
@@ -357,18 +369,22 @@ impl SystemHost {
     /// [`crate::deadmounts::probe_paths`] in a `verify-access` child, with
     /// a deadline: one entry per path, `None` if its filesystem answered.
     fn probe(&self, paths: &[String]) -> io::Result<Vec<Option<String>>> {
-        use crate::deadmounts::PROBE_TIMEOUT;
+        self.probe_within(paths, crate::deadmounts::PROBE_TIMEOUT)
+    }
+
+    /// [`Self::probe`], waiting up to `timeout` for the paths.
+    fn probe_within(&self, paths: &[String], timeout: Duration) -> io::Result<Vec<Option<String>>> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
         let req = VerifyRequest::Probe(crate::access::ProbeCheck {
             paths: paths.to_vec(),
-            timeout_ms: u64::try_from(PROBE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         });
         let reply = crate::access::run_verify_child(
             &self.helper_exe,
             &req,
-            PROBE_TIMEOUT + Duration::from_secs(10),
+            timeout + Duration::from_secs(10),
         )
         .map_err(io::Error::other)?;
         if reply.len() != paths.len() {
@@ -760,21 +776,20 @@ impl HostProbe for SystemHost {
         let mut tree = read()?;
         // An automount point recorded with its filesystem mounted: a
         // lookup makes the automounter mount it (in the helper's namespace,
-        // which is the host's). In a thread, so that an NFS server that
-        // does not answer only delays the check.
-        let mut triggered = false;
-        for s in sources {
-            if source_problem(s, &tree).is_some() && ends_on_automount(&s.path, &tree) {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let path = format!("{}/.", s.path);
-                std::thread::spawn(move || {
-                    let _ = tx.send(fs::metadata(path));
-                });
-                let _ = rx.recv_timeout(std::time::Duration::from_secs(20));
-                triggered = true;
+        // which is the host's). In a `verify-access` child with a deadline
+        // (killed when it passes), so that an NFS server that does not
+        // answer only delays the check and leaves nothing stuck behind in
+        // the helper.
+        let triggers: Vec<String> = sources
+            .iter()
+            .filter(|s| source_problem(s, &tree).is_some() && ends_on_automount(&s.path, &tree))
+            .map(|s| format!("{}/.", s.path))
+            .collect();
+        if !triggers.is_empty() {
+            // Only the mounts it leaves behind count (read again below).
+            if let Err(e) = self.probe_within(&triggers, AUTOMOUNT_TIMEOUT) {
+                eprintln!("puzuz-helper: triggering automount points {triggers:?}: {e}");
             }
-        }
-        if triggered {
             tree = read()?;
         }
         Ok(sources
@@ -948,7 +963,38 @@ impl HostProbe for SystemHost {
         }))
         .map_err(io::Error::other)
     }
+
+    fn held_file_attrs(&self, files: &[HeldFile]) -> io::Result<Vec<Option<FileAttrs>>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let req = VerifyRequest::HeldAttrs(crate::access::HeldAttrsCheck {
+            files: files.to_vec(),
+            timeout_ms: u64::try_from(HELD_ATTRS_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+        });
+        let attrs: Vec<Option<FileAttrs>> = crate::access::run_child(
+            &self.helper_exe,
+            &req,
+            HELD_ATTRS_TIMEOUT + Duration::from_secs(10),
+        )
+        .map_err(io::Error::other)?;
+        if attrs.len() != files.len() {
+            return Err(io::Error::other(format!(
+                "the lookup of held files answered {} of {} files",
+                attrs.len(),
+                files.len()
+            )));
+        }
+        Ok(attrs)
+    }
 }
+
+/// How long [`SystemHost::source_problems`] waits for automount points to
+/// be mounted.
+const AUTOMOUNT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long [`SystemHost::held_file_attrs`] waits for the files' lookups.
+const HELD_ATTRS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The local address of socket `fd` of process `pid` if it is an internet
 /// socket with `SO_REUSEPORT` (looked at through a duplicate taken with

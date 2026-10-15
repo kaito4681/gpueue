@@ -108,7 +108,7 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    （`/var/lib/puzuz/checkpoints/detached-mount`）绑定；其挂载点必须存在。它启动一个新单元 `puzuz-job-<id>-r<n>.service`，在 `/` 的 bind 挂载
    （`/run/puzuz-helper/criu-root`）上运行 `criu restore --root`，并使用恢复所用 GPU 的设备访问权限。在手动模式下，它随后对 CUDA 进程运行 cuda-checkpoint 的
    `restore` 和 `unlock`。在插件模式下，CRIU 的插件会在 `criu restore` 返回之前完成这些操作。
-   每个镜像都以其转储时的模式恢复，而不管 `cuda_checkpoint_mode` 现在的设置。作业保留其 id 和日志，镜像随后被删除。
+   每个镜像都以其转储时的模式恢复，而不管 `cuda_checkpoint_mode` 现在的设置。作业保留其 id 和日志，镜像随后被删除（如果删除失败，则在作业退出、再次被检查点或 helper 下次启动时删除；残留的恢复源镜像不会导致该作业的下一次转储被拒绝）。
    转储时处于暂停状态的作业会以**停止状态**恢复，与 `puzuz pause` 之后的状态相同：恢复 hook（参见
    [恢复与路径](#restores-and-paths)）在 CRIU 的插件恢复了 CUDA 状态之后、CRIU 仍控制着这些进程时向它们发送
    SIGSTOP，因此它们在执行任何一条指令之前就进入停止状态（CRIU 自带的 `--leave-stopped` 会在插件运行之前就停止
@@ -153,7 +153,9 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   判断是否为同一文件的依据是：它具有转储时记录的设备号和 inode，或者（重新挂载后，设备号会变化，
   sshfs 等 FUSE 文件系统会重新编号其 inode）具有转储后立即记录的所有者、组、模式、大小、修改时间和变更时间；
   变更时间无法由用户设置，而在该位置重命名或链接另一个文件会改变它（参见
-  [文件系统与挂载](install.md#filesystems-and-mounts)）。如果 hook 发现问题，它会在任务
+  [文件系统与挂载](install.md#filesystems-and-mounts)）。helper 在带期限的子进程中查询这些属性，
+  因此无响应的文件系统不会让 helper 卡住（未能在期限内查询到的文件不记录属性，只按设备号和 inode
+  判断）。如果 hook 发现问题，它会在任务
   仍处于停止状态时将其终止（CRIU 本身会忽略失败的 `pre-resume` 脚本），因此这些任务永远不会运行；
   恢复会失败并给出原因，镜像会被保留。如果检查通过且该作业在转储时处于暂停状态，hook 会停止这些任务（SIGSTOP），
   而不是让它们运行。如果 hook 根本没有运行，helper 会在 `criu restore` 返回后立即终止恢复的作业。

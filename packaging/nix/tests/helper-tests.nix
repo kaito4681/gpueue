@@ -35,7 +35,10 @@ pkgs.testers.runNixOSTest {
     totals = {"passed": 0, "failed": 0, "ignored": 0}
     for name in binaries:
         with subtest(name):
-            cmd = f"cd /tmp && ${tests}/bin/{name} --test-threads=2 --nocapture 2>&1"
+            cmd = (
+                "cd /tmp && PUZUZ_HELPER_EXE=${tests}/libexec/puzuz-helper "
+                f"${tests}/bin/{name} --test-threads=2 --nocapture 2>&1"
+            )
             status, out = machine.execute(f"su -l alice -c {shlex.quote(cmd)}")
             print(out)
             summaries = re.findall(

@@ -1869,12 +1869,13 @@ for example) never leaves a new `puzuz` next to an old `puzuz-helper`. The confi
   (`puzuz-job-<id>.service`, or `puzuz-job-<id>-r<n>.service` after a restore). A new daemon picks
   up the state from its database, and a new helper finds the running jobs again.
 - **Helper restart:** a plain `systemctl stop/restart puzuz-helper` (not a system shutdown) never
-  checkpoints anything. The stopping helper refuses new spawns and restores and lets operations in
-  flight finish first. A dump in progress can take a while, and a second SIGTERM makes it exit at
-  once. Launches it refused or abandoned are queued again by the daemon and retried when the
-  helper is back. While the helper is down, `pause`, `kill`, `checkpoint` and resuming a paused job
-  fail with "helper unavailable". `add -i`, `start`, `restore -i` and `restart -i` are accepted,
-  and the job is launched when the helper reconnects.
+  checkpoints anything. The stopping helper refuses new spawns, restores and checkpoints and lets
+  operations in flight finish first. A dump in progress can take a while, and a second SIGTERM
+  makes it exit at once. Launches it refused or abandoned are queued again by the daemon and
+  retried when the helper is back; a `checkpoint` it refused fails with "helper unavailable" and
+  leaves the job running (or paused). While the helper is down, `pause`, `kill`, `checkpoint` and
+  resuming a paused job fail with "helper unavailable". `add -i`, `start`, `restore -i` and
+  `restart -i` are accepted, and the job is launched when the helper reconnects.
 - **Versions:** the CLI and the daemon must be the same version. A mismatched client gets an
   error that says which side to update, and `puzuz doctor` warns about it. Update the `puzuz`
   binary that users run at the same time.

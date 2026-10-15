@@ -1295,7 +1295,7 @@ async fn restore_checks_the_images_paths_first() {
         .into_iter()
         .filter_map(|r| match r {
             VerifyRequest::Paths(p) => Some(p.paths),
-            VerifyRequest::Restored(_) | VerifyRequest::Exist(_) | VerifyRequest::Probe(_) => None,
+            _ => None,
         })
         .flatten()
         .collect();
@@ -2256,11 +2256,68 @@ async fn shutdown_checkpoints_everything_except_no_checkpoint_jobs() {
         ),
         HelperErrorCode::ShuttingDown
     );
+    assert_eq!(
+        err_code(
+            &c.request(Request::Checkpoint {
+                job: JobId(11),
+                image_dir: env.base().join("11"),
+                options: Default::default(),
+            })
+            .await
+        ),
+        HelperErrorCode::ShuttingDown
+    );
     // The no_checkpoint job is left to systemd.
     assert_eq!(
         env.launcher.unit(JobId(11)).unwrap().state,
         UnitState::Running
     );
+}
+
+/// A checkpoint asked for while an OS shutdown waits for the operations in
+/// flight is refused, and the job is dumped by the shutdown, not left out
+/// of its manifest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_asked_for_during_a_shutdown_is_refused_and_the_job_dumped() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(1))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    // A spawn in flight holds the shutdown up.
+    env.launcher.set_delay(Some(Duration::from_millis(500)));
+    let spawn = c.send_request(Request::Spawn(env.spawn_req(2))).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let shutdown = tokio::spawn({
+        let helper = env.helper.clone();
+        async move { helper.shutdown(|_| {}, |_| {}).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        err_code(
+            &c.request(Request::Checkpoint {
+                job: JobId(1),
+                image_dir: env.base().join("1"),
+                options: Default::default(),
+            })
+            .await
+        ),
+        HelperErrorCode::ShuttingDown
+    );
+    assert!(matches!(
+        c.response(spawn).await,
+        ResponseResult::Spawned { .. }
+    ));
+    let manifest = tokio::time::timeout(WAIT, shutdown).await.unwrap().unwrap();
+    let mut dumped: Vec<JobId> = manifest
+        .jobs
+        .iter()
+        .filter(|e| matches!(e.result, ManifestResult::Checkpointed { .. }))
+        .map(|e| e.job)
+        .collect();
+    dumped.sort();
+    assert_eq!(dumped, [JobId(1), JobId(2)], "{manifest:?}");
 }
 
 /// Collects `n` events, panicking on any that `pick` rejects.
@@ -2442,8 +2499,22 @@ async fn a_stopping_helper_abandons_queued_launches_and_refuses_new_ones() {
         ),
         HelperErrorCode::ShuttingDown
     );
+    // ...so are checkpoints (a dump that began now could be cut off by
+    // the stop)...
+    assert_eq!(
+        err_code(
+            &c.request(Request::Checkpoint {
+                job: JobId(1),
+                image_dir: env.base().join("1"),
+                options: Default::default(),
+            })
+            .await
+        ),
+        HelperErrorCode::ShuttingDown
+    );
     // ...and the running job is left alone.
     assert_eq!(c.running().await, [(JobId(1), RunningPhase::Running)]);
+    assert!(!env.base().join("1").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2924,6 +2995,192 @@ async fn the_image_a_running_job_was_restored_from_is_not_a_new_dump() {
     );
 }
 
+/// Restores job `job` from its image and then puts the image back, with
+/// the log `criu restore` writes into it, as a restore whose removal of the
+/// image failed (or a helper that stopped before it) leaves it.
+async fn restore_and_leave_the_image(env: &Env, c: &mut Client, job: u64) {
+    let image_dir = env.base().join(job.to_string());
+    let saved = env.root.join(format!("saved-image-{job}"));
+    copy_dir(&image_dir, &saved);
+    assert_eq!(
+        c.request(restore_req(job, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+    assert!(matches!(
+        c.event().await.event,
+        Event::RestoreFinished {
+            outcome: RestoreOutcome::Success { .. },
+            ..
+        }
+    ));
+    copy_dir(&saved, &image_dir);
+    std::fs::write(
+        CheckpointDir::for_job(&env.base(), job).restore_log(),
+        "(00.1) Restore finished successfully\n",
+    )
+    .unwrap();
+}
+
+async fn checkpoint_succeeds(c: &mut Client, env: &Env, job: u64) {
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(job),
+            image_dir: env.base().join(job.to_string()),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::CheckpointFinished {
+                outcome: CheckpointOutcome::Success { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+}
+
+/// The image a running job was restored from, left behind, does not
+/// refuse the job's next dump: it is stale and replaced by the new image.
+#[tokio::test]
+async fn a_left_over_image_a_job_was_restored_from_does_not_block_its_next_dump() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    spawn_and_dump(&env, &mut c, 3).await;
+    restore_and_leave_the_image(&env, &mut c, 3).await;
+    checkpoint_succeeds(&mut c, &env, 3).await;
+    let dir = CheckpointDir::for_job(&env.base(), 3);
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    assert!(!dir.restore_log().exists(), "a fresh image");
+    // A complete image the job was not restored from is never replaced.
+    assert_eq!(
+        c.request(restore_req(3, &env.base().join("3"))).await,
+        ResponseResult::Accepted
+    );
+    assert!(matches!(
+        c.event().await.event,
+        Event::RestoreFinished {
+            outcome: RestoreOutcome::Success { .. },
+            ..
+        }
+    ));
+    copy_dir(&env.root.join("saved-image-3"), &env.base().join("3"));
+    assert!(!dir.restore_log().exists());
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(3),
+            image_dir: env.base().join("3"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            &ev.event,
+            Event::CheckpointFinished {
+                outcome: CheckpointOutcome::Failed { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    assert_eq!(c.running().await, [(JobId(3), RunningPhase::Running)]);
+}
+
+/// The image a job was restored from, left behind, goes when the restored
+/// job exits, whether the helper sees it exit or finds it exited at its
+/// next start: the job id may be reused (`restart --in-place`) and dumped
+/// again.
+#[tokio::test]
+async fn a_left_over_image_a_job_was_restored_from_goes_when_the_job_exits() {
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    for job in [3, 4] {
+        spawn_and_dump(&env, &mut c, job).await;
+        restore_and_leave_the_image(&env, &mut c, job).await;
+    }
+    env.launcher.exit(JobId(3), ExitStatus::Exited { code: 0 });
+    let ev = c.event().await;
+    assert!(
+        matches!(ev.event, Event::JobExited { job: JobId(3), .. }),
+        "{ev:?}"
+    );
+    assert_eq!(
+        CheckpointDir::for_job(&env.base(), 3).status(),
+        DirStatus::Missing
+    );
+    c.request(Request::AckEvents {
+        up_to: EventSeq(u64::MAX),
+    })
+    .await;
+    drop(c);
+    let _ = env.stop.send(true);
+    env.launcher.exit(JobId(4), ExitStatus::Exited { code: 0 });
+    env.restart().await;
+    let mut c = env.client().await;
+    let ev = c.event().await;
+    assert!(
+        matches!(ev.event, Event::JobExited { job: JobId(4), .. }),
+        "{ev:?}"
+    );
+    assert_eq!(
+        CheckpointDir::for_job(&env.base(), 4).status(),
+        DirStatus::Missing
+    );
+    // The ids are used again, and their jobs dumped.
+    for job in [3, 4] {
+        spawn_and_dump(&env, &mut c, job).await;
+    }
+}
+
+/// A restore retries removing the image it restored from; one it could not
+/// remove (here: half-way, the `COMPLETE` marker gone) is replaced by the
+/// job's next dump.
+#[tokio::test]
+async fn an_image_a_restore_could_not_remove_is_replaced_by_the_next_dump() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 3).await;
+    let dir = CheckpointDir::for_job(&env.base(), 3);
+    // `criu restore` writes its log into the image (the fake does not).
+    std::fs::write(dir.restore_log(), "(00.1) Restore finished successfully\n").unwrap();
+    let images = dir.images_dir();
+    std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0o555)).unwrap();
+    assert_eq!(
+        c.request(restore_req(3, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+    assert!(matches!(
+        c.event().await.event,
+        Event::RestoreFinished {
+            outcome: RestoreOutcome::Success { .. },
+            ..
+        }
+    ));
+    assert!(dir.images_dir().exists());
+    assert!(!matches!(dir.status(), DirStatus::Complete(_)));
+    std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0o700)).unwrap();
+    checkpoint_succeeds(&mut c, &env, 3).await;
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    assert!(!dir.restore_log().exists());
+
+    // Removed only as far as the `COMPLETE` marker, the image looks like
+    // a dump that was not finalized, which a new dump never replaces;
+    // unless the job was restored from it.
+    restore_and_leave_the_image(&env, &mut c, 3).await;
+    std::fs::remove_file(dir.marker_path()).unwrap();
+    assert!(dir.is_unfinalized_dump());
+    checkpoint_succeeds(&mut c, &env, 3).await;
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    assert!(!dir.restore_log().exists());
+}
+
 /// An interrupted restore whose unit is gone (the helper stopped before it
 /// started it, or systemd already cleaned it up) is reported too, once.
 #[tokio::test]
@@ -3061,4 +3318,126 @@ async fn files_opened_just_before_the_dump_are_held() {
         assert_eq!(Path::new(&f.path), p.as_path());
         assert!(f.attrs.is_some(), "{f:?}");
     }
+}
+
+/// The `puzuz-helper` binary: `PUZUZ_HELPER_EXE` if set (the test
+/// executables run elsewhere than where cargo built them, e.g. in the
+/// NixOS VM of packaging/nix/tests/helper-tests.nix), else the one cargo
+/// built for the tests.
+fn helper_exe() -> PathBuf {
+    let exe = std::env::var_os("PUZUZ_HELPER_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_puzuz-helper")));
+    assert!(
+        exe.is_file(),
+        "{} is missing; set PUZUZ_HELPER_EXE to the puzuz-helper binary",
+        exe.display()
+    );
+    exe
+}
+
+/// The real host looks the held files up in a `verify-access` child: the
+/// very file gets its attributes, a replaced or missing one none.
+#[test]
+fn the_real_host_looks_held_files_up_in_a_child() {
+    use puzuz_helper::access::HeldFile;
+    use puzuz_helper::host::{HostProbe, SystemHost};
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let held = |name: &str| {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, name).unwrap();
+        let m = std::fs::metadata(&p).unwrap();
+        HeldFile {
+            path: p.to_str().unwrap().to_owned(),
+            dev: m.dev(),
+            ino: m.ino(),
+            attrs: None,
+        }
+    };
+    let same = held("same");
+    let mut replaced = held("replaced");
+    replaced.ino += 1;
+    let mut missing = held("missing");
+    missing.path.push_str(".gone");
+    let host = SystemHost::new("nvidia-smi".into(), Default::default(), helper_exe());
+    let attrs = host
+        .held_file_attrs(&[same.clone(), replaced, missing])
+        .unwrap();
+    assert_eq!(attrs.len(), 3);
+    assert_eq!(attrs[0], puzuz_helper::access::held_file_attrs(&same));
+    assert!(attrs[0].is_some());
+    assert_eq!(attrs[1], None);
+    assert_eq!(attrs[2], None);
+    assert_eq!(host.held_file_attrs(&[]).unwrap(), []);
+}
+
+/// The files the job held are looked up after the dump with a deadline
+/// (on the real host in a child process, as a filesystem that does not
+/// answer could block the lookup). If that fails, the image is kept as an
+/// unfinalized dump, and a helper start goes on and finalizes it later.
+#[tokio::test]
+async fn a_failed_lookup_of_held_files_leaves_the_dump_unfinalized() {
+    use puzuz_helper::access::HeldFile;
+    use puzuz_helper::engine::{MOUNTS_FILE, SavedMounts};
+    use std::os::unix::fs::MetadataExt;
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    let file = env.base().join("held.txt");
+    std::fs::create_dir_all(env.base()).unwrap();
+    std::fs::write(&file, "a").unwrap();
+    let m = std::fs::metadata(&file).unwrap();
+    env.host.set_dump_hazards(DumpHazards {
+        held_files: vec![HeldFile {
+            path: file.to_str().unwrap().to_owned(),
+            dev: m.dev(),
+            ino: m.ino(),
+            attrs: None,
+        }],
+        ..Default::default()
+    });
+    env.host
+        .set_held_attrs_failure(Some("the access check did not finish within 20s"));
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(4))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(4),
+            image_dir: env.base().join("4"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    let Event::CheckpointFinished {
+        outcome:
+            CheckpointOutcome::Failed {
+                reason,
+                code: Some(HelperErrorCode::CheckpointUnfinalized),
+            },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert!(reason.contains("did not finish within"), "{reason}");
+    let dir = CheckpointDir::for_job(&env.base(), 4);
+    assert!(dir.is_unfinalized_dump(), "{:?}", dir.status());
+    c.request(Request::AckEvents {
+        up_to: EventSeq(u64::MAX),
+    })
+    .await;
+    drop(c);
+    // A start while it still fails is not held up and keeps the image.
+    env.restart().await;
+    assert!(dir.is_unfinalized_dump(), "{:?}", dir.status());
+    // Once it works, the next start finalizes the image.
+    env.host.set_held_attrs_failure(None);
+    env.restart().await;
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    let saved: SavedMounts =
+        serde_json::from_slice(&std::fs::read(dir.root().join(MOUNTS_FILE)).unwrap()).unwrap();
+    assert!(saved.held_files()[0].attrs.is_some());
 }

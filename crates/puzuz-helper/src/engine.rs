@@ -871,6 +871,17 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
     }
 
     async fn finish_exited(&self, job: JobId, unit: &str, files: &JobFiles, status: ExitStatus) {
+        // A restored job that ran and exited: the image it was restored
+        // from, if still there (see `remove_restored_image`), is stale. Done
+        // before the exit is reported, after which the job id may be reused
+        // (`restart --in-place`).
+        let dir = CheckpointDir::for_job(&self.cfg.checkpoint_base, job.0);
+        if let Err(e) = remove_restored_image(&dir, job) {
+            eprintln!(
+                "puzuz-helper: removing the image job {} was restored from: {e}",
+                job.0
+            );
+        }
         self.emit(Event::JobExited { job, status });
         if let Err(e) = self.launcher.release(unit).await {
             eprintln!("puzuz-helper: releasing job {}: {e}", job.0);
@@ -1011,17 +1022,12 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             match state {
                 UnitState::Running => {
                     // A restore finished, but the helper stopped before it
-                    // removed the image (or removing it failed). Only that
-                    // image: anything else may be the only copy of the job.
-                    if record.unit_kind == UnitKind::Restored
-                        && matches!(dir.status(), DirStatus::Complete(_))
-                        && was_restored_from(&dir)
-                    {
+                    // removed the image (or removing it failed).
+                    if let Err(e) = remove_restored_image(&dir, job) {
                         eprintln!(
-                            "puzuz-helper: removing the image of the restored job {}",
+                            "puzuz-helper: removing the image job {} was restored from: {e}",
                             job.0
                         );
-                        let _ = dir.remove();
                     }
                     let pid = self
                         .launcher
@@ -1099,11 +1105,18 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 "leave_running is not supported",
             );
         }
+        // Counted before the check (see `Self::spawn`) and before the job
+        // is claimed: a stop that saw no operation in flight lists the job
+        // as live (see `Self::shutdown_jobs`), and one that saw this
+        // request waits for it.
+        let guard = self.inflight.enter();
+        if self.is_shutting_down() {
+            return error(HelperErrorCode::ShuttingDown, "the helper is shutting down");
+        }
         let was_stopped = match self.claim_for_checkpoint(job) {
             Ok(s) => s,
             Err(res) => return res,
         };
-        let guard = self.inflight.enter();
         // Refuse up front what the dump would refuse anyway, so the caller
         // gets the reason as the answer. The dump checks again (things may
         // change while it waits for an earlier one).
@@ -2071,8 +2084,27 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             };
             e.pid = Some(pid);
         }
-        if let Err(e) = dir.remove() {
-            eprintln!("puzuz-helper: removing the image of job {}: {e}", job.0);
+        // The job runs from here on: the image is stale. Should removing it
+        // fail every time, it is removed when the job exits or is
+        // checkpointed again, or at the helper's next start (see
+        // `remove_restored_image`).
+        let mut attempt = 1;
+        while let Err(e) = dir.remove() {
+            if attempt == REMOVE_ATTEMPTS {
+                eprintln!(
+                    "puzuz-helper: removing the image job {} was restored from failed {attempt} \
+                     times: {e}; it is removed when the job exits or is checkpointed again, or \
+                     when the helper starts again",
+                    job.0
+                );
+                break;
+            }
+            eprintln!(
+                "puzuz-helper: removing the image job {} was restored from: {e}; trying again",
+                job.0
+            );
+            attempt += 1;
+            tokio::time::sleep(REMOVE_RETRY_DELAY).await;
         }
         RestoreOutcome::Success { pid, stopped }
     }
@@ -2100,10 +2132,10 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
 
     // -- shutdown ---------------------------------------------------------
 
-    /// Stop of the helper alone (not of the OS): refuse new spawns and
-    /// restores, then wait for the spawns, restores and checkpoints in
-    /// flight to finish, so that none is cut off half-way (their answers
-    /// and events still reach the daemon). Spawns and restores whose units
+    /// Stop of the helper alone (not of the OS): refuse new spawns,
+    /// restores and checkpoints, then wait for those in flight to finish,
+    /// so that none is cut off half-way (their answers and events still
+    /// reach the daemon). Spawns and restores whose units
     /// systemd has not begun to start are abandoned instead (see
     /// [`Launcher::stop_waiting`]): they would wait for this very stop.
     /// The jobs keep running.
@@ -2137,9 +2169,10 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         }
     }
 
-    /// Refuse new spawns/restores, wait for running operations, then dump
-    /// every live job one by one (`no_checkpoint` jobs are skipped) and
-    /// write the manifest. `before_each` is called before each dump.
+    /// Refuse new spawns, restores and checkpoints, wait for running
+    /// operations, then dump every live job one by one (`no_checkpoint`
+    /// jobs are skipped) and write the manifest. `before_each` is called
+    /// before each dump.
     async fn shutdown_jobs(self: &Arc<Self>, before_each: impl Fn(JobId)) -> ShutdownManifest {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.inflight.wait_idle().await;
@@ -2508,6 +2541,14 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     }
 
     let dir = CheckpointDir::for_job(base, record.job.0);
+    // The job runs, so an image it was restored from is stale (see
+    // `remove_restored_image`); `prepare` refuses to replace any other.
+    remove_restored_image(&dir, record.job).map_err(|e| {
+        DumpError::Refused(format!(
+            "removing the image the job was restored from ({}): {e}",
+            dir.root().display()
+        ))
+    })?;
     dir.prepare()
         .map_err(|e| DumpError::Refused(format!("preparing {}: {e}", dir.root().display())))?;
     // What a restore needs besides CRIU's images, written before the dump:
@@ -2657,6 +2698,10 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     Err(DumpError::Unfinalized(unfinalized_reason(&dir, &last)))
 }
 
+/// How often a restore tries to remove the image it restored from.
+const REMOVE_ATTEMPTS: u32 = 3;
+const REMOVE_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 /// How often [`dump_job`] tries to finalize a successful dump.
 const FINALIZE_ATTEMPTS: u32 = 3;
 const FINALIZE_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -2696,6 +2741,34 @@ impl RestoreCheckError {
 /// directory (see [`CheckpointDir::prepare`]), so its image never has them.
 fn was_restored_from(dir: &CheckpointDir) -> bool {
     dir.restore_log().exists() || dir.restore_pidfile().exists()
+}
+
+/// Whether `dir` holds the image a job was restored from (see
+/// [`was_restored_from`]), complete or left so by a removal that stopped
+/// half-way (the `COMPLETE` marker goes first, see
+/// [`CheckpointDir::remove`]). Once the job has run since, that image is
+/// stale: a restore never resumes from it (the job has moved on), and left
+/// in place it would refuse every new dump of the job (see
+/// [`CheckpointDir::prepare`]).
+fn is_restored_image(dir: &CheckpointDir) -> bool {
+    was_restored_from(dir)
+        && (matches!(dir.status(), DirStatus::Complete(_)) || dir.is_unfinalized_dump())
+}
+
+/// Remove the image the live (or just exited) job `job` was restored from,
+/// if it is still there (see [`is_restored_image`]): the helper stopped
+/// before it removed it after the restore, or removing it failed. Only that
+/// image: anything else may be the only copy of the job. Returns an error
+/// if the image is there and could not be removed.
+fn remove_restored_image(dir: &CheckpointDir, job: JobId) -> io::Result<()> {
+    if !is_restored_image(dir) {
+        return Ok(());
+    }
+    eprintln!(
+        "puzuz-helper: removing the image job {} was restored from",
+        job.0
+    );
+    dir.remove()
 }
 
 /// Finalize a dump that succeeded: the [`layout::DUMPED_MARKER`], the
@@ -2764,8 +2837,22 @@ pub fn finish_dump<H: HostProbe + ?Sized>(
                     }
                 }
             }
-            // The job is gone now: its files no longer change.
-            crate::access::complete_held_files(&mut held_files);
+            // The job is gone now: its files no longer change. Those that
+            // have their attributes already keep them (see
+            // `crate::access::complete_held_files`); the lookups are made
+            // with a deadline (see `HostProbe::held_file_attrs`).
+            let (idx, missing): (Vec<usize>, Vec<crate::access::HeldFile>) = held_files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.attrs.is_none())
+                .map(|(i, f)| (i, f.clone()))
+                .unzip();
+            let attrs = host
+                .held_file_attrs(&missing)
+                .map_err(|e| format!("looking up the files the job held: {e}"))?;
+            for (i, a) in idx.into_iter().zip(attrs) {
+                held_files[i].attrs = a;
+            }
             SavedMounts::Full {
                 mount_points,
                 external_sources,
