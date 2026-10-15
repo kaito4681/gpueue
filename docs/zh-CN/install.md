@@ -1637,9 +1637,10 @@ sudo puzuz update --version 0.2.0 --yes
   后为 `puzuz-job-<id>-r<n>.service`）。新的守护进程从数据库中读取状态，新的 helper 会重新找到
   正在运行的作业。
 - **helper 重启：** 单纯的 `systemctl stop/restart puzuz-helper`（不是系统关机）永远不会创建
-  检查点。正在停止的 helper 会拒绝新的启动和恢复，并先让进行中的操作完成。进行中的转储可能
+  检查点。正在停止的 helper 会拒绝新的启动、恢复和检查点，并先让进行中的操作完成。进行中的转储可能
   需要一段时间，第二次 SIGTERM 会让它立即退出。它拒绝或放弃的启动会被守护进程重新排队，并在
-  helper 恢复后重试。helper 停止期间，`pause`、`kill`、`checkpoint` 以及恢复暂停的作业会以
+  helper 恢复后重试；被它拒绝的 `checkpoint` 会以 "helper unavailable" 失败，作业继续运行（或保持
+  暂停）。helper 停止期间，`pause`、`kill`、`checkpoint` 以及恢复暂停的作业会以
   "helper unavailable" 失败。`add -i`、`start`、`restore -i` 和 `restart -i` 会被接受，作业会在
   helper 重新连接时启动。
 - **版本：** CLI 和守护进程必须是相同版本。版本不匹配的客户端会收到错误，指出应更新哪一方，

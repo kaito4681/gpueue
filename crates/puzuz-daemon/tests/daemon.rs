@@ -832,6 +832,62 @@ async fn failed_checkpoint_terminates_the_job_while_holding_its_gpu() {
     h.stop().await;
 }
 
+/// A stopping helper refuses checkpoints (`shutting_down`): the command
+/// fails as retryable, the job keeps running (a paused one stays paused),
+/// and it can be checkpointed once the helper is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkpoint_a_stopping_helper_refuses_can_be_retried() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    let id = alice.add(&job_request("train", &[0])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+
+    h.helper.set_stopping(true);
+    let reply = alice.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    let error = reply.error();
+    assert_eq!(error.code, ErrorCode::HelperUnavailable);
+    assert_eq!(
+        error.message,
+        "the puzuz helper is stopping; the job was not checkpointed; the job keeps running; try \
+         again once the helper is back"
+    );
+    assert_eq!(alice.job(id).await.state, JobState::Running);
+    assert!(h.helper.is_running(id));
+    assert!(h.helper.signals().is_empty());
+
+    // A paused job was resumed for the dump; it is paused again.
+    h.helper.set_stopping(false);
+    assert_eq!(
+        alice.action(id, "pause", json!({})).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Paused).await;
+    h.helper.set_stopping(true);
+    let reply = alice.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(reply.error().code, ErrorCode::HelperUnavailable);
+    assert_eq!(alice.job(id).await.state, JobState::Paused);
+    assert_eq!(
+        h.helper.signals(),
+        [
+            (id, signal::SIGSTOP),
+            (id, signal::SIGCONT),
+            (id, signal::SIGSTOP)
+        ]
+    );
+
+    h.helper.set_stopping(false);
+    h.helper.set_checkpoint_outcome(FakeOutcome::Succeed);
+    assert_eq!(
+        alice.action(id, "checkpoint", json!(null)).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Checkpointed).await;
+
+    h.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refused_checkpoint_fails_the_command_and_leaves_the_job_running() {
     let mut h = Harness::new(1).await;

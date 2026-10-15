@@ -1105,11 +1105,18 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 "leave_running is not supported",
             );
         }
+        // Counted before the check (see `Self::spawn`) and before the job
+        // is claimed: a stop that saw no operation in flight lists the job
+        // as live (see `Self::shutdown_jobs`), and one that saw this
+        // request waits for it.
+        let guard = self.inflight.enter();
+        if self.is_shutting_down() {
+            return error(HelperErrorCode::ShuttingDown, "the helper is shutting down");
+        }
         let was_stopped = match self.claim_for_checkpoint(job) {
             Ok(s) => s,
             Err(res) => return res,
         };
-        let guard = self.inflight.enter();
         // Refuse up front what the dump would refuse anyway, so the caller
         // gets the reason as the answer. The dump checks again (things may
         // change while it waits for an earlier one).
@@ -2125,10 +2132,10 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
 
     // -- shutdown ---------------------------------------------------------
 
-    /// Stop of the helper alone (not of the OS): refuse new spawns and
-    /// restores, then wait for the spawns, restores and checkpoints in
-    /// flight to finish, so that none is cut off half-way (their answers
-    /// and events still reach the daemon). Spawns and restores whose units
+    /// Stop of the helper alone (not of the OS): refuse new spawns,
+    /// restores and checkpoints, then wait for those in flight to finish,
+    /// so that none is cut off half-way (their answers and events still
+    /// reach the daemon). Spawns and restores whose units
     /// systemd has not begun to start are abandoned instead (see
     /// [`Launcher::stop_waiting`]): they would wait for this very stop.
     /// The jobs keep running.
@@ -2162,9 +2169,10 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         }
     }
 
-    /// Refuse new spawns/restores, wait for running operations, then dump
-    /// every live job one by one (`no_checkpoint` jobs are skipped) and
-    /// write the manifest. `before_each` is called before each dump.
+    /// Refuse new spawns, restores and checkpoints, wait for running
+    /// operations, then dump every live job one by one (`no_checkpoint`
+    /// jobs are skipped) and write the manifest. `before_each` is called
+    /// before each dump.
     async fn shutdown_jobs(self: &Arc<Self>, before_each: impl Fn(JobId)) -> ShutdownManifest {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.inflight.wait_idle().await;

@@ -66,7 +66,7 @@ struct State {
     next_seq: u64,
     unacked: Vec<EventEnvelope>,
     spawn_failure: Option<String>,
-    /// Refuse spawns and restores as a stopping helper does.
+    /// Refuse spawns, restores and checkpoints as a stopping helper does.
     stopping: bool,
     /// Accept restores, then report them abandoned (`shutting_down`).
     abandon_restores: bool,
@@ -316,8 +316,8 @@ impl FakeHelper {
         self.with(|s| s.spawn_failure = reason.map(str::to_owned));
     }
 
-    /// Refuse spawns and restores with `shutting_down`, as a helper that
-    /// is stopping does (`false` to accept them again).
+    /// Refuse spawns, restores and checkpoints with `shutting_down`, as a
+    /// helper that is stopping does (`false` to accept them again).
     pub fn set_stopping(&self, stopping: bool) {
         self.with(|s| s.stopping = stopping);
     }
@@ -606,6 +606,12 @@ impl FakeHelper {
     fn do_checkpoint(&self, job: JobId) -> HelperResult<()> {
         self.with(|s| {
             s.check_connected()?;
+            if s.stopping {
+                return Err(HelperError::Rejected {
+                    code: HelperErrorCode::ShuttingDown,
+                    message: "the helper is shutting down".to_owned(),
+                });
+            }
             if !s.jobs.contains_key(&job) {
                 return Err(not_found(job));
             }

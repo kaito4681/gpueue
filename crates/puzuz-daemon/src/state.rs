@@ -1446,8 +1446,19 @@ impl Core {
                         ..
                     }
                 );
+                // A stopping helper starts no dump; not the job's fault,
+                // and worth another try once the helper is back.
+                let stopping = matches!(
+                    e,
+                    HelperError::Rejected {
+                        code: HelperErrorCode::ShuttingDown,
+                        ..
+                    }
+                );
                 let reason = if refused {
                     refusal_reason(&e.to_string())
+                } else if stopping {
+                    "the puzuz helper is stopping; the job was not checkpointed".to_owned()
                 } else {
                     e.to_string()
                 };
@@ -1464,17 +1475,24 @@ impl Core {
                 {
                     tracing::warn!(job = %id, "cannot pause the job again: {}", err.0.message);
                 }
-                let failure = refused.then(|| {
-                    let keeps = if paused {
-                        "the job stays paused"
-                    } else {
-                        "the job keeps running"
-                    };
-                    Failure::new(
+                let keeps = if paused {
+                    "the job stays paused"
+                } else {
+                    "the job keeps running"
+                };
+                let failure = if refused {
+                    Some(Failure::new(
                         ErrorCode::InvalidState,
                         format!("{failure_reason}; {keeps}"),
-                    )
-                });
+                    ))
+                } else if stopping {
+                    Some(Failure::new(
+                        ErrorCode::HelperUnavailable,
+                        format!("{failure_reason}; {keeps}; try again once the helper is back"),
+                    ))
+                } else {
+                    None
+                };
                 Err(failure.unwrap_or_else(|| e.into()))
             }
             // Unknown whether the helper got the request: find out, so the

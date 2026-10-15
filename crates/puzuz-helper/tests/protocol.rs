@@ -2256,11 +2256,68 @@ async fn shutdown_checkpoints_everything_except_no_checkpoint_jobs() {
         ),
         HelperErrorCode::ShuttingDown
     );
+    assert_eq!(
+        err_code(
+            &c.request(Request::Checkpoint {
+                job: JobId(11),
+                image_dir: env.base().join("11"),
+                options: Default::default(),
+            })
+            .await
+        ),
+        HelperErrorCode::ShuttingDown
+    );
     // The no_checkpoint job is left to systemd.
     assert_eq!(
         env.launcher.unit(JobId(11)).unwrap().state,
         UnitState::Running
     );
+}
+
+/// A checkpoint asked for while an OS shutdown waits for the operations in
+/// flight is refused, and the job is dumped by the shutdown, not left out
+/// of its manifest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_asked_for_during_a_shutdown_is_refused_and_the_job_dumped() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(1))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    // A spawn in flight holds the shutdown up.
+    env.launcher.set_delay(Some(Duration::from_millis(500)));
+    let spawn = c.send_request(Request::Spawn(env.spawn_req(2))).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let shutdown = tokio::spawn({
+        let helper = env.helper.clone();
+        async move { helper.shutdown(|_| {}, |_| {}).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        err_code(
+            &c.request(Request::Checkpoint {
+                job: JobId(1),
+                image_dir: env.base().join("1"),
+                options: Default::default(),
+            })
+            .await
+        ),
+        HelperErrorCode::ShuttingDown
+    );
+    assert!(matches!(
+        c.response(spawn).await,
+        ResponseResult::Spawned { .. }
+    ));
+    let manifest = tokio::time::timeout(WAIT, shutdown).await.unwrap().unwrap();
+    let mut dumped: Vec<JobId> = manifest
+        .jobs
+        .iter()
+        .filter(|e| matches!(e.result, ManifestResult::Checkpointed { .. }))
+        .map(|e| e.job)
+        .collect();
+    dumped.sort();
+    assert_eq!(dumped, [JobId(1), JobId(2)], "{manifest:?}");
 }
 
 /// Collects `n` events, panicking on any that `pick` rejects.
@@ -2442,8 +2499,22 @@ async fn a_stopping_helper_abandons_queued_launches_and_refuses_new_ones() {
         ),
         HelperErrorCode::ShuttingDown
     );
+    // ...so are checkpoints (a dump that began now could be cut off by
+    // the stop)...
+    assert_eq!(
+        err_code(
+            &c.request(Request::Checkpoint {
+                job: JobId(1),
+                image_dir: env.base().join("1"),
+                options: Default::default(),
+            })
+            .await
+        ),
+        HelperErrorCode::ShuttingDown
+    );
     // ...and the running job is left alone.
     assert_eq!(c.running().await, [(JobId(1), RunningPhase::Running)]);
+    assert!(!env.base().join("1").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
