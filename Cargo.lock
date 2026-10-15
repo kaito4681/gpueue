@@ -699,6 +699,131 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpueue"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "clap_complete",
+ "clap_complete_nushell",
+ "comfy-table",
+ "flate2",
+ "gpueue-checkpoint",
+ "gpueue-config",
+ "gpueue-core",
+ "gpueue-daemon",
+ "gpueue-protocol",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "interim",
+ "minisign-verify",
+ "nix",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tokio",
+ "toml",
+ "ureq",
+]
+
+[[package]]
+name = "gpueue-checkpoint"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "gpueue-config"
+version = "0.1.0"
+dependencies = [
+ "gpueue-core",
+ "gpueue-protocol",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+]
+
+[[package]]
+name = "gpueue-core"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "gpueue-daemon"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "futures",
+ "gpueue-config",
+ "gpueue-core",
+ "gpueue-protocol",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "nix",
+ "nvml-wrapper",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "gpueue-helper"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "clap",
+ "gpueue-checkpoint",
+ "gpueue-config",
+ "gpueue-protocol",
+ "nix",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
+name = "gpueue-protocol"
+version = "0.1.0"
+dependencies = [
+ "gpueue-core",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1182,131 +1307,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "puzuz"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "clap_complete",
- "clap_complete_nushell",
- "comfy-table",
- "flate2",
- "http-body-util",
- "hyper",
- "hyper-util",
- "interim",
- "minisign-verify",
- "nix",
- "puzuz-checkpoint",
- "puzuz-config",
- "puzuz-core",
- "puzuz-daemon",
- "puzuz-protocol",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "tokio",
- "toml",
- "ureq",
-]
-
-[[package]]
-name = "puzuz-checkpoint"
-version = "0.1.0"
-dependencies = [
- "rustix",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "puzuz-config"
-version = "0.1.0"
-dependencies = [
- "puzuz-core",
- "puzuz-protocol",
- "serde",
- "tempfile",
- "thiserror 2.0.21",
- "toml",
-]
-
-[[package]]
-name = "puzuz-core"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "puzuz-daemon"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "futures",
- "http-body-util",
- "hyper",
- "hyper-util",
- "nix",
- "nvml-wrapper",
- "puzuz-config",
- "puzuz-core",
- "puzuz-protocol",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tower-service",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "puzuz-helper"
-version = "0.1.0"
-dependencies = [
- "cc",
- "clap",
- "nix",
- "puzuz-checkpoint",
- "puzuz-config",
- "puzuz-protocol",
- "rustix",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "zbus",
-]
-
-[[package]]
-name = "puzuz-protocol"
-version = "0.1.0"
-dependencies = [
- "http-body-util",
- "hyper",
- "hyper-util",
- "puzuz-core",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]

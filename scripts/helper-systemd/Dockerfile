@@ -3,7 +3,7 @@
 # that the Docker+systemd PoC used in manual mode. Its glibc is newer than
 # the toolchain image's (Debian bookworm), so the binary built there runs
 # here. BASE may be any image derived from it that already has the
-# packages (e.g. the PoC's puzuz-poc/systemd259:0.1 where apt is offline).
+# packages (e.g. the PoC's gpueue-poc/systemd259:0.1 where apt is offline).
 ARG BASE=ubuntu:26.04
 FROM ${BASE}
 RUN set -e; \
@@ -26,7 +26,7 @@ RUN set -e; \
     getent passwd 1001 >/dev/null || useradd -m -u 1001 -s /bin/sh bob
 # Optional: sshfs and an SSH server for the FUSE mount scenario of
 # scripts/e2e/scenario.sh (it prints a SKIP line when they are missing, e.g.
-# where apt is offline, or fails with PUZUZ_E2E_REQUIRE_SSHFS=1).
+# where apt is offline, or fails with GPUEUE_E2E_REQUIRE_SSHFS=1).
 RUN if ! command -v sshfs >/dev/null || ! command -v sshd >/dev/null; then \
         (apt-get update \
          && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \

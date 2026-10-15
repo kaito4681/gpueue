@@ -1,0 +1,33 @@
+# pacman's systemd hooks create the gpueue user and group (sysusers.d), the directories
+# (tmpfiles.d) and reload systemd. As usual on Arch, nothing is enabled or restarted here.
+
+post_install() {
+  cat <<'EOF'
+==> Start gpueue:
+      sudo systemctl enable --now gpueue-helper.service gpueue.service
+      gpueue doctor
+==> Checkpoint and restore need CRIU 4.2 or newer: sudo pacman -S criu
+    GPU jobs need NVIDIA's cuda-checkpoint, see
+    https://github.com/kaito4681/gpueue/blob/main/docs/install.md#cuda-checkpoint
+==> Make someone an administrator: sudo usermod -aG gpueue-admin <user>
+EOF
+}
+
+post_upgrade() {
+  cat <<'EOF'
+==> Restart gpueue to run the new version (running jobs keep running):
+      sudo systemctl restart gpueue-helper.service gpueue.service
+    The gpueue command and the daemon must be the same version.
+EOF
+}
+
+post_remove() {
+  cat <<'EOF'
+==> If the services were enabled, stop them and remove their links:
+      sudo systemctl disable --now gpueue.service gpueue-helper.service
+    Jobs still running in gpueue-job-* units keep running until stopped
+    (sudo systemctl stop 'gpueue-job-*').
+==> /etc/gpueue (if changed) and /var/lib/gpueue (state, logs, checkpoint images) are kept.
+    Delete them by hand to remove all data.
+EOF
+}

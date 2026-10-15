@@ -1,4 +1,4 @@
-# /etc/puzuz/config.toml of the full-stack e2e test.
+# /etc/gpueue/config.toml of the full-stack e2e test.
 grace_secs = 5
 gpu_detection = "static"
 

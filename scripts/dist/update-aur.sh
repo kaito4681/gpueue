@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Points the AUR package (packaging/aur/puzuz-bin) at release v<VERSION>: sets pkgver
+# Points the AUR package (packaging/aur/gpueue-bin) at release v<VERSION>: sets pkgver
 # (and pkgrel=1 when the version changes), downloads the release's tarballs with their
 # .minisig files and checks them like install.sh does (the release key, and the trusted
-# comment "puzuz v<VERSION> <file>"), computes the PKGBUILD's checksums from the verified
+# comment "gpueue v<VERSION> <file>"), computes the PKGBUILD's checksums from the verified
 # tarballs and from the tag's source archive, and regenerates .SRCINFO with
 # `makepkg --printsrcinfo` (run directly when makepkg is installed, else in an Arch Linux
 # container).
@@ -15,21 +15,21 @@
 #
 # Usage: scripts/dist/update-aur.sh VERSION      (e.g. 0.2.0; prereleases are not packaged)
 # Environment:
-#   PUZUZ_RELEASE_BASE_URL  repository URL the PKGBUILD downloads from
-#                           (default https://github.com/kaito4681/puzuz; file:// works,
+#   GPUEUE_RELEASE_BASE_URL  repository URL the PKGBUILD downloads from
+#                           (default https://github.com/kaito4681/gpueue; file:// works,
 #                           for tests)
-#   PUZUZ_AUR_DIR           package directory (default packaging/aur/puzuz-bin)
-#   PUZUZ_ARCH_IMAGE        container image with makepkg
+#   GPUEUE_AUR_DIR           package directory (default packaging/aur/gpueue-bin)
+#   GPUEUE_ARCH_IMAGE        container image with makepkg
 #   MINISIGN                the minisign binary (default: scripts/dist/get-minisign.sh)
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 version="${1:-}"
 version="${version#v}"
-base="${PUZUZ_RELEASE_BASE_URL:-https://github.com/kaito4681/puzuz}"
+base="${GPUEUE_RELEASE_BASE_URL:-https://github.com/kaito4681/gpueue}"
 base="${base%/}"
-dir="${PUZUZ_AUR_DIR:-$root/packaging/aur/puzuz-bin}"
-image="${PUZUZ_ARCH_IMAGE:-archlinux:base-devel-20260927.0.600689}"
+dir="${GPUEUE_AUR_DIR:-$root/packaging/aur/gpueue-bin}"
+image="${GPUEUE_ARCH_IMAGE:-archlinux:base-devel-20260927.0.600689}"
 targets=(x86_64:x86_64-unknown-linux-gnu aarch64:aarch64-unknown-linux-gnu)
 
 die() { echo "update-aur: $*" >&2; exit 1; }
@@ -46,10 +46,10 @@ is_sha256() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
 
 # The source archive has no published checksum; GitHub keeps tag archives byte-stable.
 fetch "$base/archive/refs/tags/v$version.tar.gz" "$work/src.tar.gz"
-tar -tzf "$work/src.tar.gz" "puzuz-$version/packaging/config.toml" >/dev/null 2>&1 ||
-    die "the source archive of v$version has no puzuz-$version/packaging/config.toml"
-tar -xzOf "$work/src.tar.gz" "puzuz-$version/packaging/minisign.pub" >"$work/minisign.pub" 2>/dev/null ||
-    die "the source archive of v$version has no puzuz-$version/packaging/minisign.pub"
+tar -tzf "$work/src.tar.gz" "gpueue-$version/packaging/config.toml" >/dev/null 2>&1 ||
+    die "the source archive of v$version has no gpueue-$version/packaging/config.toml"
+tar -xzOf "$work/src.tar.gz" "gpueue-$version/packaging/minisign.pub" >"$work/minisign.pub" 2>/dev/null ||
+    die "the source archive of v$version has no gpueue-$version/packaging/minisign.pub"
 src_sum="$(sha256sum "$work/src.tar.gz" | cut -d' ' -f1)"
 is_sha256 "$src_sum" || die "cannot compute the checksum of the source archive"
 
@@ -61,12 +61,12 @@ minisign="${MINISIGN:-}"
 declare -A sums
 for entry in "${targets[@]}"; do
     arch="${entry%%:*}"
-    name="puzuz-v$version-${entry#*:}.tar.gz"
+    name="gpueue-v$version-${entry#*:}.tar.gz"
     fetch "$base/releases/download/v$version/$name" "$work/$name"
     fetch "$base/releases/download/v$version/$name.minisig" "$work/$name.minisig"
     comment="$("$minisign" -V -Q -p "$work/minisign.pub" -m "$work/$name" -x "$work/$name.minisig")" ||
         die "bad signature on $name"
-    [ "$comment" = "puzuz v$version $name" ] ||
+    [ "$comment" = "gpueue v$version $name" ] ||
         die "the signature of $name is for another file (trusted comment \"$comment\")"
     sum="$(sha256sum "$work/$name" | cut -d' ' -f1)"
     is_sha256 "$sum" || die "cannot compute the checksum of $name"

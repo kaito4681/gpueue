@@ -1,6 +1,6 @@
 #!/bin/sh
-# Before the puzuz package is installed: refuse to install next to an
-# installation made by `puzuz service install` (install.sh, `puzuz update`).
+# Before the gpueue package is installed: refuse to install next to an
+# installation made by `gpueue service install` (install.sh, `gpueue update`).
 # Its units in /etc/systemd/system would override the package's units in
 # /usr/lib/systemd/system, so the package's binaries would never run.
 #
@@ -8,16 +8,16 @@
 # `abort-upgrade <new-version>`; rpm %pre `1` (install) / `2` (upgrade).
 set -e
 
-# Must equal service::MARKER (checked by a unit test in crates/puzuz).
-MARKER='# Installed by `puzuz service install`; re-running it overwrites this file.'
+# Must equal service::MARKER (checked by a unit test in crates/gpueue).
+MARKER='# Installed by `gpueue service install`; re-running it overwrites this file.'
 
 case "$1" in
 install | 1)
-    for unit in /etc/systemd/system/puzuz.service /etc/systemd/system/puzuz-helper.service; do
+    for unit in /etc/systemd/system/gpueue.service /etc/systemd/system/gpueue-helper.service; do
         if [ -f "$unit" ] && [ "$(head -n 1 "$unit")" = "$MARKER" ]; then
-            echo "puzuz is already installed with \`puzuz service install\` (install.sh) ($unit)." >&2
-            echo "Remove that installation first (running jobs, /etc/puzuz and /var/lib/puzuz are kept):" >&2
-            echo "  sudo puzuz uninstall   (a puzuz without that command: sudo bash install.sh --uninstall)" >&2
+            echo "gpueue is already installed with \`gpueue service install\` (install.sh) ($unit)." >&2
+            echo "Remove that installation first (running jobs, /etc/gpueue and /var/lib/gpueue are kept):" >&2
+            echo "  sudo gpueue uninstall   (a gpueue without that command: sudo bash install.sh --uninstall)" >&2
             echo "then install this package again." >&2
             exit 1
         fi

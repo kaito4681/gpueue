@@ -1,0 +1,62 @@
+[Unit]
+Description=gpueue job queue daemon
+Documentation=https://github.com/kaito4681/gpueue
+# The daemon talks to the helper; it is started after it and therefore
+# stopped before it. Stopping the daemon never stops jobs.
+After=network.target gpueue-helper.service systemd-tmpfiles-setup.service
+Wants=gpueue-helper.service
+
+[Service]
+Type=exec
+User=gpueue
+Group=gpueue
+ExecStart=/usr/bin/gpueue daemon
+KillMode=mixed
+TimeoutStopSec=60s
+Restart=on-failure
+RestartSec=2s
+UMask=0007
+# Every API connection and log stream takes a file descriptor. The daemon
+# caps connections per user and in total well below this (see
+# docs/architecture.md), so no user can run it out of descriptors.
+LimitNOFILE=65536
+
+# The daemon is unprivileged and needs no privileges at all.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+# Devices: only the pseudo devices (/dev/null, /dev/urandom, ...) and the
+# NVIDIA control and GPU nodes (/dev/nvidiactl, /dev/nvidia<N>; character
+# major 195, named "nvidiactl"/"nvidia" - "nvidia-frontend" on older drivers
+# - in /proc/devices), which NVML opens read-write to detect the GPUs at
+# start-up. The nodes are mode 0666, so no extra group is needed. Not
+# PrivateDevices=yes: its private /dev has no /dev/nvidia* (NVML then fails
+# with "driver is not loaded"), and BindPaths= cannot follow GPU nodes by
+# pattern. The device cgroup still denies everything else (e.g.
+# /dev/nvidia-uvm: the daemon never runs CUDA). Device groups are looked up
+# in /proc/devices when the unit starts; like GPU detection itself, they
+# need a restart of the daemon after the NVIDIA driver is loaded later.
+DevicePolicy=closed
+DeviceAllow=char-nvidiactl rw
+DeviceAllow=char-nvidia rw
+DeviceAllow=char-nvidia-frontend rw
+SystemCallFilter=~@raw-io
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# Its own state, the job logs (group gpueue, see tmpfiles.d/gpueue.conf) and
+# the sockets. If state_db, logs_dir or api_socket (or data_dir) are moved in
+# /etc/gpueue/config.toml, add their directories with a drop-in
+# (`sudo systemctl edit gpueue.service`: [Service] ReadWritePaths=<dirs>);
+# `gpueue doctor` warns about any that are missing.
+ReadWritePaths=/var/lib/gpueue/daemon /var/lib/gpueue/logs /run/gpueue
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 name: APT repository
 
-# Adds the .deb files of a published release to the puzuz APT repository, a
+# Adds the .deb files of a published release to the gpueue APT repository, a
 # flat repository in the release `apt` (scripts/dist/apt-repo.sh; see
 # docs/install.md, "The APT repository (maintainers)").
 #

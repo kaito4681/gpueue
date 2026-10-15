@@ -9,7 +9,7 @@
 #   KEY_FILE  ASCII-armored GPG secret key; its passphrase in RPM_PASSPHRASE
 #             (may be empty)
 #   KEYRING   the public key the secret key must belong to
-#             (packaging/apt/puzuz-archive-keyring.gpg)
+#             (packaging/apt/gpueue-archive-keyring.gpg)
 # Needs rpmsign and rpm (Debian/Ubuntu: the rpm package) and gpg.
 set -euo pipefail
 

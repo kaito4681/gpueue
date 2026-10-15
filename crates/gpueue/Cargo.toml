@@ -1,0 +1,52 @@
+[package]
+name = "gpueue"
+description = "GPU-aware job queue with transparent checkpointing (CLI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gpueue"
+path = "src/main.rs"
+
+[features]
+# Test builds only (scripts/dist/build-test-versions.sh): `gpueue update` honours
+# GPUEUE_RELEASE_API_URL (a fake GitHub API) and GPUEUE_UPDATE_PUBKEY_FILE (another release key).
+# Never enabled in releases.
+test-hooks = []
+
+[dependencies]
+gpueue-core.workspace = true
+gpueue-protocol = { workspace = true, features = ["client"] }
+gpueue-daemon.workspace = true
+gpueue-checkpoint.workspace = true
+gpueue-config.workspace = true
+clap = { workspace = true, features = ["env", "wrap_help"] }
+clap_complete.workspace = true
+clap_complete_nushell.workspace = true
+chrono.workspace = true
+interim.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+comfy-table.workspace = true
+nix = { workspace = true, features = ["dir"] }
+ureq.workspace = true
+minisign-verify.workspace = true
+sha2.workspace = true
+semver.workspace = true
+toml = { workspace = true, features = ["display"] }
+tar.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"] }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http-body-util.workspace = true
+
+[lints]
+workspace = true

@@ -7,7 +7,7 @@
 # distribution test serves it to install.sh).
 #
 # scripts/install.sh pins the same version and checksum (it downloads this
-# tarball when minisign is not installed); a unit test in crates/puzuz keeps
+# tarball when minisign is not installed); a unit test in crates/gpueue keeps
 # the two in sync.
 #
 # Usage: scripts/dist/get-minisign.sh DIR

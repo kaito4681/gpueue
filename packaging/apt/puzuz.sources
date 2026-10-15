@@ -1,6 +1,0 @@
-# The puzuz APT repository, installed by the puzuz package (see
-# /usr/share/doc/puzuz/install.md). Edits are kept on upgrades.
-Types: deb
-URIs: https://github.com/kaito4681/puzuz/releases/download/apt/
-Suites: ./
-Signed-By: /etc/apt/keyrings/puzuz.gpg

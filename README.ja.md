@@ -1,10 +1,10 @@
-<a id="puzuz"></a>
-# puzuz
+<a id="gpueue"></a>
+# gpueue
 
 [English](README.md) | 日本語 | [简体中文](README.zh-CN.md)
 
 複数のユーザーで共有する 1 台の Linux マシン向けの GPU ジョブキューです。CLI は
-[pueue](https://github.com/Nukesor/pueue) と同じように使えます。puzuz はその上に 2 つの機能を加えます。GPU
+[pueue](https://github.com/Nukesor/pueue) と同じように使えます。gpueue はその上に 2 つの機能を加えます。GPU
 スロットと、[CRIU](https://criu.org) と NVIDIA [cuda-checkpoint](https://github.com/NVIDIA/cuda-checkpoint)
 による実行中ジョブの透過的なチェックポイント/リストア（CPU、メモリ、GPU の状態）です。マシンの再起動時にまだ
 動いている学習はディスクに保存され、止まったところから再開します。最初からやり直すことはありません。
@@ -19,17 +19,17 @@
 > リリースから使えるようになります。
 
 <a id="why"></a>
-## なぜ puzuz か
+## なぜ gpueue か
 
 共有の GPU ワークステーションでは、ジョブを `nohup` や `tmux`、ユーザーごとの pueue で動かし、GPU の取り合いを
 チャットで調整するのが普通です。カーネルやドライバーの更新のための再起動は、すべての学習を止めてしまいます。
-puzuz は次のものを提供します。
+gpueue は次のものを提供します。
 
 - **全員で 1 つのキュー**：システム全体のデーモンが全ユーザーのジョブをスケジュールし、誰がどの GPU を
   使っているかを表示します。
 - **GPU スロット**：ジョブは特定の GPU を要求し（`--gpu 0,1`）、それらが空いたときにだけ開始します。
-- **チェックポイント/リストア**：実行中のジョブは、OS のシャットダウン時、`puzuz shutdown` の実行時、または
-  `puzuz checkpoint` で必要なときに保存されます。あとで `puzuz restore` で再開できます。コードを変更する
+- **チェックポイント/リストア**：実行中のジョブは、OS のシャットダウン時、`gpueue shutdown` の実行時、または
+  `gpueue checkpoint` で必要なときに保存されます。あとで `gpueue restore` で再開できます。コードを変更する
   必要はありません。
 
 <a id="features"></a>
@@ -38,20 +38,20 @@ puzuz は次のものを提供します。
 - pueue 互換のコマンド：`add`、`status`、`log`、`follow`、`wait`、`pause`、`start`、`kill`、
   `remove`、`restart`、`clean`、`reset`、`stash`、`enqueue`、`switch`、`group`、`parallel`、
   `shutdown`、`completions`。加えて、グループ、依存関係（`--after`）、優先度、遅延実行、ラベル。
-- GPU スロット：GPU ごとに同時に実行できるジョブ数の上限（`puzuz gpu parallel`）。各ジョブには
+- GPU スロット：GPU ごとに同時に実行できるジョブ数の上限（`gpueue gpu parallel`）。各ジョブには
   `CUDA_VISIBLE_DEVICES` と `CUDA_DEVICE_ORDER=PCI_BUS_ID` が設定されます。GPU は NVML で検出します。
 - ユーザー間の公平な共有：Slurm 式のマルチファクター優先度（減衰する使用量によるフェアシェア、待ち時間、
-  nice、`top`。`puzuz prio` と `puzuz share` で数値を確認できます）。
+  nice、`top`。`gpueue prio` と `gpueue share` で数値を確認できます）。
 - CPU と CUDA プロセスの透過的なチェックポイント/リストア。DataLoader のワーカーを fork する PyTorch の
   ジョブも含みます（[fork ガード](#limitations) を参照）。
 - OS のシャットダウンや再起動のときに、実行中の全ジョブを自動でチェックポイントします。
 - マルチユーザー：ジョブはその所有者として実行されます。他のユーザーはジョブが存在することは分かりますが、
-  そのコマンド、環境変数、ログは見えません。管理者は root と `puzuz-admin` グループです。
-- 権限分離：デーモン（HTTP API、スケジューラー、SQLite）は特権のないシステムユーザー `puzuz` として
+  そのコマンド、環境変数、ログは見えません。管理者は root と `gpueue-admin` グループです。
+- 権限分離：デーモン（HTTP API、スケジューラー、SQLite）は特権のないシステムユーザー `gpueue` として
   動きます。ジョブの起動と CRIU の実行は、小さな root ヘルパーだけが行います。
 - ジョブはそれぞれ専用の systemd ユニットで動くため、デーモンやヘルパーを再起動しても（たとえば
   アップグレード中でも）動き続けます。
-- `puzuz doctor` がインストール状態を確認し、問題ごとにそれを直すコマンドを表示します。
+- `gpueue doctor` がインストール状態を確認し、問題ごとにそれを直すコマンドを表示します。
 
 <a id="quick-start"></a>
 ## クイックスタート
@@ -62,93 +62,93 @@ puzuz は次のものを提供します。
 ### インストール（管理者）
 
 systemd と glibc 2.34 以降を備えた x86_64 または aarch64 の Linux（Ubuntu 22.04 以降、Debian 12 以降、
-RHEL 9 以降）では、インストーラーが最新のリリースをダウンロードして検証し、puzuz を /usr/local/bin に
+RHEL 9 以降）では、インストーラーが最新のリリースをダウンロードして検証し、gpueue を /usr/local/bin に
 インストールします。
 
 ```sh
-curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.sh | sudo bash
 ```
 
-インストーラーは systemd ユニット、`puzuz` ユーザー、`puzuz-admin` グループ、ディレクトリ、デフォルトの
-/etc/puzuz/config.toml を用意し、サービスを起動して `puzuz doctor` のレポートを表示します。CRIU と
-cuda-checkpoint はインストールしません。足りない場合はそう伝えます。あとで `sudo puzuz update` で更新できます
-（実行中のジョブは動き続けます）。削除は `sudo puzuz uninstall` で行い、データは残ります（`--purge` を付けると
+インストーラーは systemd ユニット、`gpueue` ユーザー、`gpueue-admin` グループ、ディレクトリ、デフォルトの
+/etc/gpueue/config.toml を用意し、サービスを起動して `gpueue doctor` のレポートを表示します。CRIU と
+cuda-checkpoint はインストールしません。足りない場合はそう伝えます。あとで `sudo gpueue update` で更新できます
+（実行中のジョブは動き続けます）。削除は `sudo gpueue uninstall` で行い、データは残ります（`--purge` を付けると
 データも削除します）。GitHub のトークンは不要です（`GH_TOKEN` が設定されていれば使いますが、API のレート
 制限が上がるだけです）。
 
-Debian と Ubuntu（amd64 または arm64）では、代わりに puzuz の APT リポジトリ（GitHub リリースの `apt`）
+Debian と Ubuntu（amd64 または arm64）では、代わりに gpueue の APT リポジトリ（GitHub リリースの `apt`）
 からパッケージをインストールできます。`curl` と `ca-certificates` が必要で、最新の安定版とアーキテクチャは
 apt が選びます。
 
 ```sh
-sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
-sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
-sudo apt update && sudo apt install puzuz
+sudo curl -fsSLo /etc/apt/keyrings/gpueue.gpg https://github.com/kaito4681/gpueue/releases/download/apt/gpueue.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/gpueue.sources https://github.com/kaito4681/gpueue/releases/download/apt/gpueue.sources
+sudo apt update && sudo apt install gpueue
 ```
 
 または、最新リリースの `.deb` を直接インストールします（同じリポジトリが登録されます）。
 
 ```sh
 arch=$(dpkg --print-architecture)
-curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
-sudo apt install "./puzuz_${arch}.deb"
+curl -fLO "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue_${arch}.deb"
+sudo apt install "./gpueue_${arch}.deb"
 ```
 
 同じサービスをインストールして起動し、`criu` を推奨パッケージとします（前提条件は
 [docs/ja/install.md](docs/ja/install.md#installing-the-debianubuntu-package) を参照）。どちらの方法でも、
-以降のバージョンは `sudo apt update && sudo apt upgrade` で入ります。`sudo apt remove puzuz` はサービスを
-停止し、`sudo apt purge puzuz` は /etc/puzuz も削除します。どちらも /var/lib/puzuz と実行中のジョブは
+以降のバージョンは `sudo apt update && sudo apt upgrade` で入ります。`sudo apt remove gpueue` はサービスを
+停止し、`sudo apt purge gpueue` は /etc/gpueue も削除します。どちらも /var/lib/gpueue と実行中のジョブは
 残します。
 
 Fedora、RHEL、Rocky、Alma Linux 9 以降（x86_64 または aarch64）では、リリースの .rpm をインストール
 します（dnf は URL をそのまま受け付けます）。
 
 ```sh
-sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
+sudo dnf install "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue.$(uname -m).rpm"
 ```
 
 これらの URL は常に最新の安定版リリースを指します（`releases/latest` はプレリリースを飛ばします）。特定の
-バージョン用に、バージョン付きのファイル（`puzuz_<version>_<arch>.deb`、`puzuz-<version>-1.<arch>.rpm`）
+バージョン用に、バージョン付きのファイル（`gpueue_<version>_<arch>.deb`、`gpueue-<version>-1.<arch>.rpm`）
 も添付されています。どのファイルにも `.sha256` と `.minisig` があります
 （[リリースを手動で検証する](docs/ja/install.md#verifying-a-release-by-hand) を参照）。
 
 dnf リポジトリはまだありません（予定、issue #23）。更新するには、同じコマンドを `sudo dnf upgrade`
-で実行します。`sudo dnf remove puzuz` はサービスを停止し、
-/var/lib/puzuz と実行中のジョブは残します。`criu` を推奨パッケージとします。Fedora のものは十分に新しい
+で実行します。`sudo dnf remove gpueue` はサービスを停止し、
+/var/lib/gpueue と実行中のジョブは残します。`criu` を推奨パッケージとします。Fedora のものは十分に新しい
 ですが、Rocky/RHEL 9 には 3.19 しかないため、チェックポイントにはより新しい CRIU が必要です（CRIU が
 なくてもジョブは実行できます）。ソースからビルドしたり、Nix flake を使ったりもできます
 （[docs/ja/install.md](docs/ja/install.md) を参照）。
 
-NixOS では、flake のモジュール（`github:kaito4681/puzuz/stable`、`nixosModules.default`）をインポートし、
-`services.puzuz.enable = true` を設定します（[NixOS](docs/ja/install.md#nixos) を参照）。home-manager の
+NixOS では、flake のモジュール（`github:kaito4681/gpueue/stable`、`nixosModules.default`）をインポートし、
+`services.gpueue.enable = true` を設定します（[NixOS](docs/ja/install.md#nixos) を参照）。home-manager の
 ユーザーは `homeManagerModules.default` で CLI の補完を追加できます。他のディストリビューション上の Nix
 （x86_64 または aarch64）では、flake をビルドし、その結果からサービスをインストールします（バイナリは
 /usr/local/bin にコピーされ、Nix のガベージコレクションから保護されます。
 [Nix でのインストール](docs/ja/install.md#installing-with-nix) を参照）。
 
 ```sh
-nix build github:kaito4681/puzuz/stable
-sudo ./result/bin/puzuz service install
+nix build github:kaito4681/gpueue/stable
+sudo ./result/bin/gpueue service install
 ```
 
-Arch Linux（x86_64、aarch64）では、当面は上記のインストーラーを使ってください。AUR パッケージ `puzuz-bin`
+Arch Linux（x86_64、aarch64）では、当面は上記のインストーラーを使ってください。AUR パッケージ `gpueue-bin`
 はまだ公開されていません。CRIU（チェックポイントには 4.2 以降）は公式リポジトリにあります。
 
 ```sh
 sudo pacman -S criu
-curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.sh | sudo bash
 ```
 
-`sudo puzuz update` で更新し、`sudo puzuz uninstall` で削除します。パッケージが AUR に公開されたら、
-代わりに任意の AUR ヘルパーで [`puzuz-bin`](https://aur.archlinux.org/packages/puzuz-bin) を
+`sudo gpueue update` で更新し、`sudo gpueue uninstall` で削除します。パッケージが AUR に公開されたら、
+代わりに任意の AUR ヘルパーで [`gpueue-bin`](https://aur.archlinux.org/packages/gpueue-bin) を
 インストールできます（[docs/ja/install.md](docs/ja/install.md#arch-linux-aur) を参照）。
 
 ```sh
 # Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.
-puzuz doctor
+gpueue doctor
 
 # Optional: make someone an administrator.
-sudo usermod -aG puzuz-admin alice
+sudo usermod -aG gpueue-admin alice
 ```
 
 一般ユーザーは何もインストールする必要はありません。
@@ -159,53 +159,53 @@ sudo usermod -aG puzuz-admin alice
 ```sh
 # Queue a job on GPU 0. The command runs through `sh -c` in the current directory, with your
 # environment.
-puzuz add --gpu 0 -l resnet -- 'python train.py --epochs 100'
+gpueue add --gpu 0 -l resnet -- 'python train.py --epochs 100'
 
-puzuz status          # all jobs of all users (others' commands are hidden)
-puzuz gpu             # GPUs, slots in use, and which jobs hold them
-puzuz log 0           # the last lines of job 0's output
-puzuz follow 0        # stream the output, like tail -f
+gpueue status          # all jobs of all users (others' commands are hidden)
+gpueue gpu             # GPUs, slots in use, and which jobs hold them
+gpueue log 0           # the last lines of job 0's output
+gpueue follow 0        # stream the output, like tail -f
 ```
 
 <a id="checkpoint-and-restore"></a>
 ### チェックポイントとリストア
 
 ```sh
-puzuz checkpoint 0    # save job 0 to disk and stop it; frees the GPU. State: Checkpointed
-puzuz restore 0       # queue it again; it resumes once its group and GPUs have a free slot
-puzuz restore -i 0    # ...or put it first among your queued jobs (administrators: resume right away; see "Job priority")
+gpueue checkpoint 0    # save job 0 to disk and stop it; frees the GPU. State: Checkpointed
+gpueue restore 0       # queue it again; it resumes once its group and GPUs have a free slot
+gpueue restore -i 0    # ...or put it first among your queued jobs (administrators: resume right away; see "Job priority")
 ```
 
 リストアされたジョブは、チェックポイントされた瞬間から処理を続けます。ジョブ ID は変わらず、出力は同じログに
 追記されます。
 
 一時停止中のジョブもチェックポイントできます（再起動時も同様です）。一時停止したままリストアされ、GPU
-スロットも保持したままです。`puzuz start` で再開します。CRIU と cuda-checkpoint は実行中のプロセスを
+スロットも保持したままです。`gpueue start` で再開します。CRIU と cuda-checkpoint は実行中のプロセスを
 必要とするため、ダンプの間はジョブが一瞬だけ動きます。リストアは停止したままのジョブを戻すので、
-`puzuz start` までジョブは（一瞬たりとも）何も実行しません。チェックポイントの処理中は `puzuz pause` は
+`gpueue start` までジョブは（一瞬たりとも）何も実行しません。チェックポイントの処理中は `gpueue pause` は
 拒否されます。
 
 <a id="what-happens-on-reboot"></a>
 ### 再起動時に何が起きるか
 
-1. OS がシャットダウンするとき、`puzuz-helper.service` はファイルシステムや NVIDIA のサービスより先に
+1. OS がシャットダウンするとき、`gpueue-helper.service` はファイルシステムや NVIDIA のサービスより先に
    停止されます。このとき実行中のジョブを 1 つずつチェックポイントします。`--no-checkpoint` のジョブは
    単に終了されます。
 2. 起動後、それらのジョブは `Checkpointed` として表示されます。キューで待っていたジョブはそのまま待機し、
    通常どおり開始します。
-3. 各所有者（または管理者）が `puzuz restore <id>` か `puzuz restore -a` でジョブを再開します。リストアが
+3. 各所有者（または管理者）が `gpueue restore <id>` か `gpueue restore -a` でジョブを再開します。リストアが
    自動で始まることはありません。
 
 チェックポイントがうまくいかない場合は 2 通りあります。
 
 - **拒否：** ジョブに触れる前にヘルパーのチェックが失敗した場合です（空き容量が足りない、決してリストア
-  できないマウントがある、など）。ジョブは動き続けます。`puzuz checkpoint` は理由を示して失敗します。
-  ダンプを行う時点になって初めて拒否された場合（たとえば `puzuz shutdown` の最中）、所有者は次に `puzuz`
-  コマンドを実行したときに警告を受けます。理由は `puzuz status` と `puzuz log` でジョブの最後のエラーとして
+  できないマウントがある、など）。ジョブは動き続けます。`gpueue checkpoint` は理由を示して失敗します。
+  ダンプを行う時点になって初めて拒否された場合（たとえば `gpueue shutdown` の最中）、所有者は次に `gpueue`
+  コマンドを実行したときに警告を受けます。理由は `gpueue status` と `gpueue log` でジョブの最後のエラーとして
   表示されます。
 - **失敗：** ダンプ自体が失敗した場合です。CRIU はジョブを元に戻しますが、ジョブは一度凍結されているため
   停止され（SIGTERM で自分のチェックポイントを保存する機会を与え、`grace_secs` 後に SIGKILL）、理由とともに
-  `Checkpoint failed` と表示されます。所有者は次に `puzuz` コマンドを実行したときに警告を受けます。
+  `Checkpoint failed` と表示されます。所有者は次に `gpueue` コマンドを実行したときに警告を受けます。
 
 OS のシャットダウンや再起動の間は、保存できなかったジョブは、ダンプが拒否されたか失敗したかにかかわらず、
 すべて systemd によって停止されます。起動後は理由とともに `Checkpoint failed` と表示され、所有者に警告が
@@ -214,22 +214,22 @@ OS のシャットダウンや再起動の間は、保存できなかったジ�
 <a id="pueue-compatibility-and-differences"></a>
 ## pueue との互換性と違い
 
-コマンド名、オプション、表のレイアウトは pueue 4.0 に合わせているので、`pueue` を `puzuz` に置き換えれば、
-pueue での習慣やスクリプトの多くはそのまま使えます。puzuz が真似ているのは CLI だけです。pueue の
+コマンド名、オプション、表のレイアウトは pueue 4.0 に合わせているので、`pueue` を `gpueue` に置き換えれば、
+pueue での習慣やスクリプトの多くはそのまま使えます。gpueue が真似ているのは CLI だけです。pueue の
 プロトコルは話さず、pueue のファイルも読みません。違いは次のとおりです。
 
-| 項目 | pueue | puzuz |
+| 項目 | pueue | gpueue |
 | --- | --- | --- |
-| デーモン | ユーザーごとに 1 つ、ユーザーが起動（`pueued`） | システム全体で 1 つ、systemd が実行（`puzuz daemon`、ユーザー `puzuz`）。ユーザーがデーモンを起動することはありません。 |
-| デーモンの選択 | `-c/--config`、`-p/--profile` | `--socket <path>`（環境変数 `PUZUZ_SOCKET`、デフォルトは `/run/puzuz/puzuz.sock`） |
+| デーモン | ユーザーごとに 1 つ、ユーザーが起動（`pueued`） | システム全体で 1 つ、systemd が実行（`gpueue daemon`、ユーザー `gpueue`）。ユーザーがデーモンを起動することはありません。 |
+| デーモンの選択 | `-c/--config`、`-p/--profile` | `--socket <path>`（環境変数 `GPUEUE_SOCKET`、デフォルトは `/run/gpueue/gpueue.sock`） |
 | `send` | タスクの stdin に入力を送る | 非対応：ジョブの stdin は `/dev/null` です。コマンドを非対話的にしてください。 |
 | `shutdown` | 全タスクを kill してデーモンを停止 | 管理者のみ。実行中の全ジョブをチェックポイントしてからデーモンを停止します。チェックポイントが拒否されたジョブは動き続けます。`--no-checkpoint` を付けると代わりに kill します。 |
 | `restart` | 終了したタスク | `Checkpointed` のジョブにも使えます。新しいジョブとして最初からやり直し、イメージは残ります。 |
-| `start <id>`、`add -i`、`restart -i`（と `restore -i`） | すべての上限を無視してすぐにタスクを開始 | すべての上限を無視してすぐに開始するのは管理者だけです。それ以外のユーザーのジョブは自分のジョブの先頭にキューされ（`puzuz top` と同じ）、ほかのキュー中のジョブと同じく順番を待ちます（[ジョブの優先度](#job-priority)を参照） |
+| `start <id>`、`add -i`、`restart -i`（と `restore -i`） | すべての上限を無視してすぐにタスクを開始 | すべての上限を無視してすぐに開始するのは管理者だけです。それ以外のユーザーのジョブは自分のジョブの先頭にキューされ（`gpueue top` と同じ）、ほかのキュー中のジョブと同じく順番を待ちます（[ジョブの優先度](#job-priority)を参照） |
 | `reset`、`-a/--all`、`-g/--group` | 全タスク | 自分のジョブ。管理者は全員のジョブに作用します。 |
 | `pause/start/kill -a`、`-g` | グループも一時停止/再開 | グループを一時停止/再開するのは管理者だけです。それ以外のユーザーの場合、グループはそのままです。 |
 | 用語 | "task" | "job"。`--print-task-id` などのオプション名は互換性のためにそのままです。 |
-| `--json` | pueue の内部状態 | puzuz 独自のスキーマ（後述） |
+| `--json` | pueue の内部状態 | gpueue 独自のスキーマ（後述） |
 | `edit`、`env`、`restart --edit` | 対応 | 受け付けますが、まだ実装されていません |
 | `add -o/--priority`、`switch` | デーモンの全タスクを並べ替える | 自分のジョブだけを並べ替えます。どのユーザーのジョブを先に開始するかは、フェアシェアを含む Slurm 式のマルチファクター優先度で決まります（[ジョブの優先度](#job-priority) を参照）。`priority_type = "basic"` で pueue の順序に戻ります。 |
 | コールバック、エイリアス、`pueue.yml` | 対応 | ありません |
@@ -250,7 +250,7 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 | `site <IDS>... <N>`、`group priority <GROUP> <N>` | ジョブのサイトファクター、グループの優先度を設定します（管理者） |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | systemd サービスを管理します。install は最後のチェックが失敗すると 0 以外で終了します（[docs/ja/install.md](docs/ja/install.md) を参照） |
 | `uninstall [--purge] [--yes]` | サービスと、`service install` がコピーしたバイナリを削除します（root が必要） |
-| `update [--check] [--version V] [-y]` | 最新（または指定した）リリースに puzuz を更新します。root が必要で、root でなければ確認だけを行います（[docs/ja/install.md](docs/ja/install.md#upgrading) を参照） |
+| `update [--check] [--version V] [-y]` | 最新（または指定した）リリースに gpueue を更新します。root が必要で、root でなければ確認だけを行います（[docs/ja/install.md](docs/ja/install.md#upgrading) を参照） |
 | `doctor` | インストール状態を確認します |
 | `daemon` | デーモンをフォアグラウンドで実行します（systemd がこれを行います） |
 
@@ -261,7 +261,7 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 <a id="json-output"></a>
 ### JSON 出力
 
-`puzuz status --json` は `{"groups": [...], "jobs": [...]}` を出力します。
+`gpueue status --json` は `{"groups": [...], "jobs": [...]}` を出力します。
 
 ```json
 {
@@ -289,15 +289,15 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 - `waiting` は、管理者以外がすぐに実行しようとしたものの GPU スロットか一時停止中のグループを待っている
   キュー中のジョブにだけ付きます：`{"reason": "gpu_slots", "gpus": [0]}`、`{"reason": "group_paused"}`、
   `{"reason": "unavailable"}` のいずれかです。
-- `puzuz log --json` は `{"<id>": {"job": <job>, "output": "..."}}` を出力します。`puzuz group --json` は
-  `{"groups": [...]}` を出力します。`puzuz gpu --json` は
+- `gpueue log --json` は `{"<id>": {"job": <job>, "output": "..."}}` を出力します。`gpueue group --json` は
+  `{"groups": [...]}` を出力します。`gpueue gpu --json` は
   `{"gpus": [{"index", "uuid", "name", "memory_total_bytes", "driver_version", "parallel",
   "used", "jobs": [{"id", "owner"}]}]}` を出力し、`"available": false` は消えた GPU を示します。
-- `puzuz prio --json` は `{"priority_type", "weights": {"age", "fairshare", "job_size",
+- `gpueue prio --json` は `{"priority_type", "weights": {"age", "fairshare", "job_size",
   "partition", "tres"}, "jobs": [{"id", "owner", "group", "priority", "factors": {"age",
   "fairshare", "job_size", "partition", "tres_cpu", "tres_gpu"}, "weighted": {"age", "fairshare",
   "job_size", "partition", "tres"}, "site", "nice"}]}` を出力し、ジョブはスケジュール順に並びます。
-  `puzuz share --json` は `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
+  `gpueue share --json` は `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
   "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
   "usage_reset_period", "billing_weights", "usage_calc_at"}` を出力します。
 
@@ -308,13 +308,13 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   クライアントが他人になりすますことはできません。
 - 各ジョブは、それを追加したユーザーのものです。そのユーザーの uid、gid、補助グループで、`no_new_privs` を
   設定し、すべてのケーパビリティを落とした状態で実行されます。コマンドは追加したときのディレクトリで、
-  `puzuz add` を実行したときの環境変数で実行されます。
+  `gpueue add` を実行したときの環境変数で実行されます。
 - root ヘルパーは、システムアカウント（uid が `job_min_uid` 未満。既定は `/etc/login.defs` の `UID_MIN`）、
   `job_allowed_users` が設定されているときにそこに含まれないユーザー、プライマリグループが root 相当の
   グループ（`job_denied_groups`。既定は `docker`、`lxd`、`incus-admin`、`libvirt`、`libvirtd`、`disk`、`sudo`、
   `wheel`、`admin`）であるユーザーのジョブを拒否します。これらのグループはすべてのジョブの補助グループから
   外されるので、所有者が Docker や sudo を使えてもジョブからは使えません（外したグループはヘルパーのジャーナルに記録されます）。
-  拒否されたジョブは `puzuz refuses to run jobs as <user>: <reason>` という理由で起動に失敗します。
+  拒否されたジョブは `gpueue refuses to run jobs as <user>: <reason>` という理由で起動に失敗します。
   [ジョブを実行できるユーザー](docs/ja/install.md#who-jobs-may-run-as)を参照してください。
 - 所有者が root になれる場合でも、ジョブは root になることも root として操作することもできません。`no_new_privs`
   のもとでは setuid プログラム（`sudo`、`su`、`pkexec`）は権限を得られず、ジョブのユニットからはシステムの D-Bus
@@ -348,16 +348,16 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 - **ジョブをすぐに実行できるのは管理者だけです**（`start <id>`、`add -i`、`restart -i`、`restore -i`）。
   管理者のものはすべての上限を無視します。それ以外のユーザーのジョブは自分のジョブの先頭にキューされます
   （[ジョブの優先度](#job-priority)を参照）。
-- 管理者は root と `puzuz-admin` グループのメンバー（プライマリまたは補助グループ）です。チェックは
-  リクエストごとに行われるので、`usermod -aG puzuz-admin <user>` はすぐに反映されます。
+- 管理者は root と `gpueue-admin` グループのメンバー（プライマリまたは補助グループ）です。チェックは
+  リクエストごとに行われるので、`usermod -aG gpueue-admin <user>` はすぐに反映されます。
 
 <a id="gpu-slots"></a>
 ## GPU スロット
 
-- `puzuz add --gpu 0,1 ...` は、そのグループに空きスロットがあり、かつ指定した**すべての** GPU に空き
+- `gpueue add --gpu 0,1 ...` は、そのグループに空きスロットがあり、かつ指定した**すべての** GPU に空き
   スロットがあるときにだけジョブを開始します。デーモンは知らない GPU 番号を拒否します。
-- デフォルトでは各 GPU で同時に実行できるジョブは 1 つです。管理者は `puzuz gpu parallel 2`（全 GPU）や
-  `puzuz gpu parallel 2 --gpu 1` で変更できます。`0` は無制限を意味します。スロットが数えるのはジョブの数で、
+- デフォルトでは各 GPU で同時に実行できるジョブは 1 つです。管理者は `gpueue gpu parallel 2`（全 GPU）や
+  `gpueue gpu parallel 2 --gpu 1` で変更できます。`0` は無制限を意味します。スロットが数えるのはジョブの数で、
   VRAM ではありません。
 - GPU 番号は PCI バスの順序に従います。これは `nvidia-smi` や `CUDA_DEVICE_ORDER=PCI_BUS_ID` と同じ順序です。
   ジョブの中では `CUDA_VISIBLE_DEVICES` に要求した GPU が並ぶので、プログラムからは `cuda:0`、`cuda:1`、…
@@ -375,7 +375,7 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   適用されます。`start <id>`、`add -i`、`restart -i`、`restore -i` でも同じです（[ジョブの優先度](#job-priority)を
   参照）。これらを無視するのは管理者の即時実行だけです。
 - GPU はデーモンの起動時に NVML で検出されます（設定の `[[gpus]]` のリストはフォールバックにすぎません）。
-  GPU を追加・取り外ししたら `puzuz.service` を再起動してください。`puzuz doctor` はデーモンが検出したものと
+  GPU を追加・取り外ししたら `gpueue.service` を再起動してください。`gpueue doctor` はデーモンが検出したものと
   `nvidia-smi` を比較します。
 
 <a id="job-priority"></a>
@@ -385,13 +385,13 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 優先度は Slurm の multifactor プラグインに従います。デフォルトでは、フェアシェアの要素（最近マシンをあまり
 使っていないユーザーが先。使用量は半減期 7 日で減衰します）と待ち時間の要素（待っていた時間）の合計から、
 ジョブの nice 値を引いたものです。ジョブのサイズ、グループ（パーティション）、GPU ごと（TRES）の要素を
-重みに加えることもできます。自分で付けた `-o` の優先度、`switch`、`puzuz top` が並べ替えるのは自分の
+重みに加えることもできます。自分で付けた `-o` の優先度、`switch`、`gpueue top` が並べ替えるのは自分の
 ジョブだけです。管理者以外が pueue の即時実行（キュー中または stash されたジョブの `start <id>`、`add -i`、
-`restart -i`、`restore -i`）を使った場合も同じで、ジョブは `puzuz top` とまったく同じように自分のジョブの
+`restart -i`、`restore -i`）を使った場合も同じで、ジョブは `gpueue top` とまったく同じように自分のジョブの
 先頭にキューされ、その後はグループの `parallel` の上限、GPU スロット、一時停止中のグループ、依存関係の
 もとで他のユーザーのジョブと順番を競います。コマンドは、開始ではなくキューされたことを表示します。
 `enable_user_top = false`（または `priority_type = "basic"`）のときは、単にキューされます。一時停止中の
-ジョブの `start` はこれまでどおり再開です。管理者の即時実行はすべての上限を無視してすぐに開始します。`puzuz prio` はジョブがその位置にある理由を、`puzuz share` は全員の使用量を表示します。
+ジョブの `start` はこれまでどおり再開です。管理者の即時実行はすべての上限を無視してすぐに開始します。`gpueue prio` はジョブがその位置にある理由を、`gpueue share` は全員の使用量を表示します。
 計算式と設定は [優先度とフェアシェア](docs/ja/install.md#priority-and-fair-share) を参照してください。
 
 <a id="requirements"></a>
@@ -423,8 +423,8 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   ジョブをリストアするには、それらのファイルシステムがすべて同じパスに再びマウントされている必要があります。
   そうでなければリストアは拒否され、イメージは残ります。`/scratch` のような tmpfs 上のファイルは再起動後に
   残りません。[ファイルシステムとマウント](docs/ja/install.md#filesystems-and-mounts) を参照してください。
-- **クラッシュ耐性なし：** チェックポイントが取られるのは、正常なシャットダウン、`puzuz shutdown`、
-  `puzuz checkpoint` のときだけです。電源断、カーネルパニック、ハードリセットでは何も保存されません。定期的な
+- **クラッシュ耐性なし：** チェックポイントが取られるのは、正常なシャットダウン、`gpueue shutdown`、
+  `gpueue checkpoint` のときだけです。電源断、カーネルパニック、ハードリセットでは何も保存されません。定期的な
   チェックポイントはまだありません。学習自体のチェックポイントも引き続き保存してください。
 - **fork ガード：** CUDA プロセスが `exec` せずに fork した子プロセス（たとえば `fork` 開始方式の PyTorch
   DataLoader ワーカー）は、CRIU が保存できない NVIDIA デバイスのマッピングを引き継ぎます。ヘルパーは
@@ -461,10 +461,10 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
     加えたディスク容量が必要で、1 ジョブずつ書き込まれます。
     テストでは、7 GB の VRAM を使うジョブのダンプに約 10〜20 秒かかりました。
 - **`/` を覆うマウント：** ルートディレクトリが別のマウントで覆われているジョブはチェックポイントできません。
-  puzuz はダンプを拒否し、理由を伝えます。ジョブは動き続けます。
+  gpueue はダンプを拒否し、理由を伝えます。ジョブは動き続けます。
 - チェックポイントのイメージは、そのジョブが存在する間は自動で削除されることはありません。削除されるのは、
   ジョブのリストアが成功したとき、ジョブが削除されたとき（`remove`、`clean`、`reset`）、またはダンプが
-  失敗したときです。`checkpoint_size_limit_bytes` を超えると puzuz は警告しますが、拒否はしません。
+  失敗したときです。`checkpoint_size_limit_bytes` を超えると gpueue は警告しますが、拒否はしません。
 - まだないもの：`edit`、`env`、定期的なチェックポイント、ジョブを動かしたままのチェックポイント、完全な
   チェックポイントなしでの GPU の解放（"GPU suspend"）、Web UI や TCP API、VRAM で数えるスロット。
 
@@ -474,24 +474,24 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 プレリリース（バージョン 0.1.0）。これまでにテストしたもの：
 
 - すべてのクレートのユニットテストと統合テスト（`scripts/test-in-docker.sh`）。
-- PID 1 の systemd 259、CRIU 4.2、`puzuz service install` でインストールしたバイナリを使った、特権 Docker
+- PID 1 の systemd 259、CRIU 4.2、`gpueue service install` でインストールしたバイナリを使った、特権 Docker
   コンテナ内でのフルスタックのエンドツーエンドテスト（`scripts/e2e-test.sh`）。テストは、基本的なキュー操作、
   3 ユーザーでの認可、グループと GPU の上限、チェックポイント/リストア、デーモンとヘルパーの再起動、一度に
-  大量に追加したジョブ、`puzuz shutdown`、そして擬似的な再起動をカバーしています。擬似的な再起動では、
+  大量に追加したジョブ、`gpueue shutdown`、そして擬似的な再起動をカバーしています。擬似的な再起動では、
   コンテナを systemd でシャットダウンし、新しいコンテナでジョブをリストアします。別の ext4 ファイルシステム、
   バインドマウント、`x-systemd.automount`、overlayfs、tmpfs、sshfs 上で作業するジョブで、それらが新しい
   マウントとして戻ってくる場合も含みます。
 - Docker 内の本物の GPU（ドライバー 595、manual モードの CRIU 4.2.1、Python 3.12 上の PyTorch 2.8）で：
   CUDA のカウンターと、fork された DataLoader ワーカーを使う PyTorch の学習のチェックポイント/リストア
-  （結果は中断しなかった実行と同一）、およびパッケージ化されサンドボックス化された `puzuz.service` 内での
+  （結果は中断しなかった実行と同一）、およびパッケージ化されサンドボックス化された `gpueue.service` 内での
   デーモンによる NVML の GPU 検出。
 - QEMU/KVM 仮想マシンの実際の OS の再起動と電源断（`scripts/vm-reboot-test.sh`）：systemd 259 と CRIU 4.2
-  の Ubuntu 26.04 に `puzuz service install` で puzuz をインストールし、`/var/lib/puzuz` を専用の ext4
+  の Ubuntu 26.04 に `gpueue service install` で gpueue をインストールし、`/var/lib/gpueue` を専用の ext4
   ディスクに置き、2 ユーザーの CPU ジョブと `--no-checkpoint` のジョブを動かします。シナリオは
-  `systemctl reboot`、`systemctl poweroff` の後の新規起動、そして 1 GiB のジョブの `puzuz checkpoint` が
+  `systemctl reboot`、`systemctl poweroff` の後の新規起動、そして 1 GiB のジョブの `gpueue checkpoint` が
   まだ実行中の再起動です。起動のたびに、前回の起動のジャーナルが停止順序（最初にデーモンが停止し、ヘルパーは
   自身が停止する前にジョブをダンプし、`--no-checkpoint` のジョブのユニットはヘルパーの後にだけ停止し、最後に
-  `/var/lib/puzuz` がアンマウントされる）を示し、
+  `/var/lib/gpueue` がアンマウントされる）を示し、
   タイムアウトや SIGKILL がないこと、`--no-checkpoint` のジョブが SIGTERM を受け取ったこと、リストアした
   ジョブが止まったところからカウントを続けることを確認します。
 
@@ -516,15 +516,15 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
 ## コーディングエージェント向け Agent Skill
 
 このリポジトリには、コーディングエージェント（Claude Code、Codex、Cursor など）に一般ユーザーとしての
-puzuz の使い方を教える [Agent Skill](https://agentskills.io) が [skills/puzuz](skills/puzuz/SKILL.md)
+gpueue の使い方を教える [Agent Skill](https://agentskills.io) が [skills/gpueue](skills/gpueue/SKILL.md)
 に含まれています。内容は、デーモンが動いているかの確認、作業ディレクトリ・環境変数・`--gpu` を正しく
-指定したジョブの追加、ログの追跡、ポーリングの代わりに `puzuz wait` で待つこと、pause/kill/restart、
+指定したジョブの追加、ログの追跡、ポーリングの代わりに `gpueue wait` で待つこと、pause/kill/restart、
 checkpoint/restore、`--json` 出力、よくあるエラー、安全のためのルール（自分のジョブだけを操作し、`sudo`
 や管理者コマンドは使わない）です。[skills](https://github.com/vercel-labs/skills) CLI でインストールします。
 
 ```sh
-npx skills add kaito4681/puzuz              # このプロジェクトのみ。全プロジェクトなら -g
-npx skills add kaito4681/puzuz -g -a claude-code -y
+npx skills add kaito4681/gpueue              # このプロジェクトのみ。全プロジェクトなら -g
+npx skills add kaito4681/gpueue -g -a claude-code -y
 ```
 
 <a id="documentation"></a>
@@ -549,15 +549,15 @@ scripts/e2e-test.sh               # full stack under systemd in a privileged con
 scripts/vm-reboot-test.sh         # real reboot/poweroff of a QEMU/KVM VM with CPU jobs (needs /dev/kvm)
 scripts/service-install-test.sh   # service install / status / uninstall and doctor
 scripts/helper-systemd-test.sh    # the helper alone under systemd
-scripts/dist-test.sh              # install.sh against a fake GitHub API (PUZUZ_DIST_BASE=debian:12 ...)
+scripts/dist-test.sh              # install.sh against a fake GitHub API (GPUEUE_DIST_BASE=debian:12 ...)
 nix build -L .#checks.x86_64-linux.nixos         # NixOS module in a VM (needs KVM)
 nix build -L .#checks.x86_64-linux.home-manager  # home-manager module evaluation
-nix build -L .#checks.x86_64-linux.helper-tests  # all puzuz-helper tests in a VM (needs KVM)
+nix build -L .#checks.x86_64-linux.helper-tests  # all gpueue-helper tests in a VM (needs KVM)
 ```
 
-`scripts/e2e-test.sh` は冒頭で環境変数を説明しています。たとえば `PUZUZ_E2E_ONLY` や、GPU のシナリオ用の
-`PUZUZ_E2E_GPU=1` です。`PUZUZ_HELPER_GPU=1 scripts/helper-systemd-test.sh`（CUDA のベースイメージが必要。
-スクリプトを参照）は、どちらの `PUZUZ_HELPER_CUDA_MODE` でも、GPU のチェックポイントを期限切れに追い込み、
+`scripts/e2e-test.sh` は冒頭で環境変数を説明しています。たとえば `GPUEUE_E2E_ONLY` や、GPU のシナリオ用の
+`GPUEUE_E2E_GPU=1` です。`GPUEUE_HELPER_GPU=1 scripts/helper-systemd-test.sh`（CUDA のベースイメージが必要。
+スクリプトを参照）は、どちらの `GPUEUE_HELPER_CUDA_MODE` でも、GPU のチェックポイントを期限切れに追い込み、
 ダンプの途中で `criu` / `cuda-checkpoint` を kill します。`scripts/measure-checkpoint.sh` はチェックポイントの
 各ステップにかかる時間を測定します。どのスクリプトもホスト上で特権の必要な処理は実行しません。
 

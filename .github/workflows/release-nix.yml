@@ -1,6 +1,6 @@
 name: Release (Nix stable branch)
 
-# Nix users follow releases with `github:kaito4681/puzuz/stable` (see
+# Nix users follow releases with `github:kaito4681/gpueue/stable` (see
 # docs/install.md). When a release is published as a stable one
 # (`released`, like the APT repository and the AUR package: not when the tag
 # is pushed, so never before the release is built and published), the

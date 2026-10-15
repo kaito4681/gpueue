@@ -1,6 +1,6 @@
 #!/bin/sh
-# After the puzuz package is removed: forget its units; on purge also delete
-# the configuration. The state, logs and checkpoint images in /var/lib/puzuz
+# After the gpueue package is removed: forget its units; on purge also delete
+# the configuration. The state, logs and checkpoint images in /var/lib/gpueue
 # are always kept (they may belong to jobs that are still running or that
 # can still be restored); this prints how to delete them.
 #
@@ -22,18 +22,18 @@ esac
 if [ "$action" = purge ]; then
     # dpkg has already deleted the conffiles; this removes what was added
     # next to them (e.g. github-token) and the directory itself.
-    rm -rf /etc/puzuz
-    rm -f /var/lib/puzuz/package-removed
+    rm -rf /etc/gpueue
+    rm -f /var/lib/gpueue/package-removed
 fi
 
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
 fi
 
-if [ "$action" = purge ] && [ -d /var/lib/puzuz ]; then
-    echo "puzuz: kept /var/lib/puzuz (state, job logs, checkpoint images). To delete it:"
-    echo "  sudo systemctl stop 'puzuz-job-*'   # if jobs are still running"
-    echo "  sudo rm -rf /var/lib/puzuz"
+if [ "$action" = purge ] && [ -d /var/lib/gpueue ]; then
+    echo "gpueue: kept /var/lib/gpueue (state, job logs, checkpoint images). To delete it:"
+    echo "  sudo systemctl stop 'gpueue-job-*'   # if jobs are still running"
+    echo "  sudo rm -rf /var/lib/gpueue"
 fi
 
 exit 0

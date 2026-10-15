@@ -1,7 +1,7 @@
-# NixOS module: services.puzuz (the daemon, the root helper and the CLI).
+# NixOS module: services.gpueue (the daemon, the root helper and the CLI).
 #
 # The systemd units and the tmpfiles.d entries are generated from the files
-# in packaging/ (the same ones the .deb and `puzuz service install` use),
+# in packaging/ (the same ones the .deb and `gpueue service install` use),
 # with ExecStart= pointing into the store, so they cannot drift apart.
 { self }:
 {
@@ -11,7 +11,7 @@
   ...
 }:
 let
-  cfg = config.services.puzuz;
+  cfg = config.services.gpueue;
   inherit (lib)
     literalExpression
     mkDefault
@@ -23,7 +23,7 @@ let
 
   flakePackages = self.packages.${pkgs.stdenv.hostPlatform.system} or { };
   toml = pkgs.formats.toml { };
-  configFile = toml.generate "puzuz-config.toml" cfg.settings;
+  configFile = toml.generate "gpueue-config.toml" cfg.settings;
 
   # True with `services.xserver.videoDrivers = [ "nvidia" ]` (also on
   # headless machines) or `hardware.nvidia.datacenter.enable`.
@@ -32,18 +32,18 @@ let
   # The packaged units and tmpfiles.d entries with the binaries' store paths.
   # `substitute --replace-fail` makes the build fail if a template stops
   # using ExecStart=/usr/bin/.
-  units = pkgs.runCommand "puzuz-systemd-units" { } ''
+  units = pkgs.runCommand "gpueue-systemd-units" { } ''
     mkdir -p "$out/lib/systemd/system" "$out/lib/tmpfiles.d"
     for unit in ${../systemd}/*.service; do
       substitute "$unit" "$out/lib/systemd/system/$(basename "$unit")" \
         --replace-fail "ExecStart=/usr/bin/" "ExecStart=${cfg.package}/bin/"
     done
-    cp ${../tmpfiles.d/puzuz.conf} "$out/lib/tmpfiles.d/puzuz.conf"
+    cp ${../tmpfiles.d/gpueue.conf} "$out/lib/tmpfiles.d/gpueue.conf"
   '';
 
   serviceOverrides = {
     wantedBy = [ "multi-user.target" ];
-    # Both read /etc/puzuz/config.toml at start-up. Restarting either one
+    # Both read /etc/gpueue/config.toml at start-up. Restarting either one
     # leaves running jobs alone (they run in their own units).
     restartTriggers = [ configFile ];
     # `systemctl restart` instead of stop + start on nixos-rebuild switch.
@@ -51,16 +51,16 @@ let
   };
 in
 {
-  options.services.puzuz = {
-    enable = lib.mkEnableOption "the puzuz job queue (daemon, root helper and CLI)";
+  options.services.gpueue = {
+    enable = lib.mkEnableOption "the gpueue job queue (daemon, root helper and CLI)";
 
     package = mkOption {
       type = types.package;
       default = flakePackages.default;
-      defaultText = literalExpression "inputs.puzuz.packages.\${system}.default";
+      defaultText = literalExpression "inputs.gpueue.packages.\${system}.default";
       description = ''
-        The puzuz package. Its `bin/puzuz` runs the daemon and its
-        `bin/puzuz-helper` the root helper; it is also added to
+        The gpueue package. Its `bin/gpueue` runs the daemon and its
+        `bin/gpueue-helper` the root helper; it is also added to
         `environment.systemPackages`.
       '';
     };
@@ -70,7 +70,7 @@ in
       default = [ ];
       example = [ "alice" ];
       description = ''
-        Users added to the `puzuz-admin` group. Its members administer the
+        Users added to the `gpueue-admin` group. Its members administer the
         queue: all users' jobs, groups, GPU limits and shutdown.
       '';
     };
@@ -85,8 +85,8 @@ in
         }
       '';
       description = ''
-        Contents of `/etc/puzuz/config.toml`; see `packaging/config.toml`
-        in the puzuz repository (or `docs/install.md`, "Configuration") for
+        Contents of `/etc/gpueue/config.toml`; see `packaging/config.toml`
+        in the gpueue repository (or `docs/install.md`, "Configuration") for
         the keys. The module sets `criu_path`, `cuda_checkpoint_path`,
         `nvidia_smi_path`, `nvml_library` and `shell` (with
         `lib.mkDefault`) from the options below.
@@ -96,10 +96,10 @@ in
     criuPackage = mkOption {
       type = types.package;
       default = flakePackages.criu;
-      defaultText = literalExpression "inputs.puzuz.packages.\${system}.criu";
+      defaultText = literalExpression "inputs.gpueue.packages.\${system}.criu";
       description = ''
         CRIU (4.2 or later) used by the helper to checkpoint and restore
-        jobs. The default is the CRIU 4.2 package of the puzuz flake.
+        jobs. The default is the CRIU 4.2 package of the gpueue flake.
       '';
     };
 
@@ -147,11 +147,11 @@ in
   };
 
   config = mkIf cfg.enable {
-    services.puzuz.settings = mkMerge [
+    services.gpueue.settings = mkMerge [
       {
         criu_path = mkDefault "${cfg.criuPackage}/bin/criu";
         # NixOS keeps /bin/sh (environment.binsh) but nothing else in /bin
-        # and /usr/bin. A job runs with the environment of the `puzuz add`
+        # and /usr/bin. A job runs with the environment of the `gpueue add`
         # that submitted it, so the rest of its PATH is the user's
         # (/run/wrappers/bin, /run/current-system/sw/bin, ...); the shell
         # itself does not depend on it.
@@ -175,7 +175,7 @@ in
     # directory above it is a symlink or writable by anyone but root. A
     # `mode` makes NixOS copy the file into /etc (owned by root) instead of
     # linking it into the store through /etc/static.
-    environment.etc."puzuz/config.toml" = {
+    environment.etc."gpueue/config.toml" = {
       source = configFile;
       mode = "0644";
     };
@@ -184,17 +184,17 @@ in
 
     systemd.packages = [ units ];
     systemd.tmpfiles.packages = [ units ];
-    systemd.services.puzuz-helper = serviceOverrides;
-    systemd.services.puzuz = serviceOverrides;
+    systemd.services.gpueue-helper = serviceOverrides;
+    systemd.services.gpueue = serviceOverrides;
 
-    # packaging/sysusers.d/puzuz.conf
-    users.users.puzuz = {
+    # packaging/sysusers.d/gpueue.conf
+    users.users.gpueue = {
       isSystemUser = true;
-      group = "puzuz";
-      home = "/var/lib/puzuz/daemon";
-      description = "puzuz job queue daemon";
+      group = "gpueue";
+      home = "/var/lib/gpueue/daemon";
+      description = "gpueue job queue daemon";
     };
-    users.groups.puzuz = { };
-    users.groups.puzuz-admin.members = cfg.admins;
+    users.groups.gpueue = { };
+    users.groups.gpueue-admin.members = cfg.admins;
   };
 }

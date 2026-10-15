@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Maintains the puzuz APT repository: a flat repository (`Suites: ./` in
-# packaging/apt/puzuz.sources) whose files are the assets of the GitHub
+# Maintains the gpueue APT repository: a flat repository (`Suites: ./` in
+# packaging/apt/gpueue.sources) whose files are the assets of the GitHub
 # release `apt`.
 #
 #   apt-repo.sh update DIR [DEB...]
@@ -11,8 +11,8 @@
 #     list is dropped), then adds the DEBs to DIR, keeps the newest KEEP
 #     versions per architecture (Debian version order), writes the index
 #     (Packages, Packages.gz, Release, its signatures Release.gpg (detached)
-#     and InRelease (clearsigned)), plus the archive keyring as puzuz.gpg and
-#     the sources file as puzuz.sources, both taken from the newest kept
+#     and InRelease (clearsigned)), plus the archive keyring as gpueue.gpg and
+#     the sources file as gpueue.sources, both taken from the newest kept
 #     package (for adding the repository by hand), and only then deletes the
 #     .deb files that fell out of the index. Nothing in DIR changes unless
 #     the new index was generated, signed and verified.
@@ -21,7 +21,7 @@
 #     Publishes the .deb files of the release TAG, if it is a published,
 #     stable (not pre-release) release; otherwise it says so and exits 0.
 #     Creates the release `apt` when missing (as a pre-release, so it never
-#     becomes the "latest" release that install.sh and `puzuz update`
+#     becomes the "latest" release that install.sh and `gpueue update`
 #     follow), downloads its .deb files and index files and TAG's .deb files
 #     (checked against their .sha256 and their minisign signatures, with the
 #     public key of TAG's commit), runs `update` on them (which verifies the
@@ -33,14 +33,14 @@
 #     the upload can see a mismatch between the index files; running it again
 #     fixes that.
 #
-# A .deb must be named puzuz_<version>_<amd64|arm64>.deb, where <version> is
+# A .deb must be named gpueue_<version>_<amd64|arm64>.deb, where <version> is
 # the release's (tag) version: the package's own version differs for a
 # pre-release (0.2.0-rc.1 is 0.2.0~rc.1 inside the package, and GitHub
 # cannot store `~` in asset names), so `Filename:` in Packages is the file
 # name, never derived from the package version.
 #
 # The index is signed only with a key that is in the keyring the newest kept
-# package installs (/etc/apt/keyrings/puzuz.gpg), and never for packages that
+# package installs (/etc/apt/keyrings/gpueue.gpg), and never for packages that
 # ship the TEST key (scripts/dist/gen-apt-key.sh --test).
 #
 # Environment:
@@ -50,26 +50,26 @@
 #   APT_KEYRING          check the signing key against this keyring instead of
 #                        the newest package's (tests)
 #   APT_VERIFY_KEYRING   verify the existing index with this keyring (default:
-#                        packaging/apt/puzuz-archive-keyring.gpg of this tree;
+#                        packaging/apt/gpueue-archive-keyring.gpg of this tree;
 #                        when the archive key changes, it must also hold the
 #                        key that signed the previous index)
 #   MINISIGN             `github`: the minisign binary (default: a pinned one,
 #                        downloaded by scripts/dist/get-minisign.sh)
-#   PUZUZ_APT_RETRY_DELAY  `github`: seconds before the 2nd upload attempt,
+#   GPUEUE_APT_RETRY_DELAY  `github`: seconds before the 2nd upload attempt,
 #                        twice that before the 3rd (default 5)
-#   PUZUZ_APT_KEEP       versions to keep per architecture (default 5)
-#   GITHUB_REPOSITORY    `github`: owner/repo (default kaito4681/puzuz); gh
+#   GPUEUE_APT_KEEP       versions to keep per architecture (default 5)
+#   GITHUB_REPOSITORY    `github`: owner/repo (default kaito4681/gpueue); gh
 #                        needs GH_TOKEN with contents: write
 # Needs dpkg-deb, apt-ftparchive (apt-utils), gpg and gpgv; `github` also gh
 # and curl.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-keep="${PUZUZ_APT_KEEP:-5}"
+keep="${GPUEUE_APT_KEEP:-5}"
 apt_release=apt
-pkg_keyring=etc/apt/keyrings/puzuz.gpg
-pkg_sources=etc/apt/sources.list.d/puzuz.sources
-index_files=(puzuz.gpg puzuz.sources Packages Packages.gz Release Release.gpg InRelease)
+pkg_keyring=etc/apt/keyrings/gpueue.gpg
+pkg_sources=etc/apt/sources.list.d/gpueue.sources
+index_files=(gpueue.gpg gpueue.sources Packages Packages.gz Release Release.gpg InRelease)
 temp_dirs=()
 cleanup() {
     if [ -n "${GNUPGHOME:-}" ]; then gpgconf --kill all >/dev/null 2>&1 || true; fi
@@ -99,7 +99,7 @@ need() {
 declare -A deb_version=() deb_arch=()
 
 # Reads the .deb $1 once and records its version and architecture, after
-# checking that it is a puzuz package whose file name matches its fields.
+# checking that it is a gpueue package whose file name matches its fields.
 read_deb() {
     local deb="$1" name fields key value pkg="" arch="" version="" file_version
     name="$(basename "$deb")"
@@ -112,10 +112,10 @@ read_deb() {
         Version) version="$value" ;;
         esac
     done <<<"$fields"
-    [ "$pkg" = puzuz ] || die "$name: package '$pkg', not puzuz"
+    [ "$pkg" = gpueue ] || die "$name: package '$pkg', not gpueue"
     case "$arch" in amd64 | arm64) ;; *) die "$name: unsupported architecture '$arch'" ;; esac
     [ -n "$version" ] || die "$name: no version"
-    [[ "$name" =~ ^puzuz_([^_/~]+)_${arch}\.deb$ ]] || die "$name: not named puzuz_<version>_$arch.deb"
+    [[ "$name" =~ ^gpueue_([^_/~]+)_${arch}\.deb$ ]] || die "$name: not named gpueue_<version>_$arch.deb"
     file_version="${BASH_REMATCH[1]}"
     # The tag version, with the pre-release separator as nfpm writes it.
     [ "$version" = "$file_version" ] || [ "$version" = "${file_version/-/\~}" ] ||
@@ -173,7 +173,7 @@ verify_existing() {
     local -A listed=()
     stale=()
     shopt -s nullglob
-    debs=("$dir"/puzuz_*.deb)
+    debs=("$dir"/gpueue_*.deb)
     shopt -u nullglob
     [ "${#debs[@]}" -gt 0 ] || return 0
     [ -f "$dir/InRelease" ] && [ -f "$dir/Packages" ] ||
@@ -213,7 +213,7 @@ cmd_update() {
     local dir="${1:?}" deb arch name
     shift
     need dpkg-deb dpkg apt-ftparchive gpg gpgv gzip cmp
-    [[ "$keep" =~ ^[1-9][0-9]*$ ]] || die "PUZUZ_APT_KEEP must be a positive number"
+    [[ "$keep" =~ ^[1-9][0-9]*$ ]] || die "GPUEUE_APT_KEEP must be a positive number"
 
     local work
     work="$(mktemp -d)"
@@ -223,12 +223,12 @@ cmd_update() {
     local -A by_name=() is_stale=()
     local added=()
     if [ -d "$dir" ]; then
-        local verify_keyring="${APT_VERIFY_KEYRING:-$root/packaging/apt/puzuz-archive-keyring.gpg}"
+        local verify_keyring="${APT_VERIFY_KEYRING:-$root/packaging/apt/gpueue-archive-keyring.gpg}"
         verify_keyring="$(cd "$(dirname "$verify_keyring")" && pwd)/$(basename "$verify_keyring")"
         verify_existing "$dir" "$verify_keyring"
         for name in "${stale[@]}"; do is_stale[$name]=1; done
         shopt -s nullglob
-        for deb in "$dir"/puzuz_*.deb; do
+        for deb in "$dir"/gpueue_*.deb; do
             [ -z "${is_stale[$(basename "$deb")]:-}" ] || continue
             read_deb "$deb"
             by_name[$(basename "$deb")]="$deb"
@@ -264,7 +264,7 @@ cmd_update() {
     done
 
     # The keyring and sources file of the newest kept package: what the next
-    # `apt upgrade` installs, and what puzuz.gpg / puzuz.sources publish.
+    # `apt upgrade` installs, and what gpueue.gpg / gpueue.sources publish.
     local newest
     # Both architectures of a version ship the same files; the newest version
     # of all is enough (same versions do not collide across architectures).
@@ -300,10 +300,10 @@ cmd_update() {
     # apt warns when they change. No Valid-Until: the index changes only with
     # a release.
     apt-ftparchive \
-        -o APT::FTPArchive::Release::Origin=puzuz \
-        -o APT::FTPArchive::Release::Label=puzuz \
+        -o APT::FTPArchive::Release::Origin=gpueue \
+        -o APT::FTPArchive::Release::Label=gpueue \
         -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
-        -o APT::FTPArchive::Release::Description="puzuz (https://github.com/kaito4681/puzuz)" \
+        -o APT::FTPArchive::Release::Description="gpueue (https://github.com/kaito4681/gpueue)" \
         release "$idx" >"$work/Release" || die "apt-ftparchive release failed"
     mv "$work/Release" "$idx/Release"
 
@@ -316,8 +316,8 @@ cmd_update() {
     gpgv --quiet --keyring "$keyring" "$idx/InRelease" 2>/dev/null || die "InRelease does not verify with $keyring"
     gpgv --quiet --keyring "$keyring" "$idx/Release.gpg" "$idx/Release" 2>/dev/null ||
         die "Release.gpg does not verify with $keyring"
-    cp "$work/newest/$pkg_keyring" "$idx/puzuz.gpg"
-    cp "$work/newest/$pkg_sources" "$idx/puzuz.sources"
+    cp "$work/newest/$pkg_keyring" "$idx/gpueue.gpg"
+    cp "$work/newest/$pkg_sources" "$idx/gpueue.sources"
 
     # Only now change DIR: new packages, then the index, then deletions.
     mkdir -p "$dir"
@@ -356,7 +356,7 @@ upload() {
     for attempt in 1 2 3; do
         gh release upload "$apt_release" -R "$repo" --clobber "$@" && return 0
         log "uploading ${*##*/} failed (attempt $attempt of 3)"
-        [ "$attempt" = 3 ] || sleep "$((attempt * ${PUZUZ_APT_RETRY_DELAY:-5}))"
+        [ "$attempt" = 3 ] || sleep "$((attempt * ${GPUEUE_APT_RETRY_DELAY:-5}))"
     done
     return 1
 }
@@ -382,7 +382,7 @@ restore_index() {
 }
 
 cmd_github() {
-    local tag="${1:?}" repo="${GITHUB_REPOSITORY:-kaito4681/puzuz}" state
+    local tag="${1:?}" repo="${GITHUB_REPOSITORY:-kaito4681/gpueue}" state
     need gh curl dpkg-deb sha256sum
 
     # The publishing policy: published, stable releases of version tags.
@@ -404,18 +404,18 @@ cmd_github() {
 
     # The release's packages, checked like a user would check them, with the
     # minisign key of the tag's commit (a re-run for an older tag may come
-    # from a newer default branch). Only the versioned puzuz_<version>_<arch>.deb
-    # files: the version-less copies puzuz_<arch>.deb (for
+    # from a newer default branch). Only the versioned gpueue_<version>_<arch>.deb
+    # files: the version-less copies gpueue_<arch>.deb (for
     # releases/latest/download) are the same packages.
     gh api -H "Accept: application/vnd.github.raw" \
         "repos/$repo/contents/packaging/minisign.pub?ref=$tag" >"$work/minisign.pub" ||
         die "cannot read packaging/minisign.pub at $tag"
     gh release download "$tag" -R "$repo" -D "$work/new" \
-        -p 'puzuz_*_*.deb' -p 'puzuz_*_*.deb.sha256' -p 'puzuz_*_*.deb.minisig'
+        -p 'gpueue_*_*.deb' -p 'gpueue_*_*.deb.sha256' -p 'gpueue_*_*.deb.minisig'
     local minisign="${MINISIGN:-}" deb new=()
     [ -n "$minisign" ] || minisign="$("$root/scripts/dist/get-minisign.sh" "$work/minisign")"
     shopt -s nullglob
-    for deb in "$work/new"/puzuz_*_*.deb; do
+    for deb in "$work/new"/gpueue_*_*.deb; do
         (cd "$work/new" && sha256sum --quiet -c "$(basename "$deb").sha256") || die "$(basename "$deb"): checksum mismatch"
         "$minisign" -Vq -p "$work/minisign.pub" -m "$deb" || die "$(basename "$deb"): bad signature"
         new+=("$deb")
@@ -427,7 +427,7 @@ cmd_github() {
         log "creating the release $apt_release"
         gh release create "$apt_release" -R "$repo" --prerelease --latest=false \
             --title "APT repository" \
-            --notes "The puzuz APT repository (a flat repository; its files are the assets of this release). It is updated by .github/workflows/release-apt.yml; see docs/install.md." >/dev/null
+            --notes "The gpueue APT repository (a flat repository; its files are the assets of this release). It is updated by .github/workflows/release-apt.yml; see docs/install.md." >/dev/null
     fi
     # The current assets: the packages and the index files, all downloaded,
     # so that `update` verifies the packages against the signed index, and
@@ -436,13 +436,13 @@ cmd_github() {
     names="$(gh release view "$apt_release" -R "$repo" --json assets -q '.assets[].name')" ||
         die "cannot list the assets of the release $apt_release"
     while IFS= read -r name; do
-        case "$name" in puzuz_*.deb) before+=("$name") ;; esac
+        case "$name" in gpueue_*.deb) before+=("$name") ;; esac
         for file in "${index_files[@]}"; do
             if [ "$name" = "$file" ]; then prev_index+=("$name"); fi
         done
     done <<<"$names"
     local patterns=()
-    [ "${#before[@]}" -eq 0 ] || patterns+=(-p 'puzuz_*.deb')
+    [ "${#before[@]}" -eq 0 ] || patterns+=(-p 'gpueue_*.deb')
     for name in "${prev_index[@]}"; do patterns+=(-p "$name"); done
     if [ "${#patterns[@]}" -gt 0 ]; then
         gh release download "$apt_release" -R "$repo" -D "$work/repo" "${patterns[@]}" ||
@@ -461,7 +461,7 @@ cmd_github() {
     for name in "${before[@]}"; do trusted[$name]=1; done
     for name in "${stale[@]}"; do unset "trusted[$name]"; done
     shopt -s nullglob
-    for file in "$work/repo"/puzuz_*.deb; do
+    for file in "$work/repo"/gpueue_*.deb; do
         name="$(basename "$file")"
         in_after[$name]=1
         [ -n "${trusted[$name]:-}" ] || uploads+=("$file")

@@ -1,17 +1,17 @@
 #cloud-config
 # Provisioning of the cached VM image of scripts/vm-reboot-test.sh (runs
 # once; run.sh substitutes @SSH_KEY@). Users as in scripts/e2e: alice
-# (1000) and bob (1001) are regular users, carol (1002) is in puzuz-admin
-# (the group is created here; puzuz's sysusers.d entry keeps it).
-hostname: puzuz-vm
+# (1000) and bob (1001) are regular users, carol (1002) is in gpueue-admin
+# (the group is created here; gpueue's sysusers.d entry keeps it).
+hostname: gpueue-vm
 disable_root: false
 ssh_pwauth: false
 groups:
-  - puzuz-admin
+  - gpueue-admin
 users:
   - {name: alice, uid: "1000", shell: /bin/bash, lock_passwd: true}
   - {name: bob, uid: "1001", shell: /bin/bash, lock_passwd: true}
-  - {name: carol, uid: "1002", shell: /bin/bash, lock_passwd: true, groups: [puzuz-admin]}
+  - {name: carol, uid: "1002", shell: /bin/bash, lock_passwd: true, groups: [gpueue-admin]}
 write_files:
   - path: /root/.ssh/authorized_keys
     permissions: "0600"
@@ -45,9 +45,9 @@ runcmd:
   - fstrim -av || true
   - |
     if [ -e /proc/sys/kernel/ns_last_pid ] && command -v criu >/dev/null; then
-      echo "PUZUZ-PROVISION-OK kernel $(uname -r), $(criu --version | head -n1), $(systemctl --version | head -n1)" >/dev/ttyS0
+      echo "GPUEUE-PROVISION-OK kernel $(uname -r), $(criu --version | head -n1), $(systemctl --version | head -n1)" >/dev/ttyS0
     else
-      echo "PUZUZ-PROVISION-FAILED kernel $(uname -r), ns_last_pid: $(ls /proc/sys/kernel/ns_last_pid 2>&1), criu: $(command -v criu)" >/dev/ttyS0
+      echo "GPUEUE-PROVISION-FAILED kernel $(uname -r), ns_last_pid: $(ls /proc/sys/kernel/ns_last_pid 2>&1), criu: $(command -v criu)" >/dev/ttyS0
     fi
 power_state:
   mode: poweroff

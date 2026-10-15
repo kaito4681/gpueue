@@ -30,12 +30,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 ROOT, PORT, TOKEN = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-REPO = sys.argv[4] if len(sys.argv) > 4 else "kaito4681/puzuz"
+REPO = sys.argv[4] if len(sys.argv) > 4 else "kaito4681/gpueue"
 # See above: a long release. The notes mention assets, URLs and tags the way real notes do.
 PADDING_ASSETS = 300
 BODY = "".join(
     f"- change {i}, see {{the notes}}: \"tag_name\": \"v0.0.{i}\", "
-    f"https://github.com/{REPO}/releases/download/v0.0.{i}/puzuz.tar.gz\n"
+    f"https://github.com/{REPO}/releases/download/v0.0.{i}/gpueue.tar.gz\n"
     for i in range(1500)
 )
 assert len(BODY) > 100_000

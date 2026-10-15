@@ -3,7 +3,7 @@
 # Usage: scripts/test-in-docker.sh [cargo args...]   (default: test --workspace)
 set -euo pipefail
 
-image="${PUZUZ_TEST_IMAGE:-puzuz-test:1.98.1}"
+image="${GPUEUE_TEST_IMAGE:-gpueue-test:1.98.1}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Build the toolchain image (rust + clippy + rustfmt) on first use.
@@ -16,14 +16,14 @@ if [ "$#" -eq 0 ]; then
 fi
 
 # The cache volume is created root-owned; hand it to the invoking user once.
-docker run --rm -v puzuz-cargo-home:/cargo "$image" \
+docker run --rm -v gpueue-cargo-home:/cargo "$image" \
     sh -c "chown $(id -u):$(id -g) /cargo" >/dev/null
 
 exec docker run --rm \
     --user "$(id -u):$(id -g)" \
     -e CARGO_HOME=/cargo \
     -e CARGO_TARGET_DIR=/work/target/docker \
-    -v puzuz-cargo-home:/cargo \
+    -v gpueue-cargo-home:/cargo \
     -v "$root":/work \
     -w /work \
     "$image" \

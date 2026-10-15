@@ -1,13 +1,13 @@
-# home-manager module: programs.puzuz (the CLI and its shell completions).
+# home-manager module: programs.gpueue (the CLI and its shell completions).
 #
 # The daemon and the root helper need root and the system's systemd, so they
 # cannot come from home-manager: an administrator installs them (NixOS
 # module, .deb, install.sh, ...). The CLI must have the daemon's version;
 # with `package = null` (the default) only the completions are set up, for
-# the system's `puzuz`, whose version always matches.
+# the system's `gpueue`, whose version always matches.
 { config, lib, ... }:
 let
-  cfg = config.programs.puzuz;
+  cfg = config.programs.gpueue;
   inherit (lib)
     literalExpression
     mkIf
@@ -16,10 +16,10 @@ let
     types
     ;
 
-  # The hooks load the completion files installed next to whichever `puzuz`
-  # is in PATH (the system's: <prefix>/bin/puzuz and <prefix>/share/...), so
+  # The hooks load the completion files installed next to whichever `gpueue`
+  # is in PATH (the system's: <prefix>/bin/gpueue and <prefix>/share/...), so
   # they match its version. Only when there are none do they ask
-  # `puzuz completions <shell>` (which runs puzuz at every shell start).
+  # `gpueue completions <shell>` (which runs gpueue at every shell start).
 
   integrationOption =
     shell:
@@ -27,23 +27,23 @@ let
       type = types.bool;
       default = true;
       description = ''
-        Whether to load the completions of the system's `puzuz` in ${shell}
+        Whether to load the completions of the system's `gpueue` in ${shell}
         when `package` is `null`. (A package brings its own completion
         files, which home-manager links into the profile.)
       '';
     };
 in
 {
-  options.programs.puzuz = {
-    enable = lib.mkEnableOption "the puzuz CLI and its shell completions";
+  options.programs.gpueue = {
+    enable = lib.mkEnableOption "the gpueue CLI and its shell completions";
 
     package = mkOption {
       type = types.nullOr types.package;
       default = null;
-      example = literalExpression "inputs.puzuz.packages.\${pkgs.stdenv.hostPlatform.system}.default";
+      example = literalExpression "inputs.gpueue.packages.\${pkgs.stdenv.hostPlatform.system}.default";
       description = ''
-        The puzuz package to install into the profile. `null` installs
-        nothing and only sets up the completions of the system's `puzuz`
+        The gpueue package to install into the profile. `null` installs
+        nothing and only sets up the completions of the system's `gpueue`
         (which an administrator installed together with the daemon). A
         package must have the daemon's version: commands fail with a version
         mismatch otherwise.
@@ -60,16 +60,16 @@ in
 
     (mkIf (cfg.package == null && cfg.enableBashIntegration) {
       programs.bash.initExtra = ''
-        if command -v puzuz >/dev/null 2>&1; then
-          __puzuz_dir="$(dirname "$(dirname "$(readlink -f "$(command -v puzuz)")")")/share/bash-completion/completions"
-          if [ -r "$__puzuz_dir/puzuz.bash" ]; then
-            source "$__puzuz_dir/puzuz.bash"
-          elif [ -r "$__puzuz_dir/puzuz" ]; then
-            source "$__puzuz_dir/puzuz"
+        if command -v gpueue >/dev/null 2>&1; then
+          __gpueue_dir="$(dirname "$(dirname "$(readlink -f "$(command -v gpueue)")")")/share/bash-completion/completions"
+          if [ -r "$__gpueue_dir/gpueue.bash" ]; then
+            source "$__gpueue_dir/gpueue.bash"
+          elif [ -r "$__gpueue_dir/gpueue" ]; then
+            source "$__gpueue_dir/gpueue"
           else
-            source <(puzuz completions bash)
+            source <(gpueue completions bash)
           fi
-          unset __puzuz_dir
+          unset __gpueue_dir
         fi
       '';
     })
@@ -79,27 +79,27 @@ in
       # programs.zsh.enableCompletion is on; without it (no compdef) the hook
       # does nothing.
       programs.zsh.initContent = ''
-        if (( $+commands[puzuz] && $+functions[compdef] )); then
-          __puzuz_dir=''${''${commands[puzuz]:A}:h:h}/share/zsh/site-functions
-          if [[ -r $__puzuz_dir/_puzuz ]]; then
-            fpath=($__puzuz_dir $fpath)
-            autoload -Uz _puzuz && compdef _puzuz puzuz
+        if (( $+commands[gpueue] && $+functions[compdef] )); then
+          __gpueue_dir=''${''${commands[gpueue]:A}:h:h}/share/zsh/site-functions
+          if [[ -r $__gpueue_dir/_gpueue ]]; then
+            fpath=($__gpueue_dir $fpath)
+            autoload -Uz _gpueue && compdef _gpueue gpueue
           else
-            source <(puzuz completions zsh)
+            source <(gpueue completions zsh)
           fi
-          unset __puzuz_dir
+          unset __gpueue_dir
         fi
       '';
     })
 
     (mkIf (cfg.package == null && cfg.enableFishIntegration) {
       programs.fish.interactiveShellInit = ''
-        if command -q puzuz
-          set -l __puzuz_file (path resolve (command -v puzuz) | path dirname | path dirname)/share/fish/vendor_completions.d/puzuz.fish
-          if test -r $__puzuz_file
-            source $__puzuz_file
+        if command -q gpueue
+          set -l __gpueue_file (path resolve (command -v gpueue) | path dirname | path dirname)/share/fish/vendor_completions.d/gpueue.fish
+          if test -r $__gpueue_file
+            source $__gpueue_file
           else
-            puzuz completions fish | source
+            gpueue completions fish | source
           end
         end
       '';

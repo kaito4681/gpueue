@@ -1,4 +1,4 @@
-"""GPU job of the helper-systemd test (PUZUZ_HELPER_GPU=1).
+"""GPU job of the helper-systemd test (GPUEUE_HELPER_GPU=1).
 
 Holds <vram_gb> of GPU memory filled with a known pattern and trains a tiny
 linear model on the GPU with a fixed, deterministic schedule. Each step

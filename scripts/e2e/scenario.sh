@@ -2,7 +2,7 @@
 # Full-stack scenarios; runs inside the systemd container as root (see
 # scripts/e2e-test.sh). Users act through the real CLI with runuser:
 # alice (1000) and bob (1001) are regular users, carol (1002) is in
-# puzuz-admin; scenario 17 adds dave (1003), a user without usage, and
+# gpueue-admin; scenario 17 adds dave (1003), a user without usage, and
 # scenario 18 svcacct (990, a system account) and dockeruser (1004, primary
 # group docker).
 #
@@ -11,9 +11,9 @@
 # exits non-zero if any failed.
 set -uo pipefail
 
-LOGS=/var/lib/puzuz/logs
-CKPT=/var/lib/puzuz/checkpoints
-STATE=/var/lib/puzuz/e2e   # values handed from reboot-prepare to reboot-verify
+LOGS=/var/lib/gpueue/logs
+CKPT=/var/lib/gpueue/checkpoints
+STATE=/var/lib/gpueue/e2e   # values handed from reboot-prepare to reboot-verify
 COUNTER='i=0; while :; do echo $i; i=$((i+1)); sleep 0.2; done'
 
 say() { printf '\n--- %s\n' "$*"; }
@@ -21,11 +21,11 @@ fail() {
     echo "FAIL: $*" >&2
     exit 1
 }
-# pz <user> <puzuz args...>: the CLI as <user>, from their home directory.
+# pz <user> <gpueue args...>: the CLI as <user>, from their home directory.
 pz() {
     local u=$1
     shift
-    (cd "/home/$u" && ${PZ_TIMEOUT:+timeout "$PZ_TIMEOUT"} runuser -u "$u" -- puzuz --color never "$@")
+    (cd "/home/$u" && ${PZ_TIMEOUT:+timeout "$PZ_TIMEOUT"} runuser -u "$u" -- gpueue --color never "$@")
 }
 # add <user> [add options] -- <command>: prints the new job's id.
 add() {
@@ -75,7 +75,7 @@ EOF
 # wait_unit <id> [timeout]: the unit of job <id> is active (the job really
 # runs, not just picked by the daemon).
 wait_unit() {
-    wait_for "${2:-30}" "puzuz-job-$1.service to be active" systemctl is-active --quiet "puzuz-job-$1.service"
+    wait_for "${2:-30}" "gpueue-job-$1.service to be active" systemctl is-active --quiet "gpueue-job-$1.service"
 }
 wait_socket() {
     wait_for 30 "the daemon socket" pz carol status --json >/dev/null 2>&1
@@ -93,7 +93,7 @@ log_lines() { grep -c . "$LOGS/$1/$2.log"; }
 unit_states() {
     local unit cg
     unit=$(systemctl list-units --no-legend --plain --state=active \
-        "puzuz-job-$1.service" "puzuz-job-$1-r*.service" | awk '{print $1}' | tail -n1)
+        "gpueue-job-$1.service" "gpueue-job-$1-r*.service" | awk '{print $1}' | tail -n1)
     [ -n "$unit" ] || return 1
     cg=$(systemctl show -p ControlGroup --value "$unit")
     find "/sys/fs/cgroup$cg" -name cgroup.procs -exec cat {} + 2>/dev/null \
@@ -136,7 +136,7 @@ diagnose() {
     echo "--- jobs with errors"
     q carol "[(j['id'], st(j['id']), j['details'].get('last_error')) for j in d['jobs'] if j['details'].get('last_error')]" || true
     local f
-    for f in "$CKPT"/*/*.log /var/lib/puzuz/helper/jobs/*/*.log; do
+    for f in "$CKPT"/*/*.log /var/lib/gpueue/helper/jobs/*/*.log; do
         [ -f "$f" ] || continue
         echo "--- tail of $f"
         grep -E 'Error|Warn' "$f" | tail -n 20
@@ -144,8 +144,8 @@ diagnose() {
 }
 
 FAILED=()
-# PUZUZ_E2E_ONLY: space-separated scenario numbers to run (all if empty).
-ONLY="${PUZUZ_E2E_ONLY:-}"
+# GPUEUE_E2E_ONLY: space-separated scenario numbers to run (all if empty).
+ONLY="${GPUEUE_E2E_ONLY:-}"
 run() { # run <name> <function>
     if [ -n "$ONLY" ] && [[ " $ONLY " != *" ${1%% *} "* ]]; then
         return 0
@@ -268,7 +268,7 @@ s3_limits() {
     wait_state "$a" running
     # GPU isolation (gpu_device_isolation = true, the default): every job
     # unit is DevicePolicy=closed.
-    [ "$(systemctl show -p DevicePolicy --value "puzuz-job-$a.service")" = closed ] \
+    [ "$(systemctl show -p DevicePolicy --value "gpueue-job-$a.service")" = closed ] \
         || fail "job $a's unit is not DevicePolicy=closed"
     wait_state "$c" running
     expect_state "$b" queued
@@ -305,7 +305,7 @@ s4_checkpoint_restore() {
     sleep 1.5
     pz alice checkpoint "$id" || fail "checkpoint"
     wait_state "$id" checkpointed 120
-    ! systemctl is-active --quiet "puzuz-job-$id.service" || fail "the unit still runs after the dump"
+    ! systemctl is-active --quiet "gpueue-job-$id.service" || fail "the unit still runs after the dump"
     [ -e "$CKPT/$id" ] || fail "no image in $CKPT/$id"
     before=$(last_line 1000 "$id")
     sleep 1
@@ -345,11 +345,11 @@ restart_while_running() {
     expect_state "$a" running
     expect_state "$b" running
     for id in "$a" "$b"; do
-        systemctl is-active --quiet "puzuz-job-$id.service" || fail "job $id died with the restart of $unit"
+        systemctl is-active --quiet "gpueue-job-$id.service" || fail "job $id died with the restart of $unit"
     done
     systemctl stop "$unit"
     sleep 4 # job a exits while $unit is down
-    systemctl is-active --quiet "puzuz-job-$b.service" || fail "job $b died with $unit"
+    systemctl is-active --quiet "gpueue-job-$b.service" || fail "job $b died with $unit"
     systemctl start "$unit"
     wait_socket
     wait_state "$a" done/failed/5 15
@@ -357,8 +357,8 @@ restart_while_running() {
     wait_state "$b" done/success 20
     grep -qx finished "$LOGS/1001/$b.log" || fail "job $b's output is missing"
 }
-s5_daemon_restart() { restart_while_running puzuz.service; }
-s6_helper_restart() { restart_while_running puzuz-helper.service; }
+s5_daemon_restart() { restart_while_running gpueue.service; }
+s6_helper_restart() { restart_while_running gpueue-helper.service; }
 
 s8_shutdown() {
     local a b c d lines
@@ -374,12 +374,12 @@ s8_shutdown() {
     wait_state "$d" paused
     ! pz alice shutdown 2>/dev/null || fail "a regular user can shut the daemon down"
     pz carol shutdown || fail "shutdown"
-    wait_for 120 "the daemon to exit" bash -c '! systemctl is-active --quiet puzuz.service'
+    wait_for 120 "the daemon to exit" bash -c '! systemctl is-active --quiet gpueue.service'
     for i in "$a" "$b" "$c" "$d"; do
-        ! systemctl is-active --quiet "puzuz-job-$i.service" || fail "job $i still runs after shutdown"
+        ! systemctl is-active --quiet "gpueue-job-$i.service" || fail "job $i still runs after shutdown"
     done
     [ -e "$CKPT/$a" ] && [ -e "$CKPT/$b" ] && [ -e "$CKPT/$d" ] || fail "no images for jobs $a, $b and $d"
-    systemctl start puzuz.service
+    systemctl start gpueue.service
     wait_socket
     expect_state "$a" checkpointed
     expect_state "$b" checkpointed
@@ -414,7 +414,7 @@ s8_shutdown() {
 
 # A job paused before its checkpoint is restored paused (the dump needs it
 # running, so it is resumed for the dump; the restore leaves it stopped, so
-# it runs nothing before `puzuz start` resumes it). `pause` is refused while a dump
+# it runs nothing before `gpueue start` resumes it). `pause` is refused while a dump
 # is in progress; the job is then checkpointed as asked and restored
 # running.
 s13_paused_checkpoint() {
@@ -470,10 +470,10 @@ s13_paused_checkpoint() {
 }
 
 # check_cuda_mode <id>: the checkpoint of GPU job <id> was made in the
-# configured CUDA mode (PUZUZ_E2E_CUDA_MODE, default manual): in plugin
+# configured CUDA mode (GPUEUE_E2E_CUDA_MODE, default manual): in plugin
 # mode CRIU loaded cuda_plugin.so, in manual mode it did not.
 check_cuda_mode() {
-    local mode=${PUZUZ_E2E_CUDA_MODE:-manual}
+    local mode=${GPUEUE_E2E_CUDA_MODE:-manual}
     grep -q "\"mode\": *\"$mode\"" "$CKPT/$1/meta.json" \
         || fail "the checkpoint of job $1 is not in $mode mode: $(cat "$CKPT/$1/meta.json")"
     if [ "$mode" = plugin ]; then
@@ -483,7 +483,7 @@ check_cuda_mode() {
     fi
 }
 
-# PUZUZ_E2E_GPU=1 only: GPU isolation, and a CUDA job (GPU 0 is real)
+# GPUEUE_E2E_GPU=1 only: GPU isolation, and a CUDA job (GPU 0 is real)
 # keeps its GPU memory across checkpoint/restore in a restore unit that is
 # isolated to GPU 0 as well.
 s9_gpu() {
@@ -517,11 +517,11 @@ s9_gpu() {
     pz alice restore "$id" || fail "restore"
     wait_state "$id" running 300
     # The restore unit is isolated to the GPU of the restore, too.
-    [ "$(systemctl show -p DevicePolicy --value "puzuz-job-$id-r1.service")" = closed ] \
+    [ "$(systemctl show -p DevicePolicy --value "gpueue-job-$id-r1.service")" = closed ] \
         || fail "the restore unit of job $id is not DevicePolicy=closed"
-    systemctl show -p DeviceAllow --value "puzuz-job-$id-r1.service" | grep -q '/dev/nvidia0 rw' \
+    systemctl show -p DeviceAllow --value "gpueue-job-$id-r1.service" | grep -q '/dev/nvidia0 rw' \
         || fail "the restore unit of job $id may not open /dev/nvidia0: \
-$(systemctl show -p DeviceAllow "puzuz-job-$id-r1.service")"
+$(systemctl show -p DeviceAllow "gpueue-job-$id-r1.service")"
     sleep 2
     after=$(last_line 1000 "$id" | cut -d' ' -f1)
     echo "GPU counter before dump: $before, after restore: $after"
@@ -543,7 +543,7 @@ assert [a for a, _ in rows] == list(range(1, len(rows) + 1)), "steps not consecu
 EOF
 }
 
-# PUZUZ_E2E_GPU=1 only: s13 for CUDA jobs. A paused CUDA counter and a
+# GPUEUE_E2E_GPU=1 only: s13 for CUDA jobs. A paused CUDA counter and a
 # paused PyTorch training job (forked DataLoader workers) are restored
 # paused with their GPU state, and continue on `start`; `pause` during a
 # GPU dump is refused.
@@ -589,7 +589,7 @@ s14_gpu_paused() {
     PAUSED_CHECKPOINT=1 gpu_train_variant 60 1 2
 }
 
-# PUZUZ_E2E_GPU=1 only: PyTorch training whose DataLoader forks its workers
+# GPUEUE_E2E_GPU=1 only: PyTorch training whose DataLoader forks its workers
 # (the default start method): the workers inherit the CUDA process's NVIDIA
 # device mappings, which CRIU cannot dump; the helper's fork guard drops
 # them. Each variant is checkpointed and restored <n> times and must log
@@ -605,7 +605,7 @@ gpu_train_variant() {
     expect_state "$ref" done/success
     head -n1 "$LOGS/1000/$ref.log"
     grep -q 'start_method=fork ' "$LOGS/1000/$ref.log" || fail "the workers are not forked"
-    grep -q 'preload=.*puzuz-forkguard-' "$LOGS/1000/$ref.log" || fail "the fork guard is not preloaded"
+    grep -q 'preload=.*gpueue-forkguard-' "$LOGS/1000/$ref.log" || fail "the fork guard is not preloaded"
     id=$(add alice -g free --gpu 0 -- "$cmd")
     wait_state "$id" running
     for k in $(seq "$n"); do
@@ -665,26 +665,26 @@ s11_gpu_fork_workers() {
     gpu_train_variant 80 2 2 pin epochs
 }
 
-# PUZUZ_E2E_GPU=1 only: NVML detection under the packaged, sandboxed
-# puzuz.service. The daemon is restarted with gpu_detection = "auto" and
+# GPUEUE_E2E_GPU=1 only: NVML detection under the packaged, sandboxed
+# gpueue.service. The daemon is restarted with gpu_detection = "auto" and
 # no [[gpus]] list; it must find the real GPU with NVML (name, UUID,
-# memory and driver as nvidia-smi reports them) and `puzuz doctor` must be
+# memory and driver as nvidia-smi reports them) and `gpueue doctor` must be
 # happy with that. The static test configuration is put back afterwards.
 s12_nvml_detection() {
     local since out smi
     mkdir -p "$STATE"
-    cp /etc/puzuz/config.toml "$STATE/config-static.toml"
+    cp /etc/gpueue/config.toml "$STATE/config-static.toml"
     { grep '^cuda_checkpoint_mode' "$STATE/config-static.toml" || true
-      printf 'grace_secs = 5\ngpu_detection = "auto"\n'; } >/etc/puzuz/config.toml
+      printf 'grace_secs = 5\ngpu_detection = "auto"\n'; } >/etc/gpueue/config.toml
     since=$(date '+%Y-%m-%d %H:%M:%S')
-    systemctl restart puzuz.service
+    systemctl restart gpueue.service
     wait_socket
     out=$(pz carol gpu --json) || fail "gpu --json"
     echo "$out"
     smi=$(nvidia-smi --query-gpu=index,uuid,name,memory.total,driver_version \
         --format=csv,noheader,nounits) || fail "nvidia-smi"
     echo "nvidia-smi: $smi"
-    python3 - "$out" "$smi" <<'EOF' || fail "puzuz gpu does not show the GPU NVML should detect"
+    python3 - "$out" "$smi" <<'EOF' || fail "gpueue gpu does not show the GPU NVML should detect"
 import json, sys
 gpus = {g["index"]: g for g in json.loads(sys.argv[1])["gpus"]}
 index, uuid, name, mib, driver = [f.strip() for f in sys.argv[2].splitlines()[0].split(",")]
@@ -700,7 +700,7 @@ EOF
     # The journal is captured first (see s2_authz): `journalctl | grep -q`
     # fails when grep's early exit kills journalctl with SIGPIPE.
     local journal
-    journal="$(journalctl -u puzuz.service --since "$since" -o cat --no-pager)" \
+    journal="$(journalctl -u gpueue.service --since "$since" -o cat --no-pager)" \
         || fail "journalctl failed"
     grep -q 'detected 1 GPU(s) with NVML' <<<"$journal" || fail "the daemon did not log NVML detection"
     ! grep 'NVML failed' <<<"$journal" || fail "the daemon logged an NVML failure"
@@ -708,15 +708,15 @@ EOF
     grep -E '^OK +gpus: 1 GPU\(s\), detected with NVML$' <<<"$out" \
         || fail "doctor does not report NVML detection: $(grep gpus <<<"$out")"
 
-    install -m 0644 "$STATE/config-static.toml" /etc/puzuz/config.toml
-    systemctl restart puzuz.service
+    install -m 0644 "$STATE/config-static.toml" /etc/gpueue/config.toml
+    systemctl restart gpueue.service
     wait_socket
 }
 
 # s7 is split across two containers by scripts/e2e-test.sh.
 # The helper dumps the jobs on its own during the OS shutdown: a running
 # and a paused counter (the paused one comes back paused), and with
-# PUZUZ_E2E_GPU=1 a running and a paused CUDA counter on GPU 0.
+# GPUEUE_E2E_GPU=1 a running and a paused CUDA counter on GPU 0.
 s7_prepare() {
     local a b c g h
     free_group
@@ -727,7 +727,7 @@ s7_prepare() {
     wait_state "$b" running
     wait_state "$c" running
     mkdir -p "$STATE"
-    if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
+    if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
         pz carol gpu parallel 2 || fail "gpu parallel"
         g=$(add alice -g free --gpu 0 -- 'exec /opt/venv/bin/python3 -u /e2e/gpu_counter.py')
         h=$(add alice -g free --gpu 0 -- 'exec /opt/venv/bin/python3 -u /e2e/gpu_counter.py')
@@ -781,7 +781,7 @@ s7_verify() {
     pz alice kill "$c"
     wait_state "$c" 'done/*'
 
-    if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
+    if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
         g=$(cat "$STATE/g")
         h=$(cat "$STATE/h")
         for i in "$g" "$h"; do
@@ -819,7 +819,7 @@ s7_verify() {
 # $STATE/mounts and prints the id.
 mjob() {
     local name=$1 cwd=$2 file=$3 pre=${4:-} id
-    id=$( (cd "$cwd" && runuser -u alice -- puzuz --color never add -p -g free -- \
+    id=$( (cd "$cwd" && runuser -u alice -- gpueue --color never add -p -g free -- \
         "$pre exec 3>>$file; i=0; while :; do echo \$i >&3; i=\$((i+1)); sleep 0.2; done"))
     echo "$id $name $file" >>"$STATE/mounts"
     echo "$id"
@@ -869,7 +869,7 @@ mount_dev() { findmnt -fno MAJ:MIN "$1" | tail -n1; }
 # job_mountinfo <id>: mountinfo of the job's namespace.
 job_mountinfo() {
     local pid
-    pid=$(systemctl show -p MainPID --value "puzuz-job-$1.service")
+    pid=$(systemctl show -p MainPID --value "gpueue-job-$1.service")
     cat "/proc/$(pgrep -P "$pid" | head -n1)/mountinfo"
 }
 
@@ -911,15 +911,15 @@ s15_prepare() {
         # and kept open all the time, so the dump finds the job holding one
         # it created after the helper listed the job's files before the
         # dump (on sshfs it shows as root's: the restore must recognise it
-        # as held at the dump, see `puzuz-helper dump-hook`).
+        # as held at the dump, see `gpueue-helper dump-hook`).
         rm -f /nfs/n-*
         mjob sshfs /nfs /nfs/n-nfs.txt \
             '(while :; do exec 5>/nfs/n-state.tmp; date +%s%N >&5; mv /nfs/n-state.tmp /nfs/n-state; done) &' \
             >/dev/null
         for _ in $(seq 50); do [ -s /nfs/n-nfs.txt ] && break; sleep 0.2; done
         stat -c %i /nfs/n-nfs.txt >"$STATE/nfs-ino" 2>/dev/null || true
-    elif [ "${PUZUZ_E2E_REQUIRE_SSHFS:-}" = 1 ]; then
-        fail "/nfs (sshfs) is not mounted, and PUZUZ_E2E_REQUIRE_SSHFS=1"
+    elif [ "${GPUEUE_E2E_REQUIRE_SSHFS:-}" = 1 ]; then
+        fail "/nfs (sshfs) is not mounted, and GPUEUE_E2E_REQUIRE_SSHFS=1"
     else
         echo "SKIP 15 network filesystem part: /nfs (sshfs) is not mounted"
     fi
@@ -991,14 +991,14 @@ s16_prepare() {
     need_mounts
     pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
     rm -f /data/alice/m-gone.txt
-    id=$( (cd /data/alice && runuser -u alice -- puzuz --color never add -p -g free -- \
+    id=$( (cd /data/alice && runuser -u alice -- gpueue --color never add -p -g free -- \
         'exec 3>>/data/alice/m-gone.txt; i=0; while :; do echo $i >&3; i=$((i+1)); sleep 0.2; done'))
     wait_state "$id" running
     sleep 1.5
     mkdir -p "$STATE"
     echo "$id" >"$STATE/gone"
     # /data does not come back at the next boot (no fstab entry).
-    echo /data >>/var/lib/puzuz-e2e-disk/skip-next-boot
+    echo /data >>/var/lib/gpueue-e2e-disk/skip-next-boot
 }
 s16_verify() {
     local id
@@ -1022,7 +1022,7 @@ s16_verify() {
 # is on it is refused with a reason naming the mount, and keeps running.
 RNFS=/rnfs
 mount_rnfs() {
-    local disk=/var/lib/puzuz-e2e-disk
+    local disk=/var/lib/gpueue-e2e-disk
     mkdir -p "$RNFS"
     sshfs -o allow_other,default_permissions,IdentityFile="$disk/ssh/id",StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,LogLevel=ERROR \
         root@127.0.0.1:/srv/ext4/export "$RNFS" || fail "sshfs on $RNFS"
@@ -1030,14 +1030,14 @@ mount_rnfs() {
 # cjob <cwd> <file>: a counter job of alice's with its cwd in <cwd> that
 # appends to <file>; prints the id.
 cjob() {
-    (cd "$1" && runuser -u alice -- puzuz --color never add -p -g free -- \
+    (cd "$1" && runuser -u alice -- gpueue --color never add -p -g free -- \
         "exec 3>>$2; i=0; while :; do echo \$i >&3; i=\$((i+1)); sleep 0.2; done")
 }
 # live_pid <id>: host PID of the init of the job's namespace, restored or
 # not.
 active_unit() {
-    systemctl list-units --no-legend --plain --state=active "puzuz-job-$1.service" \
-        "puzuz-job-$1-r*.service" | awk 'NR == 1 {print $1}'
+    systemctl list-units --no-legend --plain --state=active "gpueue-job-$1.service" \
+        "gpueue-job-$1-r*.service" | awk 'NR == 1 {print $1}'
 }
 has_active_unit() { [ -n "$(active_unit "$1")" ]; }
 live_pid() {
@@ -1061,7 +1061,7 @@ s20_prepare() {
     local u s d n i err
     need_mounts
     if ! command -v sshfs >/dev/null || ! pgrep -x sshd >/dev/null; then
-        [ "${PUZUZ_E2E_REQUIRE_SSHFS:-}" != 1 ] || fail "sshfs is missing, and PUZUZ_E2E_REQUIRE_SSHFS=1"
+        [ "${GPUEUE_E2E_REQUIRE_SSHFS:-}" != 1 ] || fail "sshfs is missing, and GPUEUE_E2E_REQUIRE_SSHFS=1"
         echo "SKIP 20 a dead FUSE mount: sshfs is not available"
         return 0
     fi
@@ -1164,7 +1164,7 @@ s10_burst() {
     # `add --immediate` that finds the helper away is refused (no job).
     burst b 16 'echo ok; sleep 3' >/dev/null 2>&1 &
     sleep 0.15
-    systemctl restart puzuz-helper.service
+    systemctl restart gpueue-helper.service
     wait
     mapfile -t ids < <(cat "$STATE"/burst-b-*)
     echo "${#ids[@]} of 16 jobs added around the helper restart"
@@ -1178,11 +1178,11 @@ s10_burst() {
     done
 }
 
-# prio_ids <user>: the pending jobs as `puzuz prio --json` orders them.
+# prio_ids <user>: the pending jobs as `gpueue prio --json` orders them.
 prio_ids() {
     pz "$1" prio --json | python3 -c 'import json, sys; print(" ".join(str(j["id"]) for j in json.load(sys.stdin)["jobs"]))'
 }
-# raw_usage <user> <uid>: the decayed usage of <uid> as `puzuz share --json` shows it.
+# raw_usage <user> <uid>: the decayed usage of <uid> as `gpueue share --json` shows it.
 raw_usage() {
     pz "$1" share --json | python3 -c "import json, sys; print(next((u['raw_usage'] for u in json.load(sys.stdin)['users'] if u['uid'] == $2), 0))"
 }
@@ -1240,7 +1240,7 @@ s18_job_policy() {
     # The log header (with the reason) goes to stderr.
     log=$(pz svcacct log "$id" 2>&1) || fail "log failed"
     echo "$log"
-    grep -q 'puzuz refuses to run jobs as svcacct: uid 990 is below job_min_uid' <<<"$log" \
+    grep -q 'gpueue refuses to run jobs as svcacct: uid 990 is below job_min_uid' <<<"$log" \
         || fail "the log does not show the refusal"
 
     # A denied supplementary group is left out (the helper's journal says so).
@@ -1251,7 +1251,7 @@ s18_job_policy() {
     expect_state "$id" done/success
     log=$(pz alice log --full "$id") || fail "log failed"
     echo "$log"
-    journal=$(journalctl -u puzuz-helper.service -o cat)
+    journal=$(journalctl -u gpueue-helper.service -o cat)
     grep -q "job $id of alice: leaving out the supplementary groups \\[.*\"docker\"" <<<"$journal" \
         || fail "the helper's journal does not say that docker was left out"
     groups=$(sed -n 's/^groups=//p' <<<"$log")
@@ -1264,22 +1264,22 @@ s18_job_policy() {
     id=$(add dockeruser -- 'echo should not run')
     wait_state "$id" done/failed_to_spawn
     log=$(pz dockeruser log "$id" 2>&1) || fail "log failed"
-    grep -q 'puzuz refuses to run jobs as dockeruser: primary group docker is in job_denied_groups' \
+    grep -q 'gpueue refuses to run jobs as dockeruser: primary group docker is in job_denied_groups' \
         <<<"$log" || fail "the log does not show the refusal: $log"
 }
 
-# s19: a job of a user who can become root in every usual way outside puzuz
+# s19: a job of a user who can become root in every usual way outside gpueue
 # (member of sudo with a NOPASSWD rule, a polkit rule trusting the sudo
 # group, member of docker with a root daemon socket, member of disk with a
 # block device, member of libvirt with world-connectable sockets in
 # /run/libvirt, which libvirt authorizes through polkit) cannot do any of
 # it, before and after a checkpoint/restore.
-# Each way is first shown to work for the same user outside puzuz.
+# Each way is first shown to work for the same user outside gpueue.
 E2E_DOCKER_SOCK=/run/e2e-docker.sock
 E2E_LISTENERS=
 # listen_world <socket>: as root, listen on a world-connectable Unix
 # socket (like libvirt's polkit-authorized ones) in the background, and
-# check that eve can connect to it outside puzuz.
+# check that eve can connect to it outside gpueue.
 listen_world() {
     local sock=$1
     rm -f "$sock"
@@ -1294,7 +1294,7 @@ while True:
     E2E_LISTENERS="$E2E_LISTENERS $!"
     wait_for 10 "the socket $sock" test -S "$sock"
     runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' \
-        "$sock" || fail "eve cannot connect to $sock outside puzuz"
+        "$sock" || fail "eve cannot connect to $sock outside gpueue"
 }
 # The default job_hidden_socket_dirs.
 E2E_SOCKET_DIRS="/run/libvirt /run/cups"
@@ -1310,7 +1310,7 @@ late_sockets() {
         listen_world "$sock"
         echo "$sock" >>/home/eve/e2e-late-sockets
     done
-    echo "control: eve can connect to the late sockets (round $2) outside puzuz"
+    echo "control: eve can connect to the late sockets (round $2) outside gpueue"
 }
 s19_no_escalation() {
     local id log dev uid gid out r
@@ -1333,8 +1333,8 @@ EOF
     if command -v sudo >/dev/null; then
         echo 'eve ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/e2e-eve
         chmod 0440 /etc/sudoers.d/e2e-eve
-        runuser -u eve -- sudo -n true || fail "the sudoers rule does not work outside puzuz"
-        echo "control: eve can sudo outside puzuz"
+        runuser -u eve -- sudo -n true || fail "the sudoers rule does not work outside gpueue"
+        echo "control: eve can sudo outside gpueue"
     else
         echo "SKIP: no sudo in the image (the sudo checks are skipped)"
     fi
@@ -1349,10 +1349,10 @@ polkit.addRule(function(action, subject) {
 EOF
         systemctl restart polkit.service 2>/dev/null || true
         runuser -u eve -- systemctl --no-ask-password start e2e-escalate.service \
-            || fail "the polkit rule does not let eve start units outside puzuz"
+            || fail "the polkit rule does not let eve start units outside gpueue"
         [ -e /run/e2e-escalated ] || fail "the control start left no marker"
         rm -f /run/e2e-escalated
-        echo "control: eve can start system units through polkit outside puzuz"
+        echo "control: eve can start system units through polkit outside gpueue"
     else
         echo "SKIP: no polkit in the image (no control for the D-Bus checks)"
     fi
@@ -1360,7 +1360,7 @@ EOF
     # systemd's Varlink services: every socket under /run/systemd except
     # the kept log and resolution sockets and userdb/ must be out of a
     # job's reach; two polkit-authorized calls are shown to work for eve
-    # outside puzuz.
+    # outside gpueue.
     find /run/systemd -type s \
         -not -path /run/systemd/journal/socket -not -path /run/systemd/journal/stdout \
         -not -path /run/systemd/journal/dev-log -not -path /run/systemd/resolve/io.systemd.Resolve \
@@ -1375,8 +1375,8 @@ EOF
             "$out" >/home/eve/e2e-cred-decrypt.json
         runuser -u eve -- varlinkctl call /run/systemd/io.systemd.Credentials \
             io.systemd.Credentials.Decrypt "$(cat /home/eve/e2e-cred-decrypt.json)" \
-            || fail "the polkit rule does not let eve decrypt system credentials outside puzuz"
-        echo "control: eve can decrypt system credentials through Varlink and polkit outside puzuz"
+            || fail "the polkit rule does not let eve decrypt system credentials outside gpueue"
+        echo "control: eve can decrypt system credentials through Varlink and polkit outside gpueue"
     else
         echo "SKIP: no io.systemd.Credentials or polkit (no Varlink control)"
     fi
@@ -1396,8 +1396,8 @@ while True:
     c.close()' "$E2E_DOCKER_SOCK" "$(getent group docker | cut -d: -f3)" &
     wait_for 10 "the fake docker socket" test -S "$E2E_DOCKER_SOCK"
     runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' \
-        "$E2E_DOCKER_SOCK" || fail "eve cannot connect to the docker socket outside puzuz"
-    echo "control: eve can connect to the docker socket outside puzuz"
+        "$E2E_DOCKER_SOCK" || fail "eve cannot connect to the docker socket outside gpueue"
+    echo "control: eve can connect to the docker socket outside gpueue"
 
     # A block device of group disk.
     truncate -s 1M "$STATE/e2e-blk.img" 2>/dev/null || { mkdir -p "$STATE"; truncate -s 1M "$STATE/e2e-blk.img"; }
@@ -1405,8 +1405,8 @@ while True:
     chgrp disk "$dev"
     chmod 0660 "$dev"
     runuser -u eve -- python3 -c 'import os, sys; os.open(sys.argv[1], os.O_RDONLY)' "$dev" \
-        || fail "eve cannot open $dev outside puzuz"
-    echo "control: eve can open $dev outside puzuz"
+        || fail "eve cannot open $dev outside gpueue"
+    echo "control: eve can open $dev outside gpueue"
 
     # Daemon sockets that authorize by the caller's groups in the user
     # database (libvirt: polkit; CUPS: SystemGroup), as world-connectable
@@ -1423,7 +1423,7 @@ while True:
         listen_world /run/cups/e2e-cups.sock
         echo /run/cups/e2e-cups.sock >>/home/eve/e2e-daemon-sockets
     fi
-    echo "control: eve can connect to the daemon sockets outside puzuz: $(tr '\n' ' ' </home/eve/e2e-daemon-sockets)"
+    echo "control: eve can connect to the daemon sockets outside gpueue: $(tr '\n' ' ' </home/eve/e2e-daemon-sockets)"
     : >/home/eve/e2e-late-sockets
     chown eve: /home/eve/e2e-late-sockets /home/eve/e2e-daemon-sockets
     id=$(add eve -- "bash /e2e/escalation_checks.sh $uid $gid $E2E_DOCKER_SOCK $dev /home/eve")
@@ -1439,7 +1439,7 @@ while True:
     # The restored job's namespace still hides /run/dbus, /run/systemd and
     # the directories of job_hidden_socket_dirs.
     out=$(grep -E ' /run/(dbus|systemd|libvirt|cups) ' \
-        "/proc/$(systemctl show -p MainPID --value "puzuz-job-$id-r1.service")/mountinfo" || true)
+        "/proc/$(systemctl show -p MainPID --value "gpueue-job-$id-r1.service")/mountinfo" || true)
     echo "restored job's mounts on /run/dbus, /run/systemd, /run/libvirt and /run/cups: $out"
     for r in /run/dbus /run/systemd $E2E_SOCKET_DIRS; do
         grep -q " $r .* - tmpfs " <<<"$out" || fail "the restored job's namespace does not hide $r"
@@ -1504,13 +1504,13 @@ main)
     run "4 checkpoint and restore" s4_checkpoint_restore
     run "5 daemon restart" s5_daemon_restart
     run "6 helper restart" s6_helper_restart
-    run "8 puzuz shutdown" s8_shutdown
+    run "8 gpueue shutdown" s8_shutdown
     run "10 many jobs at once" s10_burst
     run "13 checkpoint of a paused job" s13_paused_checkpoint
     run "17 multifactor priority (fair share, nice, top)" s17_priority
     run "18 job credential policy" s18_job_policy
     run "19 no privilege escalation from jobs" s19_no_escalation
-    if [ "${PUZUZ_E2E_GPU:-}" = 1 ]; then
+    if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers
         run "14 GPU checkpoint of paused jobs" s14_gpu_paused

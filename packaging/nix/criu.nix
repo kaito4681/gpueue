@@ -1,5 +1,5 @@
-# CRIU 4.2.x. puzuz needs CRIU 4.2 or newer; nixpkgs still has 4.1.1.
-# Exported as `packages.<system>.criu` (for the NixOS module); the puzuz
+# CRIU 4.2.x. gpueue needs CRIU 4.2 or newer; nixpkgs still has 4.1.1.
+# Exported as `packages.<system>.criu` (for the NixOS module); the gpueue
 # package itself does not depend on it.
 {
   criu,

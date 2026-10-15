@@ -1,21 +1,21 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-default-members = ["crates/puzuz"]
+default-members = ["crates/gpueue"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-repository = "https://github.com/kaito4681/puzuz"
+repository = "https://github.com/kaito4681/gpueue"
 
 [workspace.dependencies]
-puzuz-core = { path = "crates/puzuz-core" }
-puzuz-protocol = { path = "crates/puzuz-protocol" }
-puzuz-daemon = { path = "crates/puzuz-daemon" }
-puzuz-checkpoint = { path = "crates/puzuz-checkpoint" }
-puzuz-config = { path = "crates/puzuz-config" }
+gpueue-core = { path = "crates/gpueue-core" }
+gpueue-protocol = { path = "crates/gpueue-protocol" }
+gpueue-daemon = { path = "crates/gpueue-daemon" }
+gpueue-checkpoint = { path = "crates/gpueue-checkpoint" }
+gpueue-config = { path = "crates/gpueue-config" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -40,14 +40,14 @@ nix = { version = "0.30", features = ["user", "sched", "mount", "signal", "proce
 axum = "0.8"
 futures = "0.3"
 tokio-util = "0.7"
-# Only `from_str` is used (puzuz-config); a crate that serializes adds "display".
+# Only `from_str` is used (gpueue-config); a crate that serializes adds "display".
 toml = { version = "0.9", default-features = false, features = ["std", "serde", "parse"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 nvml-wrapper = "0.13"
 cc = "1"
-# `puzuz update` only (never the helper): HTTPS with rustls, release
+# `gpueue update` only (never the helper): HTTPS with rustls, release
 # signatures, checksums and tarballs.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 minisign-verify = "0.2"

@@ -1,8 +1,8 @@
 #!/bin/sh
-# After the puzuz package is installed or upgraded: create the user and the
+# After the gpueue package is installed or upgraded: create the user and the
 # directories, then enable and start the services (first installation) or
 # restart them (upgrade). Running jobs are transient units of their own
-# (puzuz-job-<id>.service) and keep running while the services restart.
+# (gpueue-job-<id>.service) and keep running while the services restart.
 #
 # Arguments: deb `configure [<last-configured-version>]` (empty on the first
 # installation) / `abort-remove` / `abort-deconfigure ...` / `abort-upgrade
@@ -13,10 +13,10 @@
 # shellcheck disable=SC2086 # $UNITS is split into the unit names on purpose.
 set -e
 
-UNITS="puzuz-helper.service puzuz.service"
+UNITS="gpueue-helper.service gpueue.service"
 # Left by prerm when the package was removed but not purged: dpkg then still
 # passes the old version to `configure`, but the services were disabled.
-REMOVED_MARKER=/var/lib/puzuz/package-removed
+REMOVED_MARKER=/var/lib/gpueue/package-removed
 
 systemd_running() {
     [ -d /run/systemd/system ]
@@ -45,16 +45,16 @@ abort-remove | abort-deconfigure)
 *) exit 0 ;;
 esac
 
-# The system user `puzuz` and the group `puzuz-admin` (sysusers.d/puzuz.conf;
+# The system user `gpueue` and the group `gpueue-admin` (sysusers.d/gpueue.conf;
 # systemd-sysusers comes with the systemd the package depends on).
-systemd-sysusers /usr/lib/sysusers.d/puzuz.conf
+systemd-sysusers /usr/lib/sysusers.d/gpueue.conf
 
-# /var/lib/puzuz and /run/puzuz (tmpfiles.d/puzuz.conf).
+# /var/lib/gpueue and /run/gpueue (tmpfiles.d/gpueue.conf).
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
-    systemd-tmpfiles --create /usr/lib/tmpfiles.d/puzuz.conf ||
-        echo "puzuz: warning: systemd-tmpfiles --create failed; the services create what they need at boot" >&2
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/gpueue.conf ||
+        echo "gpueue: warning: systemd-tmpfiles --create failed; the services create what they need at boot" >&2
 else
-    echo "puzuz: warning: systemd-tmpfiles not found; /var/lib/puzuz and /run/puzuz were not created" >&2
+    echo "gpueue: warning: systemd-tmpfiles not found; /var/lib/gpueue and /run/gpueue were not created" >&2
 fi
 
 if systemd_running; then
@@ -65,22 +65,22 @@ if [ "$action" = install ]; then
     rm -f "$REMOVED_MARKER"
     if systemd_running; then
         systemctl enable $UNITS ||
-            echo "puzuz: warning: could not enable $UNITS" >&2
+            echo "gpueue: warning: could not enable $UNITS" >&2
         if systemctl start $UNITS; then
-            echo "puzuz: started $UNITS. Check the installation with \`puzuz doctor\`."
+            echo "gpueue: started $UNITS. Check the installation with \`gpueue doctor\`."
         else
-            echo "puzuz: warning: $UNITS did not start; see \`puzuz doctor\` and \`journalctl -u puzuz-helper -u puzuz\`" >&2
+            echo "gpueue: warning: $UNITS did not start; see \`gpueue doctor\` and \`journalctl -u gpueue-helper -u gpueue\`" >&2
         fi
     else
         # Offline: only the [Install] symlinks, so the services start on the next boot.
         systemctl --no-reload enable $UNITS >/dev/null 2>&1 || true
-        echo "puzuz: systemd is not running; the services were not started."
+        echo "gpueue: systemd is not running; the services were not started."
     fi
 else
     if systemd_running; then
         # Only the services that are running (an administrator may have stopped them).
         systemctl try-restart $UNITS ||
-            echo "puzuz: warning: restarting $UNITS failed; see \`puzuz doctor\`" >&2
+            echo "gpueue: warning: restarting $UNITS failed; see \`gpueue doctor\`" >&2
     fi
 fi
 

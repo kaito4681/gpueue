@@ -1,0 +1,6 @@
+# The gpueue APT repository, installed by the gpueue package (see
+# /usr/share/doc/gpueue/install.md). Edits are kept on upgrades.
+Types: deb
+URIs: https://github.com/kaito4681/gpueue/releases/download/apt/
+Suites: ./
+Signed-By: /etc/apt/keyrings/gpueue.gpg

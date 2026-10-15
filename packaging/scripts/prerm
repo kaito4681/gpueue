@@ -1,14 +1,14 @@
 #!/bin/sh
-# Before the puzuz package is removed (not upgraded): stop and disable the
-# services. Running jobs are units of their own (puzuz-job-<id>.service) and
+# Before the gpueue package is removed (not upgraded): stop and disable the
+# services. Running jobs are units of their own (gpueue-job-<id>.service) and
 # are never touched here: they keep running, and their logs and checkpoints
-# stay in /var/lib/puzuz.
+# stay in /var/lib/gpueue.
 #
 # Arguments: deb `remove` / `upgrade <new-version>` / `deconfigure ...` /
 # `failed-upgrade <old-version>`; rpm %preun `0` (erase) / `1` (upgrade).
 set -e
 
-REMOVED_MARKER=/var/lib/puzuz/package-removed
+REMOVED_MARKER=/var/lib/gpueue/package-removed
 
 case "$1" in
 remove | 0) ;;
@@ -17,24 +17,24 @@ esac
 
 if [ -d /run/systemd/system ]; then
     # Daemon first, then the helper (a plain stop leaves jobs running).
-    systemctl disable --now puzuz.service puzuz-helper.service ||
-        echo "puzuz: warning: could not stop and disable puzuz.service and puzuz-helper.service" >&2
-    jobs="$(systemctl list-units --plain --no-legend --state=active,activating,deactivating 'puzuz-job-*' 2>/dev/null |
+    systemctl disable --now gpueue.service gpueue-helper.service ||
+        echo "gpueue: warning: could not stop and disable gpueue.service and gpueue-helper.service" >&2
+    jobs="$(systemctl list-units --plain --no-legend --state=active,activating,deactivating 'gpueue-job-*' 2>/dev/null |
         awk '{print $1}' | tr '\n' ' ')" || jobs=""
     if [ -n "$jobs" ]; then
-        echo "puzuz: jobs keep running in their own units: $jobs"
-        echo "puzuz: stop them with \`sudo systemctl stop 'puzuz-job-*'\` if they should not."
+        echo "gpueue: jobs keep running in their own units: $jobs"
+        echo "gpueue: stop them with \`sudo systemctl stop 'gpueue-job-*'\` if they should not."
     fi
 else
-    systemctl --no-reload disable puzuz.service puzuz-helper.service >/dev/null 2>&1 || true
+    systemctl --no-reload disable gpueue.service gpueue-helper.service >/dev/null 2>&1 || true
 fi
 
 # deb: a later reinstallation of a removed (not purged) package, or a
 # rolled-back removal (postinst abort-remove), enables and starts the services
-# again (see postinst). /var/lib/puzuz is created as tmpfiles.d/puzuz.conf
+# again (see postinst). /var/lib/gpueue is created as tmpfiles.d/gpueue.conf
 # does, in case it is missing.
 if [ "$1" = remove ]; then
-    install -d -m 0755 -o root -g root /var/lib/puzuz
+    install -d -m 0755 -o root -g root /var/lib/gpueue
     : >"$REMOVED_MARKER"
 fi
 

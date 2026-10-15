@@ -1,6 +1,6 @@
-"""Query `puzuz status --json` (or `gpu --json`) read from stdin.
+"""Query `gpueue status --json` (or `gpu --json`) read from stdin.
 
-Usage: puzuz status --json | python3 q.py EXPR
+Usage: gpueue status --json | python3 q.py EXPR
 EXPR is a Python expression over `d` (the parsed JSON) with these helpers:
   job(id)    the job object (KeyError if missing)
   st(id)     a compact state: "running", "done/success/0", "done/failed/3",
