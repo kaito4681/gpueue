@@ -142,7 +142,9 @@ aarch64 且 glibc 为 2.34 或更高版本，以及 puzuz 是否并非由包管�
 3. 用内置于脚本中的发布密钥（`packaging/minisign.pub`）校验 `.minisig` 签名。它使用 `PATH` 中的
    `minisign`；如果没有，就从 GitHub 将 minisign 0.12 的静态二进制发布包下载到临时目录，用内置于脚本中的
    SHA-256 校验和（与 `scripts/dist/get-minisign.sh` 相同）校验后使用。如果下载失败，它会停止，并提示你
-   从发行版安装 `minisign`（例如 `sudo apt install minisign`）后重新运行；签名校验绝不会被跳过，
+   从发行版安装 `minisign`（例如 `sudo apt install minisign`）后重新运行；签名校验绝不会被跳过。
+   签名的 trusted comment 必须是所请求的发布版本和 tarball 的 `puzuz <tag> <file>`，因此以较新名称提供的
+   旧发布版本的（签名有效的）tarball 会被拒绝，
 4. 解压 tarball（拒绝链接以及指向其外部的路径），运行新的 `puzuz service install`
    （它沿用当前安装所在的目录，否则使用 `/usr/local/bin`；只有你指定了 `--bin-dir` 时才会传递该选项），
    并打印其 `puzuz doctor` 报告，
@@ -164,12 +166,17 @@ Alma Linux 上可以改用 [.rpm](#installing-the-fedorarhelrocky-package)，在
 每个发布版本针对每个目标（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`）都包含
 `puzuz-v<X>-<target>.tar.gz` 及其 `.sha256` 和 `.minisig` 文件；软件包 `puzuz_<X>_amd64.deb`、
 `puzuz_<X>_arm64.deb`、`puzuz-<X>-1.x86_64.rpm` 和 `puzuz-<X>-1.aarch64.rpm` 也各自带有这两种文件；
-另外还有 `install.sh` 及其 `install.sh.minisig`。要自己校验 tarball（或软件包）：
+另外还有 `install.sh` 及其 `install.sh.minisig`；`.rpm` 经过 GPG 签名的发布版本还带有 `RPM-GPG-KEY-puzuz`
+及其 `RPM-GPG-KEY-puzuz.minisig`。要自己校验 tarball（或软件包）：
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 ```
+
+minisign 会打印签名的 trusted comment（它受签名保护），其中写明发布版本和文件
+（`Trusted comment: puzuz v0.1.0 puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`）。请确认它就是你要下载的
+发布版本和文件。
 
 `curl ... | sudo bash` 会直接运行下载到的内容。要先校验 `install.sh`，请将它与签名一起下载，用发布密钥
 （`packaging/minisign.pub`）验证，然后运行校验过的副本：
@@ -381,10 +388,13 @@ Fedora 的 CRIU（4.2）足够新，RHEL/Rocky/Alma 9 的 3.19 则不够，因�
 
 **验证。** 与所有发布版本资源文件一样，`.rpm` 带有 `.sha256` 和 `.minisig` 文件（参见
 [手动验证发布版本](#verifying-a-release-by-hand)）。使用 GPG 密钥构建的发布版本还会对 `.rpm` 本身签名，
-并将该密钥作为 `RPM-GPG-KEY-puzuz` 附上（即 APT 仓库的密钥）：
+并将该密钥作为 `RPM-GPG-KEY-puzuz` 附上（即 APT 仓库的密钥）。该密钥文件与其他资源文件一样带有 minisign
+签名，导入前请先用发布密钥校验它：
 
 ```sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz.minisig
+minisign -Vm RPM-GPG-KEY-puzuz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 gpg --show-keys RPM-GPG-KEY-puzuz                   # E53970325A397378537BC77620B6B72F9F5585C2
 sudo rpm --import RPM-GPG-KEY-puzuz
 rpm -K puzuz-0.1.0-1.x86_64.rpm                     # "digests signatures OK"
@@ -678,9 +688,10 @@ cuda-checkpoint（参见 [cuda-checkpoint](#cuda-checkpoint)）。两者都是�
 
 PKGBUILD 位于 `packaging/aur/puzuz-bin`。当一个发布版本作为稳定版本发布时（与 APT 仓库相同的 `released`
 事件；草稿和预发布版本不会触发），
-`.github/workflows/release-aur.yml` 会运行 `scripts/dist/update-aur.sh <version>`，它从发布版本的 `.sha256`
-文件中获取 tarball 的校验和，计算该标签源码归档的校验和（用于单元和片段），并在 Arch Linux 容器中重新生成
-`.SRCINFO`。然后它将 `PKGBUILD`、`.SRCINFO` 和 `puzuz-bin.install` 推送到
+`.github/workflows/release-aur.yml` 会运行 `scripts/dist/update-aur.sh <version>`，它下载发布版本的 tarball
+及其 `.minisig` 文件，用该标签的 `packaging/minisign.pub` 校验它们（并像 `install.sh` 一样校验 trusted comment
+`puzuz v<version> <file>`），根据校验过的 tarball 和该标签的源码归档（用于单元和片段，签名的资源文件中不包含它们）
+计算 PKGBUILD 的校验和，并在 Arch Linux 容器中重新生成 `.SRCINFO`。然后它将 `PKGBUILD`、`.SRCINFO` 和 `puzuz-bin.install` 推送到
 `ssh://aur@aur.archlinux.org/puzuz-bin.git`。发布版本必须同时包含 x86_64 和 aarch64 的 tarball。
 要在不发布新版本的情况下修改打包，请在 PKGBUILD 中递增 `pkgrel`，并手动运行工作流
 （`gh workflow run release-aur.yml -f version=<X.Y.Z>`）。
@@ -1573,7 +1584,8 @@ sudo puzuz update --version 0.2.0 --yes
    发布版本以修复这对二进制文件。只有通过 `--version` 明确指定时才会安装较旧的版本，
 3. 请求确认（`-y/--yes` 跳过确认），
 4. 将 tarball、`.sha256` 和 `.minisig` 下载到 `/var/lib/puzuz/update`（root，0700），用 `puzuz`
-   内置的发布密钥验证 minisign 签名，并校验校验和，
+   内置的发布密钥验证 minisign 签名（与 `install.sh` 一样，其 trusted comment 必须是该发布版本的
+   `puzuz <tag> <file>`），并校验校验和，
 5. 解压 tarball（仅限普通文件和目录），并询问新的 `puzuz` 支持哪个数据库模式（schema）。无法
    打开守护进程数据库的发布版本（模式变更之前的旧版本）会在任何更改之前被拒绝，
 6. 针对已安装的目录运行新的 `puzuz service install`，删除 Nix 构建安装的 Nix GC 根（发布版本的

@@ -341,8 +341,21 @@ fn public_key(sys: &dyn System) -> Result<String> {
     }
 }
 
-/// Checks the minisign signature `signature` (a `.minisig` file) of `data`.
-pub fn verify_signature(public_key: &str, data: &[u8], signature: &[u8]) -> Result<()> {
+/// The trusted comment the release workflow signs `file` of release `tag` with
+/// (`minisign -t "puzuz $TAG <file>"` in .github/workflows/release.yml).
+pub fn release_trusted_comment(tag: &str, file: &str) -> String {
+    format!("puzuz {tag} {file}")
+}
+
+/// Checks the minisign signature `signature` (a `.minisig` file) of `data`, and that its
+/// trusted comment (which the signature covers) is `trusted_comment`: a valid signature of
+/// another file, e.g. an older release's tarball served under a newer name, is refused.
+pub fn verify_signature(
+    public_key: &str,
+    data: &[u8],
+    signature: &[u8],
+    trusted_comment: &str,
+) -> Result<()> {
     let key = if public_key.trim().lines().count() == 1 {
         minisign_verify::PublicKey::from_base64(public_key.trim())
     } else {
@@ -356,7 +369,16 @@ pub fn verify_signature(public_key: &str, data: &[u8], signature: &[u8]) -> Resu
                 .map_err(|err| format!("invalid signature file: {err}"))
         })?;
     key.verify(data, &signature, false)
-        .map_err(|err| format!("bad signature: {err}"))
+        .map_err(|err| format!("bad signature: {err}"))?;
+    // Only after `verify`, which also checks the global signature over the comment.
+    let found = signature.trusted_comment();
+    if found != trusted_comment {
+        return Err(format!(
+            "the signature is for another file (trusted comment \"{}\", expected \"{trusted_comment}\")",
+            found.escape_debug()
+        ));
+    }
+    Ok(())
 }
 
 /// Checks `data` against a `sha256sum` line for `name` in `sums`.
@@ -763,7 +785,8 @@ fn install_release(sys: &dyn System, plan: &InstallPlan<'_>, out: &mut dyn Write
         write_work_file(sys, &plan.work.join(file), data)?;
     }
 
-    verify_signature(&public_key(sys)?, &tarball, &signature)
+    let comment = release_trusted_comment(&plan.release.tag_name, &tarball_name);
+    verify_signature(&public_key(sys)?, &tarball, &signature, &comment)
         .map_err(|err| format!("{tarball_name}: {err}; not installing it"))?;
     writeln!(out, "verified the signature").ok();
     verify_sha256(&tarball, &sums, &tarball_name)?;

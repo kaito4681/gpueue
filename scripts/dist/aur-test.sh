@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Tests the AUR package (packaging/aur/puzuz-bin) in an Arch Linux container with systemd
 # as PID 1: builds a release tarball of the working tree (x86_64, like
-# .github/workflows/release.yml), lays it out like a GitHub release next to a source
-# archive of the tree, runs scripts/dist/update-aur.sh against that (file://), then
+# .github/workflows/release.yml), lays it out like a GitHub release (signed with a
+# throwaway minisign key, which the source archive carries as packaging/minisign.pub) next to
+# a source archive of the tree, runs scripts/dist/update-aur.sh against that (file://), then
 # builds the package with makepkg as an unprivileged user, installs it with pacman, starts
 # the services, runs a job, upgrades to pkgrel 2 while a job runs, and removes the package.
 # namcap is run on the PKGBUILD and the package when it can be installed.
@@ -45,20 +46,64 @@ else
     tar -C "$stage/build" -czf "$release/$name.tar.gz" "$name"
 fi
 (cd "$release" && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
-# Never used on x86_64; update-aur.sh only needs its checksum file.
+# Never used on x86_64; update-aur.sh only checks its signature.
 aarch64="puzuz-v$version-aarch64-unknown-linux-gnu.tar.gz"
 cp "$release/$name.tar.gz" "$release/$aarch64"
 (cd "$release" && sha256sum "$aarch64" >"$aarch64.sha256")
 
+# A throwaway release key: the tarballs are signed as release.yml signs them.
+minisign="$("$root/scripts/dist/get-minisign.sh" "$root/target/dist-tools")"
+mkdir -p "$stage/keys"
+"$minisign" -G -W -p "$stage/keys/release.pub" -s "$stage/keys/release.key" >/dev/null
+"$minisign" -G -W -p "$stage/keys/other.pub" -s "$stage/keys/other.key" >/dev/null
+# sign FILE KEY COMMENT
+sign() { "$minisign" -S -s "$stage/keys/$2.key" -m "$release/$1" -t "$3" >/dev/null; }
+sign "$name.tar.gz" release "puzuz v$version $name.tar.gz"
+sign "$aarch64" release "puzuz v$version $aarch64"
+
 # The source archive: tracked and new (not ignored) files of the working tree, as GitHub
-# would archive the tag.
+# would archive the tag, with the throwaway key as packaging/minisign.pub.
+mkdir -p "$stage/src/puzuz-$version"
 (cd "$root" && git ls-files -z --cached --others --exclude-standard |
-    tar --null --ignore-failed-read -T - --transform "s,^,puzuz-$version/," -czf - 2>/dev/null) \
-    >"$stage/repo/archive/refs/tags/v$version.tar.gz"
+    tar --null --ignore-failed-read -T - -cf - 2>/dev/null) | tar -C "$stage/src/puzuz-$version" -xf -
+cp "$stage/keys/release.pub" "$stage/src/puzuz-$version/packaging/minisign.pub"
+tar -C "$stage/src" -czf "$stage/repo/archive/refs/tags/v$version.tar.gz" "puzuz-$version"
+rm -rf "$stage/src"
 
 cp -r "$root/packaging/aur/puzuz-bin" "$stage/pkg"
-PUZUZ_RELEASE_BASE_URL="file://$stage/repo" PUZUZ_AUR_DIR="$stage/pkg" \
-    "$root/scripts/dist/update-aur.sh" "$version"
+update_aur() {
+    PUZUZ_RELEASE_BASE_URL="file://$stage/repo" PUZUZ_AUR_DIR="$stage/pkg" MINISIGN="$minisign" \
+        "$root/scripts/dist/update-aur.sh" "$version"
+}
+# expect_refused PATTERN: update-aur.sh fails, says PATTERN and leaves the PKGBUILD alone.
+expect_refused() {
+    local out
+    if out="$(update_aur 2>&1)"; then
+        echo "$out"
+        echo "FAIL: update-aur.sh accepted a bad release" >&2
+        exit 1
+    fi
+    grep -qF -- "$1" <<<"$out" || { echo "$out"; echo "FAIL: expected \"$1\"" >&2; exit 1; }
+    cmp -s "$root/packaging/aur/puzuz-bin/PKGBUILD" "$stage/pkg/PKGBUILD" ||
+        { echo "FAIL: a refused release changed the PKGBUILD" >&2; exit 1; }
+}
+cp "$release/$aarch64.minisig" "$stage/aarch64.minisig"
+# Signed with another key.
+sign "$aarch64" other "puzuz v$version $aarch64"
+expect_refused "bad signature on $aarch64"
+# Signed with the release key, but as another release's file.
+sign "$aarch64" release "puzuz v0.0.1 puzuz-v0.0.1-aarch64-unknown-linux-gnu.tar.gz"
+expect_refused "the signature of $aarch64 is for another file"
+# A tarball that does not match its signature.
+cp "$stage/aarch64.minisig" "$release/$aarch64.minisig"
+echo corrupted >>"$release/$aarch64"
+expect_refused "bad signature on $aarch64"
+cp "$release/$name.tar.gz" "$release/$aarch64"
+rm -f "$stage/keys/release.key" "$stage/keys/other.key"
+
+update_aur
+grep -qx "sha256sums_x86_64=('$(sha256sum "$release/$name.tar.gz" | cut -d' ' -f1)')" "$stage/pkg/PKGBUILD" ||
+    { echo "FAIL: the PKGBUILD does not have the tarball's checksum" >&2; exit 1; }
 cp "$root/scripts/dist/aur-scenario.sh" "$stage/"
 chmod -R a+rX "$stage"
 

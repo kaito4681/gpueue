@@ -23,39 +23,39 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt
           rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --locked
 
   msrv:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Keep in sync with rust-version in Cargo.toml.
       - run: |
           rustup toolchain install 1.88 --profile minimal
           rustup default 1.88
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo check --workspace --all-targets --locked
 
   shellcheck:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: |
           mapfile -t files < <(git ls-files '*.sh' 'packaging/scripts/*')
           docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:v0.10.0 \
@@ -66,7 +66,7 @@ jobs:
   actionlint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: |
           docker run --rm -v "$PWD":/repo -w /repo \
             rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
@@ -85,7 +85,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # GitHub's x86_64 Linux runners have /dev/kvm, but only for root.
       - name: Enable KVM
         if: matrix.runner == 'ubuntu-24.04'
@@ -94,7 +94,7 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - uses: cachix/install-nix-action@v31.11.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           # Only where KVM is enabled; the arm runner has no VM tests.
           extra_nix_config: ${{ matrix.runner == 'ubuntu-24.04' && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
@@ -119,7 +119,7 @@ jobs:
     needs: [test]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: scripts/service-install-test.sh
 
   # Two test versions of the tree, packaged like release.yml does, for the
@@ -129,9 +129,9 @@ jobs:
     needs: [test]
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: scripts/dist/build-test-versions.sh target/dist-releases test.1 test.2:migration
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-releases
           path: target/dist-releases
@@ -148,8 +148,8 @@ jobs:
       matrix:
         base: ["ubuntu:26.04", "ubuntu:24.04", "ubuntu:22.04", "debian:12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist-releases
           path: target/dist-releases
@@ -170,7 +170,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - if: matrix.runner == 'ubuntu-24.04-arm'
         run: scripts/test-in-docker.sh test --workspace --locked
       - run: scripts/test-in-docker.sh build --locked -p puzuz -p puzuz-helper
@@ -179,7 +179,7 @@ jobs:
           for base in debian:12 ubuntu:24.04; do
             PUZUZ_DEB_BASE="$base" scripts/deb-test.sh target/deb/puzuz_*.deb
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: deb-${{ matrix.runner }}
           path: target/deb/puzuz_*.deb
@@ -203,8 +203,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: deb-${{ matrix.runner }}
           path: target/deb
@@ -224,7 +224,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: scripts/test-in-docker.sh build --locked -p puzuz -p puzuz-helper
       - name: Build the .rpm, and a pre-release of it to upgrade from
         run: |
@@ -247,7 +247,7 @@ jobs:
     needs: [test]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: scripts/test-in-docker.sh build --locked -p puzuz -p puzuz-helper
       - name: Package the release tarball
         run: |
@@ -266,7 +266,7 @@ jobs:
     needs: [test]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: scripts/e2e-test.sh
         env:
           # The FUSE part of scenario 15 must not be skipped silently.

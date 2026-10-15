@@ -13,16 +13,22 @@ const TEST_PUB: &str = include_str!("testdata/test.pub");
 const OTHER_PUB: &str = include_str!("testdata/other.pub");
 const DATA: &[u8] = b"puzuz release data\n";
 const DATA_SIG: &str = "untrusted comment: signature from minisign secret key
-RUQJYNONsWvmxH7NcJ5/zM7w2vMx8mrcqlcK6iqgbqU//Tz0Vb4SuiGE7kpDnNz3jlEOJ3GEB3tZLjoGgpGWzaAE/1QqcDNaEAI=
+RUSjXZl/Hd7WoSiBgmAlgoSdxEV988z5oex+Nhiu0Mo9UNDRR+2weyD4nfD7QcVekvQtApHWnHqHvHz6HTVZJmJyy1Kag9ARfgs=
 trusted comment: test signature
-r2jL3bJ9M/08nEyswJfikSJ/eqvJhLUQRUn67t84/PtT6lMl3qwb1eyL7NFf0x8qFOtFFG7PtQhBx7i0z12lCw==
+39XpaOiBF7jaxzUGp2YVn8ik8ntDnmo+KZjooeE4pwGKAXkE5rPzwZjIl89CRYt3VYtvePTz8YHL/QhCzryRCw==
 ";
 
-// A release v9.0.0 holding two small scripts, signed with TEST_PUB's key.
+// A release v9.0.0 holding two small scripts, signed with TEST_PUB's key and the trusted
+// comment of the release workflow ("puzuz v9.0.0 puzuz-v9.0.0-<target>.tar.gz").
 const NAME: &str = "puzuz-v9.0.0-x86_64-unknown-linux-gnu";
 const TARBALL: &[u8] = include_bytes!("testdata/puzuz-v9.0.0-x86_64-unknown-linux-gnu.tar.gz");
 const TARBALL_SIG: &[u8] =
     include_bytes!("testdata/puzuz-v9.0.0-x86_64-unknown-linux-gnu.tar.gz.minisig");
+// The same tarball signed with the same key, but as v8.0.0's file: its trusted comment is
+// "puzuz v8.0.0 puzuz-v8.0.0-x86_64-unknown-linux-gnu.tar.gz" (an older release's
+// signature, replayed under a newer name).
+const TARBALL_SIG_V8: &[u8] =
+    include_bytes!("testdata/puzuz-v8.0.0-x86_64-unknown-linux-gnu.tar.gz.minisig");
 
 const API: &str = "http://127.0.0.1:8080";
 const REPO_API: &str = "http://127.0.0.1:8080/repos/kaito4681/puzuz";
@@ -131,15 +137,51 @@ fn installed(sys: &FakeSystem) -> bool {
 
 #[test]
 fn signatures_are_checked() {
-    verify_signature(TEST_PUB, DATA, DATA_SIG.as_bytes()).unwrap();
+    const COMMENT: &str = "test signature";
+    verify_signature(TEST_PUB, DATA, DATA_SIG.as_bytes(), COMMENT).unwrap();
     // The bare base64 key works too.
-    verify_signature(TEST_PUB.lines().nth(1).unwrap(), DATA, DATA_SIG.as_bytes()).unwrap();
-    let err = verify_signature(OTHER_PUB, DATA, DATA_SIG.as_bytes()).unwrap_err();
+    verify_signature(
+        TEST_PUB.lines().nth(1).unwrap(),
+        DATA,
+        DATA_SIG.as_bytes(),
+        COMMENT,
+    )
+    .unwrap();
+    let err = verify_signature(OTHER_PUB, DATA, DATA_SIG.as_bytes(), COMMENT).unwrap_err();
     assert!(err.contains("bad signature"), "{err}");
-    let err = verify_signature(TEST_PUB, b"tampered\n", DATA_SIG.as_bytes()).unwrap_err();
+    let err = verify_signature(TEST_PUB, b"tampered\n", DATA_SIG.as_bytes(), COMMENT).unwrap_err();
     assert!(err.contains("bad signature"), "{err}");
-    let err = verify_signature(TEST_PUB, DATA, b"garbage").unwrap_err();
+    let err = verify_signature(TEST_PUB, DATA, b"garbage", COMMENT).unwrap_err();
     assert!(err.contains("invalid signature"), "{err}");
+    // A valid signature with another trusted comment.
+    let err =
+        verify_signature(TEST_PUB, DATA, DATA_SIG.as_bytes(), "test signature 2").unwrap_err();
+    assert!(
+        err.contains(
+            "is for another file (trusted comment \"test signature\", expected \"test signature 2\")"
+        ),
+        "{err}"
+    );
+    // The trusted comment is covered by the signature: editing it breaks the signature.
+    let edited = DATA_SIG.replace(
+        "trusted comment: test signature",
+        "trusted comment: test signature 2",
+    );
+    let err = verify_signature(TEST_PUB, DATA, edited.as_bytes(), "test signature 2").unwrap_err();
+    assert!(err.contains("bad signature"), "{err}");
+}
+
+#[test]
+fn release_signatures_name_the_tag_and_the_file() {
+    let name = format!("{NAME}.tar.gz");
+    let comment = release_trusted_comment("v9.0.0", &name);
+    assert_eq!(comment, format!("puzuz v9.0.0 {name}"));
+    verify_signature(TEST_PUB, TARBALL, TARBALL_SIG, &comment).unwrap();
+    let err = verify_signature(TEST_PUB, TARBALL, TARBALL_SIG_V8, &comment).unwrap_err();
+    assert!(
+        err.contains("trusted comment \"puzuz v8.0.0 puzuz-v8.0.0-"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -563,6 +605,26 @@ fn a_bad_signature_or_checksum_is_refused() {
     let err = run(&sys, &opts(false, None)).unwrap_err();
     assert!(err.contains("checksum mismatch"), "{err}");
     assert!(!installed(&sys));
+}
+
+#[test]
+fn an_older_release_signature_under_a_newer_name_is_refused() {
+    let sys = system();
+    sys.serve(
+        &format!("{REPO_API}/releases/assets/13"),
+        200,
+        TARBALL_SIG_V8,
+    );
+    let err = run(&sys, &opts(false, None)).unwrap_err();
+    assert!(
+        err.contains(&format!(
+            "{NAME}.tar.gz: the signature is for another file (trusted comment \"puzuz v8.0.0 \
+             puzuz-v8.0.0-x86_64-unknown-linux-gnu.tar.gz\", expected \"puzuz v9.0.0 {NAME}.tar.gz\")"
+        )),
+        "{err}"
+    );
+    assert!(!installed(&sys));
+    assert!(!sys.ran("puzuz service version-info"));
 }
 
 #[test]

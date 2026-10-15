@@ -169,7 +169,7 @@ check_arch() {
 
 # version_ge A B: whether version A >= version B (dotted numbers).
 version_ge() {
-    [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
+    [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | sed -n 1p)" = "$2" ]
 }
 
 check_glibc() {
@@ -209,7 +209,8 @@ os_family() {
 # unit_puzuz UNIT: the puzuz binary that UNIT's ExecStart= runs (after any
 # of systemd's -@:+! prefixes), or nothing.
 unit_puzuz() {
-    sed -n 's|^ExecStart=[-@:+!]*\(/[^ ]*/puzuz\) daemon.*|\1|p' "$1" 2>/dev/null | head -n1
+    # sed stops at the first match itself: no `| head -n1` (see json_tag).
+    sed -n '\|^ExecStart=[-@:+!]*/[^ ]*/puzuz daemon|{s|^ExecStart=[-@:+!]*\(/[^ ]*/puzuz\) daemon.*|\1|p;q;}' "$1" 2>/dev/null
 }
 
 # The directory of the binaries the `service install` unit runs, or nothing.
@@ -444,9 +445,21 @@ api_get() {
     esac
 }
 
-# json_tag FILE: the release's tag_name.
+# The JSON readers below read their input to the end and print in an END
+# block: a reader that exits at the first match (`exit`, `head -n1`, `grep -q`)
+# kills the writer (tr) with SIGPIPE once the JSON is longer than a pipe
+# buffer, and pipefail then turns the match into a silent exit with status 141.
+# A release's body (its notes) comes after its assets, so it can be long.
+
+# json_tag FILE: the release's tag_name (the first one).
 json_tag() {
-    tr ',{}' '\n\n\n' <"$1" | sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+    tr ',{}' '\n\n\n' <"$1" | awk '
+        tag == "" && /^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"/ {
+            tag = $0
+            sub(/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"/, "", tag)
+            sub(/".*/, "", tag)
+        }
+        END { print tag }'
 }
 
 # json_asset_id FILE NAME: the id of the release asset called NAME. Each asset
@@ -463,8 +476,9 @@ json_asset_id() {
             url = $0
             sub(/"[[:space:]]*$/, "", url)
             n = length(want)
-            if (substr(url, length(url) - n) == "/" want) { print id; exit }
-        }'
+            if (found == "" && substr(url, length(url) - n) == "/" want) found = id
+        }
+        END { print found }'
 }
 
 # download_asset RELEASE_JSON NAME: downloads the asset NAME into $WORK.
@@ -507,8 +521,14 @@ verify() {
     if [ "${PUZUZ_TEST_HOOKS:-}" = 1 ] && [ -n "${PUZUZ_UPDATE_PUBKEY_FILE:-}" ]; then
         key=(-p "$PUZUZ_UPDATE_PUBKEY_FILE")
     fi
-    "$MINISIGN" -V -q "${key[@]}" -m "$WORK/$tarball" -x "$WORK/$tarball.minisig" >/dev/null ||
+    # -Q prints the trusted comment, which the signature covers. The release
+    # workflow signs with "puzuz <tag> <file>": requiring exactly that keeps
+    # an older (validly signed) release from being served under a newer name.
+    local comment want="puzuz $TAG $tarball"
+    comment="$("$MINISIGN" -V -Q "${key[@]}" -m "$WORK/$tarball" -x "$WORK/$tarball.minisig")" ||
         die "bad signature on $tarball; not installing it"
+    [ "$comment" = "$want" ] ||
+        die "the signature of $tarball is for another file (trusted comment \"$comment\", expected \"$want\"); not installing it"
     info "verified the minisign signature"
 }
 

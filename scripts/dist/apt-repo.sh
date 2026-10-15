@@ -152,7 +152,7 @@ import_signing_key() {
     [ -n "${APT_GPG_PRIVATE_KEY:-}" ] || die "APT_GPG_PRIVATE_KEY is not set"
     printf '%s\n' "$APT_GPG_PRIVATE_KEY" | gpg --batch --quiet --import 2>/dev/null ||
         die "cannot import APT_GPG_PRIVATE_KEY"
-    signing_fpr="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" {print $10; exit}')"
+    signing_fpr="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" && fpr == "" {fpr = $10} END {print fpr}')"
     [ -n "$signing_fpr" ] || die "APT_GPG_PRIVATE_KEY holds no secret key"
     fprs="$(gpg --batch --with-colons --import-options show-only --import "$keyring" 2>/dev/null |
         awk -F: '$1 == "fpr" {print $10}')" || die "cannot read the keyring $keyring"

@@ -26,6 +26,14 @@ PY
 }
 # owner <job>: the uid that `spawns` gives the job.
 owner() { if [ $(($1 % 2)) -eq 0 ]; then echo 1000; else echo 1001; fi; }
+# last_checkpoint_failure JOB: the helper's last "checkpoint of job JOB failed"
+# message. The journal is captured first, then filtered by a reader that reads
+# all of it (see the journal check below).
+last_checkpoint_failure() {
+    local journal
+    journal="$(journalctl -u puzuz-helper.service -o cat --no-pager)"
+    grep "checkpoint of job $1 failed" <<<"$journal" | tail -n1 || true
+}
 # requests <op> <python expression for the extra fields of job j> <jobs...>
 requests() {
     python3 - "$@" <<'PY'
@@ -208,9 +216,13 @@ client "$(steps <<'EOF'
 ]
 EOF
 )"
-journalctl -u puzuz-helper.service --no-pager | grep -q 'relative names' \
+# The journal is captured first: with `journalctl | grep -q`, grep exits at
+# the first match, journalctl dies of SIGPIPE when more follows, and pipefail
+# turns the match into a failure.
+journal="$(journalctl -u puzuz-helper.service --no-pager)"
+grep -q 'relative names' <<<"$journal" \
     || fail "no refusal of the relatively bound socket in the helper's log"
-journalctl -u puzuz-helper.service --no-pager | grep -q 'SO_REUSEPORT (127.0.0.1:' \
+grep -q 'SO_REUSEPORT (127.0.0.1:' <<<"$journal" \
     || fail "no refusal of the SO_REUSEPORT socket in the helper's log"
 rm -f /home/alice/ctl.sock
 
@@ -398,9 +410,9 @@ EOF
 )"
     wait
     echo "checkpoint failed after $((SECONDS - t0)) s"
-    journalctl -u puzuz-helper.service -o cat | grep 'checkpoint of job 4 failed' | tail -n1
-    journalctl -u puzuz-helper.service -o cat | grep 'checkpoint of job 4 failed' | tail -n1 \
-        | grep -q 'did not finish within its deadline of 3s.*the job was resumed' \
+    last_failure="$(last_checkpoint_failure 4)"
+    echo "$last_failure"
+    grep -q 'did not finish within its deadline of 3s.*the job was resumed' <<<"$last_failure" \
         || fail "no deadline error for job 4"
     job_runs_on
     [ -e /var/lib/puzuz/checkpoints/4 ] && fail "the failed image of job 4 was kept"
@@ -416,8 +428,7 @@ EOF
 EOF
 )"
     wait
-    journalctl -u puzuz-helper.service -o cat | grep 'checkpoint of job 4 failed' | tail -n1 \
-        | grep -q 'was killed by signal 9.*the job was resumed' \
+    grep -q 'was killed by signal 9.*the job was resumed' <<<"$(last_checkpoint_failure 4)" \
         || fail "no killed-criu error for job 4"
     job_runs_on
 

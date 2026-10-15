@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 # Points the AUR package (packaging/aur/puzuz-bin) at release v<VERSION>: sets pkgver
-# (and pkgrel=1 when the version changes), takes the tarballs' checksums from the
-# release's .sha256 files, computes the checksum of the tag's source archive and
-# regenerates .SRCINFO with `makepkg --printsrcinfo` (run directly when makepkg is
-# installed, else in an Arch Linux container).
+# (and pkgrel=1 when the version changes), downloads the release's tarballs with their
+# .minisig files and checks them like install.sh does (the release key, and the trusted
+# comment "puzuz v<VERSION> <file>"), computes the PKGBUILD's checksums from the verified
+# tarballs and from the tag's source archive, and regenerates .SRCINFO with
+# `makepkg --printsrcinfo` (run directly when makepkg is installed, else in an Arch Linux
+# container).
+#
+# The release key is packaging/minisign.pub of the tag (from its source archive), as
+# apt-repo.sh takes it: a run for an older tag may come from a newer default branch. No
+# signed release asset carries the systemd units, the sysusers.d and tmpfiles.d snippets
+# and the default configuration, so the PKGBUILD takes them from the same source archive
+# (GitHub generates it from the tag, and keeps it byte-stable).
 #
 # Usage: scripts/dist/update-aur.sh VERSION      (e.g. 0.2.0; prereleases are not packaged)
 # Environment:
@@ -12,6 +20,7 @@
 #                           for tests)
 #   PUZUZ_AUR_DIR           package directory (default packaging/aur/puzuz-bin)
 #   PUZUZ_ARCH_IMAGE        container image with makepkg
+#   MINISIGN                the minisign binary (default: scripts/dist/get-minisign.sh)
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -35,23 +44,35 @@ trap 'rm -rf "$work"' EXIT
 fetch() { curl -fsSL --retry 3 -o "$2" "$1" || die "cannot download $1"; }
 is_sha256() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
 
-# Tarball checksums, as published with the release.
-declare -A sums
-for entry in "${targets[@]}"; do
-    arch="${entry%%:*}"
-    name="puzuz-v$version-${entry#*:}.tar.gz"
-    fetch "$base/releases/download/v$version/$name.sha256" "$work/$arch.sha256"
-    read -r sum file <"$work/$arch.sha256" || true
-    is_sha256 "${sum:-}" || die "no checksum in $name.sha256"
-    [ "${file#\*}" = "$name" ] || die "$name.sha256 is for '${file:-}', not $name"
-    sums[$arch]="$sum"
-done
-
 # The source archive has no published checksum; GitHub keeps tag archives byte-stable.
 fetch "$base/archive/refs/tags/v$version.tar.gz" "$work/src.tar.gz"
 tar -tzf "$work/src.tar.gz" "puzuz-$version/packaging/config.toml" >/dev/null 2>&1 ||
     die "the source archive of v$version has no puzuz-$version/packaging/config.toml"
+tar -xzOf "$work/src.tar.gz" "puzuz-$version/packaging/minisign.pub" >"$work/minisign.pub" 2>/dev/null ||
+    die "the source archive of v$version has no puzuz-$version/packaging/minisign.pub"
 src_sum="$(sha256sum "$work/src.tar.gz" | cut -d' ' -f1)"
+is_sha256 "$src_sum" || die "cannot compute the checksum of the source archive"
+
+minisign="${MINISIGN:-}"
+[ -n "$minisign" ] || minisign="$("$root/scripts/dist/get-minisign.sh" "$work/minisign")"
+
+# The tarballs, checked against the release key and the release's trusted comment; their
+# checksums are computed from the verified files.
+declare -A sums
+for entry in "${targets[@]}"; do
+    arch="${entry%%:*}"
+    name="puzuz-v$version-${entry#*:}.tar.gz"
+    fetch "$base/releases/download/v$version/$name" "$work/$name"
+    fetch "$base/releases/download/v$version/$name.minisig" "$work/$name.minisig"
+    comment="$("$minisign" -V -Q -p "$work/minisign.pub" -m "$work/$name" -x "$work/$name.minisig")" ||
+        die "bad signature on $name"
+    [ "$comment" = "puzuz v$version $name" ] ||
+        die "the signature of $name is for another file (trusted comment \"$comment\")"
+    sum="$(sha256sum "$work/$name" | cut -d' ' -f1)"
+    is_sha256 "$sum" || die "cannot compute the checksum of $name"
+    sums[$arch]="$sum"
+    echo "update-aur: verified the signature of $name"
+done
 
 old_version="$(sed -n 's/^pkgver=//p' "$pkgbuild")"
 # set_line KEY VALUE: replaces the single line KEY=... of the PKGBUILD.

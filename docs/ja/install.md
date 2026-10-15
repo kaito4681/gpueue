@@ -165,7 +165,8 @@ curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.s
    ディレクトリにダウンロードし、スクリプトに組み込まれた SHA-256 チェックサム（`scripts/dist/get-minisign.sh`
    と同じもの）で確認してから使います。このダウンロードに失敗すると、ディストリビューションから `minisign` を
    インストールして（例: `sudo apt install minisign`）再実行するよう伝えて止まります。署名の確認を省くことは
-   ありません。
+   ありません。署名の trusted comment は、要求したリリースと tarball の `puzuz <tag> <file>` でなければ
+   なりません。これにより、古いリリースの（正しく署名された）tarball を新しい名前で配っても拒否されます。
 4. tarball を展開し（リンクや tarball の外を指すパスは拒否します）、新しい `puzuz service install` を実行し
    （現在のインストール先のディレクトリを維持し、なければ `/usr/local/bin` を使います。`--bin-dir` は指定
    した場合にだけ渡されます）、その `puzuz doctor` のレポートを表示します。
@@ -190,13 +191,18 @@ Arch Linux では公開後に [AUR パッケージ](#arch-linux-aur) を使え�
 各リリースには、ターゲット（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`）ごとに
 `.sha256` と `.minisig` ファイル付きの `puzuz-v<X>-<target>.tar.gz`、同じ 2 つのファイルがそれぞれに付いた
 パッケージ `puzuz_<X>_amd64.deb`、`puzuz_<X>_arm64.deb`、`puzuz-<X>-1.x86_64.rpm`、
-`puzuz-<X>-1.aarch64.rpm`、そして `install.sh.minisig` 付きの `install.sh` があります。tarball（または
+`puzuz-<X>-1.aarch64.rpm`、`install.sh.minisig` 付きの `install.sh`、そして `.rpm` が GPG 署名されている
+リリースでは `RPM-GPG-KEY-puzuz.minisig` 付きの `RPM-GPG-KEY-puzuz` があります。tarball（または
 パッケージ）を自分で確認するには次のようにします。
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 ```
+
+minisign は署名の trusted comment（署名の対象に含まれます）を表示します。これはリリースとファイルを
+示します（`Trusted comment: puzuz v0.1.0 puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`）。ダウンロード
+しようとしたリリースとファイルであることを確認してください。
 
 `curl ... | sudo bash` はダウンロードした内容をそのまま実行します。先に `install.sh` を確認するには、署名と
 一緒にダウンロードし、リリース鍵（`packaging/minisign.pub`）で検証してから、確認したファイルを実行します。
@@ -429,10 +435,13 @@ CRIU が必要です（[CRIU](#criu) を参照）。ジョブの実行は CRIU �
 
 **検証。** 他のリリースアセットと同様に、`.rpm` にも `.sha256` と `.minisig` ファイルがあります
 （[リリースを手動で検証する](#verifying-a-release-by-hand) を参照）。GPG 鍵でビルドされたリリースでは
-`.rpm` 自体にも署名され、その鍵（APT リポジトリの鍵）が `RPM-GPG-KEY-puzuz` として添付されます。
+`.rpm` 自体にも署名され、その鍵（APT リポジトリの鍵）が `RPM-GPG-KEY-puzuz` として添付されます。この鍵ファイルも
+他のアセットと同様に minisign で署名されているので、インポートする前にリリース鍵で確認してください。
 
 ```sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz.minisig
+minisign -Vm RPM-GPG-KEY-puzuz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 gpg --show-keys RPM-GPG-KEY-puzuz                   # E53970325A397378537BC77620B6B72F9F5585C2
 sudo rpm --import RPM-GPG-KEY-puzuz
 rpm -K puzuz-0.1.0-1.x86_64.rpm                     # "digests signatures OK"
@@ -753,8 +762,10 @@ puzuz doctor
 PKGBUILD は `packaging/aur/puzuz-bin` にあります。リリースが安定版リリースとして公開されると（APT
 リポジトリと同じ `released` イベント。ドラフトやプレリリースでは動きません）、
 `.github/workflows/release-aur.yml` が `scripts/dist/update-aur.sh <version>` を実行します。これは
-リリースの `.sha256` ファイルから tarball のチェックサムを取り、タグのソースアーカイブ（ユニットと断片用）の
-チェックサムを計算し、Arch Linux のコンテナで `.SRCINFO` を再生成します。そして `PKGBUILD`、`.SRCINFO`、
+リリースの tarball とその `.minisig` ファイルをダウンロードし、タグの `packaging/minisign.pub` で（`install.sh`
+と同様に trusted comment `puzuz v<version> <file>` も）確認し、確認した tarball と、タグのソースアーカイブ
+（署名付きのアセットには含まれないユニットと断片用）から PKGBUILD のチェックサムを計算し、Arch Linux の
+コンテナで `.SRCINFO` を再生成します。そして `PKGBUILD`、`.SRCINFO`、
 `puzuz-bin.install` を `ssh://aur@aur.archlinux.org/puzuz-bin.git` に push します。リリースには x86_64 と
 aarch64 の両方の tarball が必要です。新しいリリースなしでパッケージングを変更するには、PKGBUILD の
 `pkgrel` を上げてワークフローを手動で実行します（`gh workflow run release-aur.yml -f version=<X.Y.Z>`）。
@@ -1736,7 +1747,8 @@ sudo puzuz update --version 0.2.0 --yes
    指定されたときだけインストールします。
 3. 確認を求めます（`-y/--yes` で省略できます）。
 4. tarball、`.sha256`、`.minisig` を `/var/lib/puzuz/update`（root、0700）にダウンロードし、`puzuz` に組み込まれた
-   リリース鍵で minisign の署名を、そしてチェックサムを確認します。
+   リリース鍵で minisign の署名を（`install.sh` と同様に、その trusted comment がそのリリースの
+   `puzuz <tag> <file>` であることも）、そしてチェックサムを確認します。
 5. tarball を展開し（通常ファイルとディレクトリのみ）、新しい `puzuz` に対応するデータベースのスキーマを
    問い合わせます。デーモンのデータベースを開けないリリース（スキーマ変更より前の古いもの）は、何かを変更する
    前に拒否されます。

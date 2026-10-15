@@ -146,7 +146,9 @@ binary decides the rest before it installs anything. It then:
    static minisign 0.12 release from GitHub into the temporary directory, checks it against the
    SHA-256 checksum built into the script (the same pin as `scripts/dist/get-minisign.sh`), and
    uses that. If that download fails, it stops and asks you to install `minisign` from your
-   distribution (e.g. `sudo apt install minisign`) and re-run it; the signature is never skipped,
+   distribution (e.g. `sudo apt install minisign`) and re-run it; the signature is never skipped.
+   The signature's trusted comment must be `puzuz <tag> <file>` for the requested release and
+   tarball, so an older release's (validly signed) tarball served under a newer name is refused,
 4. extracts the tarball (refusing links and paths outside it), runs the new
    `puzuz service install` (which keeps the directory of the current installation, else uses
    `/usr/local/bin`; `--bin-dir` is passed on only if you gave it), and prints its
@@ -171,13 +173,18 @@ below.
 Each release has, for each target (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`),
 `puzuz-v<X>-<target>.tar.gz` with `.sha256` and `.minisig` files, the packages
 `puzuz_<X>_amd64.deb`, `puzuz_<X>_arm64.deb`, `puzuz-<X>-1.x86_64.rpm` and
-`puzuz-<X>-1.aarch64.rpm` with the same two files each, and `install.sh` with `install.sh.minisig`.
+`puzuz-<X>-1.aarch64.rpm` with the same two files each, `install.sh` with `install.sh.minisig`, and,
+when the `.rpm` files are GPG-signed, `RPM-GPG-KEY-puzuz` with `RPM-GPG-KEY-puzuz.minisig`.
 To check a tarball (or a package) yourself:
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 minisign -Vm puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 ```
+
+minisign prints the signature's trusted comment, which the signature covers: it names the release
+and the file (`Trusted comment: puzuz v0.1.0 puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`). Check
+that it is the release and file you meant to download.
 
 `curl ... | sudo bash` runs whatever the download contains. To check `install.sh` first, download
 it with its signature, verify it with the release key (`packaging/minisign.pub`), and run the
@@ -410,10 +417,13 @@ new enough, the 3.19 of RHEL/Rocky/Alma 9 is not, so checkpointing there needs a
 
 **Verifying.** Like every release asset, the `.rpm` has `.sha256` and `.minisig` files (see
 [Verifying a release by hand](#verifying-a-release-by-hand)). Releases built with the GPG key also
-sign the `.rpm` itself, and attach that key as `RPM-GPG-KEY-puzuz` (the APT repository's key):
+sign the `.rpm` itself, and attach that key as `RPM-GPG-KEY-puzuz` (the APT repository's key),
+minisign-signed like the other assets. Check the key file with the release key before importing it:
 
 ```sh
 curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz
+curl -fsSLO https://github.com/kaito4681/puzuz/releases/download/v0.1.0/RPM-GPG-KEY-puzuz.minisig
+minisign -Vm RPM-GPG-KEY-puzuz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
 gpg --show-keys RPM-GPG-KEY-puzuz                   # E53970325A397378537BC77620B6B72F9F5585C2
 sudo rpm --import RPM-GPG-KEY-puzuz
 rpm -K puzuz-0.1.0-1.x86_64.rpm                     # "digests signatures OK"
@@ -732,9 +742,12 @@ Checkpoints need CRIU 4.2 or newer, which is in the official repositories
 
 The PKGBUILD lives in `packaging/aur/puzuz-bin`. When a release is published as a stable release
 (the `released` event, like the APT repository; never for a draft or a pre-release),
-`.github/workflows/release-aur.yml` runs `scripts/dist/update-aur.sh <version>`, which takes the
-tarballs' checksums from the release's `.sha256` files, computes the checksum of the tag's source
-archive (for the units and snippets), and regenerates `.SRCINFO` in an Arch Linux container.
+`.github/workflows/release-aur.yml` runs `scripts/dist/update-aur.sh <version>`, which downloads
+the release's tarballs and their `.minisig` files, checks them with the tag's
+`packaging/minisign.pub` (and the trusted comment `puzuz v<version> <file>`, as `install.sh` does),
+computes the PKGBUILD's checksums from the verified tarballs and from the tag's source archive (for
+the units and snippets, which no signed asset carries), and regenerates `.SRCINFO` in an Arch
+Linux container.
 It then pushes `PKGBUILD`, `.SRCINFO` and `puzuz-bin.install` to
 `ssh://aur@aur.archlinux.org/puzuz-bin.git`. The release must have both the x86_64 and the aarch64
 tarball. To change the packaging without a new release, bump `pkgrel` in the PKGBUILD and run the
@@ -1740,7 +1753,8 @@ rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or
    repair the pair. An older version is installed only when asked for with `--version`,
 3. asks for confirmation (`-y/--yes` skips it),
 4. downloads the tarball, `.sha256` and `.minisig` into `/var/lib/puzuz/update` (root, 0700),
-   checks the minisign signature with the release key built into `puzuz`, and the checksum,
+   checks the minisign signature with the release key built into `puzuz` (its trusted comment
+   must be `puzuz <tag> <file>` of that release, as with `install.sh`), and the checksum,
 5. extracts the tarball (regular files and directories only) and asks the new `puzuz` which
    database schema it supports. A release that cannot open the daemon's database (an older one,
    from before a schema change) is refused before anything changes,

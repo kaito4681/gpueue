@@ -57,7 +57,7 @@ else
         --quick-gen-key "$uid" rsa4096 sign never 3<<<"$pass"
 fi
 
-fpr="$(gpg --batch --with-colons --list-keys "$uid" | awk -F: '$1 == "fpr" {print $10; exit}')"
+fpr="$(gpg --batch --with-colons --list-keys "$uid" | awk -F: '$1 == "fpr" && fpr == "" {fpr = $10} END {print fpr}')"
 [ -n "$fpr" ] || { echo "cannot find the new key" >&2; exit 1; }
 mkdir -p "$(dirname "$keyring")"
 gpg --batch --export --export-options export-minimal "$fpr" >"$keyring"

@@ -13,6 +13,11 @@ that /releases/latest returns. Like GitHub for a private repository:
   GitHub's object storage does with a signed URL); with another Accept header it returns
   the asset's JSON.
 
+Every release is long, as a real one with long notes and many assets can be: its body is
+over 100 KB (after the assets, as GitHub orders the keys) and it lists hundreds of further
+assets of other names around the real ones, so that a client that stops reading the JSON at
+the first match (and so kills its writer with SIGPIPE under pipefail) fails the test.
+
 Every request is appended to ROOT/../requests.log (method, path, whether a token was sent).
 
 Usage: fake_github.py ROOT PORT TOKEN [OWNER/REPO]
@@ -26,6 +31,14 @@ from urllib.parse import unquote, urlsplit
 
 ROOT, PORT, TOKEN = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 REPO = sys.argv[4] if len(sys.argv) > 4 else "kaito4681/puzuz"
+# See above: a long release. The notes mention assets, URLs and tags the way real notes do.
+PADDING_ASSETS = 300
+BODY = "".join(
+    f"- change {i}, see {{the notes}}: \"tag_name\": \"v0.0.{i}\", "
+    f"https://github.com/{REPO}/releases/download/v0.0.{i}/puzuz.tar.gz\n"
+    for i in range(1500)
+)
+assert len(BODY) > 100_000
 LOG = os.path.join(os.path.dirname(os.path.abspath(ROOT)), "requests.log")
 
 
@@ -66,6 +79,11 @@ class Handler(BaseHTTPRequestHandler):
         return f"http://{self.headers.get('Host', f'127.0.0.1:{PORT}')}"
 
     def asset_json(self, tag, aid, name):
+        asset = self.asset_json_fields(tag, aid, name)
+        asset["size"] = os.path.getsize(os.path.join(ROOT, tag, name))
+        return asset
+
+    def asset_json_fields(self, tag, aid, name):
         base = self.base()
         return {
             "url": f"{base}/repos/{REPO}/releases/assets/{aid}",
@@ -77,13 +95,18 @@ class Handler(BaseHTTPRequestHandler):
                          "url": f"{base}/users/github-actions%5Bbot%5D"},
             "content_type": "application/octet-stream",
             "state": "uploaded",
-            "size": os.path.getsize(os.path.join(ROOT, tag, name)),
+            "size": 0,
             "browser_download_url":
                 f"https://github.com/{REPO}/releases/download/{tag}/{name}",
         }
 
     def release_json(self, tag):
         base = self.base()
+        real = [self.asset_json(tag, aid, name) for aid, name in assets(tag)]
+        # Listed, but not downloadable (find_asset does not know their ids).
+        padding = [self.asset_json_fields(tag, 900000 + i, f"notes-{i:03}.txt")
+                   for i in range(PADDING_ASSETS)]
+        half = PADDING_ASSETS // 2
         return {
             "url": f"{base}/repos/{REPO}/releases/1",
             "assets_url": f"{base}/repos/{REPO}/releases/1/assets",
@@ -92,8 +115,8 @@ class Handler(BaseHTTPRequestHandler):
             "name": tag,
             "draft": False,
             "prerelease": False,
-            "body": "Fake release, with a comma, and {braces}.",
-            "assets": [self.asset_json(tag, aid, name) for aid, name in assets(tag)],
+            "assets": padding[:half] + real + padding[half:],
+            "body": BODY,
         }
 
     def send(self, code, body=b"", content_type="application/json", headers=()):

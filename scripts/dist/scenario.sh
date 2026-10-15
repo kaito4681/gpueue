@@ -211,6 +211,11 @@ scenario_17() {
     GH_TOKEN="$TOKEN" expect_fail "bad signature" bash "$install" --version "$VERSION-test.badsig"
     [ "$(sha256sum /usr/local/bin/puzuz)" = "$before" ] || fail "the binary changed"
 
+    step "17: an older release's validly signed tarball under a newer name is refused"
+    GH_TOKEN="$TOKEN" expect_fail "is for another file (trusted comment \"puzuz v$V1 puzuz-v$V1-" \
+        bash "$install" --version "$VERSION-test.replay"
+    [ "$(sha256sum /usr/local/bin/puzuz)" = "$before" ] || fail "the binary changed"
+
     step "17: re-running install.sh installs v2; the job keeps running"
     set_latest "$V2"
     GH_TOKEN="$TOKEN" bash "$install" | tee /tmp/install-v2.out
@@ -302,13 +307,15 @@ scenario_18() {
     grep -qF "INFO  update: puzuz $V2 is available (this is $V1)" /tmp/doctor.out ||
         { cat /tmp/doctor.out; fail "doctor does not report v2"; }
 
-    step "18: a bad signature, a link in the tarball, a checksum of another file: refused, nothing changes"
+    step "18: a bad signature, an older release's tarball under a newer name, a link in the tarball, a checksum of another file: refused, nothing changes"
     local before
     before="$(sha256sum "$puzuz")"
     expect_fail "bad signature" "$puzuz" update --yes --version "$VERSION-test.badsig"
     [ "$(sha256sum "$puzuz")" = "$before" ] || fail "the binary changed"
     [ "$(daemon_version)" = "$V1" ] || fail "the daemon changed"
     [ ! -e /var/lib/puzuz/update ] || fail "the download directory was left behind"
+    expect_fail "is for another file (trusted comment \"puzuz v$V1 puzuz-v$V1-" \
+        "$puzuz" update --yes --version "$VERSION-test.replay"
     expect_fail "is a link or special file" "$puzuz" update --yes --version "$VERSION-test.symlink"
     expect_fail "checksum" "$puzuz" update --yes --version "$VERSION-test.nullsha"
     [ "$(sha256sum "$puzuz")" = "$before" ] || fail "the binary changed"
