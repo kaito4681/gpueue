@@ -247,39 +247,66 @@ jobs:
           rm -f "$key"
       - name: Write the release notes
         run: |
+          pubkey="$(sed -n 2p packaging/minisign.pub)"
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download"
           cat >"$RUNNER_TEMP/notes.md" <<EOF
           ## Install or update (administrators)
 
-          With install.sh (x86_64 and aarch64; later updates with \`sudo gpueue update\`):
+          ### Debian and Ubuntu (amd64, arm64)
+
+          Recommended: add the gpueue APT repository (needs \`curl\` and \`ca-certificates\`).
+          apt picks the newest stable version and the architecture, and later versions come with
+          \`sudo apt update && sudo apt upgrade\`:
 
           \`\`\`sh
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | sudo bash -s -- --version ${TAG#v}
+          sudo curl -fsSLo /etc/apt/keyrings/gpueue.gpg $base/apt/gpueue.gpg
+          sudo curl -fsSLo /etc/apt/sources.list.d/gpueue.sources $base/apt/gpueue.sources
+          sudo apt update && sudo apt install gpueue
           \`\`\`
 
-          On Debian and Ubuntu, the package instead (download the file for your architecture):
+          Or download and install this release's .deb (it registers the same repository):
 
           \`\`\`sh
-          sudo apt install ./gpueue_${TAG#v}_amd64.deb    # x86_64
-          sudo apt install ./gpueue_${TAG#v}_arm64.deb    # aarch64
+          arch=\$(dpkg --print-architecture)    # amd64 or arm64
+          curl -fLO "$base/$TAG/gpueue_${TAG#v}_\${arch}.deb"
+          sudo apt install "./gpueue_${TAG#v}_\${arch}.deb"
           \`\`\`
 
-          On Fedora, RHEL, Rocky and Alma Linux, the .rpm (there is no dnf repository yet:
-          update an older .rpm installation with \`sudo dnf upgrade\` and the same URL):
+          ### Fedora, RHEL, Rocky and Alma Linux (x86_64, aarch64)
+
+          dnf downloads the .rpm itself. There is no dnf repository yet: update an older .rpm
+          installation by running the same command with \`sudo dnf upgrade\`.
 
           \`\`\`sh
-          sudo dnf install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/gpueue-${TAG#v}-1.x86_64.rpm    # x86_64
-          sudo dnf install https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/gpueue-${TAG#v}-1.aarch64.rpm   # aarch64
+          sudo dnf install "$base/$TAG/gpueue-${TAG#v}-1.\$(uname -m).rpm"
+          \`\`\`
+
+          ### Other distributions: install.sh
+
+          x86_64 and aarch64; later updates with \`sudo gpueue update\`:
+
+          \`\`\`sh
+          curl -fsSL $base/$TAG/install.sh | sudo bash -s -- --version ${TAG#v}
+          \`\`\`
+
+          ### Checking a download
+
+          Every file has a \`.sha256\` and a minisign signature (\`.minisig\`). The trusted
+          comment names the release and the file (\`gpueue $TAG <file>\`):
+
+          \`\`\`sh
+          file=gpueue_${TAG#v}_amd64.deb    # the file to check
+          for f in "\$file" "\$file.sha256" "\$file.minisig"; do curl -fLO "$base/$TAG/\$f"; done
+          sha256sum -c "\$file.sha256"
+          minisign -Vm "\$file" -P $pubkey
           \`\`\`
 
           The packages are also attached as \`gpueue_<amd64|arm64>.deb\` and
           \`gpueue.<x86_64|aarch64>.rpm\`, so that
           \`https://github.com/$GITHUB_REPOSITORY/releases/latest/download/<name>\` always gives
-          the newest stable release (see docs/install.md).
-
-          Running jobs keep running. The tarballs (\`gpueue-$TAG-<target>.tar.gz\`), the
-          \`.deb\` and the \`.rpm\` files and \`install.sh\` are signed with minisign
-          (\`.minisig\`, public key in \`packaging/minisign.pub\`); see docs/install.md for
-          checking \`install.sh\` before running it, manual installation and uninstalling.
+          the newest stable release. Running jobs keep running through an update. See
+          docs/install.md for the prerequisites (CRIU, cuda-checkpoint), manual installation and
+          uninstalling.
           EOF
       - name: Create or update the GitHub release
         run: |
