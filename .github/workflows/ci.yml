@@ -72,23 +72,89 @@ jobs:
             rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
             -color
 
-  # flake.nix: evaluate the outputs and run the checks (the home-manager
-  # module evaluation; on x86_64 also two NixOS VM tests, which need KVM: the
-  # NixOS module, and every puzuz-helper test), run the whole test suite with
-  # the Nix toolchain outside the build sandbox, then build puzuz (without its
-  # tests) and CRIU on both architectures.
+  # Whether this run needs the Nix jobs below. Pull requests that change only
+  # files that no flake output and no test reads (other workflows, skills/,
+  # AGENTS.md, the translated READMEs, docker/, the test and release scripts
+  # other than those packaging/nix/package.nix embeds) skip them; pushes and
+  # manual runs always run them. A skipped job passes a required check,
+  # unlike a workflow-level paths filter, which would leave it pending.
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      nix: ${{ steps.filter.outputs.nix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # A pull request is checked out as its merge commit, whose first
+          # parent is the base branch.
+          fetch-depth: 2
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          nix=true
+          if [ "$EVENT" = pull_request ]; then
+            nix=false
+            while IFS= read -r file; do
+              case "$file" in
+                # Read by the package (keep in sync with the source fileset
+                # in packaging/nix/package.nix), or this workflow.
+                scripts/install.sh | scripts/dist/deb-check.sh | scripts/dist/get-minisign.sh | .github/workflows/ci.yml) ;;
+                .agents/* | skills/* | AGENTS.md | README.ja.md | README.zh-CN.md | .gitignore | docker/* | scripts/* | .github/*)
+                  continue ;;
+              esac
+              echo "Running the Nix jobs, for $file"
+              nix=true
+              break
+            done < <(git diff --name-only HEAD^1 HEAD)
+          fi
+          echo "nix=$nix" >> "$GITHUB_OUTPUT"
+
+  # flake.nix, in parallel jobs: every check, an evaluation of all outputs,
+  # the whole test suite with the Nix toolchain outside the build sandbox
+  # (the package build runs no tests: those that spawn jobs cannot pass in
+  # the sandbox, which refuses setgid), and builds of puzuz and CRIU. The
+  # x86_64 checks include two NixOS VM tests, which need KVM (the NixOS
+  # module, and every puzuz-helper test), so the work there is split over
+  # three runners; the aarch64 runner (no VM tests) does it all.
   nix:
+    needs: [changes]
+    if: needs.changes.outputs.nix == 'true'
+    name: nix (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        include:
+          # The NixOS module test, and the home-manager check, which needs
+          # the same puzuz build; then that package and CRIU (built for the
+          # NixOS test) are tried out.
+          - name: x86_64 nixos VM
+            runner: ubuntu-24.04
+            kvm: true
+            build: .#checks.x86_64-linux.nixos .#checks.x86_64-linux.home-manager
+            smoke: true
+          - name: x86_64 helper-tests VM
+            runner: ubuntu-24.04
+            kvm: true
+            build: .#checks.x86_64-linux.helper-tests
+          # Evaluates every output for every system; the builds of the
+          # x86_64 checks are in the two jobs above.
+          - name: x86_64 eval and tests
+            runner: ubuntu-24.04
+            eval: true
+            cargo-test: true
+          - name: aarch64
+            runner: ubuntu-24.04-arm
+            flake-check: true
+            cargo-test: true
+            smoke: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # GitHub's x86_64 Linux runners have /dev/kvm, but only for root.
       - name: Enable KVM
-        if: matrix.runner == 'ubuntu-24.04'
+        if: matrix.kvm
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -96,21 +162,28 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
-          # Only where KVM is enabled; the arm runner has no VM tests.
-          extra_nix_config: ${{ matrix.runner == 'ubuntu-24.04' && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
-      - run: nix flake check -L
-      # The package build runs no tests: those that spawn jobs cannot pass in
-      # the build sandbox (it refuses setgid). Run the whole suite with the Nix
-      # toolchain outside the sandbox instead, on both architectures.
+          extra_nix_config: ${{ matrix.kvm && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
+      - if: matrix.flake-check
+        run: nix flake check -L
+      - if: matrix.eval
+        run: nix flake check --no-build --all-systems
+      - if: matrix.build
+        env:
+          INSTALLABLES: ${{ matrix.build }}
+        run: |
+          read -ra installables <<< "$INSTALLABLES"
+          nix build -L --no-link "${installables[@]}"
       - name: Tests outside the build sandbox
+        if: matrix.cargo-test
         run: nix develop -c cargo test --workspace --locked
-      - run: nix build -L .#default
-      - run: |
+      - if: matrix.smoke
+        run: |
+          nix build -L .#default
           ./result/bin/puzuz --version
           ./result/bin/puzuz-helper --help >/dev/null
           test -s result/share/bash-completion/completions/puzuz.bash
-      - run: nix build -L .#criu -o result-criu
-      - run: ./result-criu/bin/criu --version
+          nix build -L .#criu -o result-criu
+          ./result-criu/bin/criu --version
 
   # `puzuz service install|uninstall|status` and the install method checks
   # under systemd in a privileged container.

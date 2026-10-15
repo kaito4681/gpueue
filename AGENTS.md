@@ -35,7 +35,12 @@
   these jobs: `lint` (fmt, clippy), `test`, `msrv` (`rust-version`), `shellcheck`, `actionlint`
   (the workflow files), the CPU e2e (`e2e`), `service-install`, `dist-build` and `dist` (tarball
   and `install.sh`), `deb`, `rpm`, `apt-repo`, `aur` (builds and installs the AUR package from a
-  locally built tarball with `scripts/dist/aur-test.sh`) and `nix`. Pushing a `v<version>` tag runs
+  locally built tarball with `scripts/dist/aur-test.sh`) and `nix`. `nix` is a matrix of four
+  runners: on x86_64 the NixOS module VM test (with the home-manager check and the package/CRIU
+  smoke checks), the helper-tests VM, and `nix flake check --no-build --all-systems` plus
+  `nix develop -c cargo test`; on aarch64 `nix flake check` plus the same tests and smoke checks.
+  A `changes` job skips `nix` on pull requests whose files no flake output or test reads (keep
+  its list in sync with the source fileset in `packaging/nix/package.nix`). Pushing a `v<version>` tag runs
   `.github/workflows/release.yml`, which builds and signs the tarballs, `.deb` and `.rpm`
   packages and attaches them, with `install.sh` and `RPM-GPG-KEY-puzuz`, to a draft GitHub
   release. Publishing the release triggers `release-apt.yml` (APT repository) and `release-aur.yml`
