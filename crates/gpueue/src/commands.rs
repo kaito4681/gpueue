@@ -1,6 +1,6 @@
 //! Executing the subcommands that talk to the daemon.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -989,7 +989,13 @@ impl App {
             let Some(event) = events.next_event().await? else {
                 return Err("lost the connection to the daemon while waiting".into());
             };
-            for line in waiter.handle(event, &self.ctx)? {
+            let lines = if event == Event::Resync {
+                // Events were dropped: read the jobs again.
+                waiter.resync(&self.jobs().await?, &self.ctx)
+            } else {
+                waiter.handle(event, &self.ctx)?
+            };
+            for line in lines {
                 if !quiet {
                     print_best_effort(&line);
                 }
@@ -1003,6 +1009,8 @@ struct Waiter {
     target: JobSelector,
     target_status: WaitTargetStatus,
     watched: HashMap<JobId, JobState>,
+    /// Every job [`Waiter::add`] was given, watched or not.
+    seen: HashSet<JobId>,
     /// With `--status success`: a job finished unsuccessfully.
     failed: bool,
 }
@@ -1013,6 +1021,7 @@ impl Waiter {
             target,
             target_status,
             watched: HashMap::new(),
+            seen: HashSet::new(),
             failed: false,
         }
     }
@@ -1031,6 +1040,7 @@ impl Waiter {
     /// Starts watching `job` unless it already reached the target.
     fn add(&mut self, job: &JobView, first_run: bool, ctx: &RenderCtx) -> Option<String> {
         let line = render::wait_new_job(job, first_run, ctx);
+        self.seen.insert(job.id);
         if !self.check_reached(job) {
             self.watched.insert(job.id, job.state.clone());
         }
@@ -1077,9 +1087,28 @@ impl Waiter {
             Event::DaemonShutdown => {
                 return Err("the daemon is shutting down".into());
             }
-            Event::GroupUpdated { .. } | Event::GroupRemoved { .. } => {}
+            Event::GroupUpdated { .. } | Event::GroupRemoved { .. } | Event::Resync => {}
         }
         Ok(lines)
+    }
+
+    /// Catches up with `jobs`, the current list, after the event stream
+    /// dropped events ([`Event::Resync`]): as if each change since had
+    /// been an event.
+    fn resync(&mut self, jobs: &[JobView], ctx: &RenderCtx) -> Vec<String> {
+        let mut lines = Vec::new();
+        let present: HashSet<JobId> = jobs.iter().map(|job| job.id).collect();
+        self.watched.retain(|id, _| present.contains(id));
+        for job in jobs {
+            let event = if self.seen.contains(&job.id) {
+                Event::JobUpdated { job: job.clone() }
+            } else {
+                Event::JobAdded { job: job.clone() }
+            };
+            // Neither kind of event fails.
+            lines.extend(self.handle(event, ctx).unwrap_or_default());
+        }
+        lines
     }
 }
 
@@ -1492,6 +1521,39 @@ mod tests {
             .unwrap();
         assert!(lines.is_empty());
         assert!(waiter.watched.is_empty());
+    }
+
+    #[test]
+    fn waiter_catches_up_after_a_resync() {
+        let ctx = ctx();
+        let mut waiter = Waiter::new(
+            JobSelector::Group {
+                group: "default".into(),
+            },
+            WaitTargetStatus::Done,
+        );
+        let mut running = job(1, JobState::Running);
+        waiter.add(&running, true, &ctx);
+        let removed = job(2, JobState::Running);
+        waiter.add(&removed, true, &ctx);
+        let done = |result| JobState::Done { result };
+        let finished = job(4, done(JobResult::Success));
+        waiter.add(&finished, true, &ctx);
+        assert_eq!(waiter.watched.len(), 2);
+
+        // The events that finished job 1, removed job 2 and added job 3
+        // were dropped; the list shows where things are.
+        running.state = done(JobResult::Success);
+        let added = job(3, JobState::Queued { enqueued_at: 0 });
+        let lines = waiter.resync(&[running, added, finished], &ctx);
+        assert_eq!(
+            lines,
+            vec![
+                "12:00:00 - Job 1 succeeded with 0",
+                "12:00:00 - New job 3 with status Queued",
+            ]
+        );
+        assert_eq!(waiter.watched.keys().collect::<Vec<_>>(), [&JobId(3)]);
     }
 
     #[test]

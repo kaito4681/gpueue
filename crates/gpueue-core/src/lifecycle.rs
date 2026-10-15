@@ -27,6 +27,8 @@
 //! Checkpointed jobs are only resumed by `restore`; `start` and `kill` reject
 //! them, and [`hint`] tells the user which command to use instead.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::error::Error;
 use crate::model::{Job, JobId, JobResult, JobState, Timestamp};
 
@@ -301,28 +303,68 @@ pub fn clean(job: &Job, successful_only: bool) -> Result<Transition, Error> {
 /// that are not part of the same removal (`to_delete`). Mirrors pueue's
 /// `is_task_removable`, including transitive dependants.
 pub fn blocking_dependants(jobs: &[Job], id: JobId, to_delete: &[JobId]) -> Vec<JobId> {
+    let index = DependantIndex::new(jobs);
+    let to_delete: HashSet<JobId> = to_delete.iter().copied().collect();
+    let found: Result<_, std::convert::Infallible> =
+        blocking_dependants_with(id, &to_delete, |dep| Ok(index.of(dep).to_vec()));
+    found.unwrap_or_else(|never| match never {})
+}
+
+/// [`blocking_dependants`] with the dependants looked up by
+/// `unfinished_dependants`, which returns the unfinished jobs that depend
+/// directly on a job (e.g. from the database, or a [`DependantIndex`]).
+/// Looks only at the dependants of `id` and of the jobs removed with it,
+/// so checking every job of a large removal stays cheap.
+pub fn blocking_dependants_with<E>(
+    id: JobId,
+    to_delete: &HashSet<JobId>,
+    mut unfinished_dependants: impl FnMut(JobId) -> Result<Vec<JobId>, E>,
+) -> Result<Vec<JobId>, E> {
     let mut blocking = Vec::new();
     let mut pending = vec![id];
-    let mut seen = vec![id];
+    let mut seen = HashSet::from([id]);
     while let Some(current) = pending.pop() {
-        for job in jobs {
-            if seen.contains(&job.id)
-                || matches!(job.state, JobState::Done { .. })
-                || !job.spec.dependencies.contains(&current)
-            {
+        for dependant in unfinished_dependants(current)? {
+            if !seen.insert(dependant) {
                 continue;
             }
-            seen.push(job.id);
-            if to_delete.contains(&job.id) {
+            if to_delete.contains(&dependant) {
                 // Removed together; its own dependants must be checked too.
-                pending.push(job.id);
+                pending.push(dependant);
             } else {
-                blocking.push(job.id);
+                blocking.push(dependant);
             }
         }
     }
     blocking.sort();
-    blocking
+    Ok(blocking)
+}
+
+/// The unfinished jobs depending on each job, built once from a job list
+/// (see [`blocking_dependants_with`]).
+#[derive(Debug, Default)]
+pub struct DependantIndex {
+    by_dependency: HashMap<JobId, Vec<JobId>>,
+}
+
+impl DependantIndex {
+    pub fn new(jobs: &[Job]) -> Self {
+        let mut by_dependency: HashMap<JobId, Vec<JobId>> = HashMap::new();
+        for job in jobs {
+            if matches!(job.state, JobState::Done { .. }) {
+                continue;
+            }
+            for dep in &job.spec.dependencies {
+                by_dependency.entry(*dep).or_default().push(job.id);
+            }
+        }
+        Self { by_dependency }
+    }
+
+    /// The unfinished jobs that depend directly on `id`.
+    pub fn of(&self, id: JobId) -> &[JobId] {
+        self.by_dependency.get(&id).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// `restart`.

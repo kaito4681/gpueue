@@ -29,7 +29,7 @@ use gpueue_protocol::api::{
 use crate::error::{ApiResult, Failure};
 use crate::state::{Core, PendingWarnings};
 pub use extract::{Auth, PeerCred, TEST_UID_HEADER};
-use extract::{JsonBody, OptionalJson};
+use extract::{JsonBody, OptionalJson, Permit};
 
 pub type AppState = Arc<Core>;
 
@@ -37,12 +37,19 @@ pub type AppState = Arc<Core>;
 /// handler future is dropped when the connection closes, and an operation
 /// cut off between its commit and its helper requests would leave a job
 /// marked `Running` that was never spawned (and its launch unsettled, see
-/// [`crate::launch`]).
-async fn detached<T, F>(operation: F) -> ApiResult<T>
+/// [`crate::launch`]). The operation holds the connection's `permit` until
+/// it is done, so operations whose clients went away still count against
+/// the caller's connection limit (see [`crate::limits`]) instead of piling
+/// up on the blocking pool the database calls run on.
+async fn detached<T, F>(Permit(permit): Permit, operation: F) -> ApiResult<T>
 where
     F: Future<Output = ApiResult<T>> + Send + 'static,
     T: Send + 'static,
 {
+    let operation = async move {
+        let _permit = permit;
+        operation.await
+    };
     match tokio::spawn(operation).await {
         Ok(result) => result,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
@@ -208,9 +215,10 @@ async fn list_jobs(
 async fn add_job(
     State(core): State<AppState>,
     Auth(caller): Auth,
+    permit: Permit,
     JsonBody(request): JsonBody<AddJobRequest>,
 ) -> ApiResult<(StatusCode, Json<AddJobResponse>)> {
-    let response = detached(async move { core.add_job(caller, request).await }).await?;
+    let response = detached(permit, async move { core.add_job(caller, request).await }).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -227,11 +235,12 @@ async fn get_job(
 async fn remove_job(
     State(core): State<AppState>,
     Auth(caller): Auth,
+    permit: Permit,
     Path(id): Path<String>,
 ) -> ApiResult<Json<JobActionResult>> {
     let id = parse_job_id(&id)?;
-    detached(async move {
-        core.job_action(caller, id, JobAction::Remove, Vec::new())
+    detached(permit, async move {
+        core.job_action(caller, id, JobAction::Remove, Default::default())
             .await
     })
     .await?;
@@ -241,6 +250,7 @@ async fn remove_job(
 async fn job_action(
     State(core): State<AppState>,
     Auth(caller): Auth,
+    permit: Permit,
     Path((id, action)): Path<(String, String)>,
     body: axum::body::Bytes,
 ) -> ApiResult<Json<JobActionResult>> {
@@ -262,8 +272,11 @@ async fn job_action(
         JobActionKind::Enqueue => JobAction::Enqueue(opts::<EnqueueOptions>(&body)?),
         JobActionKind::Remove => unreachable!("filtered above"),
     };
-    let done = detached(async move { core.job_action_by_id(caller, id, action, Vec::new()).await })
-        .await?;
+    let done = detached(permit, async move {
+        core.job_action_by_id(caller, id, action, Default::default())
+            .await
+    })
+    .await?;
     Ok(Json(JobActionResult {
         id,
         outcome: done.outcome(),
@@ -273,27 +286,30 @@ async fn job_action(
 async fn bulk(
     State(core): State<AppState>,
     Auth(caller): Auth,
+    permit: Permit,
     JsonBody(request): JsonBody<BulkJobRequest>,
 ) -> ApiResult<Response> {
-    let response = detached(async move { core.bulk(caller, request).await }).await?;
+    let response = detached(permit, async move { core.bulk(caller, request).await }).await?;
     Ok(Json(response).into_response())
 }
 
 async fn clean(
     State(core): State<AppState>,
     Auth(caller): Auth,
+    permit: Permit,
     OptionalJson(request): OptionalJson<CleanRequest>,
 ) -> ApiResult<Response> {
-    let response = detached(async move { core.clean(caller, request).await }).await?;
+    let response = detached(permit, async move { core.clean(caller, request).await }).await?;
     Ok(Json(response).into_response())
 }
 
 async fn reset(
     State(core): State<AppState>,
     Auth(caller): Auth,
+    permit: Permit,
     OptionalJson(request): OptionalJson<ResetRequest>,
 ) -> ApiResult<Response> {
-    let response = detached(async move { core.reset(caller, request).await }).await?;
+    let response = detached(permit, async move { core.reset(caller, request).await }).await?;
     Ok(Json(response).into_response())
 }
 

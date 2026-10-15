@@ -751,6 +751,24 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// The local calendar day (days since 1970-01-01) on which the reset
+/// period containing `now` began, with local time `utc_offset_secs` ahead
+/// of UTC; `None` for `none` and `now`, which have no calendar boundaries.
+pub fn period_start_day(now: Timestamp, utc_offset_secs: i32, period: ResetPeriod) -> Option<i64> {
+    let offset_ms = utc_offset_secs as i64 * 1000;
+    let today = (now + offset_ms).div_euclid(MS_PER_DAY);
+    let (year, month, _) = civil_from_days(today);
+    Some(match period {
+        ResetPeriod::None | ResetPeriod::Now => return None,
+        ResetPeriod::Daily => today,
+        // 1970-01-01 was a Thursday; Sunday is 0.
+        ResetPeriod::Weekly => today - (today + 4).rem_euclid(7),
+        ResetPeriod::Monthly => days_from_civil(year, month, 1),
+        ResetPeriod::Quarterly => days_from_civil(year, (month - 1) / 3 * 3 + 1, 1),
+        ResetPeriod::Yearly => days_from_civil(year, 1, 1),
+    })
+}
+
 /// When the current reset period began (in Unix milliseconds), with local
 /// time `utc_offset_secs` ahead of UTC; `None` for `none` and `now`,
 /// which have no calendar boundaries.
@@ -760,22 +778,17 @@ pub fn period_start(
     period: ResetPeriod,
 ) -> Option<Timestamp> {
     let offset_ms = utc_offset_secs as i64 * 1000;
-    let today = (now + offset_ms).div_euclid(MS_PER_DAY);
-    let (year, month, _) = civil_from_days(today);
-    let start_day = match period {
-        ResetPeriod::None | ResetPeriod::Now => return None,
-        ResetPeriod::Daily => today,
-        // 1970-01-01 was a Thursday; Sunday is 0.
-        ResetPeriod::Weekly => today - (today + 4).rem_euclid(7),
-        ResetPeriod::Monthly => days_from_civil(year, month, 1),
-        ResetPeriod::Quarterly => days_from_civil(year, (month - 1) / 3 * 3 + 1, 1),
-        ResetPeriod::Yearly => days_from_civil(year, 1, 1),
-    };
-    Some(start_day * MS_PER_DAY - offset_ms)
+    period_start_day(now, utc_offset_secs, period).map(|day| day * MS_PER_DAY - offset_ms)
 }
 
 /// Whether usage last reset (or first recorded) at `last_reset` must be
 /// reset at `now`: a period boundary lies after `last_reset`.
+///
+/// Compares instants, so a boundary computed with a different UTC offset
+/// than the one in force at `last_reset` can be off by the difference: on
+/// the day daylight saving time ends, the day's midnight moves to after a
+/// reset made at the earlier midnight. Prefer [`reset_due_since_day`]; this
+/// is for state recorded before the day was.
 pub fn reset_due(
     period: ResetPeriod,
     last_reset: Timestamp,
@@ -783,6 +796,20 @@ pub fn reset_due(
     utc_offset_secs: i32,
 ) -> bool {
     period_start(now, utc_offset_secs, period).is_some_and(|start| start > last_reset)
+}
+
+/// Whether usage last reset for the period that began on local day
+/// `last_reset_day` (see [`period_start_day`]) must be reset at `now`: the
+/// current period began on a later day. Days are compared rather than
+/// instants, so a change of the UTC offset (daylight saving time) does not
+/// make a boundary that has been passed due again.
+pub fn reset_due_since_day(
+    period: ResetPeriod,
+    last_reset_day: i64,
+    now: Timestamp,
+    utc_offset_secs: i32,
+) -> bool {
+    period_start_day(now, utc_offset_secs, period).is_some_and(|day| day > last_reset_day)
 }
 
 #[cfg(test)]

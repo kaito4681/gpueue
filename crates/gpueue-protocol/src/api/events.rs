@@ -32,6 +32,9 @@ pub enum Event {
     },
     /// The daemon is shutting down; the stream ends afterwards.
     DaemonShutdown,
+    /// The subscriber fell behind and events were dropped: re-read the
+    /// state kept up to date from the stream (the stream goes on).
+    Resync,
 }
 
 impl Event {
@@ -44,6 +47,7 @@ impl Event {
             Event::GroupUpdated { .. } => "group_updated",
             Event::GroupRemoved { .. } => "group_removed",
             Event::DaemonShutdown => "daemon_shutdown",
+            Event::Resync => "resync",
         }
     }
 

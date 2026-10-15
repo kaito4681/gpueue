@@ -34,13 +34,24 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    open: at most 64 connections and 16 streams (`log --follow`, `/v1/events`) per uid, and 4096
    connections in total (`gpueue.service` raises `LimitNOFILE` well above that). A request over a
    limit is answered with `too_many_requests`. A connection must send its request headers within
-   20 seconds, and an idle keep-alive connection is closed after 20 seconds. `log --tail` looks
+   20 seconds, and an idle keep-alive connection is closed after 20 seconds. A job operation (`add`,
+   job actions, bulk actions, `clean`, `reset`) runs to completion even if its client goes away,
+   and keeps counting as one of the caller's connections until it has, so abandoned operations
+   cannot pile up. `log --tail` looks
    for line starts in the last 4 MiB of the log at most (the output starts there if they hold
-   fewer lines), and only a few such scans run at once.
+   fewer lines), and only a few such scans run at once. What one user stores is limited too: at
+   most `max_unfinished_jobs_per_user` jobs that have not finished (`add` and a `restart` that
+   brings a job back are refused with `too_many_requests` beyond it), and at most
+   `max_job_spec_bytes` for a job's command, working directory, label and environment together
+   (refused with `bad_request`). A `/v1/events` subscriber that falls too far behind gets a
+   `resync` event instead of the events it missed; `gpueue wait` then reads the job list again.
 2. **Scheduling.** A queued job starts when its group has a free slot and every requested GPU has
    a free slot. Candidates are considered in priority order (see
-   [Priority and fair share](#priority-and-fair-share)). The daemon then asks the helper to spawn
-   it. Immediate launches (`start <id>`, `add -i`, `restart -i`, `restore -i`) by an
+   [Priority and fair share](#priority-and-fair-share)). A scheduling pass reads the jobs that
+   have not finished without their commands and environments, and only the jobs it launches in
+   full. The daemon then asks the helper to spawn
+   it (at most 8 spawn or restore requests at a time; the job is recorded as running before its
+   request waits for its turn). Immediate launches (`start <id>`, `add -i`, `restart -i`, `restore -i`) by an
    administrator are marked as forced, in memory, and launched at once, ignoring every limit.
    Anybody else's are not forced: the action queues the job (or queues it for restore) and, in
    the same transaction, moves it first among the owner's jobs like `gpueue top`
@@ -309,7 +320,11 @@ failed and keeps the image as well.
   helper refuses is left running, because terminating it would lose the work. The daemon logs a
   warning and the owner is warned. Stop it with `gpueue kill` or `gpueue shutdown --no-checkpoint`
   if needed.
-- **`systemctl stop/restart gpueue-helper` or `gpueue`** on its own leaves jobs running.
+- **`systemctl stop/restart gpueue-helper` or `gpueue`** on its own leaves jobs running. A
+  stopping daemon first puts the launches it has decided on but not sent to the helper yet back
+  in line (otherwise the next daemon would find their jobs gone and mark them lost, failing their
+  dependants), and gives the helper up to 10 seconds to answer the spawn and restore requests
+  already sent.
 
 ## Priority and fair share
 
@@ -329,7 +344,9 @@ scheduler:
   `gpueue prio`) uses the same candidate selection, so it lists what the plan considers.
 - The storage keeps `jobs.nice`, `jobs.site_factor`, `jobs.top_seq`, `jobs.run_since`, `groups.priority`, the
   `user_shares` and `user_usage` tables and, in `meta`, when usage was last calculated and reset
-  (schema version 6).
+  (schema version 6), and the local day on which the reset period of the last reset began. A
+  reset is due when the current period began on a later day, so a change of the UTC offset
+  (daylight saving time) does not make the same boundary due twice.
 - Only running time is billed. Every state change goes through one place in the daemon
   (`Core::apply_in_tx`), which sets `jobs.run_since` when a job starts running and, when it stops
   running, charges the time since to its owner's usage in the same transaction. A usage task runs

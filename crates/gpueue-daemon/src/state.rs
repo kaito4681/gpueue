@@ -17,7 +17,7 @@
 //! has been answered (see [`crate::launch`]); [`Core::wait_for_launch`] and
 //! [`Core::launch_in_flight`] enforce that ordering per job.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -197,6 +197,17 @@ pub struct Changes {
     launching: Vec<JobId>,
     /// Jobs whose checkpoint request is sent after the commit.
     checkpointing: Vec<JobId>,
+    /// Jobs that stopped holding slots (see [`Launches::prune_settled`]).
+    released: Vec<JobId>,
+    /// Changes of [`Core::forced`], in order (`true`: marked), made once
+    /// the transaction has committed.
+    forced: Vec<(JobId, bool)>,
+    /// New fair-share factors for [`Core::fairshare`], cached once the
+    /// transaction has committed.
+    fairshare: Option<Arc<HashMap<Uid, f64>>>,
+    /// Launches of the scheduler, recorded in [`Core::unsent_launches`]
+    /// once the transaction has committed.
+    unsent: Vec<(JobId, UnsentLaunch)>,
 }
 
 impl Changes {
@@ -225,6 +236,19 @@ impl Changes {
     fn checkpointing(&mut self, id: JobId) {
         self.checkpointing.push(id);
     }
+    /// Marks `id` to be launched regardless of free slots (see
+    /// [`Core::forced`]) once the transaction has committed.
+    pub fn force_launch(&mut self, id: JobId) {
+        self.forced.push((id, true));
+    }
+    fn unforce_launch(&mut self, id: JobId) {
+        self.forced.push((id, false));
+    }
+    /// Caches `factors` as the fair-share factors once the transaction
+    /// has committed.
+    pub(crate) fn set_fairshare(&mut self, factors: HashMap<Uid, f64>) {
+        self.fairshare = Some(Arc::new(factors));
+    }
     fn is_empty(&self) -> bool {
         self.added.is_empty()
             && self.updated.is_empty()
@@ -233,6 +257,32 @@ impl Changes {
             && self.groups_removed.is_empty()
             && !self.other
     }
+}
+
+/// A launch the scheduler has committed but whose request has not been
+/// sent yet (see [`Core::unsent_launches`]): the state it put the job in
+/// (`Running` or `Restoring`) and the job's `started_at`, which identify
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnsentLaunch {
+    state: JobState,
+    started_at: Option<Timestamp>,
+}
+
+/// What [`Core::reap_pending`] found.
+enum Reaped {
+    /// Removed; these effects remain.
+    Removed(Job, Vec<Effect>),
+    /// Gone already.
+    Gone,
+    /// Running again after a dump that did not happen or a restore: being
+    /// killed (these effects remain), and removed once it has stopped.
+    Killed(Job, Vec<Effect>),
+    /// Running again, its launch not answered yet: looked at again once it
+    /// is.
+    LaunchInFlight,
+    /// Not removable yet.
+    Later,
 }
 
 /// What [`Core::notice_loop`] tracks of the helper's events.
@@ -263,7 +313,7 @@ pub fn needs_helper(effect: &Effect) -> bool {
     )
 }
 
-/// The states a forced launch (see [`Core::force_launch`]) goes through:
+/// The states a forced launch (see [`Changes::force_launch`]) goes through:
 /// waiting for the helper, then launching or launched.
 fn is_launch_state(state: &JobState) -> bool {
     matches!(
@@ -303,6 +353,10 @@ const STOPPING_HELPER_PAUSE: Duration = Duration::from_secs(1);
 
 /// Spawn/restore requests the scheduler has outstanding at most.
 const MAX_CONCURRENT_LAUNCHES: usize = 8;
+
+/// How long a stopping daemon waits for the helper to answer the spawn and
+/// restore requests it has sent (see [`Core::stop_launches`]).
+pub(crate) const STOP_LAUNCH_WAIT: Duration = Duration::from_secs(10);
 
 /// `log --tail` scans running at once at most (see `api::log`).
 const MAX_TAIL_SCANS: usize = 2;
@@ -434,8 +488,9 @@ pub struct Core {
     pub cancel: CancellationToken,
     /// Fired when `gpueue shutdown` has finished.
     pub shutdown_complete: CancellationToken,
-    /// Jobs `reset` will remove once they have stopped.
-    pending_removal: Mutex<BTreeSet<JobId>>,
+    /// Jobs `reset` will remove once they have stopped, and whether they
+    /// have been killed (see [`Core::reap_pending`]).
+    pending_removal: Mutex<BTreeMap<JobId, bool>>,
     /// Live helper jobs the database does not account for (see
     /// [`Orphan`]).
     orphans: Mutex<BTreeMap<JobId, Orphan>>,
@@ -457,6 +512,15 @@ pub struct Core {
     checkpoint_requests: Launches,
     /// Bounds the scheduler's concurrent spawn/restore requests.
     launch_slots: Semaphore,
+    /// Launches the scheduler has committed (the job is recorded as
+    /// `Running` or `Restoring`) whose request waits for one of the
+    /// `launch_slots`. A stopping daemon puts them back in line (see
+    /// [`Core::stop_launches`]); the launch task that gets a slot first
+    /// takes its entry out and sends the request.
+    unsent_launches: Mutex<HashMap<JobId, UnsentLaunch>>,
+    /// Fired by [`Core::stop_launches`]: the scheduler launches nothing
+    /// more, and launches waiting for a slot are not sent.
+    launches_stopped: CancellationToken,
     /// Jobs whose spawn or restore request went unanswered (connection
     /// lost or timed out), with the state that launch put them in
     /// (`Running` or `Restoring`); see [`Core::spawn_lost_check`].
@@ -509,7 +573,7 @@ impl Core {
             reconciled: AtomicBool::new(false),
             cancel: CancellationToken::new(),
             shutdown_complete: CancellationToken::new(),
-            pending_removal: Mutex::new(BTreeSet::new()),
+            pending_removal: Mutex::new(BTreeMap::new()),
             orphans: Mutex::new(BTreeMap::new()),
             events_applied: watch::channel(0).0,
             tail_scans: Semaphore::new(MAX_TAIL_SCANS),
@@ -517,6 +581,8 @@ impl Core {
             launches: Launches::default(),
             checkpoint_requests: Launches::default(),
             launch_slots: Semaphore::new(MAX_CONCURRENT_LAUNCHES),
+            unsent_launches: Mutex::new(HashMap::new()),
+            launches_stopped: CancellationToken::new(),
             unconfirmed_launches: Mutex::new(HashMap::new()),
             forced: Mutex::new(HashSet::new()),
             launch_check_hook: Mutex::new(None),
@@ -590,12 +656,6 @@ impl Core {
                 ),
             )),
         }
-    }
-
-    /// Marks `id` to be launched regardless of free slots (an
-    /// administrator's launching action, see [`Core::forced`]).
-    pub fn force_launch(&self, id: JobId) {
-        self.forced.lock().unwrap().insert(id);
     }
 
     /// A helper refused or abandoned a launch because it is stopping: the
@@ -930,6 +990,11 @@ impl Core {
             .call(move |store| {
                 let mut changes = Changes::default();
                 let result = store.transaction(|tx| f(tx, &mut changes));
+                // What is kept in memory follows the database once the
+                // transaction has committed (and not if it failed).
+                if result.is_ok() {
+                    core.apply_memory_changes(&mut changes);
+                }
                 let changed = result.is_ok() && !changes.is_empty();
                 if changed {
                     for &id in &changes.launching {
@@ -952,6 +1017,33 @@ impl Core {
             self.schedule.notify_one();
         }
         result
+    }
+
+    /// The in-memory part of a committed transaction's [`Changes`].
+    fn apply_memory_changes(&self, changes: &mut Changes) {
+        if !changes.forced.is_empty() {
+            let mut forced = self.forced.lock().unwrap();
+            for (id, mark) in changes.forced.drain(..) {
+                if mark {
+                    forced.insert(id);
+                } else {
+                    forced.remove(&id);
+                }
+            }
+        }
+        if let Some(factors) = changes.fairshare.take() {
+            *self.fairshare.lock().unwrap() = factors;
+        }
+        for &id in &changes.released {
+            self.launches.prune_settled(id);
+            self.checkpoint_requests.prune_settled(id);
+        }
+        if !changes.unsent.is_empty() {
+            self.unsent_launches
+                .lock()
+                .unwrap()
+                .extend(changes.unsent.drain(..));
+        }
     }
 
     /// Runs a read-only closure against the store.
@@ -1028,6 +1120,9 @@ impl Core {
             transition.apply(job, now);
             tx.update_job_state(job.id, &job.state, job.started_at, job.finished_at)?;
             self.account_run(tx, &old, job, now)?;
+            if old.occupies_slot() && !job.state.occupies_slot() {
+                changes.released.push(job.id);
+            }
             if matches!(old, JobState::Done { .. })
                 && matches!(
                     job.state,
@@ -1043,7 +1138,7 @@ impl Core {
                 job.top_seq = None;
             }
             if !is_launch_state(&job.state) {
-                self.forced.lock().unwrap().remove(&job.id);
+                changes.unforce_launch(job.id);
             }
             if restored {
                 // The job runs again; an earlier failed attempt is history.
@@ -2323,8 +2418,11 @@ impl Core {
         let core = self.clone();
         let launched = self
             .write(move |tx, ch| {
-                // Finished jobs only matter as dependencies.
-                let mut jobs = tx.list_unfinished_jobs()?;
+                // Checked under the database lock (see `Core::stop_launches`).
+                let launch = launch && !core.launches_stopped.is_cancelled();
+                // Finished jobs only matter as dependencies. Commands and
+                // environments are not needed to decide (only to launch).
+                let mut jobs = tx.list_unfinished_jobs_brief()?;
                 let groups = tx.list_groups()?;
                 let reserved = core.orphan_reservations();
                 let mut launched = Vec::new();
@@ -2353,7 +2451,7 @@ impl Core {
                         }
                         let t = lifecycle::dispatch(job)?;
                         core.apply_in_tx(tx, job, &t, now, ch)?;
-                        launched.push((job.clone(), t.effects));
+                        launched.push((job.id, t.effects));
                     }
                 }
                 // Undetected GPUs are left out, so jobs that need them wait.
@@ -2402,76 +2500,209 @@ impl Core {
                         };
                         let t = lifecycle::dispatch(job)?;
                         core.apply_in_tx(tx, job, &t, now, ch)?;
-                        launched.push((job.clone(), t.effects));
+                        launched.push((job.id, t.effects));
                     }
                 }
-                Ok(launched)
+                // The whole jobs, for their spawn or restore requests.
+                let mut full = Vec::with_capacity(launched.len());
+                for (id, effects) in launched {
+                    let job = tx.get_job(id)?.ok_or(gpueue_core::Error::JobNotFound(id))?;
+                    ch.unsent.push((
+                        id,
+                        UnsentLaunch {
+                            state: job.state.clone(),
+                            started_at: job.started_at,
+                        },
+                    ));
+                    full.push((job, effects));
+                }
+                Ok(full)
             })
             .await?;
         // Each launch runs on its own task, so one slow helper answer does
         // not hold up the next scheduling round; at most
-        // `MAX_CONCURRENT_LAUNCHES` are sent at a time. They stop with the
-        // daemon; a request dropped unanswered is settled by the next
-        // reconciliation (the launch tracker settles it on drop).
+        // `MAX_CONCURRENT_LAUNCHES` are sent at a time. A launch still
+        // waiting for a slot when the daemon stops is put back in line
+        // (see `Core::stop_launches`); one sent and not answered by then is
+        // dropped, and settled by the next reconciliation (the launch
+        // tracker settles it on drop).
         for (job, effects) in launched {
             let core = self.clone();
             tokio::spawn(async move {
+                let _permit = tokio::select! {
+                    biased;
+                    _ = core.cancel.cancelled() => return,
+                    _ = core.launches_stopped.cancelled() => return,
+                    permit = core.launch_slots.acquire() => permit,
+                };
+                // Put back in line by `stop_launches` in the meantime?
+                if core
+                    .unsent_launches
+                    .lock()
+                    .unwrap()
+                    .remove(&job.id)
+                    .is_none()
+                {
+                    return;
+                }
                 // Biased: once the daemon is stopped, a launch that has not
                 // been answered yet is dropped at its next wake-up instead
                 // of acting on the outcome.
                 tokio::select! {
                     biased;
                     _ = core.cancel.cancelled() => {}
-                    _ = async {
-                        let _permit = core.launch_slots.acquire().await;
-                        let _ = core.run_effects(&job, &effects).await;
-                    } => {}
+                    _ = core.run_effects(&job, &effects) => {}
                 }
             });
         }
         Ok(())
     }
 
+    /// Stops launching, for a daemon that stops (SIGTERM, see
+    /// `Daemon::stop`) while the helper and the jobs keep running.
+    ///
+    /// The scheduler records a launched job as `Running` (or `Restoring`)
+    /// before its request waits for a launch slot. A job whose request was
+    /// never sent would be marked lost by the next daemon, and its
+    /// dependants failed, so these launches are put back in line instead
+    /// (as when the helper refuses them, see
+    /// [`lifecycle::requeue_unlaunched`]). Launches whose requests have
+    /// been sent get `wait` at most for the helper's answer.
+    pub async fn stop_launches(self: &Arc<Self>, wait: Duration) {
+        self.launches_stopped.cancel();
+        let core = self.clone();
+        let now = now_ms();
+        let result = self
+            .write(move |tx, ch| {
+                // Under the database lock: a scheduling pass has either
+                // committed its launches (they are in the map, unless their
+                // task has taken them out to send them) or sees
+                // `launches_stopped` and launches nothing.
+                let unsent = std::mem::take(&mut *core.unsent_launches.lock().unwrap());
+                let mut taken = Vec::with_capacity(unsent.len());
+                let mut requeued = 0;
+                for (id, launch) in unsent {
+                    taken.push(id);
+                    let Some(mut job) = tx.get_job(id)? else {
+                        continue;
+                    };
+                    if job.state != launch.state || job.started_at != launch.started_at {
+                        continue;
+                    }
+                    let t = lifecycle::requeue_unlaunched(&job, now)?;
+                    core.apply_in_tx(tx, &mut job, &t, now, ch)?;
+                    requeued += 1;
+                }
+                Ok((taken, requeued))
+            })
+            .await;
+        match result {
+            Ok((taken, requeued)) => {
+                for id in taken {
+                    self.launches
+                        .settle_on_drop(id)
+                        .finish(LaunchOutcome::Requeued);
+                }
+                if requeued > 0 {
+                    tracing::info!(
+                        count = requeued,
+                        "put launches that had not been sent to the helper back in line"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                "cannot put launches that were not sent back in line: {}",
+                e.0.message
+            ),
+        }
+        if tokio::time::timeout(wait, self.launches.wait_idle())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "the helper has not answered every spawn or restore request; \
+                 the next daemon finds out what became of them"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------
     // reset and shutdown
     // -----------------------------------------------------------------
 
-    pub fn mark_for_removal(&self, id: JobId) {
-        self.pending_removal.lock().unwrap().insert(id);
+    /// `reset` removes `id` once it has stopped; `killed`: `reset` is
+    /// killing it (it runs), rather than waiting for a checkpoint or
+    /// restore to end.
+    pub fn mark_for_removal(&self, id: JobId, killed: bool) {
+        self.pending_removal.lock().unwrap().insert(id, killed);
     }
 
     /// Removes a job `reset` asked for once it is removable.
+    ///
+    /// `reset` cannot kill a job that is being checkpointed or restored; it
+    /// only marks it. Should the job then run again (the helper refused
+    /// the dump, or the restore succeeded), it is killed here, and removed
+    /// once it has stopped.
     pub async fn reap_pending(self: &Arc<Self>, id: JobId) {
-        if !self.pending_removal.lock().unwrap().contains(&id) {
+        let Some(killed) = self.pending_removal.lock().unwrap().get(&id).copied() else {
             return;
-        }
+        };
         let core = self.clone();
         let now = now_ms();
         let result = self
             .write(move |tx, ch| {
                 let Some(mut job) = tx.get_job(id)? else {
-                    return Ok(Some(None));
+                    return Ok(Reaped::Gone);
                 };
                 let Ok(t) = lifecycle::remove(&job) else {
-                    return Ok(None);
+                    if killed || !matches!(job.state, JobState::Running | JobState::Paused) {
+                        return Ok(Reaped::Later);
+                    }
+                    if core.launch_in_flight(id) {
+                        return Ok(Reaped::LaunchInFlight);
+                    }
+                    let t = lifecycle::kill(&job, None)?;
+                    core.apply_in_tx(tx, &mut job, &t, now, ch)?;
+                    return Ok(Reaped::Killed(job, t.effects));
                 };
                 let snapshot = job.clone();
                 core.apply_in_tx(tx, &mut job, &t, now, ch)?;
                 tx.remove_job(id)?;
                 ch.removed(id);
-                Ok(Some(Some((snapshot, t.effects))))
+                Ok(Reaped::Removed(snapshot, t.effects))
             })
             .await;
         match result {
-            Ok(Some(removed)) => {
+            Ok(Reaped::Removed(job, effects)) => {
                 self.pending_removal.lock().unwrap().remove(&id);
-                if let Some((job, effects)) = removed {
-                    let _ = self.run_effects(&job, &effects).await;
-                }
+                let _ = self.run_effects(&job, &effects).await;
             }
-            Ok(None) => {}
+            Ok(Reaped::Gone) => {
+                self.pending_removal.lock().unwrap().remove(&id);
+            }
+            Ok(Reaped::Killed(job, effects)) => {
+                tracing::info!(job = %id, "the job reset asked to remove runs again; killing it");
+                if let Some(killed) = self.pending_removal.lock().unwrap().get_mut(&id) {
+                    *killed = true;
+                }
+                let _ = self.run_effects(&job, &effects).await;
+            }
+            Ok(Reaped::LaunchInFlight) => self.reap_after_launch(id),
+            Ok(Reaped::Later) => {}
             Err(e) => tracing::warn!(job = %id, "cannot remove job: {}", e.0.message),
         }
+    }
+
+    /// [`Core::reap_pending`] once the launch of `id` has been answered.
+    fn reap_after_launch(self: &Arc<Self>, id: JobId) {
+        let core = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = core.cancel.cancelled() => return,
+                _ = core.launches.wait(id) => {}
+            }
+            core.reap_pending(id).await;
+        });
     }
 
     /// Waits until `pred` holds for the job list, the timeout passes or the
@@ -2481,7 +2712,7 @@ impl Core {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             rx.borrow_and_update();
-            if let Ok(jobs) = self.read(|s| s.list_unfinished_jobs()).await
+            if let Ok(jobs) = self.read(|s| s.list_unfinished_jobs_brief()).await
                 && pred(&jobs)
             {
                 return true;
@@ -2521,7 +2752,7 @@ impl Core {
                     tracing::warn!("the helper has not answered every spawn or restore request");
                 }
             }
-            let jobs = match self.read(|s| s.list_unfinished_jobs()).await {
+            let jobs = match self.read(|s| s.list_unfinished_jobs_brief()).await {
                 Ok(jobs) => jobs,
                 Err(_) => break,
             };
@@ -2678,6 +2909,36 @@ mod tests {
                     .unwrap();
             })
             .await;
+    }
+
+    /// What a transaction keeps in memory (the forced-launch marks, the
+    /// fair-share factors) follows only once it has committed.
+    #[tokio::test]
+    async fn memory_changes_follow_only_committed_transactions() {
+        let core = core(None, Vec::new());
+        let id = JobId(1);
+        let change = move |ch: &mut Changes| {
+            ch.force_launch(id);
+            ch.set_fairshare(HashMap::from([(Uid(1000), 0.5)]));
+        };
+        let failed = core
+            .write(move |_, ch| {
+                change(ch);
+                Err::<(), _>(Failure::internal("the commit fails"))
+            })
+            .await;
+        assert!(failed.is_err());
+        assert!(!core.forced.lock().unwrap().contains(&id));
+        assert!(core.fairshare_factors().is_empty());
+
+        core.write(move |_, ch| {
+            change(ch);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(core.forced.lock().unwrap().contains(&id));
+        assert_eq!(core.fairshare_factors().get(&Uid(1000)), Some(&0.5));
     }
 
     #[tokio::test]

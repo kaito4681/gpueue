@@ -160,5 +160,7 @@ a power loss. Training code should still save its own checkpoints.
 | `... queued first among your jobs instead of being launched right away` | normal for non-admin `-i`/`start`; the job waits for its turn. |
 | job `Failed to spawn`: `gpueue refuses to run jobs as <user>: <reason>` | the account is not allowed to run jobs (system user, denied group such as `docker`/`sudo` as primary group); tell the user. |
 | `Checkpoint failed` / checkpoint refused | see `gpueue log <id>` for the reason; see [references/checkpoint.md](references/checkpoint.md). |
+| `user N has ... jobs that have not finished, and at most M are allowed` | the per-user limit of unfinished jobs; wait for jobs to finish, or remove queued/stashed ones the user no longer needs (ask first). Don't add jobs in a loop to get around it. |
+| `the job is too large: ... (max_job_spec_bytes)` | the command plus the environment `gpueue add` sends is too big; unset large environment variables or put the command in a script. |
 
 `gpueue <command> --help` is authoritative for every flag.

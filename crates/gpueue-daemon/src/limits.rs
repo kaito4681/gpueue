@@ -46,6 +46,25 @@ pub struct UidPermit {
     uid: u32,
 }
 
+/// A connection's [`UidPermit`], attached to each of its requests. A job
+/// operation runs to completion even if its client goes away (see
+/// `api::detached`); it keeps this permit until then, so operations left
+/// behind by closed connections still count against the caller's
+/// connection limit and cannot pile up.
+#[derive(Debug, Clone)]
+pub struct ConnectionPermit {
+    /// Released when the last clone is dropped.
+    _permit: Arc<UidPermit>,
+}
+
+impl ConnectionPermit {
+    pub fn new(permit: UidPermit) -> Self {
+        Self {
+            _permit: Arc::new(permit),
+        }
+    }
+}
+
 impl UidLimiter {
     pub fn new(per_uid: usize, total: usize) -> Arc<Self> {
         Arc::new(Self {

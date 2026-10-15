@@ -425,6 +425,7 @@ fn event_golden_and_sse() {
         r#"{"type":"group_updated","group":{"name":"gpu","parallel":2,"paused":false}}"#,
     );
     assert_golden(&Event::DaemonShutdown, r#"{"type":"daemon_shutdown"}"#);
+    assert_golden(&Event::Resync, r#"{"type":"resync"}"#);
 
     let event = Event::JobUpdated {
         job: JobView::redacted(&sample_job()),

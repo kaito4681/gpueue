@@ -33,10 +33,18 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    <a id="api-limits"></a>每个用户都能连接到该套接字，因此守护进程会限制单个用户同时保持打开的资源：
    每个 uid 最多 64 个连接和 16 个流（`log --follow`、`/v1/events`），全部连接合计最多 4096 个
    （`gpueue.service` 把 `LimitNOFILE` 设得远高于此）。超出限制的请求会收到 `too_many_requests`。
-   连接必须在 20 秒内发送请求头，空闲的 keep-alive 连接会在 20 秒后关闭。`log --tail` 最多只在日志末尾
-   4 MiB 内查找行首（如果这一范围内的行数不够，就从那里开始输出），并且同时只运行少量这样的扫描。
+   连接必须在 20 秒内发送请求头，空闲的 keep-alive 连接会在 20 秒后关闭。作业操作（`add`、作业动作、批量动作、
+   `clean`、`reset`）即使客户端离开也会执行完毕，并且在完成之前一直算作调用者的一个连接，因此被遗弃的操作不会堆积。
+   `log --tail` 最多只在日志末尾
+   4 MiB 内查找行首（如果这一范围内的行数不够，就从那里开始输出），并且同时只运行少量这样的扫描。单个用户能保存的
+   内容也有限制：未结束的作业最多 `max_unfinished_jobs_per_user` 个（超出后 `add` 以及让作业重新运行的 `restart`
+   会以 `too_many_requests` 被拒绝），一个作业的命令、工作目录、标签和环境变量合计最多 `max_job_spec_bytes`
+   （超出会以 `bad_request` 被拒绝）。落后太多的 `/v1/events` 订阅者会收到一个 `resync` 事件来代替它错过的事件；
+   `gpueue wait` 随后会重新读取作业列表。
 2. **调度。** 当排队作业的组有空闲槽位，且其申请的每块 GPU 都有空闲槽位时，该作业启动。
-   候选作业按优先级顺序考虑（参见[优先级与公平共享](#priority-and-fair-share)）。守护进程随后请求 helper 创建它。
+   候选作业按优先级顺序考虑（参见[优先级与公平共享](#priority-and-fair-share)）。每一轮调度读取未结束的作业时不读取
+   它们的命令和环境变量，只完整读取要启动的作业。守护进程随后请求 helper 创建它（同时最多 8 个 spawn 或 restore
+   请求；作业在其请求排队等待之前就被记录为运行中）。
    管理员的立即启动（`start <id>`、`add -i`、`restart -i`、`restore -i`）的作业会在内存中被标记为"强制"，
    忽略所有限制立即启动。其他用户的则不是强制的：操作把作业排队（或排队等待恢复），并在同一事务中像
    `gpueue top` 一样把它移到所有者作业的最前面（`Core::queue_first`；在 `enable_user_top = false` 或
@@ -228,7 +236,9 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   （或在 `--no-checkpoint` 时终止它们），等待它们稳定下来，然后退出。helper 继续运行。转储失败的作业会被终止。
   转储被 helper 拒绝的作业会继续运行，因为终止它会丢失工作成果。守护进程会记录一条警告，所有者也会收到警告。
   如有需要，请用 `gpueue kill` 或 `gpueue shutdown --no-checkpoint` 停止它。
-- 单独执行 **`systemctl stop/restart gpueue-helper` 或 `gpueue`** 时，作业会继续运行。
+- 单独执行 **`systemctl stop/restart gpueue-helper` 或 `gpueue`** 时，作业会继续运行。正在停止的守护进程会先把已决定
+  启动但尚未发送给 helper 的作业放回队列（否则下一个守护进程会发现这些作业不见了，把它们标记为 lost，并让依赖它们的作业失败），
+  并最多等待 10 秒，让 helper 回答已经发送的 spawn 和 restore 请求。
 
 <a id="priority-and-fair-share"></a>
 ## 优先级与公平共享
@@ -243,7 +253,8 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   保持 pueue 的顺序（也用于 `priority_type = "basic"`）。`scheduler::pending_priorities`（`gpueue prio`
   背后的实现）使用相同的候选选择，因此它列出的正是调度计划所考虑的作业。
 - 存储中保存 `jobs.nice`、`jobs.site_factor`、`jobs.top_seq`、`jobs.run_since`、`groups.priority`、
-  `user_shares` 和 `user_usage` 表，并在 `meta` 中保存上次计算和重置用量的时间（schema 版本 6）。
+  `user_shares` 和 `user_usage` 表，并在 `meta` 中保存上次计算和重置用量的时间（schema 版本 6），以及上次重置所针对的
+  重置周期开始的本地日期。只有当前周期开始于更晚的日期时才会重置，因此 UTC 偏移的变化（夏令时）不会让同一个边界重置两次。
 - 只有运行时间会被计费。每次状态变化都经过守护进程中的同一个地方（`Core::apply_in_tx`），它在作业开始运行时
   设置 `jobs.run_since`，在作业停止运行时于同一事务中将此后的时间计入其所有者的用量。用量任务每隔
   `priority_calc_period_secs` 运行一次：在一个事务中，它按自上次计算以来的时间衰减每个用户的用量，对运行中的

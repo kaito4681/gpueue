@@ -38,7 +38,7 @@ use gpueue_protocol::api::{
 };
 
 use crate::error::{ApiResult, Failure};
-use crate::state::{Core, now_ms};
+use crate::state::{Changes, Core, now_ms};
 
 /// The fair-share table from the store: shares, usage, and the owners of
 /// unfinished jobs as the active users.
@@ -89,10 +89,10 @@ impl Core {
         self.fairshare.lock().unwrap().clone()
     }
 
-    /// Recomputes the cached fair-share factors from `s`.
-    fn refresh_fairshare(&self, s: &dyn StoreOps) -> Result<(), StorageError> {
-        let factors = priority::fair_share_factors(&fair_share_table(s)?);
-        *self.fairshare.lock().unwrap() = Arc::new(factors);
+    /// Recomputes the fair-share factors from `tx`; they are cached once
+    /// the transaction has committed.
+    fn refresh_fairshare(&self, tx: &dyn StoreOps, ch: &mut Changes) -> Result<(), StorageError> {
+        ch.set_fairshare(priority::fair_share_factors(&fair_share_table(tx)?));
         Ok(())
     }
 
@@ -144,8 +144,13 @@ impl Core {
                 if reset_now {
                     tx.replace_user_usage(&Default::default())?;
                     tx.set_usage_reset_at(now)?;
-                    // Nothing before the reset is charged.
+                    // Nothing before the reset is charged: neither the time
+                    // since the last calculation nor the run time of jobs
+                    // still running since before it.
                     tx.set_usage_calc_at(now)?;
+                    for id in tx.list_job_run_since()?.into_keys() {
+                        tx.set_job_run_since(id, Some(now))?;
+                    }
                     tracing::info!("priority_usage_reset_period = \"now\": usage reset");
                 }
                 if tx.usage_reset_at()?.is_none() {
@@ -187,13 +192,29 @@ impl Core {
             let mut usage = tx.list_user_usage()?;
             // Run time before this is not charged (a reset).
             let mut not_before = None;
-            let reset_at = tx.usage_reset_at()?.unwrap_or(now);
             let period = settings.priority_usage_reset_period;
-            if priority::reset_due(period, reset_at, now, offset) {
+            // The period the last reset was for is kept as its first day,
+            // not as an instant: a boundary computed after the UTC offset
+            // changed (daylight saving time) is not due again.
+            let reset_day = tx.usage_reset_day()?;
+            let due = match reset_day {
+                Some(day) => priority::reset_due_since_day(period, day, now, offset),
+                // Recorded before the day was kept.
+                None => {
+                    let reset_at = tx.usage_reset_at()?.unwrap_or(now);
+                    priority::reset_due(period, reset_at, now, offset)
+                }
+            };
+            if due {
                 usage.clear();
                 tx.set_usage_reset_at(now)?;
                 not_before = priority::period_start(now, offset, period);
                 tracing::info!(period = %period, "usage reset");
+            }
+            if (due || reset_day.is_none())
+                && let Some(day) = priority::period_start_day(now, offset, period)
+            {
+                tx.set_usage_reset_day(day)?;
             }
             let mut run_since = tx.list_job_run_since()?;
             let running = tx.list_jobs(&JobFilter::all().state("running"))?;
@@ -220,7 +241,7 @@ impl Core {
             let next = priority::apply_usage(&usage, decay, &charges);
             tx.replace_user_usage(&next)?;
             tx.set_usage_calc_at(now)?;
-            core.refresh_fairshare(tx)?;
+            core.refresh_fairshare(tx, ch)?;
             // The fair-share factors changed.
             ch.touch();
             Ok(())
@@ -241,7 +262,7 @@ impl Core {
         let reserved = self.orphan_reservations();
         let jobs = self
             .read(move |s| {
-                let jobs = s.list_unfinished_jobs()?;
+                let jobs = s.list_unfinished_jobs_brief()?;
                 let groups = s.list_groups()?;
                 let gpus: Vec<_> = s
                     .list_gpus()?
@@ -303,7 +324,7 @@ impl Core {
         let core = self.clone();
         self.write(move |tx, ch| {
             tx.set_user_shares(uid, shares)?;
-            core.refresh_fairshare(tx)?;
+            core.refresh_fairshare(tx, ch)?;
             ch.touch();
             Ok(())
         })

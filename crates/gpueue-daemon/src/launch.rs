@@ -27,7 +27,11 @@
 //! Settled launches are also remembered until the next reconciliation: the
 //! helper's list of live jobs that comes with a (re)connect may have been
 //! taken before such a spawn reached it, so those jobs are double-checked
-//! instead of being marked lost right away.
+//! instead of being marked lost right away. Reconciliation only looks at
+//! jobs that hold slots, so a job's entry is dropped once it no longer
+//! holds slots (it finished, was put back in line or checkpointed, see
+//! [`Launches::prune_settled`]) or is removed: the set does not grow with
+//! every launch of a long helper session.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -72,6 +76,10 @@ struct Record {
     in_flight: bool,
     /// Set once settled, unless the request was abandoned.
     outcome: Option<LaunchOutcome>,
+    /// The job stopped holding slots while this launch was in flight
+    /// (e.g. it exited before its spawn request returned): its settling is
+    /// of no interest to the next reconciliation.
+    released: bool,
 }
 
 #[derive(Debug, Default)]
@@ -117,6 +125,7 @@ impl Launches {
                 seq,
                 in_flight: true,
                 outcome: None,
+                released: false,
             },
         );
     }
@@ -165,6 +174,20 @@ impl Launches {
         if !state.in_flight(id) {
             state.jobs.remove(&id);
         }
+        state.settled.remove(&id);
+    }
+
+    /// Drops `id` from the launches settled since the last
+    /// [`Launches::take_settled`]: the job no longer holds slots, so the
+    /// next reconciliation does not look at it.
+    pub fn prune_settled(&self, id: JobId) {
+        let mut state = self.state.lock().unwrap();
+        state.settled.remove(&id);
+        if let Some(record) = state.jobs.get_mut(&id)
+            && record.in_flight
+        {
+            record.released = true;
+        }
     }
 
     /// Returns a guard that settles the current launch of `id` when
@@ -192,14 +215,18 @@ impl Launches {
     fn settle(&self, id: JobId, seq: Option<u64>, outcome: Option<LaunchOutcome>) {
         {
             let mut state = self.state.lock().unwrap();
+            let mut track = true;
             if let Some(record) = state.jobs.get_mut(&id)
                 && seq == Some(record.seq)
                 && record.in_flight
             {
                 record.in_flight = false;
                 record.outcome = outcome;
+                track = !record.released;
             }
-            state.settled.insert(id);
+            if track {
+                state.settled.insert(id);
+            }
         }
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
@@ -378,5 +405,28 @@ mod tests {
         drop(launches.settle_on_drop(id));
         launches.forget(id);
         assert_eq!(launches.latest(id), None);
+    }
+
+    #[test]
+    fn settled_launches_are_pruned() {
+        let launches = Launches::default();
+        for n in 1..=3 {
+            launches.begin(JobId(n));
+            drop(launches.settle_on_drop(JobId(n)));
+        }
+        // Job 1 no longer holds slots; job 2 was removed.
+        launches.prune_settled(JobId(1));
+        launches.forget(JobId(2));
+        assert_eq!(launches.take_settled(), HashSet::from([JobId(3)]));
+        // A job that stops holding slots before its launch settles.
+        launches.begin(JobId(4));
+        launches.prune_settled(JobId(4));
+        drop(launches.settle_on_drop(JobId(4)));
+        assert!(!launches.in_flight(JobId(4)));
+        assert!(launches.take_settled().is_empty());
+        // Its next launch is tracked again.
+        launches.begin(JobId(4));
+        drop(launches.settle_on_drop(JobId(4)));
+        assert_eq!(launches.take_settled(), HashSet::from([JobId(4)]));
     }
 }
