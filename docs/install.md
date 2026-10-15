@@ -477,7 +477,7 @@ Plain `github:kaito4681/puzuz` is the development head (`main`).
 
 ### NixOS
 
-The flake's NixOS module (`nixosModules.default`, file `nix/nixos-module.nix`) sets up the
+The flake's NixOS module (`nixosModules.default`, file `packaging/nix/nixos-module.nix`) sets up the
 daemon, the root helper, the CLI, the `puzuz` system user, the `puzuz-admin` group,
 `/etc/puzuz/config.toml` and the directories below `/var/lib/puzuz`. Do not run
 `puzuz service install` or `puzuz update` on NixOS; both refuse to (NixOS is recognized by
@@ -628,7 +628,7 @@ services.puzuz.cudaCheckpointPackage = pkgs.callPackage ./cuda-checkpoint.nix { 
 home-manager manages one user's environment, so it cannot install the daemon or the helper
 (they need root and the system's systemd). Its module (`homeManagerModules.default`) sets up the
 CLI's shell completions for a machine where an administrator installed puzuz
-(`homeManagerModules.default`, file `nix/home-manager-module.nix`):
+(`homeManagerModules.default`, file `packaging/nix/home-manager-module.nix`):
 
 ```nix
 {

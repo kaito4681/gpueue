@@ -497,7 +497,7 @@ GitHub リリースからは何もダウンロードしません。出力は次�
 <a id="nixos"></a>
 ### NixOS
 
-flake の NixOS モジュール（`nixosModules.default`、ファイル `nix/nixos-module.nix`）は、デーモン、root
+flake の NixOS モジュール（`nixosModules.default`、ファイル `packaging/nix/nixos-module.nix`）は、デーモン、root
 ヘルパー、CLI、`puzuz` システムユーザー、`puzuz-admin` グループ、`/etc/puzuz/config.toml`、
 `/var/lib/puzuz` 以下のディレクトリを用意します。NixOS では `puzuz service install` や `puzuz update` を
 実行しないでください。どちらも実行を拒否します（NixOS は `/etc/os-release` の `ID=nixos` で判別します。
@@ -647,7 +647,7 @@ services.puzuz.cudaCheckpointPackage = pkgs.callPackage ./cuda-checkpoint.nix { 
 home-manager は 1 人のユーザーの環境を管理するものなので、デーモンやヘルパー（root とシステムの systemd が
 必要）はインストールできません。そのモジュール（`homeManagerModules.default`）は、管理者が puzuz を
 インストールしたマシン向けに CLI のシェル補完を用意します（`homeManagerModules.default`、ファイル
-`nix/home-manager-module.nix`）。
+`packaging/nix/home-manager-module.nix`）。
 
 ```nix
 {

@@ -20,9 +20,10 @@
   (`update DIR DEB...` locally, `github TAG` from `.github/workflows/release-apt.yml` when a
   release is published); `scripts/apt-repo-test.sh [DEB]` upgrades v1 to v2 through a local copy
   in containers (`PUZUZ_APT_BASES`, `PUZUZ_DEB_HTTPS=1`).
-- Nix flake: `flake.nix` and `nix/` (package, CRIU override, the NixOS module
-  `nix/nixos-module.nix`, the home-manager module `nix/home-manager-module.nix`, and their tests
-  in `nix/tests/`). Without Nix on the host, run `nix flake check` / `nix build .#default` in a
+- Nix flake: `flake.nix` and `packaging/nix/` (package, CRIU override, the NixOS module
+  `packaging/nix/nixos-module.nix`, the home-manager module
+  `packaging/nix/home-manager-module.nix`, and their tests in `packaging/nix/tests/`). Without
+  Nix on the host, run `nix flake check` / `nix build .#default` in a
   pinned `nixos/nix` Docker image; the NixOS VM tests (`.#checks.x86_64-linux.nixos`, and
   `.#checks.x86_64-linux.helper-tests`, which runs every puzuz-helper test) need `--device /dev/kvm` and
   `--option system-features "kvm nixos-test"`. The package build

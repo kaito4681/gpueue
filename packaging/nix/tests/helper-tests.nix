@@ -1,7 +1,7 @@
 # Runs every test of puzuz-helper in a NixOS VM, with nothing skipped
 # (`nix build .#checks.x86_64-linux.helper-tests`).
 #
-# The package build runs no tests (see `doCheck` in nix/package.nix): those
+# The package build runs no tests (see `doCheck` in packaging/nix/package.nix): those
 # in tests/protocol.rs that start a job cannot pass in the Nix build sandbox,
 # because the helper makes the job's log directory setgid and the sandbox
 # refuses setgid modes. The tests use fakes for systemd, CRIU

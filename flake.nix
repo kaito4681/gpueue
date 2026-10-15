@@ -15,12 +15,12 @@
     in
     {
       packages = forAllSystems (pkgs: rec {
-        puzuz = pkgs.callPackage ./nix/package.nix { };
+        puzuz = pkgs.callPackage ./packaging/nix/package.nix { };
         default = puzuz;
         # CRIU 4.2.x (nixpkgs has 4.1.1); not a dependency of puzuz.
-        criu = pkgs.callPackage ./nix/criu.nix { };
+        criu = pkgs.callPackage ./packaging/nix/criu.nix { };
         # The puzuz-helper test executables, for checks.x86_64-linux.helper-tests.
-        helper-tests = pkgs.callPackage ./nix/helper-tests.nix { inherit puzuz; };
+        helper-tests = pkgs.callPackage ./packaging/nix/helper-tests.nix { inherit puzuz; };
       });
 
       devShells = forAllSystems (pkgs: {
@@ -40,21 +40,21 @@
       formatter = forAllSystems (pkgs: pkgs.nixfmt);
 
       # services.puzuz: the daemon, the root helper and the CLI.
-      nixosModules.default = import ./nix/nixos-module.nix { inherit self; };
+      nixosModules.default = import ./packaging/nix/nixos-module.nix { inherit self; };
 
       # programs.puzuz: the CLI's completions (or the CLI) for one user.
-      homeManagerModules.default = import ./nix/home-manager-module.nix;
+      homeManagerModules.default = import ./packaging/nix/home-manager-module.nix;
 
       checks = forAllSystems (
         pkgs:
         {
-          home-manager = import ./nix/tests/home-manager.nix { inherit self pkgs; };
+          home-manager = import ./packaging/nix/tests/home-manager.nix { inherit self pkgs; };
         }
         # NixOS VM tests (they need KVM): the NixOS module, and every
         # puzuz-helper test, including those the package build skips.
         // nixpkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
-          nixos = import ./nix/tests/nixos.nix { inherit self pkgs; };
-          helper-tests = import ./nix/tests/helper-tests.nix { inherit self pkgs; };
+          nixos = import ./packaging/nix/tests/nixos.nix { inherit self pkgs; };
+          helper-tests = import ./packaging/nix/tests/helper-tests.nix { inherit self pkgs; };
         }
       );
     };
