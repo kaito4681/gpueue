@@ -77,8 +77,10 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    キュー中のジョブはそれが終わるまで開始しません。`gpueue status` は管理者に孤立ジョブを表示し、
    `gpueue doctor` は警告を出します。管理者は `gpueue kill <id>` で停止できます。
 4. **ヘルパー → systemd。** ヘルパーは D-Bus 経由で、メインプロセスが `gpueue-helper shim` である一時的な
-   サービスを開始します。ユニットには `Before=gpueue-helper.service` と `KillMode=mixed` が設定され、stdin は
-   `/dev/null`、停止のタイムアウトは `grace_secs` です。各ジョブはデーモン、ヘルパー、ユーザーのセッションの
+   サービスを開始します。これはヘルパーのバイナリの内容アドレス方式のコピー
+   （`<data_dir>/lib/gpueue-helper-<hash>`。[ヘルパーのバイナリのコピー](#helper-binary-copies)を参照）から実行
+   されます。ユニットには `Before=gpueue-helper.service`、`After=remote-fs.target network.target`（順序のみ）、
+   `KillMode=mixed` が設定され、stdin は `/dev/null`、停止のタイムアウトは `grace_secs` です。各ジョブはデーモン、ヘルパー、ユーザーのセッションの
    外にある自分専用の cgroup で動くので、デーモンやヘルパーの再起動やユーザーのログアウトを生き延びます。
    `gpu_device_isolation`（デフォルトで有効）のとき、ユニットには `DevicePolicy=closed` と、ジョブの GPU
    だけを許可する `DeviceAllow=` も設定されます（[GPU の分離](#gpu-isolation) を参照）。
@@ -292,8 +294,24 @@ CRIU は root として動き、リストアするジョブのすべてをダン
   `cuda-checkpoint --action restore` を実行したときに、リストアされたプロセスの中でドライバーがデバイス
   ノードを開き直すためです。インストールガイドの [GPU の分離](install.md#gpu-isolation) を参照してください。
 - 起動時、ヘルパーは書き込み先やコードの読み込み元のディレクトリ（`criu -L` に渡す
-  `<data_dir>/criu-no-plugins` や、fork ガードの `<data_dir>/lib` を含む）について、それらとその親が root の
-  ものでなければ拒否します。
+  `<data_dir>/criu-no-plugins` や、fork ガードとヘルパーのコピーを置く `<data_dir>/lib` を含む）について、それらと
+  その親が root のものでなければ拒否します。
+
+<a id="helper-binary-copies"></a>**ヘルパーのバイナリのコピー。** ジョブのプロセスツリーにはヘルパーが含まれる
+（名前空間の init は `gpueue-helper shim-init`）ので、すべてのチェックポイントのイメージはヘルパーの実行ファイルを
+マップしており、CRIU はそのパスのファイルのサイズとビルド ID が同じ場合に限りそれをリストアします。パッケージの
+アップグレード、`install.sh`、`gpueue update` はインストールされたバイナリをその場で置き換えるため、アップグレード
+前にダンプしたジョブはリストアできず、アップグレードをまたいで動いていたジョブはダンプできなくなっていました
+（CRIU はそのサイズの削除済み実行ファイルをダンプできません）。そこでヘルパーは起動時に自分自身を
+`<data_dir>/lib/gpueue-helper-<内容の FNV-1a ハッシュ>`（モード 0755。一時ファイルに書いてから所定の名前に
+rename し、他の root 所有のパスと同様に確認します）にコピーし、ジョブのユニットはそのコピーを実行します。ジョブの
+記録とイメージとともに保存される記録（`helper-job.json`）がそれを指す（`shim_exe`）ので、リストアはツリーを
+ダンプ時のバイナリの上に戻し、コピーがない場合はリストアの拒否理由としてそれを伝えます。ヘルパーは起動のたびに、
+自分自身のものでも、ジョブの記録やイメージの記録が指すものでも、イメージ（`files.img`）がマップするものでもない
+コピーを削除します。読めないチェックポイントがある場合は何も削除しません。NixOS ではヘルパーはパスの変わらない
+Nix ストアから動くので、コピーは作らず、代わりに Nix の GC ルート（`/nix/var/nix/gcroots/gpueue/job-<id>`）が
+古いストアパスを保持します。コピーを作れなかった場合、ヘルパーは警告を出し、ジョブのユニットはインストールされた
+バイナリを実行します。
 
 <a id="shutdown-ordering"></a>
 ## シャットダウンの順序
@@ -314,7 +332,9 @@ CRIU は root として動き、リストアするジョブのすべてをダン
   plugin モードでは、ヘルパーが `cuda-checkpoint --get-state` で問い合わせ、必要に応じてリストアとアンロックを
   行います）。一時停止中のジョブも（先に再開してから）ダンプされ、`gpueue restore` のあと一時停止した状態で
   （停止したまま、何も実行せずに）戻ります。ジョブのユニットは `Before=gpueue-helper.service` なので、systemd はヘルパーが終わってから
-  それらを停止します。次の起動時、デーモンはヘルパーの再送イベントから結果を受け取り、ジョブを
+  それらを停止します。また `After=remote-fs.target network.target` なので、そのとき動いているもの
+  （`--no-checkpoint` のジョブや、ダンプが失敗または拒否されたもの）は、リモートのファイルシステムがアンマウント
+  されネットワークが止まる前に停止されます。次の起動時、デーモンはヘルパーの再送イベントから結果を受け取り、ジョブを
   `Checkpointed` にします。ダンプが失敗したか拒否されたジョブは systemd によって停止されています。それらは
   理由とともに `Checkpoint failed` とされ、所有者に警告が出ます。
 - **`gpueue shutdown`**（管理者）はユニットの順序に頼りません。デーモンは実行中のジョブを 1 つずつチェック

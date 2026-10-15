@@ -65,7 +65,9 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    具有相同 id 的排队作业在它结束之前不会启动。`gpueue status` 会向管理员列出孤立作业，`gpueue doctor`
    会对其发出警告，管理员可以用 `gpueue kill <id>` 停止它。
 4. **helper → systemd。** helper 通过 D-Bus 启动一个临时服务，其主进程为
-   `gpueue-helper shim`。该单元设置了 `Before=gpueue-helper.service` 和 `KillMode=mixed`，stdin 为
+   `gpueue-helper shim`，从 helper 二进制文件的内容寻址副本（`<data_dir>/lib/gpueue-helper-<hash>`，见
+   [helper 二进制副本](#helper-binary-copies)）运行。该单元设置了 `Before=gpueue-helper.service`、
+   `After=remote-fs.target network.target`（仅排序）和 `KillMode=mixed`，stdin 为
    `/dev/null`，停止超时为 `grace_secs`。每个作业都位于自己的 cgroup 中，独立于守护进程、helper 和用户会话，
    因此在守护进程和 helper 重启以及用户注销后仍能继续存在。在 `gpu_device_isolation`（默认开启）时，该单元还设置了
    `DevicePolicy=closed` 和只允许作业 GPU 的 `DeviceAllow=`（见 [GPU 隔离](#gpu-isolation)）。
@@ -227,7 +229,20 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   运行，而在手动模式下，当 helper 对被恢复的进程运行 `cuda-checkpoint --action restore` 时，驱动会在这些进程中
   重新打开设备节点。见安装指南中的 [GPU 隔离](install.md#gpu-isolation)。
 - 启动时，helper 会拒绝它要写入或从中加载代码的目录（包括传给 `criu -L` 的
-  `<data_dir>/criu-no-plugins`，以及 fork guard 的 `<data_dir>/lib`），除非这些目录及其父目录都归 root 所有。
+  `<data_dir>/criu-no-plugins`，以及存放 fork guard 和 helper 副本的 `<data_dir>/lib`），除非这些目录及其父目录
+  都归 root 所有。
+
+<a id="helper-binary-copies"></a>**helper 二进制副本。** 作业的进程树中包含 helper（命名空间的 init 是
+`gpueue-helper shim-init`），因此每个检查点镜像都映射了 helper 的可执行文件，而 CRIU 只有在该路径上的文件
+大小和构建 ID 相同时才会恢复它。软件包升级、`install.sh` 和 `gpueue update` 会原地替换已安装的二进制文件，
+这曾使升级前转储的作业无法恢复，跨越升级运行的作业无法转储（CRIU 无法转储这么大的已删除可执行文件）。
+因此 helper 在启动时把自身复制到 `<data_dir>/lib/gpueue-helper-<内容的 FNV-1a 哈希>`（模式 0755，先写入
+临时文件再 rename 到位，然后像其他归 root 所有的路径一样检查），作业单元运行这个副本。作业记录以及随镜像
+保存的记录（`helper-job.json`）会指明它（`shim_exe`），因此恢复会让进程树回到转储时的二进制文件上，副本
+缺失时拒绝恢复并说明原因。helper 每次启动时都会删除既不是它自己的、也没有被作业记录或镜像记录指明、也没有
+被镜像（`files.img`）映射的副本；如果有检查点无法读取，则不删除任何副本。在 NixOS 上 helper 从路径不变的
+Nix store 运行，不创建副本，而由 Nix GC root（`/nix/var/nix/gcroots/gpueue/job-<id>`）保留旧的 store 路径。
+如果无法创建副本，helper 会记录警告，作业单元则运行已安装的二进制文件。
 
 <a id="shutdown-ordering"></a>
 ## 关机顺序
@@ -245,7 +260,9 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   在插件模式下，被终止的 CRIU 的插件可能让 CUDA 进程停留在锁定或已创建检查点的状态，helper 会通过
   `cuda-checkpoint --get-state` 查询，并按需恢复和解锁它们）。暂停的作业也会被转储
   （先被继续），并在 `gpueue restore` 之后以暂停状态（保持停止，不执行任何代码）回来。作业单元设置了
-  `Before=gpueue-helper.service`，因此 systemd 只在 helper 完成之后才停止它们。下次启动时，
+  `Before=gpueue-helper.service`，因此 systemd 只在 helper 完成之后才停止它们；作业单元还设置了
+  `After=remote-fs.target network.target`，因此届时仍在运行的作业（`--no-checkpoint` 作业，以及转储失败或
+  被拒绝的作业）会在远程文件系统卸载和网络关闭之前停止。下次启动时，
   守护进程从 helper 重放的事件中获取结果，并将这些作业标记为
   `Checkpointed`。转储失败或被拒绝的作业已被 systemd 停止。它们被标记为
   `Checkpoint failed` 并附带原因，其所有者会收到警告。

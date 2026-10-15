@@ -659,6 +659,130 @@ async fn nix_gc_roots_follow_jobs_and_their_checkpoints() {
     assert!(!rooted(9));
 }
 
+/// Job units run a content-addressed copy of the helper (see
+/// `gpueue_helper::helperbin`), which an upgrade does not replace: a copy
+/// stays while a job record or a checkpoint needs it, also across helper
+/// restarts with another binary, and goes at the next start after that.
+#[tokio::test]
+async fn helper_copies_follow_jobs_and_their_checkpoints() {
+    use gpueue_helper::helperbin;
+    // The next event, acknowledged (so that restarts do not replay it).
+    async fn next(c: &mut Client) -> Event {
+        let ev = c.event().await;
+        assert_eq!(
+            c.request(Request::AckEvents { up_to: ev.seq }).await,
+            ResponseResult::Ok
+        );
+        ev.event
+    }
+    let mut env = Env::new().await;
+    let root = env.root.clone();
+    let lib = root.join("lib");
+    let build = |name: &str, contents: &[u8]| {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("gpueue-helper");
+        std::fs::write(&exe, contents).unwrap();
+        helperbin::install(&lib, &exe).unwrap()
+    };
+    let config_with = |copy: &Path| {
+        let mut cfg = with_mode(config(&root, uid()), &root, CudaMode::Manual);
+        cfg.helper_copy_dir = Some(lib.clone());
+        cfg.shim_exe = Some(copy.to_owned());
+        cfg
+    };
+    let v1 = build("v1", b"\x7fELF helper 1");
+    env.restart_with(config_with(&v1)).await;
+
+    let mut c = env.client().await;
+    for job in [1, 2, 3] {
+        assert!(matches!(
+            c.request(Request::Spawn(env.spawn_req(job))).await,
+            ResponseResult::Spawned { .. }
+        ));
+    }
+    assert!(env.launcher.spawned().iter().all(|s| s.exe == v1));
+    let base = env.base();
+    let image_dir = |job: u64| base.join(job.to_string());
+    for job in [2, 3] {
+        let r = c
+            .request(Request::Checkpoint {
+                job: JobId(job),
+                image_dir: image_dir(job),
+                options: Default::default(),
+            })
+            .await;
+        assert_eq!(r, ResponseResult::Accepted);
+        assert!(matches!(
+            next(&mut c).await,
+            Event::CheckpointFinished {
+                outcome: CheckpointOutcome::Success { .. },
+                ..
+            }
+        ));
+    }
+    drop(c);
+
+    // An upgrade: another binary, another copy. Job 1 still runs v1, the
+    // checkpoints need it too; a copy nothing needs goes.
+    let v2 = build("v2", b"\x7fELF helper 2");
+    let stale = build("v0", b"\x7fELF helper 0");
+    env.restart_with(config_with(&v2)).await;
+    assert!(v1.exists() && v2.exists());
+    assert!(!stale.exists(), "an unused copy is removed at start-up");
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(4))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    assert_eq!(env.launcher.spawned().last().unwrap().exe, v2);
+
+    // A restore puts the job back on the copy it was dumped with; the copy
+    // stays as long as the restored job runs.
+    assert_eq!(
+        c.request(restore_req(2, &image_dir(2))).await,
+        ResponseResult::Accepted
+    );
+    let ev = next(&mut c).await;
+    assert!(
+        matches!(
+            ev,
+            Event::RestoreFinished {
+                outcome: RestoreOutcome::Success { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    // The copy of an image is not removed by hand ...
+    std::fs::rename(&v1, env.root.join("v1-moved")).unwrap();
+    let r = c.request(restore_req(3, &image_dir(3))).await;
+    assert_eq!(err_code(&r), HelperErrorCode::InvalidRequest, "{r:?}");
+    assert!(format!("{r:?}").contains("helper binary"), "{r:?}");
+    std::fs::rename(env.root.join("v1-moved"), &v1).unwrap();
+    assert_eq!(
+        c.request(Request::DeleteCheckpoint {
+            job: JobId(3),
+            image_dir: image_dir(3)
+        })
+        .await,
+        ResponseResult::Ok
+    );
+    env.launcher.exit(JobId(1), ExitStatus::Exited { code: 0 });
+    assert!(matches!(next(&mut c).await, Event::JobExited { .. }));
+    drop(c);
+    env.restart_with(config_with(&v2)).await;
+    assert!(v1.exists(), "the restored job 2 still runs v1");
+
+    // Once no job and no checkpoint needs v1, the next start removes it.
+    let mut c = env.client().await;
+    env.launcher.exit(JobId(2), ExitStatus::Exited { code: 0 });
+    assert!(matches!(next(&mut c).await, Event::JobExited { .. }));
+    drop(c);
+    env.restart_with(config_with(&v2)).await;
+    assert!(!v1.exists() && v2.exists());
+}
+
 #[tokio::test]
 async fn checkpoint_then_restore() {
     let env = Env::new().await;

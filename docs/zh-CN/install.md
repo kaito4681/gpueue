@@ -908,7 +908,7 @@ store 路径注册为垃圾回收根 `/nix/var/nix/gcroots/gpueue`（通过 `nix
    | `/var/lib/gpueue/helper` | 0711 root | helper 的作业记录和事件队列 |
    | `/var/lib/gpueue/checkpoints` | 0700 root | 检查点镜像，每个作业一个 `<id>/` |
    | `/var/lib/gpueue/logs` | 0755 root | 作业输出，`<uid>/<id>.log`（helper 以 2770 权限创建 `<uid>/`，所有者为该用户，组为 `gpueue`） |
-   | `/var/lib/gpueue/lib` | 0755 root | fork guard 库（`gpueue-forkguard-<hash>.so`） |
+   | `/var/lib/gpueue/lib` | 0755 root | fork guard 库（`gpueue-forkguard-<hash>.so`），以及作业单元运行的 helper 副本（`gpueue-helper-<hash>`；见[升级](#upgrading)） |
    | `/var/lib/gpueue/criu-no-plugins` | 0755 root | 手动模式使用的空 CRIU 插件目录 |
    | `/run/gpueue` | 0755 gpueue | `gpueue.sock`（守护进程，权限 0666）和 `helper.sock`（helper，所有者 `gpueue`，权限 0600） |
    | `/run/gpueue-helper` | 0700 root | `criu restore --root` 使用的 `/` 的绑定挂载 |
@@ -1165,7 +1165,7 @@ sudo systemctl restart gpueue-helper.service gpueue.service
 helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/gpueue`、`/etc`、`/`）都归 root 所有、
 不可被组或其他用户写入、且不是符号链接，否则它会**拒绝启动**。同样的规则也适用于它写入或
 从中加载代码的目录：`data_dir`、`helper_state_dir`、`logs_dir`、`checkpoints_dir`、
-`<data_dir>/criu-no-plugins`（传给 `criu -L`，且必须为空）、`<data_dir>/lib`（fork guard）及其
+`<data_dir>/criu-no-plugins`（传给 `criu -L`，且必须为空）、`<data_dir>/lib`（fork guard 和 helper 副本）及其
 所有父目录都必须归 root 所有，且不可被组或其他用户写入（与配置文件不同，归 root 所有的符号
 链接会被跟随，并检查其目标）；helper 会在其中创建任何内容之前检查它们。请保持 tmpfiles.d
 创建的目录结构。守护进程把数据库放在 `daemon/` 子目录中，因为 `data_dir` 本身必须归 root 所有。
@@ -1662,7 +1662,10 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 - **内核 NFS**（NFSv3/v4）未测试：Docker 测试环境无法加载主机的 `nfs` 模块。在上述检查中，NFS
   与其他文件系统表现相同。请从 `/etc/fstab` 挂载它（`_netdev` 或 `x-systemd.automount`），使其
   在 helper 启动前挂载，并在关机时 helper 转储完作业之后才卸载（`gpueue-helper.service` 排在
-  `remote-fs.target`、`network.target` 和 `network-online.target` 之后）。作业打开的文件会按路径重新打开，因此它们必须仍存在于服务器上。
+  `remote-fs.target`、`network.target` 和 `network-online.target` 之后）。作业单元也排在
+  `remote-fs.target` 和 `network.target` 之后（仅排序），因此在 helper 转储之后仍在运行的作业
+  （`--no-checkpoint` 作业，以及转储失败或被拒绝的作业）会在 NFS 卸载和网络关闭之前收到 SIGTERM，
+  并有 `grace_secs` 的时间保存工作。作业打开的文件会按路径重新打开，因此它们必须仍存在于服务器上。
 - **autofs 间接映射**（autofs 守护进程按需挂载 `/net/<host>` 或 `/home/<user>`）：作业启动时已
   挂载的键对其可见；之后才首次访问的键不可见（命名空间是私有的）。恢复这样的命名空间尚未
   测试。
@@ -1788,6 +1791,20 @@ sudo gpueue update --version 0.2.0 --yes
   helper 重新连接时启动。
 - **版本：** CLI 和守护进程必须是相同版本。版本不匹配的客户端会收到错误，指出应更新哪一方，
   `gpueue doctor` 也会就此发出警告。请同时更新用户运行的 `gpueue` 二进制文件。
+- **检查点在升级后仍可使用。** 作业的进程树中包含 helper 二进制文件（其命名空间的 init 是
+  `gpueue-helper shim-init`），而 CRIU 只有在可执行文件与转储时是同一个文件时才会恢复进程。升级会
+  替换 `/usr/bin/gpueue-helper`（或 `/usr/local/bin/gpueue-helper`），因此作业单元不运行该文件：
+  helper 启动时会把自身复制到 `/var/lib/gpueue/lib/gpueue-helper-<内容的哈希>`（root，0755），新的
+  作业单元运行这个副本（`journalctl -u gpueue-helper` 会显示 `job units run ...`）。作业在运行期间以及
+  经过检查点和恢复后，都继续使用启动它的那个副本；升级会为新作业添加一个新副本。helper 启动时会删除
+  既没有作业记录也没有检查点需要的副本，因此存在一两个副本（每个仍在使用的版本一个）是正常的。不要
+  手动删除它们：副本丢失的检查点无法恢复。NixOS 上不会创建副本，旧的二进制文件由 Nix store 保留
+  （见 [NixOS](#nixos)）。
+- **从 0.1.1 或更早版本升级：** 这些版本启动的作业直接运行已安装的二进制文件，而升级会替换它。请在
+  升级前恢复已创建检查点的作业：升级后它们的恢复会失败（`restore.log` 中出现 `File
+  usr/bin/gpueue-helper has bad size`）。正在运行的作业会继续运行，但无法再创建检查点（`Can't dump
+  ghost file /usr/bin/gpueue-helper`），关机时也一样，因此请让它们在下次重启之前结束。升级后启动的
+  作业不受影响。
 - `/var/lib/gpueue/lib` 中旧的 fork guard 库会被有意保留：升级前创建检查点的作业需要完全相同的
   文件才能恢复。
 - 升级 NVIDIA 驱动之前，请恢复或删除已创建检查点的作业。驱动版本不同的恢复会被拒绝。
@@ -1998,4 +2015,9 @@ refused:` 开头），其所有者会收到警告。
   驱动和 GPU 恢复。在插件模式下 GPU UUID 也必须一致。在手动模式下，同型号的另一张卡会被
   重新映射。
 - `not enough free GPU memory`：其他作业正在使用该 GPU。请等待或释放它。
+- `the checkpointed job runs the helper binary /var/lib/gpueue/lib/gpueue-helper-<hash>, which is
+  gone`：作业转储时所用的 helper 副本被手动删除了（只要检查点存在，helper 就会保留它）。请把同一
+  构建放回该路径，或删除该作业。
 - 进程打开的文件，或其可执行文件和库，被修改或删除（见 `restore.log`）。请在相同路径恢复它们。
+  `File usr/bin/gpueue-helper has bad size` 表示该作业由 gpueue 0.1.1 或更早版本在升级前创建了检查点
+  （见[升级](#upgrading)）。

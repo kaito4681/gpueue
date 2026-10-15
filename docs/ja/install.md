@@ -1002,7 +1002,7 @@ NixOS 以外で Nix でビルドした場合（`nix build` のあと `sudo ./res
    | `/var/lib/gpueue/helper` | 0711 root | ヘルパーのジョブの記録とイベントキュー |
    | `/var/lib/gpueue/checkpoints` | 0700 root | チェックポイントのイメージ、ジョブごとに `<id>/` |
    | `/var/lib/gpueue/logs` | 0755 root | ジョブの出力、`<uid>/<id>.log`（ヘルパーが `<uid>/` をモード 2770、ユーザーの所有、グループ `gpueue` で作成） |
-   | `/var/lib/gpueue/lib` | 0755 root | fork ガードのライブラリ（`gpueue-forkguard-<hash>.so`） |
+   | `/var/lib/gpueue/lib` | 0755 root | fork ガードのライブラリ（`gpueue-forkguard-<hash>.so`）と、ジョブのユニットが実行するヘルパーのコピー（`gpueue-helper-<hash>`。[アップグレード](#upgrading)を参照） |
    | `/var/lib/gpueue/criu-no-plugins` | 0755 root | manual モード用の空の CRIU プラグインディレクトリ |
    | `/run/gpueue` | 0755 gpueue | `gpueue.sock`（デーモン、モード 0666）と `helper.sock`（ヘルパー、`gpueue` の所有、モード 0600） |
    | `/run/gpueue-helper` | 0700 root | `criu restore --root` が使う `/` のバインドマウント |
@@ -1282,7 +1282,7 @@ sudo systemctl restart gpueue-helper.service gpueue.service
 グループやその他のユーザーが書き込めず、シンボリックリンクでない場合でなければ**起動を拒否します**。書き
 込み先やコードの読み込み元のディレクトリにも同じ規則が適用されます。`data_dir`、`helper_state_dir`、
 `logs_dir`、`checkpoints_dir`、`<data_dir>/criu-no-plugins`（`criu -L` に渡され、空でなければなりません）、
-`<data_dir>/lib`（fork ガード）とそれらのすべての親は、root の所有で、グループやその他のユーザーが書き
+`<data_dir>/lib`（fork ガードとヘルパーのコピー）とそれらのすべての親は、root の所有で、グループやその他のユーザーが書き
 込めない必要があります（設定ファイルと異なり、root が所有するシンボリックリンクはたどられ、リンク先も確認
 されます）。ヘルパーはそこに何かを作る前にそれらを確認します。tmpfiles.d が作る配置を保ってください。
 `data_dir` 自体は root のものでなければならないので、デーモンはデータベースを `daemon/` サブディレクトリに
@@ -1841,8 +1841,11 @@ automount ポイントをトリガーしながら）確認し、なければ分�
   込めないためです。上記のチェックでは、NFS は他のファイルシステムと同じように扱われます。ヘルパーの開始前に
   マウントされ、シャットダウン時にヘルパーがジョブをダンプしたあとでアンマウントされるように、`/etc/fstab`
   （`_netdev` または `x-systemd.automount`）からマウントしてください（`gpueue-helper.service` は
-  `remote-fs.target`、`network.target`、`network-online.target` のあとに順序付けられています）。ジョブが開いていたファイルはパスで開き直されるので、
-  サーバー上にまだ存在している必要があります。
+  `remote-fs.target`、`network.target`、`network-online.target` のあとに順序付けられています）。ジョブの
+  ユニットも `remote-fs.target` と `network.target` のあとに順序付けられている（順序のみ）ので、ヘルパーの
+  ダンプのあとも動いているジョブ（`--no-checkpoint` のジョブと、ダンプが失敗または拒否されたジョブ）は、NFS が
+  アンマウントされネットワークが止まる前に SIGTERM を受け取り、`grace_secs` の間に作業を保存できます。
+  ジョブが開いていたファイルはパスで開き直されるので、サーバー上にまだ存在している必要があります。
 - **autofs の間接マップ**（autofs デーモンが `/net/<host>` や `/home/<user>` を必要に応じてマウントするもの）：
   ジョブの開始時にマウントされていたキーはジョブから見えますが、あとで初めてアクセスされたキーは見えません
   （名前空間は private です）。そうした名前空間のリストアはテストしていません。
@@ -1984,6 +1987,23 @@ sudo gpueue update --version 0.2.0 --yes
 - **バージョン：** CLI とデーモンは同じバージョンでなければなりません。バージョンの合わないクライアントには、
   どちら側を更新すべきかを示すエラーが返り、`gpueue doctor` もそれを警告します。ユーザーが実行する `gpueue`
   バイナリも同時に更新してください。
+- **チェックポイントはアップグレードを越えて使えます。** ジョブのプロセスツリーにはヘルパーのバイナリが含まれ
+  （名前空間の init は `gpueue-helper shim-init` です）、CRIU は実行ファイルがダンプ時と同じファイルである場合に
+  限りプロセスをリストアします。アップグレードは `/usr/bin/gpueue-helper`（または
+  `/usr/local/bin/gpueue-helper`）を置き換えるので、ジョブのユニットはそのファイルを実行しません。ヘルパーは
+  起動時に自分自身を `/var/lib/gpueue/lib/gpueue-helper-<内容のハッシュ>`（root、0755）にコピーし、新しい
+  ジョブのユニットはそのコピーを実行します（`journalctl -u gpueue-helper` に `job units run ...` と表示されます）。
+  ジョブは自分を起動したコピーを、実行中もチェックポイントとリストアを経ても使い続け、アップグレードは新しい
+  ジョブのために新しいコピーを追加します。ヘルパーは起動時に、ジョブの記録からもチェックポイントからも必要と
+  されなくなったコピーを削除するので、コピーが 1 つか 2 つ（まだ使われているバージョンごとに 1 つ）あるのは
+  正常です。手で削除しないでください。コピーがなくなったチェックポイントはリストアできません。NixOS ではコピーは
+  作られず、Nix ストアが古いバイナリを保持します（[NixOS](#nixos) を参照）。
+- **0.1.1 以前からのアップグレード：** これらのバージョンが起動したジョブは、インストールされたバイナリそのものを
+  実行しており、アップグレードはそれを置き換えます。チェックポイント済みのジョブはアップグレードの前にリストア
+  してください。アップグレード後はリストアが失敗します（`restore.log` に `File usr/bin/gpueue-helper has bad
+  size`）。実行中のジョブは動き続けますが、チェックポイントはできなくなり（`Can't dump ghost file
+  /usr/bin/gpueue-helper`）、シャットダウン時も同じなので、次の再起動の前に終わらせてください。アップグレード後に
+  起動したジョブには影響しません。
 - `/var/lib/gpueue/lib` の古い fork ガードのライブラリは意図的に残されます。アップグレード前にチェックポイント
   したジョブのリストアには、まさにそのファイルが必要だからです。
 - NVIDIA ドライバーをアップグレードする前に、チェックポイント済みのジョブをリストアするか削除してください。
@@ -2209,5 +2229,10 @@ OS のシャットダウンや再起動の間に、ダンプが失敗したか�
   せん。元のドライバーと GPU でリストアしてください。plugin モードでは GPU の UUID も一致する必要があります。
   manual モードでは同じモデルの別のカードは再マップされます。
 - `not enough free GPU memory`：他のジョブが GPU を使っています。待つか、GPU を空けてください。
+- `the checkpointed job runs the helper binary /var/lib/gpueue/lib/gpueue-helper-<hash>, which is
+  gone`：ジョブがダンプされたときのヘルパーのコピーが手で削除されています（ヘルパーはチェックポイントがある間
+  それを残します）。同じビルドをそのパスに戻すか、ジョブを削除してください。
 - プロセスが開いていたファイル、またはその実行ファイルやライブラリが変更または削除されています（`restore.log` を
-  参照）。同じパスに元に戻してください。
+  参照）。同じパスに元に戻してください。`File usr/bin/gpueue-helper has bad size` は、gpueue 0.1.1 以前で
+  チェックポイントしたジョブをアップグレード後にリストアしようとしたことを意味します（[アップグレード](#upgrading)を
+  参照）。
