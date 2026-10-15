@@ -990,7 +990,7 @@ following:
    | `/var/lib/gpueue/helper` | 0711 root | the helper's job records and event queue |
    | `/var/lib/gpueue/checkpoints` | 0700 root | checkpoint images, `<id>/` per job |
    | `/var/lib/gpueue/logs` | 0755 root | job output, `<uid>/<id>.log` (the helper creates `<uid>/` with mode 2770, owned by the user, group `gpueue`) |
-   | `/var/lib/gpueue/lib` | 0755 root | the fork guard library (`gpueue-forkguard-<hash>.so`) |
+   | `/var/lib/gpueue/lib` | 0755 root | the fork guard library (`gpueue-forkguard-<hash>.so`) and the copies of the helper that job units run (`gpueue-helper-<hash>`; see [Upgrading](#upgrading)) |
    | `/var/lib/gpueue/criu-no-plugins` | 0755 root | empty CRIU plugin directory for manual mode |
    | `/run/gpueue` | 0755 gpueue | `gpueue.sock` (daemon, mode 0666) and `helper.sock` (helper, owned by `gpueue`, mode 0600) |
    | `/run/gpueue-helper` | 0700 root | bind mount of `/` used by `criu restore --root` |
@@ -1277,7 +1277,7 @@ The helper runs as root and **refuses to start** unless the file and every paren
 (`/etc/gpueue`, `/etc`, `/`) are owned by root, not group- or world-writable, and not symlinks.
 The same rule applies to the directories it writes to or loads code from: `data_dir`,
 `helper_state_dir`, `logs_dir`, `checkpoints_dir`, `<data_dir>/criu-no-plugins` (passed to
-`criu -L`, and it must be empty), `<data_dir>/lib` (the fork guard) and all their parents must be
+`criu -L`, and it must be empty), `<data_dir>/lib` (the fork guard and the helper copies) and all their parents must be
 owned by root and not group- or world-writable (symlinks owned by root are followed and their
 targets checked, unlike for the configuration file); the helper checks them before it creates
 anything there. Keep the layout that
@@ -1853,8 +1853,11 @@ Not tested, or not supported:
   `/etc/fstab` (`_netdev`, or `x-systemd.automount`) so that it is mounted before the helper
   starts and unmounted only after the helper has dumped the jobs at shutdown
   (`gpueue-helper.service` is ordered after `remote-fs.target`, `network.target` and
-  `network-online.target`). Files that the job had open are reopened by path, so they must still
-  exist on the server.
+  `network-online.target`). The job units are ordered after `remote-fs.target` and
+  `network.target` too (ordering only), so the jobs that are still running after the helper's
+  dumps (`--no-checkpoint` jobs, and jobs whose dump failed or was refused) get their SIGTERM, and
+  `grace_secs` to save their work, before NFS is unmounted and the network goes down. Files that
+  the job had open are reopened by path, so they must still exist on the server.
 - **autofs indirect maps** (an autofs daemon mounting `/net/<host>` or `/home/<user>` on demand):
   keys mounted when the job starts are visible to it; keys first accessed later are not (the
   namespace is private). Restoring such a namespace has not been tested.
@@ -1998,6 +2001,23 @@ for example) never leaves a new `gpueue` next to an old `gpueue-helper`. The con
 - **Versions:** the CLI and the daemon must be the same version. A mismatched client gets an
   error that says which side to update, and `gpueue doctor` warns about it. Update the `gpueue`
   binary that users run at the same time.
+- **Checkpoints survive upgrades.** A job's process tree contains the helper binary (its
+  namespace init is `gpueue-helper shim-init`), and CRIU restores a process only if its
+  executable is the same file as at the dump. An upgrade replaces `/usr/bin/gpueue-helper` (or
+  `/usr/local/bin/gpueue-helper`), so job units do not run that file: at start-up the helper
+  copies itself to `/var/lib/gpueue/lib/gpueue-helper-<hash of the contents>` (root, 0755), and
+  new job units run the copy (`journalctl -u gpueue-helper` shows `job units run ...`). A job keeps
+  the copy that started it while it runs, through checkpoints and restores, and an upgrade adds a
+  new copy for new jobs. The helper removes a copy when it starts and neither a job record nor a
+  checkpoint needs it any more, so one or two copies (one per version still in use) are normal.
+  Do not remove them by hand: a checkpoint whose copy is gone cannot be restored. On NixOS no copy
+  is made; the Nix store keeps the old binary (see [NixOS](#nixos)).
+- **Upgrading from 0.1.1 or older:** jobs started by those versions run the installed binary
+  itself, which the upgrade replaces. Restore checkpointed jobs before upgrading: after the
+  upgrade their restore fails (`File usr/bin/gpueue-helper has bad size` in `restore.log`). Jobs
+  that are running keep running, but can no longer be checkpointed (`Can't dump ghost file
+  /usr/bin/gpueue-helper`), also not at a shutdown, so let them finish before the next reboot.
+  Jobs started after the upgrade are not affected.
 - Old fork guard libraries in `/var/lib/gpueue/lib` are kept on purpose: jobs checkpointed before
   the upgrade need the exact file to restore.
 - Restore or remove checkpointed jobs before upgrading the NVIDIA driver. A restore with a
@@ -2226,5 +2246,9 @@ A failed restore keeps the job `Checkpointed` and keeps its image, so you can fi
   missing GPU. Restore with the original driver and GPU. In plugin mode the GPU UUIDs must match
   as well. In manual mode a different card of the same model is remapped.
 - `not enough free GPU memory`: other jobs use the GPU. Wait, or free it.
+- `the checkpointed job runs the helper binary /var/lib/gpueue/lib/gpueue-helper-<hash>, which is
+  gone`: the copy of the helper the job was dumped with was removed by hand (the helper keeps it
+  while the checkpoint exists). Put the same build back at that path, or remove the job.
 - Files the process had open, or its executables and libraries, were changed or deleted (see
-  `restore.log`). Restore them at the same paths.
+  `restore.log`). Restore them at the same paths. `File usr/bin/gpueue-helper has bad size` means
+  the job was checkpointed by gpueue 0.1.1 or older before an upgrade (see [Upgrading](#upgrading)).

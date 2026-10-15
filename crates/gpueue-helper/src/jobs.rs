@@ -54,6 +54,14 @@ pub struct JobRecord {
     /// How many times the job has been restored.
     #[serde(default)]
     pub restores: u32,
+    /// The copy of the helper binary (see [`crate::helperbin`]) the job's
+    /// unit was started with (`<copy> shim`), which its process tree runs
+    /// (`shim-init`) and its images map. Restores keep it, and it is kept
+    /// as long as a record names it. `None` when the unit ran the helper
+    /// itself (from the Nix store, when no copy could be made, or by an
+    /// older helper).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shim_exe: Option<PathBuf>,
     /// Every group id the job ran with when it was dumped (`Gid:` and
     /// `Groups:` of its processes): CRIU restores them, so the owner must
     /// still be in each. Only in the copy kept with the image.
@@ -439,6 +447,7 @@ mod tests {
             unit_kind: UnitKind::Spawned,
             unit: "gpueue-job-5.service".into(),
             restores: 0,
+            shim_exe: None,
             dump_groups: None,
             dumping: false,
             restoring: false,

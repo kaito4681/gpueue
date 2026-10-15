@@ -87,8 +87,10 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    ends. `gpueue status` lists orphans to administrators, `gpueue doctor` warns about them, and an
    administrator can stop one with `gpueue kill <id>`.
 4. **Helper → systemd.** Over D-Bus the helper starts a transient service whose main process is
-   `gpueue-helper shim`. The unit has `Before=gpueue-helper.service` and `KillMode=mixed`, stdin is
-   `/dev/null`, and the stop timeout is `grace_secs`. Each job lives in its own cgroup, outside the
+   `gpueue-helper shim`, run from a content-addressed copy of the helper binary
+   (`<data_dir>/lib/gpueue-helper-<hash>`, see [Helper binary copies](#helper-binary-copies)). The
+   unit has `Before=gpueue-helper.service`, `After=remote-fs.target network.target` (ordering
+   only) and `KillMode=mixed`, stdin is `/dev/null`, and the stop timeout is `grace_secs`. Each job lives in its own cgroup, outside the
    daemon, the helper and the user's session, so it survives restarts of the daemon and the
    helper and the user logging out. With `gpu_device_isolation` (the default) the unit also has
    `DevicePolicy=closed` and `DeviceAllow=` for the job's GPUs only (see
@@ -326,8 +328,25 @@ failed and keeps the image as well.
   device nodes in the restored processes when the helper runs `cuda-checkpoint --action restore`
   on them. See [GPU isolation](install.md#gpu-isolation) in the installation guide.
 - At start-up the helper refuses directories it writes to or loads code from (including
-  `<data_dir>/criu-no-plugins`, passed to `criu -L`, and the fork guard's `<data_dir>/lib`) unless
-  they and their parents belong to root.
+  `<data_dir>/criu-no-plugins`, passed to `criu -L`, and `<data_dir>/lib`, which holds the fork
+  guard and the helper copies) unless they and their parents belong to root.
+
+<a id="helper-binary-copies"></a>**Helper binary copies.** A job's process tree contains the helper
+(the namespace init is `gpueue-helper shim-init`), so every checkpoint image maps the helper's
+executable, and CRIU restores it only if the file at that path has the same size and build ID.
+Package upgrades, `install.sh` and `gpueue update` replace the installed binary in place, which
+made jobs dumped before an upgrade unrestorable and jobs running across one undumpable (CRIU
+cannot dump a deleted executable of that size). At start-up the helper therefore copies itself to
+`<data_dir>/lib/gpueue-helper-<FNV-1a hash of the contents>` (mode 0755, written to a temporary file
+and renamed into place, then checked like the other root-owned paths), and job units run that
+copy. The job record and the record kept with the image (`helper-job.json`) name it
+(`shim_exe`), so a restore puts the tree back on the binary it was dumped with, and a refused
+restore says so when the copy is missing. At each start the helper removes the copies that are
+neither its own nor named by a job record or an image's record, nor mapped by an image
+(`files.img`); if a checkpoint cannot be read, nothing is removed. On NixOS the helper runs from
+the Nix store, whose paths do not change; it makes no copy, and the Nix GC roots
+(`/nix/var/nix/gcroots/gpueue/job-<id>`) keep the old store path instead. If the copy cannot be
+made, the helper logs a warning and job units run the installed binary.
 
 ## Shutdown ordering
 
@@ -347,7 +366,10 @@ failed and keeps the image as well.
   killed CRIU's plugin may have left the CUDA processes locked or checkpointed, the helper asks
   `cuda-checkpoint --get-state` and restores and unlocks them as needed). Paused jobs are dumped too
   (resumed first), and come back paused (stopped, without running) after `gpueue restore`. Job units are
-  `Before=gpueue-helper.service`, so systemd stops them only after the helper has finished. On the
+  `Before=gpueue-helper.service`, so systemd stops them only after the helper has finished, and
+  `After=remote-fs.target network.target`, so the ones still running then (`--no-checkpoint` jobs,
+  failed or refused dumps) are stopped before remote filesystems are unmounted and the network
+  goes down. On the
   next boot the daemon gets the results from the helper's replayed events and marks the jobs
   `Checkpointed`. Jobs whose dump failed or was refused were stopped by systemd. They are marked
   `Checkpoint failed` with the reason, and their owners are warned.

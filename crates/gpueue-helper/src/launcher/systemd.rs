@@ -11,6 +11,12 @@
 //!   SIGTERM to the shim, which forwards it to the job), and
 //!   `Before=gpueue-helper.service` (at OS shutdown the helper stops — and
 //!   dumps — first; the job units are stopped after it).
+//!   `After=remote-fs.target network.target` (ordering only): the job
+//!   units left at shutdown (`--no-checkpoint` jobs, failed or refused
+//!   dumps) are stopped while NFS and the network are still there.
+//! - `ExecStart=` runs the helper's content-addressed copy (see
+//!   [`crate::helperbin`]), not the installed binary, which upgrades
+//!   replace.
 //! - `StandardInput=null`; the shim's own messages go to the journal. The
 //!   job's stdout/stderr are *not* connected with `StandardOutput=append:`
 //!   because systemd opens that file as root, following symlinks, in a
@@ -65,6 +71,8 @@ const JOB_GONE_ERRORS: &[&str] = &[
 
 /// The unit every job unit is ordered before.
 pub const HELPER_UNIT: &str = "gpueue-helper.service";
+/// The units every job unit is ordered after (see [`common_props`]).
+pub const JOB_UNIT_AFTER: [&str; 2] = ["remote-fs.target", "network.target"];
 
 const CAP_CHOWN: u64 = 0;
 const CAP_DAC_OVERRIDE: u64 = 1;
@@ -277,20 +285,7 @@ impl SystemdLauncher {
     }
 
     fn common_props(&self, description: String) -> Props<'static> {
-        vec![
-            ("Description", Value::from(description)),
-            ("Before", Value::from(vec![HELPER_UNIT.to_owned()])),
-            ("RemainAfterExit", Value::from(true)),
-            ("KillMode", Value::from("mixed")),
-            ("NoNewPrivileges", Value::from(true)),
-            ("StandardInput", Value::from("null")),
-            ("StandardOutput", Value::from("journal")),
-            ("StandardError", Value::from("journal")),
-            (
-                "TimeoutStopUSec",
-                Value::from(duration_usec(self.job_stop_timeout)),
-            ),
-        ]
+        common_props(description, self.job_stop_timeout)
     }
 
     async fn wait_for_start(&self, spec: &LaunchSpec) -> LaunchResult<u32> {
@@ -353,7 +348,7 @@ impl SystemdLauncher {
 
 impl Launcher for SystemdLauncher {
     async fn spawn(&self, spec: &LaunchSpec) -> LaunchResult<u32> {
-        let exe = self.helper_exe.to_string_lossy().into_owned();
+        let exe = spec.exe.to_string_lossy().into_owned();
         let dir = spec.files.dir().to_string_lossy().into_owned();
         let mut props = self.common_props(format!(
             "gpueue job {}: {}",
@@ -569,6 +564,38 @@ impl Launcher for SystemdLauncher {
     }
 }
 
+/// What every job unit (spawned or restored) gets. `Before=` the helper:
+/// at OS shutdown the helper stops (and dumps) first. `After=` the remote
+/// filesystems and the network (ordering only, nothing is pulled in): the
+/// job units still running then (`--no-checkpoint` jobs, and jobs whose
+/// dump was refused or failed) are stopped before NFS is unmounted and the
+/// network goes down, so a job that saves its state there on SIGTERM can.
+pub fn common_props(description: String, job_stop_timeout: Duration) -> Props<'static> {
+    vec![
+        ("Description", Value::from(description)),
+        ("Before", Value::from(vec![HELPER_UNIT.to_owned()])),
+        (
+            "After",
+            Value::from(
+                JOB_UNIT_AFTER
+                    .iter()
+                    .map(|u| (*u).to_owned())
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        ("RemainAfterExit", Value::from(true)),
+        ("KillMode", Value::from("mixed")),
+        ("NoNewPrivileges", Value::from(true)),
+        ("StandardInput", Value::from("null")),
+        ("StandardOutput", Value::from("journal")),
+        ("StandardError", Value::from("journal")),
+        (
+            "TimeoutStopUSec",
+            Value::from(duration_usec(job_stop_timeout)),
+        ),
+    ]
+}
+
 /// `DevicePolicy=closed` with `DeviceAllow=` of `devices` (an array of
 /// `(path, access)` on D-Bus); nothing without isolation.
 pub fn device_props(devices: Option<&[DeviceRule]>) -> Props<'static> {
@@ -666,6 +693,35 @@ mod tests {
         assert!(!crate::shim::is_forwardable(17)); // CHLD
         assert!(!crate::shim::is_forwardable(11)); // SEGV
         assert!(!crate::shim::is_forwardable(34)); // SIGRTMIN
+    }
+
+    #[test]
+    fn job_units_are_ordered_after_the_network_and_remote_filesystems() {
+        let props = common_props("job".into(), Duration::from_secs(5));
+        let get = |name: &str| {
+            props
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no {name}"))
+        };
+        assert_eq!(
+            get("After"),
+            Value::from(vec![
+                "remote-fs.target".to_owned(),
+                "network.target".to_owned()
+            ])
+        );
+        assert_eq!(get("After").value_signature().to_string(), "as");
+        assert_eq!(
+            get("Before"),
+            Value::from(vec!["gpueue-helper.service".to_owned()])
+        );
+        // Ordering only: nothing is pulled in.
+        for dep in ["Requires", "Wants", "BindsTo", "Requisite"] {
+            assert!(props.iter().all(|(n, _)| *n != dep), "{dep} is set");
+        }
+        assert_eq!(get("TimeoutStopUSec"), Value::from(5_000_000u64));
     }
 
     #[test]

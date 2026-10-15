@@ -19,6 +19,8 @@
 //!   answer, and how dumps and restores get along without them.
 //! - [`forkguard`]: the preload library that makes forked children of CUDA
 //!   processes checkpointable.
+//! - [`helperbin`]: the content-addressed copies of the helper that job
+//!   units run, so that upgrades do not break restores.
 //! - [`gcroots`]: Nix GC roots that keep the helper's store path while jobs
 //!   need it.
 //! - [`traced`]: lets the CUDA restore threads of a stopped job run while
@@ -32,6 +34,7 @@ pub mod engine;
 pub mod events;
 pub mod forkguard;
 pub mod gcroots;
+pub mod helperbin;
 pub mod host;
 pub mod images;
 pub mod jobs;

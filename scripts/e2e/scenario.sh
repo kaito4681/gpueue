@@ -80,6 +80,37 @@ wait_unit() {
 wait_socket() {
     wait_for 30 "the daemon socket" pz carol status --json >/dev/null 2>&1
 }
+# helper_connected: the daemon reports the helper connected (`GET
+# /v1/version`, `helper.connected`).
+helper_connected() {
+    python3 -I -c '
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+s.connect("/run/gpueue/gpueue.sock")
+s.sendall(b"GET /v1/version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+data = b""
+while chunk := s.recv(65536):
+    data += chunk
+head, _, body = data.partition(b"\r\n\r\n")
+if b"chunked" in head.lower():
+    out, rest = b"", body
+    while rest:
+        size, _, rest = rest.partition(b"\r\n")
+        n = int(size, 16)
+        if n == 0:
+            break
+        out, rest = out + rest[:n], rest[n + 2:]
+    body = out
+sys.exit(0 if json.loads(body)["helper"]["connected"] else 1)
+' 2>/dev/null
+}
+# wait_helper: after a restart of the helper, wait until the daemon is
+# connected to the new one (the daemon socket answers before that).
+wait_helper() {
+    wait_socket
+    wait_for 60 "the daemon to reconnect to the helper" helper_connected
+}
 started_at() { q carol "job($1)['started_at']"; }
 finished_at() { q carol "job($1)['finished_at']"; }
 # free_group: the unlimited group "free" (created by s3, or here when s3
@@ -1646,6 +1677,96 @@ while True:
     rm -f "$E2E_DOCKER_SOCK" /etc/sudoers.d/e2e-eve /etc/polkit-1/rules.d/10-e2e-sudo.rules
 }
 
+# s24: an upgrade replaces the helper binary in place while one job runs
+# and another is checkpointed (as dpkg, rpm, install.sh and pacman do: a
+# new file renamed over the old one), then restarts the helper. Every job's
+# process tree contains the helper (`shim-init`), and CRIU restores a
+# mapped executable only if it is the same file (and cannot dump a deleted
+# one this large): jobs run a root-owned, content-addressed copy of the
+# helper under /var/lib/gpueue/lib, which is kept while a job or an image
+# needs it and removed at the next start of the helper afterwards.
+# job_exe <id>: the executable of the init of job <id>'s live unit.
+job_exe() { readlink "/proc/$(live_pid "$1")/exe"; }
+s24_helper_upgrade() {
+    local a b c exe=/usr/local/bin/gpueue-helper lib=/var/lib/gpueue/lib before old new
+    mkdir -p "$STATE"
+    cp -p "$exe" "$STATE/helper.orig"
+    # Put the original binary back whatever happens (runs when the
+    # scenario's subshell exits, also via `fail`).
+    # shellcheck disable=SC2064 # expanded now, on purpose
+    trap "cp -p '$STATE/helper.orig' '$exe.e2e' && mv -f '$exe.e2e' '$exe'; systemctl restart gpueue-helper.service; wait_helper || true" EXIT
+    free_group
+    a=$(add alice -g free -- "$COUNTER")
+    b=$(add alice -g free -- "$COUNTER")
+    wait_state "$a" running
+    wait_state "$b" running
+    wait_unit "$a"
+    wait_unit "$b"
+    old=$(job_exe "$a")
+    echo "jobs run $old"
+    case "$old" in "$lib"/gpueue-helper-*) ;; *) fail "job $a runs $old, not a copy in $lib" ;; esac
+    cmp -s "$old" "$exe" || fail "$old is not a copy of $exe"
+    [ "$(stat -c '%U %a' "$old")" = "root 755" ] || fail "$old is not root's, mode 0755"
+    sleep 1
+    pz alice checkpoint "$a" || fail "checkpoint $a"
+    wait_state "$a" checkpointed 120
+    # Another build: same code, another size and contents.
+    cp -p "$exe" "$exe.e2e"
+    printf 'gpueue e2e upgrade %s\n' "$(date +%s%N)" >>"$exe.e2e"
+    mv -f "$exe.e2e" "$exe"
+    systemctl restart gpueue-helper.service
+    wait_helper
+    sleep 1
+    expect_state "$b" running
+    [ "$(job_exe "$b")" = "$old" ] || fail "job $b no longer runs $old"
+    # A new job runs a copy of the new binary.
+    c=$(add alice -g free -- "$COUNTER")
+    wait_state "$c" running
+    wait_unit "$c"
+    new=$(job_exe "$c")
+    echo "new jobs run $new"
+    [ "$new" != "$old" ] && cmp -s "$new" "$exe" || fail "job $c runs $new, not a copy of the new $exe"
+    [ -e "$old" ] || fail "$old was removed while jobs need it"
+    # A job dumped before the upgrade is restored by the new helper ...
+    before=$(last_line 1000 "$a")
+    pz alice restore "$a" || fail "restore $a"
+    wait_state "$a" running 120
+    sleep 1.5
+    [ "$(last_line 1000 "$a")" -gt "$before" ] || fail "job $a (dumped before the upgrade) did not continue"
+    [ "$(job_exe "$a")" = "$old" ] || fail "the restored job $a does not run $old"
+    # ... and a job that ran across the upgrade is dumped by it and restored.
+    pz alice checkpoint "$b" || fail "checkpoint $b"
+    wait_state "$b" checkpointed 120
+    before=$(last_line 1000 "$b")
+    pz alice restore "$b" || fail "restore $b"
+    wait_state "$b" running 120
+    sleep 1.5
+    [ "$(last_line 1000 "$b")" -gt "$before" ] || fail "job $b (started before the upgrade) did not continue"
+    check_counter_log 1000 "$a"
+    check_counter_log 1000 "$b"
+    pz carol kill "$a" "$b" || fail "kill"
+    wait_state "$a" 'done/*'
+    wait_state "$b" 'done/*'
+    # Back to the original binary (a "downgrade"): job c still needs the
+    # new copy; once it is gone, the next start removes that copy. (The
+    # original's copy stays: earlier scenarios' checkpoints may need it.)
+    cp -p "$STATE/helper.orig" "$exe.e2e"
+    mv -f "$exe.e2e" "$exe"
+    systemctl restart gpueue-helper.service
+    wait_helper
+    [ -e "$new" ] || fail "$new was removed while job $c runs it"
+    [ -e "$old" ] || fail "$old, the current copy, is missing"
+    pz carol kill "$c" || fail "kill $c"
+    wait_state "$c" 'done/*'
+    sleep 1
+    systemctl restart gpueue-helper.service
+    wait_helper
+    [ ! -e "$new" ] || fail "$new is still there, but no job or checkpoint needs it"
+    [ -e "$old" ] || fail "$old, the current copy, was removed"
+    journalctl -u gpueue-helper.service -o cat | grep -F "removed $new" \
+        || fail "the helper did not log the removal of $new"
+}
+
 case "${1:-main}" in
 main)
     run "1 add/status/log/follow/wait" s1_lifecycle
@@ -1661,6 +1782,7 @@ main)
     run "18 job credential policy" s18_job_policy
     run "19 no privilege escalation from jobs" s19_no_escalation
     run "23 nested namespaces" s23_nested_namespaces
+    run "24 helper binary replaced by an upgrade" s24_helper_upgrade
     if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers

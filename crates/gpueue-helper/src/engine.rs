@@ -2,11 +2,11 @@
 //! restore and shutdown logic, independent of the socket and of how jobs
 //! are launched.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -540,6 +540,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             unit_kind: UnitKind::Spawned,
             unit: unit_name(req.job),
             restores: 0,
+            shim_exe: self.cfg.shim_exe.clone(),
             dump_groups: None,
             dumping: false,
             restoring: false,
@@ -648,6 +649,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         let spec = LaunchSpec {
             job: req.job,
             unit: record.unit.clone(),
+            exe: self.cfg.job_exe().to_owned(),
             files: files.clone(),
             argv,
             envs,
@@ -1101,7 +1103,76 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             .map(|(_, record)| record.job)
             .collect();
         self.cfg.gc_roots.retain(|job| left.contains(&job));
+        self.collect_helper_copies();
         Ok(())
+    }
+
+    /// Removes the copies of the helper binary (see [`crate::helperbin`])
+    /// that no job and no checkpoint needs any more: the current one, the
+    /// `shim_exe` of every job record and of every image's record, and
+    /// every copy an image maps are kept. Nothing is removed when a
+    /// checkpoint cannot be read.
+    fn collect_helper_copies(&self) {
+        let Some(dir) = &self.cfg.helper_copy_dir else {
+            return;
+        };
+        let keep = match self.helper_copies_in_use(dir) {
+            Ok(keep) => keep,
+            Err(e) => {
+                eprintln!(
+                    "gpueue-helper: warning: not removing old helper copies in {}: {e}",
+                    dir.display()
+                );
+                return;
+            }
+        };
+        match crate::helperbin::collect_garbage(dir, &keep) {
+            Ok(removed) => {
+                for path in removed {
+                    eprintln!(
+                        "gpueue-helper: removed {}, which no job or checkpoint needs",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "gpueue-helper: warning: removing old helper copies in {}: {e}",
+                dir.display()
+            ),
+        }
+    }
+
+    fn helper_copies_in_use(&self, dir: &Path) -> Result<BTreeSet<PathBuf>, String> {
+        let mut keep = BTreeSet::new();
+        keep.insert(self.cfg.job_exe().to_owned());
+        let records = jobs::scan(&self.cfg.jobs_dir()).map_err(|e| format!("job records: {e}"))?;
+        keep.extend(records.into_iter().filter_map(|(_, r)| r.shim_exe));
+        let ids = layout::scan(&self.cfg.checkpoint_base)
+            .map_err(|e| format!("{}: {e}", self.cfg.checkpoint_base.display()))?;
+        for (id, _) in ids {
+            let ck = CheckpointDir::for_job(&self.cfg.checkpoint_base, id);
+            match fs::read(ck.root().join(OWNER_FILE)) {
+                Ok(bytes) => {
+                    let record: JobRecord = serde_json::from_slice(&bytes)
+                        .map_err(|e| format!("the checkpoint of job {id}: {OWNER_FILE}: {e}"))?;
+                    keep.extend(record.shim_exe);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("the checkpoint of job {id}: {OWNER_FILE}: {e}")),
+            }
+            // Also what the image itself maps (an older record may not
+            // say).
+            let paths = crate::images::read_paths(&ck.images_dir())
+                .map_err(|e| format!("the checkpoint of job {id}: {e}"))?;
+            keep.extend(
+                paths
+                    .into_iter()
+                    .flat_map(|p| p.files)
+                    .map(PathBuf::from)
+                    .filter(|p| crate::helperbin::is_copy(dir, p)),
+            );
+        }
+        Ok(keep)
     }
 
     // -- checkpoint -------------------------------------------------------
@@ -1378,6 +1449,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                         unit_kind: UnitKind::Restored,
                         unit: String::new(),
                         restores: 0,
+                        shim_exe: None,
                         dump_groups: None,
                         dumping: false,
                         restoring: true,
@@ -1508,6 +1580,21 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     ),
                 ));
             }
+        }
+        // The restored tree runs the helper binary it was dumped with
+        // (see `crate::helperbin`), which CRIU needs unchanged.
+        if let Some(exe) = &record.shim_exe
+            && !exe.is_file()
+        {
+            return Err(error(
+                HelperErrorCode::InvalidRequest,
+                format!(
+                    "the checkpointed job runs the helper binary {}, which is gone (it is kept \
+                     while the checkpoint exists, so it was removed by other means); the job \
+                     cannot be restored",
+                    exe.display()
+                ),
+            ));
         }
         let allowed_gids = creds.allowed_gids();
         self.check_image_paths(&dir, &record, &allowed_gids)?;

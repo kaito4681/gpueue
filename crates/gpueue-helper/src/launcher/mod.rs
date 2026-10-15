@@ -30,6 +30,9 @@ use crate::jobs::{JobFiles, UnitKind};
 pub struct LaunchSpec {
     pub job: JobId,
     pub unit: String,
+    /// The helper binary the unit runs as `<exe> shim <job dir>` (see
+    /// [`crate::helperbin`]).
+    pub exe: PathBuf,
     /// The job's files; `spawn.json` (credentials, command, environment)
     /// is already written.
     pub files: JobFiles,

@@ -242,6 +242,33 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
             ),
         }
     }
+    // Job units run a copy of this binary that upgrades do not replace, so
+    // that their checkpoints can still be restored (see
+    // `gpueue_helper::helperbin`). Not from the Nix store, whose paths do
+    // not change (the GC roots keep them).
+    match &cfg.helper_copy_dir {
+        Some(dir) if cfg.gc_roots.target().is_none() => {
+            match gpueue_helper::helperbin::install(dir, &cfg.helper_exe)
+                .map_err(|e| e.to_string())
+                .and_then(|copy| {
+                    gpueue_helper::validate::check_root_owned_path(&copy)?;
+                    Ok(copy)
+                }) {
+                Ok(copy) => {
+                    eprintln!("gpueue-helper: job units run {}", copy.display());
+                    cfg.shim_exe = Some(copy);
+                }
+                Err(e) => eprintln!(
+                    "gpueue-helper: WARN cannot copy {} into {}: {e}; job units run it \
+                     directly, and their checkpoints cannot be restored once an upgrade \
+                     replaces it",
+                    cfg.helper_exe.display(),
+                    dir.display()
+                ),
+            }
+        }
+        _ => {}
+    }
     // Also in plugin mode: an image is restored in the mode it was dumped
     // in. Its ancestors were checked above, so nobody but root can have put
     // anything on the way.

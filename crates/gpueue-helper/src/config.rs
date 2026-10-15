@@ -74,6 +74,14 @@ pub struct HelperConfig {
     /// Nix GC roots that keep `helper_exe` while jobs need it (see
     /// [`crate::gcroots`]); disabled unless it runs from the Nix store.
     pub gc_roots: crate::gcroots::GcRoots,
+    /// Where the copies of the helper binary that job units run are kept
+    /// (see [`crate::helperbin`]); `None` disables them. `<data_dir>/lib`
+    /// once resolved from the configuration file.
+    pub helper_copy_dir: Option<PathBuf>,
+    /// What new job units run as `<exe> shim <job dir>`: the copy of the
+    /// helper in `helper_copy_dir`, set at start-up when it could be made;
+    /// `None` runs `helper_exe` itself (NixOS, tests).
+    pub shim_exe: Option<PathBuf>,
     /// `nvidia-smi`, used to find CUDA processes and GPU memory.
     pub nvidia_smi: PathBuf,
     /// Where the fork guard is installed at start-up (see
@@ -108,6 +116,8 @@ impl Default for HelperConfig {
             job_stop_timeout: Duration::from_secs(30),
             helper_exe: PathBuf::from("/usr/bin/gpueue-helper"),
             gc_roots: crate::gcroots::GcRoots::disabled(),
+            helper_copy_dir: None,
+            shim_exe: None,
             nvidia_smi: PathBuf::from("nvidia-smi"),
             fork_guard_dir: Some(PathBuf::from(DEFAULT_FORK_GUARD_DIR)),
             job_preload: None,
@@ -164,6 +174,7 @@ impl HelperConfig {
                 .job_stop_timeout
                 .unwrap_or(Duration::from_secs(file.grace_secs)),
             fork_guard_dir: file.fork_guard.then(|| file.data_dir.join("lib")),
+            helper_copy_dir: Some(file.data_dir.join("lib")),
             gpu_device_isolation: file.gpu_device_isolation,
             job_policy: crate::validate::JobPolicy::from_config(
                 file,
@@ -306,6 +317,12 @@ impl HelperConfig {
         if let Some(dir) = &self.fork_guard_dir {
             paths.push(dir);
         }
+        // The copies of the helper that job units run as root.
+        if let Some(dir) = &self.helper_copy_dir
+            && self.fork_guard_dir.as_ref() != Some(dir)
+        {
+            paths.push(dir);
+        }
         // Created and mounted on as root in every job's namespace and before
         // restores (see `crate::mountfd::ensure_root_dir`): whoever could
         // change a directory on the way could have root create a directory
@@ -323,6 +340,12 @@ impl HelperConfig {
             }
         }
         paths
+    }
+
+    /// What a new job unit runs as `<exe> shim <job dir>` (see
+    /// [`Self::shim_exe`]).
+    pub fn job_exe(&self) -> &Path {
+        self.shim_exe.as_deref().unwrap_or(&self.helper_exe)
     }
 
     pub fn jobs_dir(&self) -> PathBuf {
@@ -386,6 +409,7 @@ mod tests {
         assert_eq!(c.socket_path, PathBuf::from("/run/x/helper.sock"));
         assert_eq!(c.state_dir, PathBuf::from("/srv/pz/helper"));
         assert_eq!(c.fork_guard_dir, Some(PathBuf::from("/srv/pz/lib")));
+        assert_eq!(c.helper_copy_dir, Some(PathBuf::from("/srv/pz/lib")));
         assert_eq!(c.checkpoint_base, PathBuf::from("/srv/pz/checkpoints"));
         assert_eq!(c.log_base, PathBuf::from("/logs"));
         assert_eq!(c.job_stop_timeout, Duration::from_secs(7));
@@ -612,8 +636,21 @@ mod tests {
         let paths = r.config.paths_to_check();
         assert!(paths.contains(&Path::new("/srv/pz/criu-no-plugins")));
         assert!(paths.contains(&Path::new("/srv/pz/lib")));
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|p| **p == Path::new("/srv/pz/lib"))
+                .count(),
+            1
+        );
+        // Without the fork guard, the directory still holds the copies of
+        // the helper that job units run.
         let r = HelperConfig::resolve(&file("fork_guard = false\n"), Overrides::default());
+        assert_eq!(
+            r.config.helper_copy_dir,
+            Some(PathBuf::from(DEFAULT_FORK_GUARD_DIR))
+        );
         let paths = r.config.paths_to_check();
-        assert!(!paths.contains(&Path::new(DEFAULT_FORK_GUARD_DIR)));
+        assert!(paths.contains(&Path::new(DEFAULT_FORK_GUARD_DIR)));
     }
 }
