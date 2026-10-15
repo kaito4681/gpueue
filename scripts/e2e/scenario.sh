@@ -1190,6 +1190,99 @@ s21_private_fuse() {
     rm -f /home/alice/.e2e-ssh-id
 }
 
+# s22: FUSE mounts of the job's owner in directories the owner controls.
+# - One with allow_other (user_allow_other in /etc/fuse.conf) in alice's
+#   home: CRIU would bind it on restore by its path, as root, following
+#   symlinks on the way, and alice could have renamed a directory on the
+#   way and left a symlink to another directory in its place. A job that
+#   does not use it is checkpointed with it left out and gets an empty,
+#   inaccessible directory there; a job working in it is refused.
+# - One without allow_other in a directory of alice's below a /tmp that is
+#   a plain directory (made so here if it is a mount): the shim cannot
+#   reach it to detach it before the private /tmp covers it, and must
+#   still leave it out of the job's namespace.
+AFUSE=/home/alice/a22/afuse
+UFUSE=/tmp/alice-dir/fuse
+s22_owner_fuse() {
+    local disk=/var/lib/gpueue-e2e-disk u d err tmp_was_mount=
+    need_mounts
+    if ! command -v sshfs >/dev/null || ! pgrep -x sshd >/dev/null; then
+        [ "${GPUEUE_E2E_REQUIRE_SSHFS:-}" != 1 ] || fail "sshfs is missing, and GPUEUE_E2E_REQUIRE_SSHFS=1"
+        echo "SKIP 22 FUSE mounts in the owner's directories: sshfs is not available"
+        return 0
+    fi
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    rm -f /home/alice/m22-*.txt
+    install -o alice -m 600 "$disk/ssh/id" /home/alice/.e2e-ssh-id
+    cp -a /etc/fuse.conf /etc/fuse.conf.e2e 2>/dev/null || : >/etc/fuse.conf.e2e
+    echo user_allow_other >>/etc/fuse.conf
+    local sshfs_opts=IdentityFile=/home/alice/.e2e-ssh-id,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,LogLevel=ERROR
+    runuser -u alice -- mkdir -p "$AFUSE"
+    runuser -u alice -- sshfs -o "allow_other,$sshfs_opts" root@127.0.0.1:/srv/ext4/export "$AFUSE" \
+        || fail "sshfs of alice with allow_other on $AFUSE"
+    stat "$AFUSE" >/dev/null || fail "root cannot look at alice's allow_other mount"
+    if mountpoint -q /tmp; then
+        tmp_was_mount=1
+        umount -l /tmp
+    fi
+    runuser -u alice -- mkdir -p "$UFUSE"
+    runuser -u alice -- sshfs -o "$sshfs_opts" root@127.0.0.1:/srv/ext4/export "$UFUSE" \
+        || fail "sshfs of alice on $UFUSE"
+    u=$(cjob /home/alice /home/alice/m22-u.txt)
+    d=$(cjob "$AFUSE" /home/alice/m22-d.txt)
+    wait_state "$u" running
+    wait_state "$d" running
+    sleep 1
+    ! grep -q " $UFUSE " "/proc/$(live_pid "$u")/mountinfo" \
+        || fail "job $u has $UFUSE, hidden under its /tmp"
+    pz alice checkpoint "$u" >/dev/null || fail "checkpoint $u"
+    restore_continues "$u" /home/alice/m22-u.txt
+    [ "$(awk -v mp="$AFUSE" '$5 == mp {for (i = 7; i <= NF; i++) if ($i == "-") {print $(i + 1); exit}}' \
+        "/proc/$(live_pid "$u")/mountinfo")" != fuse.sshfs ] \
+        || fail "the restored job $u got $AFUSE bound from the host"
+    ! grep -q " $UFUSE " "/proc/$(live_pid "$u")/mountinfo" \
+        || fail "the restored job $u has $UFUSE"
+    err=$(pz alice checkpoint "$d" 2>&1) && fail "the checkpoint of job $d was not refused"
+    echo "checkpoint of job $d: $err"
+    grep -q "$AFUSE (fuse.sshfs) could only be restored by binding a host path that someone other than root can redirect: $AFUSE (/home/alice is not a directory that only root can change)" <<<"$err" \
+        || fail "the refusal does not name $AFUSE: $err"
+    grep -q "the working directory $AFUSE" <<<"$err" || fail "the refusal does not say why: $err"
+    expect_state "$d" running
+    pz alice kill "$u" "$d" >/dev/null
+    wait_state "$u" 'done/*'
+    wait_state "$d" 'done/*'
+    runuser -u alice -- fusermount3 -u "$AFUSE" 2>/dev/null || umount -l "$AFUSE"
+    runuser -u alice -- fusermount3 -u "$UFUSE" 2>/dev/null || umount -l "$UFUSE"
+    rm -rf /tmp/alice-dir
+    if [ -n "$tmp_was_mount" ]; then mount -t tmpfs -o mode=1777 tmpfs /tmp; fi
+    mv /etc/fuse.conf.e2e /etc/fuse.conf
+    rm -f /home/alice/.e2e-ssh-id
+}
+
+# s23: a job with processes in a PID and user namespace of their own
+# (`unshare -Urpf`, as bwrap or a rootless container runtime): CRIU cannot
+# dump nested namespaces, and the helper's scans would not see the
+# processes in it, so the checkpoint is refused up front, with the reason,
+# and the job keeps running.
+s23_nested_namespaces() {
+    local j err
+    if ! runuser -u alice -- unshare -Urpf --mount-proc true 2>/dev/null; then
+        echo "SKIP 23 nested namespaces: unprivileged user namespaces are not available"
+        return 0
+    fi
+    pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
+    j=$(add alice -g free -- unshare -Urpf --mount-proc sleep 1000)
+    wait_state "$j" running
+    sleep 1
+    err=$(pz alice checkpoint "$j" 2>&1) && fail "the checkpoint of job $j was not refused"
+    echo "checkpoint of job $j: $err"
+    grep -q "processes in a PID or user namespace of their own" <<<"$err" \
+        || fail "the refusal does not say why: $err"
+    expect_state "$j" running
+    pz alice kill "$j" >/dev/null
+    wait_state "$j" 'done/*'
+}
+
 # Many jobs at once: `add --immediate` from several CLIs in parallel races
 # the scheduler, so the helper gets concurrent spawns; then again while the
 # helper restarts. No job may fail to spawn or get lost.
@@ -1567,6 +1660,7 @@ main)
     run "17 multifactor priority (fair share, nice, top)" s17_priority
     run "18 job credential policy" s18_job_policy
     run "19 no privilege escalation from jobs" s19_no_escalation
+    run "23 nested namespaces" s23_nested_namespaces
     if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers
@@ -1580,6 +1674,7 @@ reboot-prepare)
     run "16 a mount missing after a reboot (prepare)" s16_prepare
     run "20 a dead FUSE mount (prepare)" s20_prepare
     run "21 a FUSE mount that refuses root" s21_private_fuse
+    run "22 FUSE mounts in the owner's directories" s22_owner_fuse
     ;;
 reboot-verify)
     # 16 first: until it mounts /data again, every restore is refused.

@@ -263,6 +263,45 @@ pub fn unreachable_sources(job: &MountTree, helper: &MountTree) -> Vec<String> {
     out
 }
 
+/// For each mount of `job` (but its root) whose filesystem `helper` (the
+/// helper's namespace, where criu runs) also has, the host paths that CRIU
+/// may pick as its external bind source: CRIU takes a mount of its own
+/// namespace with the same device whose root contains the job mount's root,
+/// and records that mount's mount point plus the rest of the job mount's
+/// root (the last such mount, but its superblock options also count, so
+/// every candidate is listed). On restore it binds that path by its name,
+/// as root, following symlinks on the way (see
+/// [`crate::mountfd::bind_source_problem`]).
+pub fn bind_source_candidates(job: &MountTree, helper: &MountTree) -> Vec<(u64, Vec<String>)> {
+    let job_root = job.root_id();
+    let mut out = Vec::new();
+    for j in &job.entries {
+        if Some(j.id) == job_root {
+            continue;
+        }
+        let mut paths: Vec<String> = Vec::new();
+        for h in helper
+            .entries
+            .iter()
+            .filter(|h| h.dev == j.dev && path_under(&j.root, &h.root))
+        {
+            let rest = j.root[h.root.len()..].trim_start_matches('/');
+            let path = match (h.mount_point.as_str(), rest) {
+                (mp, "") => mp.to_owned(),
+                ("/", rest) => format!("/{rest}"),
+                (mp, rest) => format!("{mp}/{rest}"),
+            };
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        if !paths.is_empty() {
+            out.push((j.id, paths));
+        }
+    }
+    out
+}
+
 /// Where a host path that CRIU bind-mounts on restore (an external mount
 /// source) lived at dump time: the mount of the helper's namespace that a
 /// lookup of the path ended in. A restore needs the same filesystem type
@@ -383,6 +422,37 @@ fn nonempty(fstype: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRIU's possible bind sources: the host's mount point plus the rest
+    /// of the job mount's root.
+    #[test]
+    fn bind_source_candidates_follow_criu() {
+        let job = MountTree::parse(
+            "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 8:1 /home/alice/x /data rw - ext4 /dev/sda1 rw
+3 1 0:50 / /home/alice/fs rw - fuse.sshfs alice@h: rw
+4 1 0:51 /sub /mnt/sub rw - nfs h:/e rw
+5 1 0:52 / /tmp rw - tmpfs tmpfs rw
+",
+        );
+        let helper = MountTree::parse(
+            "\
+10 0 8:1 / / rw - ext4 /dev/sda1 rw
+13 10 0:50 / /home/alice/fs rw - fuse.sshfs alice@h: rw
+14 10 0:51 / /net rw - nfs h:/e rw
+15 10 0:51 /sub /srv rw - nfs h:/e rw
+",
+        );
+        assert_eq!(
+            bind_source_candidates(&job, &helper),
+            [
+                (2, vec!["/home/alice/x".to_owned()]),
+                (3, vec!["/home/alice/fs".to_owned()]),
+                (4, vec!["/net/sub".to_owned(), "/srv".to_owned()]),
+            ]
+        );
+    }
 
     /// The job namespace of the GPU e2e container before the fix.
     const DOCKER_GPU: &str = "\

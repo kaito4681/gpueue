@@ -73,11 +73,14 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    （以便命名空间获得自动挂载的文件系统）启动该命名空间的 init。init 把挂载设为私有，并挂载一个新的 `/proc`。它会移除被其他挂载遮盖的挂载以及重启后不会保留的挂载
    （`/run/*`、`/media/*`），把每个叠加在其 `autofs` 挂载之上的自动挂载文件系统替换为普通的副本，
    并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs（在此之前先卸下挂载在那里及其下方的东西，例如主机的 tmpfs
-   `/tmp` 以及其上的 AppImage FUSE 挂载，否则它们会隐藏在命名空间中保留下来）。除非 `job_system_dbus = true`，它会用一个空的 tmpfs 隐藏 `/run/dbus`，并且除非
+   `/tmp` 以及其上的 AppImage FUSE 挂载，否则它们会隐藏在命名空间中保留下来）。因位于 root 以外的人可以修改的
+   目录之下而无法这样够到的挂载（`/tmp` 是普通目录时，用户在 `/tmp/<自己的目录>/` 中的 FUSE 挂载），会在挂载
+   私有 tmpfs 之后，像其他被隐藏的挂载一样先把它移到一旁再移除。除非 `job_system_dbus = true`，它会用一个空的 tmpfs 隐藏 `/run/dbus`，并且除非
    `job_systemd_varlink = true`，用只保留 journald 日志套接字、resolved 名称解析套接字和 `resolv.conf` 文件以及 `userdb/`
    的 tmpfs 隐藏 `/run/systemd`，因此即使之后出现新的套接字，作业也无法通过 D-Bus 或 Varlink 向 systemd 或 polkit
    请求任何操作。它同样用空的 tmpfs 隐藏 `job_hidden_socket_dirs` 中的目录（默认为 `/run/libvirt` 和
-   `/run/cups`，这些守护进程在用户数据库中检查调用者的组），不存在时先创建；CRIU 会转储这些挂载并在恢复时
+   `/run/cups`，这些守护进程在用户数据库中检查调用者的组），不存在时先创建；每个目录都只经过只有 root 能修改的
+   目录、不跟随符号链接到达（如果某一项途中的目录不属于 root，或可被组或其他人写入，helper 拒绝启动）；CRIU 会转储这些挂载并在恢复时
    重建它（见 [作业能做什么、不能做什么](install.md#what-a-job-can-and-cannot-do)）。然后它切换到所有者的
    uid、gid 和组并设置 `no_new_privs`，以所有者身份打开日志
    （`/var/lib/gpueue/logs/<uid>/<id>.log`）和工作目录，并通过 `sh -c` 运行命令。
@@ -89,12 +92,15 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
 6. **检查点。** helper 检查可用空间（用于 RSS 和显存、保存在镜像中的已删除文件，以及作业的 `/tmp` 和
    `/dev/shm` 的内容）、挂载和作业的套接字。作业命名空间中的 FUSE 和网络挂载，如果主机上已没有它，
    或者其 `statfs` 以连接错误失败或在 5 秒内没有返回（在子进程中检查），或者它拒绝 root 访问（`lstat`
-   以 `EACCES` 失败：未使用 `allow_other` 的 FUSE 挂载），就被视为已死：在其上有打开的
+   以 `EACCES` 失败：未使用 `allow_other` 的 FUSE 挂载），就被视为已死；CRIU 只能从位于 root 以外的人可以修改的
+   目录之下的主机路径重新绑定的挂载也是如此（见 [恢复与路径](#restores-and-paths)）：在其上有打开的
    文件、工作目录或根目录、可执行文件、映射或绑定的 Unix 套接字的作业，会被拒绝，原因中写明该挂载。
    对其他作业，helper 把它们作为带有自己键名的外部挂载交给 CRIU
    （`--external mnt[<mount point>]:gpueue-detached-<n>`，其下的挂载用 `--skip-mnt`），并记录在
    `helper-mounts.json` 中，这样一个已死的文件系统不会让所有作业都无法做检查点（见
-   [不再响应的网络和 FUSE 文件系统](install.md#network-and-fuse-filesystems-that-stop-answering)）。如果检查失败，它会在触碰作业之前拒绝转储，作业继续运行，
+   [不再响应的网络和 FUSE 文件系统](install.md#network-and-fuse-filesystems-that-stop-answering)）。
+   如果命名空间 init 的后代中有进程位于自己的 PID 或用户命名空间（`unshare`、`bwrap`、rootless 容器运行时），
+   作业会被拒绝：CRIU 无法转储嵌套的 PID 和用户命名空间。如果检查失败，它会在触碰作业之前拒绝转储，作业继续运行，
    `checkpoint` 请求会失败并给出原因（只有在应当转储时才发现的拒绝，会改为随结果一起报告，并由守护进程警告所有者）。
    在手动模式下，它随后对每个 CUDA 进程运行
    `cuda-checkpoint --action lock` 和 `checkpoint`，接着以 `--tcp-close` 和
@@ -148,6 +154,15 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 - **在恢复之前**，如果所有者已离开其中某个组、镜像中有绑定在主机文件系统上的套接字，或者镜像中的某个路径
   （`files.img`）已无法由所有者在途中不经过符号链接而到达（以所有者身份通过
   `openat2(RESOLVE_NO_SYMLINKS)` 检查），则拒绝恢复；
+- **对 CRIU 从主机绑定的挂载**（作业命名空间的外部挂载，以及代替转储时略去的挂载的主机文件系统）：CRIU 以
+  root 身份按路径查找每个来源，并跟随途中的符号链接（`open_tree(AT_SYMLINK_NOFOLLOW)` 只保护最后一个组成部分），
+  而恢复钩子只检查任务持有的文件，不检查它们的挂载。因此到这样的来源途中的每个目录都必须是只有 root 能修改的
+  目录（属于 root，除非带 sticky 位否则不可被组或其他人写入，且不在 FUSE 文件系统上），并且不跟随符号链接地检查；
+  这样在 CRIU 绑定之前别人就无法改变它。否则，例如在自己的主目录中有 `allow_other` FUSE 挂载的所有者，可以在
+  检查之后重命名途中的某个目录并在原处放一个符号链接，恢复的作业就会被绑定上另一个主机目录，例如它本来无法到达
+  的其他用户主目录下的目录。转储时，这样的挂载被视为已死（使用它的作业被拒绝，其他作业在不包含它的情况下被
+  检查点）；略去的挂载除非其主机路径在恢复时通过此检查，否则恢复为空的、无法访问的目录；记录的外部挂载来源未
+  通过此检查的恢复会被拒绝；
 - **在恢复的作业运行之前**，检查 CRIU 实际打开了什么：CRIU 将
   `gpueue-helper verify-restore-hook` 作为其 `pre-resume` 动作脚本（`--action-script`）运行，
   此时恢复的任务已经完整，但仍在其控制下处于停止状态；该 hook 的子进程

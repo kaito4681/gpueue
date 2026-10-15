@@ -254,6 +254,7 @@ pub fn refusal(dead: &DeadMounts) -> Option<String> {
     const SHOWN: usize = 5;
     if !dead.used.is_empty() {
         let mut parts: Vec<String> = Vec::new();
+        let mut redirectable = false;
         for d in &dead.dead {
             let what: Vec<&str> = dead
                 .used
@@ -269,7 +270,18 @@ pub fn refusal(dead: &DeadMounts) -> Option<String> {
             if more > 0 {
                 list.push_str(&format!(" and {more} more"));
             }
+            redirectable |= d.why.starts_with(UNSAFE_BIND);
             parts.push(format!("{}; the job uses it: {list}", d.describe()));
+        }
+        if redirectable {
+            return Some(format!(
+                "the job depends on a filesystem that is gone, does not answer, root cannot \
+                 access, or that CRIU could only restore by binding a host path that someone \
+                 other than root can redirect: {}. It is not checkpointed; mount the \
+                 filesystem on a directory whose parents only root can change (an \
+                 administrator's mount point, such as below /mnt), or end the job",
+                parts.join("; ")
+            ));
         }
         return Some(format!(
             "the job depends on a filesystem that is gone, does not answer or root cannot \
@@ -410,6 +422,65 @@ pub fn mount_point_missing(path: &Path) -> bool {
         }
     }
 }
+
+/// Marks the mounts of `job` that CRIU could only bind again from a host
+/// path that someone other than root can redirect as dead, so that a dump
+/// leaves them out (or is refused when the job uses one) like a mount that
+/// refuses root: `candidates` are the possible bind sources of each mount
+/// (see [`crate::mounts::bind_source_candidates`]), `problems` the
+/// (path, why) of those that must not be bound (see
+/// [`crate::mountfd::bind_source_problem`]). `remote` and `answers` are
+/// the input of [`dead_mounts`]: a mount already there gets the reason if
+/// it answered, any other is added.
+///
+/// CRIU looks such a path up by its name as root on restore, following
+/// symlinks on the way, after every check. Whoever controls a directory on
+/// the way (alice's home, with her `allow_other` FUSE mount in it) could
+/// rename it and leave a symlink in its place, and the restored job would
+/// get another directory of the host bound there, such as one of another
+/// user's that alice could not reach.
+pub fn add_unsafe_binds(
+    job: &MountTree,
+    remote: &mut Vec<RemoteMount>,
+    answers: &mut Vec<Option<String>>,
+    candidates: &[(u64, Vec<String>)],
+    problems: &[(String, String)],
+) {
+    answers.resize(remote.len(), None);
+    for (id, paths) in candidates {
+        let Some((path, why)) = paths
+            .iter()
+            .find_map(|p| problems.iter().find(|(q, _)| q == p))
+        else {
+            continue;
+        };
+        let why = format!("{UNSAFE_BIND} {path} ({why})");
+        match remote.iter().position(|m| m.id == *id) {
+            Some(i) => {
+                if answers[i].is_none() {
+                    answers[i] = Some(why);
+                }
+            }
+            None => {
+                let Some(e) = job.get(*id) else { continue };
+                remote.push(RemoteMount {
+                    id: e.id,
+                    mount_point: e.mount_point.clone(),
+                    fstype: e.fstype.clone(),
+                    dev: e.dev.clone(),
+                    on_host: true,
+                });
+                answers.push(Some(why));
+            }
+        }
+    }
+}
+
+/// Start of [`DeadMount::why`] of a mount that CRIU could only bind again
+/// from a host path that someone other than root can redirect (see
+/// [`add_unsafe_binds`]); the path and why follow.
+pub const UNSAFE_BIND: &str =
+    "could only be restored by binding a host path that someone other than root can redirect:";
 
 /// [`DeadMount::why`] of a FUSE mount that refuses root.
 pub const NO_ROOT_ACCESS: &str = "cannot be accessed by root (a FUSE mount without `allow_other`)";
@@ -864,6 +935,57 @@ mod tests {
 
     /// What does not finish in time (as a lookup on a filesystem that does
     /// not answer) is left behind, without holding up the others.
+    /// A mount whose bind source someone other than root can redirect is
+    /// dead like one that refuses root; one that is dead already keeps its
+    /// reason.
+    #[test]
+    fn unsafe_bind_sources_make_mounts_dead() {
+        let job = MountTree::parse(
+            "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 8:1 /home/alice/x /data rw - ext4 /dev/sda1 rw
+3 1 0:50 / /home/alice/fs rw - fuse.sshfs alice@h: rw
+4 3 0:53 / /home/alice/fs/in rw - tmpfs tmpfs rw
+5 1 0:51 / /nfs rw - nfs h:/e rw
+",
+        );
+        let helper = MountTree::parse(
+            "\
+10 0 8:1 / / rw - ext4 /dev/sda1 rw
+13 10 0:50 / /home/alice/fs rw - fuse.sshfs alice@h: rw
+15 10 0:51 / /nfs rw - nfs h:/e rw
+",
+        );
+        let mut remote = remote_mounts(&job, &helper);
+        let mut answers = vec![None, Some("does not answer (x)".to_owned())];
+        let candidates = crate::mounts::bind_source_candidates(&job, &helper);
+        let why = "/home/alice is not a directory that only root can change".to_owned();
+        let problems = vec![
+            ("/home/alice/x".to_owned(), why.clone()),
+            ("/home/alice/fs".to_owned(), why.clone()),
+            ("/nfs".to_owned(), "never asked".to_owned()),
+        ];
+        add_unsafe_binds(&job, &mut remote, &mut answers, &candidates, &problems);
+        let dead = dead_mounts(&job, &remote, &answers);
+        let got: Vec<(&str, &str)> = dead
+            .dead
+            .iter()
+            .map(|d| (d.mount_point.as_str(), d.why.as_str()))
+            .collect();
+        let fs_why = format!("{UNSAFE_BIND} /home/alice/fs ({why})");
+        let data_why = format!("{UNSAFE_BIND} /home/alice/x ({why})");
+        assert_eq!(
+            got,
+            [
+                ("/home/alice/fs", fs_why.as_str()),
+                ("/nfs", "does not answer (x)"),
+                ("/data", data_why.as_str()),
+            ]
+        );
+        assert_eq!(dead.below, ["/home/alice/fs/in"]);
+        assert!(refusal(&dead).is_none());
+    }
+
     #[test]
     fn each_with_deadline_leaves_stuck_items_behind() {
         let start = std::time::Instant::now();

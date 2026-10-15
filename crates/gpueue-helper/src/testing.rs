@@ -32,6 +32,10 @@ pub struct FakeHost {
     verified: Mutex<Vec<VerifyRequest>>,
     tmpfs_bytes: Mutex<u64>,
     dead: Mutex<crate::deadmounts::DeadMounts>,
+    /// See [`FakeHost::set_nested_namespace_processes`].
+    nested: Mutex<Vec<String>>,
+    /// See [`FakeHost::set_bind_source_problems`].
+    bind_problems: Mutex<Vec<(String, String)>>,
     /// The CUDA PIDs of every [`HostProbe::with_cuda_threads_running`].
     cuda_released: Mutex<Vec<Vec<u32>>>,
     /// What [`HostProbe::unstopped_threads`] reports.
@@ -164,7 +168,9 @@ impl HostProbe for FakeHost {
         let problems = match req {
             VerifyRequest::Paths(_) => &self.path_problems,
             VerifyRequest::Restored(_) => &self.restored_problems,
-            VerifyRequest::Probe(c) => return Ok(vec![String::new(); c.paths.len()]),
+            VerifyRequest::Probe(c) | VerifyRequest::BindSources(c) => {
+                return Ok(vec![String::new(); c.paths.len()]);
+            }
             VerifyRequest::HeldAttrs(_) => return Err("not a check with a list of problems".into()),
             VerifyRequest::Exist(c) => {
                 return Ok(c
@@ -200,6 +206,23 @@ impl HostProbe for FakeHost {
         Ok(self.dead.lock().unwrap().clone())
     }
 
+    fn nested_namespace_processes(&self, _init_pid: u32) -> io::Result<Vec<String>> {
+        Ok(self.nested.lock().unwrap().clone())
+    }
+
+    fn bind_source_problems(&self, paths: &[String]) -> io::Result<Vec<Option<String>>> {
+        let problems = self.bind_problems.lock().unwrap();
+        Ok(paths
+            .iter()
+            .map(|p| {
+                problems
+                    .iter()
+                    .find(|(q, _)| q == p)
+                    .map(|(_, why)| why.clone())
+            })
+            .collect())
+    }
+
     fn with_cuda_threads_running(
         &self,
         _init_pid: u32,
@@ -224,6 +247,18 @@ impl FakeHost {
     /// What [`HostProbe::dead_mounts`] reports for every job.
     pub fn set_dead_mounts(&self, d: crate::deadmounts::DeadMounts) {
         *self.dead.lock().unwrap() = d;
+    }
+
+    /// What [`HostProbe::nested_namespace_processes`] reports for every
+    /// job.
+    pub fn set_nested_namespace_processes(&self, procs: Vec<String>) {
+        *self.nested.lock().unwrap() = procs;
+    }
+
+    /// (path, why) that [`HostProbe::bind_source_problems`] reports; every
+    /// other path may be bound.
+    pub fn set_bind_source_problems(&self, problems: Vec<(String, String)>) {
+        *self.bind_problems.lock().unwrap() = problems;
     }
 
     /// What [`HostProbe::process_groups`] reports for every job.

@@ -161,12 +161,13 @@ pub const SYSTEM_BUS_DIRS: [&str; 2] = ["/run/dbus", "/var/run/dbus"];
 /// Create the mount points a restore of a job hidden with `plan` needs
 /// on the host: the directories of [`MountPlan::hidden_dirs`] (the shim
 /// may have created them, and `/run` is empty after a reboot). Only where
-/// the parent exists; errors are left to the restore.
+/// the parent exists, and only through directories that only root can
+/// change, without following symlinks (see
+/// [`crate::mountfd::ensure_root_dir`]); errors are left to the restore.
 pub fn ensure_restore_mount_points(plan: &MountPlan) {
     for dir in &plan.hidden_dirs {
-        let path = std::path::Path::new(dir);
-        if path.parent().is_some_and(|p| p.is_dir()) && !path.exists() {
-            let _ = std::fs::DirBuilder::new().mode(0o755).create(path);
+        if let Err(e) = crate::mountfd::ensure_root_dir(dir) {
+            eprintln!("gpueue-helper: creating the mount point {dir}: {e}");
         }
     }
 }

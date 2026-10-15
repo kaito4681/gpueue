@@ -45,6 +45,11 @@ reason. A refused restore keeps the image so it can be retried.
   and keep your group memberships.
 - **Same mounts:** every filesystem the job saw when it started must be mounted at the same path
   again; files on a tmpfs such as `/scratch` do not survive a reboot.
+- **Your own FUSE mounts** (sshfs, rclone, ...) in your home or another directory you own are
+  left out of the checkpoint, and a job working in one is refused: mount it below a directory
+  only root controls (ask the administrator), or use `--no-checkpoint`.
+- **Nested namespaces:** a job that runs `unshare`, `bwrap` or a rootless container runtime
+  (its own PID or user namespace) is refused; use `--no-checkpoint`.
 - **Same GPU:** the GPU model, driver version and GPU index must match the time of the checkpoint.
 - **Disk space:** an image takes roughly RSS + VRAM (+ the job's `/tmp`, `/dev/shm`).
 - **PyTorch:** forked DataLoader workers are handled (a preloaded "fork guard"; Python 3.14+

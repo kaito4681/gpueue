@@ -167,6 +167,11 @@ pub enum VerifyRequest {
     /// The reply has one entry per path: empty if its filesystem answered,
     /// else why not.
     Probe(ProbeCheck),
+    /// Whether `criu restore` may bind these host paths by their names
+    /// (see [`crate::mountfd::bind_source_problem`]); the reply has one
+    /// entry per path: empty if it may, else why not. As root, each with
+    /// `timeout_ms`.
+    BindSources(ProbeCheck),
     /// The reply is a [`HeldAttrsReply`].
     HeldAttrs(HeldAttrsCheck),
 }
@@ -250,6 +255,23 @@ fn verify(req: Result<VerifyRequest, String>) -> VerifyReply {
         .into_iter()
         .map(Option::unwrap_or_default)
         .collect()),
+        VerifyRequest::BindSources(c) => {
+            let timeout = std::time::Duration::from_millis(c.timeout_ms);
+            Ok(
+                crate::deadmounts::each_with_deadline(c.paths, timeout, |p| {
+                    crate::mountfd::bind_source_problem(&p)
+                })
+                .into_iter()
+                .map(|r| match r {
+                    Some(problem) => problem.unwrap_or_default(),
+                    None => format!(
+                        "a directory on the way did not answer within {}s",
+                        timeout.as_secs()
+                    ),
+                })
+                .collect(),
+            )
+        }
         VerifyRequest::HeldAttrs(_) => Err("not a check with a list of problems".into()),
     })
 }

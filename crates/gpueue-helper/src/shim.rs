@@ -58,6 +58,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Gid, Pid, Uid};
 
 use crate::jobs::{JobFiles, MountPlan, ShimSpec, StartFailure, StartReport, write_status_to};
+use crate::mountfd;
 use crate::mounts::{MountTree, triggered_automounts, untriggered_automounts};
 pub use crate::mounts::{path_under, unescape_octal};
 
@@ -382,120 +383,6 @@ fn read_mount_tree() -> Result<MountTree, String> {
         .map_err(|e| format!("reading mountinfo: {e}"))
 }
 
-/// `O_PATH` descriptors for mount surgery. Paths come from mountinfo, but
-/// the directories on the way may belong to the job's owner, who can
-/// rename them or replace them with symlinks at any time (e.g. on a FUSE
-/// mount of their own). The shim is still root, so it never resolves such
-/// a path twice and never follows a symlink: it walks to a mount point's
-/// parent once, one component at a time, accepting only root-owned
-/// directories that nobody else can change, and then works relative to
-/// descriptors.
-mod mountfd {
-    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-
-    use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags, StatxFlags};
-
-    const PATH_FLAGS: OFlags = OFlags::PATH
-        .union(OFlags::DIRECTORY)
-        .union(OFlags::NOFOLLOW)
-        .union(OFlags::CLOEXEC);
-    /// For a mount point itself: without `O_DIRECTORY`, which would make
-    /// the lookup trigger an automount point (in the job's namespace, where
-    /// the automounter refuses with `EPERM`).
-    const LEAF_FLAGS: OFlags = OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
-    const RESOLVE: ResolveFlags = ResolveFlags::NO_SYMLINKS.union(ResolveFlags::NO_MAGICLINKS);
-
-    /// Whether a directory with the owner `uid` and this mode can only be
-    /// changed by `owner` (root, except in tests): owned by `owner` and not
-    /// group/world-writable, or sticky (then others cannot rename
-    /// `owner`'s entries, and the next component is checked in turn).
-    pub fn controlled_by(owner: u32, uid: u32, mode: u32) -> bool {
-        uid == owner && (mode & 0o022 == 0 || mode & 0o1000 != 0)
-    }
-
-    /// The parent directory of the absolute `path` and its last
-    /// component; `Err` if a component is a symlink or a directory on the
-    /// way is not controlled by root ([`controlled_by`]).
-    pub fn open_parent(path: &str) -> Result<(OwnedFd, String), String> {
-        open_parent_in("/", path, 0)
-    }
-
-    /// [`open_parent`] with the walk starting at the directory `top`
-    /// (instead of `/`) and every directory on the way required to be
-    /// controlled by `owner` (instead of root): `path`'s components are
-    /// looked up from `top`. For tests, which cannot rely on `/` and the
-    /// system directories being root's (e.g. in a Nix build sandbox).
-    pub(super) fn open_parent_in(
-        top: &str,
-        path: &str,
-        owner: u32,
-    ) -> Result<(OwnedFd, String), String> {
-        let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-        let Some((last, dirs)) = comps.split_last() else {
-            return Err(format!("{path:?} has no parent"));
-        };
-        if comps.iter().any(|c| *c == "." || *c == "..") {
-            return Err(format!("{path:?} is not a canonical path"));
-        }
-        let mut fd = rustix::fs::open(top, PATH_FLAGS, Mode::empty())
-            .map_err(|e| format!("opening {top}: {e}"))?;
-        check(&fd, top, owner)?;
-        let mut walked = String::new();
-        for c in dirs {
-            walked.push('/');
-            walked.push_str(c);
-            fd = rustix::fs::openat2(&fd, *c, PATH_FLAGS, Mode::empty(), RESOLVE)
-                .map_err(|e| format!("opening {walked} without following symlinks: {e}"))?;
-            check(&fd, &walked, owner)?;
-        }
-        Ok((fd, (*last).to_owned()))
-    }
-
-    fn check(fd: &OwnedFd, what: &str, owner: u32) -> Result<(), String> {
-        let st = rustix::fs::fstat(fd).map_err(|e| format!("{what}: {e}"))?;
-        if !controlled_by(owner, st.st_uid, st.st_mode) {
-            return Err(format!(
-                "{what} is not a directory that only root can change"
-            ));
-        }
-        Ok(())
-    }
-
-    /// `name` in `dir`, without following symlinks: the root of whatever is
-    /// mounted there, or the directory itself.
-    pub fn open_at(dir: &OwnedFd, name: &str) -> Result<OwnedFd, String> {
-        let fd = rustix::fs::openat2(dir, name, LEAF_FLAGS, Mode::empty(), RESOLVE)
-            .map_err(|e| format!("opening {name}: {e}"))?;
-        // `O_NOFOLLOW` opens a symlink itself.
-        let st = rustix::fs::fstat(&fd).map_err(|e| format!("{name}: {e}"))?;
-        if st.st_mode & 0o170000 == 0o120000 {
-            return Err(format!("{name} is a symlink"));
-        }
-        Ok(fd)
-    }
-
-    /// `path` without following symlinks (no ownership requirements).
-    pub fn open_nofollow(path: &str) -> Result<OwnedFd, String> {
-        rustix::fs::openat2(rustix::fs::CWD, path, LEAF_FLAGS, Mode::empty(), RESOLVE)
-            .map_err(|e| format!("opening {path}: {e}"))
-    }
-
-    /// The id of the mount `fd` is on (as in mountinfo).
-    pub fn mnt_id(fd: &OwnedFd) -> Result<u64, String> {
-        rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
-            .map(|s| s.stx_mnt_id)
-            .map_err(|e| format!("statx: {e}"))
-    }
-
-    /// Detach the mount whose root `fd` is (`umount2` through its
-    /// `/proc/self/fd` link, so the path is not resolved again).
-    pub fn detach(fd: &OwnedFd) -> Result<(), String> {
-        let path = format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd());
-        nix::mount::umount2(path.as_str(), nix::mount::MntFlags::MNT_DETACH)
-            .map_err(|e| format!("detaching: {e}"))
-    }
-}
-
 /// Remove every mount that is hidden under a later mount (see
 /// [`crate::mounts`]). The job cannot reach such a mount, but CRIU dumps it
 /// as an external bind of a path that does not lead to it, and the restore
@@ -787,6 +674,9 @@ fn prune_mounts(plan: &MountPlan) -> Result<(), String> {
         .iter()
         .filter(|(id, _)| now.get(*id).is_some())
         .map(|(_, p)| p.as_str())
+        // Those the private tmpfs covers are removed once it is mounted
+        // (see `setup_mounts`).
+        .filter(|p| !plan.tmpfs.iter().any(|t| crate::mounts::path_under(p, t)))
         .collect();
     if !left.is_empty() {
         eprintln!(
@@ -832,6 +722,13 @@ fn setup_mounts(plan: &MountPlan) -> Result<(), String> {
         )
         .map_err(|e| format!("mounting a tmpfs on {t}: {e}"))?;
     }
+    // Mounts that the pruning had to leave in place, because they lie
+    // below a directory that someone other than root can change (alice's
+    // FUSE mount in `/tmp/alice-dir/` when `/tmp` is a plain directory),
+    // are hidden under the private tmpfs now: set it aside and detach them
+    // by descriptor (see `remove_hidden_mounts`), or the job could not be
+    // restored.
+    remove_hidden_mounts()?;
     hide_dirs(&plan.hidden_dirs)?;
     if let Some(keep) = &plan.systemd_run_keep {
         mask_systemd_run(keep)?;
@@ -857,34 +754,22 @@ fn mount_empty_tmpfs(path: &Path) -> Result<(), String> {
 /// an empty tmpfs, creating it first if only it is missing. Two names of
 /// one directory (`/var/run/dbus` when `/var/run` links to `/run`) are
 /// hidden once; a directory whose parent does not exist is skipped (there
-/// is no path to it).
+/// is no path to it). Each is reached through directories only root can
+/// change, without following symlinks, and mounted on by descriptor (see
+/// [`mountfd::ensure_root_dir`]).
 fn hide_dirs(dirs: &[String]) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt;
-    let mut hidden: Vec<PathBuf> = Vec::new();
+    let mut hidden: Vec<String> = Vec::new();
     for dir in dirs {
-        let path = Path::new(dir);
-        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        let Some((fd, real)) =
+            mountfd::ensure_root_dir(dir).map_err(|e| format!("hiding {dir}: {e}"))?
+        else {
             continue;
         };
-        let Ok(parent) = std::fs::canonicalize(parent) else {
-            continue;
-        };
-        let real = parent.join(name);
         if hidden.contains(&real) {
             continue;
         }
-        match std::fs::symlink_metadata(&real) {
-            Ok(meta) if meta.is_dir() => {}
-            Ok(_) => return Err(format!("{}: not a directory", real.display())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                std::fs::DirBuilder::new()
-                    .mode(0o755)
-                    .create(&real)
-                    .map_err(|e| format!("creating {}: {e}", real.display()))?;
-            }
-            Err(e) => return Err(format!("{}: {e}", real.display())),
-        }
-        mount_empty_tmpfs(&real)?;
+        mount_empty_tmpfs(Path::new(&mountfd::fd_path(&fd)))
+            .map_err(|e| format!("{e} ({real})"))?;
         hidden.push(real);
     }
     Ok(())
@@ -1116,62 +1001,5 @@ mod tests {
             mounts_to_prune(mi, &MountPlan::default()),
             ["/tmp", "/tmp/.mount_orca-liellLH"]
         );
-    }
-
-    #[test]
-    fn mount_surgery_only_walks_root_controlled_directories() {
-        assert!(mountfd::controlled_by(0, 0, 0o40755));
-        assert!(mountfd::controlled_by(0, 0, 0o41777), "sticky like /tmp");
-        assert!(!mountfd::controlled_by(0, 0, 0o40777));
-        assert!(!mountfd::controlled_by(0, 0, 0o40775));
-        assert!(!mountfd::controlled_by(0, 1000, 0o40755));
-
-        // The walk starts at a directory tree of our own, with ourselves
-        // as the owner that must control it: `/` and the system
-        // directories are not root's everywhere (e.g. in a Nix build
-        // sandbox).
-        use std::os::unix::fs::PermissionsExt;
-        let me = nix::unistd::geteuid().as_raw();
-        let tmp = tempfile::tempdir().unwrap();
-        let top = tmp.path().to_str().unwrap();
-        let mkdir = |rel: &str, mode: u32| {
-            let p = tmp.path().join(rel);
-            std::fs::create_dir(&p).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
-        };
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        mkdir("usr", 0o755);
-        mkdir("usr/bin", 0o755);
-        std::fs::write(tmp.path().join("usr/bin/env"), b"").unwrap();
-        mkdir("proc", 0o755);
-        mkdir("proc/1", 0o555);
-        std::os::unix::fs::symlink("1", tmp.path().join("proc/self")).unwrap();
-        mkdir("tmp", 0o1777);
-        mkdir("tmp/d", 0o755);
-        mkdir("home", 0o777);
-        mkdir("srv", 0o775);
-
-        let (_, name) = mountfd::open_parent_in(top, "/usr/bin/env", me).unwrap();
-        assert_eq!(name, "env");
-        // Sticky (like /tmp): the next component is checked in turn.
-        mountfd::open_parent_in(top, "/tmp/d/x", me).unwrap();
-        // A symlink on the way (like `/proc/self`) is not followed.
-        let e = mountfd::open_parent_in(top, "/proc/self/fd/0", me).unwrap_err();
-        assert!(e.contains("/proc/self"), "{e}");
-        // A directory that others than its owner can change: entries
-        // could be renamed or replaced by a symlink.
-        let e = mountfd::open_parent_in(top, "/home/mnt", me).unwrap_err();
-        assert!(
-            e.contains("/home is not") && e.contains("only root can change"),
-            "{e}"
-        );
-        let e = mountfd::open_parent_in(top, "/srv/mnt", me).unwrap_err();
-        assert!(e.contains("/srv is not"), "{e}");
-        // A directory owned by someone else (e.g. a user's directory when
-        // the walk wants root's): already the top is refused.
-        let e = mountfd::open_parent_in(top, "/usr/bin/env", me ^ 1).unwrap_err();
-        assert!(e.contains("only root can change"), "{e}");
-        assert!(mountfd::open_parent("/").is_err());
-        assert!(mountfd::open_parent("/usr/../etc/x").is_err());
     }
 }

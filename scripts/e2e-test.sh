@@ -83,7 +83,7 @@ only="${only//,/ }"
 # GPU scenarios without GPUEUE_E2E_GPU=1 (they would be skipped silently).
 for n in $only; do
     case "$n" in
-    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17 | 18 | 19 | 20 | 21) ;;
+    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23) ;;
     9 | 11 | 12 | 14)
         if [ "${GPUEUE_E2E_GPU:-}" != 1 ]; then
             echo "scenario $n needs GPUEUE_E2E_GPU=1" >&2
@@ -98,14 +98,14 @@ for n in $only; do
 done
 # selected <n>: whether scenario <n> runs.
 selected() { [ -z "$only" ] || [[ " $only " == *" $1 "* ]]; }
-reboot_selected() { selected 7 || selected 15 || selected 16 || selected 20 || selected 21; }
-mounts_selected() { selected 15 || selected 16 || selected 20 || selected 21; }
-# Whether a scenario of the main phase (not 7, 15, 16, 20 or 21) is selected.
+reboot_selected() { selected 7 || selected 15 || selected 16 || selected 20 || selected 21 || selected 22; }
+mounts_selected() { selected 15 || selected 16 || selected 20 || selected 21 || selected 22; }
+# Whether a scenario of the main phase (not 7, 15, 16, 20, 21 or 22) is selected.
 main_selected() {
     local n
     [ -z "$only" ] && return 0
     for n in $only; do
-        case "$n" in 7 | 15 | 16 | 20 | 21) ;; *) return 0 ;; esac
+        case "$n" in 7 | 15 | 16 | 20 | 21 | 22) ;; *) return 0 ;; esac
     done
     return 1
 }

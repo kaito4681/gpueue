@@ -1278,7 +1278,7 @@ Every `*_secs` key is at most one year (31536000).
 | `job_systemd_varlink` | `false` | helper | `true` lets jobs reach systemd's Varlink services under `/run/systemd`; by default the directory is hidden from jobs except journald's log sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/` (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_min_uid` | `UID_MIN` of `/etc/login.defs`, else `1000` | helper | jobs of users with a smaller uid are refused (see [Who jobs may run as](#who-jobs-may-run-as)) |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]` | helper | root-equivalent groups: dropped from jobs' supplementary groups; a job whose primary group is one of them is refused |
-| `job_hidden_socket_dirs` | `["/run/libvirt", "/run/cups"]` | helper | directories hidden from jobs behind an empty root-owned tmpfs (created first if missing): those of daemon sockets that check the caller's groups in the user database, which dropping groups does not defeat; absolute paths at least two levels deep (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
+| `job_hidden_socket_dirs` | `["/run/libvirt", "/run/cups"]` | helper | directories hidden from jobs behind an empty root-owned tmpfs (created first if missing): those of daemon sockets that check the caller's groups in the user database, which dropping groups does not defeat; absolute paths at least two levels deep, whose existing directories (and symlinks) on the way are root's and not group- or world-writable (checked when the helper starts) (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_allowed_users` | `[]` (everyone) | helper | if not empty, only these users (by name) may run jobs |
 | `gpu_detection` | `"auto"` | daemon | `"auto"`: NVML, falling back to `[[gpus]]`. `"static"`: only `[[gpus]]`. |
 | `nvml_library` | unset | daemon | NVML library path or name; by default `libnvidia-ml.so.1`, then `libnvidia-ml.so` |
@@ -1776,7 +1776,8 @@ as root's (`root@server:`, `allow_other,default_permissions`) the restore is the
 filesystems where the owner may open the files as the job does (the usual case), changes do not
 matter.
 
-Tested across a simulated reboot (`scripts/e2e-test.sh`, scenarios 15, 16 and 20) with the job's
+Tested across a simulated reboot (`scripts/e2e-test.sh`, scenarios 15, 16 and 20; 21 and 22 on
+one boot) with the job's
 working directory and open files on each of these:
 
 | Mount | Restore after a reboot |
@@ -1791,7 +1792,9 @@ working directory and open files on each of these:
 | the same, with the job's working directory on it | not checkpointed (also not at the shutdown): `the job depends on a filesystem that is gone, does not answer or root cannot access: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
 | FUSE filesystem that the job's owner mounted without `allow_other` (sshfs), with a job that does not use it | works: it is checkpointed without it and gets an empty, inaccessible directory there |
 | the same, with the job's working directory on it | not checkpointed: `... /home/alice/pfuse (fuse.sshfs) cannot be accessed by root (a FUSE mount without `allow_other`); the job uses it: the working directory /home/alice/pfuse` |
-| FUSE filesystem mounted under the host's `/tmp` (an AppImage's, e.g. `/tmp/.mount_*`) | works: the job's private `/tmp` covers it, so it is not in the job's namespace at all |
+| FUSE filesystem mounted under the host's `/tmp` (an AppImage's, e.g. `/tmp/.mount_*`), also in a directory of the user's (`/tmp/alice-dir/fuse`) when `/tmp` is a plain directory | works: the job's private `/tmp` covers it, so it is not in the job's namespace at all |
+| FUSE filesystem that the job's owner mounted with `allow_other` in a directory of theirs (`/home/alice/a22/afuse`), with a job that does not use it | works: it is checkpointed without it and gets an empty, inaccessible directory there (CRIU would bind the host path again by its name, which the owner can redirect) |
+| the same, with the job's working directory on it | not checkpointed: `... /home/alice/a22/afuse (fuse.sshfs) could only be restored by binding a host path that someone other than root can redirect: /home/alice/a22/afuse (/home/alice is not a directory that only root can change); the job uses it: ...` |
 | tmpfs mounted by the administrator (e.g. `/scratch`) with the job's files or working directory on it | refused: its contents are gone after a reboot. Use a tmpfs only for jobs that do not need to survive one. A restore on the same boot works. |
 
 Not tested, or not supported:
@@ -1822,7 +1825,13 @@ no longer has it, or if `statfs` on it fails with a connection error (`ENOTCONN`
 ...) or does not return within 5 s (asked in a child process, so a hung NFS server cannot hold up
 the helper). A FUSE mount that refuses root is treated the same way: one mounted by a user without
 `allow_other` (a user's own sshfs) answers, but only to that
-user, so CRIU (which runs as root) could not bind it again on restore.
+user, so CRIU (which runs as root) could not bind it again on restore. So is any mount (of any
+type) that CRIU could only bind again from a host path below a directory that someone other than
+root can change, such as a user's `allow_other` FUSE mount in their home: CRIU looks that path up
+as root on restore, following symlinks, and the user could redirect it to a directory they could
+not reach otherwise (see [Restores and paths](architecture.md#restores-and-paths)). Mount
+filesystems that jobs should keep across a checkpoint on a directory whose parents only root can
+change, such as below `/mnt`.
 
 - A job that uses a dead mount (a file it has open there, its working or root directory, its
   executable, a file it has mapped, or a Unix socket bound there) is **not checkpointed**. The
@@ -1835,7 +1844,8 @@ user, so CRIU (which runs as root) could not bind it again on restore.
 - **Every other job is checkpointed without the mount**. On restore its mount point gets the
   filesystem again if a filesystem of the same type is mounted there and answers, and an empty
   directory that the job cannot open (root's, mode 0,
-  `/var/lib/gpueue/checkpoints/detached-mount`) otherwise. The job never sees what lies under the
+  `/var/lib/gpueue/checkpoints/detached-mount`) otherwise, and always when the path to the mount
+  point passes a directory that someone other than root can change. The job never sees what lies under the
   mount point on the host. Mounts below a dead mount are left out. The restore needs the mount
   point directory itself; if it is gone (a mount point created at boot), it is refused until the
   directory exists again.
@@ -2089,6 +2099,15 @@ warned on their next command. Refusals:
   again (restart the sshfs, bring the NFS server back; mount a user's FUSE filesystem with
   `-o allow_other`, which needs `user_allow_other` in `/etc/fuse.conf`) and checkpoint again. See
   [Network and FUSE filesystems that stop answering](#network-and-fuse-filesystems-that-stop-answering).
+- `the job depends on a filesystem that is gone, does not answer, root cannot access, or that CRIU
+  could only restore by binding a host path that someone other than root can redirect: <mount
+  point> (<type>) could only be restored by binding a host path ...`: the job uses a mount whose
+  host path lies below a directory that someone other than root can change (a user's
+  `allow_other` FUSE mount in their home). Mount the filesystem on a directory whose parents only
+  root can change (such as below `/mnt`) for jobs that must be checkpointed.
+- `the job has processes in a PID or user namespace of their own (...)`: the job runs
+  `unshare`, `bwrap` or a rootless container runtime, and CRIU cannot dump nested PID and user
+  namespaces. Run the job with `--no-checkpoint`, or without the nested namespace.
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`: the job's
   mount namespace depends on a mount that is hidden under another one, so it could never be
   restored. Run the job again (`gpueue restart`). New jobs get a cleaned-up namespace.
@@ -2147,6 +2166,10 @@ A failed restore keeps the job `Checkpointed` and keeps its image, so you can fi
   did not answer or refused root at the dump) are missing on this host`: CRIU needs the directory to mount
   something on. Create it (or mount the filesystem there) and restore again. See
   [Network and FUSE filesystems that stop answering](#network-and-fuse-filesystems-that-stop-answering).
+- `the checkpoint binds host paths below directories that someone other than root can change,
+  which CRIU would follow as root, so it is not restored: ...`: an image made before the helper
+  checked this at the dump has an external mount whose host path someone other than root could
+  redirect. It cannot be restored safely; remove it (`gpueue remove`) and run the job again.
 - `files or directories the job used are missing on this host: [...]`: files the job had open,
   or its working directory, are gone, typically because they were on a tmpfs (`/scratch`) that
   is empty after the reboot. The job cannot be restored. Remove it (`gpueue remove`).

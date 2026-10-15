@@ -103,6 +103,18 @@ pub trait HostProbe: Send + Sync + 'static {
     fn source_mounts(&self, _paths: &[String]) -> io::Result<Vec<SourceMount>> {
         Ok(Vec::new())
     }
+    /// For each of `paths` (host paths that `criu restore` binds by name),
+    /// why it must not (see [`crate::mountfd::bind_source_problem`]), or
+    /// `None`. The real host asks a child process with a deadline.
+    fn bind_source_problems(&self, paths: &[String]) -> io::Result<Vec<Option<String>>> {
+        Ok(vec![None; paths.len()])
+    }
+    /// Processes of the job whose namespace init is `init_pid` that are in
+    /// a PID or user namespace of their own (`unshare`, `bwrap`), which
+    /// CRIU cannot dump: each as "<pid> (<command>)".
+    fn nested_namespace_processes(&self, _init_pid: u32) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
     /// Which of `sources` are not mounted as they were at dump time (see
     /// [`crate::mounts::source_problem`]); triggers automount points on
     /// the way.
@@ -311,6 +323,12 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     fn missing_paths(&self, paths: &[String]) -> io::Result<Vec<String>> {
         (**self).missing_paths(paths)
     }
+    fn bind_source_problems(&self, paths: &[String]) -> io::Result<Vec<Option<String>>> {
+        (**self).bind_source_problems(paths)
+    }
+    fn nested_namespace_processes(&self, init_pid: u32) -> io::Result<Vec<String>> {
+        (**self).nested_namespace_processes(init_pid)
+    }
     fn missing_mount_points(&self, paths: &[String]) -> io::Result<Vec<String>> {
         (**self).missing_mount_points(paths)
     }
@@ -518,6 +536,64 @@ pub fn ns_processes(proc_root: &Path, init_pid: u32) -> io::Result<Vec<u32>> {
         .into_iter()
         .map(|p| p.host_pid)
         .collect())
+}
+
+/// The descendants of `init_pid` (by `PPid`, which in a PID namespace
+/// always leads back to its init) that are in another PID or user
+/// namespace than it, as "<pid> (<command>)". CRIU refuses to dump nested
+/// PID and user namespaces ("Can't dump nested pid namespace"), and the
+/// helper's scans of a job (see [`ns_processes`]) do not see the processes
+/// in a nested PID namespace.
+pub fn nested_namespace_processes(proc_root: &Path, init_pid: u32) -> io::Result<Vec<String>> {
+    use std::collections::{HashMap, HashSet};
+    let ns_of =
+        |pid: u32, ns: &str| fs::read_link(proc_root.join(pid.to_string()).join("ns").join(ns));
+    let pid_ns = ns_of(init_pid, "pid")?;
+    let user_ns = ns_of(init_pid, "user")?;
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in fs::read_dir(proc_root)? {
+        let Ok(entry) = entry else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let ppid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        if let Some(ppid) = ppid {
+            children.entry(ppid).or_default().push(pid);
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::from([init_pid]);
+    let mut todo = vec![init_pid];
+    while let Some(pid) = todo.pop() {
+        for &child in children.get(&pid).into_iter().flatten() {
+            if !seen.insert(child) {
+                continue;
+            }
+            todo.push(child);
+            // Exited meanwhile: nothing to report.
+            let (Ok(p), Ok(u)) = (ns_of(child, "pid"), ns_of(child, "user")) else {
+                continue;
+            };
+            if p != pid_ns || u != user_ns {
+                let comm = fs::read_to_string(proc_root.join(child.to_string()).join("comm"))
+                    .map(|c| c.trim().to_owned())
+                    .unwrap_or_default();
+                out.push(format!("{child} ({comm})"));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn ns_process_infos(proc_root: &Path, init_pid: u32) -> io::Result<Vec<ProcInfo>> {
@@ -759,6 +835,32 @@ impl HostProbe for SystemHost {
                 }
             })
             .collect();
+        // Mounts that CRIU could only bind again by a host path below a
+        // directory that someone other than root can change are treated
+        // the same way (see `crate::deadmounts::add_unsafe_binds`).
+        let candidates = crate::mounts::bind_source_candidates(&job, &own);
+        let mut paths: Vec<String> = Vec::new();
+        for (_, c) in &candidates {
+            for p in c {
+                if !paths.contains(p) {
+                    paths.push(p.clone());
+                }
+            }
+        }
+        let problems: Vec<(String, String)> = paths
+            .iter()
+            .cloned()
+            .zip(self.bind_source_problems(&paths)?)
+            .filter_map(|(p, why)| why.map(|w| (p, w)))
+            .collect();
+        let (mut remote, mut answers) = (remote, answers);
+        crate::deadmounts::add_unsafe_binds(
+            &job,
+            &mut remote,
+            &mut answers,
+            &candidates,
+            &problems,
+        );
         let mut dead = dead_mounts(&job, &remote, &answers);
         if !dead.dead.is_empty() {
             let procs: Vec<_> = host_pids
@@ -783,18 +885,26 @@ impl HostProbe for SystemHost {
             .map(|m| m.mount_point.clone())
             .collect();
         let answers = self.probe(&back)?;
+        // CRIU binds the host's mount by its path, as root: only one that
+        // nobody but root can redirect (see `crate::mountfd`).
+        let unsafe_paths = self.bind_source_problems(&back)?;
         let placeholder = placeholder.to_string_lossy().into_owned();
         Ok(mounts
             .iter()
             .map(|m| {
-                let alive = back
-                    .iter()
-                    .zip(&answers)
-                    .any(|(p, a)| p == &m.mount_point && a.is_none());
-                if alive {
-                    m.mount_point.clone()
-                } else {
-                    placeholder.clone()
+                let i = back.iter().position(|p| p == &m.mount_point);
+                let alive = i.is_some_and(|i| answers.get(i).is_some_and(Option::is_none));
+                match i.and_then(|i| unsafe_paths.get(i).cloned().flatten()) {
+                    Some(why) if alive => {
+                        eprintln!(
+                            "gpueue-helper: {} is mounted again, but not bound into the \
+                             restored job: {why}",
+                            m.mount_point
+                        );
+                        placeholder.clone()
+                    }
+                    _ if alive => m.mount_point.clone(),
+                    _ => placeholder.clone(),
                 }
             })
             .collect())
@@ -995,6 +1105,38 @@ impl HostProbe for SystemHost {
         .map_err(io::Error::other)
     }
 
+    fn bind_source_problems(&self, paths: &[String]) -> io::Result<Vec<Option<String>>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let timeout = crate::deadmounts::PROBE_TIMEOUT;
+        let req = VerifyRequest::BindSources(crate::access::ProbeCheck {
+            paths: paths.to_vec(),
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        });
+        let reply = crate::access::run_verify_child(
+            &self.helper_exe,
+            &req,
+            timeout + Duration::from_secs(10),
+        )
+        .map_err(io::Error::other)?;
+        if reply.len() != paths.len() {
+            return Err(io::Error::other(format!(
+                "the bind source check answered {} of {} paths",
+                reply.len(),
+                paths.len()
+            )));
+        }
+        Ok(reply
+            .into_iter()
+            .map(|r| (!r.is_empty()).then_some(r))
+            .collect())
+    }
+
+    fn nested_namespace_processes(&self, init_pid: u32) -> io::Result<Vec<String>> {
+        nested_namespace_processes(&self.proc_root, init_pid)
+    }
+
     fn missing_mount_points(&self, paths: &[String]) -> io::Result<Vec<String>> {
         if paths.is_empty() {
             return Ok(Vec::new());
@@ -1164,6 +1306,39 @@ pub fn parse_stat_ppid(stat: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Processes below the job's init in a PID or user namespace of their
+    /// own, found by `PPid` (a nested PID namespace's processes have other
+    /// `ns/pid` links than the init); other processes of the host are not
+    /// looked at.
+    #[test]
+    fn finds_nested_namespaces_below_the_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_ = |pid: u32, ppid: u32, pidns: &str, userns: &str, comm: &str| {
+            let d = tmp.path().join(pid.to_string());
+            fs::create_dir_all(d.join("ns")).unwrap();
+            fs::write(d.join("status"), format!("Name:\t{comm}\nPPid:\t{ppid}\n")).unwrap();
+            fs::write(d.join("comm"), format!("{comm}\n")).unwrap();
+            std::os::unix::fs::symlink(pidns, d.join("ns/pid")).unwrap();
+            std::os::unix::fs::symlink(userns, d.join("ns/user")).unwrap();
+        };
+        proc_(1, 0, "pid:[1]", "user:[1]", "systemd");
+        proc_(100, 1, "pid:[2]", "user:[1]", "gpueue-helper");
+        proc_(101, 100, "pid:[2]", "user:[1]", "sh");
+        proc_(102, 101, "pid:[2]", "user:[3]", "podman");
+        proc_(103, 101, "pid:[4]", "user:[3]", "unshare");
+        proc_(104, 103, "pid:[4]", "user:[3]", "sleep");
+        proc_(200, 1, "pid:[9]", "user:[9]", "other");
+        assert_eq!(
+            nested_namespace_processes(tmp.path(), 100).unwrap(),
+            ["102 (podman)", "103 (unshare)", "104 (sleep)"]
+        );
+        assert!(
+            nested_namespace_processes(tmp.path(), 103)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     /// Without cuda-checkpoint a GPU job's dump is refused instead of
     /// taking every process for one without CUDA.

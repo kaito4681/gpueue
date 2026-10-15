@@ -90,14 +90,19 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    reboot (`/run/*`, `/media/*`), replaces each automounted filesystem stacked on its `autofs`
    mount with a plain copy, and mounts private tmpfs on `/tmp` and `/dev/shm`, after detaching
    whatever is mounted at or below them (the host's tmpfs `/tmp` and mounts on it, such as an
-   AppImage's FUSE mount, which would otherwise stay hidden in the namespace). Unless
+   AppImage's FUSE mount, which would otherwise stay hidden in the namespace). A mount it cannot
+   reach that way, because it lies below a directory someone other than root can change (a
+   user's FUSE mount in `/tmp/<their dir>/` when `/tmp` is a plain directory), is removed after
+   the private tmpfs is mounted, by setting that aside as for other hidden mounts. Unless
    `job_system_dbus = true`, it hides `/run/dbus` behind an empty tmpfs and, unless
    `job_systemd_varlink = true`, hides `/run/systemd` behind a tmpfs that holds only journald's log
    sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/`, so the job cannot
    ask systemd or polkit for anything over D-Bus or Varlink, also once new sockets appear there.
    It hides the directories of `job_hidden_socket_dirs` (by default `/run/libvirt` and
    `/run/cups`, whose daemons check the caller's groups in the user database) behind empty
-   tmpfs the same way, creating missing ones first;
+   tmpfs the same way, creating missing ones first, each reached without following symlinks
+   through directories that only root can change (the helper refuses to start if a directory
+   on the way of an entry is not root's or is group- or world-writable);
    CRIU dumps these mounts and recreates them on restore (see
    [What a job can and cannot do](install.md#what-a-job-can-and-cannot-do)). Then it drops to
    the owner's
@@ -114,13 +119,17 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    FUSE and network mounts of the job's namespace that the host no longer has, whose `statfs`
    fails with a connection error or does not return within 5 s (asked in a child process), or
    that refuse root (`lstat` fails with `EACCES`: a FUSE mount without `allow_other`) are
-   dead: a job with an open file, its working or root directory, its executable, a mapping or a
+   dead, and so is any mount that CRIU could only bind again from a host path below a directory
+   that someone other than root can change (see [Restores and paths](#restores-and-paths)): a job with an open file, its working or root directory, its executable, a mapping or a
    bound Unix socket on one is refused with a reason that names the mount. For any other job the
    helper passes them to CRIU as external mounts with keys of its own
    (`--external mnt[<mount point>]:gpueue-detached-<n>`, mounts below them with `--skip-mnt`) and
    records them in `helper-mounts.json`, so that one dead filesystem does not keep every job
    from being checkpointed (see
    [Network and FUSE filesystems that stop answering](install.md#network-and-fuse-filesystems-that-stop-answering)).
+   A job with processes in a PID or user namespace of their own (`unshare`, `bwrap`, a rootless
+   container runtime), found among the descendants of the namespace's init, is refused: CRIU
+   cannot dump nested PID and user namespaces.
    If a check fails, it refuses the
    dump before touching the job, which keeps running, and the `checkpoint` request fails with the
    reason (a refusal found only when the dump is due is reported with the outcome instead, and the
@@ -202,6 +211,20 @@ hold a root file opened with the dump-time mode. The helper therefore:
   socket bound on a host filesystem, or if a path in the image (`files.img`) can no longer be
   reached by the owner without a symlink on the way (checked as the owner, with
   `openat2(RESOLVE_NO_SYMLINKS)`);
+- **for the mounts CRIU binds from the host** (the external mounts of the job's namespace, and
+  the host's filesystem in place of a mount left out at the dump): CRIU looks each source up by
+  its path, as root, following symlinks on the way (`open_tree(AT_SYMLINK_NOFOLLOW)` only
+  protects the last component), and the restore hook checks only the files the tasks hold, not
+  their mounts. So every directory on the way to such a source must be one that only root can
+  change (root's, not group- or world-writable unless sticky, not on a FUSE filesystem),
+  walked without following symlinks; nobody else can then redirect it before CRIU binds it.
+  Otherwise the owner of, say, an `allow_other` FUSE mount in their home could rename a
+  directory on the way after the checks and leave a symlink in its place, and the restored job
+  would get another host directory bound there, such as one below another user's home it could
+  not reach. At the dump such a mount counts as dead (a job that uses it is refused, any other
+  job is checkpointed without it); a mount left out is restored as the empty, inaccessible
+  directory unless its host path passes the check at the restore; and a restore whose recorded
+  external sources fail it is refused;
 - **before the restored job runs**, checks what CRIU actually opened: CRIU runs
   `gpueue-helper verify-restore-hook` as its `pre-resume` action script (`--action-script`),
   when the restored tasks are complete but still stopped under its control; the hook's child
