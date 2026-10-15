@@ -1267,20 +1267,19 @@ s18_job_policy() {
 # s19: a job of a user who can become root in every usual way outside puzuz
 # (member of sudo with a NOPASSWD rule, a polkit rule trusting the sudo
 # group, member of docker with a root daemon socket, member of disk with a
-# block device) cannot do any of it, before and after a checkpoint/restore.
+# block device, member of libvirt with world-connectable sockets in
+# /run/libvirt, which libvirt authorizes through polkit) cannot do any of
+# it, before and after a checkpoint/restore.
 # Each way is first shown to work for the same user outside puzuz.
 E2E_DOCKER_SOCK=/run/e2e-docker.sock
 E2E_LISTENERS=
-# late_sockets <job> <n>: as root, listen on new sockets in /run/dbus and
-# /run/systemd (also journal/ and resolve/) after job <job> started, and
-# add them to the list scenario 19's job checks.
-late_sockets() {
-    local dir sock
-    for dir in /run/dbus /run/systemd /run/systemd/journal /run/systemd/resolve; do
-        mkdir -p "$dir"
-        sock=$dir/e2e-late-$2
-        rm -f "$sock"
-        python3 -c '
+# listen_world <socket>: as root, listen on a world-connectable Unix
+# socket (like libvirt's polkit-authorized ones) in the background, and
+# check that eve can connect to it outside puzuz.
+listen_world() {
+    local sock=$1
+    rm -f "$sock"
+    python3 -c '
 import os, socket, sys
 s = socket.socket(socket.AF_UNIX)
 s.bind(sys.argv[1])
@@ -1288,10 +1287,23 @@ os.chmod(sys.argv[1], 0o666)
 s.listen(16)
 while True:
     s.accept()[0].close()' "$sock" &
-        E2E_LISTENERS="$E2E_LISTENERS $!"
-        wait_for 10 "the late socket $sock" test -S "$sock"
-        runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' \
-            "$sock" || fail "eve cannot connect to $sock outside puzuz"
+    E2E_LISTENERS="$E2E_LISTENERS $!"
+    wait_for 10 "the socket $sock" test -S "$sock"
+    runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' \
+        "$sock" || fail "eve cannot connect to $sock outside puzuz"
+}
+# The default job_hidden_socket_dirs.
+E2E_SOCKET_DIRS="/run/libvirt /run/cups"
+# late_sockets <job> <n>: as root, listen on new sockets in /run/dbus,
+# /run/systemd (also journal/ and resolve/) and the directories of
+# job_hidden_socket_dirs after job <job> started, and add them to the list
+# scenario 19's job checks.
+late_sockets() {
+    local dir sock
+    for dir in /run/dbus /run/systemd /run/systemd/journal /run/systemd/resolve $E2E_SOCKET_DIRS; do
+        mkdir -p "$dir"
+        sock=$dir/e2e-late-$2
+        listen_world "$sock"
         echo "$sock" >>/home/eve/e2e-late-sockets
     done
     echo "control: eve can connect to the late sockets (round $2) outside puzuz"
@@ -1392,8 +1404,24 @@ while True:
         || fail "eve cannot open $dev outside puzuz"
     echo "control: eve can open $dev outside puzuz"
 
+    # Daemon sockets that authorize by the caller's groups in the user
+    # database (libvirt: polkit; CUPS: SystemGroup), as world-connectable
+    # stand-ins: one in /run/libvirt, which exists before the job starts,
+    # and none in /run/cups, which the shim creates when the image has no
+    # CUPS (its late sockets then appear in a directory the job never saw).
+    groupadd -f libvirt
+    usermod -aG libvirt eve
+    command -v cupsd >/dev/null || rm -rf /run/cups
+    mkdir -p /run/libvirt
+    listen_world /run/libvirt/e2e-virtqemud-sock
+    echo /run/libvirt/e2e-virtqemud-sock >/home/eve/e2e-daemon-sockets
+    if [ -d /run/cups ]; then
+        listen_world /run/cups/e2e-cups.sock
+        echo /run/cups/e2e-cups.sock >>/home/eve/e2e-daemon-sockets
+    fi
+    echo "control: eve can connect to the daemon sockets outside puzuz: $(tr '\n' ' ' </home/eve/e2e-daemon-sockets)"
     : >/home/eve/e2e-late-sockets
-    chown eve: /home/eve/e2e-late-sockets
+    chown eve: /home/eve/e2e-late-sockets /home/eve/e2e-daemon-sockets
     id=$(add eve -- "bash /e2e/escalation_checks.sh $uid $gid $E2E_DOCKER_SOCK $dev /home/eve")
     wait_state "$id" running
     # Sockets that appear after the job started: in the spawned job ...
@@ -1404,12 +1432,14 @@ while True:
     wait_state "$id" checkpointed 120
     pz eve restore "$id" || fail "restore"
     wait_state "$id" running 120
-    # The restored job's namespace still hides /run/dbus and /run/systemd.
-    out=$(grep -E ' /run/(dbus|systemd) ' \
+    # The restored job's namespace still hides /run/dbus, /run/systemd and
+    # the directories of job_hidden_socket_dirs.
+    out=$(grep -E ' /run/(dbus|systemd|libvirt|cups) ' \
         "/proc/$(systemctl show -p MainPID --value "puzuz-job-$id-r1.service")/mountinfo" || true)
-    echo "restored job's mounts on /run/dbus and /run/systemd: $out"
-    grep -q ' /run/dbus .* - tmpfs ' <<<"$out" || fail "the restored job's namespace does not hide /run/dbus"
-    grep -q ' /run/systemd .* - tmpfs ' <<<"$out" || fail "the restored job's namespace does not hide /run/systemd"
+    echo "restored job's mounts on /run/dbus, /run/systemd, /run/libvirt and /run/cups: $out"
+    for r in /run/dbus /run/systemd $E2E_SOCKET_DIRS; do
+        grep -q " $r .* - tmpfs " <<<"$out" || fail "the restored job's namespace does not hide $r"
+    done
     # ... and in the restored one.
     late_sockets "$id" 2
     runuser -u eve -- touch /home/eve/round2
@@ -1444,6 +1474,10 @@ while True:
     [ "$(grep -cx 'ok journal socket reachable' <<<"$log")" = 2 ] || fail "the journal socket is gone in the job"
     [ "$(grep -c '^ok connect to /run/systemd/' <<<"$log")" = $((2 * $(grep -c . /home/eve/e2e-varlink-sockets))) ] \
         || fail "not every Varlink socket was tried and refused in both rounds"
+    for r in 'daemon socket .* hidden$' 'connect to the daemon socket '; do
+        [ "$(grep -c "^ok $r" <<<"$log")" = $((2 * $(grep -c . /home/eve/e2e-daemon-sockets))) ] \
+            || fail "not every daemon socket passed '$r' in both rounds"
+    done
     [ ! -e /run/e2e-escalated ] || fail "a job started the root-only unit"
     # Round 1 checks the sockets created before it, round 2 all of them.
     [ "$(grep -c '^ok late socket .* hidden$' <<<"$log")" = $((3 * $(grep -c . /home/eve/e2e-late-sockets) / 2)) ] \
@@ -1451,7 +1485,8 @@ while True:
 
     for r in $E2E_LISTENERS; do kill "$r" 2>/dev/null || true; done
     rm -f /run/dbus/e2e-late-* /run/systemd/e2e-late-* /run/systemd/journal/e2e-late-* \
-        /run/systemd/resolve/e2e-late-*
+        /run/systemd/resolve/e2e-late-* /run/libvirt/e2e-* /run/cups/e2e-*
+    gpasswd -d eve libvirt >/dev/null 2>&1 || true
     kill %1 2>/dev/null || true
     losetup -d "$dev" || true
     rm -f "$E2E_DOCKER_SOCK" /etc/sudoers.d/e2e-eve /etc/polkit-1/rules.d/10-e2e-sudo.rules

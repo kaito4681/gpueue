@@ -1072,6 +1072,10 @@ puzuz service status   # both units, and whether the daemon is reachable and con
 - whether jobs can reach the system D-Bus or systemd's Varlink services, a warning when
   `job_system_dbus` or `job_systemd_varlink` is on (`job d-bus`, see
   [What a job can and cannot do](#what-a-job-can-and-cannot-do))
+- which daemon socket directories are hidden from jobs, a warning when a default of
+  `job_hidden_socket_dirs` is left out, when an entry is not a directory, or when nix-daemon's
+  `trusted-users` names anyone besides root while `/nix/var/nix/daemon-socket` is not hidden
+  (`job sockets`, see [What a job can and cannot do](#what-a-job-can-and-cannot-do))
 - which users jobs may run as: the minimum uid, the denied groups and the allowed users
   (`job policy`, see [Who jobs may run as](#who-jobs-may-run-as))
 - whether the daemon's directories are inside its `ReadWritePaths=` (`daemon write paths`)
@@ -1160,7 +1164,8 @@ Every `*_secs` key is at most one year (31536000).
 | `job_system_dbus` | `false` | helper | `true` lets jobs reach the system D-Bus (systemd, polkit); by default `/run/dbus` is hidden from jobs (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_systemd_varlink` | `false` | helper | `true` lets jobs reach systemd's Varlink services under `/run/systemd`; by default the directory is hidden from jobs except journald's log sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/` (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_min_uid` | `UID_MIN` of `/etc/login.defs`, else `1000` | helper | jobs of users with a smaller uid are refused (see [Who jobs may run as](#who-jobs-may-run-as)) |
-| `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | helper | root-equivalent groups: dropped from jobs' supplementary groups; a job whose primary group is one of them is refused |
+| `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]` | helper | root-equivalent groups: dropped from jobs' supplementary groups; a job whose primary group is one of them is refused |
+| `job_hidden_socket_dirs` | `["/run/libvirt", "/run/cups"]` | helper | directories hidden from jobs behind an empty root-owned tmpfs (created first if missing): those of daemon sockets that check the caller's groups in the user database, which dropping groups does not defeat; absolute paths at least two levels deep (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_allowed_users` | `[]` (everyone) | helper | if not empty, only these users (by name) may run jobs |
 | `gpu_detection` | `"auto"` | daemon | `"auto"`: NVML, falling back to `[[gpus]]`. `"static"`: only `[[gpus]]`. |
 | `nvml_library` | unset | daemon | NVML library path or name; by default `libnvidia-ml.so.1`, then `libnvidia-ml.so` |
@@ -1210,14 +1215,14 @@ in, the helper applies three settings to every spawn and every restore:
   | --- | --- |
   | `docker` | the Docker socket starts containers that bind-mount `/` and run as root |
   | `lxd`, `incus-admin` | the same through LXD/Incus (privileged containers, host mounts); Incus's restricted `incus` group is not listed |
-  | `libvirt` | manages `qemu:///system`, whose VMs can be given host block devices and directories |
+  | `libvirt`, `libvirtd` (NixOS) | manages `qemu:///system`, whose VMs can be given host block devices and directories |
   | `disk` | raw read/write access to block devices, and so to every file on them |
   | `sudo`, `wheel`, `admin` | sudo rights: sudo normally asks for the password, which an unattended job cannot type, but `NOPASSWD` rules or cached credentials would let the job become root |
 
   Not listed, because they do not amount to root: `shadow` (password hashes, at most cracked
   offline), `adm` (logs), `kvm`, and `video`/`render` (devices; GPU jobs need the latter two).
   Add groups that are root-equivalent on your hosts (e.g. `microk8s`), or remove one to let jobs
-  use it again (e.g. `job_denied_groups = ["lxd", "incus-admin", "libvirt", "disk", "sudo",
+  use it again (e.g. `job_denied_groups = ["lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo",
   "wheel", "admin"]` lets jobs use Docker).
 - `job_allowed_users`: if not empty, only the users listed (by name) may run jobs.
 
@@ -1246,10 +1251,11 @@ and after a checkpoint and restore.
 | cannot gain privileges with `sudo`, `su`, `pkexec` or any other setuid or file-capability program | `no_new_privs` makes the kernel ignore setuid bits and file capabilities | none |
 | cannot reach the system D-Bus, so no `systemctl`, `run0`, `machinectl`, `busctl --system` or other request to systemd, polkit or system services | the shim hides `/run/dbus` (also `/var/run/dbus` if `/var/run` is not a link to `/run`) behind an empty root-owned tmpfs in the job's mount namespace, creating the directory if the host has none yet, so a bus socket that appears later is out of reach as well; CRIU saves the tmpfs and recreates it on restore; polkit takes group membership from the user database, not from the job's groups, so dropping groups alone would not stop it | `job_system_dbus = true` |
 | cannot reach systemd's Varlink services (`io.systemd.Manager` reload and reexecute, `io.systemd.Credentials` decryption of system credentials, mountfsd, nsresourced, machined, logind, networkd, sysupdate, ...), which authorize unprivileged callers through polkit without D-Bus | the shim hides `/run/systemd` behind an empty root-owned tmpfs that holds only journald's log sockets (`journal/socket`, `journal/stdout`, `journal/dev-log`), resolved's `resolve/io.systemd.Resolve`, `resolve/stub-resolv.conf` and `resolve/resolv.conf` (bound one by one, so sockets created there later stay out of reach), the `userdb/` directory (user and group lookups only, see below) and an empty `system/`; CRIU saves and recreates this on restore | `job_systemd_varlink = true` |
-| does not have the groups `docker`, `lxd`, `incus-admin`, `libvirt`, `disk`, `sudo`, `wheel`, `admin` (root daemons' sockets, raw block devices) | the helper drops them from the supplementary groups | `job_denied_groups` |
+| cannot reach daemon sockets that authorize callers by their groups in the user database: libvirt's (`/run/libvirt/libvirt-sock`, `virtqemud-sock`, `virtstoraged-sock`, ... with their `-ro` and `-admin` variants), which are world-connectable on Fedora, RHEL, Debian, Arch and NixOS and authorized through polkit, whose shipped rule grants `org.libvirt.unix.manage` to group `libvirt` (`libvirtd` on NixOS), so a member's job could otherwise define a VM or storage pool on the host's disks; and CUPS's `/run/cups/cups.sock`, where cupsd identifies the caller by its peer credentials and lets `SystemGroup` members (`lpadmin`, `wheel`) administer printers | the shim hides each directory of `job_hidden_socket_dirs` behind an empty root-owned tmpfs, as for `/run/dbus` (creating it if missing, so sockets that appear later stay out of reach; CRIU saves and recreates this on restore); printing still works, as libcups falls back to `localhost:631`, where administration needs a password | `job_hidden_socket_dirs` |
+| does not have the groups `docker`, `lxd`, `incus-admin`, `libvirt`, `libvirtd`, `disk`, `sudo`, `wheel`, `admin` (root daemons' sockets, raw block devices) | the helper drops them from the supplementary groups | `job_denied_groups` |
 | cannot open device nodes except the standard pseudo devices and its assigned GPUs' | `DevicePolicy=closed` with `DeviceAllow=` ([GPU isolation](#gpu-isolation)) | `gpu_device_isolation` |
 
-Each switch weakens one guarantee; `puzuz doctor` warns when `job_system_dbus = true` or `job_systemd_varlink = true`. What puzuz
+Each switch weakens one guarantee; `puzuz doctor` warns when `job_system_dbus = true` or `job_systemd_varlink = true`, and when `job_hidden_socket_dirs` leaves out a default. What puzuz
 does not limit: whatever the owner's uid itself may do (files, user services over the session bus,
 network access), the amount of CPU, memory or disk a job uses, and sockets of other services
 that check credentials on their own (for example a daemon socket that allows any user).
@@ -1265,6 +1271,27 @@ started over D-Bus (which a job cannot reach), and the system bus listens on no 
 (`<listen>unix:path=/run/dbus/system_bus_socket</listen>` only). Name resolution keeps working,
 but a job sees `resolv.conf` as it was when the job started (the files are bound, and resolved
 replaces them on changes).
+
+Daemon sockets elsewhere were checked on Ubuntu 22.04/24.04/26.04, Debian 12, Fedora, RHEL 9,
+Arch and NixOS. Most decide by the socket file's group, which dropping the group already defeats:
+Docker (`/run/docker.sock`, group `docker`), Incus (`/var/lib/incus/unix.socket`, group
+`incus-admin`; `unix.socket.user`, group `incus`, gives only restricted projects), LXD
+(`/var/snap/lxd/common/lxd/unix.socket` and Ubuntu's `/run/lxd-installer.socket`, group `lxd`),
+and libvirt on Ubuntu (`libvirt-sock` of group `libvirt` with `auth_unix_rw = "none"`; hidden
+anyway). Rootful Podman's `/run/podman/podman.sock`, containerd, virtlogd and virtlockd, and
+Cockpit's internal sockets accept only root or a system group; Cockpit itself (port 9090) and
+SSH ask for the user's password or key, like any login. udisks2, NetworkManager, PackageKit,
+accounts-daemon, fwupd and firewalld only have D-Bus interfaces. snapd's `/run/snapd.socket`
+allows anyone, but installing, removing or configuring snaps needs `auth_admin` in polkit, which
+needs an authentication agent on the system bus, so a job cannot (and snaps do not run under
+`no_new_privs` anyway). nix-daemon (`/nix/var/nix/daemon-socket/socket`) checks `@group` entries
+of `trusted-users` in the group database, and a trusted user is root-equivalent: the default
+(`root` only) is safe, but if you trust `@wheel` or other users, add
+`/nix/var/nix/daemon-socket` to `job_hidden_socket_dirs` (`puzuz doctor` warns), which takes
+the Nix daemon (building, fetching) away from jobs. Add the directory of any other site-specific
+socket that trusts groups or polkit rules the same way. A mask on a directory goes away if the
+host removes that directory (the kernel detaches mounts on a removed directory in every
+namespace), so list directories that the host keeps.
 
 ## Priority and fair share
 
@@ -1872,6 +1899,7 @@ stopped until `sudo systemctl start puzuz` or the next boot.
 | `checkpoint dir` | on tmpfs, or little free space | move `checkpoints_dir` to a disk with room for RAM + VRAM of your jobs |
 | `helper settings` | ExecStart= passes flags | move the settings into `config.toml` and drop the flags |
 | `job d-bus` | allowed (`job_system_dbus = true` or `job_systemd_varlink = true`): jobs can ask systemd and polkit for actions (WARN) | unless jobs need it, remove the key from `/etc/puzuz/config.toml` and `sudo systemctl restart puzuz-helper.service` |
+| `job sockets` | a default of `job_hidden_socket_dirs` is left out (`/run/libvirt not hidden`), an entry is not a directory (every job fails to start), or nix-daemon trusts users or groups besides root while `/nix/var/nix/daemon-socket` is not hidden (WARN) | set `job_hidden_socket_dirs` to the list the hint shows (or remove the key for the defaults) and `sudo systemctl restart puzuz-helper.service` |
 | `orphaned jobs` | the helper runs jobs the daemon does not account for (WARN; their GPUs stay taken) | `puzuz status` shows them to administrators; an administrator can stop one with `puzuz kill <id>` |
 
 On NixOS (`ID=nixos` in `/etc/os-release`), the `fix:` lines name the [module options](#nixos)

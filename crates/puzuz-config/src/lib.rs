@@ -40,7 +40,10 @@
 //! fork_guard = true
 //! # Groups dropped from jobs (and refused as a job's group); see
 //! # [`job_policy::DEFAULT_JOB_DENIED_GROUPS`].
-//! job_denied_groups = ["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]
+//! job_denied_groups = ["docker", "lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]
+//! # Directories hidden from jobs behind an empty tmpfs; see
+//! # [`job_policy::DEFAULT_JOB_HIDDEN_SOCKET_DIRS`].
+//! job_hidden_socket_dirs = ["/run/libvirt", "/run/cups"]
 //! job_allowed_users = []             # empty: every user with uid >= job_min_uid
 //! update_source = "github:kaito4681/puzuz"
 //! update_check = true
@@ -202,6 +205,16 @@ pub struct Config {
     pub job_denied_groups: Vec<String>,
     /// If not empty, only these users (by name) may run jobs (helper only).
     pub job_allowed_users: Vec<String>,
+    /// Directories hidden from every job behind an empty, root-owned tmpfs
+    /// (helper only; see [`job_policy::DEFAULT_JOB_HIDDEN_SOCKET_DIRS`]):
+    /// those of daemon sockets that authorize callers by looking up their
+    /// groups in the user database (directly or through polkit), which
+    /// dropping [`Config::job_denied_groups`] from the job does not
+    /// defeat. Like `/run/dbus`, a missing directory is created first, so
+    /// a socket that appears later is out of reach too. Each entry must be
+    /// an absolute path at least two levels deep (see
+    /// [`job_policy::check_hidden_socket_dir`]). An empty list hides none.
+    pub job_hidden_socket_dirs: Vec<String>,
     /// Where `puzuz update` and `puzuz doctor` look for releases:
     /// `github:<owner>/<repo>` (CLI only).
     pub update_source: String,
@@ -409,6 +422,7 @@ impl Default for Config {
             job_min_uid: None,
             job_denied_groups: job_policy::default_denied_groups(),
             job_allowed_users: Vec::new(),
+            job_hidden_socket_dirs: job_policy::default_hidden_socket_dirs(),
             update_source: DEFAULT_UPDATE_SOURCE.to_owned(),
             update_check: true,
             gpu_detection: GpuDetection::Auto,
@@ -572,6 +586,10 @@ impl Config {
                 return Err(format!("`{key}` contains an invalid name {bad:?}"));
             }
         }
+        for dir in &self.job_hidden_socket_dirs {
+            job_policy::check_hidden_socket_dir(dir)
+                .map_err(|e| format!("`job_hidden_socket_dirs`: {e}"))?;
+        }
         self.priority.validate()?;
         let mut seen = std::collections::HashSet::new();
         for gpu in &self.gpus {
@@ -671,6 +689,10 @@ mod tests {
             job_policy::DEFAULT_JOB_DENIED_GROUPS
         );
         assert!(config.job_allowed_users.is_empty());
+        assert_eq!(
+            config.job_hidden_socket_dirs,
+            job_policy::DEFAULT_JOB_HIDDEN_SOCKET_DIRS
+        );
         let p = &config.priority;
         assert_eq!(p.priority_type, PriorityType::Multifactor);
         assert_eq!(p.priority_weight_age, 1000);
@@ -797,6 +819,7 @@ mod tests {
             job_min_uid = 2000
             job_denied_groups = ["docker"]
             job_allowed_users = ["alice", "bob"]
+            job_hidden_socket_dirs = ["/run/libvirt", "/nix/var/nix/daemon-socket"]
             some_future_setting = "x"
 
             [some_future_table]
@@ -845,6 +868,10 @@ mod tests {
         assert_eq!(config.job_min_uid, Some(2000));
         assert_eq!(config.job_denied_groups, ["docker"]);
         assert_eq!(config.job_allowed_users, ["alice", "bob"]);
+        assert_eq!(
+            config.job_hidden_socket_dirs,
+            ["/run/libvirt", "/nix/var/nix/daemon-socket"]
+        );
         // An empty list denies no group.
         let config = Config::parse("job_denied_groups = []").unwrap();
         assert!(config.job_denied_groups.is_empty());
@@ -919,6 +946,22 @@ mod tests {
         assert!(invalid("job_denied_groups = [\"\"]").contains("job_denied_groups"));
         assert!(invalid("job_allowed_users = [\"a:b\"]").contains("job_allowed_users"));
         assert!(invalid("job_allowed_users = [\" alice\"]").contains("job_allowed_users"));
+        for bad in [
+            "run/libvirt",
+            "/run",
+            "/",
+            "/run/libvirt/",
+            "/run/../etc",
+            "/run/./libvirt",
+            "/proc/1",
+            "/run/systemd/x",
+            "/run/dbus",
+            "/tmp/x",
+        ] {
+            let text = format!("job_hidden_socket_dirs = [{bad:?}]");
+            assert!(invalid(&text).contains("job_hidden_socket_dirs"), "{bad}");
+        }
+        assert!(Config::parse("job_hidden_socket_dirs = []").is_ok());
         assert!(matches!(
             Config::parse("job_min_uid = -1"),
             Err(ParseError::Toml(_))

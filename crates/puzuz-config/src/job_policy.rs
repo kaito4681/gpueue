@@ -1,7 +1,8 @@
-//! Who jobs may run as: the defaults and host lookups behind
-//! [`Config::job_min_uid`](crate::Config::job_min_uid),
-//! [`Config::job_denied_groups`](crate::Config::job_denied_groups) and
-//! [`Config::job_allowed_users`](crate::Config::job_allowed_users).
+//! Who jobs may run as and what they may reach: the defaults and host
+//! lookups behind [`Config::job_min_uid`](crate::Config::job_min_uid),
+//! [`Config::job_denied_groups`](crate::Config::job_denied_groups),
+//! [`Config::job_allowed_users`](crate::Config::job_allowed_users) and
+//! [`Config::job_hidden_socket_dirs`](crate::Config::job_hidden_socket_dirs).
 //!
 //! The helper enforces the policy (it is the trust boundary); `puzuz doctor`
 //! shows the effective one. The file paths are parameters so that tests can
@@ -29,8 +30,8 @@ pub const FALLBACK_JOB_MIN_UID: u32 = 1000;
 /// - `lxd`, `incus-admin`: the same through LXD/Incus (privileged
 ///   containers, host mounts). Incus's unprivileged `incus` group is not
 ///   included.
-/// - `libvirt`: manages `qemu:///system`, whose VMs can be given host block
-///   devices and directories.
+/// - `libvirt`, `libvirtd` (NixOS's name): manage `qemu:///system`, whose
+///   VMs can be given host block devices and directories.
 /// - `disk`: raw read/write access to block devices, i.e. to every file on
 ///   them.
 /// - `sudo`, `wheel`, `admin`: sudo rights. sudo normally asks for the
@@ -46,6 +47,7 @@ pub const DEFAULT_JOB_DENIED_GROUPS: &[&str] = &[
     "lxd",
     "incus-admin",
     "libvirt",
+    "libvirtd",
     "disk",
     "sudo",
     "wheel",
@@ -58,6 +60,76 @@ pub fn default_denied_groups() -> Vec<String> {
         .iter()
         .map(|g| (*g).to_owned())
         .collect()
+}
+
+/// Default of `job_hidden_socket_dirs`: directories of daemon sockets that
+/// authorize clients by looking up the caller's groups in the user
+/// database (directly or through polkit), so dropping groups from a job
+/// (see [`DEFAULT_JOB_DENIED_GROUPS`]) does not take their rights away.
+///
+/// - `/run/libvirt`: libvirt's sockets (`libvirt-sock`, `virtqemud-sock`,
+///   `virtstoraged-sock`, ... and their `-ro`/`-admin` variants). On
+///   Fedora, RHEL, Debian, Arch and NixOS the read-write sockets are
+///   world-connectable and authorized through polkit, whose shipped rule
+///   grants `org.libvirt.unix.manage` to group `libvirt` (`libvirtd` on
+///   NixOS): a member's job could define a VM or storage pool on the
+///   host's disks.
+/// - `/run/cups`: CUPS's local socket, where cupsd identifies the caller
+///   from its peer credentials and checks `SystemGroup` (`lpadmin`,
+///   `wheel`, `sys`) in the group database, so a member's job could
+///   administer printers. Printing still works over `localhost:631`
+///   (libcups falls back to it when the socket is missing), where
+///   administration needs a password.
+pub const DEFAULT_JOB_HIDDEN_SOCKET_DIRS: &[&str] = &["/run/libvirt", "/run/cups"];
+
+/// The default of [`Config::job_hidden_socket_dirs`](crate::Config::job_hidden_socket_dirs).
+pub fn default_hidden_socket_dirs() -> Vec<String> {
+    DEFAULT_JOB_HIDDEN_SOCKET_DIRS
+        .iter()
+        .map(|d| (*d).to_owned())
+        .collect()
+}
+
+/// Top-level directories (and what lies below them) that
+/// `job_hidden_socket_dirs` may not name: the job needs them, the shim
+/// replaces them anyway (`/tmp`, `/proc`), or another key governs them
+/// (`/run/dbus`, `/run/systemd`).
+const NOT_HIDEABLE: &[&str] = &[
+    "/proc",
+    "/sys",
+    "/dev",
+    "/tmp",
+    "/run/dbus",
+    "/var/run/dbus",
+    "/run/systemd",
+    "/var/run/systemd",
+    "/run/user",
+    "/var/run/user",
+];
+
+/// Why `dir` cannot be an entry of `job_hidden_socket_dirs`, if it cannot:
+/// it must be an absolute, normalized path at least two levels deep (not
+/// `/`, `/run` or `/home`), outside [`NOT_HIDEABLE`].
+pub fn check_hidden_socket_dir(dir: &str) -> Result<(), String> {
+    let path = Path::new(dir);
+    let normal = dir.strip_prefix('/').is_some_and(|rest| {
+        rest.split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+    });
+    if !normal || dir.contains(['\n', '\0']) {
+        return Err(format!("{dir:?} is not an absolute, normalized path"));
+    }
+    if path.components().count() < 3 {
+        return Err(format!(
+            "{dir:?} is a top-level directory; name the directory that holds the sockets"
+        ));
+    }
+    if let Some(reserved) = NOT_HIDEABLE.iter().find(|r| path.starts_with(Path::new(r))) {
+        return Err(format!(
+            "{dir:?} is below {reserved}, which cannot be hidden this way"
+        ));
+    }
+    Ok(())
 }
 
 /// Where the effective minimum uid came from.

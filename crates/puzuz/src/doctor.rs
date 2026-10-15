@@ -396,6 +396,113 @@ fn check_job_system_dbus(config: &Config, nixos: bool) -> Check {
     .hint(format!("unless jobs need it, {how}"))
 }
 
+/// Where nix-daemon listens; hiding it from jobs is the fix when it trusts
+/// more than root.
+const NIX_DAEMON_SOCKET_DIR: &str = "/nix/var/nix/daemon-socket";
+/// nix-daemon's configuration (`trusted-users`).
+const NIX_CONF: &str = "/etc/nix/nix.conf";
+
+/// The non-root entries of `trusted-users` and `extra-trusted-users` in the
+/// contents of a `nix.conf` (the last `trusted-users` wins, `extra-` adds;
+/// `include` files are not followed).
+fn nix_trusted_non_root(nix_conf: &str) -> Vec<String> {
+    let mut trusted: Vec<String> = vec!["root".into()];
+    for line in nix_conf.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let values = value.split_whitespace().map(String::from);
+        match key.trim() {
+            "trusted-users" => trusted = values.collect(),
+            "extra-trusted-users" => trusted.extend(values),
+            _ => {}
+        }
+    }
+    trusted.retain(|u| u != "root");
+    trusted.dedup();
+    trusted
+}
+
+/// `job_hidden_socket_dirs`: which daemon sockets are hidden from jobs. Warns when a default
+/// entry is missing, when an entry is not a directory (jobs would fail to start) and when
+/// nix-daemon trusts users or groups besides root while its socket stays reachable (it checks
+/// `@group` entries in the group database, so dropping the group from a job does not help).
+fn check_job_hidden_sockets(sys: &dyn System, config: &Config, nixos: bool) -> Check {
+    use puzuz_config::job_policy::DEFAULT_JOB_HIDDEN_SOCKET_DIRS;
+    const NAME: &str = "job sockets";
+    let dirs = &config.job_hidden_socket_dirs;
+    let listed = |d: &str| dirs.iter().any(|x| x == d);
+    let mut problems = Vec::new();
+    let missing: Vec<&str> = DEFAULT_JOB_HIDDEN_SOCKET_DIRS
+        .iter()
+        .copied()
+        .filter(|d| !listed(d))
+        .collect();
+    if !missing.is_empty() {
+        problems.push(format!(
+            "{} not hidden: jobs can reach the daemon sockets there, which authorize callers \
+             by their groups in the user database (polkit for libvirt, SystemGroup for CUPS), \
+             not by the job's groups",
+            missing.join(", ")
+        ));
+    }
+    let not_dirs: Vec<&str> = dirs
+        .iter()
+        .filter(|d| std::fs::symlink_metadata(sys.path(Path::new(d))).is_ok_and(|m| !m.is_dir()))
+        .map(String::as_str)
+        .collect();
+    if !not_dirs.is_empty() {
+        problems.push(format!(
+            "{} not a directory: every job fails to start (list the directory that holds \
+             the socket)",
+            not_dirs.join(", ")
+        ));
+    }
+    let nix_trusted = std::fs::read_to_string(sys.path(Path::new(NIX_CONF)))
+        .map(|text| nix_trusted_non_root(&text))
+        .unwrap_or_default();
+    if !nix_trusted.is_empty() && !listed(NIX_DAEMON_SOCKET_DIR) {
+        problems.push(format!(
+            "nix-daemon trusts {} ({NIX_CONF}), and its trusted users are root-equivalent: \
+             their jobs can act as root through {NIX_DAEMON_SOCKET_DIR}/socket, also with the \
+             group dropped",
+            nix_trusted.join(" ")
+        ));
+    }
+    if problems.is_empty() {
+        let shown = if dirs.is_empty() {
+            "none".to_owned()
+        } else {
+            dirs.join(", ")
+        };
+        return Check::ok(
+            NAME,
+            format!("hidden from jobs: {shown} (daemons that authorize by group membership)"),
+        );
+    }
+    let key = "job_hidden_socket_dirs";
+    let how = if nixos {
+        format!("set `services.puzuz.settings.{key}`, then `{REBUILD}`")
+    } else {
+        format!("set `{key}` in {DEFAULT_CONFIG_PATH} and `sudo systemctl restart {HELPER_UNIT}`")
+    };
+    let mut want: Vec<String> = dirs
+        .iter()
+        .filter(|d| !not_dirs.contains(&d.as_str()))
+        .cloned()
+        .collect();
+    for d in missing {
+        want.push(d.to_owned());
+    }
+    if !nix_trusted.is_empty() && !listed(NIX_DAEMON_SOCKET_DIR) {
+        want.push(NIX_DAEMON_SOCKET_DIR.to_owned());
+    }
+    Check::warn(NAME, problems.join("; ")).hint(format!(
+        "unless jobs need them, {how} to {want:?} (without the key, the defaults apply)"
+    ))
+}
+
 /// The helper's job credential policy: the minimum uid and where it comes from, the denied
 /// groups (and which of them exist here), the allowed users.
 fn check_job_policy(sys: &dyn System, config: &Config) -> Check {
@@ -542,6 +649,7 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
     checks.push(check_helper_settings(sys, &config, nixos));
     checks.push(check_gpu_isolation(&config, nixos));
     checks.push(check_job_system_dbus(&config, nixos));
+    checks.push(check_job_hidden_sockets(sys, &config, nixos));
     checks.push(check_job_policy(sys, &config));
     if let Some(check) = check_daemon_write_paths(sys, &config, nixos) {
         checks.push(check);

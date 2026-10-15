@@ -111,14 +111,16 @@ pub struct MountPlan {
     pub tmpfs: Vec<String>,
     /// Hide each of these directories behind an empty, root-owned tmpfs,
     /// after pruning: by default the system D-Bus directory under both of
-    /// its names (`/run/dbus`, `/var/run/dbus`), so that a job cannot reach
-    /// the system bus, also when its socket appears only later (the
-    /// host's directory is not visible in the job at all). A missing
-    /// directory is created first (as root, `0755`) if its parent exists;
-    /// two names of the same directory (`/var/run` is usually a link to
-    /// `/run`) are hidden once. Empty with `job_system_dbus = true`. CRIU
-    /// saves the tmpfs; the helper creates missing mount points before a
-    /// restore (see [`ensure_restore_mount_points`]).
+    /// its names (`/run/dbus`, `/var/run/dbus`; left out with
+    /// `job_system_dbus = true`) and the entries of
+    /// `job_hidden_socket_dirs` (`/run/libvirt`, `/run/cups`), so that a
+    /// job cannot reach the sockets there, also when they appear only
+    /// later (the host's directory is not visible in the job at all). A
+    /// missing directory is created first (as root, `0755`) if its parent
+    /// exists; two names of the same directory (`/var/run` is usually a
+    /// link to `/run`) are hidden once. CRIU saves the tmpfs; the helper
+    /// creates missing mount points before a restore (see
+    /// [`ensure_restore_mount_points`]).
     #[serde(default)]
     pub hidden_dirs: Vec<String>,
     /// `Some`: hide `/run/systemd` behind an empty, root-owned tmpfs that
@@ -183,7 +185,11 @@ impl Default for MountPlan {
             prune: vec!["/run/".into(), "/media/".into(), "/dev/shm".into()],
             keep: vec!["/run/nvidia-persistenced".into()],
             tmpfs: vec!["/tmp".into(), "/dev/shm".into()],
-            hidden_dirs: SYSTEM_BUS_DIRS.iter().map(|p| (*p).to_owned()).collect(),
+            hidden_dirs: SYSTEM_BUS_DIRS
+                .iter()
+                .chain(puzuz_config::job_policy::DEFAULT_JOB_HIDDEN_SOCKET_DIRS)
+                .map(|p| (*p).to_owned())
+                .collect(),
             systemd_run_keep: Some(SYSTEMD_RUN_KEEP.iter().map(|p| (*p).to_owned()).collect()),
         }
     }

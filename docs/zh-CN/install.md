@@ -984,6 +984,9 @@ puzuz service status   # both units, and whether the daemon is reachable and con
 - 作业的单元是否只能打开分配给它的 GPU 的设备节点（`gpu isolation`，见 [GPU 隔离](#gpu-isolation)）
 - 作业能否访问系统 D-Bus 或 systemd 的 Varlink 服务；启用 `job_system_dbus` 或 `job_systemd_varlink` 时
   发出警告（`job d-bus`，见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)）
+- 对作业隐藏了哪些守护进程套接字目录；`job_hidden_socket_dirs` 缺少某个默认项、某一项不是目录，或
+  nix-daemon 的 `trusted-users` 列出了 root 以外的用户而 `/nix/var/nix/daemon-socket` 未被隐藏时发出警告
+  （`job sockets`，见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)）
 - 作业可以以哪些用户身份运行：最小 uid、被拒绝的组和允许的用户（`job policy`，见
   [谁可以运行作业](#who-jobs-may-run-as)）
 - 守护进程的目录是否在其 `ReadWritePaths=` 之内（`daemon write paths`）
@@ -1064,7 +1067,8 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/puzu
 | `job_system_dbus` | `false` | helper | `true` 允许作业访问系统 D-Bus（systemd、polkit）；默认情况下对作业隐藏 `/run/dbus`（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
 | `job_systemd_varlink` | `false` | helper | `true` 允许作业访问 `/run/systemd` 下的 systemd Varlink 服务；默认情况下该目录对作业隐藏，只保留 journald 的日志套接字、resolved 的名称解析套接字和 `resolv.conf` 文件以及 `userdb/`（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
 | `job_min_uid` | `/etc/login.defs` 的 `UID_MIN`，没有则为 `1000` | helper | 拒绝 uid 小于此值的用户的作业（见 [谁可以运行作业](#who-jobs-may-run-as)） |
-| `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | helper | 等同 root 的组：从作业的附加组中去掉；主组为其中之一的作业会被拒绝 |
+| `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]` | helper | 等同 root 的组：从作业的附加组中去掉；主组为其中之一的作业会被拒绝 |
+| `job_hidden_socket_dirs` | `["/run/libvirt", "/run/cups"]` | helper | 用空的、属于 root 的 tmpfs 对作业隐藏的目录（不存在时先创建）：这些守护进程套接字在用户数据库中检查调用者的组，去掉组无法阻止；须为至少两级深的绝对路径（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
 | `job_allowed_users` | `[]`（所有人） | helper | 非空时，只有列出的用户（按名称）可以运行作业 |
 | `gpu_detection` | `"auto"` | 守护进程 | `"auto"`：NVML，失败时退回 `[[gpus]]`。`"static"`：只用 `[[gpus]]`。 |
 | `nvml_library` | 未设置 | 守护进程 | NVML 库的路径或名称；默认先用 `libnvidia-ml.so.1`，再用 `libnvidia-ml.so` |
@@ -1109,13 +1113,13 @@ root helper 以所有者身份启动每个作业，因此由它决定运行谁�
   | --- | --- |
   | `docker` | 通过 Docker 套接字可以启动绑定挂载 `/` 并以 root 运行的容器 |
   | `lxd`、`incus-admin` | 通过 LXD/Incus 可以做同样的事（特权容器、主机挂载）；不包括 Incus 受限的 `incus` 组 |
-  | `libvirt` | 管理 `qemu:///system`，可以把主机的块设备和目录交给其虚拟机 |
+  | `libvirt`、`libvirtd`（NixOS） | 管理 `qemu:///system`，可以把主机的块设备和目录交给其虚拟机 |
   | `disk` | 可以直接读写块设备，也就是读写其上的所有文件 |
   | `sudo`、`wheel`、`admin` | sudo 权限：sudo 通常会询问密码，无人值守的作业无法输入，但 `NOPASSWD` 规则或缓存的凭据会让作业成为 root |
 
   因为不等同 root 而未包括的组：`shadow`（密码哈希，至多被离线破解）、`adm`（日志）、`kvm`，以及
   `video`/`render`（设备；GPU 作业需要后两者）。请添加在你的主机上等同 root 的组（例如 `microk8s`），或去掉
-  某个组让作业重新可以使用它（例如 `job_denied_groups = ["lxd", "incus-admin", "libvirt", "disk", "sudo",
+  某个组让作业重新可以使用它（例如 `job_denied_groups = ["lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo",
   "wheel", "admin"]` 让作业可以使用 Docker）。
 - `job_allowed_users`：非空时，只有列出的用户（按名称）可以运行作业。
 
@@ -1141,10 +1145,11 @@ job_allowed_users`。`puzuz status` 将其显示为 `Failed to spawn`，`puzuz l
 | 无法通过 `sudo`、`su`、`pkexec` 或其他 setuid / 文件 capability 程序获得特权 | 在 `no_new_privs` 下内核会忽略 setuid 位和文件 capability | 无 |
 | 无法访问系统 D-Bus，因此无法执行 `systemctl`、`run0`、`machinectl`、`busctl --system` 或其他对 systemd、polkit、系统服务的请求 | shim 在作业的挂载命名空间中用一个空的、属于 root 的 tmpfs 隐藏 `/run/dbus`（若 `/var/run` 不是指向 `/run` 的链接，`/var/run/dbus` 也一样），主机上还没有该目录时会先创建它，因此之后才出现的总线套接字同样无法访问；恢复时 CRIU 会保存并重建这个 tmpfs；polkit 从用户数据库而不是作业的组判断组成员关系，仅去掉组无法阻止它 | `job_system_dbus = true` |
 | 无法访问 systemd 的 Varlink 服务（`io.systemd.Manager` 的 reload 和 reexecute、`io.systemd.Credentials` 对系统凭据的解密、mountfsd、nsresourced、machined、logind、networkd、sysupdate 等），这些服务不经过 D-Bus，通过 polkit 为非特权调用者授权 | shim 用一个空的、属于 root 的 tmpfs 隐藏 `/run/systemd`，只保留 journald 的日志套接字（`journal/socket`、`journal/stdout`、`journal/dev-log`）、resolved 的 `resolve/io.systemd.Resolve`、`resolve/stub-resolv.conf` 和 `resolve/resolv.conf`（逐个绑定，因此之后在那里创建的套接字仍无法访问）、`userdb/` 目录（只用于用户和组查询，见下文）以及一个空的 `system/`；恢复时 CRIU 会保存并重建这些 | `job_systemd_varlink = true` |
-| 不具有 `docker`、`lxd`、`incus-admin`、`libvirt`、`disk`、`sudo`、`wheel`、`admin` 组（root 守护进程的套接字、原始块设备） | helper 将它们从附加组中去掉 | `job_denied_groups` |
+| 无法访问在用户数据库中检查调用者的组来授权的守护进程套接字：libvirt 的套接字（`/run/libvirt/libvirt-sock`、`virtqemud-sock`、`virtstoraged-sock` 等，以及它们的 `-ro` 和 `-admin` 变体）在 Fedora、RHEL、Debian、Arch 和 NixOS 上任何人都能连接，并通过 polkit 授权，随附的 polkit 规则把 `org.libvirt.unix.manage` 授予 `libvirt` 组（NixOS 上为 `libvirtd`），否则成员的作业可以定义使用主机磁盘的虚拟机或存储池；CUPS 的 `/run/cups/cups.sock` 上，cupsd 通过对端凭据识别调用者，并允许 `SystemGroup`（`lpadmin`、`wheel`）的成员管理打印机 | shim 像处理 `/run/dbus` 一样，用空的、属于 root 的 tmpfs 隐藏 `job_hidden_socket_dirs` 中的每个目录（不存在时先创建，因此之后出现的套接字同样无法访问；恢复时 CRIU 会保存并重建）；libcups 会改用 `localhost:631`，因此仍可打印，而在那里管理需要密码 | `job_hidden_socket_dirs` |
+| 不具有 `docker`、`lxd`、`incus-admin`、`libvirt`、`libvirtd`、`disk`、`sudo`、`wheel`、`admin` 组（root 守护进程的套接字、原始块设备） | helper 将它们从附加组中去掉 | `job_denied_groups` |
 | 除标准伪设备和所分配 GPU 的设备节点外，无法打开任何设备节点 | `DevicePolicy=closed` 加 `DeviceAllow=`（[GPU 隔离](#gpu-isolation)） | `gpu_device_isolation` |
 
-每个开关都会削弱一项保证；`job_system_dbus = true` 或 `job_systemd_varlink = true` 时 `puzuz doctor` 会发出警告。puzuz 不限制的内容：所有者的
+每个开关都会削弱一项保证；`job_system_dbus = true` 或 `job_systemd_varlink = true` 时，以及 `job_hidden_socket_dirs` 缺少默认项时，`puzuz doctor` 会发出警告。puzuz 不限制的内容：所有者的
 uid 本身能做的事（文件、通过会话总线的用户服务、网络访问）、作业使用的 CPU、内存或磁盘量，以及自行检查凭据的
 其他服务的套接字（例如允许任何用户的守护进程套接字）。作业的挂载是私有的（不接收主机的传播），因此主机之后在
 `/run/dbus`、`/run/systemd` 或其 `journal/` 和 `resolve/` 中创建的套接字，无论恢复前后都不会出现在作业中（e2e 场景 19
@@ -1154,6 +1159,21 @@ uid 本身能做的事（文件、通过会话总线的用户服务、网络访�
 0644）；polkit 的 `/run/polkit/agent-helper.socket` 只能完成客户端通过 D-Bus 发起的 polkit 认证（作业无法访问 D-Bus）；
 系统总线不监听其他地址（只有 `<listen>unix:path=/run/dbus/system_bus_socket</listen>`）。名称解析可以正常使用，但作业看到的是
 作业启动时的 `resolv.conf`（这些文件是绑定挂载的，而 resolved 在变化时会替换文件）。
+
+其他位置的守护进程套接字已在 Ubuntu 22.04/24.04/26.04、Debian 12、Fedora、RHEL 9、Arch 和 NixOS 上检查过。
+大多数根据套接字文件的组来判断，去掉组即可阻止：Docker（`/run/docker.sock`，`docker` 组）、Incus
+（`/var/lib/incus/unix.socket`，`incus-admin` 组；`unix.socket.user` 属于 `incus` 组，只提供受限项目）、LXD
+（`/var/snap/lxd/common/lxd/unix.socket` 和 Ubuntu 的 `/run/lxd-installer.socket`，`lxd` 组），以及 Ubuntu 上的 libvirt
+（`libvirt` 组的 `libvirt-sock`，`auth_unix_rw = "none"`；无论如何都会隐藏）。rootful Podman 的 `/run/podman/podman.sock`、
+containerd、virtlogd 和 virtlockd 以及 Cockpit 的内部套接字只接受 root 或系统组；Cockpit 本身（端口 9090）和 SSH
+与任何登录一样需要用户的密码或密钥。udisks2、NetworkManager、PackageKit、accounts-daemon、fwupd 和 firewalld
+只有 D-Bus 接口。snapd 的 `/run/snapd.socket` 允许任何人连接，但安装、删除或配置 snap 需要 polkit 的 `auth_admin`，
+而这需要系统总线上的认证代理，因此作业做不到（何况 snap 在 `no_new_privs` 下无法运行）。nix-daemon
+（`/nix/var/nix/daemon-socket/socket`）在组数据库中检查 `trusted-users` 的 `@group` 项，而受信任用户等同 root：默认值
+（只有 `root`）是安全的，但如果信任 `@wheel` 或其他用户，请把 `/nix/var/nix/daemon-socket` 加入
+`job_hidden_socket_dirs`（`puzuz doctor` 会发出警告），这样作业就无法使用 Nix 守护进程（构建、下载）。信任组或
+polkit 规则的其他站点自有套接字，也请以同样方式加入其目录。如果主机删除了某个目录，其上的遮盖就会消失（内核会在
+所有命名空间中卸载已删除目录上的挂载），因此请列出主机会保留的目录。
 
 <a id="priority-and-fair-share"></a>
 ## 优先级与公平共享
@@ -1696,6 +1716,7 @@ sudo ls /var/lib/puzuz/checkpoints/failed-logs/   # dump.log of failed dumps (ne
 | `checkpoint dir` | on tmpfs, or little free space | 将 `checkpoints_dir` 移到有足够空间容纳作业 RAM + VRAM 的磁盘上 |
 | `helper settings` | ExecStart= passes flags | 将设置移入 `config.toml` 并去掉这些参数 |
 | `job d-bus` | allowed (`job_system_dbus = true` or `job_systemd_varlink = true`): jobs can ask systemd and polkit for actions (WARN) | 除非作业需要，否则从 `/etc/puzuz/config.toml` 中删除该键并运行 `sudo systemctl restart puzuz-helper.service` |
+| `job sockets` | a default of `job_hidden_socket_dirs` is left out (`/run/libvirt not hidden`), an entry is not a directory (every job fails to start), or nix-daemon trusts users or groups besides root while `/nix/var/nix/daemon-socket` is not hidden (WARN) | 把 `job_hidden_socket_dirs` 设为提示中的列表（或删除该键以使用默认值），然后运行 `sudo systemctl restart puzuz-helper.service` |
 | `orphaned jobs` | the helper runs jobs the daemon does not account for (WARN; their GPUs stay taken) | `puzuz status` 会向管理员显示这些作业；管理员可以用 `puzuz kill <id>` 停止它们 |
 
 在 NixOS 上（`/etc/os-release` 中为 `ID=nixos`），`fix:` 行给出的是[模块选项](#nixos)，而不是在 NixOS

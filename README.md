@@ -287,7 +287,7 @@ columns, and `Checkpointed` jobs show the image size.
 - The root helper refuses jobs of system accounts (uid below `job_min_uid`, by default `UID_MIN`
   of `/etc/login.defs`), of users missing from `job_allowed_users` when it is set, and of users
   whose primary group is root-equivalent (`job_denied_groups`: `docker`, `lxd`, `incus-admin`,
-  `libvirt`, `disk`, `sudo`, `wheel`, `admin` by default). Those groups are left out of every
+  `libvirt`, `libvirtd`, `disk`, `sudo`, `wheel`, `admin` by default). Those groups are left out of every
   job's supplementary groups, so a job cannot use Docker or sudo even if its owner can (the
   helper's journal records what it left out). A refused job fails to spawn with `puzuz refuses to run jobs as <user>: <reason>`.
   See [Who jobs may run as](docs/install.md#who-jobs-may-run-as).
@@ -295,7 +295,9 @@ columns, and `Checkpointed` jobs show the image size.
   `su`, `pkexec`) do not gain privileges under `no_new_privs`, the system D-Bus is inaccessible in
   job units (so no `systemctl`, `run0`, `machinectl` or other polkit-authorized action, whatever
   the polkit rules grant the owner's groups; `job_system_dbus = true` lifts this), neither are
-  systemd's polkit-authorized Varlink services under `/run/systemd` (`job_systemd_varlink`), root-equivalent
+  systemd's polkit-authorized Varlink services under `/run/systemd` (`job_systemd_varlink`), nor
+  daemon sockets that check the owner's groups in the user database (libvirt's in `/run/libvirt`,
+  authorized through polkit, and CUPS's in `/run/cups`; `job_hidden_socket_dirs`), root-equivalent
   groups are left out, and only the assigned GPUs' device nodes can be opened. The same holds
   after a restore. See
   [What a job can and cannot do](docs/install.md#what-a-job-can-and-cannot-do).
