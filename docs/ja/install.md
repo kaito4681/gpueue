@@ -96,15 +96,18 @@ sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux
 `criu`、`cuda-checkpoint`、`nvidia-smi` を root として実行するので、それらの絶対パスは root の所有でなければ
 なりません。root が所有するシンボリックリンクはたどられ、リンク先も同じように確認されます。また
 `/nix/store`（root の所有、sticky、グループ `nixbld`）はグループ書き込み可能ですが受け入れられるので、NixOS の
-`/run/current-system/sw/bin/criu` のようなパスも使えます。root として実行した `gpueue doctor` も、これらの
-プログラムを実行する前に同じ規則を適用します。規則を満たさないプログラムは実行せずに FAIL として報告し
-（パスを含まない名前は systemd のデフォルトの `PATH` から探します）、設定ファイル自体が所有者の確認に失敗した
-場合は、そのファイルが指定するプログラムを一つも実行しません。
+`/run/current-system/sw/bin/criu` のようなパスも使えます。`gpueue doctor` も、root かどうかにかかわらず
+（確認はメタデータを読むだけです）、これらのプログラムを実行する前に同じ規則を適用します。規則を満たさない
+プログラムは実行せずに FAIL として報告します。パスを含まない名前はヘルパーと同じように systemd のデフォルトの
+`PATH` から探し、実行ビットのないファイルは飛ばします。root として実行したときは、設定ファイル自体が所有者の
+確認に失敗した場合、そのファイルが指定するプログラムを一つも実行しません。
 
 ヘルパーは名前で指定されたプログラムを、起動時に一度だけ探します。**cuda-checkpoint（または CRIU）を
 インストールしたらヘルパーを再起動してください**（`sudo systemctl restart gpueue-helper`）。それまでは
 ヘルパーはそれらを使えず、GPU ジョブのチェックポイントを拒否し（`finding CUDA processes: the helper did not
-find cuda-checkpoint when it started ...`）、`gpueue doctor` は警告を出します（`helper programs`）。
+find cuda-checkpoint when it started ...`）、`gpueue doctor` はそれを報告します（`helper programs`）。
+同じように、ヘルパーが起動時に見つけたプログラムがその後削除・移動された場合も、再起動するまでヘルパーは
+それを使えません。
 
 <a id="dependencies-that-are-not-installed-automatically"></a>
 ### 自動ではインストールされない依存関係
@@ -183,7 +186,7 @@ curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.
 | `--token-file FILE` | トークンを FILE から読み込みます |
 | `--save-token` | `gpueue update` や以降の実行のために、トークンを `/etc/gpueue/github-token`（root、0600）に保存します |
 | `--uninstall` | インストール済みの `gpueue uninstall` で gpueue を削除します（[アンインストール](#uninstalling) を参照） |
-| `--purge` | `--uninstall` と一緒に使い、`/etc/gpueue` と `/var/lib/gpueue` も削除します |
+| `--purge` | `--uninstall` と一緒に使い、`/etc/gpueue` と `/var/lib/gpueue`（と `config.toml` が設定したデータディレクトリ）も削除します |
 | `-y`、`--yes` | purge の前に確認しません |
 
 トークンが保存されるのは `--save-token` を付けたときだけです。そうしておけば、期限切れや失効したトークンが、
@@ -1159,7 +1162,9 @@ gpueue service status   # both units, and whether the daemon is reachable and co
 
 `gpueue doctor` は次のものをこの順に確認します（括弧内はチェックの名前）。
 
-- 設定ファイルとその所有者（`config`）
+- 設定ファイルとその所有者。ヘルパーと同じ基準で判定します：ファイル、`/etc/gpueue`、`/etc`、`/` が root の
+  所有で、グループやその他から書き込めず、シンボリックリンクでないこと（`config`）。満たさないファイルは
+  読まず、デフォルトの値で報告します。
 - インストール方法（`install method`、[インストール方法](#install-method) を参照）
 - RHEL 系で gpueue が `/usr/local/bin` にある場合：sudo の `secure_path` にそのディレクトリが含まれるか
   （`sudo PATH`）
@@ -1190,8 +1195,12 @@ gpueue service status   # both units, and whether the daemon is reachable and co
 - デーモンのディレクトリが `ReadWritePaths=` の中にあるか（`daemon write paths`）
 - デーモンとヘルパーのソケット（`daemon socket`、`helper socket`）
 - デーモンとヘルパーのバージョンとその接続（`daemon`、`helper`）
-- ヘルパーの起動後にインストールされたプログラム（起動時には見つからず、ヘルパーが使うのは再起動の後）。
-  警告になります（`helper programs`、ある場合のみ）
+- ヘルパーの起動時には見つからなかったが今はインストールされているプログラム（ヘルパーが使うのは再起動の後）、
+  および起動時に見つけたが今はなくなっている、または root 以外が置き換えられるようになったプログラム
+  （`helper programs`、ある場合のみ）。見つからなかったプログラムは設定した名前で照合します（たとえば
+  `cuda_checkpoint_path = "cuda-checkpoint-r570"`）。CRIU と、NVIDIA ドライバーがあるホストでの
+  cuda-checkpoint は FAIL です。ヘルパーが拒否するプログラム（再起動するとヘルパーが止まります）も FAIL で、
+  再起動ではなく所有者の修正を案内します。それ以外は警告です。
 - ヘルパーが実行しているのにデーモンが把握していないジョブ（`orphaned jobs`、ある場合のみ）
 - チェックポイントのディレクトリ（存在するか、tmpfs でないか、空き容量）とチェックポイントの合計サイズ
   （`checkpoint dir`、`checkpoint usage`）
@@ -1940,6 +1949,13 @@ NixOS では、代わりに `services.gpueue.enable = false` を設定して `su
 sudo gpueue uninstall            # stop, disable and remove the units, snippets and copied binaries
 sudo gpueue uninstall --purge    # also delete /etc/gpueue, /var/lib/gpueue, /run/gpueue, /run/gpueue-helper
 ```
+
+`--purge` は `config.toml` がデータの置き場所として設定したディレクトリ（`data_dir`、`helper_state_dir`、
+`logs_dir`、`checkpoints_dir`）も、上のディレクトリの外にあれば削除します。`config.toml` がヘルパーの所有者の
+確認に失敗するか解析できない場合、または設定されたディレクトリが `/` であるか、上のディレクトリを含む（`data_dir = "/var/lib"`）か、ヘルパーの確認に失敗する場合
+（そのディレクトリかその上のディレクトリが root の所有でない、またはグループやその他から書き込める）は、
+何も変更する前に拒否します。削除するディレクトリの外にある `state_db` は、デーモンユーザーのディレクトリに
+あるので残して報告します。
 
 `gpueue service uninstall` は同じコマンドで、`install.sh --uninstall [--purge] [--yes]` はこれを実行します。
 `--purge` は端末で確認を求めます。端末がない場合は `--yes` を渡してください。

@@ -276,6 +276,7 @@ async fn handle_connection<L: Launcher, H: HostProbe>(
     };
     let ours = Hello {
         missing_programs: helper.config().missing_programs(),
+        programs: helper.config().resolved_programs(),
         ..Hello::current()
     };
     wr.write_all(&encode_line(&HelperMessage::Hello(ours.clone())).map_err(io::Error::other)?)

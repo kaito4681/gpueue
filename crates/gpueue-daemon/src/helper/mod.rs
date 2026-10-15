@@ -81,6 +81,8 @@ pub struct HelperState {
     pub version: Option<String>,
     /// See [`gpueue_protocol::helper::Hello::missing_programs`].
     pub missing_programs: Vec<String>,
+    /// See [`gpueue_protocol::helper::Hello::programs`].
+    pub programs: Vec<gpueue_protocol::helper::HelperProgram>,
 }
 
 pub type HelperResult<T> = Result<T, HelperError>;

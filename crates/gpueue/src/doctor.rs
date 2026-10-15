@@ -14,7 +14,7 @@ use gpueue_protocol::api::{CheckpointStorage, GpuDetectionStatus, GpuSource, Ver
 use crate::install_method::{self, Detection, InstallMethod, LocalUnit, Method, OsRelease};
 use crate::service::{ADMIN_GROUP, DAEMON_UNIT, HELPER_UNIT, TMPFILES_PATH, UNIT_DIR};
 use crate::system::{
-    Program, System, check_root_owned_chain, find_runnable_program, is_root_owned_and_protected,
+    Program, System, check_root_owned_chain, check_root_owned_no_symlinks, find_runnable_program,
 };
 
 mod sudo_path;
@@ -153,9 +153,22 @@ pub fn load_config(sys: &dyn System) -> LoadedConfig {
 }
 
 /// [`load_config`], with hints for NixOS (where the module writes the file) if `nixos`.
+///
+/// The file is judged as the helper judges it ([`gpueue_config::Config::load_trusted`]) before
+/// it is read: a file (or `/etc/gpueue`) that is or is reached through a symlink, or that
+/// anyone but root could change, is not read at all.
 fn load_config_on(sys: &dyn System, nixos: bool) -> LoadedConfig {
     let path = sys.path(Path::new(DEFAULT_CONFIG_PATH));
-    if !path.exists() {
+    let check = check_config_trust(sys, nixos);
+    if check.level != Level::Ok {
+        return LoadedConfig {
+            config: Config::default(),
+            check,
+            trusted: false,
+        };
+    }
+    // Not `exists()`, which follows symlinks (a dangling one failed the trust check above).
+    if std::fs::symlink_metadata(&path).is_err() {
         let hint = if nixos {
             format!(
                 "{ENABLE_MODULE}; the module writes {DEFAULT_CONFIG_PATH} from \
@@ -175,18 +188,11 @@ fn load_config_on(sys: &dyn System, nixos: bool) -> LoadedConfig {
         };
     }
     match Config::load(&path) {
-        Ok(config) => {
-            let mut check = check_config_trust(sys, nixos);
-            let trusted = check.level == Level::Ok;
-            if trusted {
-                check = check_config_readable(sys, nixos);
-            }
-            LoadedConfig {
-                config,
-                check,
-                trusted,
-            }
-        }
+        Ok(config) => LoadedConfig {
+            config,
+            check: check_config_readable(sys, nixos),
+            trusted: true,
+        },
         Err(err) => {
             let hint = if nixos {
                 format!(
@@ -217,33 +223,43 @@ fn rewrite_config_first(nixos: bool, fix: String) -> String {
     }
 }
 
-/// The helper (root) reads the same file and refuses it unless only root can change it.
+/// The helper (root) reads the same file and refuses it unless only root can change it: the
+/// file and every directory above it must be owned by root, not group/world-writable and not
+/// symlinks ([`check_root_owned_no_symlinks`], the helper's rule). A missing file passes.
 fn check_config_trust(sys: &dyn System, nixos: bool) -> Check {
     let file = Path::new(DEFAULT_CONFIG_PATH);
-    for path in [file, file.parent().unwrap_or(file)] {
-        match is_root_owned_and_protected(sys, path) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Check::fail(
-                    "config",
-                    format!(
-                        "{} is not owned by root or is group/world-writable; \
-                         the helper refuses to start with it",
-                        path.display()
-                    ),
-                )
-                .hint(rewrite_config_first(
-                    nixos,
-                    format!(
-                        "sudo chown root:root {0}; sudo chmod go-w {0}",
-                        path.display()
-                    ),
-                ));
-            }
-            Err(err) => return Check::fail("config", format!("{}: {err}", path.display())),
+    let (path, reason, symlink) = match check_root_owned_no_symlinks(sys, file) {
+        Err(err) => {
+            let symlink = err.message.contains("symlink");
+            (err.path.clone(), err.to_string(), symlink)
         }
-    }
-    Check::ok("config", DEFAULT_CONFIG_PATH)
+        // `load_trusted` also refuses what is not a regular file.
+        Ok(()) => match std::fs::symlink_metadata(sys.path(file)) {
+            Ok(meta) if !meta.is_file() => (
+                file.to_owned(),
+                format!("{} is not a regular file", file.display()),
+                false,
+            ),
+            _ => return Check::ok("config", DEFAULT_CONFIG_PATH),
+        },
+    };
+    let fix = if symlink {
+        format!(
+            "replace the symlink {} with a copy of what it points to, owned by root and not \
+             group- or world-writable: the helper reads {DEFAULT_CONFIG_PATH} through no symlinks",
+            path.display()
+        )
+    } else {
+        format!(
+            "sudo chown root:root {0}; sudo chmod go-w {0}",
+            path.display()
+        )
+    };
+    Check::fail(
+        "config",
+        format!("{reason}; the helper refuses to start with {DEFAULT_CONFIG_PATH}"),
+    )
+    .hint(rewrite_config_first(nixos, fix))
 }
 
 /// The daemon runs as an unprivileged user, so it needs the file to be readable by others and
@@ -662,7 +678,7 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
         HELPER_UNIT,
     ));
     checks.extend(check_daemon(&daemon));
-    if let Some(check) = check_helper_programs(sys, &config, &daemon) {
+    if let Some(check) = check_helper_programs(sys, &config, &daemon, driver.is_ok(), nixos) {
         checks.push(check);
     }
     let storage = daemon.as_ref().ok().and_then(|v| v.checkpoints.as_ref());
@@ -827,8 +843,8 @@ struct Programs {
 
 impl Programs {
     /// Resolves the program the configuration key `key` names, or the FAIL to report instead of
-    /// running it: as root, neither a program from an untrusted configuration nor one that
-    /// someone else could replace is run.
+    /// running it: as root, no program from an untrusted configuration is run, and one that
+    /// someone else could replace (which the helper refuses) is never run.
     fn resolve(
         self,
         sys: &dyn System,
@@ -848,8 +864,8 @@ impl Programs {
             .hint(rewrite_config_first(
                 self.nixos,
                 format!(
-                    "make {DEFAULT_CONFIG_PATH} and {} owned by root and not group- or \
-                     world-writable, then re-run `sudo gpueue doctor`",
+                    "make {DEFAULT_CONFIG_PATH} and {} owned by root, not group- or \
+                     world-writable and not symlinks, then re-run `sudo gpueue doctor`",
                     Path::new(DEFAULT_CONFIG_PATH)
                         .parent()
                         .unwrap_or(Path::new("/"))
@@ -863,7 +879,7 @@ impl Programs {
             Program::Untrusted { path, reason } => Err(Check::fail(
                 name,
                 format!(
-                    "{} was not run as root: {reason}; the helper would refuse it too",
+                    "{} was not run: {reason}; the helper refuses it too",
                     path.display()
                 ),
             )
@@ -946,7 +962,7 @@ fn driver_version(sys: &dyn System) -> Result<Version, String> {
         }
         Program::Untrusted { path, reason } => {
             return Err(format!(
-                "no /proc/driver/nvidia/version, and {} was not run as root: {reason}",
+                "no /proc/driver/nvidia/version, and {} was not run: {reason}",
                 path.display()
             ));
         }
@@ -1602,43 +1618,150 @@ fn check_socket(sys: &dyn System, name: &'static str, path: &Path, unit: &str) -
     }
 }
 
-/// The helper looks the programs it runs up once, when it starts: one installed later (the
-/// checks above find it) stays unavailable to it until it is restarted. Programs that are still
-/// missing are reported by their own checks.
+/// The helper looks the programs it runs up once, when it starts, and never again: one
+/// installed later stays unavailable to it, and one removed or moved later stays broken, until
+/// it is restarted. This compares what the helper reported in its Hello (the programs it did
+/// not find, by their configured name, and the paths of those it did) with what is there now.
+/// Where the helper uses the same path as the checks above, those report it; this reports only
+/// where the two differ.
 fn check_helper_programs(
     sys: &dyn System,
     config: &Config,
     daemon: &Result<VersionResponse, String>,
+    have_driver: bool,
+    nixos: bool,
 ) -> Option<Check> {
+    const NAME: &str = "helper programs";
     let helper = &daemon.as_ref().ok()?.helper;
-    let installed: Vec<&str> = helper
-        .missing_programs
-        .iter()
-        .map(String::as_str)
-        .filter(|name| {
-            let configured = match *name {
-                "criu" => &config.criu_path,
-                "cuda-checkpoint" => &config.cuda_checkpoint_path,
-                "nvidia-smi" => &config.nvidia_smi_path,
-                _ => return false,
-            };
-            !matches!(find_runnable_program(sys, configured), Program::Missing)
-        })
-        .collect();
-    if !helper.connected || installed.is_empty() {
+    if !helper.connected {
         return None;
     }
-    Some(
-        Check::warn(
-            "helper programs",
+    let mut problems: Vec<(Level, String)> = Vec::new();
+    let mut restart = false;
+    let mut untrusted: Vec<(&str, PathBuf)> = Vec::new();
+    for (name, key, configured) in [
+        ("criu", "criu_path", &config.criu_path),
+        (
+            "cuda-checkpoint",
+            "cuda_checkpoint_path",
+            &config.cuda_checkpoint_path,
+        ),
+        ("nvidia-smi", "nvidia_smi_path", &config.nvidia_smi_path),
+    ] {
+        // Without it the helper cannot checkpoint at all (CRIU), or not GPU jobs on a host
+        // with a driver (cuda-checkpoint).
+        let broken = if name == "criu" || (name == "cuda-checkpoint" && have_driver) {
+            Level::Fail
+        } else {
+            Level::Warn
+        };
+        let current = find_runnable_program(sys, configured);
+        // The helper reports a missing program by its configured (bare) name.
+        let missing_at_start = configured.file_name().is_some_and(|file| {
+            helper
+                .missing_programs
+                .iter()
+                .any(|missing| Path::new(missing) == Path::new(file))
+        });
+        let used = helper
+            .programs
+            .iter()
+            .find(|program| program.name == name)
+            .map(|program| program.path.as_path());
+        if missing_at_start {
+            match current {
+                Program::Found(path) => {
+                    restart = true;
+                    problems.push((
+                        broken,
+                        format!(
+                            "{} ({}) was installed after the helper started; the helper cannot \
+                             use it until it is restarted",
+                            configured.display(),
+                            path.display()
+                        ),
+                    ));
+                }
+                Program::Untrusted { path, reason } => {
+                    untrusted.push((key, path.clone()));
+                    problems.push((
+                        Level::Fail,
+                        format!(
+                            "{} was installed after the helper started, but {reason}: a \
+                             restarted helper would refuse it and exit",
+                            path.display()
+                        ),
+                    ));
+                }
+                // Its own check reports it.
+                Program::Missing => {}
+            }
+            continue;
+        }
+        let Some(used) = used else {
+            continue;
+        };
+        if matches!(&current, Program::Found(path) | Program::Untrusted { path, .. } if path == used)
+        {
+            // The checks above looked at the same file.
+            continue;
+        }
+        if !sys.path(used).is_file() {
+            if let Program::Found(path) = &current {
+                restart = true;
+                problems.push((
+                    broken,
+                    format!(
+                        "the helper runs {name} from {}, which is gone; it finds {} only once it \
+                         is restarted",
+                        used.display(),
+                        path.display()
+                    ),
+                ));
+            }
+            // Otherwise its own check reports the program as missing or untrusted.
+            continue;
+        }
+        if let Err(reason) = check_root_owned_chain(sys, used) {
+            untrusted.push((key, used.to_owned()));
+            problems.push((
+                Level::Fail,
+                format!(
+                    "the helper runs {name} from {}, but {reason}; a restarted helper would \
+                     refuse it and exit",
+                    used.display()
+                ),
+            ));
+        }
+    }
+    let level = problems.iter().map(|(level, _)| *level).max()?;
+    let message = problems
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut hints = Vec::new();
+    for (key, path) in &untrusted {
+        hints.push(if nixos {
             format!(
-                "{} was installed after the helper started; the helper cannot use it until it is \
-                 restarted",
-                installed.join(", ")
-            ),
-        )
-        .hint(format!("sudo systemctl restart {HELPER_UNIT}")),
-    )
+                "point `{key}` in `services.gpueue.settings` at a path in /nix/store (or remove \
+                 it), then `{REBUILD}`"
+            )
+        } else {
+            format!(
+                "make {0} and its directories owned by root and not group- or world-writable \
+                 (`sudo chown root: {0}; sudo chmod go-w {0}`), or point `{key}` in \
+                 {DEFAULT_CONFIG_PATH} at a copy that is, before restarting {HELPER_UNIT}",
+                path.display()
+            )
+        });
+    }
+    if restart && untrusted.is_empty() {
+        hints.push(format!("sudo systemctl restart {HELPER_UNIT}"));
+    } else if restart {
+        hints.push(format!("then `sudo systemctl restart {HELPER_UNIT}`"));
+    }
+    Some(Check::new(level, NAME, message).hint(hints.join("\n")))
 }
 
 fn check_daemon(daemon: &Result<VersionResponse, String>) -> Vec<Check> {

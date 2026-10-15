@@ -190,15 +190,26 @@ fn as_root_programs_others_can_replace_are_not_run() {
     let report = run(&sys, None);
     assert_eq!(level(&report, "criu"), Level::Fail);
     assert!(
-        message(&report, "criu").starts_with("/opt/criu/sbin/criu was not run as root: "),
+        message(&report, "criu").starts_with("/opt/criu/sbin/criu was not run: "),
         "{}",
         message(&report, "criu")
     );
     assert!(hint(&report, "criu").contains("`criu_path`"), "{report:#?}");
     assert!(!sys.ran("criu"), "{:?}", sys.commands());
 
-    // Unprivileged, it is run (as the user).
+    // Unprivileged, it is not run either: the check reads metadata only, and the helper
+    // refuses it whoever runs doctor.
     sys.euid = 1000;
+    sys.log.borrow_mut().clear();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "criu"), Level::Fail);
+    assert!(
+        message(&report, "criu").starts_with("/opt/criu/sbin/criu was not run: "),
+        "{}",
+        message(&report, "criu")
+    );
+    assert!(!sys.ran("criu"), "{:?}", sys.commands());
+    chmod(&sys, "/opt/criu/sbin", 0o755);
     let report = run(&sys, None);
     assert_eq!(message(&report, "criu"), "4.2.1 (/opt/criu/sbin/criu)");
 
@@ -209,7 +220,7 @@ fn as_root_programs_others_can_replace_are_not_run() {
     let report = run(&sys, None);
     assert_eq!(level(&report, "gpus"), Level::Fail);
     assert!(
-        message(&report, "gpus").starts_with("/usr/bin/nvidia-smi was not run as root"),
+        message(&report, "gpus").starts_with("/usr/bin/nvidia-smi was not run"),
         "{report:#?}"
     );
     assert!(!sys.ran("nvidia-smi"), "{:?}", sys.commands());
@@ -518,7 +529,117 @@ fn config_the_helper_would_refuse_fails() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
     let report = run(&sys, None);
     assert_eq!(level(&report, "config"), Level::Fail);
-    assert!(message(&report, "config").starts_with("/etc/gpueue is"));
+    assert!(
+        message(&report, "config").starts_with("/etc/gpueue must be owned by root"),
+        "{}",
+        message(&report, "config")
+    );
+    assert!(hint(&report, "config").contains("chmod go-w /etc/gpueue"));
+}
+
+/// Creates a symlink at `link` to `target` (system paths).
+fn symlink(sys: &FakeSystem, target: &str, link: &str) {
+    std::os::unix::fs::symlink(sys.path(Path::new(target)), sys.path(Path::new(link))).unwrap();
+}
+
+#[test]
+fn config_reached_through_a_symlink_fails_like_in_the_helper() {
+    let (sys, _sockets) = healthy();
+    // The file the symlink points to names another criu: it must not be read.
+    let config = format!("criu_path = \"/opt/criu/sbin/criu\"\n{CONFIG}");
+    sys.write("/etc/gpueue-real/config.toml", &config);
+    std::fs::remove_file(sys.path(Path::new("/etc/gpueue/config.toml"))).unwrap();
+    symlink(
+        &sys,
+        "/etc/gpueue-real/config.toml",
+        "/etc/gpueue/config.toml",
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "config"), Level::Fail);
+    assert!(
+        message(&report, "config")
+            .starts_with("/etc/gpueue/config.toml is a symlink; the helper refuses to start"),
+        "{}",
+        message(&report, "config")
+    );
+    assert!(hint(&report, "config").contains("replace the symlink"));
+    assert_eq!(message(&report, "criu"), "4.2.1 (/usr/sbin/criu)");
+    assert_eq!(load_config(&sys).config.criu_path, Path::new("criu"));
+    assert!(!load_config(&sys).trusted);
+
+    // A symlinked directory.
+    std::fs::remove_dir_all(sys.path(Path::new("/etc/gpueue"))).unwrap();
+    symlink(&sys, "/etc/gpueue-real", "/etc/gpueue");
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "config"), Level::Fail);
+    assert!(
+        message(&report, "config").starts_with("/etc/gpueue is a symlink"),
+        "{}",
+        message(&report, "config")
+    );
+
+    // A dangling symlink is no missing file: the helper refuses it too.
+    std::fs::remove_file(sys.path(Path::new("/etc/gpueue"))).unwrap();
+    sys.mkdir("/etc/gpueue");
+    symlink(&sys, "/nowhere/config.toml", "/etc/gpueue/config.toml");
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "config"), Level::Fail);
+    assert!(
+        !message(&report, "config").contains("does not exist"),
+        "{}",
+        message(&report, "config")
+    );
+    assert!(!load_config(&sys).trusted);
+}
+
+#[test]
+fn an_untrusted_config_is_not_read() {
+    let (sys, _sockets) = healthy();
+    // Writable by others, and naming a criu that is there: doctor goes by the defaults.
+    sys.write(
+        "/etc/gpueue/config.toml",
+        &format!("criu_path = \"/opt/criu/sbin/criu\"\n{CONFIG}"),
+    );
+    sys.write_exe("/opt/criu/sbin/criu", "");
+    chmod(&sys, "/etc/gpueue/config.toml", 0o666);
+    let loaded = load_config(&sys);
+    assert_eq!(loaded.check.level, Level::Fail);
+    assert!(!loaded.trusted);
+    assert_eq!(loaded.config.criu_path, Path::new("criu"));
+    let report = run(&sys, None);
+    assert_eq!(message(&report, "criu"), "4.2.1 (/usr/sbin/criu)");
+
+    // An unparsable file is reported as such once it is trusted.
+    sys.write("/etc/gpueue/config.toml", "grace_secs = \"x\"\n");
+    chmod(&sys, "/etc/gpueue/config.toml", 0o666);
+    let report = run(&sys, None);
+    assert!(message(&report, "config").contains("must be owned by root"));
+    chmod(&sys, "/etc/gpueue/config.toml", 0o644);
+    let report = run(&sys, None);
+    assert!(message(&report, "config").contains("grace_secs"));
+}
+
+#[test]
+fn programs_are_found_as_the_helper_finds_them() {
+    let (sys, _sockets) = healthy();
+    // Not executable: skipped for the next directory of the service PATH, as the helper does.
+    sys.write("/usr/local/sbin/criu", "");
+    let report = run(&sys, None);
+    assert_eq!(message(&report, "criu"), "4.2.1 (/usr/sbin/criu)");
+    assert_eq!(
+        crate::system::find_program(&sys, Path::new("criu")),
+        Some(PathBuf::from("/usr/sbin/criu"))
+    );
+    // Relative paths with a directory are refused by the helper.
+    sys.write_exe("/usr/sbin/criu", "");
+    assert_eq!(
+        crate::system::find_program(&sys, Path::new("usr/sbin/criu")),
+        None
+    );
+    assert_eq!(
+        crate::system::find_runnable_program(&sys, Path::new("usr/sbin/criu")),
+        Program::Missing
+    );
 }
 
 #[test]
@@ -817,18 +938,156 @@ fn helper_missing_programs() {
     sys.daemon = Ok(version);
     std::fs::remove_file(sys.path(Path::new("/usr/bin/nvidia-smi"))).ok();
     let report = run(&sys, None);
-    assert_eq!(level(&report, "helper programs"), Level::Warn);
+    // GPU jobs cannot be checkpointed on a host with a driver: as for a missing cuda-checkpoint.
+    assert_eq!(level(&report, "helper programs"), Level::Fail);
     assert_eq!(
         message(&report, "helper programs"),
-        "cuda-checkpoint was installed after the helper started; the helper cannot use it until \
-         it is restarted"
+        "cuda-checkpoint (/usr/local/bin/cuda-checkpoint) was installed after the helper \
+         started; the helper cannot use it until it is restarted"
     );
-    assert!(hint(&report, "helper programs").contains("systemctl restart gpueue-helper"));
+    assert_eq!(
+        hint(&report, "helper programs"),
+        "sudo systemctl restart gpueue-helper.service"
+    );
     assert_eq!(level(&report, "cuda-checkpoint"), Level::Ok);
+
+    // Without a driver, only a warning.
+    std::fs::remove_file(sys.path(Path::new("/proc/driver/nvidia/version"))).unwrap();
+    assert_eq!(level(&run(&sys, None), "helper programs"), Level::Warn);
 
     // Still missing: only its own check.
     std::fs::remove_file(sys.path(Path::new("/usr/local/bin/cuda-checkpoint"))).unwrap();
     assert!(run(&sys, None).find("helper programs").is_none());
+}
+
+#[test]
+fn helper_missing_programs_are_matched_by_their_configured_name() {
+    let (mut sys, _sockets) = healthy();
+    sys.write(
+        "/etc/gpueue/config.toml",
+        &format!("cuda_checkpoint_path = \"cuda-checkpoint-r570\"\n{CONFIG}"),
+    );
+    sys.write_exe("/usr/local/bin/cuda-checkpoint-r570", "");
+    let mut version = FakeSystem::daemon_ok(true).unwrap();
+    version.helper.missing_programs = vec!["cuda-checkpoint-r570".to_owned()];
+    sys.daemon = Ok(version);
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "helper programs"), Level::Fail);
+    assert!(
+        message(&report, "helper programs").starts_with(
+            "cuda-checkpoint-r570 (/usr/local/bin/cuda-checkpoint-r570) was installed after"
+        ),
+        "{}",
+        message(&report, "helper programs")
+    );
+}
+
+#[test]
+fn a_helper_program_installed_later_that_others_can_replace_is_not_a_restart() {
+    let (mut sys, _sockets) = healthy();
+    let mut version = FakeSystem::daemon_ok(true).unwrap();
+    version.helper.missing_programs = vec!["criu".to_owned()];
+    sys.daemon = Ok(version);
+    // A user-owned criu: a restarted helper would refuse it and exit.
+    chmod(&sys, "/usr/sbin", 0o777);
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "helper programs"), Level::Fail);
+    let message = message(&report, "helper programs");
+    assert!(
+        message.starts_with("/usr/sbin/criu was installed after the helper started, but /usr/sbin"),
+        "{message}"
+    );
+    assert!(message.contains("would refuse it and exit"), "{message}");
+    let hint = hint(&report, "helper programs");
+    assert!(hint.contains("sudo chmod go-w /usr/sbin/criu"), "{hint}");
+    assert!(!hint.contains("systemctl restart"), "{hint}");
+    chmod(&sys, "/usr/sbin", 0o755);
+}
+
+/// The helper's status with `programs` reported as resolved at its start.
+fn helper_uses(sys: &mut FakeSystem, programs: &[(&str, &str)]) {
+    let mut version = FakeSystem::daemon_ok(true).unwrap();
+    version.helper.programs = programs
+        .iter()
+        .map(|(name, path)| gpueue_protocol::helper::HelperProgram {
+            name: (*name).to_owned(),
+            path: PathBuf::from(path),
+        })
+        .collect();
+    sys.daemon = Ok(version);
+}
+
+#[test]
+fn helper_programs_removed_since_it_started() {
+    let (mut sys, _sockets) = healthy();
+    // The same paths as the checks above: nothing to add.
+    helper_uses(
+        &mut sys,
+        &[
+            ("criu", "/usr/sbin/criu"),
+            ("cuda-checkpoint", "/usr/local/bin/cuda-checkpoint"),
+            ("nvidia-smi", "/usr/bin/nvidia-smi"),
+        ],
+    );
+    assert!(run(&sys, None).find("helper programs").is_none());
+
+    // criu moved from /usr/local/sbin to /usr/sbin after the helper started.
+    helper_uses(
+        &mut sys,
+        &[
+            ("criu", "/usr/local/sbin/criu"),
+            ("nvidia-smi", "/opt/old/nvidia-smi"),
+        ],
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "criu"), Level::Ok);
+    assert_eq!(level(&report, "helper programs"), Level::Fail);
+    assert_eq!(
+        message(&report, "helper programs"),
+        "the helper runs criu from /usr/local/sbin/criu, which is gone; it finds \
+         /usr/sbin/criu only once it is restarted; the helper runs nvidia-smi from \
+         /opt/old/nvidia-smi, which is gone; it finds /usr/bin/nvidia-smi only once it is \
+         restarted"
+    );
+    assert_eq!(
+        hint(&report, "helper programs"),
+        "sudo systemctl restart gpueue-helper.service"
+    );
+
+    // nvidia-smi alone is a warning.
+    helper_uses(&mut sys, &[("nvidia-smi", "/opt/old/nvidia-smi")]);
+    assert_eq!(level(&run(&sys, None), "helper programs"), Level::Warn);
+
+    // Gone with no other copy: the program's own check reports it.
+    helper_uses(&mut sys, &[("criu", "/usr/local/sbin/criu")]);
+    std::fs::remove_file(sys.path(Path::new("/usr/sbin/criu"))).unwrap();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "criu"), Level::Fail);
+    assert!(report.find("helper programs").is_none());
+}
+
+#[test]
+fn a_helper_program_others_can_now_replace_fails() {
+    let (mut sys, _sockets) = healthy();
+    // The helper found criu in /usr/local/sbin, which is now writable by others; doctor itself
+    // finds the protected /usr/sbin/criu first only because that one is executable.
+    sys.write("/usr/local/sbin/criu", "");
+    chmod(&sys, "/usr/local/sbin/criu", 0o644);
+    chmod(&sys, "/usr/local/sbin", 0o777);
+    helper_uses(&mut sys, &[("criu", "/usr/local/sbin/criu")]);
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "criu"), Level::Ok);
+    assert_eq!(level(&report, "helper programs"), Level::Fail);
+    let message = message(&report, "helper programs");
+    assert!(
+        message.starts_with("the helper runs criu from /usr/local/sbin/criu, but /usr/local/sbin"),
+        "{message}"
+    );
+    assert!(
+        hint(&report, "helper programs").contains("sudo chmod go-w /usr/local/sbin/criu"),
+        "{report:#?}"
+    );
+    chmod(&sys, "/usr/local/sbin", 0o755);
 }
 
 #[test]

@@ -110,6 +110,7 @@ fn daemon(version: &str, schema: Option<i64>) -> Result<VersionResponse, String>
             connected: true,
             version: Some(version.to_owned()),
             missing_programs: Vec::new(),
+            programs: Vec::new(),
         },
         checkpoints: None,
         gpu_detection: None,

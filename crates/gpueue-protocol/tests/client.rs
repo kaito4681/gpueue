@@ -127,6 +127,7 @@ async fn route(req: Request<Incoming>, log: Arc<Mutex<Vec<Recorded>>>) -> Respon
                     connected: true,
                     version: None,
                     missing_programs: Vec::new(),
+                    programs: Vec::new(),
                 },
                 checkpoints: None,
                 gpu_detection: None,

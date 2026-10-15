@@ -457,6 +457,7 @@ fn resource_bodies_golden() {
                 connected: true,
                 version: Some("0.1.0".into()),
                 missing_programs: Vec::new(),
+                programs: Vec::new(),
             },
             checkpoints: None,
             gpu_detection: None,
@@ -472,6 +473,7 @@ fn resource_bodies_golden() {
             connected: false,
             version: None,
             missing_programs: Vec::new(),
+            programs: Vec::new(),
         },
         checkpoints: Some(CheckpointStorage {
             images: 2,

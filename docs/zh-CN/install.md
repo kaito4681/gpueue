@@ -79,15 +79,16 @@ sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux
 也可以放在其他位置，并在 `/etc/gpueue/config.toml` 中设置 `cuda_checkpoint_path`。`criu`、`cuda-checkpoint`
 和 `nvidia-smi` 的绝对路径必须属于 root，因为 helper 以 root 身份运行它们。属于 root 的符号链接会被跟随，
 其目标以同样方式检查；`/nix/store`（属于 root、设置了 sticky 位、组为 `nixbld`）虽然组可写，也会被接受，
-因此 NixOS 上类似 `/run/current-system/sw/bin/criu` 的路径可以正常使用。以 root 身份运行的
-`gpueue doctor` 在运行这些程序之前也应用同样的规则：不满足规则的程序不会被运行，而是报告为 FAIL
-（不含路径的名称在 systemd 的默认 `PATH` 中查找）；如果配置文件本身未通过所有者检查，它指定的
-程序一个也不会运行。
+因此 NixOS 上类似 `/run/current-system/sw/bin/criu` 的路径可以正常使用。`gpueue doctor` 无论是否以
+root 身份运行（检查只读取元数据），在运行这些程序之前都应用同样的规则：不满足规则的程序不会被运行，而是
+报告为 FAIL。不含路径的名称与 helper 一样在 systemd 的默认 `PATH` 中查找，并跳过没有执行位的文件。以 root
+身份运行时，如果配置文件本身未通过所有者检查，它指定的程序一个也不会运行。
 
 helper 只在启动时查找一次以名称给出的程序。**安装 cuda-checkpoint（或 CRIU）后请重启 helper**
 （`sudo systemctl restart gpueue-helper`）：在此之前它无法使用这些程序，会拒绝为 GPU 作业创建检查点
 （`finding CUDA processes: the helper did not find cuda-checkpoint when it started ...`），`gpueue doctor`
-也会发出警告（`helper programs`）。
+也会报告这一点（`helper programs`）。同样，helper 启动时找到、之后被删除或移动的程序，在重启之前
+helper 也无法使用。
 
 <a id="dependencies-that-are-not-installed-automatically"></a>
 ### 不会自动安装的依赖
@@ -162,7 +163,7 @@ curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.
 | `--token-file FILE` | 从 FILE 读取令牌 |
 | `--save-token` | 将令牌保存到 `/etc/gpueue/github-token`（root，0600），供 `gpueue update` 和以后的运行使用 |
 | `--uninstall` | 使用已安装的 `gpueue uninstall` 移除 gpueue（参见[卸载](#uninstalling)） |
-| `--purge` | 与 `--uninstall` 一起使用时，同时删除 `/etc/gpueue` 和 `/var/lib/gpueue` |
+| `--purge` | 与 `--uninstall` 一起使用时，同时删除 `/etc/gpueue` 和 `/var/lib/gpueue`（以及 `config.toml` 设置的数据目录） |
 | `-y`, `--yes` | 清除（purge）前不再询问 |
 
 只有指定 `--save-token` 时才会保存令牌。这样，过期或被吊销的令牌就不会在你不知道用了哪个令牌的情况下
@@ -1059,7 +1060,8 @@ gpueue service status   # both units, and whether the daemon is reachable and co
 
 `gpueue doctor` 按以下顺序检查（括号内为检查项的名称）：
 
-- 配置文件及其所有权（`config`）
+- 配置文件及其所有权，按 helper 的标准判断：文件、`/etc/gpueue`、`/etc` 和 `/` 属于 root、组和其他用户
+  不可写、且不是符号链接（`config`）。不满足的文件不会被读取，改按默认值报告。
 - 安装方式（`install method`，见 [安装方式](#install-method)）
 - 在 RHEL 系发行版上且 gpueue 位于 `/usr/local/bin` 时：sudo 的 `secure_path` 是否包含该目录（`sudo PATH`）
 - `criu`，4.2 或更新版本（`criu`）
@@ -1084,8 +1086,11 @@ gpueue service status   # both units, and whether the daemon is reachable and co
 - 守护进程的目录是否在其 `ReadWritePaths=` 之内（`daemon write paths`）
 - 守护进程和 helper 的套接字（`daemon socket`、`helper socket`）
 - 守护进程和 helper 的版本及二者的连接（`daemon`、`helper`）
-- 在 helper 启动后才安装的程序（helper 启动时没有找到它们，要重启后才会使用），给出警告
-  （`helper programs`，仅在存在时显示）
+- helper 启动时没有找到、但现在已安装的程序（要重启后才会使用），以及启动时找到、但现在已不存在
+  或可被 root 以外的用户替换的程序（`helper programs`，仅在存在时显示）。未找到的程序按配置的名称匹配
+  （例如 `cuda_checkpoint_path = "cuda-checkpoint-r570"`）。CRIU，以及有 NVIDIA 驱动的主机上的
+  cuda-checkpoint 为 FAIL；helper 会拒绝的程序（重启会使 helper 停止）也为 FAIL，提示修正所有权而不是
+  重启。其他情况为警告。
 - helper 正在运行但守护进程未记录的作业（`orphaned jobs`，仅在存在时显示）
 - 检查点目录（是否存在、是否为 tmpfs、可用空间）以及检查点总大小（`checkpoint dir`、`checkpoint usage`）
 - 你是否为管理员（`admin`）
@@ -1755,6 +1760,11 @@ sudo gpueue update --version 0.2.0 --yes
 sudo gpueue uninstall            # stop, disable and remove the units, snippets and copied binaries
 sudo gpueue uninstall --purge    # also delete /etc/gpueue, /var/lib/gpueue, /run/gpueue, /run/gpueue-helper
 ```
+
+`--purge` 还会删除 `config.toml` 设置的数据目录（`data_dir`、`helper_state_dir`、`logs_dir`、
+`checkpoints_dir`），只要它们位于上述目录之外。如果 `config.toml` 未通过 helper 的所有者检查或无法解析，
+或者某个配置的目录是 `/`、包含上述目录之一（`data_dir = "/var/lib"`）或无法通过 helper 的检查（它或其上级目录不属于 root，或组或其他用户可写），
+它会在做任何更改之前拒绝运行。位于被删除目录之外的 `state_db` 在守护进程用户的目录中，因此会被保留并报告。
 
 `gpueue service uninstall` 是同一个命令，`install.sh --uninstall [--purge] [--yes]` 会运行它。
 `--purge` 会在终端上请求确认。没有终端时，请传递 `--yes`。

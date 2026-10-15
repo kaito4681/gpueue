@@ -261,8 +261,9 @@ failed and keeps the image as well.
   `nvidia-smi`) once in its `PATH`, requires the file found, like a program given by an
   absolute path, to belong to root and to be reached only through directories that only root can
   change, and uses that absolute path from then on. A program it did not find stays unavailable
-  until the helper is restarted; the helper names it in its Hello, and the daemon passes that on
-  to `gpueue doctor`. Without cuda-checkpoint, or when a process maps an NVIDIA device but
+  until the helper is restarted; the helper names it in its Hello, together with the paths of the
+  programs it found, and the daemon passes that on to `gpueue doctor` (which reports a program
+  installed, removed or made replaceable since). Without cuda-checkpoint, or when a process maps an NVIDIA device but
   `cuda-checkpoint --get-state` cannot tell its state, the dump of a GPU job is refused rather
   than left to CRIU, which cannot dump the device mappings.
 - <a id="gpu-isolation"></a>**GPU isolation.** `CUDA_VISIBLE_DEVICES` only tells CUDA which

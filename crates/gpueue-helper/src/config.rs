@@ -264,6 +264,24 @@ impl HelperConfig {
         .collect()
     }
 
+    /// The programs [`Self::resolve_programs`] found (or that were given
+    /// as absolute paths), with where they are, for the helper's Hello:
+    /// `gpueue doctor` checks that they are still there.
+    pub fn resolved_programs(&self) -> Vec<gpueue_protocol::helper::HelperProgram> {
+        [
+            ("criu", &self.checkpoint.criu.criu_path),
+            ("cuda-checkpoint", &self.checkpoint.cuda.path),
+            ("nvidia-smi", &self.nvidia_smi),
+        ]
+        .into_iter()
+        .filter(|(_, path)| path.is_absolute() && !path.starts_with(MISSING_PROGRAM_DIR))
+        .map(|(name, path)| gpueue_protocol::helper::HelperProgram {
+            name: name.to_owned(),
+            path: path.clone(),
+        })
+        .collect()
+    }
+
     /// Paths root writes to, executes or loads code from: they and their
     /// existing ancestors must not be changeable by anyone but root.
     /// Programs given by name are only checked once
@@ -553,6 +571,13 @@ mod tests {
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[0].contains("cuda-checkpoint"), "{warnings:?}");
         assert_eq!(c.missing_programs(), ["cuda-checkpoint", "nvidia-smi"]);
+        assert_eq!(
+            c.resolved_programs(),
+            [gpueue_protocol::helper::HelperProgram {
+                name: "criu".to_owned(),
+                path: criu.clone(),
+            }]
+        );
         let paths = c.paths_to_check();
         assert!(paths.contains(&criu.as_path()));
         // Absolute ones stay as they are; relative paths are refused.
