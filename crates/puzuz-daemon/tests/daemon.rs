@@ -21,8 +21,8 @@ use puzuz_daemon::{
 use puzuz_protocol::BINARY_VERSION;
 use puzuz_protocol::api::{
     AddJobRequest, AddJobResponse, ApiError, BulkJobResponse, CleanResponse, ErrorCode,
-    GpuDetection, GpuSource, JobView, ListGpusResponse, ListJobsResponse, VERSION_HEADER,
-    VersionResponse, WARNINGS_HEADER, Warning,
+    Event as ApiEvent, GpuDetection, GpuSource, JobView, ListGpusResponse, ListJobsResponse,
+    SseDecoder, VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
 };
 use puzuz_protocol::helper::{RunningPhase, signal};
 use serde::de::DeserializeOwned;
@@ -2427,39 +2427,86 @@ async fn spawns_refused_by_a_stopping_helper_are_requeued() {
 /// helper left the job `Running` for another second although nothing ran,
 /// so a check of the job's state right after the restart passed while the
 /// spawn was still to be retried.
+///
+/// Checked without timing bounds: the job states the daemon publishes, in
+/// order, show each job queued again between the refused launch and its
+/// retry; and the retry comes no earlier than the launch pause after the
+/// refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_spawn_refused_by_a_stopping_helper_is_queued_until_retried() {
     let mut h = Harness::new(0).await;
     h.set_default_parallel(2).await;
     let alice = h.client(ALICE);
+    let response = alice.open(Method::GET, "/v1/events", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut events = response.into_body();
     h.helper.hold_launches();
     h.helper.refuse_launches(2);
     let first = alice.add(&job_request("first", &[])).await;
     let second = alice.add(&job_request("second", &[])).await;
-    let refused = tokio::time::Instant::now();
 
-    // Back in line right away, not shown as running while nothing runs.
-    for id in [first, second] {
-        let deadline = refused + Duration::from_millis(500);
-        loop {
-            let state = alice.job(id).await.state;
-            if matches!(state, JobState::Queued { .. }) {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "job {id} is still {state:?} after the helper refused it"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-    // Offered again only after a pause (not in a tight loop), then started.
+    // Offered again only after a pause (not in a tight loop); the retries
+    // are held.
     h.helper.wait_held(2).await;
+    let since_refusal = h.helper.last_refusal().unwrap().elapsed();
     assert!(
-        refused.elapsed() >= Duration::from_millis(900),
-        "retried after {:?}",
-        refused.elapsed()
+        since_refusal >= Duration::from_millis(900),
+        "retried {since_refusal:?} after the refusal"
     );
+
+    // Back in line right away, not shown as running while nothing runs:
+    // each job's published states alternate between queued and running,
+    // so every refused launch was followed by `Queued` before the next
+    // one. Which job gets which refusal depends on scheduling (the pause
+    // holds up the other job's first launch too), so only the totals are
+    // fixed: two refusals, then both jobs launched again (held). The
+    // retries' state changes were published before their requests reached
+    // the helper, so they are in the stream by now.
+    let mut states: BTreeMap<JobId, Vec<&'static str>> = BTreeMap::new();
+    let mut decoder = SseDecoder::new();
+    let relaunched = |states: &BTreeMap<JobId, Vec<&'static str>>| {
+        let launches = states
+            .values()
+            .flatten()
+            .filter(|n| **n == "running")
+            .count();
+        launches == 4
+            && [first, second]
+                .iter()
+                .all(|id| states.get(id).and_then(|s| s.last()) == Some(&"running"))
+    };
+    // Only guards against a hang: keep-alives arrive in between.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !relaunched(&states) {
+            let frame = events.frame().await.expect("event stream ended").unwrap();
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            for message in decoder.push(&data) {
+                let job = match message.parse_event().unwrap() {
+                    ApiEvent::JobAdded { job } | ApiEvent::JobUpdated { job } => job,
+                    _ => continue,
+                };
+                let seen = states.entry(job.id).or_default();
+                let name = job.state.name();
+                if seen.last() != Some(&name) {
+                    seen.push(name);
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("job states so far: {states:?}"));
+    for id in [first, second] {
+        let seen = &states[&id];
+        assert!(
+            seen.iter()
+                .enumerate()
+                .all(|(i, n)| *n == if i % 2 == 0 { "queued" } else { "running" }),
+            "job {id}: {seen:?}"
+        );
+    }
+
     h.helper.release_launches();
     for id in [first, second] {
         h.wait_spawned(id).await;

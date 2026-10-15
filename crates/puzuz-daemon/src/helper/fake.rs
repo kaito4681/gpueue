@@ -88,6 +88,8 @@ struct State {
     /// Spawn/restore requests still to refuse with `shutting_down` right
     /// away (also while launches are held).
     refuse_launches: usize,
+    /// When the last refusal due by `refuse_launches` was answered.
+    last_refusal: Option<std::time::Instant>,
     hold_launches: bool,
     /// Held requests fail with `ConnectionLost` when released.
     lose_held: bool,
@@ -329,6 +331,12 @@ impl FakeHelper {
         self.with(|s| s.refuse_launches = count);
     }
 
+    /// When the last refusal due by [`FakeHelper::refuse_launches`] was
+    /// answered.
+    pub fn last_refusal(&self) -> Option<std::time::Instant> {
+        self.with(|s| s.last_refusal)
+    }
+
     /// A refusal due by [`FakeHelper::refuse_launches`].
     fn take_refusal(&self) -> HelperResult<()> {
         self.with(|s| {
@@ -336,6 +344,7 @@ impl FakeHelper {
                 return Ok(());
             }
             s.refuse_launches -= 1;
+            s.last_refusal = Some(std::time::Instant::now());
             Err(HelperError::Rejected {
                 code: HelperErrorCode::ShuttingDown,
                 message: "the helper is shutting down".to_owned(),
