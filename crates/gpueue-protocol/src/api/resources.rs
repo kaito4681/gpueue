@@ -246,4 +246,8 @@ pub struct HelperStatus {
     /// The helper's binary version from its last Hello.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// The programs the helper did not find when it started (see
+    /// [`crate::helper::Hello::missing_programs`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_programs: Vec<String>,
 }

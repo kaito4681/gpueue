@@ -250,6 +250,20 @@ impl HelperConfig {
         Ok(warnings)
     }
 
+    /// The programs [`Self::resolve_programs`] did not find (by name), for
+    /// the helper's Hello: `gpueue doctor` reports them.
+    pub fn missing_programs(&self) -> Vec<String> {
+        [
+            &self.checkpoint.criu.criu_path,
+            &self.checkpoint.cuda.path,
+            &self.nvidia_smi,
+        ]
+        .into_iter()
+        .filter_map(|p| p.strip_prefix(MISSING_PROGRAM_DIR).ok())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+    }
+
     /// Paths root writes to, executes or loads code from: they and their
     /// existing ancestors must not be changeable by anyone but root.
     /// Programs given by name are only checked once
@@ -538,6 +552,7 @@ mod tests {
         );
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[0].contains("cuda-checkpoint"), "{warnings:?}");
+        assert_eq!(c.missing_programs(), ["cuda-checkpoint", "nvidia-smi"]);
         let paths = c.paths_to_check();
         assert!(paths.contains(&criu.as_path()));
         // Absolute ones stay as they are; relative paths are refused.

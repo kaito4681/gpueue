@@ -342,6 +342,7 @@ async fn version_mismatch_gets_our_hello_then_eof() {
     let theirs = Hello {
         protocol_version: PROTOCOL_VERSION + 1,
         binary_version: "9.9.9".into(),
+        missing_programs: Vec::new(),
     };
     wr.write_all(&encode_line(&DaemonMessage::Hello(theirs)).unwrap())
         .await

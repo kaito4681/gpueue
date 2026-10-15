@@ -274,7 +274,10 @@ async fn handle_connection<L: Launcher, H: HostProbe>(
     else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "expected hello"));
     };
-    let ours = Hello::current();
+    let ours = Hello {
+        missing_programs: helper.config().missing_programs(),
+        ..Hello::current()
+    };
     wr.write_all(&encode_line(&HelperMessage::Hello(ours.clone())).map_err(io::Error::other)?)
         .await?;
     if !ours.is_compatible(&theirs) {

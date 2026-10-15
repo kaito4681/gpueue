@@ -64,7 +64,8 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
 5. **Shim。** shim 仍以 root 身份运行，它创建一个 PID 命名空间和一个挂载命名空间，并在触发主机的自动挂载点之后
    （以便命名空间获得自动挂载的文件系统）启动该命名空间的 init。init 把挂载设为私有，并挂载一个新的 `/proc`。它会移除被其他挂载遮盖的挂载以及重启后不会保留的挂载
    （`/run/*`、`/media/*`），把每个叠加在其 `autofs` 挂载之上的自动挂载文件系统替换为普通的副本，
-   并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs。除非 `job_system_dbus = true`，它会用一个空的 tmpfs 隐藏 `/run/dbus`，并且除非
+   并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs（在此之前先卸下挂载在那里及其下方的东西，例如主机的 tmpfs
+   `/tmp` 以及其上的 AppImage FUSE 挂载，否则它们会隐藏在命名空间中保留下来）。除非 `job_system_dbus = true`，它会用一个空的 tmpfs 隐藏 `/run/dbus`，并且除非
    `job_systemd_varlink = true`，用只保留 journald 日志套接字、resolved 名称解析套接字和 `resolv.conf` 文件以及 `userdb/`
    的 tmpfs 隐藏 `/run/systemd`，因此即使之后出现新的套接字，作业也无法通过 D-Bus 或 Varlink 向 systemd 或 polkit
    请求任何操作。它同样用空的 tmpfs 隐藏 `job_hidden_socket_dirs` 中的目录（默认为 `/run/libvirt` 和
@@ -79,7 +80,8 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    任何其他信号，因为它们会送达 root 的 shim 而不是作业。
 6. **检查点。** helper 检查可用空间（用于 RSS 和显存、保存在镜像中的已删除文件，以及作业的 `/tmp` 和
    `/dev/shm` 的内容）、挂载和作业的套接字。作业命名空间中的 FUSE 和网络挂载，如果主机上已没有它，
-   或者其 `statfs` 以连接错误失败或在 5 秒内没有返回（在子进程中检查），就被视为已死：在其上有打开的
+   或者其 `statfs` 以连接错误失败或在 5 秒内没有返回（在子进程中检查），或者它拒绝 root 访问（`lstat`
+   以 `EACCES` 失败：未使用 `allow_other` 的 FUSE 挂载），就被视为已死：在其上有打开的
    文件、工作目录或根目录、可执行文件、映射或绑定的 Unix 套接字的作业，会被拒绝，原因中写明该挂载。
    对其他作业，helper 把它们作为带有自己键名的外部挂载交给 CRIU
    （`--external mnt[<mount point>]:gpueue-detached-<n>`，其下的挂载用 `--skip-mnt`），并记录在
@@ -187,7 +189,9 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   目录下的挂载会保持不动。附加组由 helper 传入（见上文），因此 shim 不会再次查找。
 - 启动时，helper 会在其 `PATH` 中查找一次以名称给出的程序（`criu`、`cuda-checkpoint`、`nvidia-smi`），
   要求找到的文件与以绝对路径给出的程序一样，归 root 所有且只能经由只有 root 能修改的目录到达，此后一直使用
-  该绝对路径。
+  该绝对路径。未找到的程序在 helper 重启之前一直不可用；helper 在其 Hello 中列出它，守护进程再把它转给
+  `gpueue doctor`。没有 cuda-checkpoint 时，或者某个进程映射了 NVIDIA 设备但 `cuda-checkpoint --get-state`
+  无法判断其状态时，GPU 作业的转储会被拒绝，而不是交给 CRIU，因为 CRIU 无法转储设备映射。
 - <a id="gpu-isolation"></a>**GPU 隔离。** `CUDA_VISIBLE_DEVICES` 只是告诉 CUDA 使用哪些 GPU，任何作业都
   可以修改它。在 `gpu_device_isolation = true`（默认）时，helper 为每个作业单元（无论启动的还是恢复的）设置
   `DevicePolicy=closed` 和一个 `DeviceAllow=` 列表（读写）：每块所分配 GPU 的 `/dev/nvidia<minor>`，加上

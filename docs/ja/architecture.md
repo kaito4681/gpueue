@@ -79,7 +79,8 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    開始します。init はマウントを private にし、新しい `/proc` をマウントします。他のマウントの下に隠れた
    マウントと、再起動後に残らないマウント（`/run/*`、`/media/*`）を取り除き、`autofs` マウントの上に重なった
    automount 済みのファイルシステムをそれぞれ普通のコピーに置き換え、`/tmp` と `/dev/shm` に専用の tmpfs を
-   マウントします。`job_system_dbus = true` でなければ `/run/dbus` を空の tmpfs で隠し、`job_systemd_varlink = true` でなければ
+   マウントします（その前に、そこやその下にマウントされているもの、つまりホストの tmpfs の `/tmp` とその上の
+   AppImage の FUSE マウントなどを外します。外さないと名前空間に隠れたまま残ります）。`job_system_dbus = true` でなければ `/run/dbus` を空の tmpfs で隠し、`job_systemd_varlink = true` でなければ
    `/run/systemd` を journald のログのソケット、resolved の名前解決のソケットと `resolv.conf` のファイル、`userdb/` だけを
    残した tmpfs で隠すので、ジョブは後からソケットが現れても D-Bus でも Varlink でも systemd や polkit に何も要求できません。
    `job_hidden_socket_dirs` のディレクトリ（既定は、呼び出し元のグループをユーザーデータベースで確かめるデーモンの
@@ -93,8 +94,9 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    送られます。それ以外のシグナルはジョブではなく root の shim に届いてしまうので、ヘルパーは拒否します。
 6. **チェックポイント。** ヘルパーは空き容量（RSS と VRAM、イメージに保存される削除済みファイル、ジョブの
    `/tmp` と `/dev/shm` の内容の分）、マウント、ジョブのソケットを確認します。ジョブの名前空間の FUSE や
-   ネットワークのマウントのうち、ホストにもうないもの、または `statfs` が接続エラーで失敗するか 5 秒以内に
-   戻らないもの（子プロセスで確認します）は死んだものとみなします。その上に開いているファイル、作業
+   ネットワークのマウントのうち、ホストにもうないもの、`statfs` が接続エラーで失敗するか 5 秒以内に
+   戻らないもの（子プロセスで確認します）、または root を拒否するもの（`lstat` が `EACCES` で失敗する：
+   `allow_other` なしの FUSE マウント）は死んだものとみなします。その上に開いているファイル、作業
    ディレクトリやルートディレクトリ、実行ファイル、マッピング、バインドされた Unix ソケットを持つジョブは、
    マウントを示す理由とともに拒否します。それ以外のジョブについては、ヘルパー独自のキーを付けた外部マウント
    として CRIU に渡し（`--external mnt[<mount point>]:gpueue-detached-<n>`、その下のマウントは
@@ -239,7 +241,11 @@ CRIU は root として動き、リストアするジョブのすべてをダン
   そのままにします。補助グループはヘルパーから渡されるので（上記を参照）、shim が改めて調べることはありません。
 - 起動時、ヘルパーは名前で指定されたプログラム（`criu`、`cuda-checkpoint`、`nvidia-smi`）を自分の `PATH`
   から一度だけ探し、見つかったファイルが、絶対パスで指定されたプログラムと同じく、root のもので、root だけが
-  変更できるディレクトリだけを通って到達できることを要求し、以後はその絶対パスを使います。
+  変更できるディレクトリだけを通って到達できることを要求し、以後はその絶対パスを使います。見つからなかった
+  プログラムは、ヘルパーが再起動されるまで使えないままです。ヘルパーはそれを Hello で伝え、デーモンはそれを
+  `gpueue doctor` に渡します。cuda-checkpoint がない場合や、プロセスが NVIDIA デバイスをマップしているのに
+  `cuda-checkpoint --get-state` がその状態を判別できない場合、GPU ジョブのダンプは CRIU に任せずに拒否されます。
+  CRIU はデバイスのマッピングをダンプできないためです。
 - <a id="gpu-isolation"></a>**GPU の分離。** `CUDA_VISIBLE_DEVICES` は CUDA に使う GPU を伝えるだけで、
   どのジョブでも書き換えられます。`gpu_device_isolation = true`（デフォルト）のとき、ヘルパーは開始した
   ユニットにもリストアしたユニットにも、`DevicePolicy=closed` と `DeviceAllow=` のリスト（読み書き）を

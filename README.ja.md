@@ -143,6 +143,32 @@ curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.
 代わりに任意の AUR ヘルパーで [`gpueue-bin`](https://aur.archlinux.org/packages/gpueue-bin) を
 インストールできます（[docs/ja/install.md](docs/ja/install.md#arch-linux-aur) を参照）。
 
+<a id="dependencies-that-are-not-installed-automatically"></a>
+#### 自動ではインストールされない依存関係
+
+どのインストール方法も NVIDIA ドライバーと cuda-checkpoint はインストールしません。パッケージは CRIU を
+推奨するだけで、多くのリリースではその CRIU は古いか存在せず、`install.sh` はどちらもインストールしません
+（足りないものを表示します）。CRIU と cuda-checkpoint がなくてもジョブは実行できますが、チェックポイントには
+必要です（[各方法が何をインストールするか](docs/ja/install.md#dependencies-that-are-not-installed-automatically)
+を参照）。
+
+- CRIU 4.2 以降：`sudo apt install criu`（Ubuntu 26.04）、`sudo dnf install criu`（Fedora）、
+  `sudo pacman -S criu`（Arch Linux）。それ以外ではソースからビルドします（[CRIU](docs/ja/install.md#criu)
+  を参照）。NixOS モジュールは独自の CRIU を持ち込みます。
+- GPU ジョブには：NVIDIA ドライバー r570 以降（`nvidia-smi` を含む）と、ドライバーと同じメジャーバージョンの
+  NVIDIA のビルド済み cuda-checkpoint を root の所有で置きます（NixOS では
+  [NixOS での cuda-checkpoint](docs/ja/install.md#cuda-checkpoint-on-nixos) を参照）。
+
+```sh
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
+```
+
+ヘルパーは cuda-checkpoint と CRIU を起動時にだけ探します。どちらかをインストールしたら
+`sudo systemctl restart gpueue-helper` でヘルパーを再起動し（[cuda-checkpoint](docs/ja/install.md#cuda-checkpoint)
+を参照）、結果を確認してください。
+
 ```sh
 # Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.
 gpueue doctor

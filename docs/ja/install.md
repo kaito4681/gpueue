@@ -81,11 +81,15 @@ Debian 13（4.1）、RHEL/Rocky/Alma 9（3.19）では足りません。<https:/
 ### cuda-checkpoint
 
 NVIDIA は cuda-checkpoint をビルド済みのバイナリとして <https://github.com/NVIDIA/cuda-checkpoint> の
-`bin/x86_64_Linux/cuda-checkpoint`（arm64 では `bin/aarch64_Linux/`）で配布しています。root の `PATH` で
-見つかる場所に、root の所有で、他のユーザーが書き込めない状態で置いてください。
+`bin/x86_64_Linux/cuda-checkpoint`（arm64 では `bin/aarch64_Linux/`）で配布しています。メジャーバージョンは
+ドライバーと同じでなければなりません（違うと `gpueue doctor` が警告します）。root の `PATH` で見つかる場所に、
+root の所有で、他のユーザーが書き込めない状態で置いてください（`uname -m` は `x86_64` か `aarch64` を表示し、
+これでディレクトリが決まります）。
 
 ```sh
-sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
 ```
 
 別の場所に置いて、`/etc/gpueue/config.toml` で `cuda_checkpoint_path` を設定することもできます。ヘルパーは
@@ -96,6 +100,44 @@ sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpo
 プログラムを実行する前に同じ規則を適用します。規則を満たさないプログラムは実行せずに FAIL として報告し
 （パスを含まない名前は systemd のデフォルトの `PATH` から探します）、設定ファイル自体が所有者の確認に失敗した
 場合は、そのファイルが指定するプログラムを一つも実行しません。
+
+ヘルパーは名前で指定されたプログラムを、起動時に一度だけ探します。**cuda-checkpoint（または CRIU）を
+インストールしたらヘルパーを再起動してください**（`sudo systemctl restart gpueue-helper`）。それまでは
+ヘルパーはそれらを使えず、GPU ジョブのチェックポイントを拒否し（`finding CUDA processes: the helper did not
+find cuda-checkpoint when it started ...`）、`gpueue doctor` は警告を出します（`helper programs`）。
+
+<a id="dependencies-that-are-not-installed-automatically"></a>
+### 自動ではインストールされない依存関係
+
+どのインストール方法も NVIDIA ドライバーと cuda-checkpoint はインストールしません。どこでも十分に新しい
+CRIU を持ち込むのは NixOS モジュールだけです。gpueue 本体のほかに各方法がインストールするもの：
+
+| インストール方法 | インストールするもの | 自分で用意するもの |
+| --- | --- | --- |
+| [install.sh](#installing-with-installsh)、[Nix ビルド](#other-distributions) + `gpueue service install` | ほかには何もなし（install.sh は CRIU と cuda-checkpoint がなければその入れ方を表示） | CRIU、NVIDIA ドライバー、cuda-checkpoint |
+| [.deb](#installing-the-debianubuntu-package) | 依存パッケージ（libc6、libgcc-s1、systemd 240 以降）と、リリースにあれば推奨の `criu` | リリースの CRIU がないか古い場合は CRIU 4.2 以降、NVIDIA ドライバー、cuda-checkpoint |
+| [.rpm](#installing-the-fedorarhelrocky-package) | 依存パッケージ（glibc 2.34 以降、libgcc、systemd）と推奨の `criu`（弱い依存） | RHEL/Rocky/Alma 9（3.19）では CRIU 4.2 以降、NVIDIA ドライバー、cuda-checkpoint |
+| [AUR](#arch-linux-aur) | 依存パッケージ（systemd、glibc、libgcc）。`criu` と `cuda-checkpoint` は任意の依存にすぎない | CRIU、NVIDIA ドライバー、cuda-checkpoint |
+| [NixOS モジュール](#nixos) | CRIU 4.2.1。`nvidia-smi` と NVML は `hardware.nvidia.package` から | NVIDIA ドライバー（`hardware.nvidia`）、cuda-checkpoint（[`cudaCheckpointPackage`](#cuda-checkpoint-on-nixos)） |
+
+CRIU と cuda-checkpoint がなくてもジョブは実行できますが、チェックポイントには必要です。追加するには
+（NixOS 以外）：
+
+```sh
+# CRIU 4.2 or newer, where the distribution has it (otherwise build it, see CRIU above)
+sudo apt install criu       # Ubuntu 26.04
+sudo dnf install criu       # Fedora
+sudo pacman -S criu         # Arch Linux
+
+# For GPU jobs, with an NVIDIA driver r570 or newer installed: cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
+
+# The helper looks the programs up only when it starts (see cuda-checkpoint above)
+sudo systemctl restart gpueue-helper
+gpueue doctor
+```
 
 <a id="installing-with-installsh"></a>
 ## install.sh でのインストール
@@ -1148,6 +1190,8 @@ gpueue service status   # both units, and whether the daemon is reachable and co
 - デーモンのディレクトリが `ReadWritePaths=` の中にあるか（`daemon write paths`）
 - デーモンとヘルパーのソケット（`daemon socket`、`helper socket`）
 - デーモンとヘルパーのバージョンとその接続（`daemon`、`helper`）
+- ヘルパーの起動後にインストールされたプログラム（起動時には見つからず、ヘルパーが使うのは再起動の後）。
+  警告になります（`helper programs`、ある場合のみ）
 - ヘルパーが実行しているのにデーモンが把握していないジョブ（`orphaned jobs`、ある場合のみ）
 - チェックポイントのディレクトリ（存在するか、tmpfs でないか、空き容量）とチェックポイントの合計サイズ
   （`checkpoint dir`、`checkpoint usage`）
@@ -1726,7 +1770,10 @@ automount ポイントをトリガーしながら）確認し、なければ分�
 | FUSE のネットワークファイルシステム（ファイルが root のものとして見えるように、root が `allow_other,default_permissions` でマウントした sshfs）。ジョブがそこで自分のファイルを書き込み・リネームし、再起動後は inode 番号が変わる | リストアの前に FUSE デーモンが再び動いていれば動作する |
 | 再起動後にマウントされていないファイルシステム（fstab のエントリーがない、NFS サーバーが停止している） | 拒否：`<path> needs <type> on <mount point>` |
 | ジョブの実行中にデーモンが死んだ FUSE ファイルシステム（sshfs を kill：マウントは残るが応答しない。その後ホストでアンマウント）と、それを使っていないジョブ | 動作する：それを除いてチェックポイントされ（同じブート中でも）、ファイルシステムが再びマウントされるまではそこに空のアクセスできないディレクトリを、その後はファイルシステムそのものを得る |
-| 同上で、ジョブの作業ディレクトリがその上にある | チェックポイントされない（シャットダウン時も）：`the job depends on a filesystem that is gone or does not answer: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
+| 同上で、ジョブの作業ディレクトリがその上にある | チェックポイントされない（シャットダウン時も）：`the job depends on a filesystem that is gone, does not answer or root cannot access: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
+| ジョブの所有者が `allow_other` なしでマウントした FUSE ファイルシステム（sshfs）と、それを使っていないジョブ | 動作する：それを除いてチェックポイントされ、そこに空のアクセスできないディレクトリを得る |
+| 同上で、ジョブの作業ディレクトリがその上にある | チェックポイントされない：`... /home/alice/pfuse (fuse.sshfs) cannot be accessed by root (a FUSE mount without `allow_other`); the job uses it: the working directory /home/alice/pfuse` |
+| ホストの `/tmp` の下にマウントされた FUSE ファイルシステム（AppImage のもの。例：`/tmp/.mount_*`） | 動作する：ジョブ専用の `/tmp` がそれを覆うので、ジョブの名前空間にはそもそも含まれない |
 | 管理者がマウントした tmpfs（例：`/scratch`）にジョブのファイルや作業ディレクトリがある | 拒否：再起動後は中身が消えています。tmpfs は再起動を生き延びる必要のないジョブにだけ使ってください。同じブート中のリストアは動作します。 |
 
 テストしていないもの、または対応していないもの：
@@ -1755,13 +1802,17 @@ automount ポイントをトリガーしながら）確認し、なければ分�
 マウント（`fuse.*`、`nfs`、`nfs4`、`cifs`、`smb3`、`9p`、`ceph`、`glusterfs` など）は、ホストにもう
 ないか、その上の `statfs` が接続エラー（`ENOTCONN`、`EIO`、`ESTALE` など）で失敗するか、5 秒以内に戻らない
 （応答しない NFS サーバーがヘルパーを止めないよう、子プロセスで確認します）と、死んだものとみなされます。
+root を拒否する FUSE マウントも同じように扱われます。ユーザーが `allow_other` なしでマウントしたもの（ユーザー
+自身の sshfs）は応答しますが、そのユーザーにだけなので、（root として
+動く）CRIU はリストア時にそれを再びバインドできません。
 
 - 死んだマウントを使っているジョブ（そこで開いているファイル、作業ディレクトリやルートディレクトリ、実行
   ファイル、マップしているファイル、そこにバインドされた Unix ソケットがある）は**チェックポイントされません**。
   ダンプはジョブに触れる前に拒否され（[チェックポイントの失敗](#checkpoint-failures) を参照）、理由には
-  マウントとジョブがそこに持っているものが示されます。例：`the job depends on a filesystem that is gone or
-  does not answer: /nfs (fuse.sshfs) is no longer mounted on the host; the job uses it: the working
-  directory /nfs/run`。ファイルシステムを再びマウントしてから、チェックポイントしてください。シャットダウン時に
+  マウントとジョブがそこに持っているものが示されます。例：`the job depends on a filesystem that is gone,
+  does not answer or root cannot access: /nfs (fuse.sshfs) is no longer mounted on the host; the job
+  uses it: the working directory /nfs/run`。ファイルシステムを再びマウントして（root がアクセスできない場合は
+  `allow_other` を付けて）から、チェックポイントしてください。シャットダウン時に
   は、そうしたジョブは systemd に停止され、その理由とともに `Checkpoint failed` と表示されます。
 - **それ以外のジョブは、そのマウントを除いてチェックポイントされます**。リストア時、そのマウントポイントには、
   同じタイプのファイルシステムがそこにマウントされていて応答すればそのファイルシステムが、そうでなければ
@@ -1991,6 +2042,12 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
 - `not enough free space for the checkpoint: need N bytes, M available`：空き容量を作るか
   `checkpoints_dir` を移してから、もう一度チェックポイントします。必要量には、ジョブが自分の `/tmp` と
   `/dev/shm` に保存している分も含まれます（その場合、メッセージにその量が示されます）。
+- `finding CUDA processes: the helper did not find cuda-checkpoint when it started ...`：GPU ジョブは
+  cuda-checkpoint なしではチェックポイントできません。インストールして（[cuda-checkpoint](#cuda-checkpoint)
+  を参照）ヘルパーを再起動してください。``... process N uses an NVIDIA device but `cuda-checkpoint
+  --get-state` does not know its CUDA state: ...``：cuda-checkpoint がそのプロセスを扱えず（例えばドライバーと
+  cuda-checkpoint のバージョンの不一致。`gpueue doctor` を参照）、CRIU もそのデバイスのマッピングをダンプ
+  できません。
 - `the job has Unix sockets bound to [...] on the host's filesystems (or to relative names ...)`：
   リストアの際に CRIU が root としてそれらのパスを作成、unlink、chown することになります。ソケットは `/tmp`
   以下の絶対パスか抽象名にバインドしてください。相対名は、バインドされたディレクトリがわからないので、
@@ -1999,10 +2056,11 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
   ソケットを作り直すので、リストアされた `SO_REUSEPORT` のソケットは root のものになり、同じポートの root の
   サービスのグループに加わって（その接続の一部を受け取って）しまう可能性があります。プログラムで
   `SO_REUSEPORT` を無効にするか、ジョブを `--no-checkpoint` で実行してください。
-- `the job depends on a filesystem that is gone or does not answer: <mount point> (<type>) ...; the job
-  uses it: ...`：ジョブが使っている FUSE やネットワークのファイルシステムが、ホストにもうマウントされていない
-  か、応答しません。再びマウントして（sshfs を再起動する、NFS サーバーを戻す）、もう一度チェックポイントして
-  ください。[応答しなくなったネットワークと FUSE のファイルシステム](#network-and-fuse-filesystems-that-stop-answering) を参照してください。
+- `the job depends on a filesystem that is gone, does not answer or root cannot access: <mount point>
+  (<type>) ...; the job uses it: ...`：ジョブが使っている FUSE やネットワークのファイルシステムが、ホストに
+  もうマウントされていないか、応答しないか、`allow_other` なしの FUSE マウントです。再びマウントして（sshfs を
+  再起動する、NFS サーバーを戻す。ユーザーの FUSE ファイルシステムは `-o allow_other` でマウントする。これには
+  `/etc/fuse.conf` の `user_allow_other` が必要です）、もう一度チェックポイントしてください。[応答しなくなったネットワークと FUSE のファイルシステム](#network-and-fuse-filesystems-that-stop-answering) を参照してください。
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`：ジョブのマウント
   名前空間が別のマウントの下に隠れたマウントに依存しているので、決してリストアできません。ジョブを実行し直して
   ください（`gpueue restart`）。新しいジョブには整理された名前空間が与えられます。
@@ -2056,8 +2114,8 @@ OS のシャットダウンや再起動の間に、ダンプが失敗したか�
   マウントポイントのディレクトリをバインドし、ジョブはその下のファイルシステムに書き込み続けることになります。
   マウントして（`systemctl start data.mount`、`mount -a`、NFS サーバーを起動する、など）もう一度リストアして
   ください。[ファイルシステムとマウント](#filesystems-and-mounts) を参照してください。
-- `the mount points [...] of filesystems that were left out of the checkpoint (they were gone or did not
-  answer at the dump) are missing on this host`：CRIU には何かをマウントするためのディレクトリが必要です。
+- `the mount points [...] of filesystems that were left out of the checkpoint (they were gone, did not
+  answer or refused root at the dump) are missing on this host`：CRIU には何かをマウントするためのディレクトリが必要です。
   それを作成して（またはそこにファイルシステムをマウントして）もう一度リストアしてください。
   [応答しなくなったネットワークと FUSE のファイルシステム](#network-and-fuse-filesystems-that-stop-answering) を参照してください。
 - `files or directories the job used are missing on this host: [...]`：ジョブが開いていたファイルや作業

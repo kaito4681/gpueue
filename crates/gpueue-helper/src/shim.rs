@@ -1102,6 +1102,22 @@ mod tests {
         assert!(!path_under("/dev/shmx", "/dev/shm"));
     }
 
+    /// What the private tmpfs on /tmp covers: the host's /tmp (a tmpfs on
+    /// Ubuntu 26.04) and an AppImage's FUSE mount on it, which refuses root.
+    #[test]
+    fn prunes_what_the_private_tmpfs_covers() {
+        let mi = "\
+1 0 0:1 / / rw - ext4 /dev/x rw
+2 1 0:2 / /tmp rw - tmpfs tmpfs rw
+3 2 0:68 / /tmp/.mount_orca-liellLH ro - fuse.orca-linux.AppImage orca-linux.AppImage ro,user_id=1000
+4 1 0:4 / /tmpdata rw - ext4 /dev/y rw
+";
+        assert_eq!(
+            mounts_to_prune(mi, &MountPlan::default()),
+            ["/tmp", "/tmp/.mount_orca-liellLH"]
+        );
+    }
+
     #[test]
     fn mount_surgery_only_walks_root_controlled_directories() {
         assert!(mountfd::controlled_by(0, 0, 0o40755));

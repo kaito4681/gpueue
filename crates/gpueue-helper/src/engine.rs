@@ -114,8 +114,9 @@ pub enum SavedMounts {
         /// (see [`crate::access::HeldFile`]).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         held_files: Vec<crate::access::HeldFile>,
-        /// FUSE and network mounts that were gone or did not answer at the
-        /// dump, which the job did not use (see [`crate::deadmounts`]).
+        /// FUSE and network mounts that were gone, did not answer or refused
+        /// root at the dump, which the job did not use (see
+        /// [`crate::deadmounts`]).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         detached_mounts: Vec<DetachedMount>,
     },
@@ -1583,9 +1584,9 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     HelperErrorCode::InvalidRequest,
                     format!(
                         "the mount points {no_mount_point:?} of filesystems that were left out \
-                         of the checkpoint (they were gone or did not answer at the dump) are \
-                         missing on this host; create these directories, or mount the \
-                         filesystems there, and restore again"
+                         of the checkpoint (they were gone, did not answer or refused root at the \
+                         dump) are missing on this host; create these directories, or mount \
+                         the filesystems there, and restore again"
                     ),
                 ));
             }

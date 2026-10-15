@@ -77,7 +77,9 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    namespace's init, after it triggered the host's automount points (so that the namespace gets
    the automounted filesystems). The init makes the mounts private and mounts a fresh `/proc`. It removes mounts hidden under other mounts and mounts that do not survive a
    reboot (`/run/*`, `/media/*`), replaces each automounted filesystem stacked on its `autofs`
-   mount with a plain copy, and mounts private tmpfs on `/tmp` and `/dev/shm`. Unless
+   mount with a plain copy, and mounts private tmpfs on `/tmp` and `/dev/shm`, after detaching
+   whatever is mounted at or below them (the host's tmpfs `/tmp` and mounts on it, such as an
+   AppImage's FUSE mount, which would otherwise stay hidden in the namespace). Unless
    `job_system_dbus = true`, it hides `/run/dbus` behind an empty tmpfs and, unless
    `job_systemd_varlink = true`, hides `/run/systemd` behind a tmpfs that holds only journald's log
    sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/`, so the job cannot
@@ -98,8 +100,9 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    any other signal, which would reach the root shim instead of the job.
 6. **Checkpoint.** The helper checks free space (for RSS and VRAM, deleted files saved in the
    image and the contents of the job's `/tmp` and `/dev/shm`), the mounts and the job's sockets.
-   FUSE and network mounts of the job's namespace that the host no longer has, or whose `statfs`
-   fails with a connection error or does not return within 5 s (asked in a child process), are
+   FUSE and network mounts of the job's namespace that the host no longer has, whose `statfs`
+   fails with a connection error or does not return within 5 s (asked in a child process), or
+   that refuse root (`lstat` fails with `EACCES`: a FUSE mount without `allow_other`) are
    dead: a job with an open file, its working or root directory, its executable, a mapping or a
    bound Unix socket on one is refused with a reason that names the mount. For any other job the
    helper passes them to CRIU as external mounts with keys of its own
@@ -257,7 +260,11 @@ failed and keeps the image as well.
 - At start-up the helper looks up programs given by name (`criu`, `cuda-checkpoint`,
   `nvidia-smi`) once in its `PATH`, requires the file found, like a program given by an
   absolute path, to belong to root and to be reached only through directories that only root can
-  change, and uses that absolute path from then on.
+  change, and uses that absolute path from then on. A program it did not find stays unavailable
+  until the helper is restarted; the helper names it in its Hello, and the daemon passes that on
+  to `gpueue doctor`. Without cuda-checkpoint, or when a process maps an NVIDIA device but
+  `cuda-checkpoint --get-state` cannot tell its state, the dump of a GPU job is refused rather
+  than left to CRIU, which cannot dump the device mappings.
 - <a id="gpu-isolation"></a>**GPU isolation.** `CUDA_VISIBLE_DEVICES` only tells CUDA which
   GPUs to use; any job could change it. With `gpu_device_isolation = true` (the default) the
   helper gives every job unit, spawned or restored, `DevicePolicy=closed` and a `DeviceAllow=`

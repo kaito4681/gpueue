@@ -66,11 +66,14 @@ CRIU 4.0 或更高版本）驱动 cuda-checkpoint。该模式是可选的；参�
 ### cuda-checkpoint
 
 NVIDIA 在 <https://github.com/NVIDIA/cuda-checkpoint> 中以预编译二进制的形式分发 cuda-checkpoint，
-位于 `bin/x86_64_Linux/cuda-checkpoint`（arm64 上为 `bin/aarch64_Linux/`）。请将它放在 root 的 `PATH`
-能找到的位置，属主为 root，且其他用户不可写：
+位于 `bin/x86_64_Linux/cuda-checkpoint`（arm64 上为 `bin/aarch64_Linux/`）。它的主版本必须与驱动相同
+（否则 `gpueue doctor` 会发出警告）。请将它放在 root 的 `PATH` 能找到的位置，属主为 root，且其他用户不可写
+（`uname -m` 输出 `x86_64` 或 `aarch64`，据此选择目录）：
 
 ```sh
-sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
 ```
 
 也可以放在其他位置，并在 `/etc/gpueue/config.toml` 中设置 `cuda_checkpoint_path`。`criu`、`cuda-checkpoint`
@@ -80,6 +83,43 @@ sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpo
 `gpueue doctor` 在运行这些程序之前也应用同样的规则：不满足规则的程序不会被运行，而是报告为 FAIL
 （不含路径的名称在 systemd 的默认 `PATH` 中查找）；如果配置文件本身未通过所有者检查，它指定的
 程序一个也不会运行。
+
+helper 只在启动时查找一次以名称给出的程序。**安装 cuda-checkpoint（或 CRIU）后请重启 helper**
+（`sudo systemctl restart gpueue-helper`）：在此之前它无法使用这些程序，会拒绝为 GPU 作业创建检查点
+（`finding CUDA processes: the helper did not find cuda-checkpoint when it started ...`），`gpueue doctor`
+也会发出警告（`helper programs`）。
+
+<a id="dependencies-that-are-not-installed-automatically"></a>
+### 不会自动安装的依赖
+
+任何安装方式都不会安装 NVIDIA 驱动和 cuda-checkpoint，并且只有 NixOS 模块会在所有情况下带来足够新的
+CRIU。除 gpueue 本身外，各安装方式会安装的内容：
+
+| 安装方式 | 会安装 | 需要自己安装 |
+| --- | --- | --- |
+| [install.sh](#installing-with-installsh)、[Nix 构建](#other-distributions) + `gpueue service install` | 不安装其他内容（缺少 CRIU 和 cuda-checkpoint 时，install.sh 会打印安装方法） | CRIU、NVIDIA 驱动、cuda-checkpoint |
+| [.deb](#installing-the-debianubuntu-package) | 其依赖（libc6、libgcc-s1、systemd 240+），以及该发行版版本中有的推荐包 `criu` | 发行版版本的 CRIU 缺失或过旧时的 CRIU 4.2+、NVIDIA 驱动、cuda-checkpoint |
+| [.rpm](#installing-the-fedorarhelrocky-package) | 其依赖（glibc 2.34+、libgcc、systemd）和推荐包 `criu`（弱依赖） | RHEL/Rocky/Alma 9（3.19）上的 CRIU 4.2+、NVIDIA 驱动、cuda-checkpoint |
+| [AUR](#arch-linux-aur) | 其依赖（systemd、glibc、libgcc）；`criu` 和 `cuda-checkpoint` 只是可选依赖 | CRIU、NVIDIA 驱动、cuda-checkpoint |
+| [NixOS 模块](#nixos) | CRIU 4.2.1；`nvidia-smi` 和 NVML 来自 `hardware.nvidia.package` | NVIDIA 驱动（`hardware.nvidia`）、cuda-checkpoint（[`cudaCheckpointPackage`](#cuda-checkpoint-on-nixos)） |
+
+没有 CRIU 和 cuda-checkpoint 作业也能运行，但创建检查点需要它们。安装方法（NixOS 以外）：
+
+```sh
+# CRIU 4.2 or newer, where the distribution has it (otherwise build it, see CRIU above)
+sudo apt install criu       # Ubuntu 26.04
+sudo dnf install criu       # Fedora
+sudo pacman -S criu         # Arch Linux
+
+# For GPU jobs, with an NVIDIA driver r570 or newer installed: cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
+
+# The helper looks the programs up only when it starts (see cuda-checkpoint above)
+sudo systemctl restart gpueue-helper
+gpueue doctor
+```
 
 <a id="installing-with-installsh"></a>
 ## 使用 install.sh 安装
@@ -1044,6 +1084,8 @@ gpueue service status   # both units, and whether the daemon is reachable and co
 - 守护进程的目录是否在其 `ReadWritePaths=` 之内（`daemon write paths`）
 - 守护进程和 helper 的套接字（`daemon socket`、`helper socket`）
 - 守护进程和 helper 的版本及二者的连接（`daemon`、`helper`）
+- 在 helper 启动后才安装的程序（helper 启动时没有找到它们，要重启后才会使用），给出警告
+  （`helper programs`，仅在存在时显示）
 - helper 正在运行但守护进程未记录的作业（`orphaned jobs`，仅在存在时显示）
 - 检查点目录（是否存在、是否为 tmpfs、可用空间）以及检查点总大小（`checkpoint dir`、`checkpoint usage`）
 - 你是否为管理员（`admin`）
@@ -1558,7 +1600,10 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 | FUSE 网络文件系统（sshfs，由 root 以 `allow_other,default_permissions` 挂载，因此文件显示为 root 所有），作业在其中写入和重命名自己的文件，且重启后 inode 号不同 | 只要 FUSE 守护进程在恢复前重新运行即可 |
 | 重启后未挂载的文件系统（缺少 fstab 条目、NFS 服务器宕机） | 拒绝：`<path> needs <type> on <mount point>` |
 | 作业运行期间其守护进程死掉的 FUSE 文件系统（sshfs 被 kill：挂载仍在但不响应；随后在主机上被卸载），以及不使用它的作业 | 可行：它们在不包含该挂载的情况下被检查点（同一次启动内也可以），在文件系统重新挂载之前在该处得到一个空的、无法访问的目录，之后得到文件系统本身 |
-| 同上，但作业的工作目录位于其上 | 不会被检查点（关机时也不会）：`the job depends on a filesystem that is gone or does not answer: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
+| 同上，但作业的工作目录位于其上 | 不会被检查点（关机时也不会）：`the job depends on a filesystem that is gone, does not answer or root cannot access: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
+| 作业所有者未使用 `allow_other` 挂载的 FUSE 文件系统（sshfs），以及不使用它的作业 | 可行：作业在不包含该挂载的情况下被检查点，并在该处得到一个空的、无法访问的目录 |
+| 同上，但作业的工作目录位于其上 | 不会被检查点：`... /home/alice/pfuse (fuse.sshfs) cannot be accessed by root (a FUSE mount without `allow_other`); the job uses it: the working directory /home/alice/pfuse` |
+| 挂载在主机 `/tmp` 下的 FUSE 文件系统（AppImage 的挂载，例如 `/tmp/.mount_*`） | 可行：作业私有的 `/tmp` 覆盖了它，因此它根本不在作业的命名空间中 |
 | 管理员挂载的 tmpfs（例如 `/scratch`），作业的文件或工作目录位于其上 | 拒绝：重启后其内容已丢失。只把 tmpfs 用于不需要跨重启保留的作业。同一次启动内的恢复可行。 |
 
 未测试或不支持：
@@ -1583,13 +1628,16 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 死掉的副本），或者它不响应（其服务器宕机）。FUSE 或网络挂载（`fuse.*`、`nfs`、`nfs4`、`cifs`、
 `smb3`、`9p`、`ceph`、`glusterfs` 等）如果主机上已没有它，或者对它的 `statfs` 以连接错误
 （`ENOTCONN`、`EIO`、`ESTALE` 等）失败，或在 5 秒内没有返回（在子进程中检查，以免卡住的 NFS
-服务器拖住 helper），就被视为已死。
+服务器拖住 helper），就被视为已死。拒绝 root 访问的 FUSE 挂载也按同样方式处理：用户未使用
+`allow_other` 挂载的文件系统（用户自己的 sshfs）会响应，但只响应该用户，
+因此（以 root 身份运行的）CRIU 在恢复时无法再次绑定它。
 
 - 使用已死挂载的作业（在其上打开的文件、工作目录或根目录、可执行文件、映射的文件，或绑定在其上的
   Unix 套接字）**不会被检查点**。转储会在触碰作业之前被拒绝（见 [检查点失败](#checkpoint-failures)），
-  原因中会写明该挂载以及作业在其上拥有的东西，例如 `the job depends on a filesystem that is gone or
-  does not answer: /nfs (fuse.sshfs) is no longer mounted on the host; the job uses it: the working
-  directory /nfs/run`。请重新挂载该文件系统，然后再做检查点。关机时，这样的作业会被 systemd 停止，
+  原因中会写明该挂载以及作业在其上拥有的东西，例如 `the job depends on a filesystem that is gone,
+  does not answer or root cannot access: /nfs (fuse.sshfs) is no longer mounted on the host; the job
+  uses it: the working directory /nfs/run`。请重新挂载该文件系统（如果 root 无法访问它，则加上
+  `allow_other`），然后再做检查点。关机时，这样的作业会被 systemd 停止，
   并带着该原因显示为 `Checkpoint failed`。
 - **其他所有作业都会在不包含该挂载的情况下被检查点**。恢复时，如果该处挂载着同一类型的文件系统且
   它响应，其挂载点就得到该文件系统，否则得到一个作业无法打开的空目录（属于 root，权限 0，
@@ -1805,15 +1853,21 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
 - `not enough free space for the checkpoint: need N bytes, M available`：释放空间或移动
   `checkpoints_dir`，然后再次创建检查点。所需空间包括作业存储在其自己的 `/tmp` 和 `/dev/shm` 中的内容
   （此时消息会给出具体大小）。
+- `finding CUDA processes: the helper did not find cuda-checkpoint when it started ...`：没有
+  cuda-checkpoint 就无法为 GPU 作业创建检查点。请安装它（见 [cuda-checkpoint](#cuda-checkpoint)）并重启
+  helper。``... process N uses an NVIDIA device but `cuda-checkpoint --get-state` does not know its CUDA
+  state: ...``：cuda-checkpoint 无法处理该进程（例如驱动与 cuda-checkpoint 版本不匹配，见
+  `gpueue doctor`），而 CRIU 也无法转储其设备映射。
 - `the job has Unix sockets bound to [...] on the host's filesystems (or to relative names ...)`：
   恢复会让 CRIU 以 root 身份创建、unlink 和 chown 这些路径。请把套接字绑定到 `/tmp` 下的绝对路径或
   抽象名称。相对名称会被视为主机路径，因为无法得知它是在哪个目录中绑定的。
 - `the job has internet sockets with SO_REUSEPORT (...)`：CRIU 在把凭据交还给作业之前以 root 身份重建
   套接字，因此恢复后的 `SO_REUSEPORT` 套接字将属于 root，并可能加入同一端口上某个 root 服务的组（并接收其
   部分连接）。请在程序中关闭 `SO_REUSEPORT`，或用 `--no-checkpoint` 运行该作业。
-- `the job depends on a filesystem that is gone or does not answer: <mount point> (<type>) ...;
-  the job uses it: ...`：作业使用的 FUSE 或网络文件系统已不再挂载在主机上，或不响应。请重新挂载它
-  （重启 sshfs、恢复 NFS 服务器），然后再次做检查点。见
+- `the job depends on a filesystem that is gone, does not answer or root cannot access: <mount
+  point> (<type>) ...; the job uses it: ...`：作业使用的 FUSE 或网络文件系统已不再挂载在主机上、不响应，
+  或者是未使用 `allow_other` 的 FUSE 挂载。请重新挂载它（重启 sshfs、恢复 NFS 服务器；用户的 FUSE 文件系统
+  请以 `-o allow_other` 挂载，这需要 `/etc/fuse.conf` 中的 `user_allow_other`），然后再次做检查点。见
   [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)。
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`：作业的
   挂载命名空间依赖一个被另一个挂载遮盖的挂载，因此永远无法恢复。请重新运行该作业
@@ -1864,8 +1918,8 @@ refused:` 开头），其所有者会收到警告。
   挂载，或者那里挂载了另一种类型的文件系统。CRIU 会改为绑定空的挂载点目录，作业将继续写入
   下层的文件系统。请挂载它（`systemctl start data.mount`、`mount -a`、启动 NFS 服务器……），然后
   再次恢复。见 [文件系统和挂载](#filesystems-and-mounts)。
-- `the mount points [...] of filesystems that were left out of the checkpoint (they were gone or
-  did not answer at the dump) are missing on this host`：CRIU 需要一个目录来在其上挂载东西。请创建它
+- `the mount points [...] of filesystems that were left out of the checkpoint (they were gone,
+  did not answer or refused root at the dump) are missing on this host`：CRIU 需要一个目录来在其上挂载东西。请创建它
   （或在该处挂载文件系统），然后再次恢复。见 [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)。
 - `files or directories the job used are missing on this host: [...]`：作业打开的文件或其工作目录
   已不存在，通常是因为它们位于重启后变空的 tmpfs（`/scratch`）上。该作业无法恢复。请删除它

@@ -138,6 +138,30 @@ Update with `sudo gpueue update` and remove with `sudo gpueue uninstall`. Once t
 the AUR, you can install [`gpueue-bin`](https://aur.archlinux.org/packages/gpueue-bin) with any AUR
 helper instead (see [docs/install.md](docs/install.md#arch-linux-aur)).
 
+#### Dependencies that are not installed automatically
+
+No install method installs the NVIDIA driver or cuda-checkpoint. The packages only recommend
+CRIU, which is too old or missing on many releases, and `install.sh` installs neither (it lists
+what is missing). Jobs run without CRIU and cuda-checkpoint; checkpoints need them (see
+[what each method installs](docs/install.md#dependencies-that-are-not-installed-automatically)).
+
+- CRIU 4.2 or newer: `sudo apt install criu` (Ubuntu 26.04), `sudo dnf install criu` (Fedora),
+  `sudo pacman -S criu` (Arch Linux); elsewhere build it from source (see
+  [CRIU](docs/install.md#criu)). The NixOS module brings its own.
+- For GPU jobs: an NVIDIA driver r570 or newer (with `nvidia-smi`), and NVIDIA's prebuilt
+  cuda-checkpoint with the driver's major version, owned by root (on NixOS see
+  [cuda-checkpoint on NixOS](docs/install.md#cuda-checkpoint-on-nixos)):
+
+```sh
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
+```
+
+The helper looks cuda-checkpoint and CRIU up only when it starts: restart it after installing
+either with `sudo systemctl restart gpueue-helper` (see
+[cuda-checkpoint](docs/install.md#cuda-checkpoint)), then check the result.
+
 ```sh
 # Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.
 gpueue doctor

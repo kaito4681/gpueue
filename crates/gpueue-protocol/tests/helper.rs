@@ -37,6 +37,7 @@ fn hello_golden() {
     let hello = Hello {
         protocol_version: 1,
         binary_version: "0.1.0".into(),
+        missing_programs: Vec::new(),
     };
     assert_golden_line(
         &DaemonMessage::Hello(hello.clone()),

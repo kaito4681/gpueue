@@ -728,6 +728,7 @@ impl Helper for FakeHelper {
         HelperState {
             connected,
             version: connected.then(|| "fake".to_owned()),
+            missing_programs: Vec::new(),
         }
     }
 

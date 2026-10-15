@@ -1,6 +1,6 @@
-//! FUSE and network mounts of a job's namespace whose filesystem is gone
-//! or does not answer ("dead" mounts), and how a dump and a restore get
-//! along without them.
+//! FUSE and network mounts of a job's namespace whose filesystem is gone,
+//! does not answer, or cannot be accessed by root ("dead" mounts), and how
+//! a dump and a restore get along without them.
 //!
 //! Every job's mount namespace is a private copy of the host's, so it holds
 //! every FUSE or network filesystem that was mounted when the job started,
@@ -11,13 +11,17 @@
 //! When the FUSE daemon of a mount exits (sshfs whose connection is lost
 //! unmounts it on the host) or its server stops answering, every job would
 //! therefore fail to checkpoint, including jobs that never touched it.
+//! A FUSE mount without `allow_other` (an AppImage's, a user's own sshfs,
+//! the document portal) is alive but refuses root, so CRIU cannot restore
+//! a bind of it, and is treated the same way.
 //!
 //! Before a dump the helper looks for such mounts ([`remote_mounts`]: FUSE
-//! or network filesystems that the host no longer has, or whose `statfs`
+//! or network filesystems that the host no longer has, whose `statfs`
 //! fails with a connection error or does not answer within
-//! [`PROBE_TIMEOUT`]) and for anything of the job that depends on them
-//! ([`dead_mount_users`]: open descriptors, working and root directories,
-//! executables, file mappings and bound Unix sockets).
+//! [`PROBE_TIMEOUT`], or whose root root cannot look at) and for anything
+//! of the job that depends on them ([`dead_mount_users`]: open
+//! descriptors, working and root directories, executables, file mappings
+//! and bound Unix sockets).
 //!
 //! - A job that depends on a dead mount is not dumped: the dump is refused
 //!   (the job is left alone) with a reason that names the mount.
@@ -108,8 +112,8 @@ pub struct DeadMount {
     pub mount_point: String,
     pub fstype: String,
     pub dev: String,
-    /// Why, for messages: "is no longer mounted on the host" or "does not
-    /// answer (...)".
+    /// Why, for messages: "is no longer mounted on the host", "does not
+    /// answer (...)" or [`NO_ROOT_ACCESS`].
     pub why: String,
 }
 
@@ -143,8 +147,8 @@ pub fn dead_mounts(
     for (i, m) in remote.iter().enumerate() {
         let why = if !m.on_host {
             "is no longer mounted on the host".to_owned()
-        } else if let Some(Some(e)) = answers.get(i) {
-            format!("does not answer ({e})")
+        } else if let Some(Some(why)) = answers.get(i) {
+            why.clone()
         } else {
             continue;
         };
@@ -268,9 +272,10 @@ pub fn refusal(dead: &DeadMounts) -> Option<String> {
             parts.push(format!("{}; the job uses it: {list}", d.describe()));
         }
         return Some(format!(
-            "the job depends on a filesystem that is gone or does not answer: {}. CRIU cannot \
-             save what the job has open there, so it is not checkpointed; mount the \
-             filesystem again (or end the job)",
+            "the job depends on a filesystem that is gone, does not answer or root cannot \
+             access: {}. CRIU cannot save what the job has open there, so it is not \
+             checkpointed; mount the filesystem again (with `allow_other` if root cannot \
+             access it), or end the job",
             parts.join("; ")
         ));
     }
@@ -282,8 +287,9 @@ pub fn refusal(dead: &DeadMounts) -> Option<String> {
         .collect();
     if !bad.is_empty() {
         return Some(format!(
-            "the job's namespace has filesystems that are gone or do not answer, whose mount \
-             points CRIU cannot be told to leave out (they contain ']' or a line break): {}",
+            "the job's namespace has filesystems that are gone, do not answer or root cannot \
+             access, whose mount points CRIU cannot be told to leave out (they contain ']' or \
+             a line break): {}",
             bad.join("; ")
         ));
     }
@@ -405,15 +411,25 @@ pub fn mount_point_missing(path: &Path) -> bool {
     }
 }
 
-/// Why the filesystem at `path` does not answer, if it does not:
-/// `statfs` (which FUSE and network filesystems pass on to their daemon or
-/// server) fails with a connection error. Other errors (e.g. `EACCES` from
-/// a FUSE mount without `allow_other`) mean that it answered. May block;
-/// see [`probe_paths`].
+/// [`DeadMount::why`] of a FUSE mount that refuses root.
+pub const NO_ROOT_ACCESS: &str = "cannot be accessed by root (a FUSE mount without `allow_other`)";
+
+/// Why CRIU cannot use the filesystem at `path`, if it cannot (see
+/// [`DeadMount::why`]):
+/// - "does not answer (...)": `statfs` (which FUSE and network filesystems
+///   pass on to their daemon or server) fails with a connection error;
+/// - [`NO_ROOT_ACCESS`]: looking at it fails with `EACCES`, as a FUSE
+///   mount without `allow_other` does for everyone but its owner (its
+///   `statfs` succeeds regardless).
+///
+/// Other errors mean that it answered. May block; see [`probe_paths`].
 pub fn probe(path: &Path) -> Option<String> {
     use rustix::io::Errno;
     match rustix::fs::statfs(path) {
-        Ok(_) => None,
+        Ok(_) => match rustix::fs::lstat(path) {
+            Err(Errno::ACCESS | Errno::PERM) => Some(NO_ROOT_ACCESS.to_owned()),
+            _ => None,
+        },
         Err(e) => {
             let dead = [
                 Errno::NOTCONN,
@@ -431,10 +447,11 @@ pub fn probe(path: &Path) -> Option<String> {
             dead.contains(&e).then(|| {
                 // "Transport endpoint is not connected (os error 107)"
                 let msg = std::io::Error::from(e).to_string();
-                match msg.rfind(" (os error ") {
-                    Some(i) => msg[..i].to_owned(),
-                    None => msg,
-                }
+                let msg = match msg.rfind(" (os error ") {
+                    Some(i) => &msg[..i],
+                    None => &msg,
+                };
+                format!("does not answer ({msg})")
             })
         }
     }
@@ -442,13 +459,20 @@ pub fn probe(path: &Path) -> Option<String> {
 
 /// [`probe`] for each of `paths`, each in a thread of its own; a path that
 /// does not answer within `timeout` counts as dead. One entry per path,
-/// `None` if it answered. The threads that are still stuck are left
-/// behind, so run this in a process that exits afterwards (the
-/// `verify-access` child).
+/// `None` if it answered and can be used. The threads that are still
+/// stuck are left behind, so run this in a process that exits afterwards
+/// (the `verify-access` child).
 pub fn probe_paths(paths: &[String], timeout: Duration) -> Vec<Option<String>> {
     each_with_deadline(paths.to_vec(), timeout, |p| probe(Path::new(&p)))
         .into_iter()
-        .map(|r| r.unwrap_or_else(|| Some(format!("no answer within {}s", timeout.as_secs()))))
+        .map(|r| {
+            r.unwrap_or_else(|| {
+                Some(format!(
+                    "does not answer (no answer within {}s)",
+                    timeout.as_secs()
+                ))
+            })
+        })
         .collect()
 }
 
@@ -602,7 +626,10 @@ mod tests {
         let dead = dead_mounts(
             &job,
             &remote,
-            &[None, Some("Transport endpoint is not connected".into())],
+            &[
+                None,
+                Some("does not answer (Transport endpoint is not connected)".into()),
+            ],
         );
         assert_eq!(
             dead.dead
@@ -712,9 +739,9 @@ mod tests {
         let reason = refusal(&dead).unwrap();
         assert!(
             reason.starts_with(
-                "the job depends on a filesystem that is gone or does not answer: /nfs \
-                 (fuse.sshfs) is no longer mounted on the host; the job uses it: the open file \
-                 /nfs/out.txt (fd 3), "
+                "the job depends on a filesystem that is gone, does not answer or root cannot \
+                 access: /nfs (fuse.sshfs) is no longer mounted on the host; the job uses it: \
+                 the open file /nfs/out.txt (fd 3), "
             ),
             "{reason}"
         );

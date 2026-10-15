@@ -160,6 +160,7 @@ async fn route(
                     helper: HelperStatus {
                         connected: true,
                         version: None,
+                        missing_programs: Vec::new(),
                     },
                     checkpoints: None,
                     gpu_detection: None,

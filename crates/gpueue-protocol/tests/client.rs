@@ -126,6 +126,7 @@ async fn route(req: Request<Incoming>, log: Arc<Mutex<Vec<Recorded>>>) -> Respon
                 helper: HelperStatus {
                     connected: true,
                     version: None,
+                    missing_programs: Vec::new(),
                 },
                 checkpoints: None,
                 gpu_detection: None,

@@ -65,11 +65,14 @@ CRIU 4.0 or newer) drive cuda-checkpoint instead. It is optional; see
 
 NVIDIA distributes cuda-checkpoint as a prebuilt binary in
 <https://github.com/NVIDIA/cuda-checkpoint>, under `bin/x86_64_Linux/cuda-checkpoint` (or
-`bin/aarch64_Linux/` on arm64). Put it
-where root's `PATH` finds it, owned by root and not writable by others:
+`bin/aarch64_Linux/` on arm64). Its major version must be the driver's (`gpueue doctor` warns
+otherwise). Put it where root's `PATH` finds it, owned by root and not writable by others
+(`uname -m` prints `x86_64` or `aarch64`, which picks the directory):
 
 ```sh
-sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
 ```
 
 You can put it somewhere else and set `cuda_checkpoint_path` in `/etc/gpueue/config.toml`. Absolute
@@ -80,6 +83,42 @@ paths like `/run/current-system/sw/bin/criu` on NixOS work. `gpueue doctor` run 
 same rule before it runs one of these programs: it reports a FAIL instead of running one that
 fails it (bare names are looked up in systemd's default `PATH`), and it runs none of the programs
 a configuration file names if that file failed its own ownership check.
+
+The helper looks programs given by name up once, when it starts. **Restart it after installing
+cuda-checkpoint (or CRIU)** (`sudo systemctl restart gpueue-helper`): until then it cannot use
+them, refuses to checkpoint GPU jobs (`finding CUDA processes: the helper did not find
+cuda-checkpoint when it started ...`), and `gpueue doctor` warns (`helper programs`).
+
+### Dependencies that are not installed automatically
+
+No install method installs the NVIDIA driver or cuda-checkpoint, and only the NixOS module brings
+a CRIU that is new enough everywhere. What each method installs besides gpueue itself:
+
+| Install method | Installs | Leaves to you |
+| --- | --- | --- |
+| [install.sh](#installing-with-installsh), [Nix build](#other-distributions) + `gpueue service install` | nothing else (install.sh prints how to install CRIU and cuda-checkpoint if they are missing) | CRIU, the NVIDIA driver, cuda-checkpoint |
+| [.deb](#installing-the-debianubuntu-package) | its dependencies (libc6, libgcc-s1, systemd 240+) and the recommended `criu` the release has | CRIU 4.2+ where the release's is missing or older, the NVIDIA driver, cuda-checkpoint |
+| [.rpm](#installing-the-fedorarhelrocky-package) | its dependencies (glibc 2.34+, libgcc, systemd) and the recommended `criu` (weak dependency) | CRIU 4.2+ on RHEL/Rocky/Alma 9 (3.19), the NVIDIA driver, cuda-checkpoint |
+| [AUR](#arch-linux-aur) | its dependencies (systemd, glibc, libgcc); `criu` and `cuda-checkpoint` are only optional dependencies | CRIU, the NVIDIA driver, cuda-checkpoint |
+| [NixOS module](#nixos) | CRIU 4.2.1; `nvidia-smi` and NVML from `hardware.nvidia.package` | the NVIDIA driver (`hardware.nvidia`), cuda-checkpoint ([`cudaCheckpointPackage`](#cuda-checkpoint-on-nixos)) |
+
+Jobs run without CRIU and cuda-checkpoint; checkpoints need them. To add them (not on NixOS):
+
+```sh
+# CRIU 4.2 or newer, where the distribution has it (otherwise build it, see CRIU above)
+sudo apt install criu       # Ubuntu 26.04
+sudo dnf install criu       # Fedora
+sudo pacman -S criu         # Arch Linux
+
+# For GPU jobs, with an NVIDIA driver r570 or newer installed: cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
+
+# The helper looks the programs up only when it starts (see cuda-checkpoint above)
+sudo systemctl restart gpueue-helper
+gpueue doctor
+```
 
 ## Installing with install.sh
 
@@ -1141,6 +1180,8 @@ gpueue service status   # both units, and whether the daemon is reachable and co
 - whether the daemon's directories are inside its `ReadWritePaths=` (`daemon write paths`)
 - the daemon and helper sockets (`daemon socket`, `helper socket`)
 - the daemon and helper versions and their connection (`daemon`, `helper`)
+- programs installed after the helper started (it did not find them then and uses them only
+  after a restart), a warning (`helper programs`, only when there are some)
 - jobs the helper runs that the daemon does not account for (`orphaned jobs`, only when there
   are some)
 - the checkpoint directory (exists, not tmpfs, free space) and the total checkpoint size
@@ -1733,7 +1774,10 @@ working directory and open files on each of these:
 | FUSE network filesystem (sshfs, mounted by root with `allow_other,default_permissions`, so that files show as root's), with the job writing and renaming its own files there, and other inode numbers after the reboot | works while the FUSE daemon is up again before the restore |
 | filesystem not mounted after the reboot (missing fstab entry, NFS server down) | refused: `<path> needs <type> on <mount point>` |
 | FUSE filesystem whose daemon died while jobs ran (sshfs killed: the mount stays but does not answer; then unmounted on the host), with jobs that do not use it | works: they are checkpointed without it (also on the same boot), and get an empty, inaccessible directory there until the filesystem is mounted again, then the filesystem itself |
-| the same, with the job's working directory on it | not checkpointed (also not at the shutdown): `the job depends on a filesystem that is gone or does not answer: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
+| the same, with the job's working directory on it | not checkpointed (also not at the shutdown): `the job depends on a filesystem that is gone, does not answer or root cannot access: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
+| FUSE filesystem that the job's owner mounted without `allow_other` (sshfs), with a job that does not use it | works: it is checkpointed without it and gets an empty, inaccessible directory there |
+| the same, with the job's working directory on it | not checkpointed: `... /home/alice/pfuse (fuse.sshfs) cannot be accessed by root (a FUSE mount without `allow_other`); the job uses it: the working directory /home/alice/pfuse` |
+| FUSE filesystem mounted under the host's `/tmp` (an AppImage's, e.g. `/tmp/.mount_*`) | works: the job's private `/tmp` covers it, so it is not in the job's namespace at all |
 | tmpfs mounted by the administrator (e.g. `/scratch`) with the job's files or working directory on it | refused: its contents are gone after a reboot. Use a tmpfs only for jobs that do not need to survive one. A restore on the same boot works. |
 
 Not tested, or not supported:
@@ -1762,15 +1806,17 @@ job keeps a dead copy), or it does not answer (its server is down). A FUSE or ne
 (`fuse.*`, `nfs`, `nfs4`, `cifs`, `smb3`, `9p`, `ceph`, `glusterfs`, ...) counts as dead if the host
 no longer has it, or if `statfs` on it fails with a connection error (`ENOTCONN`, `EIO`, `ESTALE`,
 ...) or does not return within 5 s (asked in a child process, so a hung NFS server cannot hold up
-the helper).
+the helper). A FUSE mount that refuses root is treated the same way: one mounted by a user without
+`allow_other` (a user's own sshfs) answers, but only to that
+user, so CRIU (which runs as root) could not bind it again on restore.
 
 - A job that uses a dead mount (a file it has open there, its working or root directory, its
   executable, a file it has mapped, or a Unix socket bound there) is **not checkpointed**. The
   dump is refused before the job is touched (see [Checkpoint failures](#checkpoint-failures)),
   with a reason that names the mount and what the job has there, for example `the job depends on
-  a filesystem that is gone or does not answer: /nfs (fuse.sshfs) is no longer mounted on the
-  host; the job uses it: the working directory /nfs/run`. Mount the filesystem again and
-  checkpoint it then. At a shutdown such a job is stopped by systemd and shown as `Checkpoint
+  a filesystem that is gone, does not answer or root cannot access: /nfs (fuse.sshfs) is no
+  longer mounted on the host; the job uses it: the working directory /nfs/run`. Mount the
+  filesystem again (with `allow_other` if root cannot access it) and checkpoint it then. At a shutdown such a job is stopped by systemd and shown as `Checkpoint
   failed` with that reason.
 - **Every other job is checkpointed without the mount**. On restore its mount point gets the
   filesystem again if a filesystem of the same type is mounted there and answers, and an empty
@@ -2001,6 +2047,12 @@ warned on their next command. Refusals:
 - `not enough free space for the checkpoint: need N bytes, M available`: free space or move
   `checkpoints_dir`, then checkpoint again. The need includes what the job stores in its own
   `/tmp` and `/dev/shm` (the message then says how much).
+- `finding CUDA processes: the helper did not find cuda-checkpoint when it started ...`: a GPU job
+  cannot be checkpointed without cuda-checkpoint. Install it (see
+  [cuda-checkpoint](#cuda-checkpoint)) and restart the helper. ``... process N uses an NVIDIA
+  device but `cuda-checkpoint --get-state` does not know its CUDA state: ...``: cuda-checkpoint
+  cannot handle that process (for example a driver/cuda-checkpoint version mismatch, see
+  `gpueue doctor`), and CRIU could not dump its device mappings either.
 - `the job has Unix sockets bound to [...] on the host's filesystems (or to relative names ...)`:
   a restore would make CRIU create, unlink and chown those paths as root. Bind the socket to an
   absolute path below `/tmp` or to an abstract name. A relative name counts as a host path
@@ -2009,10 +2061,11 @@ warned on their next command. Refusals:
   gives the job its credentials back, so a restored `SO_REUSEPORT` socket would belong to root and
   could join a root service's group on the same port (and receive part of its connections). Turn
   `SO_REUSEPORT` off in the program, or run the job with `--no-checkpoint`.
-- `the job depends on a filesystem that is gone or does not answer: <mount point> (<type>) ...;
-  the job uses it: ...`: a FUSE or network filesystem that the job uses is no longer mounted on
-  the host, or does not answer. Mount it again (restart the sshfs, bring the NFS server back) and
-  checkpoint again. See
+- `the job depends on a filesystem that is gone, does not answer or root cannot access: <mount
+  point> (<type>) ...; the job uses it: ...`: a FUSE or network filesystem that the job uses is no
+  longer mounted on the host, does not answer, or is a FUSE mount without `allow_other`. Mount it
+  again (restart the sshfs, bring the NFS server back; mount a user's FUSE filesystem with
+  `-o allow_other`, which needs `user_allow_other` in `/etc/fuse.conf`) and checkpoint again. See
   [Network and FUSE filesystems that stop answering](#network-and-fuse-filesystems-that-stop-answering).
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`: the job's
   mount namespace depends on a mount that is hidden under another one, so it could never be
@@ -2068,8 +2121,8 @@ A failed restore keeps the job `Checkpointed` and keeps its image, so you can fi
   the empty mount point directory instead, and the job would go on writing to the filesystem
   underneath. Mount it (`systemctl start data.mount`, `mount -a`, start the NFS server, ...) and
   restore again. See [Filesystems and mounts](#filesystems-and-mounts).
-- `the mount points [...] of filesystems that were left out of the checkpoint (they were gone or
-  did not answer at the dump) are missing on this host`: CRIU needs the directory to mount
+- `the mount points [...] of filesystems that were left out of the checkpoint (they were gone,
+  did not answer or refused root at the dump) are missing on this host`: CRIU needs the directory to mount
   something on. Create it (or mount the filesystem there) and restore again. See
   [Network and FUSE filesystems that stop answering](#network-and-fuse-filesystems-that-stop-answering).
 - `files or directories the job used are missing on this host: [...]`: files the job had open,
