@@ -181,7 +181,7 @@ names (`gpueue_amd64.deb`, `gpueue_arm64.deb`, `gpueue.x86_64.rpm`, `gpueue.aarc
 
 ```sh
 sha256sum -c gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-minisign -Vm gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+minisign -Vm gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
 ```
 
 minisign prints the signature's trusted comment, which the signature covers: it names the release
@@ -195,7 +195,7 @@ checked copy:
 ```sh
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/latest/download/install.sh
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/latest/download/install.sh.minisig
-minisign -Vm install.sh -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+minisign -Vm install.sh -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
 sudo bash install.sh
 ```
 
@@ -204,7 +204,7 @@ sudo bash install.sh
 Releases are signed in `.github/workflows/release.yml` with the minisign secret key stored in the
 repository secrets `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD`. The public key is
 `packaging/minisign.pub`, which is built into `gpueue`, and `MINISIGN_PUBKEY` in
-`scripts/install.sh`. The key in use is the real release key (id `21E8F80CBA3FE3CA`). To rotate
+`scripts/install.sh`. The key in use is the real release key (id `EA3C2ED855877E21`). To rotate
 it (a leaked key, or a new maintainer), create a new key pair as follows, replace the public key
 in both places in the same commit, and update the two secrets. Installed copies of
 `gpueue` carry the old public key and cannot verify releases signed with the new one, so they need
@@ -270,7 +270,7 @@ the download before installing it (see [Verifying a release by hand](#verifying-
 curl -fLO "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue_${arch}.deb.sha256"
 curl -fLO "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue_${arch}.deb.minisig"
 sha256sum -c "gpueue_${arch}.deb.sha256"
-minisign -Vm "gpueue_${arch}.deb" -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+minisign -Vm "gpueue_${arch}.deb" -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
 ```
 
 The trusted comment names the release and the version-less file
@@ -321,16 +321,14 @@ later fixes it.
 
 **The repository key.** The packages, the repository and the `.rpm` files are signed with one
 GPG key (`packaging/apt/gpueue-archive-keyring.gpg` in the source tree), fingerprint
-`E539 7032 5A39 7378 537B C776 20B6 B72F 9F55 85C2`. To check a downloaded key before trusting it:
+`9B4F 59D2 F414 B76B 626B 3BE0 4FB3 D15B 2389 5621`. To check a downloaded key before trusting it:
 
 ```console
 $ gpg --show-keys /etc/apt/keyrings/gpueue.gpg
-pub   rsa4096 2026-10-13 [SC]
-      E53970325A397378537BC77620B6B72F9F5585C2
-uid                      puzuz APT repository <https://github.com/kaito4681/puzuz>
+pub   rsa4096 2026-10-15 [SC]
+      9B4F59D2F414B76B626B3BE04FB3D15B23895621
+uid                      gpueue APT repository <https://github.com/kaito4681/gpueue>
 ```
-
-The uid still carries gpueue's former name, puzuz; the fingerprint is what identifies the key.
 
 **Removing.**
 
@@ -384,7 +382,7 @@ ubuntu:22.04 ubuntu:24.04 ubuntu:26.04"`), which builds a repository with
 `apt-repo.sh update DIR DEB...` and a throwaway key and upgrades through it in containers.
 
 **The archive key.** `packaging/apt/gpueue-archive-keyring.gpg` is the real key, fingerprint
-`E539 7032 5A39 7378 537B C776 20B6 B72F 9F55 85C2` (see "The repository key" in
+`9B4F 59D2 F414 B76B 626B 3BE0 4FB3 D15B 2389 5621` (see "The repository key" in
 [Installing the Debian/Ubuntu package](#installing-the-debianubuntu-package)); its secret key and
 passphrase are the repository secrets `APT_GPG_PRIVATE_KEY` and `APT_GPG_PASSPHRASE`.
 `release.yml` and `apt-repo.sh` refuse a keyring whose user ID says "TEST KEY" (written by
@@ -472,8 +470,8 @@ minisign-signed like the other assets. Check the key file with the release key b
 ```sh
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/download/v0.1.0/RPM-GPG-KEY-gpueue
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/download/v0.1.0/RPM-GPG-KEY-gpueue.minisig
-minisign -Vm RPM-GPG-KEY-gpueue -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
-gpg --show-keys RPM-GPG-KEY-gpueue                   # E53970325A397378537BC77620B6B72F9F5585C2
+minisign -Vm RPM-GPG-KEY-gpueue -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
+gpg --show-keys RPM-GPG-KEY-gpueue                   # 9B4F59D2F414B76B626B3BE04FB3D15B23895621
 sudo rpm --import RPM-GPG-KEY-gpueue
 rpm -K gpueue-0.1.0-1.x86_64.rpm                     # "digests signatures OK"
 # or let dnf refuse an unsigned or badly signed file:

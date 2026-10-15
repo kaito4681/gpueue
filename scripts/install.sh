@@ -18,7 +18,7 @@ TOKEN_FILE_SAVED="/etc/gpueue/github-token"
 INSTALL_MARKER='# Installed by `gpueue service install`; re-running it overwrites this file.'
 # The release signing key; must match packaging/minisign.pub (checked by the
 # release workflow and a unit test).
-MINISIGN_PUBKEY="RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv"
+MINISIGN_PUBKEY="RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP"
 # Without minisign in PATH, this static minisign release (x86_64 and aarch64
 # binaries in one tarball) is downloaded and checked against this SHA-256.
 # Must match scripts/dist/get-minisign.sh (checked by a unit test).

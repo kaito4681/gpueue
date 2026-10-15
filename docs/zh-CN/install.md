@@ -173,7 +173,7 @@ Alma Linux 上可以改用 [.rpm](#installing-the-fedorarhelrocky-package)，在
 
 ```sh
 sha256sum -c gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-minisign -Vm gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+minisign -Vm gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
 ```
 
 minisign 会打印签名的 trusted comment（它受签名保护），其中写明发布版本和文件
@@ -186,7 +186,7 @@ minisign 会打印签名的 trusted comment（它受签名保护），其中写�
 ```sh
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/latest/download/install.sh
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/latest/download/install.sh.minisig
-minisign -Vm install.sh -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+minisign -Vm install.sh -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
 sudo bash install.sh
 ```
 
@@ -196,7 +196,7 @@ sudo bash install.sh
 发布版本在 `.github/workflows/release.yml` 中使用 minisign 私钥签名，该私钥存放在仓库 secrets
 `MINISIGN_SECRET_KEY` 和 `MINISIGN_PASSWORD` 中。公钥是 `packaging/minisign.pub`（它被内置到 `gpueue` 中），
 以及 `scripts/install.sh` 中的 `MINISIGN_PUBKEY`。当前使用的是真正的发布密钥
-（ID `21E8F80CBA3FE3CA`）。轮换密钥（密钥泄露或维护者更换）时，按下面的步骤创建新的密钥对，在同一次提交中替换
+（ID `EA3C2ED855877E21`）。轮换密钥（密钥泄露或维护者更换）时，按下面的步骤创建新的密钥对，在同一次提交中替换
 两处公钥，并更新这两个 secrets。已安装的 `gpueue` 内置的是旧公钥，无法验证用新密钥签名的发布版本，因此需要用 `install.sh` 手动重新安装：
 
 ```sh
@@ -254,7 +254,7 @@ sudo apt install "./gpueue_${arch}.deb"
 curl -fLO "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue_${arch}.deb.sha256"
 curl -fLO "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue_${arch}.deb.minisig"
 sha256sum -c "gpueue_${arch}.deb.sha256"
-minisign -Vm "gpueue_${arch}.deb" -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+minisign -Vm "gpueue_${arch}.deb" -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
 ```
 
 受信任注释（trusted comment）写明了发布版本和不带版本号的文件名
@@ -302,16 +302,14 @@ sudo apt update && sudo apt upgrade
 
 **仓库密钥。** 软件包、仓库和 `.rpm` 文件都使用同一个 GPG 密钥签名（源码树中的
 `packaging/apt/gpueue-archive-keyring.gpg`），指纹为
-`E539 7032 5A39 7378 537B C776 20B6 B72F 9F55 85C2`。在信任下载的密钥之前，可以这样检查它：
+`9B4F 59D2 F414 B76B 626B 3BE0 4FB3 D15B 2389 5621`。在信任下载的密钥之前，可以这样检查它：
 
 ```console
 $ gpg --show-keys /etc/apt/keyrings/gpueue.gpg
-pub   rsa4096 2026-10-13 [SC]
-      E53970325A397378537BC77620B6B72F9F5585C2
-uid                      puzuz APT repository <https://github.com/kaito4681/puzuz>
+pub   rsa4096 2026-10-15 [SC]
+      9B4F59D2F414B76B626B3BE04FB3D15B23895621
+uid                      gpueue APT repository <https://github.com/kaito4681/gpueue>
 ```
-
-uid 中仍保留 gpueue 的旧名 puzuz；用于识别密钥的是指纹。
 
 **移除。**
 
@@ -358,7 +356,7 @@ fork 的 `apt` 发布版本运行 `apt update`。或者运行本地测试 `scrip
 `apt-repo.sh update DIR DEB...` 和一个一次性密钥构建仓库，并在容器中通过它进行升级。
 
 **归档密钥。** `packaging/apt/gpueue-archive-keyring.gpg` 是真正的密钥，指纹为
-`E539 7032 5A39 7378 537B C776 20B6 B72F 9F55 85C2`（参见
+`9B4F 59D2 F414 B76B 626B 3BE0 4FB3 D15B 2389 5621`（参见
 [安装 Debian/Ubuntu 软件包](#installing-the-debianubuntu-package)中的“仓库密钥”）；其私钥和口令是仓库
 secrets `APT_GPG_PRIVATE_KEY` 和 `APT_GPG_PASSPHRASE`。`release.yml` 和 `apt-repo.sh` 会拒绝用户 ID 中
 写有“TEST KEY”的密钥环（由 `scripts/dist/gen-apt-key.sh --test` 生成）。创建密钥的方法如下：
@@ -437,8 +435,8 @@ Fedora 的 CRIU（4.2）足够新，RHEL/Rocky/Alma 9 的 3.19 则不够，因�
 ```sh
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/download/v0.1.0/RPM-GPG-KEY-gpueue
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/download/v0.1.0/RPM-GPG-KEY-gpueue.minisig
-minisign -Vm RPM-GPG-KEY-gpueue -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
-gpg --show-keys RPM-GPG-KEY-gpueue                   # E53970325A397378537BC77620B6B72F9F5585C2
+minisign -Vm RPM-GPG-KEY-gpueue -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
+gpg --show-keys RPM-GPG-KEY-gpueue                   # 9B4F59D2F414B76B626B3BE04FB3D15B23895621
 sudo rpm --import RPM-GPG-KEY-gpueue
 rpm -K gpueue-0.1.0-1.x86_64.rpm                     # "digests signatures OK"
 # or let dnf refuse an unsigned or badly signed file:
