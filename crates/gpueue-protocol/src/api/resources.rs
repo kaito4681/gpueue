@@ -250,4 +250,8 @@ pub struct HelperStatus {
     /// [`crate::helper::Hello::missing_programs`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_programs: Vec<String>,
+    /// Where the helper found its programs when it started (see
+    /// [`crate::helper::Hello::programs`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<crate::helper::HelperProgram>,
 }

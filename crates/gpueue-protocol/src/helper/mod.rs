@@ -113,6 +113,20 @@ pub struct Hello {
     /// restarted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_programs: Vec<String>,
+    /// Helper only: where it found the programs it uses, when it started
+    /// (it never looks them up again), so that `gpueue doctor` can tell
+    /// when one was removed or replaced since. Older helpers send none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<HelperProgram>,
+}
+
+/// A program the helper resolved when it started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelperProgram {
+    /// `criu`, `cuda-checkpoint` or `nvidia-smi`.
+    pub name: String,
+    /// The absolute path the helper runs it from.
+    pub path: PathBuf,
 }
 
 impl Hello {
@@ -122,6 +136,7 @@ impl Hello {
             protocol_version: PROTOCOL_VERSION,
             binary_version: crate::BINARY_VERSION.to_owned(),
             missing_programs: Vec::new(),
+            programs: Vec::new(),
         }
     }
 

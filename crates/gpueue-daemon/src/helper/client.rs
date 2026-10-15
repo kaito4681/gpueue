@@ -242,6 +242,7 @@ async fn session(inner: &Arc<Inner>, stream: UnixStream, cancel: &CancellationTo
         connected: true,
         version: Some(theirs.binary_version.clone()),
         missing_programs: theirs.missing_programs.clone(),
+        programs: theirs.programs.clone(),
     };
     tracing::info!(version = %theirs.binary_version, "connected to the gpueue helper");
 

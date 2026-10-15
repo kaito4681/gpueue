@@ -1271,7 +1271,8 @@ fn purge_keeps_a_user_directory_that_fills_up_again_and_goes_on() {
         remove_dir(parent, name)
     };
     let mut out = Vec::new();
-    purge(&sys, &remove, &mut out).unwrap();
+    let dirs = PurgePlan::new(&sys).unwrap().dirs;
+    purge(&sys, &dirs, &remove, &mut out).unwrap();
     let out = String::from_utf8(out).unwrap();
     assert!(raced.get());
     assert!(
@@ -1302,7 +1303,7 @@ fn purge_keeps_a_user_directory_that_fills_up_again_and_goes_on() {
     sys.write("/var/lib/gpueue/logs/1000/9.log", "log");
     sys.write("/etc/gpueue/config.toml", "");
     let failing = |_: &std::os::fd::OwnedFd, _: &std::ffi::OsStr| Err(nix::errno::Errno::EIO);
-    let err = purge(&sys, &failing, &mut Vec::new()).unwrap_err();
+    let err = purge(&sys, &dirs, &failing, &mut Vec::new()).unwrap_err();
     assert!(err.contains("removing /var/lib/gpueue/logs/1000"), "{err}");
     assert!(sys.exists("/etc/gpueue/config.toml"));
 }
@@ -1368,6 +1369,114 @@ fn purge_deletes_data_but_not_mount_points() {
     sys.confirm_answer = false;
     run_uninstall(&sys, true, true).unwrap();
     assert_eq!(sys.prompts.borrow().len(), 1);
+}
+
+fn set_mode(sys: &FakeSystem, path: &str, mode: u32) {
+    std::fs::set_permissions(
+        sys.path(Path::new(path)),
+        std::fs::Permissions::from_mode(mode),
+    )
+    .unwrap();
+}
+
+#[test]
+fn purge_deletes_the_configured_directories() {
+    let mut sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write(
+        "/etc/gpueue/config.toml",
+        "data_dir = \"/srv/gpueue\"\n\
+         checkpoints_dir = \"/scratch/gpueue-images\"\n\
+         logs_dir = \"/srv/gpueue/logs\"\n\
+         state_db = \"/srv/db/state.sqlite\"\n",
+    );
+    sys.write("/srv/gpueue/helper/events", "queue");
+    sys.write("/srv/gpueue/logs/1000/7.log", "log");
+    sys.write("/scratch/gpueue-images/7/pages-1.img", "image");
+    sys.write("/scratch/other/file", "not gpueue's");
+    sys.write("/srv/db/state.sqlite", "db");
+    sys.confirm_answer = true;
+
+    let out = run_uninstall(&sys, true, false).unwrap();
+    let prompt = sys.prompts.borrow()[0].clone();
+    assert!(
+        prompt.contains(
+            "/var/lib/gpueue, /etc/gpueue, /run/gpueue, /run/gpueue-helper, \
+             /srv/gpueue, /scratch/gpueue-images"
+        ),
+        "{prompt}"
+    );
+    for dir in ["/srv/gpueue", "/scratch/gpueue-images", "/etc/gpueue"] {
+        assert!(out.contains(&format!("removed {dir}\n")), "{out}");
+        assert!(!sys.exists(dir), "{dir}");
+    }
+    // logs_dir is below data_dir: deleted with it, not listed twice.
+    assert_eq!(out.matches("/srv/gpueue/logs").count(), 0, "{out}");
+    assert_eq!(sys.read("/scratch/other/file").unwrap(), "not gpueue's");
+    // state_db is in a directory of the daemon user's.
+    assert!(
+        out.contains(
+            "kept /srv/db/state.sqlite (state_db is outside the purged directories; delete it \
+             by hand)"
+        ),
+        "{out}"
+    );
+    assert!(sys.exists("/srv/db/state.sqlite"));
+}
+
+#[test]
+fn purge_refuses_configured_directories_the_helper_would_refuse() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write(
+        "/etc/gpueue/config.toml",
+        "checkpoints_dir = \"/scratch/gpueue-images\"\n",
+    );
+    sys.write("/scratch/gpueue-images/7/pages-1.img", "image");
+    set_mode(&sys, "/scratch", 0o777);
+    let err = run_uninstall(&sys, true, true).unwrap_err();
+    assert!(
+        err.starts_with(
+            "refusing to purge `checkpoints_dir` = /scratch/gpueue-images: /scratch must be owned \
+             by root"
+        ),
+        "{err}"
+    );
+    // Nothing was changed.
+    assert!(sys.exists("/etc/systemd/system/gpueue.service"));
+    assert!(sys.exists("/scratch/gpueue-images/7/pages-1.img"));
+    assert!(sys.exists("/etc/gpueue/config.toml"));
+    set_mode(&sys, "/scratch", 0o755);
+
+    // `/` is never deleted.
+    sys.write("/etc/gpueue/config.toml", "logs_dir = \"/\"\n");
+    let err = run_uninstall(&sys, true, true).unwrap_err();
+    assert!(
+        err.starts_with("refusing to purge `logs_dir` = /:"),
+        "{err}"
+    );
+    // Nor a directory with more than gpueue's data in it.
+    sys.write("/etc/gpueue/config.toml", "data_dir = \"/var/lib\"\n");
+    let err = run_uninstall(&sys, true, true).unwrap_err();
+    assert!(
+        err.starts_with("refusing to purge `data_dir` = /var/lib:"),
+        "{err}"
+    );
+    assert!(sys.exists("/var/lib/gpueue"));
+
+    // A configuration the helper refuses names nothing that may be deleted.
+    sys.write(
+        "/etc/gpueue/config.toml",
+        "checkpoints_dir = \"/scratch/gpueue-images\"\n",
+    );
+    set_mode(&sys, "/etc/gpueue/config.toml", 0o666);
+    let err = run_uninstall(&sys, true, true).unwrap_err();
+    assert!(
+        err.starts_with("refusing to purge: /etc/gpueue/config.toml"),
+        "{err}"
+    );
+    assert!(sys.exists("/scratch/gpueue-images/7/pages-1.img"));
+    assert!(sys.exists("/etc/systemd/system/gpueue.service"));
 }
 
 #[test]

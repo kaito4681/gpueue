@@ -161,6 +161,7 @@ async fn route(
                         connected: true,
                         version: None,
                         missing_programs: Vec::new(),
+                        programs: Vec::new(),
                     },
                     checkpoints: None,
                     gpu_detection: None,

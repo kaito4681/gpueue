@@ -79,15 +79,18 @@ You can put it somewhere else and set `cuda_checkpoint_path` in `/etc/gpueue/con
 paths of `criu`, `cuda-checkpoint` and `nvidia-smi` must be owned by root, because the helper runs
 them as root. Symlinks owned by root are followed and their targets checked the same way, and
 `/nix/store` (owned by root, sticky, group `nixbld`) is accepted although it is group-writable, so
-paths like `/run/current-system/sw/bin/criu` on NixOS work. `gpueue doctor` run as root applies the
-same rule before it runs one of these programs: it reports a FAIL instead of running one that
-fails it (bare names are looked up in systemd's default `PATH`), and it runs none of the programs
-a configuration file names if that file failed its own ownership check.
+paths like `/run/current-system/sw/bin/criu` on NixOS work. `gpueue doctor` applies the same
+rule before it runs one of these programs, as root or not (the check only reads metadata): it
+reports a FAIL instead of running one that fails it. It finds bare names as the helper does, in
+systemd's default `PATH`, skipping files without an exec bit. Run as root, it runs none of the
+programs a configuration file names if that file failed its own ownership check.
 
 The helper looks programs given by name up once, when it starts. **Restart it after installing
 cuda-checkpoint (or CRIU)** (`sudo systemctl restart gpueue-helper`): until then it cannot use
 them, refuses to checkpoint GPU jobs (`finding CUDA processes: the helper did not find
-cuda-checkpoint when it started ...`), and `gpueue doctor` warns (`helper programs`).
+cuda-checkpoint when it started ...`), and `gpueue doctor` reports it (`helper programs`). Likewise,
+a program the helper found at start-up and that was removed or moved since stays unusable to it
+until it is restarted.
 
 ### Dependencies that are not installed automatically
 
@@ -161,7 +164,7 @@ Options go after `bash -s --` when the script comes from a pipe (for example
 | `--token-file FILE` | read the token from FILE |
 | `--save-token` | save the token to `/etc/gpueue/github-token` (root, 0600) for `gpueue update` and later runs |
 | `--uninstall` | remove gpueue with the installed `gpueue uninstall` (see [Uninstalling](#uninstalling)) |
-| `--purge` | with `--uninstall`, also delete `/etc/gpueue` and `/var/lib/gpueue` |
+| `--purge` | with `--uninstall`, also delete `/etc/gpueue` and `/var/lib/gpueue` (and the data directories `config.toml` sets) |
 | `-y`, `--yes` | do not ask before purging |
 
 A token is saved only with `--save-token`. Without it, an expired or revoked token cannot break
@@ -1149,7 +1152,9 @@ gpueue service status   # both units, and whether the daemon is reachable and co
 
 `gpueue doctor` checks, in this order (the check's name in parentheses):
 
-- the configuration file and its ownership (`config`)
+- the configuration file and its ownership, judged as the helper judges it: the file,
+  `/etc/gpueue`, `/etc` and `/` owned by root, not group- or world-writable and not symlinks
+  (`config`). A file that fails this is not read, and the defaults are reported instead.
 - the install method (`install method`, see [Install method](#install-method))
 - on the RHEL family, with gpueue in `/usr/local/bin`: whether sudo's `secure_path` includes that
   directory (`sudo PATH`)
@@ -1180,8 +1185,13 @@ gpueue service status   # both units, and whether the daemon is reachable and co
 - whether the daemon's directories are inside its `ReadWritePaths=` (`daemon write paths`)
 - the daemon and helper sockets (`daemon socket`, `helper socket`)
 - the daemon and helper versions and their connection (`daemon`, `helper`)
-- programs installed after the helper started (it did not find them then and uses them only
-  after a restart), a warning (`helper programs`, only when there are some)
+- programs the helper did not find when it started but that are installed now (it uses them only
+  after a restart), and programs it found then that are gone or that others than root could now
+  replace (`helper programs`, only when there are some). Missing programs are matched by their
+  configured name, for example `cuda_checkpoint_path = "cuda-checkpoint-r570"`. CRIU, and
+  cuda-checkpoint on a host with an NVIDIA driver, are a FAIL, and so is a program the helper
+  would refuse (restarting it would stop the helper), with an ownership fix instead of a restart.
+  Anything else is a warning.
 - jobs the helper runs that the daemon does not account for (`orphaned jobs`, only when there
   are some)
 - the checkpoint directory (exists, not tmpfs, free space) and the total checkpoint size
@@ -1947,6 +1957,14 @@ package (once it is published), `sudo pacman -R gpueue-bin` (see
 sudo gpueue uninstall            # stop, disable and remove the units, snippets and copied binaries
 sudo gpueue uninstall --purge    # also delete /etc/gpueue, /var/lib/gpueue, /run/gpueue, /run/gpueue-helper
 ```
+
+`--purge` also deletes the directories `config.toml` moves the data to: `data_dir`,
+`helper_state_dir`, `logs_dir` and `checkpoints_dir`, when they are outside the directories above.
+It refuses, before it changes anything, when `config.toml` fails the helper's ownership check or
+cannot be parsed, or when a configured directory is `/`, contains one of the directories
+above (`data_dir = "/var/lib"`), or would fail the helper's check (it or a
+directory above it not owned by root, or group- or world-writable). A `state_db` outside the
+deleted directories is kept and reported, because it is in a directory of the daemon user's.
 
 `gpueue service uninstall` is the same command, and `install.sh --uninstall [--purge] [--yes]`
 runs it. `--purge` asks for confirmation on the terminal. When there is no terminal, pass

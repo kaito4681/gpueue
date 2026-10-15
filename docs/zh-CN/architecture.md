@@ -189,8 +189,8 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   目录下的挂载会保持不动。附加组由 helper 传入（见上文），因此 shim 不会再次查找。
 - 启动时，helper 会在其 `PATH` 中查找一次以名称给出的程序（`criu`、`cuda-checkpoint`、`nvidia-smi`），
   要求找到的文件与以绝对路径给出的程序一样，归 root 所有且只能经由只有 root 能修改的目录到达，此后一直使用
-  该绝对路径。未找到的程序在 helper 重启之前一直不可用；helper 在其 Hello 中列出它，守护进程再把它转给
-  `gpueue doctor`。没有 cuda-checkpoint 时，或者某个进程映射了 NVIDIA 设备但 `cuda-checkpoint --get-state`
+  该绝对路径。未找到的程序在 helper 重启之前一直不可用；helper 在其 Hello 中列出它以及已找到程序的路径，
+  守护进程再把这些转给 `gpueue doctor`（它会报告之后安装、删除或变得可被替换的程序）。没有 cuda-checkpoint 时，或者某个进程映射了 NVIDIA 设备但 `cuda-checkpoint --get-state`
   无法判断其状态时，GPU 作业的转储会被拒绝，而不是交给 CRIU，因为 CRIU 无法转储设备映射。
 - <a id="gpu-isolation"></a>**GPU 隔离。** `CUDA_VISIBLE_DEVICES` 只是告诉 CUDA 使用哪些 GPU，任何作业都
   可以修改它。在 `gpu_device_isolation = true`（默认）时，helper 为每个作业单元（无论启动的还是恢复的）设置

@@ -288,27 +288,25 @@ impl System for RealSystem {
     }
 }
 
-/// Directories searched for system tools: systemd's default `PATH` for services, which is what
-/// the helper sees (so that e.g. `criu` in /usr/sbin is found when `doctor` runs unprivileged).
-pub const TOOL_DIRS: &[&str] = &[
-    "/usr/local/sbin",
-    "/usr/local/bin",
-    "/usr/sbin",
-    "/usr/bin",
-    "/sbin",
-    "/bin",
-];
-
-/// Resolves a configured program (a bare name or a path) to a system path; `None` if a bare
-/// name is not in [`TOOL_DIRS`] or a path does not exist.
+/// Resolves a configured program (a bare name or an absolute path) to a system path the way
+/// the helper does: a bare name is looked up in systemd's default `PATH` for services
+/// ([`gpueue_config::trust::DEFAULT_SERVICE_PATH`], what the helper sees, so that e.g. `criu`
+/// in /usr/sbin is found when `doctor` runs unprivileged) with
+/// [`gpueue_config::trust::find_program`], which skips files without an exec bit. `None` if a
+/// bare name is not found, an absolute path does not exist, or the path is relative with a
+/// directory (the helper refuses those).
 pub fn find_program(sys: &dyn System, program: &Path) -> Option<PathBuf> {
-    if program.components().count() > 1 {
+    if program.is_absolute() {
         return sys.path(program).is_file().then(|| program.to_owned());
     }
-    TOOL_DIRS
-        .iter()
-        .map(|dir| Path::new(dir).join(program))
-        .find(|candidate| sys.path(candidate).is_file())
+    if program.components().count() != 1 {
+        return None;
+    }
+    std::env::split_paths(gpueue_config::trust::DEFAULT_SERVICE_PATH)
+        .find(|dir| {
+            gpueue_config::trust::find_program(program, sys.path(dir).as_os_str()).is_some()
+        })
+        .map(|dir| dir.join(program))
 }
 
 /// What [`find_runnable_program`] found.
@@ -316,22 +314,20 @@ pub fn find_program(sys: &dyn System, program: &Path) -> Option<PathBuf> {
 pub enum Program {
     /// May be run (a system path).
     Found(PathBuf),
-    /// A bare name not in [`TOOL_DIRS`], or a path that does not exist.
+    /// Not found by [`find_program`].
     Missing,
-    /// Running as root, but someone else could replace it: it is not run.
+    /// Someone else than root could replace it: the helper refuses it, and it is not run.
     Untrusted { path: PathBuf, reason: String },
 }
 
-/// [`find_program`] for a program this process runs. As root (`gpueue doctor` and `service
-/// install` run as root), only one that nobody but root can replace is accepted: the helper's
-/// rule, [`check_root_owned_chain`], applied to the resolved path.
+/// [`find_program`] for a program this process runs (or the helper would run): only one that
+/// nobody but root can replace is accepted, the helper's rule [`check_root_owned_chain`]
+/// applied to the resolved path. The check reads metadata only, so it also applies when this
+/// process is not root (a program the helper would refuse is reported, not run).
 pub fn find_runnable_program(sys: &dyn System, program: &Path) -> Program {
     let Some(path) = find_program(sys, program) else {
         return Program::Missing;
     };
-    if sys.euid() != 0 {
-        return Program::Found(path);
-    }
     match check_root_owned_chain(sys, &path) {
         Ok(()) => Program::Found(path),
         Err(reason) => Program::Untrusted { path, reason },
@@ -352,6 +348,23 @@ pub fn is_root_owned_and_protected(sys: &dyn System, path: &Path) -> io::Result<
 /// group-writable when it is sticky and its group is `nixbld`. This is the helper's rule
 /// ([`gpueue_config::trust::OwnershipCheck`]), applied below [`System::root`].
 pub fn check_root_owned_chain(sys: &dyn System, path: &Path) -> Result<(), String> {
+    walk_root_owned(sys, path, true).map_err(|err| err.to_string())
+}
+
+/// [`check_root_owned_chain`] that refuses any symlink on the way: the rule the helper reads
+/// its configuration file with ([`gpueue_config::Config::load_trusted`]).
+pub fn check_root_owned_no_symlinks(
+    sys: &dyn System,
+    path: &Path,
+) -> Result<(), gpueue_config::trust::Untrusted> {
+    walk_root_owned(sys, path, false)
+}
+
+fn walk_root_owned(
+    sys: &dyn System,
+    path: &Path,
+    follow: bool,
+) -> Result<(), gpueue_config::trust::Untrusted> {
     use gpueue_config::trust::{GROUP_FILE, NIX_BUILD_GROUP, NIX_STORE, OwnershipCheck, group_gid};
 
     let root = sys.root();
@@ -366,9 +379,15 @@ pub fn check_root_owned_chain(sys: &dyn System, path: &Path) -> Result<(), Strin
             .find_map(|r| p.strip_prefix(r).ok())
             .map_or_else(|| p.to_owned(), |rest| Path::new("/").join(rest))
     };
-    OwnershipCheck::new(sys.root_uid(), Some(real_root.clone()), store, nixbld)
-        .check(&sys.path(path))
-        .map_err(|err| err.map_paths(to_system).to_string())
+    let check = OwnershipCheck::new(sys.root_uid(), Some(real_root.clone()), store, nixbld);
+    // Below another root, its real path: symlinks above it are not the managed system's.
+    let local = real_root.join(path.strip_prefix("/").unwrap_or(path));
+    if follow {
+        check.check(&local)
+    } else {
+        check.check_no_symlinks(&local)
+    }
+    .map_err(|err| err.map_paths(to_system))
 }
 
 /// Runs a command and turns a failure into an error message.
