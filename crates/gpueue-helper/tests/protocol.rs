@@ -217,7 +217,11 @@ impl Client {
         };
         c.send(&DaemonMessage::Hello(hello)).await;
         match c.read().await {
-            Some(HelperMessage::Hello(h)) => assert_eq!(h.protocol_version, PROTOCOL_VERSION),
+            Some(HelperMessage::Hello(h)) => {
+                assert_eq!(h.protocol_version, PROTOCOL_VERSION);
+                // The epoch of its event numbering, for the daemon.
+                assert!(h.event_epoch.is_some_and(|e| e > 0), "{h:?}");
+            }
             other => panic!("expected hello, got {other:?}"),
         }
         c
@@ -343,6 +347,7 @@ async fn version_mismatch_gets_our_hello_then_eof() {
         protocol_version: PROTOCOL_VERSION + 1,
         binary_version: "9.9.9".into(),
         missing_programs: Vec::new(),
+        event_epoch: None,
         programs: Vec::new(),
     };
     wr.write_all(&encode_line(&DaemonMessage::Hello(theirs)).unwrap())

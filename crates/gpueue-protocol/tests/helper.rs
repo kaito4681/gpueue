@@ -38,6 +38,7 @@ fn hello_golden() {
         protocol_version: 1,
         binary_version: "0.1.0".into(),
         missing_programs: Vec::new(),
+        event_epoch: None,
         programs: Vec::new(),
     };
     assert_golden_line(
@@ -49,6 +50,15 @@ fn hello_golden() {
         r#"{"type":"hello","protocol_version":1,"binary_version":"0.1.0"}"#,
     );
     assert!(Hello::current().is_compatible(&hello));
+    let with_epoch = Hello {
+        event_epoch: Some(7),
+        ..hello.clone()
+    };
+    assert_golden_line(
+        &HelperMessage::Hello(with_epoch.clone()),
+        r#"{"type":"hello","protocol_version":1,"binary_version":"0.1.0","event_epoch":7}"#,
+    );
+    assert!(Hello::current().is_compatible(&with_epoch));
     let future = Hello {
         protocol_version: 2,
         ..hello

@@ -1239,6 +1239,12 @@ fn helper_event_seq_starts_at_zero_and_is_kept() {
     assert_eq!(store.helper_event_seq().unwrap(), i64::MAX as u64);
     store.set_helper_event_seq(3).unwrap();
     assert_eq!(store.helper_event_seq().unwrap(), 3);
+    assert_eq!(store.helper_event_epoch().unwrap(), None);
+    store
+        .transaction(|tx| tx.set_helper_event_epoch(42))
+        .unwrap();
+    assert_eq!(store.helper_event_epoch().unwrap(), Some(42));
+    assert_eq!(store.helper_event_seq().unwrap(), 3);
     // The job id counter is untouched.
     assert_eq!(store.next_job_id().unwrap(), JobId(0));
 }

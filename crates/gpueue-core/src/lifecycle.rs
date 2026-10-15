@@ -605,6 +605,17 @@ pub enum Event {
     CheckpointRefused {
         reason: String,
     },
+    /// The outcome of a dump arrived after the daemon had taken its
+    /// request for lost, because the helper listed the job as running
+    /// (it resumes the job before it reports a failed dump), and had put
+    /// the job back to `Running` or `Paused`. `attempted`: CRIU tried the
+    /// dump and rolled it back (the job was frozen and its CUDA state
+    /// toggled, so it is terminated as after any failed dump); otherwise
+    /// the dump was refused before the job was touched.
+    LateCheckpointFailure {
+        reason: String,
+        attempted: bool,
+    },
     /// `stopped`: the helper left the restored processes stopped (the
     /// daemon asked for it because the job was paused when it was dumped).
     RestoreSucceeded {
@@ -627,6 +638,7 @@ impl Event {
             Event::CheckpointSucceeded => "marked as checkpointed",
             Event::CheckpointFailed { .. } => "marked as checkpoint failed",
             Event::CheckpointRefused { .. } => "marked as checkpoint refused",
+            Event::LateCheckpointFailure { .. } => "marked as checkpoint failed late",
             Event::RestoreSucceeded { .. } => "marked as restored",
             Event::RestoreFailed { .. } => "marked as restore failed",
             Event::Lost => "marked as lost",
@@ -709,6 +721,27 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
             .with(Effect::Terminate)
             .with(Effect::DeleteCheckpointImage)
         }
+        // As for the same outcomes in `Checkpointing` above; the job is
+        // already back in the state it had before the dump.
+        (
+            Event::LateCheckpointFailure {
+                reason,
+                attempted: true,
+            },
+            JobState::Running | JobState::Paused,
+        ) => Transition::to(JobState::Terminating {
+            result: JobResult::CheckpointFailed {
+                reason: reason.clone(),
+            },
+        })
+        .with(Effect::Terminate)
+        .with(Effect::DeleteCheckpointImage),
+        (
+            Event::LateCheckpointFailure {
+                attempted: false, ..
+            },
+            JobState::Running | JobState::Paused,
+        ) => Transition::unchanged(),
 
         (Event::RestoreSucceeded { stopped }, JobState::Restoring) => restored(*stopped),
         // The restore was given up as interrupted (`Lost` below, e.g. after
@@ -1417,6 +1450,53 @@ mod tests {
         assert!(t.effects.is_empty(), "no signal, no image to delete");
         assert!(on_event(&job(1, JobState::Checkpointed), &refused).is_err());
         assert!(on_event(&job(1, JobState::Queued { enqueued_at: 0 }), &refused).is_err());
+    }
+
+    /// The outcome of a dump whose request was taken for lost (the job is
+    /// back to running or paused): an attempted dump terminates the job,
+    /// a refused one leaves it alone.
+    #[test]
+    fn late_checkpoint_failure() {
+        for state in [JobState::Running, JobState::Paused] {
+            let failed = Event::LateCheckpointFailure {
+                reason: "criu failed".to_owned(),
+                attempted: true,
+            };
+            let t = on_event(&job(1, state.clone()), &failed).unwrap();
+            assert_eq!(
+                t.next,
+                Some(JobState::Terminating {
+                    result: JobResult::CheckpointFailed {
+                        reason: "criu failed".to_owned()
+                    }
+                })
+            );
+            assert_eq!(
+                t.effects,
+                vec![Effect::Terminate, Effect::DeleteCheckpointImage]
+            );
+            assert_eq!(keep_paused(&failed, t.clone()), t);
+            let refused = Event::LateCheckpointFailure {
+                reason: "no space".to_owned(),
+                attempted: false,
+            };
+            let t = on_event(&job(1, state.clone()), &refused).unwrap();
+            assert_eq!(t, Transition::unchanged());
+            assert_eq!(keep_paused(&refused, t.clone()), t);
+        }
+        let failed = Event::LateCheckpointFailure {
+            reason: "x".to_owned(),
+            attempted: true,
+        };
+        for state in [
+            JobState::Checkpointing,
+            JobState::Checkpointed,
+            JobState::Terminating {
+                result: JobResult::Killed,
+            },
+        ] {
+            assert!(on_event(&job(1, state), &failed).is_err());
+        }
     }
 
     #[test]
