@@ -79,7 +79,8 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    開始します。init はマウントを private にし、新しい `/proc` をマウントします。他のマウントの下に隠れた
    マウントと、再起動後に残らないマウント（`/run/*`、`/media/*`）を取り除き、`autofs` マウントの上に重なった
    automount 済みのファイルシステムをそれぞれ普通のコピーに置き換え、`/tmp` と `/dev/shm` に専用の tmpfs を
-   マウントします。`job_system_dbus = true` でなければ `/run/dbus` を空の tmpfs で隠し、`job_systemd_varlink = true` でなければ
+   マウントします（その前に、そこやその下にマウントされているもの、つまりホストの tmpfs の `/tmp` とその上の
+   AppImage の FUSE マウントなどを外します。外さないと名前空間に隠れたまま残ります）。`job_system_dbus = true` でなければ `/run/dbus` を空の tmpfs で隠し、`job_systemd_varlink = true` でなければ
    `/run/systemd` を journald のログのソケット、resolved の名前解決のソケットと `resolv.conf` のファイル、`userdb/` だけを
    残した tmpfs で隠すので、ジョブは後からソケットが現れても D-Bus でも Varlink でも systemd や polkit に何も要求できません。
    `job_hidden_socket_dirs` のディレクトリ（既定は、呼び出し元のグループをユーザーデータベースで確かめるデーモンの

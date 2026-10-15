@@ -77,7 +77,9 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    namespace's init, after it triggered the host's automount points (so that the namespace gets
    the automounted filesystems). The init makes the mounts private and mounts a fresh `/proc`. It removes mounts hidden under other mounts and mounts that do not survive a
    reboot (`/run/*`, `/media/*`), replaces each automounted filesystem stacked on its `autofs`
-   mount with a plain copy, and mounts private tmpfs on `/tmp` and `/dev/shm`. Unless
+   mount with a plain copy, and mounts private tmpfs on `/tmp` and `/dev/shm`, after detaching
+   whatever is mounted at or below them (the host's tmpfs `/tmp` and mounts on it, such as an
+   AppImage's FUSE mount, which would otherwise stay hidden in the namespace). Unless
    `job_system_dbus = true`, it hides `/run/dbus` behind an empty tmpfs and, unless
    `job_systemd_varlink = true`, hides `/run/systemd` behind a tmpfs that holds only journald's log
    sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/`, so the job cannot

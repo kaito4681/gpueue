@@ -1138,8 +1138,10 @@ s20_verify() {
 # could not bind it on restore. A job that does not use it is checkpointed
 # with the mount left out and restored with an empty, inaccessible
 # directory there; a job working in it is refused, with the mount named,
-# and keeps running.
+# and keeps running. One under the host's /tmp is not in the job's
+# namespace at all (its private /tmp covers it).
 PFUSE=/home/alice/pfuse
+TFUSE=/tmp/e2e-tfuse
 s21_private_fuse() {
     local disk=/var/lib/gpueue-e2e-disk u d err
     need_mounts
@@ -1155,6 +1157,11 @@ s21_private_fuse() {
     runuser -u alice -- sshfs -o IdentityFile=/home/alice/.e2e-ssh-id,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,LogLevel=ERROR \
         root@127.0.0.1:/srv/ext4/export "$PFUSE" || fail "sshfs of alice on $PFUSE"
     ! stat "$PFUSE" >/dev/null 2>&1 || fail "root can look at alice's FUSE mount"
+    # The same under the host's /tmp (as an AppImage's mount): the job's
+    # private /tmp covers it, so the job's namespace must not keep it.
+    runuser -u alice -- mkdir -p "$TFUSE"
+    runuser -u alice -- sshfs -o IdentityFile=/home/alice/.e2e-ssh-id,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,LogLevel=ERROR \
+        root@127.0.0.1:/srv/ext4/export "$TFUSE" || fail "sshfs of alice on $TFUSE"
     u=$(cjob /home/alice /home/alice/m21-u.txt)
     # (Only alice can enter $PFUSE: not `cjob`, which changes into it as root.)
     d=$(runuser -u alice -- gpueue --color never add -p -g free -w "$PFUSE" -- \
@@ -1167,6 +1174,8 @@ s21_private_fuse() {
     [ "$(awk -v mp="$PFUSE" '$5 == mp {for (i = 7; i <= NF; i++) if ($i == "-") {print $(i + 1); exit}}' \
         "/proc/$(live_pid "$u")/mountinfo")" != fuse.sshfs ] \
         || fail "the restored job $u got the FUSE mount that refuses root"
+    ! grep -q " $TFUSE " "/proc/$(live_pid "$u")/mountinfo" \
+        || fail "the restored job $u has $TFUSE, hidden under its /tmp"
     err=$(pz alice checkpoint "$d" 2>&1) && fail "the checkpoint of job $d was not refused"
     echo "checkpoint of job $d: $err"
     grep -q "$PFUSE (fuse.sshfs) cannot be accessed by root" <<<"$err" \
@@ -1177,6 +1186,7 @@ s21_private_fuse() {
     wait_state "$u" 'done/*'
     wait_state "$d" 'done/*'
     runuser -u alice -- fusermount3 -u "$PFUSE" 2>/dev/null || umount -l "$PFUSE"
+    runuser -u alice -- fusermount3 -u "$TFUSE" 2>/dev/null || umount -l "$TFUSE"
     rm -f /home/alice/.e2e-ssh-id
 }
 

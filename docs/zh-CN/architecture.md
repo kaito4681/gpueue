@@ -64,7 +64,8 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
 5. **Shim。** shim 仍以 root 身份运行，它创建一个 PID 命名空间和一个挂载命名空间，并在触发主机的自动挂载点之后
    （以便命名空间获得自动挂载的文件系统）启动该命名空间的 init。init 把挂载设为私有，并挂载一个新的 `/proc`。它会移除被其他挂载遮盖的挂载以及重启后不会保留的挂载
    （`/run/*`、`/media/*`），把每个叠加在其 `autofs` 挂载之上的自动挂载文件系统替换为普通的副本，
-   并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs。除非 `job_system_dbus = true`，它会用一个空的 tmpfs 隐藏 `/run/dbus`，并且除非
+   并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs（在此之前先卸下挂载在那里及其下方的东西，例如主机的 tmpfs
+   `/tmp` 以及其上的 AppImage FUSE 挂载，否则它们会隐藏在命名空间中保留下来）。除非 `job_system_dbus = true`，它会用一个空的 tmpfs 隐藏 `/run/dbus`，并且除非
    `job_systemd_varlink = true`，用只保留 journald 日志套接字、resolved 名称解析套接字和 `resolv.conf` 文件以及 `userdb/`
    的 tmpfs 隐藏 `/run/systemd`，因此即使之后出现新的套接字，作业也无法通过 D-Bus 或 Varlink 向 systemd 或 polkit
    请求任何操作。它同样用空的 tmpfs 隐藏 `job_hidden_socket_dirs` 中的目录（默认为 `/run/libvirt` 和

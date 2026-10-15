@@ -1775,8 +1775,9 @@ working directory and open files on each of these:
 | filesystem not mounted after the reboot (missing fstab entry, NFS server down) | refused: `<path> needs <type> on <mount point>` |
 | FUSE filesystem whose daemon died while jobs ran (sshfs killed: the mount stays but does not answer; then unmounted on the host), with jobs that do not use it | works: they are checkpointed without it (also on the same boot), and get an empty, inaccessible directory there until the filesystem is mounted again, then the filesystem itself |
 | the same, with the job's working directory on it | not checkpointed (also not at the shutdown): `the job depends on a filesystem that is gone, does not answer or root cannot access: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
-| FUSE filesystem that the job's owner mounted without `allow_other` (sshfs; also what AppImages mount under `/tmp`), with a job that does not use it | works: it is checkpointed without it and gets an empty, inaccessible directory there |
+| FUSE filesystem that the job's owner mounted without `allow_other` (sshfs), with a job that does not use it | works: it is checkpointed without it and gets an empty, inaccessible directory there |
 | the same, with the job's working directory on it | not checkpointed: `... /home/alice/pfuse (fuse.sshfs) cannot be accessed by root (a FUSE mount without `allow_other`); the job uses it: the working directory /home/alice/pfuse` |
+| FUSE filesystem mounted under the host's `/tmp` (an AppImage's, e.g. `/tmp/.mount_*`) | works: the job's private `/tmp` covers it, so it is not in the job's namespace at all |
 | tmpfs mounted by the administrator (e.g. `/scratch`) with the job's files or working directory on it | refused: its contents are gone after a reboot. Use a tmpfs only for jobs that do not need to survive one. A restore on the same boot works. |
 
 Not tested, or not supported:
@@ -1806,7 +1807,7 @@ job keeps a dead copy), or it does not answer (its server is down). A FUSE or ne
 no longer has it, or if `statfs` on it fails with a connection error (`ENOTCONN`, `EIO`, `ESTALE`,
 ...) or does not return within 5 s (asked in a child process, so a hung NFS server cannot hold up
 the helper). A FUSE mount that refuses root is treated the same way: one mounted by a user without
-`allow_other` (a user's own sshfs, an AppImage's mount under `/tmp`) answers, but only to that
+`allow_other` (a user's own sshfs) answers, but only to that
 user, so CRIU (which runs as root) could not bind it again on restore.
 
 - A job that uses a dead mount (a file it has open there, its working or root directory, its

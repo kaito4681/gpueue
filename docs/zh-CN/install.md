@@ -1601,8 +1601,9 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 | 重启后未挂载的文件系统（缺少 fstab 条目、NFS 服务器宕机） | 拒绝：`<path> needs <type> on <mount point>` |
 | 作业运行期间其守护进程死掉的 FUSE 文件系统（sshfs 被 kill：挂载仍在但不响应；随后在主机上被卸载），以及不使用它的作业 | 可行：它们在不包含该挂载的情况下被检查点（同一次启动内也可以），在文件系统重新挂载之前在该处得到一个空的、无法访问的目录，之后得到文件系统本身 |
 | 同上，但作业的工作目录位于其上 | 不会被检查点（关机时也不会）：`the job depends on a filesystem that is gone, does not answer or root cannot access: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
-| 作业所有者未使用 `allow_other` 挂载的 FUSE 文件系统（sshfs；AppImage 在 `/tmp` 下的挂载也是如此），以及不使用它的作业 | 可行：作业在不包含该挂载的情况下被检查点，并在该处得到一个空的、无法访问的目录 |
+| 作业所有者未使用 `allow_other` 挂载的 FUSE 文件系统（sshfs），以及不使用它的作业 | 可行：作业在不包含该挂载的情况下被检查点，并在该处得到一个空的、无法访问的目录 |
 | 同上，但作业的工作目录位于其上 | 不会被检查点：`... /home/alice/pfuse (fuse.sshfs) cannot be accessed by root (a FUSE mount without `allow_other`); the job uses it: the working directory /home/alice/pfuse` |
+| 挂载在主机 `/tmp` 下的 FUSE 文件系统（AppImage 的挂载，例如 `/tmp/.mount_*`） | 可行：作业私有的 `/tmp` 覆盖了它，因此它根本不在作业的命名空间中 |
 | 管理员挂载的 tmpfs（例如 `/scratch`），作业的文件或工作目录位于其上 | 拒绝：重启后其内容已丢失。只把 tmpfs 用于不需要跨重启保留的作业。同一次启动内的恢复可行。 |
 
 未测试或不支持：
@@ -1628,7 +1629,7 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 `smb3`、`9p`、`ceph`、`glusterfs` 等）如果主机上已没有它，或者对它的 `statfs` 以连接错误
 （`ENOTCONN`、`EIO`、`ESTALE` 等）失败，或在 5 秒内没有返回（在子进程中检查，以免卡住的 NFS
 服务器拖住 helper），就被视为已死。拒绝 root 访问的 FUSE 挂载也按同样方式处理：用户未使用
-`allow_other` 挂载的文件系统（用户自己的 sshfs、AppImage 在 `/tmp` 下的挂载）会响应，但只响应该用户，
+`allow_other` 挂载的文件系统（用户自己的 sshfs）会响应，但只响应该用户，
 因此（以 root 身份运行的）CRIU 在恢复时无法再次绑定它。
 
 - 使用已死挂载的作业（在其上打开的文件、工作目录或根目录、可执行文件、映射的文件，或绑定在其上的

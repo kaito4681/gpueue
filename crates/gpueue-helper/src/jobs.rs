@@ -172,10 +172,17 @@ pub fn ensure_restore_mount_points(plan: &MountPlan) {
 }
 
 impl MountPlan {
-    /// Whether the mount point `m` is detached.
+    /// Whether the mount point `m` is detached: everything a private
+    /// tmpfs will cover, and what `prune` names but `keep` does not.
+    /// Covered mounts are of no use to the job, but would stay hidden in
+    /// its namespace, where CRIU dumps them and must mount them again on
+    /// restore; one that refuses root (a FUSE mount without `allow_other`
+    /// under a tmpfs `/tmp`, such as an AppImage's) made every restore fail.
     pub fn prunes(&self, m: &str) -> bool {
         use crate::mounts::path_under;
-        self.prune.iter().any(|p| path_under(m, p)) && !self.keep.iter().any(|k| path_under(m, k))
+        self.tmpfs.iter().any(|t| path_under(m, t))
+            || (self.prune.iter().any(|p| path_under(m, p))
+                && !self.keep.iter().any(|k| path_under(m, k)))
     }
 }
 
