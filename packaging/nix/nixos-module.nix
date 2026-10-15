@@ -34,11 +34,11 @@ let
   # using ExecStart=/usr/bin/.
   units = pkgs.runCommand "puzuz-systemd-units" { } ''
     mkdir -p "$out/lib/systemd/system" "$out/lib/tmpfiles.d"
-    for unit in ${../packaging/systemd}/*.service; do
+    for unit in ${../systemd}/*.service; do
       substitute "$unit" "$out/lib/systemd/system/$(basename "$unit")" \
         --replace-fail "ExecStart=/usr/bin/" "ExecStart=${cfg.package}/bin/"
     done
-    cp ${../packaging/tmpfiles.d/puzuz.conf} "$out/lib/tmpfiles.d/puzuz.conf"
+    cp ${../tmpfiles.d/puzuz.conf} "$out/lib/tmpfiles.d/puzuz.conf"
   '';
 
   serviceOverrides = {

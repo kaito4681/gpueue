@@ -448,7 +448,7 @@ sudo dnf remove puzuz
 <a id="nixos"></a>
 ### NixOS
 
-flake 的 NixOS 模块（`nixosModules.default`，文件 `nix/nixos-module.nix`）会设置守护进程、root helper、
+flake 的 NixOS 模块（`nixosModules.default`，文件 `packaging/nix/nixos-module.nix`）会设置守护进程、root helper、
 CLI、`puzuz` 系统用户、`puzuz-admin` 组、`/etc/puzuz/config.toml` 以及 `/var/lib/puzuz` 下的各目录。
 不要在 NixOS 上运行 `puzuz service install` 或 `puzuz update`；两者都会拒绝执行（NixOS 通过
 `/etc/os-release` 中的 `ID=nixos` 识别，参见[安装方式](#install-method)）。
@@ -582,7 +582,7 @@ services.puzuz.cudaCheckpointPackage = pkgs.callPackage ./cuda-checkpoint.nix { 
 
 home-manager 管理的是单个用户的环境，因此它无法安装守护进程或 helper（它们需要 root 和系统的 systemd）。
 其模块（`homeManagerModules.default`）在管理员已安装 puzuz 的机器上为 CLI 设置 shell 补全
-（`homeManagerModules.default`，文件 `nix/home-manager-module.nix`）：
+（`homeManagerModules.default`，文件 `packaging/nix/home-manager-module.nix`）：
 
 ```nix
 {

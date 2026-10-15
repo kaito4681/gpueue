@@ -8,7 +8,7 @@
 }:
 
 let
-  cargoToml = builtins.fromTOML (builtins.readFile ../Cargo.toml);
+  cargoToml = builtins.fromTOML (builtins.readFile ../../Cargo.toml);
 
 in
 rustPlatform.buildRustPackage {
@@ -18,25 +18,27 @@ rustPlatform.buildRustPackage {
   # Only what the build reads, so that editing the flake, CI files or tests
   # scripts outside this set does not rebuild the package.
   src = lib.fileset.toSource {
-    root = ../.;
-    fileset = lib.fileset.unions [
-      ../Cargo.toml
-      ../Cargo.lock
-      ../crates
+    root = ../..;
+    # This directory (packaging/nix) is left out, so that editing the Nix
+    # expressions alone does not rebuild the package either.
+    fileset = lib.fileset.difference (lib.fileset.unions [
+      ../../Cargo.toml
+      ../../Cargo.lock
+      ../../crates
       # Embedded with include_str!: unit templates, config, release key, maintainer
       # scripts, install.sh, deb-check.sh (the last ones by the marker test),
       # get-minisign.sh (by the minisign pin test).
-      ../packaging
-      ../scripts/install.sh
-      ../scripts/dist/deb-check.sh
-      ../scripts/dist/get-minisign.sh
-      ../README.md
-      ../LICENSE
-      ../docs
-    ];
+      ../../packaging
+      ../../scripts/install.sh
+      ../../scripts/dist/deb-check.sh
+      ../../scripts/dist/get-minisign.sh
+      ../../README.md
+      ../../LICENSE
+      ../../docs
+    ]) ./.;
   };
 
-  cargoLock.lockFile = ../Cargo.lock;
+  cargoLock.lockFile = ../../Cargo.lock;
 
   # The default workspace member is only `puzuz`; the helper is a separate package.
   cargoBuildFlags = [
@@ -58,7 +60,7 @@ rustPlatform.buildRustPackage {
   # Skipping them by name needed a list that every new such test broke.
   # Instead CI runs the whole suite with this toolchain outside the sandbox
   # (`nix develop -c cargo test --workspace --locked`, on x86_64 and aarch64),
-  # and checks.x86_64-linux.helper-tests (nix/tests/helper-tests.nix) runs
+  # and checks.x86_64-linux.helper-tests (packaging/nix/tests/helper-tests.nix) runs
   # every puzuz-helper test in a NixOS VM.
   doCheck = false;
 
