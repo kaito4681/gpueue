@@ -199,7 +199,7 @@ GPG 署名されているリリースでは `RPM-GPG-KEY-gpueue.minisig` 付き�
 
 ```sh
 sha256sum -c gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-minisign -Vm gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+minisign -Vm gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
 ```
 
 minisign は署名の trusted comment（署名の対象に含まれます）を表示します。これはリリースとファイルを
@@ -212,7 +212,7 @@ minisign は署名の trusted comment（署名の対象に含まれます）を�
 ```sh
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/latest/download/install.sh
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/latest/download/install.sh.minisig
-minisign -Vm install.sh -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+minisign -Vm install.sh -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
 sudo bash install.sh
 ```
 
@@ -222,7 +222,7 @@ sudo bash install.sh
 リリースは `.github/workflows/release.yml` で、リポジトリのシークレット `MINISIGN_SECRET_KEY` と
 `MINISIGN_PASSWORD` に保存された minisign の秘密鍵で署名されます。公開鍵は `gpueue` に組み込まれる
 `packaging/minisign.pub` と、`scripts/install.sh` の `MINISIGN_PUBKEY` です。使用中の鍵は本物のリリース鍵
-（ID `21E8F80CBA3FE3CA`）です。鍵をローテーションするとき（鍵の漏えいやメンテナーの交代）は、次のように新しい鍵
+（ID `EA3C2ED855877E21`）です。鍵をローテーションするとき（鍵の漏えいやメンテナーの交代）は、次のように新しい鍵
 ペアを作り、公開鍵を 2 か所とも同じコミットで差し替え、2 つのシークレットを更新します。インストール済みの
 `gpueue` は古い公開鍵を持っており、新しい鍵で署名されたリリースを検証できないので、`install.sh` での手動の
 再インストールが必要です。
@@ -286,7 +286,7 @@ sudo apt install "./gpueue_${arch}.deb"
 curl -fLO "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue_${arch}.deb.sha256"
 curl -fLO "https://github.com/kaito4681/gpueue/releases/latest/download/gpueue_${arch}.deb.minisig"
 sha256sum -c "gpueue_${arch}.deb.sha256"
-minisign -Vm "gpueue_${arch}.deb" -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+minisign -Vm "gpueue_${arch}.deb" -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
 ```
 
 trusted comment にはリリースとバージョンなしのファイル名が書かれています
@@ -337,17 +337,15 @@ sudo apt update && sudo apt upgrade
 
 **リポジトリの鍵。** パッケージ、リポジトリ、`.rpm` ファイルは 1 つの GPG 鍵（ソースツリーの
 `packaging/apt/gpueue-archive-keyring.gpg`）で署名されています。フィンガープリントは
-`E539 7032 5A39 7378 537B C776 20B6 B72F 9F55 85C2` です。ダウンロードした鍵を信頼する前に確認するには
+`9B4F 59D2 F414 B76B 626B 3BE0 4FB3 D15B 2389 5621` です。ダウンロードした鍵を信頼する前に確認するには
 次のようにします。
 
 ```console
 $ gpg --show-keys /etc/apt/keyrings/gpueue.gpg
-pub   rsa4096 2026-10-13 [SC]
-      E53970325A397378537BC77620B6B72F9F5585C2
-uid                      puzuz APT repository <https://github.com/kaito4681/puzuz>
+pub   rsa4096 2026-10-15 [SC]
+      9B4F59D2F414B76B626B3BE04FB3D15B23895621
+uid                      gpueue APT repository <https://github.com/kaito4681/gpueue>
 ```
-
-uid には gpueue の旧名 puzuz が残っていますが、鍵を識別するのはフィンガープリントです。
 
 **削除。**
 
@@ -400,7 +398,7 @@ gh workflow run release-apt.yml -R kaito4681/gpueue -f tag=v0.1.0
 通してアップグレードします。
 
 **アーカイブ鍵。** `packaging/apt/gpueue-archive-keyring.gpg` が本物の鍵で、フィンガープリントは
-`E539 7032 5A39 7378 537B C776 20B6 B72F 9F55 85C2` です（[Debian/Ubuntu パッケージのインストール](#installing-the-debianubuntu-package)
+`9B4F 59D2 F414 B76B 626B 3BE0 4FB3 D15B 2389 5621` です（[Debian/Ubuntu パッケージのインストール](#installing-the-debianubuntu-package)
 の「リポジトリの鍵」を参照）。その秘密鍵とパスフレーズはリポジトリのシークレット `APT_GPG_PRIVATE_KEY` と
 `APT_GPG_PASSPHRASE` です。`release.yml` と `apt-repo.sh` は、ユーザー ID に "TEST KEY" とある keyring
 （`scripts/dist/gen-apt-key.sh --test` が書き込むもの）を拒否します。鍵は次のように作ります。
@@ -488,8 +486,8 @@ CRIU が必要です（[CRIU](#criu) を参照）。ジョブの実行は CRIU �
 ```sh
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/download/v0.1.0/RPM-GPG-KEY-gpueue
 curl -fsSLO https://github.com/kaito4681/gpueue/releases/download/v0.1.0/RPM-GPG-KEY-gpueue.minisig
-minisign -Vm RPM-GPG-KEY-gpueue -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
-gpg --show-keys RPM-GPG-KEY-gpueue                   # E53970325A397378537BC77620B6B72F9F5585C2
+minisign -Vm RPM-GPG-KEY-gpueue -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP
+gpg --show-keys RPM-GPG-KEY-gpueue                   # 9B4F59D2F414B76B626B3BE04FB3D15B23895621
 sudo rpm --import RPM-GPG-KEY-gpueue
 rpm -K gpueue-0.1.0-1.x86_64.rpm                     # "digests signatures OK"
 # or let dnf refuse an unsigned or badly signed file:

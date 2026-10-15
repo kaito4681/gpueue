@@ -50,7 +50,7 @@
   `scripts/measure-checkpoint.sh` (times each checkpoint step; not a pass/fail test).
 - Distribution test (`scripts/install.sh` against a fake GitHub API, two test versions of the
   tree): `scripts/dist-test.sh` (`GPUEUE_DIST_BASE=ubuntu:22.04|ubuntu:24.04|debian:12`, default
-  ubuntu:26.04). The release signing key (`packaging/minisign.pub`, id 21E8F80CBA3FE3CA) is the
+  ubuntu:26.04). The release signing key (`packaging/minisign.pub`, id EA3C2ED855877E21) is the
   real one; to rotate it, create a new pair with `scripts/dist/gen-signing-key.sh` (see
   `docs/install.md`).
 - AUR package (`packaging/aur/gpueue-bin`): `scripts/dist/aur-test.sh` builds and installs it in
