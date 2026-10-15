@@ -65,11 +65,14 @@ CRIU 4.0 or newer) drive cuda-checkpoint instead. It is optional; see
 
 NVIDIA distributes cuda-checkpoint as a prebuilt binary in
 <https://github.com/NVIDIA/cuda-checkpoint>, under `bin/x86_64_Linux/cuda-checkpoint` (or
-`bin/aarch64_Linux/` on arm64). Put it
-where root's `PATH` finds it, owned by root and not writable by others:
+`bin/aarch64_Linux/` on arm64). Its major version must be the driver's (`gpueue doctor` warns
+otherwise). Put it where root's `PATH` finds it, owned by root and not writable by others
+(`uname -m` prints `x86_64` or `aarch64`, which picks the directory):
 
 ```sh
-sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
 ```
 
 You can put it somewhere else and set `cuda_checkpoint_path` in `/etc/gpueue/config.toml`. Absolute
@@ -85,6 +88,37 @@ The helper looks programs given by name up once, when it starts. **Restart it af
 cuda-checkpoint (or CRIU)** (`sudo systemctl restart gpueue-helper`): until then it cannot use
 them, refuses to checkpoint GPU jobs (`finding CUDA processes: the helper did not find
 cuda-checkpoint when it started ...`), and `gpueue doctor` warns (`helper programs`).
+
+### Dependencies that are not installed automatically
+
+No install method installs the NVIDIA driver or cuda-checkpoint, and only the NixOS module brings
+a CRIU that is new enough everywhere. What each method installs besides gpueue itself:
+
+| Install method | Installs | Leaves to you |
+| --- | --- | --- |
+| [install.sh](#installing-with-installsh), [Nix build](#other-distributions) + `gpueue service install` | nothing else (install.sh prints how to install CRIU and cuda-checkpoint if they are missing) | CRIU, the NVIDIA driver, cuda-checkpoint |
+| [.deb](#installing-the-debianubuntu-package) | its dependencies (libc6, libgcc-s1, systemd 240+) and the recommended `criu` the release has | CRIU 4.2+ where the release's is missing or older, the NVIDIA driver, cuda-checkpoint |
+| [.rpm](#installing-the-fedorarhelrocky-package) | its dependencies (glibc 2.34+, libgcc, systemd) and the recommended `criu` (weak dependency) | CRIU 4.2+ on RHEL/Rocky/Alma 9 (3.19), the NVIDIA driver, cuda-checkpoint |
+| [AUR](#arch-linux-aur) | its dependencies (systemd, glibc, libgcc); `criu` and `cuda-checkpoint` are only optional dependencies | CRIU, the NVIDIA driver, cuda-checkpoint |
+| [NixOS module](#nixos) | CRIU 4.2.1; `nvidia-smi` and NVML from `hardware.nvidia.package` | the NVIDIA driver (`hardware.nvidia`), cuda-checkpoint ([`cudaCheckpointPackage`](#cuda-checkpoint-on-nixos)) |
+
+Jobs run without CRIU and cuda-checkpoint; checkpoints need them. To add them (not on NixOS):
+
+```sh
+# CRIU 4.2 or newer, where the distribution has it (otherwise build it, see CRIU above)
+sudo apt install criu       # Ubuntu 26.04
+sudo dnf install criu       # Fedora
+sudo pacman -S criu         # Arch Linux
+
+# For GPU jobs, with an NVIDIA driver r570 or newer installed: cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
+
+# The helper looks the programs up only when it starts (see cuda-checkpoint above)
+sudo systemctl restart gpueue-helper
+gpueue doctor
+```
 
 ## Installing with install.sh
 

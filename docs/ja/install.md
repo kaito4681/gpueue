@@ -81,11 +81,15 @@ Debian 13（4.1）、RHEL/Rocky/Alma 9（3.19）では足りません。<https:/
 ### cuda-checkpoint
 
 NVIDIA は cuda-checkpoint をビルド済みのバイナリとして <https://github.com/NVIDIA/cuda-checkpoint> の
-`bin/x86_64_Linux/cuda-checkpoint`（arm64 では `bin/aarch64_Linux/`）で配布しています。root の `PATH` で
-見つかる場所に、root の所有で、他のユーザーが書き込めない状態で置いてください。
+`bin/x86_64_Linux/cuda-checkpoint`（arm64 では `bin/aarch64_Linux/`）で配布しています。メジャーバージョンは
+ドライバーと同じでなければなりません（違うと `gpueue doctor` が警告します）。root の `PATH` で見つかる場所に、
+root の所有で、他のユーザーが書き込めない状態で置いてください（`uname -m` は `x86_64` か `aarch64` を表示し、
+これでディレクトリが決まります）。
 
 ```sh
-sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
 ```
 
 別の場所に置いて、`/etc/gpueue/config.toml` で `cuda_checkpoint_path` を設定することもできます。ヘルパーは
@@ -101,6 +105,39 @@ sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpo
 インストールしたらヘルパーを再起動してください**（`sudo systemctl restart gpueue-helper`）。それまでは
 ヘルパーはそれらを使えず、GPU ジョブのチェックポイントを拒否し（`finding CUDA processes: the helper did not
 find cuda-checkpoint when it started ...`）、`gpueue doctor` は警告を出します（`helper programs`）。
+
+<a id="dependencies-that-are-not-installed-automatically"></a>
+### 自動ではインストールされない依存関係
+
+どのインストール方法も NVIDIA ドライバーと cuda-checkpoint はインストールしません。どこでも十分に新しい
+CRIU を持ち込むのは NixOS モジュールだけです。gpueue 本体のほかに各方法がインストールするもの：
+
+| インストール方法 | インストールするもの | 自分で用意するもの |
+| --- | --- | --- |
+| [install.sh](#installing-with-installsh)、[Nix ビルド](#other-distributions) + `gpueue service install` | ほかには何もなし（install.sh は CRIU と cuda-checkpoint がなければその入れ方を表示） | CRIU、NVIDIA ドライバー、cuda-checkpoint |
+| [.deb](#installing-the-debianubuntu-package) | 依存パッケージ（libc6、libgcc-s1、systemd 240 以降）と、リリースにあれば推奨の `criu` | リリースの CRIU がないか古い場合は CRIU 4.2 以降、NVIDIA ドライバー、cuda-checkpoint |
+| [.rpm](#installing-the-fedorarhelrocky-package) | 依存パッケージ（glibc 2.34 以降、libgcc、systemd）と推奨の `criu`（弱い依存） | RHEL/Rocky/Alma 9（3.19）では CRIU 4.2 以降、NVIDIA ドライバー、cuda-checkpoint |
+| [AUR](#arch-linux-aur) | 依存パッケージ（systemd、glibc、libgcc）。`criu` と `cuda-checkpoint` は任意の依存にすぎない | CRIU、NVIDIA ドライバー、cuda-checkpoint |
+| [NixOS モジュール](#nixos) | CRIU 4.2.1。`nvidia-smi` と NVML は `hardware.nvidia.package` から | NVIDIA ドライバー（`hardware.nvidia`）、cuda-checkpoint（[`cudaCheckpointPackage`](#cuda-checkpoint-on-nixos)） |
+
+CRIU と cuda-checkpoint がなくてもジョブは実行できますが、チェックポイントには必要です。追加するには
+（NixOS 以外）：
+
+```sh
+# CRIU 4.2 or newer, where the distribution has it (otherwise build it, see CRIU above)
+sudo apt install criu       # Ubuntu 26.04
+sudo dnf install criu       # Fedora
+sudo pacman -S criu         # Arch Linux
+
+# For GPU jobs, with an NVIDIA driver r570 or newer installed: cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
+
+# The helper looks the programs up only when it starts (see cuda-checkpoint above)
+sudo systemctl restart gpueue-helper
+gpueue doctor
+```
 
 <a id="installing-with-installsh"></a>
 ## install.sh でのインストール

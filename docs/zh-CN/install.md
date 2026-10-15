@@ -66,11 +66,14 @@ CRIU 4.0 或更高版本）驱动 cuda-checkpoint。该模式是可选的；参�
 ### cuda-checkpoint
 
 NVIDIA 在 <https://github.com/NVIDIA/cuda-checkpoint> 中以预编译二进制的形式分发 cuda-checkpoint，
-位于 `bin/x86_64_Linux/cuda-checkpoint`（arm64 上为 `bin/aarch64_Linux/`）。请将它放在 root 的 `PATH`
-能找到的位置，属主为 root，且其他用户不可写：
+位于 `bin/x86_64_Linux/cuda-checkpoint`（arm64 上为 `bin/aarch64_Linux/`）。它的主版本必须与驱动相同
+（否则 `gpueue doctor` 会发出警告）。请将它放在 root 的 `PATH` 能找到的位置，属主为 root，且其他用户不可写
+（`uname -m` 输出 `x86_64` 或 `aarch64`，据此选择目录）：
 
 ```sh
-sudo install -o root -g root -m 0755 cuda-checkpoint /usr/local/bin/cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
 ```
 
 也可以放在其他位置，并在 `/etc/gpueue/config.toml` 中设置 `cuda_checkpoint_path`。`criu`、`cuda-checkpoint`
@@ -85,6 +88,38 @@ helper 只在启动时查找一次以名称给出的程序。**安装 cuda-check
 （`sudo systemctl restart gpueue-helper`）：在此之前它无法使用这些程序，会拒绝为 GPU 作业创建检查点
 （`finding CUDA processes: the helper did not find cuda-checkpoint when it started ...`），`gpueue doctor`
 也会发出警告（`helper programs`）。
+
+<a id="dependencies-that-are-not-installed-automatically"></a>
+### 不会自动安装的依赖
+
+任何安装方式都不会安装 NVIDIA 驱动和 cuda-checkpoint，并且只有 NixOS 模块会在所有情况下带来足够新的
+CRIU。除 gpueue 本身外，各安装方式会安装的内容：
+
+| 安装方式 | 会安装 | 需要自己安装 |
+| --- | --- | --- |
+| [install.sh](#installing-with-installsh)、[Nix 构建](#other-distributions) + `gpueue service install` | 不安装其他内容（缺少 CRIU 和 cuda-checkpoint 时，install.sh 会打印安装方法） | CRIU、NVIDIA 驱动、cuda-checkpoint |
+| [.deb](#installing-the-debianubuntu-package) | 其依赖（libc6、libgcc-s1、systemd 240+），以及该发行版版本中有的推荐包 `criu` | 发行版版本的 CRIU 缺失或过旧时的 CRIU 4.2+、NVIDIA 驱动、cuda-checkpoint |
+| [.rpm](#installing-the-fedorarhelrocky-package) | 其依赖（glibc 2.34+、libgcc、systemd）和推荐包 `criu`（弱依赖） | RHEL/Rocky/Alma 9（3.19）上的 CRIU 4.2+、NVIDIA 驱动、cuda-checkpoint |
+| [AUR](#arch-linux-aur) | 其依赖（systemd、glibc、libgcc）；`criu` 和 `cuda-checkpoint` 只是可选依赖 | CRIU、NVIDIA 驱动、cuda-checkpoint |
+| [NixOS 模块](#nixos) | CRIU 4.2.1；`nvidia-smi` 和 NVML 来自 `hardware.nvidia.package` | NVIDIA 驱动（`hardware.nvidia`）、cuda-checkpoint（[`cudaCheckpointPackage`](#cuda-checkpoint-on-nixos)） |
+
+没有 CRIU 和 cuda-checkpoint 作业也能运行，但创建检查点需要它们。安装方法（NixOS 以外）：
+
+```sh
+# CRIU 4.2 or newer, where the distribution has it (otherwise build it, see CRIU above)
+sudo apt install criu       # Ubuntu 26.04
+sudo dnf install criu       # Fedora
+sudo pacman -S criu         # Arch Linux
+
+# For GPU jobs, with an NVIDIA driver r570 or newer installed: cuda-checkpoint
+git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint /tmp/cuda-checkpoint
+sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux/cuda-checkpoint" \
+  /usr/local/bin/cuda-checkpoint
+
+# The helper looks the programs up only when it starts (see cuda-checkpoint above)
+sudo systemctl restart gpueue-helper
+gpueue doctor
+```
 
 <a id="installing-with-installsh"></a>
 ## 使用 install.sh 安装
