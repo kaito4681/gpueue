@@ -162,3 +162,4 @@ a power loss. Training code should still save its own checkpoints.
 | `Checkpoint failed` / checkpoint refused | see `puzuz log <id>` for the reason; see [references/checkpoint.md](references/checkpoint.md). |
 
 `puzuz <command> --help` is authoritative for every flag.
+
