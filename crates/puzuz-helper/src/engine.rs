@@ -1502,6 +1502,10 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             // Looked up in a child process with a deadline: a filesystem
             // that does not answer (an NFS server that is down) must not
             // hold up the helper.
+            // The directories the shim hid behind a tmpfs (/run/libvirt,
+            // ...) are created again first: after a reboot only the shim
+            // had made them, and they are not missing in that sense.
+            crate::jobs::ensure_restore_mount_points(&self.cfg.mounts);
             let mut lookup = required.clone();
             lookup.extend(used.iter().filter(|f| !required.contains(f)).cloned());
             let absent = self.host.missing_paths(&lookup).map_err(|e| {
