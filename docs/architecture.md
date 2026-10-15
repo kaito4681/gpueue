@@ -81,7 +81,10 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    `job_system_dbus = true`, it hides `/run/dbus` behind an empty tmpfs and, unless
    `job_systemd_varlink = true`, hides `/run/systemd` behind a tmpfs that holds only journald's log
    sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/`, so the job cannot
-   ask systemd or polkit for anything over D-Bus or Varlink, also once new sockets appear there;
+   ask systemd or polkit for anything over D-Bus or Varlink, also once new sockets appear there.
+   It hides the directories of `job_hidden_socket_dirs` (by default `/run/libvirt` and
+   `/run/cups`, whose daemons check the caller's groups in the user database) behind empty
+   tmpfs the same way, creating missing ones first;
    CRIU dumps these mounts and recreates them on restore (see
    [What a job can and cannot do](install.md#what-a-job-can-and-cannot-do)). Then it drops to
    the owner's

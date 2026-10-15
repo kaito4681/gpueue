@@ -67,7 +67,8 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs。除非 `job_system_dbus = true`，它会用一个空的 tmpfs 隐藏 `/run/dbus`，并且除非
    `job_systemd_varlink = true`，用只保留 journald 日志套接字、resolved 名称解析套接字和 `resolv.conf` 文件以及 `userdb/`
    的 tmpfs 隐藏 `/run/systemd`，因此即使之后出现新的套接字，作业也无法通过 D-Bus 或 Varlink 向 systemd 或 polkit
-   请求任何操作；CRIU 会转储这个挂载并在恢复时
+   请求任何操作。它同样用空的 tmpfs 隐藏 `job_hidden_socket_dirs` 中的目录（默认为 `/run/libvirt` 和
+   `/run/cups`，这些守护进程在用户数据库中检查调用者的组），不存在时先创建；CRIU 会转储这些挂载并在恢复时
    重建它（见 [作业能做什么、不能做什么](install.md#what-a-job-can-and-cannot-do)）。然后它切换到所有者的
    uid、gid 和组并设置 `no_new_privs`，以所有者身份打开日志
    （`/var/lib/puzuz/logs/<uid>/<id>.log`）和工作目录，并通过 `sh -c` 运行命令。

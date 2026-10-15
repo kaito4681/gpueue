@@ -568,6 +568,76 @@ fn job_system_dbus_is_shown() {
 }
 
 #[test]
+fn hidden_daemon_sockets_are_shown() {
+    let (sys, _sockets) = healthy();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job sockets"), Level::Ok);
+    assert!(message(&report, "job sockets").contains("/run/libvirt, /run/cups"));
+
+    // A default left out.
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!("job_hidden_socket_dirs = [\"/run/cups\"]\n{CONFIG}"),
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job sockets"), Level::Warn);
+    assert!(message(&report, "job sockets").starts_with("/run/libvirt not hidden"));
+    assert!(hint(&report, "job sockets").contains(r#"["/run/cups", "/run/libvirt"]"#));
+
+    // An entry that is a socket, not a directory.
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!(
+            "job_hidden_socket_dirs = [\"/run/libvirt\", \"/run/cups\", \"/run/x/sock\"]\n{CONFIG}"
+        ),
+    );
+    sys.write("/run/x/sock", "");
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job sockets"), Level::Warn);
+    assert!(message(&report, "job sockets").contains("/run/x/sock not a directory"));
+
+    // nix-daemon trusting a group.
+    sys.write("/etc/puzuz/config.toml", CONFIG);
+    sys.write(
+        "/etc/nix/nix.conf",
+        "trusted-users = root\nextra-trusted-users = @wheel # admins\n",
+    );
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "job sockets"), Level::Warn);
+    assert!(message(&report, "job sockets").contains("nix-daemon trusts @wheel"));
+    assert!(hint(&report, "job sockets").contains("/nix/var/nix/daemon-socket"));
+    sys.write(
+        "/etc/puzuz/config.toml",
+        &format!(
+            "job_hidden_socket_dirs = [\"/run/libvirt\", \"/run/cups\", \"/nix/var/nix/daemon-socket\"]\n{CONFIG}"
+        ),
+    );
+    assert_eq!(level(&run(&sys, None), "job sockets"), Level::Ok);
+    sys.write("/etc/puzuz/config.toml", CONFIG);
+    sys.write("/etc/nix/nix.conf", "trusted-users = root\n");
+    assert_eq!(level(&run(&sys, None), "job sockets"), Level::Ok);
+}
+
+#[test]
+fn nix_trusted_users_are_parsed() {
+    use super::nix_trusted_non_root;
+    assert!(nix_trusted_non_root("").is_empty());
+    assert!(nix_trusted_non_root("trusted-users = root\n").is_empty());
+    assert_eq!(
+        nix_trusted_non_root("trusted-users = root @wheel alice\n"),
+        ["@wheel", "alice"]
+    );
+    // The last setting wins; extra- adds.
+    assert_eq!(
+        nix_trusted_non_root(
+            "trusted-users = @wheel\ntrusted-users = root\nextra-trusted-users = bob\n"
+        ),
+        ["bob"]
+    );
+    assert!(nix_trusted_non_root("# trusted-users = @wheel\n").is_empty());
+}
+
+#[test]
 fn gpu_isolation_is_shown() {
     let (sys, _sockets) = healthy();
     let report = run(&sys, None);

@@ -293,7 +293,7 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   `puzuz add` を実行したときの環境変数で実行されます。
 - root ヘルパーは、システムアカウント（uid が `job_min_uid` 未満。既定は `/etc/login.defs` の `UID_MIN`）、
   `job_allowed_users` が設定されているときにそこに含まれないユーザー、プライマリグループが root 相当の
-  グループ（`job_denied_groups`。既定は `docker`、`lxd`、`incus-admin`、`libvirt`、`disk`、`sudo`、
+  グループ（`job_denied_groups`。既定は `docker`、`lxd`、`incus-admin`、`libvirt`、`libvirtd`、`disk`、`sudo`、
   `wheel`、`admin`）であるユーザーのジョブを拒否します。これらのグループはすべてのジョブの補助グループから
   外されるので、所有者が Docker や sudo を使えてもジョブからは使えません（外したグループはヘルパーのジャーナルに記録されます）。
   拒否されたジョブは `puzuz refuses to run jobs as <user>: <reason>` という理由で起動に失敗します。
@@ -302,7 +302,9 @@ pueue での習慣やスクリプトの多くはそのまま使えます。puzuz
   のもとでは setuid プログラム（`sudo`、`su`、`pkexec`）は権限を得られず、ジョブのユニットからはシステムの D-Bus
   に接続できないので、polkit のルールが所有者のグループに何を許していても `systemctl`、`run0`、`machinectl`
   などの polkit で認可される操作はできません（`job_system_dbus = true` で解除できます）。`/run/systemd` の下の、
-  polkit で認可する systemd の Varlink サービスにも接続できません（`job_systemd_varlink`）。root 相当のグループは
+  polkit で認可する systemd の Varlink サービスにも接続できません（`job_systemd_varlink`）。所有者のグループを
+  ユーザーデータベースで確かめるデーモンのソケット（polkit で認可する `/run/libvirt` の libvirt のもの、`/run/cups` の
+  CUPS のもの）にも接続できません（`job_hidden_socket_dirs`）。root 相当のグループは
   外され、開けるデバイスノードは割り当てた GPU のものだけです。リストアの後も同じです。
   [ジョブにできること・できないこと](docs/ja/install.md#what-a-job-can-and-cannot-do)を参照してください。
 - **所有者または管理者のみ：** ジョブの変更（`kill`、`pause`、`start`、`remove`、`checkpoint`、

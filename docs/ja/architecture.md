@@ -81,7 +81,9 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    automount 済みのファイルシステムをそれぞれ普通のコピーに置き換え、`/tmp` と `/dev/shm` に専用の tmpfs を
    マウントします。`job_system_dbus = true` でなければ `/run/dbus` を空の tmpfs で隠し、`job_systemd_varlink = true` でなければ
    `/run/systemd` を journald のログのソケット、resolved の名前解決のソケットと `resolv.conf` のファイル、`userdb/` だけを
-   残した tmpfs で隠すので、ジョブは後からソケットが現れても D-Bus でも Varlink でも systemd や polkit に何も要求できません。CRIU はこのマウントを
+   残した tmpfs で隠すので、ジョブは後からソケットが現れても D-Bus でも Varlink でも systemd や polkit に何も要求できません。
+   `job_hidden_socket_dirs` のディレクトリ（既定は、呼び出し元のグループをユーザーデータベースで確かめるデーモンの
+   `/run/libvirt` と `/run/cups`）も同じように空の tmpfs で隠します（なければ先に作ります）。CRIU はこのマウントを
    ダンプし、リストアで作り直します（[ジョブにできること・できないこと](install.md#what-a-job-can-and-cannot-do)を参照）。その後、`no_new_privs` を設定して所有者の uid、gid、グループに切り替え、ログ
    （`/var/lib/puzuz/logs/<uid>/<id>.log`）と作業ディレクトリを所有者として開き、`sh -c` でコマンドを
    実行します。環境変数はクライアントのものに、`CUDA_VISIBLE_DEVICES`、`CUDA_DEVICE_ORDER=PCI_BUS_ID`、

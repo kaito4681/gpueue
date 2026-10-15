@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run inside a puzuz job by scenario 19 (scripts/e2e/scenario.sh): tries
-# every way the test container offers a member of `sudo`, `docker` and
-# `disk` to become root or act as root, and checks the job's identity.
+# every way the test container offers a member of `sudo`, `docker`,
+# `disk` and `libvirt` to become root or act as root, and checks the job's
+# identity.
 # Prints "ok <check>" for each attempt that failed as it must, "BAD <check>:
 # <detail>" otherwise, and "round <n> done" at the end of round <n>.
 #
@@ -82,11 +83,30 @@ s.connect(sys.argv[1])' "$sock"
     else
         echo "skip varlinkctl calls (no io.systemd.Credentials on this host)"
     fi
+    # Daemon sockets that authorize by the caller's groups in the user
+    # database (libvirt through polkit, CUPS through SystemGroup): stand-ins
+    # the scenario created as root before the job started in
+    # job_hidden_socket_dirs. Neither visible nor reachable.
+    n=0
+    while read -r sock; do
+        [ -n "$sock" ] || continue
+        n=$((n + 1))
+        if [ -e "$sock" ]; then
+            bad "daemon socket $sock hidden" "the job sees it"
+        else
+            ok "daemon socket $sock hidden"
+        fi
+        must_fail "connect to the daemon socket $sock" python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])' "$sock"
+    done <"$home/e2e-daemon-sockets"
+    echo "   (tried $n daemon sockets)"
     must_fail_if systemd-dissect "systemd-dissect --mount (mountfsd)" \
         systemd-dissect --mount --mkdir /usr/lib/os-release "$home/e2e-dissect"
     # Sockets the host created after the job started (listed by the
-    # scenario before each round), in /run/dbus and /run/systemd: neither
-    # visible nor reachable.
+    # scenario before each round), in /run/dbus, /run/systemd and the
+    # directories of job_hidden_socket_dirs: neither visible nor reachable.
     while read -r sock; do
         [ -n "$sock" ] || continue
         if [ -e "$sock" ]; then
@@ -110,7 +130,7 @@ s.connect(sys.argv[1])' "$sock"
     [ "$(id -g)" = "$gid" ] && ok "gid" || bad "gid" "$(id -g) != $gid"
     local groups
     groups=$(id -Gn)
-    if grep -qwE 'sudo|docker|disk' <<<"$groups"; then
+    if grep -qwE 'sudo|docker|disk|libvirt' <<<"$groups"; then
         bad "groups" "$groups"
     else
         ok "groups"

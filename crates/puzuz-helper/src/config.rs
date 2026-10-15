@@ -172,10 +172,16 @@ impl HelperConfig {
             ),
             ..HelperConfig::default()
         };
-        if file.job_system_dbus {
-            // Jobs may reach the system D-Bus: /run/dbus stays.
-            cfg.mounts.hidden_dirs.clear();
-        }
+        // The system D-Bus directory unless jobs may reach it, then the
+        // daemon socket directories of `job_hidden_socket_dirs`.
+        cfg.mounts.hidden_dirs = if file.job_system_dbus {
+            Vec::new()
+        } else {
+            crate::jobs::SYSTEM_BUS_DIRS.map(String::from).to_vec()
+        };
+        cfg.mounts
+            .hidden_dirs
+            .extend(file.job_hidden_socket_dirs.iter().cloned());
         if file.job_systemd_varlink {
             // Jobs may reach systemd's Varlink services: /run/systemd stays.
             cfg.mounts.systemd_run_keep = None;
@@ -424,10 +430,27 @@ mod tests {
     #[test]
     fn the_system_bus_is_covered_unless_allowed() {
         let r = HelperConfig::resolve(&file(""), Overrides::default());
-        assert_eq!(r.config.mounts.hidden_dirs, ["/run/dbus", "/var/run/dbus"]);
+        assert_eq!(
+            r.config.mounts.hidden_dirs,
+            ["/run/dbus", "/var/run/dbus", "/run/libvirt", "/run/cups"]
+        );
+        assert_eq!(r.config.mounts, crate::jobs::MountPlan::default());
         let r = HelperConfig::resolve(&file("job_system_dbus = true\n"), Overrides::default());
-        assert!(r.config.mounts.hidden_dirs.is_empty());
+        assert_eq!(r.config.mounts.hidden_dirs, ["/run/libvirt", "/run/cups"]);
         assert!(r.config.mounts.systemd_run_keep.is_some());
+    }
+
+    #[test]
+    fn daemon_socket_dirs_follow_the_configuration() {
+        let r = HelperConfig::resolve(&file("job_hidden_socket_dirs = []\n"), Overrides::default());
+        assert_eq!(r.config.mounts.hidden_dirs, crate::jobs::SYSTEM_BUS_DIRS);
+        let r = HelperConfig::resolve(
+            &file(
+                "job_system_dbus = true\njob_hidden_socket_dirs = [\"/nix/var/nix/daemon-socket\"]\n",
+            ),
+            Overrides::default(),
+        );
+        assert_eq!(r.config.mounts.hidden_dirs, ["/nix/var/nix/daemon-socket"]);
     }
 
     #[test]
@@ -439,7 +462,10 @@ mod tests {
         );
         let r = HelperConfig::resolve(&file("job_systemd_varlink = true\n"), Overrides::default());
         assert_eq!(r.config.mounts.systemd_run_keep, None);
-        assert_eq!(r.config.mounts.hidden_dirs, crate::jobs::SYSTEM_BUS_DIRS);
+        assert_eq!(
+            r.config.mounts.hidden_dirs[..2],
+            crate::jobs::SYSTEM_BUS_DIRS
+        );
     }
 
     #[test]

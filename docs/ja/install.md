@@ -1093,6 +1093,10 @@ puzuz service status   # both units, and whether the daemon is reachable and con
 - ジョブがシステムの D-Bus や systemd の Varlink サービスに到達できるか。`job_system_dbus` か
   `job_systemd_varlink` が有効なら警告します（`job d-bus`、
   [ジョブにできること・できないこと](#what-a-job-can-and-cannot-do) を参照）
+- ジョブから隠すデーモンのソケットのディレクトリ。`job_hidden_socket_dirs` の既定の項目が抜けているとき、
+  ディレクトリでない項目があるとき、nix-daemon の `trusted-users` が root 以外を挙げているのに
+  `/nix/var/nix/daemon-socket` を隠していないときに警告します（`job sockets`、
+  [ジョブにできること・できないこと](#what-a-job-can-and-cannot-do) を参照）
 - ジョブを実行できるユーザー：最小の uid、拒否するグループ、許可するユーザー（`job policy`、
   [ジョブを実行できるユーザー](#who-jobs-may-run-as) を参照）
 - デーモンのディレクトリが `ReadWritePaths=` の中にあるか（`daemon write paths`）
@@ -1179,7 +1183,8 @@ sudo systemctl restart puzuz-helper.service puzuz.service
 | `job_system_dbus` | `false` | ヘルパー | `true` にするとジョブがシステムの D-Bus（systemd、polkit）に接続できます。デフォルトではジョブから `/run/dbus` を隠します（[ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)を参照） |
 | `job_systemd_varlink` | `false` | ヘルパー | `true` にするとジョブが `/run/systemd` の下にある systemd の Varlink サービスに接続できます。デフォルトでは journald のログのソケット、resolved の名前解決のソケットと `resolv.conf` のファイル、`userdb/` 以外のこのディレクトリをジョブから隠します（[ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)を参照） |
 | `job_min_uid` | `/etc/login.defs` の `UID_MIN`、なければ `1000` | ヘルパー | uid がこれより小さいユーザーのジョブを拒否します（[ジョブを実行できるユーザー](#who-jobs-may-run-as)を参照） |
-| `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` | ヘルパー | root 相当のグループ。ジョブの補助グループから外し、プライマリグループがこれらのいずれかであるジョブは拒否します |
+| `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]` | ヘルパー | root 相当のグループ。ジョブの補助グループから外し、プライマリグループがこれらのいずれかであるジョブは拒否します |
+| `job_hidden_socket_dirs` | `["/run/libvirt", "/run/cups"]` | ヘルパー | 空の root 所有の tmpfs でジョブから隠すディレクトリ（なければ先に作ります）。呼び出し元のグループをユーザーデータベースで確かめるデーモンのソケットのもので、グループを外しても防げません。2 階層以上の絶対パスで指定します（[ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)を参照） |
 | `job_allowed_users` | `[]`（全員） | ヘルパー | 空でなければ、ここに（名前で）挙げたユーザーだけがジョブを実行できます |
 | `gpu_detection` | `"auto"` | デーモン | `"auto"`：NVML、失敗したら `[[gpus]]`。`"static"`：`[[gpus]]` のみ。 |
 | `nvml_library` | 未設定 | デーモン | NVML ライブラリのパスまたは名前。デフォルトでは `libnvidia-ml.so.1`、次に `libnvidia-ml.so` |
@@ -1228,14 +1233,14 @@ root ヘルパーがすべてのジョブをその所有者として起動する
   | --- | --- |
   | `docker` | Docker のソケットから、`/` をバインドマウントして root で動くコンテナを起動できる |
   | `lxd`、`incus-admin` | LXD/Incus で同じことができる（特権コンテナ、ホストのマウント）。Incus の制限付きの `incus` グループは含めていない |
-  | `libvirt` | `qemu:///system` を管理でき、その VM にホストのブロックデバイスやディレクトリを渡せる |
+  | `libvirt`、`libvirtd`（NixOS） | `qemu:///system` を管理でき、その VM にホストのブロックデバイスやディレクトリを渡せる |
   | `disk` | ブロックデバイスに直接読み書きでき、つまりその上のすべてのファイルを読み書きできる |
   | `sudo`、`wheel`、`admin` | sudo の権限。sudo は通常パスワードを尋ね、無人のジョブはそれを入力できないが、`NOPASSWD` の規則やキャッシュされた認証があればジョブが root になれてしまう |
 
   root に相当しないので含めていないもの：`shadow`（パスワードハッシュ。せいぜいオフラインで解析される）、
   `adm`（ログ）、`kvm`、`video`/`render`（デバイス。GPU ジョブには後の 2 つが必要）。ホストで root 相当になる
   グループ（例：`microk8s`）を追加するか、ジョブに使わせたいグループを外してください（例：
-  `job_denied_groups = ["lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]` でジョブが
+  `job_denied_groups = ["lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]` でジョブが
   Docker を使えるようになります）。
 - `job_allowed_users`：空でなければ、（名前で）挙げたユーザーだけがジョブを実行できます。
 
@@ -1263,10 +1268,11 @@ polkit が信頼するグループのメンバー）でも、ジョブがそれ�
 | `sudo`、`su`、`pkexec` などの setuid やファイルケーパビリティのプログラムで権限を得られない | `no_new_privs` のもとではカーネルが setuid ビットとファイルケーパビリティを無視する | なし |
 | システムの D-Bus に接続できないので、`systemctl`、`run0`、`machinectl`、`busctl --system` など、systemd、polkit、システムサービスへの要求はできない | shim がジョブのマウント名前空間で `/run/dbus`（`/var/run` が `/run` へのリンクでなければ `/var/run/dbus` も）を空の root 所有の tmpfs で隠す。ホストにまだそのディレクトリがなければ作るので、後から現れるバスのソケットにも接続できない。リストアでは CRIU が tmpfs を保存して作り直す。polkit はグループの所属をジョブのグループではなくユーザーデータベースから判断するので、グループを外すだけでは防げない | `job_system_dbus = true` |
 | systemd の Varlink サービス（`io.systemd.Manager` の reload と reexecute、`io.systemd.Credentials` のシステム資格情報の復号、mountfsd、nsresourced、machined、logind、networkd、sysupdate など）に接続できない。これらは D-Bus を通らずに polkit で一般ユーザーの呼び出しを認可する | shim が `/run/systemd` を空の root 所有の tmpfs で隠し、journald のログのソケット（`journal/socket`、`journal/stdout`、`journal/dev-log`）、resolved の `resolve/io.systemd.Resolve`、`resolve/stub-resolv.conf`、`resolve/resolv.conf`（1 つずつバインドするので、後からそこに作られたソケットには接続できない）、`userdb/` ディレクトリ（ユーザーとグループの検索だけ。後述）と空の `system/` だけを残す。リストアでは CRIU がこれを保存して作り直す | `job_systemd_varlink = true` |
-| `docker`、`lxd`、`incus-admin`、`libvirt`、`disk`、`sudo`、`wheel`、`admin` のグループを持たない（root のデーモンのソケット、ブロックデバイスそのもの） | ヘルパーが補助グループから外す | `job_denied_groups` |
+| 呼び出し元のグループをユーザーデータベースで確かめて認可するデーモンのソケットに接続できない。libvirt のもの（`/run/libvirt/libvirt-sock`、`virtqemud-sock`、`virtstoraged-sock` など。`-ro` と `-admin` も）は Fedora、RHEL、Debian、Arch、NixOS では誰でも接続でき、polkit で認可される。同梱の polkit ルールは `org.libvirt.unix.manage` をグループ `libvirt`（NixOS では `libvirtd`）に許すので、隠さなければメンバーのジョブがホストのディスクを使う VM やストレージプールを定義できる。CUPS の `/run/cups/cups.sock` では、cupsd がピアの資格情報で呼び出し元を判断し、`SystemGroup`（`lpadmin`、`wheel`）のメンバーにプリンターの管理を許す | shim が `job_hidden_socket_dirs` の各ディレクトリを `/run/dbus` と同じく空の root 所有の tmpfs で隠す（なければ作るので、後から現れるソケットにも接続できない。リストアでは CRIU が保存して作り直す）。libcups は `localhost:631` に切り替えるので印刷はでき、そこでの管理にはパスワードが要る | `job_hidden_socket_dirs` |
+| `docker`、`lxd`、`incus-admin`、`libvirt`、`libvirtd`、`disk`、`sudo`、`wheel`、`admin` のグループを持たない（root のデーモンのソケット、ブロックデバイスそのもの） | ヘルパーが補助グループから外す | `job_denied_groups` |
 | 標準の疑似デバイスと割り当てた GPU のもの以外のデバイスノードを開けない | `DevicePolicy=closed` と `DeviceAllow=`（[GPU の分離](#gpu-isolation)） | `gpu_device_isolation` |
 
-それぞれの切り替えは保証を 1 つ弱めます。`job_system_dbus = true` か `job_systemd_varlink = true` のときは `puzuz doctor` が警告します。
+それぞれの切り替えは保証を 1 つ弱めます。`job_system_dbus = true` か `job_systemd_varlink = true` のとき、`job_hidden_socket_dirs` から既定の項目が抜けているときは `puzuz doctor` が警告します。
 puzuz が制限しないもの：所有者の uid そのものにできること（ファイル、セッションバス経由のユーザーサービス、
 ネットワーク）、ジョブが使う CPU、メモリ、ディスクの量、自分で資格情報を確かめるほかのサービスのソケット
 （たとえば、どのユーザーにも許すデーモンのソケット）。ジョブのマウントはプライベート（ホストからの伝播なし）なので、
@@ -1279,6 +1285,25 @@ puzuz が制限しないもの：所有者の uid そのものにできること
 だけで（ジョブは D-Bus に接続できません）、システムバスはほかのアドレスでは待ち受けません
 （`<listen>unix:path=/run/dbus/system_bus_socket</listen>` だけ）。名前解決は使えますが、ジョブには開始したときの
 `resolv.conf` が見えます（ファイルをバインドしており、resolved は変更時にファイルを置き換えるため）。
+
+ほかの場所にあるデーモンのソケットは Ubuntu 22.04/24.04/26.04、Debian 12、Fedora、RHEL 9、Arch、NixOS で
+確かめました。ほとんどはソケットファイルのグループで判断するので、グループを外せば防げます。Docker
+（`/run/docker.sock`、グループ `docker`）、Incus（`/var/lib/incus/unix.socket`、グループ `incus-admin`。
+`unix.socket.user` はグループ `incus` で、制限付きのプロジェクトしか与えません）、LXD
+（`/var/snap/lxd/common/lxd/unix.socket` と Ubuntu の `/run/lxd-installer.socket`、グループ `lxd`）、Ubuntu の libvirt
+（`auth_unix_rw = "none"` でグループ `libvirt` の `libvirt-sock`。いずれにせよ隠します）がそうです。rootful の Podman の
+`/run/podman/podman.sock`、containerd、virtlogd と virtlockd、Cockpit の内部のソケットは root かシステムグループしか
+受け付けません。Cockpit そのもの（ポート 9090）と SSH は、ほかのログインと同じくユーザーのパスワードか鍵を求めます。
+udisks2、NetworkManager、PackageKit、accounts-daemon、fwupd、firewalld には D-Bus のインターフェースしかありません。
+snapd の `/run/snapd.socket` には誰でも接続できますが、snap のインストール、削除、設定には polkit の `auth_admin`
+が要り、それにはシステムバス上の認証エージェントが要るので、ジョブにはできません（そもそも snap は `no_new_privs`
+のもとでは動きません）。nix-daemon（`/nix/var/nix/daemon-socket/socket`）は `trusted-users` の `@group` を
+グループデータベースで確かめ、信頼されたユーザーは root 相当です。既定（`root` だけ）は安全ですが、`@wheel`
+やほかのユーザーを信頼するなら `/nix/var/nix/daemon-socket` を `job_hidden_socket_dirs` に加えてください
+（`puzuz doctor` が警告します）。ジョブからは Nix デーモン（ビルド、取得）を使えなくなります。グループや polkit
+のルールを信頼するサイト独自のソケットも、同じようにそのディレクトリを加えてください。ホストがディレクトリを
+削除すると、その上のマスクは外れます（削除されたディレクトリ上のマウントは、カーネルがすべての名前空間で外します）。
+ホストが残すディレクトリを挙げてください。
 
 <a id="priority-and-fair-share"></a>
 ## 優先度とフェアシェア
@@ -1895,6 +1920,7 @@ sudo ls /var/lib/puzuz/checkpoints/failed-logs/   # dump.log of failed dumps (ne
 | `checkpoint dir` | on tmpfs, or little free space | `checkpoints_dir` を、ジョブの RAM + VRAM を収められるディスクに移します |
 | `helper settings` | ExecStart= passes flags | 設定を `config.toml` に移し、フラグを削除します |
 | `job d-bus` | allowed (`job_system_dbus = true` or `job_systemd_varlink = true`): jobs can ask systemd and polkit for actions (WARN) | ジョブに必要でなければ、そのキーを `/etc/puzuz/config.toml` から削除して `sudo systemctl restart puzuz-helper.service` を実行します |
+| `job sockets` | a default of `job_hidden_socket_dirs` is left out (`/run/libvirt not hidden`), an entry is not a directory (every job fails to start), or nix-daemon trusts users or groups besides root while `/nix/var/nix/daemon-socket` is not hidden (WARN) | `job_hidden_socket_dirs` をヒントが示すリストにして（既定に戻すならキーを削除して）、`sudo systemctl restart puzuz-helper.service` を実行します |
 | `orphaned jobs` | the helper runs jobs the daemon does not account for (WARN; their GPUs stay taken) | `puzuz status` は管理者にそれらを表示します。管理者は `puzuz kill <id>` で停止できます |
 
 NixOS（`/etc/os-release` が `ID=nixos`）では、`fix:` の行は NixOS では当てはまらない手順の代わりに

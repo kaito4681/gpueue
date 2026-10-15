@@ -133,12 +133,26 @@
 # job's supplementary groups (the helper's journal records it), and a job whose primary
 # group is one of them is refused, as is restoring a checkpoint taken with
 # one. Names are looked up in /etc/group; names not listed there are ignored;
-# gid 0 is always dropped. Why each is listed: docker, lxd, incus-admin and
-# libvirt start containers or VMs with host mounts or devices as root; disk
+# gid 0 is always dropped. Why each is listed: docker, lxd, incus-admin,
+# libvirt and libvirtd (NixOS) start containers or VMs with host mounts or
+# devices as root; disk
 # gives raw access to block devices; sudo, wheel and admin give sudo rights
 # (NOPASSWD rules or cached credentials would let an unattended job become
 # root). Remove a group (e.g. docker) to let jobs use it again.
-# job_denied_groups = ["docker", "lxd", "incus-admin", "libvirt", "disk", "sudo", "wheel", "admin"]
+# job_denied_groups = ["docker", "lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]
+
+# [helper] Directories of daemon sockets hidden from jobs behind an empty,
+# root-owned tmpfs (like /run/dbus), also after a restore and also for a
+# socket that appears later. Dropping a group from a job does not stop daemons
+# that look the caller's groups up in the user database: libvirt authorizes
+# through polkit, whose shipped rule trusts group libvirt (Fedora, RHEL,
+# Debian, Arch, NixOS), and cupsd checks its SystemGroup (lpadmin, wheel) for
+# callers on its socket (printing still works over localhost:631). Add the
+# directory of any other such socket, e.g. "/nix/var/nix/daemon-socket" when
+# nix-daemon's trusted-users lists a group or user besides root. Entries are
+# absolute directories at least two levels deep; a missing one is created.
+# `puzuz doctor` warns when a default is left out.
+# job_hidden_socket_dirs = ["/run/libvirt", "/run/cups"]
 
 # [helper] If not empty, only these users (by name) may run jobs; others are
 # refused. Empty: every user with uid >= job_min_uid.
