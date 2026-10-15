@@ -21,8 +21,8 @@ use puzuz_daemon::{
 use puzuz_protocol::BINARY_VERSION;
 use puzuz_protocol::api::{
     AddJobRequest, AddJobResponse, ApiError, BulkJobResponse, CleanResponse, ErrorCode,
-    GpuDetection, GpuSource, JobView, ListGpusResponse, ListJobsResponse, VERSION_HEADER,
-    VersionResponse, WARNINGS_HEADER, Warning,
+    Event as ApiEvent, GpuDetection, GpuSource, JobView, ListGpusResponse, ListJobsResponse,
+    SseDecoder, VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
 };
 use puzuz_protocol::helper::{RunningPhase, signal};
 use serde::de::DeserializeOwned;
@@ -988,6 +988,51 @@ async fn lost_checkpoint_requests_do_not_leave_jobs_checkpointing() {
     h.stop().await;
 }
 
+/// A checkpoint request the helper has not read yet when it reconnects
+/// is not taken for lost: the live-job list that comes with the reconnect
+/// may predate the request, so it shows the job running. The helper then
+/// handles the request: a dump it refuses leaves the job running, instead
+/// of ending it as "checkpoint failed" as a refused dump of a running job
+/// (an OS shutdown's) does (#17).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_helper_reconnect_during_a_checkpoint_request_does_not_abandon_it() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let id = alice.add(&job_request("a", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+    h.helper
+        .set_checkpoint_outcome(FakeOutcome::Refuse("not enough free space".to_owned()));
+    h.helper.hold_checkpoints();
+    let request = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.action(id, "checkpoint", json!(null)).await }
+    });
+    h.helper.wait_held_checkpoints(1).await;
+    assert_eq!(alice.job(id).await.state, JobState::Checkpointing);
+    // The list sent with the reconnect shows the job running. Its notice
+    // is handled before the dump's outcome, which follows it.
+    h.helper.disconnect();
+    h.helper.reconnect();
+    h.helper.release_checkpoints();
+    assert_eq!(request.await.unwrap().status, StatusCode::OK);
+    alice
+        .wait_for(id, "running with the refusal", |j| {
+            j.state == JobState::Running
+                && last_error(j) == Some("checkpoint refused: not enough free space")
+        })
+        .await;
+    assert!(h.helper.is_running(id));
+    assert!(h.helper.signals().is_empty(), "{:?}", h.helper.signals());
+
+    // The next dump goes through.
+    h.helper.set_checkpoint_outcome(FakeOutcome::Succeed);
+    let reply = alice.action(id, "checkpoint", json!(null)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    alice.wait_state(id, &JobState::Checkpointed).await;
+    h.stop().await;
+}
+
 /// The helper replays the events the daemon applied but did not
 /// acknowledge (it stopped in between); they are not applied twice. A
 /// replayed refusal would otherwise end the job, which has been running
@@ -1050,6 +1095,53 @@ async fn replayed_helper_events_are_applied_once() {
     // New events still apply.
     h.helper.exit(refused, 0);
     alice.wait_state(refused, &done(JobResult::Success)).await;
+    h.stop().await;
+}
+
+/// Replayed events that come with numbers up to the last one applied are
+/// applied all the same when the helper's numbering was reset (its state
+/// was wiped): the replay ends below the last number applied, which a
+/// helper that kept its numbering cannot do. Skipping them would mark the
+/// job lost instead of recording its exit (#20).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replayed_events_are_applied_after_the_helpers_numbering_was_reset() {
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(3).await;
+    let alice = h.client(ALICE);
+    let ids = [
+        alice.add(&job_request("a", &[])).await,
+        alice.add(&job_request("b", &[])).await,
+        alice.add(&job_request("c", &[])).await,
+    ];
+    for id in ids {
+        alice.wait_state(id, &JobState::Running).await;
+        h.wait_spawned(id).await;
+    }
+    let [a, b, c] = ids;
+    // Events 1 and 2 are applied and acknowledged.
+    h.exit(a, 0).await;
+    h.exit(b, 0).await;
+    for id in [a, b] {
+        alice.wait_state(id, &done(JobResult::Success)).await;
+    }
+
+    h.helper.disconnect();
+    h.helper.reset_event_numbering();
+    h.helper.exit(c, 3);
+    assert_eq!(h.helper.unacked()[0].seq.0, 1);
+    h.helper.reconnect();
+    let job = alice
+        .wait_for(c, "finished", |j| j.state != JobState::Running)
+        .await;
+    assert_eq!(job.state, done(JobResult::Failed { exit_code: 3 }));
+
+    // The numbering goes on from there.
+    let d = alice.add(&job_request("d", &[])).await;
+    alice.wait_state(d, &JobState::Running).await;
+    h.exit(d, 4).await;
+    alice
+        .wait_state(d, &done(JobResult::Failed { exit_code: 4 }))
+        .await;
     h.stop().await;
 }
 
@@ -2335,39 +2427,86 @@ async fn spawns_refused_by_a_stopping_helper_are_requeued() {
 /// helper left the job `Running` for another second although nothing ran,
 /// so a check of the job's state right after the restart passed while the
 /// spawn was still to be retried.
+///
+/// Checked without timing bounds: the job states the daemon publishes, in
+/// order, show each job queued again between the refused launch and its
+/// retry; and the retry comes no earlier than the launch pause after the
+/// refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_spawn_refused_by_a_stopping_helper_is_queued_until_retried() {
     let mut h = Harness::new(0).await;
     h.set_default_parallel(2).await;
     let alice = h.client(ALICE);
+    let response = alice.open(Method::GET, "/v1/events", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut events = response.into_body();
     h.helper.hold_launches();
     h.helper.refuse_launches(2);
     let first = alice.add(&job_request("first", &[])).await;
     let second = alice.add(&job_request("second", &[])).await;
-    let refused = tokio::time::Instant::now();
 
-    // Back in line right away, not shown as running while nothing runs.
-    for id in [first, second] {
-        let deadline = refused + Duration::from_millis(500);
-        loop {
-            let state = alice.job(id).await.state;
-            if matches!(state, JobState::Queued { .. }) {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "job {id} is still {state:?} after the helper refused it"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-    // Offered again only after a pause (not in a tight loop), then started.
+    // Offered again only after a pause (not in a tight loop); the retries
+    // are held.
     h.helper.wait_held(2).await;
+    let since_refusal = h.helper.last_refusal().unwrap().elapsed();
     assert!(
-        refused.elapsed() >= Duration::from_millis(900),
-        "retried after {:?}",
-        refused.elapsed()
+        since_refusal >= Duration::from_millis(900),
+        "retried {since_refusal:?} after the refusal"
     );
+
+    // Back in line right away, not shown as running while nothing runs:
+    // each job's published states alternate between queued and running,
+    // so every refused launch was followed by `Queued` before the next
+    // one. Which job gets which refusal depends on scheduling (the pause
+    // holds up the other job's first launch too), so only the totals are
+    // fixed: two refusals, then both jobs launched again (held). The
+    // retries' state changes were published before their requests reached
+    // the helper, so they are in the stream by now.
+    let mut states: BTreeMap<JobId, Vec<&'static str>> = BTreeMap::new();
+    let mut decoder = SseDecoder::new();
+    let relaunched = |states: &BTreeMap<JobId, Vec<&'static str>>| {
+        let launches = states
+            .values()
+            .flatten()
+            .filter(|n| **n == "running")
+            .count();
+        launches == 4
+            && [first, second]
+                .iter()
+                .all(|id| states.get(id).and_then(|s| s.last()) == Some(&"running"))
+    };
+    // Only guards against a hang: keep-alives arrive in between.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !relaunched(&states) {
+            let frame = events.frame().await.expect("event stream ended").unwrap();
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            for message in decoder.push(&data) {
+                let job = match message.parse_event().unwrap() {
+                    ApiEvent::JobAdded { job } | ApiEvent::JobUpdated { job } => job,
+                    _ => continue,
+                };
+                let seen = states.entry(job.id).or_default();
+                let name = job.state.name();
+                if seen.last() != Some(&name) {
+                    seen.push(name);
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("job states so far: {states:?}"));
+    for id in [first, second] {
+        let seen = &states[&id];
+        assert!(
+            seen.iter()
+                .enumerate()
+                .all(|(i, n)| *n == if i % 2 == 0 { "queued" } else { "running" }),
+            "job {id}: {seen:?}"
+        );
+    }
+
     h.helper.release_launches();
     for id in [first, second] {
         h.wait_spawned(id).await;

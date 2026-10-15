@@ -1274,10 +1274,14 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 if let Err(e) = entry.files.write_record(&record) {
                     eprintln!("puzuz-helper: recording checkpoint of job {}: {e}", job.0);
                 }
-                self.table().remove(&job);
+                // The job stays listed (as checkpointing) until its unit
+                // is released, which may take a while: the daemon takes a
+                // job that is neither listed nor reported for lost, and
+                // would delete its image.
                 if let Err(e) = self.launcher.release(&unit).await {
                     eprintln!("puzuz-helper: releasing {unit} after dump: {e}");
                 }
+                self.table().remove(&job);
                 outcome
             }
             Err(e) => {

@@ -53,12 +53,14 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
    Events are persisted and replayed until the daemon acknowledges them, so nothing is lost while
    the daemon is down. The daemon stores the number of the last event it applied with its effect
    and skips replayed events up to it, so an event is applied once even if the daemon stopped
-   before acknowledging it. An event it cannot decode (from a newer helper) is logged and
+   before acknowledging it. A replay that ends below that number comes from a helper whose state
+   was reset (its numbering started over), so its events are applied. An event it cannot decode (from a newer helper) is logged and
    acknowledged rather than ending the connection. After a reconnect both sides reconcile their
    lists of jobs: a job the helper no longer runs is lost, and a job the daemon believes is being
    checkpointed but the helper runs normally lost its checkpoint request and goes back to running
-   (or paused) with a failed checkpoint. A checkpoint request that times out is followed up the
-   same way. Before the daemon marks a job lost because the helper no longer knows it, it applies
+   (or paused) with a failed checkpoint. If that checkpoint request is still unanswered, or was
+   answered since the previous reconnect, the list may predate it, so the daemon checks again once
+   the answer is in. A checkpoint request that times out is followed up the same way. Before the daemon marks a job lost because the helper no longer knows it, it applies
    every event the helper sent before saying so, so a job that has just exited keeps its result.
    <a id="orphans"></a>A job the helper runs that the daemon has as finished, queued, checkpointed
    or not at all (for example after restoring the database from a backup) is an *orphan*. It is

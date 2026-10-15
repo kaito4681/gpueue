@@ -1058,6 +1058,47 @@ async fn a_restored_job_that_did_not_stop_is_killed() {
     assert_eq!(c.running().await, [(JobId(5), RunningPhase::Stopped)]);
 }
 
+/// A dumped job stays listed, as checkpointing, until its outcome is sent:
+/// releasing its unit may take a while, and the daemon takes a job the
+/// helper neither lists nor has reported for lost (deleting its image).
+#[tokio::test]
+async fn dumped_job_is_listed_until_its_outcome_is_sent() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let job = JobId(3);
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(3))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    env.launcher.hold_releases();
+    let r = c
+        .request(Request::Checkpoint {
+            job,
+            image_dir: env.base().join("3"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    env.launcher.wait_held_releases(1).await;
+    assert_eq!(c.running().await, [(job, RunningPhase::Checkpointing)]);
+    assert!(c.events.is_empty(), "{:?}", c.events);
+
+    env.launcher.let_releases_go();
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::CheckpointFinished {
+                outcome: CheckpointOutcome::Success { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    assert!(c.running().await.is_empty());
+    assert!(env.launcher.unit(job).is_none(), "dumped unit released");
+}
+
 /// Spawns job `job` and checkpoints it successfully; the image directory.
 async fn spawn_and_dump(env: &Env, c: &mut Client, job: u64) -> PathBuf {
     assert!(matches!(

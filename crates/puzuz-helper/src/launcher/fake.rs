@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use puzuz_protocol::helper::{ExitStatus, HelperErrorCode, JobId, signal};
+use tokio::sync::watch;
 
 use super::{
     LaunchError, LaunchResult, LaunchSpec, Launcher, RestoreSpec, UnitState, parse_unit_name,
@@ -41,10 +42,22 @@ struct Inner {
     after_restore: Option<fn(&RestoreSpec)>,
 }
 
+/// Whether `release` calls are held, and how many are waiting (see
+/// [`FakeLauncher::hold_releases`]).
+#[derive(Debug)]
+struct ReleaseGate(watch::Sender<(bool, usize)>);
+
+impl Default for ReleaseGate {
+    fn default() -> Self {
+        Self(watch::channel((false, 0)).0)
+    }
+}
+
 /// Units live in a map; tests drive exits with [`FakeLauncher::exit`].
 #[derive(Debug, Default)]
 pub struct FakeLauncher {
     inner: Mutex<Inner>,
+    releases: ReleaseGate,
 }
 
 impl FakeLauncher {
@@ -126,6 +139,42 @@ impl FakeLauncher {
         }
         self.lock().active -= 1;
         result
+    }
+
+    /// Makes `release` wait (as a slow StopUnit does) until
+    /// [`Self::let_releases_go`].
+    pub fn hold_releases(&self) {
+        self.releases.0.send_modify(|g| g.0 = true);
+    }
+
+    pub fn let_releases_go(&self) {
+        self.releases.0.send_modify(|g| g.0 = false);
+    }
+
+    /// Resolves once `count` `release` calls (or more) are being held.
+    pub async fn wait_held_releases(&self, count: usize) {
+        let mut rx = self.releases.0.subscribe();
+        loop {
+            let held = rx.borrow_and_update().1;
+            if held >= count || rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn release_gate(&self) {
+        let mut rx = self.releases.0.subscribe();
+        if !rx.borrow_and_update().0 {
+            return;
+        }
+        self.releases.0.send_modify(|g| g.1 += 1);
+        loop {
+            let hold = rx.borrow_and_update().0;
+            if !hold || rx.changed().await.is_err() {
+                break;
+            }
+        }
+        self.releases.0.send_modify(|g| g.1 -= 1);
     }
 
     /// The most spawns and restores that were in progress at once.
@@ -241,6 +290,7 @@ impl Launcher for FakeLauncher {
     }
 
     async fn release(&self, unit: &str) -> LaunchResult<()> {
+        self.release_gate().await;
         self.lock().units.remove(unit);
         Ok(())
     }
