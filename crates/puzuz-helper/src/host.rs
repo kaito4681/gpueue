@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use puzuz_checkpoint::command::{CudaCheckpointOptions, cuda_get_state};
+use puzuz_checkpoint::command::{CudaCheckpointOptions, cuda_get_restore_tid, cuda_get_state};
 use puzuz_checkpoint::exec::run_with_timeout;
 use puzuz_checkpoint::{CommandSpec, probe, procfs, space};
 
@@ -158,6 +158,23 @@ pub trait HostProbe: Send + Sync + 'static {
             .cloned()
             .collect())
     }
+    /// Runs `restore`, the CUDA restore of the processes `cuda_pids` of a
+    /// stopped job (namespace init `init_pid`), with only their CUDA restore
+    /// threads running: the job stays stopped and runs none of its own code
+    /// (see [`crate::traced`]).
+    fn with_cuda_threads_running(
+        &self,
+        _init_pid: u32,
+        _cuda_pids: &[u32],
+        restore: &mut (dyn FnMut() -> Result<(), String> + Send),
+    ) -> Result<(), String> {
+        restore()
+    }
+    /// The threads of `init_pid` and of the processes in its PID namespace
+    /// that are not stopped (`T`), as `(process, thread)`.
+    fn unstopped_threads(&self, _init_pid: u32) -> io::Result<Vec<(u32, u32)>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Things about a job that make CRIU work on host paths as root.
@@ -258,6 +275,17 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     }
     fn open_files(&self, host_pids: &[u32]) -> io::Result<Vec<String>> {
         (**self).open_files(host_pids)
+    }
+    fn with_cuda_threads_running(
+        &self,
+        init_pid: u32,
+        cuda_pids: &[u32],
+        restore: &mut (dyn FnMut() -> Result<(), String> + Send),
+    ) -> Result<(), String> {
+        (**self).with_cuda_threads_running(init_pid, cuda_pids, restore)
+    }
+    fn unstopped_threads(&self, init_pid: u32) -> io::Result<Vec<(u32, u32)>> {
+        (**self).unstopped_threads(init_pid)
     }
     fn dump_hazards(&self, host_pids: &[u32], private: &[String]) -> io::Result<DumpHazards> {
         (**self).dump_hazards(host_pids, private)
@@ -570,6 +598,53 @@ impl HostProbe for SystemHost {
                 && probe::parse_cuda_state(&o.stdout).is_some()
             {
                 out.push(pid);
+            }
+        }
+        Ok(out)
+    }
+
+    fn with_cuda_threads_running(
+        &self,
+        init_pid: u32,
+        cuda_pids: &[u32],
+        restore: &mut (dyn FnMut() -> Result<(), String> + Send),
+    ) -> Result<(), String> {
+        let mut threads = Vec::with_capacity(cuda_pids.len());
+        for &pid in cuda_pids {
+            let what = format!("cuda-checkpoint --get-restore-tid of process {pid}");
+            let spec = cuda_get_restore_tid(&self.cuda_checkpoint, pid);
+            let out = run_with_timeout(&spec, self.get_state_timeout, Duration::from_millis(20))
+                .map_err(|e| format!("{what}: {e}"))?;
+            let tid = out
+                .stdout
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("{what} printed {:?}", out.stdout.trim()))?;
+            threads.push((pid, tid));
+        }
+        crate::traced::with_threads_running(init_pid, &threads, restore)?
+    }
+
+    fn unstopped_threads(&self, init_pid: u32) -> io::Result<Vec<(u32, u32)>> {
+        let mut out = Vec::new();
+        for pid in [init_pid]
+            .into_iter()
+            .chain(ns_processes(&self.proc_root, init_pid)?)
+        {
+            let Ok(tasks) = fs::read_dir(self.proc_root.join(pid.to_string()).join("task")) else {
+                continue;
+            };
+            for task in tasks.flatten() {
+                let Ok(stat) = fs::read_to_string(task.path().join("stat")) else {
+                    continue;
+                };
+                let tid = task.file_name().to_str().and_then(|t| t.parse().ok());
+                match (tid, procfs::parse_stat_state(&stat)) {
+                    // Gone, or exiting.
+                    (_, Some('Z' | 'X')) | (None, _) => {}
+                    (Some(_), Some('T')) => {}
+                    (Some(tid), _) => out.push((pid, tid)),
+                }
             }
         }
         Ok(out)

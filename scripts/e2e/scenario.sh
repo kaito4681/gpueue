@@ -88,23 +88,38 @@ free_group() {
     pz carol group | grep -qw free || pz carol group add free -p 0 || fail "group add"
 }
 log_lines() { grep -c . "$LOGS/$1/$2.log"; }
-# proc_states <id>: the states (R, S, T, ...) of the processes of job <id>'s
-# live unit, counted, for information.
-proc_states() {
+# unit_states <id>: the state (R, S, T, ...) of every process of job <id>'s
+# live unit, one per line; fails without an active unit.
+unit_states() {
     local unit cg
     unit=$(systemctl list-units --no-legend --plain --state=active \
         "puzuz-job-$1.service" "puzuz-job-$1-r*.service" | awk '{print $1}' | tail -n1)
-    [ -n "$unit" ] || { echo "no active unit"; return; }
+    [ -n "$unit" ] || return 1
     cg=$(systemctl show -p ControlGroup --value "$unit")
     find "/sys/fs/cgroup$cg" -name cgroup.procs -exec cat {} + 2>/dev/null \
-        | while read -r p; do awk '/^State:/ {print $2}' "/proc/$p/status" 2>/dev/null; done \
-        | sort | uniq -c | tr -s ' \n' ' '
+        | while read -r p; do awk '/^State:/ {print $2}' "/proc/$p/status" 2>/dev/null; done
 }
-# expect_paused <uid> <id>: job <id> is paused and its log does not grow.
+# proc_states <id>: unit_states counted, for information.
+proc_states() {
+    local states
+    states=$(unit_states "$1") || { echo "no active unit"; return; }
+    sort <<<"$states" | uniq -c | tr -s ' \n' ' '
+}
+# expect_paused <uid> <id> [lines]: job <id> is paused, every process of it
+# is stopped (T; zombies aside) as soon as it shows as paused, and its log
+# does not grow. With <lines>, the length of its log before the restore
+# that paused it, the log must not have grown since either: a job paused
+# when it was dumped is restored stopped and runs nothing.
 expect_paused() {
-    local n
+    local n states
     expect_state "$2" paused
+    states=$(unit_states "$2") || fail "job $2 is paused but has no active unit"
+    if [ -z "$states" ] || grep -qvE '^[TZ]$' <<<"$states"; then
+        fail "job $2 is paused but not stopped: $(proc_states "$2")"
+    fi
     n=$(log_lines "$1" "$2")
+    [ -z "${3:-}" ] || [ "$n" = "$3" ] \
+        || fail "job $2 ran after its restore: its log has $n lines, $3 before"
     sleep 1.5
     [ "$(log_lines "$1" "$2")" = "$n" ] || fail "job $2 runs although it is paused"
     expect_state "$2" paused
@@ -345,7 +360,7 @@ s5_daemon_restart() { restart_while_running puzuz.service; }
 s6_helper_restart() { restart_while_running puzuz-helper.service; }
 
 s8_shutdown() {
-    local a b c d
+    local a b c d lines
     free_group
     a=$(add alice -g free -- "$COUNTER")
     b=$(add bob -g free -- "$COUNTER")
@@ -382,9 +397,10 @@ s8_shutdown() {
     [ "$(last_line 1001 "$b")" -gt "$before_b" ] || fail "job $b did not continue"
     check_counter_log 1000 "$a"
     check_counter_log 1001 "$b"
+    lines=$(log_lines 1000 "$d")
     pz alice restore "$d" || fail "restore $d"
     wait_state "$d" paused 120
-    expect_paused 1000 "$d"
+    expect_paused 1000 "$d" "$lines"
     pz alice start "$d" || fail "start $d"
     wait_state "$d" running
     expect_continues 1000 "$d"
@@ -396,12 +412,12 @@ s8_shutdown() {
 }
 
 # A job paused before its checkpoint is restored paused (the dump needs it
-# running, so it is resumed for the dump and stopped again after the
-# restore), and `puzuz start` resumes it. `pause` is refused while a dump
+# running, so it is resumed for the dump; the restore leaves it stopped, so
+# it runs nothing before `puzuz start` resumes it). `pause` is refused while a dump
 # is in progress; the job is then checkpointed as asked and restored
 # running.
 s13_paused_checkpoint() {
-    local id big state out
+    local id big state out lines
     free_group
     id=$(add alice -g free -- "$COUNTER")
     wait_state "$id" running
@@ -410,9 +426,10 @@ s13_paused_checkpoint() {
     wait_state "$id" paused
     pz alice checkpoint "$id" || fail "checkpoint"
     wait_state "$id" checkpointed 120
+    lines=$(log_lines 1000 "$id")
     pz alice restore "$id" || fail "restore"
     wait_state "$id" paused 120
-    expect_paused 1000 "$id"
+    expect_paused 1000 "$id" "$lines"
     pz alice start "$id" || fail "start"
     wait_state "$id" running
     expect_continues 1000 "$id"
@@ -530,7 +547,7 @@ EOF
 # paused with their GPU state, and continue on `start`; `pause` during a
 # GPU dump is refused.
 s14_gpu_paused() {
-    local id state out
+    local id state out lines
     pz carol gpu parallel 1 || fail "gpu parallel"
     free_group
     id=$(add alice -g free --gpu 0 -- 'exec /opt/venv/bin/python3 -u /e2e/gpu_counter.py')
@@ -541,9 +558,10 @@ s14_gpu_paused() {
     pz alice checkpoint "$id" || fail "checkpoint"
     wait_state "$id" checkpointed 300
     check_cuda_mode "$id"
+    lines=$(log_lines 1000 "$id")
     pz alice restore "$id" || fail "restore"
     wait_state "$id" paused 300
-    expect_paused 1000 "$id"
+    expect_paused 1000 "$id" "$lines"
     pz alice start "$id" || fail "start"
     wait_state "$id" running
     expect_continues 1000 "$id"
@@ -578,7 +596,7 @@ s14_gpu_paused() {
 # the workers still producing batches after each restore.
 # gpu_train_variant <steps> <checkpoints> <gpu_train.py args...>
 gpu_train_variant() {
-    local steps=$1 n=$2 ref id k lines last=0 marks=()
+    local steps=$1 n=$2 ref id k lines logged last=0 marks=()
     shift 2
     local cmd="exec /opt/venv/bin/python3 -u /e2e/gpu_train.py $steps $*"
     ref=$(add alice -g free --gpu 0 -- "$cmd")
@@ -602,10 +620,11 @@ gpu_train_variant() {
         check_cuda_mode "$id"
         last=$(grep -c ^step= "$LOGS/1000/$id.log")
         marks+=("$last")
+        logged=$(log_lines 1000 "$id")
         pz alice restore "$id" || fail "restore $k"
         if [ "${PAUSED_CHECKPOINT:-}" = 1 ]; then
             wait_state "$id" paused 300
-            expect_paused 1000 "$id"
+            expect_paused 1000 "$id" "$logged"
             pz alice start "$id" || fail "start $k"
         fi
         wait_state "$id" running 300
@@ -725,7 +744,7 @@ s7_prepare() {
     echo "$c" >"$STATE/c"
 }
 s7_verify() {
-    local a b c g h before after
+    local a b c g h before after lines
     a=$(cat "$STATE/a")
     b=$(cat "$STATE/b")
     c=$(cat "$STATE/c")
@@ -747,9 +766,10 @@ s7_verify() {
     pz alice kill "$a"
     wait_state "$a" 'done/*'
 
+    lines=$(log_lines 1000 "$c")
     pz alice restore "$c" || fail "restore $c"
     wait_state "$c" paused 120
-    expect_paused 1000 "$c"
+    expect_paused 1000 "$c" "$lines"
     pz alice start "$c" || fail "start $c"
     wait_state "$c" running
     expect_continues 1000 "$c"
@@ -768,9 +788,10 @@ s7_verify() {
         pz alice restore "$g" || fail "restore $g"
         wait_state "$g" running 300
         expect_continues 1000 "$g"
+        lines=$(log_lines 1000 "$h")
         pz alice restore "$h" || fail "restore $h"
         wait_state "$h" paused 300
-        expect_paused 1000 "$h"
+        expect_paused 1000 "$h" "$lines"
         pz alice start "$h" || fail "start $h"
         wait_state "$h" running
         expect_continues 1000 "$h"

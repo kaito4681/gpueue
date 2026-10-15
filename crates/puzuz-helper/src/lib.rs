@@ -19,6 +19,8 @@
 //!   processes checkpointable.
 //! - [`gcroots`]: Nix GC roots that keep the helper's store path while jobs
 //!   need it.
+//! - [`traced`]: lets the CUDA restore threads of a stopped job run while
+//!   the rest of it stays stopped.
 
 pub mod access;
 pub mod config;
@@ -37,6 +39,7 @@ pub mod notify;
 pub mod server;
 pub mod shim;
 pub mod testing;
+pub mod traced;
 pub mod validate;
 
 pub use config::HelperConfig;

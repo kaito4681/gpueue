@@ -222,6 +222,13 @@ pub struct RestoreRequest {
     /// GPUs the job had; the helper checks they are the same model and
     /// driver as at dump time.
     pub gpus: Vec<GpuIndex>,
+    /// The job was paused when it was dumped: leave the restored processes
+    /// stopped, as SIGSTOP leaves them (a later SIGCONT resumes them), so
+    /// that they do not run a single instruction before the owner resumes
+    /// the job. A helper that predates this field ignores it and resumes
+    /// them; its [`RestoreOutcome::Success`] then lacks `stopped`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub leave_stopped: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,8 +453,16 @@ impl CheckpointOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum RestoreOutcome {
-    /// The job runs again; the helper has removed the image.
-    Success { pid: u32 },
+    /// The job runs again (or, with `stopped`, is stopped); the helper has
+    /// removed the image.
+    Success {
+        pid: u32,
+        /// The processes were left stopped, as asked with
+        /// [`RestoreRequest::leave_stopped`]. Absent from older helpers,
+        /// which always resume them.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stopped: bool,
+    },
     /// The image was left in place.
     Failed {
         reason: String,

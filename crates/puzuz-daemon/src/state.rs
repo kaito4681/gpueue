@@ -1666,11 +1666,23 @@ impl Core {
 
     async fn start_restore(self: &Arc<Self>, job: &Job) -> Result<(), LaunchFailure> {
         self.warn_if_gpus_changed(job).await;
+        // A job paused when it was dumped is restored stopped: it does not
+        // run before its owner resumes it (see `lifecycle::keep_paused`,
+        // which still stops it if the helper resumed it after all).
+        let id = job.id;
+        let paused = match self.read(move |s| s.get_checkpoint(id)).await {
+            Ok(record) => record.is_some_and(|r| r.paused),
+            Err(e) => {
+                tracing::warn!(job = %id, "cannot read the checkpoint record: {}", e.0.message);
+                false
+            }
+        };
         let request = RestoreRequest {
             job: job.id,
             uid: job.owner,
             image_dir: self.image_dir(job.id),
             gpus: job.spec.gpus.clone(),
+            leave_stopped: paused,
         };
         match self.helper.restore(request).await {
             Ok(()) => Ok(()),
@@ -1921,7 +1933,7 @@ impl Core {
             }
             hp::Event::RestoreFinished { job, outcome } => {
                 let event = match outcome {
-                    RestoreOutcome::Success { .. } => E::RestoreSucceeded,
+                    RestoreOutcome::Success { stopped, .. } => E::RestoreSucceeded { stopped },
                     RestoreOutcome::Failed {
                         code: Some(HelperErrorCode::ShuttingDown),
                         reason,

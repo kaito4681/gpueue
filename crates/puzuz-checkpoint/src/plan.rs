@@ -5,7 +5,9 @@
 //!   forever. Every plan that touches CUDA starts with
 //!   [`Step::EnsureRunnable`] (rollback plans guard each step with
 //!   [`Step::IfRunnable`] instead), and every command carries an outer
-//!   timeout.
+//!   timeout. The one exception is [`restore_cuda_plan_stopped`], whose
+//!   caller keeps the CUDA restore threads of the stopped processes
+//!   running.
 //! - Manual dump: lock *all* CUDA PIDs, then checkpoint all, then
 //!   `criu dump`. Manual restore: `criu restore`, then restore all, then
 //!   unlock all.
@@ -284,6 +286,20 @@ pub fn restore_cuda_plan(
         return Vec::new();
     }
     resume_steps(cfg, &dedup(host_pids), device_map)
+}
+
+/// [`restore_cuda_plan`] for a job that stays stopped (it was paused when
+/// it was dumped), without its [`Step::EnsureRunnable`]: the caller lets
+/// the processes' CUDA restore threads, which serve `cuda-checkpoint`, run
+/// while the rest stays stopped.
+pub fn restore_cuda_plan_stopped(
+    cfg: &CheckpointConfig,
+    host_pids: &[u32],
+    device_map: Option<&DeviceMap>,
+) -> Vec<Step> {
+    let mut steps = restore_cuda_plan(cfg, host_pids, device_map);
+    steps.retain(|s| !matches!(s, Step::EnsureRunnable { .. }));
+    steps
 }
 
 fn resume_steps(cfg: &CheckpointConfig, pids: &[u32], map: Option<&DeviceMap>) -> Vec<Step> {
@@ -623,6 +639,12 @@ pub(crate) mod tests {
         };
         assert!(command.has_arg("--device-map"));
         assert!(restore_cuda_plan(&c, &[], None).is_empty());
+
+        // A job that stays stopped: the same steps without the check.
+        let stopped = restore_cuda_plan_stopped(&c, &[201, 202], Some(&map));
+        assert_eq!(stopped, cuda[1..]);
+        assert!(restore_cuda_plan_stopped(&c, &[], None).is_empty());
+        assert!(restore_cuda_plan_stopped(&cfg(CudaMode::Plugin), &[201], None).is_empty());
     }
 
     #[test]

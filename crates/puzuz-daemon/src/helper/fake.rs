@@ -69,6 +69,11 @@ struct State {
     stopping: bool,
     /// Accept restores, then report them abandoned (`shutting_down`).
     abandon_restores: bool,
+    /// Ignore `leave_stopped` and resume restored jobs, as helpers that
+    /// predate it do.
+    ignore_leave_stopped: bool,
+    /// The `leave_stopped` of every restore request.
+    restores_stopped: Vec<(JobId, bool)>,
     checkpoint_outcome: FakeOutcome,
     restore_outcome: FakeOutcome,
     restore_rejection: Option<String>,
@@ -325,6 +330,17 @@ impl FakeHelper {
         self.with(|s| s.abandon_restores = abandon);
     }
 
+    /// Resume restored jobs whatever `leave_stopped` asks, and report them
+    /// running, as helpers that predate stopped restores do.
+    pub fn set_ignore_leave_stopped(&self, ignore: bool) {
+        self.with(|s| s.ignore_leave_stopped = ignore);
+    }
+
+    /// The job and `leave_stopped` of every restore request received.
+    pub fn restore_requests(&self) -> Vec<(JobId, bool)> {
+        self.with(|s| s.restores_stopped.clone())
+    }
+
     /// Holds spawn and restore requests until [`release_launches`].
     ///
     /// [`release_launches`]: FakeHelper::release_launches
@@ -562,6 +578,7 @@ impl FakeHelper {
         self.with(|s| {
             s.check_connected()?;
             let job = request.job;
+            s.restores_stopped.push((job, request.leave_stopped));
             if s.jobs.contains_key(&job) {
                 return Err(HelperError::Rejected {
                     code: HelperErrorCode::Busy,
@@ -595,15 +612,15 @@ impl FakeHelper {
                     FakeOutcome::Succeed => {
                         s.images.remove(&job);
                         let pid = s.next_pid();
-                        s.jobs.insert(
-                            job,
-                            FakeJob {
-                                pid,
-                                phase: RunningPhase::Running,
-                            },
-                        );
+                        let stopped = request.leave_stopped && !s.ignore_leave_stopped;
+                        let phase = if stopped {
+                            RunningPhase::Stopped
+                        } else {
+                            RunningPhase::Running
+                        };
+                        s.jobs.insert(job, FakeJob { pid, phase });
                         s.launched.insert(job, (request.uid, request.gpus.clone()));
-                        RestoreOutcome::Success { pid }
+                        RestoreOutcome::Success { pid, stopped }
                     }
                     FakeOutcome::Fail(reason) | FakeOutcome::Refuse(reason) => {
                         RestoreOutcome::failed(reason)

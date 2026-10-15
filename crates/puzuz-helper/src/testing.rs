@@ -32,6 +32,10 @@ pub struct FakeHost {
     verified: Mutex<Vec<VerifyRequest>>,
     tmpfs_bytes: Mutex<u64>,
     dead: Mutex<crate::deadmounts::DeadMounts>,
+    /// The CUDA PIDs of every [`HostProbe::with_cuda_threads_running`].
+    cuda_released: Mutex<Vec<Vec<u32>>>,
+    /// What [`HostProbe::unstopped_threads`] reports.
+    unstopped: Mutex<Vec<(u32, u32)>>,
     /// While set, access checks block (see [`FakeHost::hold_access_checks`]).
     held: Mutex<bool>,
     released: std::sync::Condvar,
@@ -182,6 +186,20 @@ impl HostProbe for FakeHost {
     ) -> io::Result<crate::deadmounts::DeadMounts> {
         Ok(self.dead.lock().unwrap().clone())
     }
+
+    fn with_cuda_threads_running(
+        &self,
+        _init_pid: u32,
+        cuda_pids: &[u32],
+        restore: &mut (dyn FnMut() -> Result<(), String> + Send),
+    ) -> Result<(), String> {
+        self.cuda_released.lock().unwrap().push(cuda_pids.to_vec());
+        restore()
+    }
+
+    fn unstopped_threads(&self, _init_pid: u32) -> io::Result<Vec<(u32, u32)>> {
+        Ok(self.unstopped.lock().unwrap().clone())
+    }
 }
 
 impl FakeHost {
@@ -216,6 +234,18 @@ impl FakeHost {
     /// Every access check requested so far.
     pub fn verified(&self) -> Vec<VerifyRequest> {
         self.verified.lock().unwrap().clone()
+    }
+
+    /// The CUDA PIDs of every restore of a stopped job's CUDA state (see
+    /// [`HostProbe::with_cuda_threads_running`]).
+    pub fn cuda_released(&self) -> Vec<Vec<u32>> {
+        self.cuda_released.lock().unwrap().clone()
+    }
+
+    /// Threads reported as not stopped (see
+    /// [`HostProbe::unstopped_threads`]).
+    pub fn set_unstopped_threads(&self, threads: Vec<(u32, u32)>) {
+        *self.unstopped.lock().unwrap() = threads;
     }
 }
 

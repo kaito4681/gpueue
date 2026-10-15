@@ -27,7 +27,12 @@
 //!   - unless the file is deleted, its path must lead the owner to the very
 //!     same inode without symlinks (`openat2` with `RESOLVE_NO_SYMLINKS`).
 //!
-//!   Only then does CRIU resume the job; otherwise it kills it. This check looks
+//!   Only then does CRIU resume the job; otherwise it kills it. A job that
+//!   is to stay paused ([`RestoredCheck::stop`]) is sent SIGSTOP right
+//!   there instead, while CRIU still holds its tasks: CRIU's detach then lets
+//!   them enter the stop before they run a single instruction (what CRIU's
+//!   `--leave-stopped` does, but after its CUDA plugin has restored the
+//!   GPU state). This check looks
 //!   at what CRIU actually opened, so a race with the owner changing paths
 //!   cannot get past it. Objects on the namespace's own mounts (`/proc`,
 //!   the private tmpfs) come from the image and are skipped.
@@ -105,6 +110,11 @@ pub struct RestoredCheck {
     /// Files the job held at the dump (see [`HeldFile`]).
     #[serde(default)]
     pub held: Vec<HeldFile>,
+    /// If the check passes, stop the tasks (SIGSTOP, as `puzuz pause` does)
+    /// before CRIU lets them go, so they stay stopped (the job was paused
+    /// when it was dumped).
+    #[serde(default)]
+    pub stop: bool,
 }
 
 /// Before a restore: which of these paths do not exist (looked up as
@@ -274,12 +284,14 @@ pub fn run_restore_hook(request: &Path) -> i32 {
     let init_pid: Option<u32> = std::env::var("CRTOOLS_INIT_PID")
         .ok()
         .and_then(|p| p.parse().ok());
-    let reply: VerifyReply = (|| {
+    let mut stop = false;
+    let mut reply: VerifyReply = (|| {
         let mut check: RestoredCheck = serde_json::from_slice(
             &fs::read(request).map_err(|e| format!("reading {}: {e}", request.display()))?,
         )
         .map_err(|e| format!("decoding {}: {e}", request.display()))?;
         check.init_pid = init_pid.ok_or("CRIU did not set CRTOOLS_INIT_PID")?;
+        stop = check.stop;
         let exe = std::env::current_exe().map_err(|e| format!("locating myself: {e}"))?;
         run_verify_child(
             &exe,
@@ -287,6 +299,16 @@ pub fn run_restore_hook(request: &Path) -> i32 {
             std::time::Duration::from_secs(120),
         )
     })();
+    // A job that stays paused is stopped now, while CRIU holds its tasks:
+    // the SIGSTOP is pending when CRIU detaches, so each task stops before
+    // it returns to its own code.
+    if stop
+        && matches!(&reply, Ok(p) if p.is_empty())
+        && let Some(init) = init_pid
+        && let Err(e) = stop_tree(init)
+    {
+        reply = Err(format!("stopping the restored job: {e}"));
+    }
     let ok = matches!(&reply, Ok(p) if p.is_empty());
     // CRIU only logs a failed pre-resume script and resumes the tasks
     // anyway, so kill them here, while they are still stopped under its
@@ -360,6 +382,20 @@ pub fn run_dump_hook(request: &Path) -> i32 {
         eprintln!("puzuz-helper: listing the files of the dumped job: {e}");
     }
     0
+}
+
+/// SIGSTOP to `init` and every process in its PID namespace (signals from
+/// the host's namespace reach a namespace init too).
+fn stop_tree(init: u32) -> Result<(), String> {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    let pids = crate::host::ns_processes(Path::new("/proc"), init)
+        .map_err(|e| format!("listing the job's processes: {e}"))?;
+    for pid in [init].into_iter().chain(pids) {
+        let raw = i32::try_from(pid).map_err(|_| format!("invalid pid {pid}"))?;
+        kill(Pid::from_raw(raw), Signal::SIGSTOP).map_err(|e| format!("process {pid}: {e}"))?;
+    }
+    Ok(())
 }
 
 /// SIGKILL to every process in the PID namespace of `init`, and to `init`.
@@ -1028,6 +1064,7 @@ mod tests {
             private_tmpfs: vec![],
             exempt: vec![],
             held: vec![],
+            stop: false,
         };
         assert_eq!(check_restored_procs(&req, &[parent, zombie]), Ok(vec![]));
         child.kill().unwrap();
@@ -1211,6 +1248,7 @@ VmFlags: rd ex mr mw me
             private_tmpfs: vec![],
             exempt: vec![],
             held: vec![],
+            stop: false,
         };
         // `ns_processes` lists the PID namespace of the init: in a test that
         // is the host's, so restrict it to the child.
