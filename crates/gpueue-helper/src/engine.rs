@@ -145,6 +145,16 @@ impl SavedMounts {
     }
 
     /// See [`SavedMounts::Full`].
+    pub fn external_sources(&self) -> &[String] {
+        match self {
+            SavedMounts::Full {
+                external_sources, ..
+            } => external_sources,
+            SavedMounts::MountPoints(_) => &[],
+        }
+    }
+
+    /// See [`SavedMounts::Full`].
     pub fn source_mounts(&self) -> &[SourceMount] {
         match self {
             SavedMounts::Full { source_mounts, .. } => source_mounts,
@@ -1566,6 +1576,37 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     ),
                 ));
             }
+            // CRIU binds each of these by its path, as root, following
+            // symlinks on the way: none may lie below a directory that
+            // someone other than root can change (the owner could redirect
+            // it to a directory they cannot reach otherwise). The dump
+            // leaves such mounts out (see `crate::deadmounts::add_unsafe_binds`);
+            // this catches older images and directories changed since.
+            let sources = mounts.external_sources();
+            let unsafe_sources: Vec<String> = self
+                .host
+                .bind_source_problems(sources)
+                .map_err(|e| {
+                    error(
+                        HelperErrorCode::Internal,
+                        format!("checking the host paths the checkpoint binds: {e}"),
+                    )
+                })?
+                .into_iter()
+                .zip(sources)
+                .filter_map(|(why, p)| why.map(|w| format!("{p}: {w}")))
+                .collect();
+            if !unsafe_sources.is_empty() {
+                return Err(error(
+                    HelperErrorCode::InvalidRequest,
+                    format!(
+                        "the checkpoint binds host paths below directories that someone other \
+                         than root can change, which CRIU would follow as root, so it is not \
+                         restored: {}",
+                        unsafe_sources.join("; ")
+                    ),
+                ));
+            }
             // A mount left out of the checkpoint (see `crate::deadmounts`)
             // is replaced by the restore, but it needs its mount point.
             let detached: Vec<String> = mounts
@@ -2328,6 +2369,24 @@ pub fn precheck_dump<H: HostProbe + ?Sized>(
     let procs = host
         .job_processes(init_pid)
         .map_err(|e| format!("listing the job's processes: {e}"))?;
+    // CRIU fails on them, and the scans below would not see the processes
+    // of a nested PID namespace: refuse at once, with the reason.
+    let nested = host
+        .nested_namespace_processes(init_pid)
+        .map_err(|e| format!("listing the job's processes: {e}"))?;
+    if !nested.is_empty() {
+        const SHOWN: usize = 5;
+        let mut list = nested[..nested.len().min(SHOWN)].join(", ");
+        if nested.len() > SHOWN {
+            list.push_str(&format!(" and {} more", nested.len() - SHOWN));
+        }
+        return Err(format!(
+            "the job has processes in a PID or user namespace of their own ({list}), as \
+             `unshare`, `bwrap` or a container runtime create; CRIU cannot checkpoint nested \
+             PID and user namespaces, so the job is not checkpointed (run it with \
+             --no-checkpoint, or without the nested namespace)"
+        ));
+    }
     let rss: u64 = procs.iter().map(|p| p.rss_bytes).sum();
 
     let mut meta = CheckpointMeta::new(record.job.0, now_ms(), mode);

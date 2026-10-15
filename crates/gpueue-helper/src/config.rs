@@ -288,6 +288,13 @@ impl HelperConfig {
         if let Some(dir) = &self.fork_guard_dir {
             paths.push(dir);
         }
+        // Created and mounted on as root in every job's namespace and before
+        // restores (see `crate::mountfd::ensure_root_dir`): whoever could
+        // change a directory on the way could have root create a directory
+        // or mount a tmpfs somewhere else.
+        for dir in &self.mounts.hidden_dirs {
+            paths.push(Path::new(dir));
+        }
         for program in [
             &self.checkpoint.criu.criu_path,
             &self.checkpoint.cuda.path,

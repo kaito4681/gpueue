@@ -1865,6 +1865,100 @@ async fn a_dump_past_its_deadline_is_killed_and_the_job_resumed() {
     assert_eq!(c.running().await, [(JobId(8), RunningPhase::Running)]);
 }
 
+/// CRIU cannot dump nested PID or user namespaces (`unshare`, `bwrap`),
+/// and the helper's scans would not see their processes: refused up front.
+#[tokio::test]
+async fn dump_refuses_a_job_with_nested_namespaces() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let job = JobId(5);
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(5))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    env.host
+        .set_nested_namespace_processes(vec!["4242 (unshare)".into()]);
+    let r = c
+        .request(Request::Checkpoint {
+            job,
+            image_dir: env.base().join("5"),
+            options: Default::default(),
+        })
+        .await;
+    let ResponseResult::Error {
+        code: HelperErrorCode::CheckpointRefused,
+        message,
+    } = r
+    else {
+        panic!("{r:?}")
+    };
+    assert!(
+        message.contains("PID or user namespace of their own (4242 (unshare))"),
+        "{message}"
+    );
+    c.no_event().await;
+    assert!(env.exec.lock().unwrap().actions.is_empty());
+    assert_eq!(c.running().await, [(job, RunningPhase::Running)]);
+}
+
+/// CRIU binds the external mount sources of an image by their host paths,
+/// as root, following symlinks: a restore whose sources lie below a
+/// directory someone other than root can change is refused.
+#[tokio::test]
+async fn restore_refuses_bind_sources_that_others_can_redirect() {
+    use gpueue_helper::engine::{MOUNTS_FILE, SavedMounts};
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 5).await;
+    let path = CheckpointDir::for_job(&env.base(), 5)
+        .root()
+        .join(MOUNTS_FILE);
+    let SavedMounts::Full {
+        mount_points,
+        open_files,
+        held_files,
+        detached_mounts,
+        ..
+    } = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+    else {
+        panic!("old format")
+    };
+    let src = env.root.to_str().unwrap().to_owned();
+    let saved = SavedMounts::Full {
+        mount_points,
+        external_sources: vec![src.clone()],
+        source_mounts: Vec::new(),
+        open_files,
+        held_files,
+        detached_mounts,
+    };
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    env.host.set_bind_source_problems(vec![(
+        src.clone(),
+        "/home/alice is not a directory that only root can change".into(),
+    )]);
+    let r = c.request(restore_req(5, &image_dir)).await;
+    let ResponseResult::Error {
+        code: HelperErrorCode::InvalidRequest,
+        message,
+    } = r
+    else {
+        panic!("{r:?}")
+    };
+    assert!(
+        message.contains(&format!(
+            "{src}: /home/alice is not a directory that only root can change"
+        )),
+        "{message}"
+    );
+    assert!(env.launcher.restored().is_empty());
+    env.host.set_bind_source_problems(Vec::new());
+    assert_eq!(
+        c.request(restore_req(5, &image_dir)).await,
+        ResponseResult::Accepted
+    );
+}
+
 #[tokio::test]
 async fn dump_refuses_a_job_that_depends_on_a_hidden_mount() {
     let env = Env::new().await;

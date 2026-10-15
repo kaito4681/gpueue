@@ -1162,7 +1162,7 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/gpue
 | `job_systemd_varlink` | `false` | helper | `true` 允许作业访问 `/run/systemd` 下的 systemd Varlink 服务；默认情况下该目录对作业隐藏，只保留 journald 的日志套接字、resolved 的名称解析套接字和 `resolv.conf` 文件以及 `userdb/`（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
 | `job_min_uid` | `/etc/login.defs` 的 `UID_MIN`，没有则为 `1000` | helper | 拒绝 uid 小于此值的用户的作业（见 [谁可以运行作业](#who-jobs-may-run-as)） |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]` | helper | 等同 root 的组：从作业的附加组中去掉；主组为其中之一的作业会被拒绝 |
-| `job_hidden_socket_dirs` | `["/run/libvirt", "/run/cups"]` | helper | 用空的、属于 root 的 tmpfs 对作业隐藏的目录（不存在时先创建）：这些守护进程套接字在用户数据库中检查调用者的组，去掉组无法阻止；须为至少两级深的绝对路径（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
+| `job_hidden_socket_dirs` | `["/run/libvirt", "/run/cups"]` | helper | 用空的、属于 root 的 tmpfs 对作业隐藏的目录（不存在时先创建）：这些守护进程套接字在用户数据库中检查调用者的组，去掉组无法阻止；须为至少两级深的绝对路径，途中已存在的目录（和符号链接）须属于 root 且不可被组或其他人写入（helper 启动时检查）（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
 | `job_allowed_users` | `[]`（所有人） | helper | 非空时，只有列出的用户（按名称）可以运行作业 |
 | `gpu_detection` | `"auto"` | 守护进程 | `"auto"`：NVML，失败时退回 `[[gpus]]`。`"static"`：只用 `[[gpus]]`。 |
 | `nvml_library` | 未设置 | 守护进程 | NVML 库的路径或名称；默认先用 `libnvidia-ml.so.1`，再用 `libnvidia-ml.so` |
@@ -1588,7 +1588,7 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 `allow_other,default_permissions`），恢复随后就会被拒绝。在所有者可以像作业那样打开文件的
 文件系统上（通常情况），文件的变化无关紧要。
 
-已在模拟重启中测试（`scripts/e2e-test.sh`，场景 15、16 和 20），作业的工作目录和打开的文件分别位于
+已在模拟重启中测试（`scripts/e2e-test.sh`，场景 15、16 和 20；21 和 22 在同一次启动中），作业的工作目录和打开的文件分别位于
 以下各种挂载上：
 
 | 挂载 | 重启后恢复 |
@@ -1603,7 +1603,9 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 | 同上，但作业的工作目录位于其上 | 不会被检查点（关机时也不会）：`the job depends on a filesystem that is gone, does not answer or root cannot access: /rnfs (fuse.sshfs) does not answer (...); the job uses it: the working directory /rnfs` |
 | 作业所有者未使用 `allow_other` 挂载的 FUSE 文件系统（sshfs），以及不使用它的作业 | 可行：作业在不包含该挂载的情况下被检查点，并在该处得到一个空的、无法访问的目录 |
 | 同上，但作业的工作目录位于其上 | 不会被检查点：`... /home/alice/pfuse (fuse.sshfs) cannot be accessed by root (a FUSE mount without `allow_other`); the job uses it: the working directory /home/alice/pfuse` |
-| 挂载在主机 `/tmp` 下的 FUSE 文件系统（AppImage 的挂载，例如 `/tmp/.mount_*`） | 可行：作业私有的 `/tmp` 覆盖了它，因此它根本不在作业的命名空间中 |
+| 挂载在主机 `/tmp` 下的 FUSE 文件系统（AppImage 的挂载，例如 `/tmp/.mount_*`），`/tmp` 是普通目录时位于用户自己目录中的也一样（`/tmp/alice-dir/fuse`） | 可行：作业私有的 `/tmp` 覆盖了它，因此它根本不在作业的命名空间中 |
+| 作业所有者在自己的目录中以 `allow_other` 挂载的 FUSE 文件系统（`/home/alice/a22/afuse`），以及不使用它的作业 | 可行：作业在不包含该挂载的情况下被检查点，并在那里得到一个空的、无法访问的目录（CRIU 会按名称再次绑定该主机路径，而所有者可以改变它） |
+| 同上，但作业的工作目录位于其上 | 不会被检查点：`... /home/alice/a22/afuse (fuse.sshfs) could only be restored by binding a host path that someone other than root can redirect: /home/alice/a22/afuse (/home/alice is not a directory that only root can change); the job uses it: ...` |
 | 管理员挂载的 tmpfs（例如 `/scratch`），作业的文件或工作目录位于其上 | 拒绝：重启后其内容已丢失。只把 tmpfs 用于不需要跨重启保留的作业。同一次启动内的恢复可行。 |
 
 未测试或不支持：
@@ -1630,7 +1632,10 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 （`ENOTCONN`、`EIO`、`ESTALE` 等）失败，或在 5 秒内没有返回（在子进程中检查，以免卡住的 NFS
 服务器拖住 helper），就被视为已死。拒绝 root 访问的 FUSE 挂载也按同样方式处理：用户未使用
 `allow_other` 挂载的文件系统（用户自己的 sshfs）会响应，但只响应该用户，
-因此（以 root 身份运行的）CRIU 在恢复时无法再次绑定它。
+因此（以 root 身份运行的）CRIU 在恢复时无法再次绑定它。CRIU 只能从位于 root 以外的人可以修改的目录之下的
+主机路径重新绑定的挂载（任何类型）也是如此，例如用户在自己主目录中的 `allow_other` FUSE 挂载：CRIU 在恢复时
+以 root 身份跟随符号链接查找该路径，用户可以把它改到自己本来无法到达的目录（见 [恢复与路径](architecture.md#restores-and-paths)）。
+需要在检查点前后保留给作业的文件系统，请挂载在父目录只有 root 能修改的目录上，例如 `/mnt` 之下。
 
 - 使用已死挂载的作业（在其上打开的文件、工作目录或根目录、可执行文件、映射的文件，或绑定在其上的
   Unix 套接字）**不会被检查点**。转储会在触碰作业之前被拒绝（见 [检查点失败](#checkpoint-failures)），
@@ -1641,7 +1646,7 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
   并带着该原因显示为 `Checkpoint failed`。
 - **其他所有作业都会在不包含该挂载的情况下被检查点**。恢复时，如果该处挂载着同一类型的文件系统且
   它响应，其挂载点就得到该文件系统，否则得到一个作业无法打开的空目录（属于 root，权限 0，
-  `/var/lib/gpueue/checkpoints/detached-mount`）。作业永远看不到主机上挂载点之下的内容。已死挂载之下
+  `/var/lib/gpueue/checkpoints/detached-mount`）；如果到挂载点的路径经过 root 以外的人可以修改的目录，则总是后者。作业永远看不到主机上挂载点之下的内容。已死挂载之下
   的挂载会被略去。恢复需要挂载点目录本身；如果它已不存在（在启动时创建的挂载点），在该目录再次存在
   之前恢复会被拒绝。
 
@@ -1869,6 +1874,14 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
   或者是未使用 `allow_other` 的 FUSE 挂载。请重新挂载它（重启 sshfs、恢复 NFS 服务器；用户的 FUSE 文件系统
   请以 `-o allow_other` 挂载，这需要 `/etc/fuse.conf` 中的 `user_allow_other`），然后再次做检查点。见
   [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)。
+- `the job depends on a filesystem that is gone, does not answer, root cannot access, or that CRIU
+  could only restore by binding a host path that someone other than root can redirect: <mount
+  point> (<type>) could only be restored by binding a host path ...`：作业使用的挂载，其主机路径位于 root 以外的
+  人可以修改的目录之下（用户在自己主目录中的 `allow_other` FUSE 挂载）。对需要做检查点的作业，请把文件系统
+  挂载在父目录只有 root 能修改的目录上（例如 `/mnt` 之下）。
+- `the job has processes in a PID or user namespace of their own (...)`：作业运行了 `unshare`、`bwrap` 或
+  rootless 容器运行时，而 CRIU 无法转储嵌套的 PID 和用户命名空间。请用 `--no-checkpoint` 运行该作业，或不使用
+  嵌套的命名空间。
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`：作业的
   挂载命名空间依赖一个被另一个挂载遮盖的挂载，因此永远无法恢复。请重新运行该作业
   （`gpueue restart`）。新作业会得到清理过的命名空间。
@@ -1921,6 +1934,9 @@ refused:` 开头），其所有者会收到警告。
 - `the mount points [...] of filesystems that were left out of the checkpoint (they were gone,
   did not answer or refused root at the dump) are missing on this host`：CRIU 需要一个目录来在其上挂载东西。请创建它
   （或在该处挂载文件系统），然后再次恢复。见 [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)。
+- `the checkpoint binds host paths below directories that someone other than root can change,
+  which CRIU would follow as root, so it is not restored: ...`：在 helper 于转储时检查这一点之前创建的镜像中，
+  有一个外部挂载的主机路径可以被 root 以外的人改变。它无法被安全地恢复；请删除它（`gpueue remove`）并重新运行作业。
 - `files or directories the job used are missing on this host: [...]`：作业打开的文件或其工作目录
   已不存在，通常是因为它们位于重启后变空的 tmpfs（`/scratch`）上。该作业无法恢复。请删除它
   （`gpueue remove`）。

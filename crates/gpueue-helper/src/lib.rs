@@ -12,6 +12,8 @@
 //! - [`shim`]: the job unit's main process (PID/mount namespace init).
 //! - [`host`]: `/proc`, `nvidia-smi`, users and mounts.
 //! - [`devices`]: GPU isolation (the device nodes a job unit may open).
+//! - [`mountfd`]: walking to mount points and bind sources without
+//!   following symlinks, through directories only root controls.
 //! - [`mounts`]: mountinfo analysis (hidden mounts, CRIU's external binds).
 //! - [`deadmounts`]: FUSE and network mounts that are gone or do not
 //!   answer, and how dumps and restores get along without them.
@@ -34,6 +36,7 @@ pub mod host;
 pub mod images;
 pub mod jobs;
 pub mod launcher;
+pub mod mountfd;
 pub mod mounts;
 pub mod notify;
 pub mod server;
