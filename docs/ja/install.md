@@ -242,11 +242,36 @@ git commit packaging/minisign.pub scripts/install.sh
 ## Debian/Ubuntu パッケージのインストール
 
 各リリースには、Debian 12 と Ubuntu 22.04、24.04、26.04 向けに、amd64 と arm64 の `.deb` があります。
-最新リリースからこのマシンのアーキテクチャのものをダウンロードし、apt でインストールします。apt は依存する
-ものも一緒に入れます。
+安定版リリースは puzuz の APT リポジトリにも入っています。これは GitHub リリース `apt`
+（`https://github.com/kaito4681/puzuz/releases/download/apt/`、`/etc/apt/keyrings/puzuz.gpg` の鍵で署名）にあるフラットリポジトリです。
+
+**前提条件。**
+
+- 以下のコマンドに必要な `curl` と `ca-certificates`（`sudo apt install curl ca-certificates`）。
+  `/etc/apt/keyrings` はサポート対象のどのリリースでも apt に含まれています。
+- PID 1 としての systemd 240 以降（パッケージが依存しています。systemd が PID 1 でなければサービスは有効化
+  されるだけです。後述）。
+- 任意：チェックポイント用の CRIU 4.2 以降（ディストリビューションのものはないか古いことが多いです。
+  [CRIU](#criu) を参照）、GPU ジョブ用の NVIDIA ドライバーと cuda-checkpoint
+  （[cuda-checkpoint](#cuda-checkpoint) を参照）。これらがなくてもジョブは実行できます。
+
+**APT リポジトリから（推奨）。** リポジトリを追加してそこからインストールします。最新の安定版と
+アーキテクチャは apt が選びます。ファイル名と内容は次のとおり正確にしてください（パッケージがインストール
+するものと同じなので、あとでパッケージがそれらについて尋ねることはありません）。
 
 ```sh
-arch=$(uname -m | sed 's/^x86_64$/amd64/; s/^aarch64$/arm64/')
+sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
+sudo apt update && sudo apt install puzuz
+```
+
+**`.deb` を直接。** または、最新リリースからこのマシンのアーキテクチャのパッケージをダウンロードし、
+apt でインストールします。apt は依存するものも一緒に入れ、パッケージは同じリポジトリを登録します。
+
+```sh
+arch=$(dpkg --print-architecture)
 curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
 sudo apt install "./puzuz_${arch}.deb"
 ```
@@ -296,10 +321,7 @@ puzuz では `install.sh --uninstall`）。実行中のジョブ、`/etc/puzuz`�
 `puzuz doctor` と `puzuz service install-method` はパッケージによるインストールをディストリビューションの
 `package` として報告し、`puzuz service install`、`install.sh`、`puzuz update` はそれに手を出しません。
 
-**更新。** パッケージは puzuz の APT リポジトリを登録します。これは GitHub リリース `apt`
-（`https://github.com/kaito4681/puzuz/releases/download/apt/`、`/etc/apt/keyrings/puzuz.gpg` の鍵で署名）
-にあるフラットリポジトリです。そのため `.deb` を手動でインストールするのは 1 回だけで、以降のバージョンは
-システムの他の部分と一緒に入ります。
+**更新。** どちらの方法でも、以降のバージョンはシステムの他の部分と一緒にリポジトリから入ります。
 
 ```sh
 sudo apt update && sudo apt upgrade
@@ -312,18 +334,6 @@ sudo apt update && sudo apt upgrade
 いなければ新しいバージョンの keyring で置き換えられます（新しい署名鍵はこうして届きます）。新しいリリースの
 アップロード中は、`apt update` がハッシュの不一致やファイルの欠落で一時的に失敗することがあります。1 分ほど
 して再実行すれば直ります。
-
-**リポジトリを手動で追加する。** リリースページから最初の `.deb` をインストールする代わりに、リポジトリを
-追加してそこからインストールすることもできます。ファイル名と内容は次のとおり正確にしてください（パッケージが
-インストールするものと同じなので、あとでパッケージがそれらについて尋ねることはありません）。
-
-```sh
-sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg \
-  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
-sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
-  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
-sudo apt update && sudo apt install puzuz
-```
 
 **リポジトリの鍵。** パッケージ、リポジトリ、`.rpm` ファイルは 1 つの GPG 鍵（ソースツリーの
 `packaging/apt/puzuz-archive-keyring.gpg`）で署名されています。フィンガープリントは
@@ -431,8 +441,17 @@ gh secret set APT_GPG_PASSPHRASE -R kaito4681/puzuz
 ## Fedora/RHEL/Rocky パッケージのインストール
 
 各リリースには、Fedora と RHEL 互換の 9 以降（RHEL、Rocky Linux、AlmaLinux。glibc 2.34 以降）向けに、
-x86_64 と aarch64 の `.rpm` があります（どちらかは `uname -m` で分かります）。最新リリースのものを dnf で
-インストールします。dnf は URL を直接受け取れ、依存するものも一緒に入れます。
+x86_64 と aarch64 の `.rpm` があります（どちらかは `uname -m` で分かります）。
+
+**前提条件。**
+
+- PID 1 としての systemd（パッケージが必要とします。systemd が PID 1 でなければサービスは有効化されるだけ
+  です）。パッケージは dnf 自身がダウンロードします。`curl`（と `ca-certificates`）は検証用のファイルを
+  ダウンロードするときだけ必要です。
+- 任意：チェックポイント用の CRIU 4.2 以降（[CRIU](#criu) を参照）、GPU ジョブ用の NVIDIA ドライバーと
+  cuda-checkpoint（[cuda-checkpoint](#cuda-checkpoint) を参照）。これらがなくてもジョブは実行できます。
+
+最新リリースの `.rpm` を dnf でインストールします。dnf は URL を直接受け取れ、依存するものも一緒に入れます。
 
 ```sh
 sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"

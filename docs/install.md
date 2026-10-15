@@ -224,11 +224,38 @@ draft on GitHub, or `install.sh` (which asks for the latest published release) d
 ## Installing the Debian/Ubuntu package
 
 Each release has a `.deb` for amd64 and arm64, for Debian 12 and Ubuntu 22.04, 24.04 and 26.04.
-Download the one for this machine's architecture from the latest release and install it with apt,
-which also pulls in what it depends on:
+The stable releases are also in the puzuz APT repository, a flat repository in the GitHub release
+`apt` (`https://github.com/kaito4681/puzuz/releases/download/apt/`, signed with the key in
+`/etc/apt/keyrings/puzuz.gpg`).
+
+**Prerequisites.**
+
+- `curl` and `ca-certificates`, for the commands below (`sudo apt install curl ca-certificates`).
+  `/etc/apt/keyrings` comes with apt on every supported release.
+- systemd 240 or newer as PID 1 (the package depends on it; without systemd as PID 1 the services
+  are only enabled, see below).
+- Optional: CRIU 4.2 or newer for checkpoints (the distribution's is often missing or too old, see
+  [CRIU](#criu)), and for GPU jobs the NVIDIA driver and cuda-checkpoint (see
+  [cuda-checkpoint](#cuda-checkpoint)). Jobs run without them.
+
+**From the APT repository (recommended).** Add the repository and install from it; apt picks the
+newest stable version and the architecture. Use these exact file names and contents (they are what
+the package installs, so the package does not ask about them later):
 
 ```sh
-arch=$(uname -m | sed 's/^x86_64$/amd64/; s/^aarch64$/arm64/')
+sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
+sudo apt update && sudo apt install puzuz
+```
+
+**The `.deb` directly.** Or download the package for this machine's architecture from the latest
+release and install it with apt, which also pulls in what it depends on; the package registers the
+same repository:
+
+```sh
+arch=$(dpkg --print-architecture)
 curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
 sudo apt install "./puzuz_${arch}.deb"
 ```
@@ -278,10 +305,7 @@ the command, `install.sh --uninstall`). Running jobs, `/etc/puzuz` and `/var/lib
 and `puzuz service install-method` report the package's installation as a distribution
 `package`, and `puzuz service install`, `install.sh` and `puzuz update` refuse to touch it.
 
-**Updates.** The package registers the puzuz APT repository, a flat repository in the GitHub
-release `apt` (`https://github.com/kaito4681/puzuz/releases/download/apt/`, signed with the key in
-`/etc/apt/keyrings/puzuz.gpg`). So the `.deb` is installed by hand only once;
-later versions come with the rest of the system:
+**Updates.** Either way, later versions come from the repository with the rest of the system:
 
 ```sh
 sudo apt update && sudo apt upgrade
@@ -294,18 +318,6 @@ versions of each. An upgrade restarts the running services. Running jobs keep ru
 new version's keyring when you have not changed it (that is how a new signing key arrives). While a new release is being uploaded,
 `apt update` may briefly fail with a hash mismatch or a missing file; running it again a minute
 later fixes it.
-
-**Adding the repository by hand.** Instead of installing the first `.deb` from the release page,
-you can add the repository and install from it. Use these exact file names and contents (they are
-what the package installs, so the package does not ask about them later):
-
-```sh
-sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg \
-  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
-sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
-  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
-sudo apt update && sudo apt install puzuz
-```
 
 **The repository key.** The packages, the repository and the `.rpm` files are signed with one
 GPG key (`packaging/apt/puzuz-archive-keyring.gpg` in the source tree), fingerprint
@@ -412,8 +424,18 @@ binaries; `scripts/deb-test.sh` and `scripts/rpm-test.sh` check them in containe
 ## Installing the Fedora/RHEL/Rocky package
 
 Each release has an `.rpm` for x86_64 and aarch64 (`uname -m` tells which), for Fedora and
-RHEL-compatible 9 or newer (RHEL, Rocky Linux, AlmaLinux; glibc 2.34 or newer). Install the one of
-the latest release with dnf, which takes the URL directly and pulls in what it depends on:
+RHEL-compatible 9 or newer (RHEL, Rocky Linux, AlmaLinux; glibc 2.34 or newer).
+
+**Prerequisites.**
+
+- systemd as PID 1 (the package requires it; without systemd as PID 1 the services are only
+  enabled). dnf downloads the package itself; `curl` (with `ca-certificates`) is needed only to
+  download the files for verifying it.
+- Optional: CRIU 4.2 or newer for checkpoints (see [CRIU](#criu)), and for GPU jobs the NVIDIA
+  driver and cuda-checkpoint (see [cuda-checkpoint](#cuda-checkpoint)). Jobs run without them.
+
+Install the `.rpm` of the latest release with dnf, which takes the URL directly and pulls in what
+it depends on:
 
 ```sh
 sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"

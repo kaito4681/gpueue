@@ -72,19 +72,29 @@ missing. Update later with `sudo puzuz update` (running jobs keep running). Remo
 `sudo puzuz uninstall`, which keeps the data (`--purge` deletes it too). A GitHub token is not
 needed (`GH_TOKEN` is used when set; it only raises the API rate limit).
 
-On Debian and Ubuntu (amd64 or arm64) you can install the package from the release instead:
+On Debian and Ubuntu (amd64 or arm64) you can install the package from the puzuz APT repository
+(in the GitHub release `apt`) instead; this needs `curl` and `ca-certificates`, and apt picks the
+newest stable version and the architecture:
 
 ```sh
-arch=$(uname -m | sed 's/^x86_64$/amd64/; s/^aarch64$/arm64/')
+sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
+sudo apt update && sudo apt install puzuz
+```
+
+Or install the `.deb` of the latest release directly (it registers the same repository):
+
+```sh
+arch=$(dpkg --print-architecture)
 curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
 sudo apt install "./puzuz_${arch}.deb"
 ```
 
-It installs and starts the same services and recommends `criu`. It also registers the puzuz APT
-repository (in the GitHub release `apt`), so you install the `.deb` by hand only once: later
-versions come with `sudo apt update && sudo apt upgrade`. `sudo apt remove puzuz` stops the
-services; `sudo apt purge puzuz` also deletes /etc/puzuz. Both keep /var/lib/puzuz and running
-jobs.
+It installs and starts the same services and recommends `criu` (see
+[docs/install.md](docs/install.md#installing-the-debianubuntu-package) for the prerequisites).
+Either way, later versions come with `sudo apt update && sudo apt upgrade`. `sudo apt remove puzuz`
+stops the services; `sudo apt purge puzuz` also deletes /etc/puzuz. Both keep /var/lib/puzuz and
+running jobs.
 
 On Fedora, RHEL, Rocky and Alma Linux 9+ (x86_64 or aarch64), install the .rpm from the release
 (dnf takes the URL directly):

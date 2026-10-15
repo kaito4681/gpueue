@@ -69,18 +69,27 @@ curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.s
 `sudo puzuz uninstall` 卸载，数据会被保留（加上 `--purge` 则一并删除）。不需要 GitHub token（如果设置了
 `GH_TOKEN` 则会使用它；它只用于提高 API 速率限制）。
 
-在 Debian 和 Ubuntu（amd64 或 arm64）上，也可以改为安装发布版本中的软件包：
+在 Debian 和 Ubuntu（amd64 或 arm64）上，也可以改为从 puzuz 的 APT 仓库（位于 GitHub Release `apt` 中）
+安装软件包；这需要 `curl` 和 `ca-certificates`，最新的稳定版本和架构由 apt 自动选择：
 
 ```sh
-arch=$(uname -m | sed 's/^x86_64$/amd64/; s/^aarch64$/arm64/')
+sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
+sudo apt update && sudo apt install puzuz
+```
+
+或者直接安装最新发布版本的 `.deb`（它会注册同一个仓库）：
+
+```sh
+arch=$(dpkg --print-architecture)
 curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
 sudo apt install "./puzuz_${arch}.deb"
 ```
 
-它会安装并启动相同的服务，并推荐安装 `criu`。它还会注册 puzuz 的 APT 仓库（位于 GitHub Release `apt` 中），
-因此只需手动安装一次 `.deb`：之后的版本通过 `sudo apt update && sudo apt upgrade` 获取。
-`sudo apt remove puzuz` 会停止服务；`sudo apt purge puzuz` 还会删除 /etc/puzuz。两者都会保留 /var/lib/puzuz
-和运行中的作业。
+它会安装并启动相同的服务，并推荐安装 `criu`（前提条件参见
+[docs/zh-CN/install.md](docs/zh-CN/install.md#installing-the-debianubuntu-package)）。无论哪种方式，之后的版本
+都通过 `sudo apt update && sudo apt upgrade` 获取。`sudo apt remove puzuz` 会停止服务；`sudo apt purge puzuz`
+还会删除 /etc/puzuz。两者都会保留 /var/lib/puzuz 和运行中的作业。
 
 在 Fedora、RHEL、Rocky 和 Alma Linux 9+（x86_64 或 aarch64）上，安装发布版本中的 .rpm
 （dnf 可以直接接受 URL）：
