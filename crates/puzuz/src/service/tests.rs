@@ -587,6 +587,79 @@ fn the_gc_root_goes_once_the_binaries_no_longer_come_from_the_store() {
 }
 
 #[test]
+fn a_nix_store_root_does_not_own_is_refused() {
+    let sys = nix_build_system();
+    // The interpreter the binaries load (the store path itself exists too).
+    sys.write(NIX_LOADER, "loader");
+    let store = sys.path(Path::new("/nix/store"));
+    // A single-user installation's store: writable by its owner's group (and not sticky).
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(
+        err.contains(&format!(
+            "/home/u/result/bin/puzuz-helper loads its dynamic loader {NIX_LOADER}"
+        )),
+        "{err}"
+    );
+    assert!(err.contains("/nix/store must be owned by root"), "{err}");
+    assert!(err.contains("multi-user Nix installation"), "{err}");
+    assert!(!sys.exists("/usr/local/bin/puzuz-helper"));
+    assert!(!sys.exists("/etc/systemd/system/puzuz-helper.service"));
+    assert!(!sys.ran("systemctl daemon-reload"), "{:?}", sys.commands());
+
+    // A group-writable store path is refused too.
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let glibc = sys.path(Path::new("/nix/store/xyz-glibc-2.40"));
+    std::fs::set_permissions(&glibc, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(
+        err.contains("/nix/store/xyz-glibc-2.40 must be owned by root"),
+        "{err}"
+    );
+    std::fs::set_permissions(&glibc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The store of a multi-user installation (sticky, group nixbld) is accepted.
+    let gid = std::fs::metadata(&store).unwrap().gid();
+    sys.write("/etc/group", &format!("nixbld:x:{gid}:nixbld1\n"));
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o1775)).unwrap();
+    run_install(&sys, &opts()).unwrap();
+    assert_eq!(read_bytes(&sys, "/usr/local/bin/puzuz"), elf(NIX_LOADER));
+}
+
+#[test]
+fn a_nix_store_binary_others_can_replace_is_not_run() {
+    let sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    let nix_store = sys.path(Path::new("/usr/bin/nix-store"));
+    std::fs::set_permissions(&nix_store, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let out = run_install(&sys, &opts()).unwrap();
+    assert!(!sys.ran("nix-store"), "{:?}", sys.commands());
+    assert!(
+        out.contains("warning: did not run /usr/bin/nix-store as root"),
+        "{out}"
+    );
+    assert!(out.contains("sudo nix-store --add-root"), "{out}");
+    assert_eq!(receipt(&sys).gc_root, None);
+
+    // A trusted one in the default profile is used instead.
+    let sys = nix_build_system();
+    sys.write_exe("/usr/bin/nix-store", "");
+    std::fs::set_permissions(
+        sys.path(Path::new("/usr/bin/nix-store")),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    sys.write_exe("/nix/var/nix/profiles/default/bin/nix-store", "");
+    run_install(&sys, &opts()).unwrap();
+    assert!(
+        sys.ran("nix-store --add-root /nix/var/nix/gcroots/puzuz"),
+        "{:?}",
+        sys.commands()
+    );
+    assert_eq!(receipt(&sys).gc_root, Some(PathBuf::from(GC_ROOT)));
+}
+
+#[test]
 fn bin_dir_installs_copies() {
     let mut sys = FakeSystem::new();
     sys.exe = PathBuf::from("/home/u/target/release/puzuz");
@@ -667,6 +740,60 @@ fn an_identical_binary_behind_a_symlink_is_replaced() {
     // A root-owned regular file with the same contents and mode is kept.
     let out = run_install(&sys, &opts()).unwrap();
     assert!(!out.contains("installed /usr/local/bin"), "{out}");
+}
+
+#[test]
+fn binaries_used_in_place_must_be_root_owned_and_protected() {
+    // A group-writable helper in /usr/bin.
+    let sys = system();
+    let helper = sys.path(Path::new("/usr/bin/puzuz-helper"));
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(
+        err.contains("/usr/bin/puzuz-helper would be used in place and run as root"),
+        "{err}"
+    );
+    assert!(
+        err.contains("/usr/bin/puzuz-helper must be owned by root"),
+        "{err}"
+    );
+    assert!(!sys.exists("/etc/systemd/system/puzuz-helper.service"));
+    assert!(!sys.ran("systemctl daemon-reload"), "{:?}", sys.commands());
+
+    // A root-owned symlink into a directory others can write to.
+    let sys = system();
+    sys.write_exe("/home/u/bin/puzuz-helper", "helper binary");
+    std::fs::set_permissions(
+        sys.path(Path::new("/home/u")),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    std::fs::remove_file(sys.path(Path::new("/usr/bin/puzuz-helper"))).unwrap();
+    std::os::unix::fs::symlink(
+        sys.path(Path::new("/home/u/bin/puzuz-helper")),
+        sys.path(Path::new("/usr/bin/puzuz-helper")),
+    )
+    .unwrap();
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(
+        err.contains("/usr/bin/puzuz-helper would be used in place"),
+        "{err}"
+    );
+    assert!(
+        err.contains("/home/u (which /usr/bin/puzuz-helper resolves through) must be owned"),
+        "{err}"
+    );
+    assert!(!sys.exists("/etc/systemd/system/puzuz-helper.service"));
+    assert!(!sys.ran("systemctl daemon-reload"), "{:?}", sys.commands());
+
+    // Protected, it is used in place.
+    std::fs::set_permissions(
+        sys.path(Path::new("/home/u")),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    run_install(&sys, &opts()).unwrap();
+    assert!(receipt(&sys).copied.is_empty());
 }
 
 #[test]
@@ -1123,6 +1250,61 @@ fn purge_reports_a_purge_directory_that_is_a_mount_point_as_kept() {
 }
 
 #[test]
+fn purge_keeps_a_user_directory_that_fills_up_again_and_goes_on() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write("/var/lib/puzuz/daemon/state.sqlite", "db");
+    sys.write("/var/lib/puzuz/logs/1000/7.log", "log");
+    sys.write("/var/lib/puzuz/logs/1001/8.log", "log");
+    sys.write("/run/puzuz/puzuz.sock", "");
+    sys.write("/run/puzuz-helper/helper.sock", "");
+    // The user writes a new log after their directory was emptied, before it is removed.
+    let racing = sys.path(Path::new("/var/lib/puzuz/logs/1000/9.log"));
+    let raced = std::cell::Cell::new(false);
+    let remove = |parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr| {
+        if name == "1000" && !raced.replace(true) {
+            std::fs::write(&racing, "new log").unwrap();
+        }
+        remove_dir(parent, name)
+    };
+    let mut out = Vec::new();
+    purge(&sys, &remove, &mut out).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(raced.get());
+    assert!(
+        out.contains(
+            "kept /var/lib/puzuz/logs/1000 (files were added to it while it was deleted; delete \
+             it by hand)"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("kept /var/lib/puzuz (deleted what could be deleted; see above)"),
+        "{out}"
+    );
+    assert_eq!(
+        sys.read("/var/lib/puzuz/logs/1000/9.log").unwrap(),
+        "new log"
+    );
+    assert!(!sys.exists("/var/lib/puzuz/logs/1000/7.log"));
+    assert!(!sys.exists("/var/lib/puzuz/logs/1001"));
+    assert!(!sys.exists("/var/lib/puzuz/daemon"));
+    // The other purge directories are deleted all the same.
+    for dir in ["/etc/puzuz", "/run/puzuz", "/run/puzuz-helper"] {
+        assert!(out.contains(&format!("removed {dir}\n")), "{out}");
+        assert!(!sys.exists(dir), "{dir}");
+    }
+
+    // Another error still stops the purge.
+    sys.write("/var/lib/puzuz/logs/1000/9.log", "log");
+    sys.write("/etc/puzuz/config.toml", "");
+    let failing = |_: &std::os::fd::OwnedFd, _: &std::ffi::OsStr| Err(nix::errno::Errno::EIO);
+    let err = purge(&sys, &failing, &mut Vec::new()).unwrap_err();
+    assert!(err.contains("removing /var/lib/puzuz/logs/1000"), "{err}");
+    assert!(sys.exists("/etc/puzuz/config.toml"));
+}
+
+#[test]
 fn purge_asks_for_confirmation() {
     let sys = system();
     run_install(&sys, &opts()).unwrap();
@@ -1496,6 +1678,154 @@ fn install_does_not_follow_a_planted_temporary_file() {
         "new helper"
     );
     assert!(!sys.exists("/usr/local/bin/.puzuz-helper.puzuz-install"));
+}
+
+/// A build directory with new binaries and an installation of old ones in /usr/local/bin.
+fn old_installation() -> (FakeSystem, InstallOptions) {
+    let sys = build_dir_system();
+    sys.write_exe("/usr/local/bin/puzuz", "old puzuz");
+    sys.write_exe("/usr/local/bin/puzuz-helper", "old helper");
+    let options = InstallOptions {
+        bin_dir: Some(PathBuf::from("/usr/local/bin")),
+        ..opts()
+    };
+    (sys, options)
+}
+
+/// No temporary or backup files are left in /usr/local/bin.
+fn assert_no_leftovers(sys: &FakeSystem) {
+    let left: Vec<String> = std::fs::read_dir(sys.path(Path::new("/usr/local/bin")))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with('.') && name != ".puzuz-helper.puzuz-install")
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_failed_helper_write_leaves_both_old_binaries() {
+    let (sys, options) = old_installation();
+    // Writing the helper's temporary file fails (as on ENOSPC or EIO): a non-empty directory
+    // is in its place, which cannot be removed like a file, even by root.
+    sys.write(
+        "/usr/local/bin/.puzuz-helper.puzuz-install/blocker",
+        "not a file",
+    );
+    let err = run_install(&sys, &options).unwrap_err();
+    assert!(err.contains("writing /usr/local/bin/puzuz-helper"), "{err}");
+    assert!(
+        err.contains("the binaries in /usr/local/bin were not changed"),
+        "{err}"
+    );
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "old puzuz");
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "old helper"
+    );
+    assert!(!sys.exists("/usr/local/bin/.puzuz.puzuz-install"));
+    assert_no_leftovers(&sys);
+    assert!(!sys.ran("systemctl daemon-reload"), "{:?}", sys.commands());
+
+    // Once the obstacle is gone, both are replaced.
+    std::fs::remove_dir_all(sys.path(Path::new("/usr/local/bin/.puzuz-helper.puzuz-install")))
+        .unwrap();
+    let out = run_install(&sys, &options).unwrap();
+    assert!(out.contains("installed /usr/local/bin/puzuz\n"), "{out}");
+    assert!(
+        out.contains("installed /usr/local/bin/puzuz-helper\n"),
+        "{out}"
+    );
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "new puzuz");
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "new helper"
+    );
+    assert_no_leftovers(&sys);
+}
+
+#[test]
+fn a_failure_after_the_helper_was_replaced_restores_it() {
+    let (sys, options) = old_installation();
+    // The helper is put in place first; then puzuz cannot be (a non-empty directory took its
+    // place), so the helper is rolled back.
+    std::fs::remove_file(sys.path(Path::new("/usr/local/bin/puzuz"))).unwrap();
+    sys.write("/usr/local/bin/puzuz/blocker", "not a file");
+    let err = run_install(&sys, &options).unwrap_err();
+    assert!(err.contains("writing /usr/local/bin/puzuz:"), "{err}");
+    assert!(
+        err.contains("restored the previous /usr/local/bin/puzuz-helper"),
+        "{err}"
+    );
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "old helper"
+    );
+    assert!(sys.exists("/usr/local/bin/puzuz/blocker"));
+    assert!(!sys.exists("/usr/local/bin/.puzuz.puzuz-install"));
+    assert!(!sys.exists("/usr/local/bin/.puzuz-helper.puzuz-install"));
+    assert_no_leftovers(&sys);
+}
+
+/// Stages new contents for /usr/local/bin/puzuz-helper and /usr/local/bin/puzuz.
+fn stage_both(sys: &FakeSystem) -> Vec<Staged> {
+    ["puzuz-helper", "puzuz"]
+        .iter()
+        .map(|name| {
+            let path = Path::new("/usr/local/bin").join(name);
+            stage_file(sys, &path, format!("new {name}").as_bytes(), 0o755)
+                .unwrap()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// A rename that fails for the second file, as on EIO.
+fn rename_failing_for_puzuz(from: &Path, to: &Path) -> io::Result<()> {
+    if to.ends_with("bin/puzuz") {
+        return Err(io::Error::from_raw_os_error(nix::libc::EIO));
+    }
+    std::fs::rename(from, to)
+}
+
+#[test]
+fn a_failed_rename_rolls_back_the_binaries_already_replaced() {
+    let (sys, _) = old_installation();
+    let staged = stage_both(&sys);
+    let err = commit_staged_with(&sys, &staged, &rename_failing_for_puzuz).unwrap_err();
+    assert!(err.contains("writing /usr/local/bin/puzuz:"), "{err}");
+    assert!(
+        err.contains("restored the previous /usr/local/bin/puzuz-helper"),
+        "{err}"
+    );
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "old puzuz");
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "old helper"
+    );
+    assert_eq!(mode(&sys, "/usr/local/bin/puzuz-helper"), 0o755);
+    assert!(!sys.exists("/usr/local/bin/.puzuz-helper.puzuz-install"));
+    assert!(!sys.exists("/usr/local/bin/.puzuz.puzuz-install"));
+    assert_no_leftovers(&sys);
+
+    // A first install has nothing to restore: the new helper is removed again.
+    let sys = build_dir_system();
+    sys.mkdir("/usr/local/bin");
+    let staged = stage_both(&sys);
+    commit_staged_with(&sys, &staged, &rename_failing_for_puzuz).unwrap_err();
+    assert!(!sys.exists("/usr/local/bin/puzuz-helper"));
+    assert!(!sys.exists("/usr/local/bin/puzuz"));
+    assert_no_leftovers(&sys);
+
+    // Without a failure both are replaced and the backups are gone.
+    let (sys, _) = old_installation();
+    let staged = stage_both(&sys);
+    commit_staged(&sys, &staged).unwrap();
+    assert_eq!(sys.read("/usr/local/bin/puzuz").unwrap(), "new puzuz");
+    assert_eq!(
+        sys.read("/usr/local/bin/puzuz-helper").unwrap(),
+        "new puzuz-helper"
+    );
+    assert_no_leftovers(&sys);
 }
 
 /// Runs the install in a child process with umask 077 (the umask is process-wide, so it must

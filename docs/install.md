@@ -801,7 +801,8 @@ sudo target/release/puzuz service install
 
 1. the directory of the current `service install` installation, when re-installing or updating,
 2. else the directory the `puzuz` binary is in, if that is `/usr/bin` or `/usr/local/bin`
-   (used in place, nothing is copied),
+   (used in place, nothing is copied; both binaries, and anything a symlink there resolves
+   through, must then be owned by root and not group- or world-writable),
 3. else `/usr/local/bin`, where `puzuz` and `puzuz-helper` are copied (it says so). That is the
    usual place for software the administrator installs: package managers leave it alone, and it
    is in systemd's and every user's default `PATH`.
@@ -822,8 +823,15 @@ Built with Nix outside NixOS (`nix build`, then `sudo ./result/bin/puzuz service
 binaries are copied to `/usr/local/bin` like any other build. They still load their libraries
 from the Nix store, so install also registers the store path as a garbage-collector root,
 `/nix/var/nix/gcroots/puzuz` (with `nix-store --add-root /nix/var/nix/gcroots/puzuz --realise
-<store path>`). If `nix-store` is not found or fails, install warns and prints that command, and
-a root recorded earlier is kept. Whether the root is still needed is decided from the installed
+<store path>`). Only a `nix-store` that nobody but root can replace is run (the one in root's
+`PATH`, else `/nix/var/nix/profiles/default/bin/nix-store` or
+`/run/current-system/sw/bin/nix-store`). If none is found or it fails, install warns and prints
+that command, and a root recorded earlier is kept. Since the helper runs as root with that
+loader and those libraries, install refuses binaries whose loader is in a store someone else can
+change: the loader and every directory above it must be owned by root and not writable by group
+or others, except `/nix/store` itself, which may be group-writable when it is sticky and its
+group is `nixbld` (a multi-user Nix installation; a single-user installation's store belongs to
+its user). Whether the root is still needed is decided from the installed
 binaries themselves (their dynamic loader is in `/nix/store`), so moving a Nix-built copy with
 `--bin-dir` keeps it. `puzuz uninstall` removes the root, and so does installing binaries that
 do not use the store (for example `puzuz update`).
@@ -1724,8 +1732,9 @@ rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or
    before anything is downloaded, a missing one is written by the install) and
    that it runs as the installed binary (the directory in `puzuz.service`'s `ExecStart=`),
 2. looks up the latest release (or `--version`) and compares it with its own version. Nothing
-   happens when it is up to date. An older version is installed only when asked for with
-   `--version`,
+   happens when it is up to date, unless the installed `puzuz-helper` is missing or reports
+   another version (an interrupted earlier update): then the release is installed again to
+   repair the pair. An older version is installed only when asked for with `--version`,
 3. asks for confirmation (`-y/--yes` skips it),
 4. downloads the tarball, `.sha256` and `.minisig` into `/var/lib/puzuz/update` (root, 0700),
    checks the minisign signature with the release key built into `puzuz`, and the checksum,
@@ -1735,16 +1744,18 @@ rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... puzuz update`), or
 6. runs the new `puzuz service install` for the installed directory, removes the Nix GC root of
    a Nix-built installation (the release's binaries do not need the store), waits until the
    daemon runs the new version and is connected to the helper, and deletes the download. If
-   `service install` fails, `puzuz update` looks at the installed binaries: if they are not the
-   release's, it stops with that error; if they are (only the final checks failed), it warns and
-   goes on.
+   `service install` fails, `puzuz update` looks at each installed binary: if neither is the
+   release's, it stops with that error; if only one is, it stops and says to run it again
+   (which repairs the pair); if both are (only the final checks failed), it warns and goes on.
 
 `install.sh` (run again, optionally with `--version`) works too and does the same; it checks the
 signature with the `minisign` in `PATH`, or downloads a pinned one (see
 [Running the installer](#running-the-installer)).
 
 `service install` (and so both ways above) replaces the binaries and units and restarts both
-services if anything changed. The configuration file is kept.
+services if anything changed. It writes both binaries first and then puts them in place, the
+helper first; if one cannot be put in place, the other is restored, so a failure (a full disk,
+for example) never leaves a new `puzuz` next to an old `puzuz-helper`. The configuration file is kept.
 
 - **Running jobs are not affected.** They run in their own systemd units
   (`puzuz-job-<id>.service`, or `puzuz-job-<id>-r<n>.service` after a restore). A new daemon picks
@@ -1804,7 +1815,9 @@ runs it. `--purge` asks for confirmation on the terminal. When there is no termi
 - `--purge` asks for confirmation (`-y/--yes` skips it). It does not descend into mount points
   (for example the bind mount of `/` below `/run/puzuz-helper`). Those are reported for you to
   unmount and delete by hand. A purge directory that is itself a mount point (for example
-  `/var/lib/puzuz` on its own filesystem) is emptied and kept. The deletion never follows
+  `/var/lib/puzuz` on its own filesystem) is emptied and kept. A directory that is not empty any
+  more when it is to be removed (a user's log directory a running process keeps writing to) is
+  kept and reported too, and the other directories are still deleted. The deletion never follows
   symlinks, including ones users place in their log directories.
 - The system user `puzuz` and the group `puzuz-admin` are always kept.
 

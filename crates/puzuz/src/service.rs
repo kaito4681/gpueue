@@ -170,26 +170,30 @@ fn already_written(sys: &dyn System, path: &Path, contents: &[u8], mode: u32) ->
             .is_ok_and(|existing| existing == contents)
 }
 
-/// Writes `contents` to the system path atomically unless it is already there.
-/// Returns whether anything changed.
-fn write_file(sys: &dyn System, path: &Path, contents: &[u8], mode: u32) -> Result<bool> {
-    let local = sys.path(path);
+/// A file [`stage_file`] wrote next to its target (synced, with its final mode) but did not
+/// put in place yet.
+struct Staged {
+    /// The system path it replaces.
+    path: PathBuf,
+    /// The temporary file (a local path) in the target's directory.
+    tmp: PathBuf,
+}
+
+/// Writes `contents` to a temporary file next to the system path `path` unless the path
+/// already holds them. Returns `None` if nothing needs to change.
+fn stage_file(sys: &dyn System, path: &Path, contents: &[u8], mode: u32) -> Result<Option<Staged>> {
     if already_written(sys, path, contents, mode) {
-        return Ok(false);
+        return Ok(None);
     }
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
     create_dirs(sys, parent)?;
-    let file_name = local.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = local.with_file_name(format!(".{file_name}.puzuz-install"));
+    let tmp = sibling(&sys.path(path), "puzuz-install");
     let write = || -> io::Result<()> {
         // A leftover (or planted) temporary file or symlink is removed, not followed; the new
         // one is created exclusively and never through a symlink.
-        match std::fs::remove_file(&tmp) {
-            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
-            _ => {}
-        }
+        remove_if_present(&tmp)?;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -199,14 +203,130 @@ fn write_file(sys: &dyn System, path: &Path, contents: &[u8], mode: u32) -> Resu
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
-        // Renaming replaces even a running binary (writing into it fails with ETXTBSY).
-        std::fs::rename(&tmp, &local)
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
     };
     write().map_err(|err| {
         let _ = std::fs::remove_file(&tmp);
         format!("writing {}: {err}", path.display())
     })?;
+    Ok(Some(Staged {
+        path: path.to_owned(),
+        tmp,
+    }))
+}
+
+/// `.<name>.<suffix>` next to the local path `local`.
+fn sibling(local: &Path, suffix: &str) -> PathBuf {
+    let file_name = local.file_name().unwrap_or_default().to_string_lossy();
+    local.with_file_name(format!(".{file_name}.{suffix}"))
+}
+
+/// Removes the file (or symlink) at the local path unless it is missing.
+fn remove_if_present(local: &Path) -> io::Result<()> {
+    match std::fs::remove_file(local) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
+    }
+}
+
+/// Puts the staged files in place, in order, each atomically (renaming replaces even a running
+/// binary; writing into it would fail with ETXTBSY). All or none: if one cannot be put in
+/// place, those already renamed are rolled back to the files they replaced (kept as hard links
+/// until all are in place). Every temporary file is removed.
+fn commit_staged(sys: &dyn System, staged: &[Staged]) -> Result<()> {
+    commit_staged_with(sys, staged, &|from, to| std::fs::rename(from, to))
+}
+
+/// [`commit_staged`] with the rename it uses (tests make it fail).
+fn commit_staged_with(
+    sys: &dyn System,
+    staged: &[Staged],
+    rename: &dyn Fn(&Path, &Path) -> io::Result<()>,
+) -> Result<()> {
+    // The files put in place, each with a hard link to the file it replaced, if any.
+    let mut done: Vec<(&Staged, Option<PathBuf>)> = Vec::new();
+    let mut failure = None;
+    for file in staged {
+        let local = sys.path(&file.path);
+        let commit = || -> io::Result<Option<PathBuf>> {
+            let previous = match std::fs::symlink_metadata(&local) {
+                Ok(_) => {
+                    let backup = sibling(&local, "puzuz-previous");
+                    remove_if_present(&backup)?;
+                    // Links the entry itself: a symlink is not followed.
+                    std::fs::hard_link(&local, &backup)?;
+                    Some(backup)
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+                Err(err) => return Err(err),
+            };
+            if let Err(err) = rename(&file.tmp, &local) {
+                if let Some(backup) = &previous {
+                    let _ = std::fs::remove_file(backup);
+                }
+                return Err(err);
+            }
+            Ok(previous)
+        };
+        match commit() {
+            Ok(previous) => done.push((file, previous)),
+            Err(err) => {
+                failure = Some(format!("writing {}: {err}", file.path.display()));
+                break;
+            }
+        }
+    }
+    let result = match failure {
+        None => {
+            for backup in done.iter().filter_map(|(_, previous)| previous.as_ref()) {
+                let _ = std::fs::remove_file(backup);
+            }
+            Ok(())
+        }
+        Some(failure) if done.is_empty() && staged.len() > 1 => {
+            Err(format!("{failure}; nothing was replaced"))
+        }
+        Some(failure) if done.is_empty() => Err(failure),
+        Some(failure) => {
+            let mut not_restored = Vec::new();
+            for (file, previous) in done.iter().rev() {
+                let local = sys.path(&file.path);
+                let restored = match previous {
+                    Some(backup) => std::fs::rename(backup, &local),
+                    None => std::fs::remove_file(&local),
+                };
+                if let Err(err) = restored {
+                    not_restored.push(format!("{}: {err}", file.path.display()));
+                }
+            }
+            let names = done
+                .iter()
+                .map(|(file, _)| file.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" and ");
+            Err(if not_restored.is_empty() {
+                format!("{failure}; restored the previous {names}")
+            } else {
+                format!(
+                    "{failure}; could not restore the previous {names} ({})",
+                    not_restored.join(", ")
+                )
+            })
+        }
+    };
+    for file in staged {
+        let _ = remove_if_present(&file.tmp);
+    }
+    result
+}
+
+/// Writes `contents` to the system path atomically unless it is already there.
+/// Returns whether anything changed.
+fn write_file(sys: &dyn System, path: &Path, contents: &[u8], mode: u32) -> Result<bool> {
+    let Some(staged) = stage_file(sys, path, contents, mode)? else {
+        return Ok(false);
+    };
+    commit_staged(sys, std::slice::from_ref(&staged))?;
     Ok(true)
 }
 
@@ -324,25 +444,56 @@ fn install_binaries(
             )
         }
     })?;
-    let mut changed = false;
+    // Nix-built binaries keep loading their loader and libraries from the store.
+    gc_root::check_store_trusted(sys, &[&helper, &exe])?;
     let mut copied = Vec::new();
-    for (source, name) in [(&exe, "puzuz"), (&helper, "puzuz-helper")] {
-        let target = bin_dir.join(name);
-        // Used in place, also under another name of the same directory (/bin and /usr/bin on
-        // merged /usr) — but not through a symlink or a file root does not own.
-        if sys.path(source) == sys.path(&target)
-            || (same_file(sys, source, &target) && root_owned_regular_file(sys, &target))
-        {
-            continue;
+    let mut staged = Vec::new();
+    // Both are written before either is put in place, the helper first: a failure never leaves
+    // a new puzuz next to an old helper (or the other way round).
+    let mut stage = || -> Result<()> {
+        for (source, name) in [(&helper, "puzuz-helper"), (&exe, "puzuz")] {
+            let target = bin_dir.join(name);
+            // Used in place, also under another name of the same directory (/bin and /usr/bin
+            // on merged /usr) — but not through a symlink or a file root does not own.
+            if sys.path(source) == sys.path(&target) {
+                // Run as root from where it is: nobody but root may be able to replace it (nor
+                // what a symlink there points to).
+                check_root_owned_chain(sys, &target).map_err(|err| {
+                    format!(
+                        "{} would be used in place and run as root, but {err}; make it a file \
+                         only root can change",
+                        target.display()
+                    )
+                })?;
+                continue;
+            }
+            if same_file(sys, source, &target) && root_owned_regular_file(sys, &target) {
+                continue;
+            }
+            let bytes = std::fs::read(sys.path(source))
+                .map_err(io_err(format!("reading {}", source.display())))?;
+            if let Some(file) = stage_file(sys, &target, &bytes, 0o755)? {
+                staged.push(file);
+            }
+            copied.push(target);
         }
-        let bytes = std::fs::read(sys.path(source))
-            .map_err(io_err(format!("reading {}", source.display())))?;
-        if write_file(sys, &target, &bytes, 0o755)? {
-            writeln!(out, "installed {}", target.display()).ok();
-            changed = true;
+        Ok(())
+    };
+    if let Err(err) = stage() {
+        for file in &staged {
+            let _ = remove_if_present(&file.tmp);
         }
-        copied.push(target);
+        return Err(format!(
+            "{err}; the binaries in {} were not changed",
+            bin_dir.display()
+        ));
     }
+    commit_staged(sys, &staged)?;
+    for file in &staged {
+        writeln!(out, "installed {}", file.path.display()).ok();
+    }
+    let changed = !staged.is_empty();
+    copied.sort();
     Ok(Binaries {
         bin_dir,
         changed,
@@ -962,27 +1113,7 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
     }
 
     if options.purge {
-        let mounts = mount_points(sys);
-        for dir in PURGE_DIRS {
-            let path = Path::new(dir);
-            if sys.path(path).symlink_metadata().is_err() {
-                continue;
-            }
-            let purged = remove_tree(sys, path, &mounts)?;
-            for skipped in &purged.kept_mounts {
-                writeln!(
-                    out,
-                    "kept {} (a mount point; unmount it and delete it by hand)",
-                    skipped.display()
-                )
-                .ok();
-            }
-            if purged.removed {
-                writeln!(out, "removed {dir}").ok();
-            } else if purged.is_mount {
-                writeln!(out, "kept {dir} (a mount point; deleted what was in it)").ok();
-            }
-        }
+        purge(sys, &remove_dir, out)?;
         writeln!(
             out,
             "The system user puzuz and the group {ADMIN_GROUP} are kept."
@@ -995,6 +1126,52 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
              `sudo puzuz uninstall --purge` deletes them."
         )
         .ok();
+    }
+    Ok(())
+}
+
+/// Removes an empty directory: `name` in the directory `parent`.
+type RemoveDir<'a> = dyn Fn(&std::os::fd::OwnedFd, &std::ffi::OsStr) -> nix::Result<()> + 'a;
+
+/// [`RemoveDir`] with `unlinkat(AT_REMOVEDIR)`.
+fn remove_dir(parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> nix::Result<()> {
+    nix::unistd::unlinkat(parent, name, nix::unistd::UnlinkatFlags::RemoveDir)
+}
+
+/// Deletes [`PURGE_DIRS`] with [`remove_tree`], reporting what is kept. What cannot be deleted
+/// below a purge directory (a mount point, or a directory a user keeps adding files to) is
+/// reported and the rest is still deleted.
+fn purge(sys: &dyn System, remove_dir: &RemoveDir<'_>, out: &mut dyn Write) -> Result<()> {
+    let mounts = mount_points(sys);
+    for dir in PURGE_DIRS {
+        let path = Path::new(dir);
+        if sys.path(path).symlink_metadata().is_err() {
+            continue;
+        }
+        let purged = remove_tree(sys, path, &mounts, remove_dir)?;
+        for skipped in &purged.kept_mounts {
+            writeln!(
+                out,
+                "kept {} (a mount point; unmount it and delete it by hand)",
+                skipped.display()
+            )
+            .ok();
+        }
+        for skipped in &purged.kept_not_empty {
+            writeln!(
+                out,
+                "kept {} (files were added to it while it was deleted; delete it by hand)",
+                skipped.display()
+            )
+            .ok();
+        }
+        if purged.removed {
+            writeln!(out, "removed {dir}").ok();
+        } else if purged.is_mount {
+            writeln!(out, "kept {dir} (a mount point; deleted what was in it)").ok();
+        } else {
+            writeln!(out, "kept {dir} (deleted what could be deleted; see above)").ok();
+        }
     }
     Ok(())
 }
@@ -1041,6 +1218,9 @@ struct Purged {
     kept_mounts: Vec<PathBuf>,
     /// The directory itself is a mount point: its contents were deleted, the directory kept.
     is_mount: bool,
+    /// Directories below it that were not empty any more when they were to be removed (system
+    /// paths).
+    kept_not_empty: Vec<PathBuf>,
 }
 
 /// Deletes the system path `path` recursively without following symlinks and without entering
@@ -1049,7 +1229,13 @@ struct Purged {
 /// Users own directories inside the purged trees (`/var/lib/puzuz/logs/<uid>/`), so the walk
 /// works on directory file descriptors (`openat(O_NOFOLLOW)`, `unlinkat`), never on path names
 /// that could be swapped for a symlink between a check and its use (CVE-2022-21658).
-fn remove_tree(sys: &dyn System, path: &Path, mounts: &BTreeSet<PathBuf>) -> Result<Purged> {
+/// `remove_dir` removes the emptied directories.
+fn remove_tree(
+    sys: &dyn System,
+    path: &Path,
+    mounts: &BTreeSet<PathBuf>,
+    remove_dir: &RemoveDir<'_>,
+) -> Result<Purged> {
     use nix::fcntl::{OFlag, open};
     use nix::sys::stat::Mode;
 
@@ -1073,18 +1259,20 @@ fn remove_tree(sys: &dyn System, path: &Path, mounts: &BTreeSet<PathBuf>) -> Res
         name,
         path,
         parent_dev,
+        remove_dir,
     };
     purged.removed = remove_entry(&at, mounts, true, &mut purged)?;
     Ok(purged)
 }
 
 /// An entry [`remove_entry`] removes: `name` in the directory `parent` (on the device
-/// `parent_dev`), the system path `path`.
+/// `parent_dev`), the system path `path`; directories are removed with `remove_dir`.
 struct Location<'a> {
     parent: &'a std::os::fd::OwnedFd,
     name: &'a std::ffi::OsStr,
     path: &'a Path,
     parent_dev: u64,
+    remove_dir: &'a RemoveDir<'a>,
 }
 
 /// Removes the entry; returns whether it is gone. `top` is the purge directory itself, which
@@ -1149,13 +1337,22 @@ fn remove_entry(
             name,
             path: &path.join(name),
             parent_dev: dev,
+            remove_dir: at.remove_dir,
         };
         empty &= remove_entry(&child, mounts, false, purged)?;
     }
     drop(dir);
     if empty && !is_mount {
-        unlinkat(at.parent, at.name, UnlinkatFlags::RemoveDir).map_err(removing)?;
-        return Ok(true);
+        return match (at.remove_dir)(at.parent, at.name) {
+            Ok(()) => Ok(true),
+            // A user added a file to their directory (`/var/lib/puzuz/logs/<uid>/`) since it
+            // was listed: it is kept, like a mount point, and the purge goes on.
+            Err(Errno::ENOTEMPTY | Errno::EEXIST) if !top => {
+                purged.kept_not_empty.push(path.to_owned());
+                Ok(false)
+            }
+            Err(err) => Err(removing(err)),
+        };
     }
     Ok(false)
 }

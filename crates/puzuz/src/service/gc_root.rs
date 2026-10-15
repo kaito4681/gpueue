@@ -7,7 +7,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use super::receipt::{BINARIES, RECEIPT_PATH};
-use crate::system::{System, run_checked};
+use crate::system::{Program, System, check_root_owned_chain, find_runnable_program, run_checked};
 
 pub const NIX_STORE: &str = "/nix/store";
 /// The garbage-collector root `service install` registers for binaries from the Nix store.
@@ -64,15 +64,44 @@ pub fn elf_interpreter(file: &std::fs::File) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf8(path[..end].to_vec()).ok()?))
 }
 
+/// The dynamic loader of the binary at the system path `binary` if it is in the Nix store.
+fn store_interpreter(sys: &dyn System, binary: &Path) -> Option<PathBuf> {
+    std::fs::File::open(sys.path(binary))
+        .ok()
+        .and_then(|file| elf_interpreter(&file))
+        .filter(|interp| interp.starts_with(NIX_STORE))
+}
+
 /// Whether the binaries in `bin_dir` load their dynamic loader from the Nix store (they are
 /// built with Nix, wherever they were copied to).
 pub fn binaries_need_store(sys: &dyn System, bin_dir: &Path) -> bool {
-    BINARIES.iter().any(|name| {
-        std::fs::File::open(sys.path(&bin_dir.join(name)))
-            .ok()
-            .and_then(|file| elf_interpreter(&file))
-            .is_some_and(|interp| interp.starts_with(NIX_STORE))
-    })
+    BINARIES
+        .iter()
+        .any(|name| store_interpreter(sys, &bin_dir.join(name)).is_some())
+}
+
+/// Refuses binaries (system paths) that load their dynamic loader and libraries from a Nix
+/// store someone other than root can change: puzuz-helper runs them as root. The loader and
+/// every directory above it must pass [`check_root_owned_chain`], which accepts a
+/// group-writable `/nix/store` only when it is sticky and its group is `nixbld` (a multi-user
+/// Nix installation); a single-user installation's store belongs to that user.
+pub fn check_store_trusted(sys: &dyn System, binaries: &[&Path]) -> Result<(), String> {
+    for binary in binaries {
+        let Some(interp) = store_interpreter(sys, binary) else {
+            continue;
+        };
+        check_root_owned_chain(sys, &interp).map_err(|err| {
+            format!(
+                "{} loads its dynamic loader {} and its libraries from {NIX_STORE}, and \
+                 puzuz-helper would run as root with them, but {err}. Install binaries built by \
+                 a multi-user Nix installation (whose {NIX_STORE} only root can change), or a \
+                 release tarball",
+                binary.display(),
+                interp.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn manual_command(store_path: &str) -> String {
@@ -82,25 +111,43 @@ fn manual_command(store_path: &str) -> String {
 /// Registers [`GC_ROOT`] for `store_path` with `nix-store`. Returns whether it worked; a failure
 /// is only a warning.
 fn add_gc_root(sys: &dyn System, store_path: &Path, out: &mut dyn Write) -> bool {
-    let program = crate::system::find_program(sys, Path::new("nix-store")).or_else(|| {
-        NIX_STORE_BINARIES
-            .iter()
-            .map(PathBuf::from)
-            .find(|path| sys.path(path).is_file())
-    });
     let store_path_text = store_path.to_string_lossy();
     let manual = format!(
         "register it yourself so that garbage collection keeps what the binaries use: {}",
         manual_command(&store_path_text)
     );
-    let Some(program) = program else {
-        writeln!(
-            out,
-            "warning: nix-store not found; the binaries come from {store_path_text} but no GC \
-             root was registered; {manual}"
-        )
-        .ok();
-        return false;
+    // Run as root: only a nix-store nobody else can replace.
+    let candidates: Vec<Program> = std::iter::once(Path::new("nix-store"))
+        .chain(NIX_STORE_BINARIES.iter().map(Path::new))
+        .map(|candidate| find_runnable_program(sys, candidate))
+        .filter(|program| !matches!(program, Program::Missing))
+        .collect();
+    let found = candidates
+        .iter()
+        .find(|program| matches!(program, Program::Found(_)))
+        .or(candidates.first())
+        .cloned();
+    let program = match found {
+        Some(Program::Found(program)) => program,
+        Some(Program::Untrusted { path, reason }) => {
+            writeln!(
+                out,
+                "warning: did not run {} as root: {reason}; the binaries come from \
+                 {store_path_text} but no GC root was registered; {manual}",
+                path.display()
+            )
+            .ok();
+            return false;
+        }
+        Some(Program::Missing) | None => {
+            writeln!(
+                out,
+                "warning: nix-store not found; the binaries come from {store_path_text} but no \
+                 GC root was registered; {manual}"
+            )
+            .ok();
+            return false;
+        }
     };
     match run_checked(
         sys,

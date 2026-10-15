@@ -745,7 +745,8 @@ sudo target/release/puzuz service install
 
 1. 重新安装或更新时，使用当前 `service install` 安装所在的目录；
 2. 否则，如果 `puzuz` 二进制文件所在目录是 `/usr/bin` 或 `/usr/local/bin`，则使用该目录
-   （就地使用，不复制任何文件）；
+   （就地使用，不复制任何文件；此时两个二进制文件以及其中符号链接解析经过的所有路径都必须
+   归 root 所有，且组和其他用户不可写）；
 3. 否则使用 `/usr/local/bin`，并将 `puzuz` 和 `puzuz-helper` 复制到那里（会给出提示）。这是
    管理员自行安装软件的常用位置：包管理器不会触碰它，而且它在 systemd 和所有用户的默认
    `PATH` 中。
@@ -764,8 +765,12 @@ sudo target/release/puzuz service install
 在 NixOS 以外用 Nix 构建时（`nix build`，然后 `sudo ./result/bin/puzuz service install`），二进制
 文件会像其他构建一样被复制到 `/usr/local/bin`。它们仍从 Nix store 加载库，因此安装时还会把该
 store 路径注册为垃圾回收根 `/nix/var/nix/gcroots/puzuz`（通过 `nix-store --add-root /nix/var/nix/gcroots/puzuz --realise
-<store path>`）。如果找不到 `nix-store` 或它执行失败，安装会发出警告并打印该命令，之前记录的
-根会被保留。是否仍需要该根，是根据已安装的二进制文件本身判断的（其动态加载器位于
+<store path>`）。只会运行除 root 外无人能替换的 `nix-store`（root 的 `PATH` 中的那个，否则为
+`/nix/var/nix/profiles/default/bin/nix-store` 或 `/run/current-system/sw/bin/nix-store`）。如果找不到
+`nix-store` 或它执行失败，安装会发出警告并打印该命令，之前记录的根会被保留。由于 helper 以 root
+身份使用该加载器和这些库运行，安装会拒绝其加载器位于他人可修改的 store 中的二进制文件：加载器及其
+上方的每个目录都必须归 root 所有，且组和其他用户不可写；`/nix/store` 本身例外，当它设置了粘滞位且
+所属组为 `nixbld` 时（多用户 Nix 安装）可以组可写（单用户安装的 store 属于该用户）。是否仍需要该根，是根据已安装的二进制文件本身判断的（其动态加载器位于
 `/nix/store` 中），因此用 `--bin-dir` 移动 Nix 构建的副本时它会被保留。`puzuz uninstall` 会删除
 该根，安装不使用 store 的二进制文件（例如 `puzuz update`）也会删除它。
 
@@ -1561,8 +1566,9 @@ sudo puzuz update --version 0.2.0 --yes
 1. 检查 puzuz 是否由 `puzuz service install` 安装（而不是由软件包、Nix 或手工安装，且两个单元都
    属于它：以其他方式安装的 helper 单元会在下载任何内容之前被拒绝，缺失的 helper 单元由安装写入），
    以及它是否作为已安装的二进制文件运行（`puzuz.service` 的 `ExecStart=` 中的目录），
-2. 查找最新的发布版本（或 `--version` 指定的版本）并与自身版本比较。已是最新时什么也不做。
-   只有通过 `--version` 明确指定时才会安装较旧的版本，
+2. 查找最新的发布版本（或 `--version` 指定的版本）并与自身版本比较。已是最新时什么也不做，
+   除非已安装的 `puzuz-helper` 缺失或报告的是另一个版本（之前的更新被中断）：此时会重新安装该
+   发布版本以修复这对二进制文件。只有通过 `--version` 明确指定时才会安装较旧的版本，
 3. 请求确认（`-y/--yes` 跳过确认），
 4. 将 tarball、`.sha256` 和 `.minisig` 下载到 `/var/lib/puzuz/update`（root，0700），用 `puzuz`
    内置的发布密钥验证 minisign 签名，并校验校验和，
@@ -1570,14 +1576,16 @@ sudo puzuz update --version 0.2.0 --yes
    打开守护进程数据库的发布版本（模式变更之前的旧版本）会在任何更改之前被拒绝，
 6. 针对已安装的目录运行新的 `puzuz service install`，删除 Nix 构建安装的 Nix GC 根（发布版本的
    二进制文件不需要 store），等待守护进程运行新版本并连接到 helper，然后删除下载的文件。如果
-   `service install` 失败，`puzuz update` 会检查已安装的二进制文件：若它们不是该发布版本的文件，
-   就以该错误停止；若是（只有最后的检查失败），就发出警告并继续。
+   `service install` 失败，`puzuz update` 会逐个检查已安装的二进制文件：若两者都不是该发布版本的
+   文件，就以该错误停止；若只有一个是，就停止并提示再运行一次（再次运行会修复这对二进制文件）；
+   若两者都是（只有最后的检查失败），就发出警告并继续。
 
 `install.sh`（再次运行，可选 `--version`）同样可用，效果相同；它用 `PATH` 中的 `minisign` 验证签名，
 或者下载一个固定版本的 minisign（参见[运行安装程序](#running-the-installer)）。
 
 `service install`（因此上述两种方式都是）会替换二进制文件和单元，并在有任何变化时重启两个
-服务。配置文件会被保留。
+服务。它先写入两个二进制文件，再从 helper 开始依次放到位；如果其中一个无法放到位，另一个会被
+恢复，因此失败（例如磁盘已满）时绝不会留下新的 `puzuz` 与旧的 `puzuz-helper` 并存。配置文件会被保留。
 
 - **正在运行的作业不受影响。** 它们运行在各自的 systemd 单元中（`puzuz-job-<id>.service`，恢复
   后为 `puzuz-job-<id>-r<n>.service`）。新的守护进程从数据库中读取状态，新的 helper 会重新找到
@@ -1630,7 +1638,8 @@ sudo puzuz uninstall --purge    # also delete /etc/puzuz, /var/lib/puzuz, /run/p
   `sudo systemctl stop 'puzuz-job-*'` 停止它们，或在卸载前为它们创建检查点或终止它们。
 - `--purge` 会请求确认（`-y/--yes` 跳过确认）。它不会进入挂载点（例如 `/run/puzuz-helper` 下
   `/` 的绑定挂载）。这些挂载点会被报告，由你手工卸载并删除。本身就是挂载点的待删除目录（例如位于
-  独立文件系统上的 `/var/lib/puzuz`）会被清空并保留。删除过程从不跟随符号链接（包括用户放在自己
+  独立文件系统上的 `/var/lib/puzuz`）会被清空并保留。在要删除时已不再为空的目录（仍有进程在写入的
+  用户日志目录）同样会被保留并报告，其他目录仍会被删除。删除过程从不跟随符号链接（包括用户放在自己
   日志目录中的符号链接）。
 - 系统用户 `puzuz` 和组 `puzuz-admin` 始终会被保留。
 
