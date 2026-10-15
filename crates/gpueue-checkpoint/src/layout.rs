@@ -366,13 +366,40 @@ impl CheckpointDir {
 
     /// Delete the checkpoint. The marker goes first so that a crash during
     /// removal leaves an incomplete directory, never a "complete" partial one.
+    /// The restore log and pidfile go last, so that a removal that stops
+    /// half-way still shows that a job was restored from the image (which
+    /// makes the rest of it safe to remove later).
     pub fn remove(&self) -> io::Result<()> {
+        self.remove_with(|path| {
+            if fs::symlink_metadata(path)?.is_dir() {
+                fs::remove_dir_all(path)
+            } else {
+                fs::remove_file(path)
+            }
+        })
+    }
+
+    /// [`Self::remove`], deleting each entry of the directory with
+    /// `remove_entry`.
+    fn remove_with(&self, mut remove_entry: impl FnMut(&Path) -> io::Result<()>) -> io::Result<()> {
         if !self.root.exists() {
             return Ok(());
         }
         remove_if_exists(&self.marker_path())?;
         fsync_dir(&self.root)?;
-        fs::remove_dir_all(&self.root)
+        let last = [self.restore_log(), self.restore_pidfile()];
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if !last.contains(&path) {
+                remove_entry(&path)?;
+            }
+        }
+        for path in &last {
+            if fs::symlink_metadata(path).is_ok() {
+                remove_entry(path)?;
+            }
+        }
+        fs::remove_dir(&self.root)
     }
 }
 
@@ -648,6 +675,50 @@ mod tests {
         d.remove().unwrap();
         assert_eq!(d.status(), DirStatus::Missing);
         d.remove().unwrap();
+    }
+
+    /// A removal that stops half-way (here at `images/`, whatever order the
+    /// directory lists its entries in) keeps the restore log and pidfile,
+    /// which show that a job was restored from the image; they go last.
+    #[test]
+    fn a_removal_that_stops_half_way_keeps_the_restore_evidence() {
+        let tmp = TempDir::new();
+        let d = CheckpointDir::for_job(tmp.path(), 3);
+        d.prepare().unwrap();
+        fake_dump(&d);
+        d.finalize(meta(3)).unwrap();
+        fs::write(d.restore_log(), "(00.1) Restore finished successfully\n").unwrap();
+        fs::write(d.restore_pidfile(), "10001\n").unwrap();
+
+        let images = d.images_dir();
+        let mut removed = Vec::new();
+        let err = d
+            .remove_with(|path| {
+                if path == images {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+                removed.push(path.to_owned());
+                fs::remove_file(path)
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!d.marker_path().exists());
+        assert!(d.restore_log().exists(), "removed: {removed:?}");
+        assert!(d.restore_pidfile().exists(), "removed: {removed:?}");
+
+        // Once it can be removed, everything goes, the evidence last.
+        let mut order = Vec::new();
+        d.remove_with(|path| {
+            order.push(path.file_name().unwrap().to_owned());
+            if fs::symlink_metadata(path)?.is_dir() {
+                fs::remove_dir_all(path)
+            } else {
+                fs::remove_file(path)
+            }
+        })
+        .unwrap();
+        assert_eq!(d.status(), DirStatus::Missing);
+        assert_eq!(order[order.len() - 2..], [RESTORE_LOG, RESTORE_PIDFILE]);
     }
 
     #[test]
