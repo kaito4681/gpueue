@@ -662,6 +662,9 @@ pub fn run(sys: &dyn System, socket: Option<&Path>) -> Report {
         HELPER_UNIT,
     ));
     checks.extend(check_daemon(&daemon));
+    if let Some(check) = check_helper_programs(sys, &config, &daemon) {
+        checks.push(check);
+    }
     let storage = daemon.as_ref().ok().and_then(|v| v.checkpoints.as_ref());
     checks.push(check_checkpoint_dir(sys, &config, storage, nixos));
     if let Some(storage) = storage {
@@ -1597,6 +1600,45 @@ fn check_socket(sys: &dyn System, name: &'static str, path: &Path, unit: &str) -
         Err(err) => Check::fail(name, format!("{}: {err}", path.display()))
             .hint(format!("sudo systemctl start {unit}")),
     }
+}
+
+/// The helper looks the programs it runs up once, when it starts: one installed later (the
+/// checks above find it) stays unavailable to it until it is restarted. Programs that are still
+/// missing are reported by their own checks.
+fn check_helper_programs(
+    sys: &dyn System,
+    config: &Config,
+    daemon: &Result<VersionResponse, String>,
+) -> Option<Check> {
+    let helper = &daemon.as_ref().ok()?.helper;
+    let installed: Vec<&str> = helper
+        .missing_programs
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            let configured = match *name {
+                "criu" => &config.criu_path,
+                "cuda-checkpoint" => &config.cuda_checkpoint_path,
+                "nvidia-smi" => &config.nvidia_smi_path,
+                _ => return false,
+            };
+            !matches!(find_runnable_program(sys, configured), Program::Missing)
+        })
+        .collect();
+    if !helper.connected || installed.is_empty() {
+        return None;
+    }
+    Some(
+        Check::warn(
+            "helper programs",
+            format!(
+                "{} was installed after the helper started; the helper cannot use it until it is \
+                 restarted",
+                installed.join(", ")
+            ),
+        )
+        .hint(format!("sudo systemctl restart {HELPER_UNIT}")),
+    )
 }
 
 fn check_daemon(daemon: &Result<VersionResponse, String>) -> Vec<Check> {

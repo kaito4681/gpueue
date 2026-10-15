@@ -79,6 +79,8 @@ pub enum HelperNotice {
 pub struct HelperState {
     pub connected: bool,
     pub version: Option<String>,
+    /// See [`gpueue_protocol::helper::Hello::missing_programs`].
+    pub missing_programs: Vec<String>,
 }
 
 pub type HelperResult<T> = Result<T, HelperError>;

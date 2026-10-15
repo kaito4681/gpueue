@@ -108,6 +108,11 @@ pub enum HelperMessage {
 pub struct Hello {
     pub protocol_version: u32,
     pub binary_version: String,
+    /// Helper only: the programs (`criu`, `cuda-checkpoint`, `nvidia-smi`)
+    /// it did not find when it started, and so cannot use until it is
+    /// restarted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_programs: Vec<String>,
 }
 
 impl Hello {
@@ -116,6 +121,7 @@ impl Hello {
         Self {
             protocol_version: PROTOCOL_VERSION,
             binary_version: crate::BINARY_VERSION.to_owned(),
+            missing_programs: Vec::new(),
         }
     }
 

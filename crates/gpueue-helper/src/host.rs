@@ -319,6 +319,16 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     }
 }
 
+/// Whether `/proc/<pid>/maps` contents map an NVIDIA device node
+/// (`/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`, ...).
+pub fn maps_nvidia_device(maps: &str) -> bool {
+    maps.lines().any(|line| {
+        line.split_whitespace()
+            .nth(5)
+            .is_some_and(|path| path.starts_with("/dev/nvidia"))
+    })
+}
+
 /// The real host.
 #[derive(Debug, Clone)]
 pub struct SystemHost {
@@ -595,6 +605,20 @@ impl HostProbe for SystemHost {
     }
 
     fn cuda_pids(&self, host_pids: &[u32]) -> io::Result<Vec<u32>> {
+        // Without it every process would look like one without CUDA, and
+        // CRIU would fail on the NVIDIA device mappings it cannot dump.
+        let tool = &self.cuda_checkpoint.path;
+        if !host_pids.is_empty() && !tool.is_file() {
+            return Err(io::Error::other(
+                if tool.starts_with(crate::config::MISSING_PROGRAM_DIR) {
+                    "the helper did not find cuda-checkpoint when it started (install it and \
+                     restart gpueue-helper)"
+                        .to_owned()
+                } else {
+                    format!("cuda-checkpoint {} is missing", tool.display())
+                },
+            ));
+        }
         let mut out = Vec::new();
         for &pid in host_pids {
             // cuda-checkpoint hangs on stopped/frozen processes.
@@ -609,11 +633,29 @@ impl HostProbe for SystemHost {
             }
             let spec = cuda_get_state(&self.cuda_checkpoint, pid);
             // Processes without CUDA make cuda-checkpoint fail.
-            if let Ok(o) =
-                run_with_timeout(&spec, self.get_state_timeout, Duration::from_millis(20))
-                && probe::parse_cuda_state(&o.stdout).is_some()
-            {
-                out.push(pid);
+            let state = run_with_timeout(&spec, self.get_state_timeout, Duration::from_millis(20));
+            match &state {
+                Ok(o) if probe::parse_cuda_state(&o.stdout).is_some() => out.push(pid),
+                // One that maps an NVIDIA device does use the GPU: CRIU
+                // cannot dump it unless cuda-checkpoint can.
+                _ if fs::read_to_string(self.proc_root.join(pid.to_string()).join("maps"))
+                    .is_ok_and(|maps| maps_nvidia_device(&maps)) =>
+                {
+                    let why = match state {
+                        Ok(o) => o
+                            .stderr
+                            .lines()
+                            .chain(o.stdout.lines())
+                            .next()
+                            .map_or_else(|| "no state".to_owned(), |l| l.trim().to_owned()),
+                        Err(e) => e.to_string(),
+                    };
+                    return Err(io::Error::other(format!(
+                        "process {pid} uses an NVIDIA device but `cuda-checkpoint --get-state` \
+                         does not know its CUDA state: {why}"
+                    )));
+                }
+                _ => {}
             }
         }
         Ok(out)
@@ -1122,6 +1164,50 @@ pub fn parse_stat_ppid(stat: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without cuda-checkpoint a GPU job's dump is refused instead of
+    /// taking every process for one without CUDA.
+    #[test]
+    fn cuda_pids_without_cuda_checkpoint() {
+        let host = |path: &Path| {
+            SystemHost::new(
+                PathBuf::from("nvidia-smi"),
+                CudaCheckpointOptions {
+                    path: path.to_owned(),
+                    ..CudaCheckpointOptions::default()
+                },
+                PathBuf::from("/nonexistent/gpueue-helper"),
+            )
+        };
+        let me = std::process::id();
+        let missing = Path::new(crate::config::MISSING_PROGRAM_DIR).join("cuda-checkpoint");
+        let e = host(&missing).cuda_pids(&[me]).unwrap_err().to_string();
+        assert!(e.contains("restart gpueue-helper"), "{e}");
+        let e = host(Path::new("/nonexistent/cc"))
+            .cuda_pids(&[me])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("/nonexistent/cc is missing"), "{e}");
+        // Nothing to ask about.
+        assert_eq!(host(&missing).cuda_pids(&[]).unwrap(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn finds_nvidia_device_mappings() {
+        // What CRIU failed on when cuda-checkpoint had not run.
+        let cuda = "\
+55d0c0a00000-55d0c0a01000 r--p 00000000 103:02 1234   /home/u/check
+200200000-200400000 rw-s 00000000 00:07 1046                             /dev/nvidia0
+7ffd1000-7ffd2000 rw-p 00000000 00:00 0                                  [stack]
+";
+        assert!(maps_nvidia_device(cuda));
+        let plain = "\
+55d0c0a00000-55d0c0a01000 r--p 00000000 103:02 1234   /home/u/dev/nvidia-notes
+7ffd1000-7ffd2000 rw-p 00000000 00:00 0                                  [stack]
+7ffd3000-7ffd4000 rw-p 00000000 00:00 0
+";
+        assert!(!maps_nvidia_device(plain));
+    }
 
     #[test]
     fn parses_nvidia_smi() {

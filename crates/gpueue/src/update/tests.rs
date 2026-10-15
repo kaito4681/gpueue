@@ -109,6 +109,7 @@ fn daemon(version: &str, schema: Option<i64>) -> Result<VersionResponse, String>
         helper: HelperStatus {
             connected: true,
             version: Some(version.to_owned()),
+            missing_programs: Vec::new(),
         },
         checkpoints: None,
         gpu_detection: None,

@@ -806,6 +806,32 @@ fn sockets_and_connections() {
 }
 
 #[test]
+fn helper_missing_programs() {
+    let (mut sys, _sockets) = healthy();
+    assert!(run(&sys, None).find("helper programs").is_none());
+
+    // cuda-checkpoint was installed after the helper started; nvidia-smi
+    // is still missing, which its own check reports.
+    let mut version = FakeSystem::daemon_ok(true).unwrap();
+    version.helper.missing_programs = vec!["cuda-checkpoint".to_owned(), "nvidia-smi".to_owned()];
+    sys.daemon = Ok(version);
+    std::fs::remove_file(sys.path(Path::new("/usr/bin/nvidia-smi"))).ok();
+    let report = run(&sys, None);
+    assert_eq!(level(&report, "helper programs"), Level::Warn);
+    assert_eq!(
+        message(&report, "helper programs"),
+        "cuda-checkpoint was installed after the helper started; the helper cannot use it until \
+         it is restarted"
+    );
+    assert!(hint(&report, "helper programs").contains("systemctl restart gpueue-helper"));
+    assert_eq!(level(&report, "cuda-checkpoint"), Level::Ok);
+
+    // Still missing: only its own check.
+    std::fs::remove_file(sys.path(Path::new("/usr/local/bin/cuda-checkpoint"))).unwrap();
+    assert!(run(&sys, None).find("helper programs").is_none());
+}
+
+#[test]
 fn socket_override() {
     let (sys, _sockets) = healthy();
     let report = run(&sys, Some(Path::new("/run/other.sock")));

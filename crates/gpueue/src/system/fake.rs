@@ -170,6 +170,7 @@ impl FakeSystem {
             helper: HelperStatus {
                 connected: helper_connected,
                 version: helper_connected.then(|| gpueue_protocol::BINARY_VERSION.to_owned()),
+                missing_programs: Vec::new(),
             },
             checkpoints: None,
             gpu_detection: None,
