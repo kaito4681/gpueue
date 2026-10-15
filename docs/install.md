@@ -173,9 +173,11 @@ below.
 Each release has, for each target (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`),
 `puzuz-v<X>-<target>.tar.gz` with `.sha256` and `.minisig` files, the packages
 `puzuz_<X>_amd64.deb`, `puzuz_<X>_arm64.deb`, `puzuz-<X>-1.x86_64.rpm` and
-`puzuz-<X>-1.aarch64.rpm` with the same two files each, `install.sh` with `install.sh.minisig`, and,
-when the `.rpm` files are GPG-signed, `RPM-GPG-KEY-puzuz` with `RPM-GPG-KEY-puzuz.minisig`.
-To check a tarball (or a package) yourself:
+`puzuz-<X>-1.aarch64.rpm` with the same two files each, the same packages again under version-less
+names (`puzuz_amd64.deb`, `puzuz_arm64.deb`, `puzuz.x86_64.rpm`, `puzuz.aarch64.rpm`, for
+`releases/latest/download/<name>`) with their own two files each, `install.sh` with
+`install.sh.minisig`, and, when the `.rpm` files are GPG-signed, `RPM-GPG-KEY-puzuz` with
+`RPM-GPG-KEY-puzuz.minisig`. To check a tarball (or a package) yourself:
 
 ```sh
 sha256sum -c puzuz-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
@@ -221,13 +223,58 @@ draft on GitHub, or `install.sh` (which asks for the latest published release) d
 
 ## Installing the Debian/Ubuntu package
 
-Each release has a `.deb` for amd64 and arm64 (`dpkg --print-architecture` tells which), for
-Debian 12 and Ubuntu 22.04, 24.04 and 26.04. Download `puzuz_<version>_<arch>.deb` from the
-release and install it with apt, which also pulls in what it depends on:
+Each release has a `.deb` for amd64 and arm64, for Debian 12 and Ubuntu 22.04, 24.04 and 26.04.
+The stable releases are also in the puzuz APT repository, a flat repository in the GitHub release
+`apt` (`https://github.com/kaito4681/puzuz/releases/download/apt/`, signed with the key in
+`/etc/apt/keyrings/puzuz.gpg`).
+
+**Prerequisites.**
+
+- `curl` and `ca-certificates`, for the commands below (`sudo apt install curl ca-certificates`).
+  `/etc/apt/keyrings` comes with apt on every supported release.
+- systemd 240 or newer as PID 1 (the package depends on it; without systemd as PID 1 the services
+  are only enabled, see below).
+- Optional: CRIU 4.2 or newer for checkpoints (the distribution's is often missing or too old, see
+  [CRIU](#criu)), and for GPU jobs the NVIDIA driver and cuda-checkpoint (see
+  [cuda-checkpoint](#cuda-checkpoint)). Jobs run without them.
+
+**From the APT repository (recommended).** Add the repository and install from it; apt picks the
+newest stable version and the architecture. Use these exact file names and contents (they are what
+the package installs, so the package does not ask about them later):
 
 ```sh
-sudo apt install ./puzuz_0.1.0_amd64.deb
+sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
+sudo apt update && sudo apt install puzuz
 ```
+
+**The `.deb` directly.** Or download the package for this machine's architecture from the latest
+release and install it with apt, which also pulls in what it depends on; the package registers the
+same repository:
+
+```sh
+arch=$(dpkg --print-architecture)
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
+sudo apt install "./puzuz_${arch}.deb"
+```
+
+`releases/latest` is the newest stable release (pre-releases are skipped), and
+`puzuz_<arch>.deb` is a version-less copy of its `puzuz_<version>_<arch>.deb`. The versioned
+files are attached too, for a specific version
+(`https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz_0.1.0_amd64.deb`). To verify
+the download before installing it (see [Verifying a release by hand](#verifying-a-release-by-hand)):
+
+```sh
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb.sha256"
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb.minisig"
+sha256sum -c "puzuz_${arch}.deb.sha256"
+minisign -Vm "puzuz_${arch}.deb" -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+```
+
+The trusted comment names the release and the version-less file
+(`Trusted comment: puzuz v0.1.0 puzuz_amd64.deb`).
 
 The package contains:
 
@@ -258,10 +305,7 @@ the command, `install.sh --uninstall`). Running jobs, `/etc/puzuz` and `/var/lib
 and `puzuz service install-method` report the package's installation as a distribution
 `package`, and `puzuz service install`, `install.sh` and `puzuz update` refuse to touch it.
 
-**Updates.** The package registers the puzuz APT repository, a flat repository in the GitHub
-release `apt` (`https://github.com/kaito4681/puzuz/releases/download/apt/`, signed with the key in
-`/etc/apt/keyrings/puzuz.gpg`). So the `.deb` is installed by hand only once;
-later versions come with the rest of the system:
+**Updates.** Either way, later versions come from the repository with the rest of the system:
 
 ```sh
 sudo apt update && sudo apt upgrade
@@ -274,18 +318,6 @@ versions of each. An upgrade restarts the running services. Running jobs keep ru
 new version's keyring when you have not changed it (that is how a new signing key arrives). While a new release is being uploaded,
 `apt update` may briefly fail with a hash mismatch or a missing file; running it again a minute
 later fixes it.
-
-**Adding the repository by hand.** Instead of installing the first `.deb` from the release page,
-you can add the repository and install from it. Use these exact file names and contents (they are
-what the package installs, so the package does not ask about them later):
-
-```sh
-sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg \
-  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
-sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
-  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
-sudo apt update && sudo apt install puzuz
-```
 
 **The repository key.** The packages, the repository and the `.rpm` files are signed with one
 GPG key (`packaging/apt/puzuz-archive-keyring.gpg` in the source tree), fingerprint
@@ -392,14 +424,29 @@ binaries; `scripts/deb-test.sh` and `scripts/rpm-test.sh` check them in containe
 ## Installing the Fedora/RHEL/Rocky package
 
 Each release has an `.rpm` for x86_64 and aarch64 (`uname -m` tells which), for Fedora and
-RHEL-compatible 9 or newer (RHEL, Rocky Linux, AlmaLinux; glibc 2.34 or newer). Install it with
-dnf, from a downloaded file or straight from the release URL; dnf pulls in what it depends on:
+RHEL-compatible 9 or newer (RHEL, Rocky Linux, AlmaLinux; glibc 2.34 or newer).
+
+**Prerequisites.**
+
+- systemd as PID 1 (the package requires it; without systemd as PID 1 the services are only
+  enabled). dnf downloads the package itself; `curl` (with `ca-certificates`) is needed only to
+  download the files for verifying it.
+- Optional: CRIU 4.2 or newer for checkpoints (see [CRIU](#criu)), and for GPU jobs the NVIDIA
+  driver and cuda-checkpoint (see [cuda-checkpoint](#cuda-checkpoint)). Jobs run without them.
+
+Install the `.rpm` of the latest release with dnf, which takes the URL directly and pulls in what
+it depends on:
 
 ```sh
-sudo dnf install ./puzuz-0.1.0-1.x86_64.rpm
-# or
-sudo dnf install https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz-0.1.0-1.x86_64.rpm
+sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
 ```
+
+As for the `.deb`, `puzuz.<arch>.rpm` is a version-less copy of the newest stable release's
+`puzuz-<version>-1.<arch>.rpm`, which is attached too, for a specific version
+(`sudo dnf install https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz-0.1.0-1.x86_64.rpm`).
+To verify it first, download `puzuz.$(uname -m).rpm` with its `.sha256` and `.minisig` files and check them as for the
+[`.deb`](#installing-the-debianubuntu-package) (the trusted comment names the version-less file),
+then install the checked file with `sudo dnf install "./puzuz.$(uname -m).rpm"`.
 
 (A pre-release such as `v0.2.0-rc.1` is `puzuz-0.2.0-rc.1-1.<arch>.rpm`; inside the package its
 version is `0.2.0~rc.1`, which sorts before `0.2.0`.)
@@ -436,12 +483,12 @@ sudo dnf install --setopt=localpkg_gpgcheck=1 ./puzuz-0.1.0-1.x86_64.rpm
 versions. Install the newer `.rpm` of the release instead; dnf takes the URL directly:
 
 ```sh
-sudo dnf upgrade https://github.com/kaito4681/puzuz/releases/download/v<new version>/puzuz-<new version>-1.x86_64.rpm
+sudo dnf upgrade "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
 ```
 
 When a newer release exists, the "update" line of `puzuz doctor` (and `puzuz update --check`)
-prints this command with the release's URL for the machine's architecture, and how to check the
-signature first. An upgrade restarts the running services. Running jobs keep running.
+prints such a command with the release's versioned URL for the machine's architecture, and how to
+check the signature first. An upgrade restarts the running services. Running jobs keep running.
 
 **Removing.**
 

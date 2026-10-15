@@ -69,26 +69,41 @@ curl -fsSL https://github.com/kaito4681/puzuz/releases/latest/download/install.s
 `sudo puzuz uninstall` 卸载，数据会被保留（加上 `--purge` 则一并删除）。不需要 GitHub token（如果设置了
 `GH_TOKEN` 则会使用它；它只用于提高 API 速率限制）。
 
-在 Debian 和 Ubuntu（amd64 或 arm64）上，也可以改为安装发布版本中的软件包：
+在 Debian 和 Ubuntu（amd64 或 arm64）上，也可以改为从 puzuz 的 APT 仓库（位于 GitHub Release `apt` 中）
+安装软件包；这需要 `curl` 和 `ca-certificates`，最新的稳定版本和架构由 apt 自动选择：
 
 ```sh
-sudo apt install ./puzuz_<version>_amd64.deb     # or _arm64.deb
+sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
+sudo apt update && sudo apt install puzuz
 ```
 
-它会安装并启动相同的服务，并推荐安装 `criu`。它还会注册 puzuz 的 APT 仓库（位于 GitHub Release `apt` 中），
-因此只需手动安装一次 `.deb`：之后的版本通过 `sudo apt update && sudo apt upgrade` 获取。
-`sudo apt remove puzuz` 会停止服务；`sudo apt purge puzuz` 还会删除 /etc/puzuz。两者都会保留 /var/lib/puzuz
-和运行中的作业。
+或者直接安装最新发布版本的 `.deb`（它会注册同一个仓库）：
+
+```sh
+arch=$(dpkg --print-architecture)
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
+sudo apt install "./puzuz_${arch}.deb"
+```
+
+它会安装并启动相同的服务，并推荐安装 `criu`（前提条件参见
+[docs/zh-CN/install.md](docs/zh-CN/install.md#installing-the-debianubuntu-package)）。无论哪种方式，之后的版本
+都通过 `sudo apt update && sudo apt upgrade` 获取。`sudo apt remove puzuz` 会停止服务；`sudo apt purge puzuz`
+还会删除 /etc/puzuz。两者都会保留 /var/lib/puzuz 和运行中的作业。
 
 在 Fedora、RHEL、Rocky 和 Alma Linux 9+（x86_64 或 aarch64）上，安装发布版本中的 .rpm
-（文件或其 URL 均可）：
+（dnf 可以直接接受 URL）：
 
 ```sh
-sudo dnf install ./puzuz-<version>-1.x86_64.rpm   # or -1.aarch64.rpm, or the release URL
+sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
 ```
 
-目前还没有 dnf 仓库（已在计划中，issue #23）：更新时用 `sudo dnf upgrade <its URL>` 安装较新发布版本的
-.rpm。`sudo dnf remove puzuz` 会停止服务，并保留 /var/lib/puzuz 和运行中的作业。它推荐安装 `criu`；
+这些 URL 始终指向最新的稳定发布版本（`releases/latest` 会跳过预发布版本）；带版本号的文件
+（`puzuz_<version>_<arch>.deb`、`puzuz-<version>-1.<arch>.rpm`）也一并附带，用于安装特定版本。
+每个文件都有 `.sha256` 和 `.minisig` 文件（参见
+[手动验证发布版本](docs/zh-CN/install.md#verifying-a-release-by-hand)）。
+
+目前还没有 dnf 仓库（已在计划中，issue #23）：更新时用 `sudo dnf upgrade` 运行同一条命令。`sudo dnf remove puzuz` 会停止服务，并保留 /var/lib/puzuz 和运行中的作业。它推荐安装 `criu`；
 Fedora 的版本足够新，而 Rocky/RHEL 9 只提供 3.19，因此在那里创建检查点需要更新的 CRIU（没有它作业也能运行）。
 你也可以从源码构建，或使用 Nix flake（参见 [docs/zh-CN/install.md](docs/zh-CN/install.md)）。
 

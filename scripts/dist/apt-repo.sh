@@ -404,16 +404,18 @@ cmd_github() {
 
     # The release's packages, checked like a user would check them, with the
     # minisign key of the tag's commit (a re-run for an older tag may come
-    # from a newer default branch).
+    # from a newer default branch). Only the versioned puzuz_<version>_<arch>.deb
+    # files: the version-less copies puzuz_<arch>.deb (for
+    # releases/latest/download) are the same packages.
     gh api -H "Accept: application/vnd.github.raw" \
         "repos/$repo/contents/packaging/minisign.pub?ref=$tag" >"$work/minisign.pub" ||
         die "cannot read packaging/minisign.pub at $tag"
     gh release download "$tag" -R "$repo" -D "$work/new" \
-        -p 'puzuz_*.deb' -p 'puzuz_*.deb.sha256' -p 'puzuz_*.deb.minisig'
+        -p 'puzuz_*_*.deb' -p 'puzuz_*_*.deb.sha256' -p 'puzuz_*_*.deb.minisig'
     local minisign="${MINISIGN:-}" deb new=()
     [ -n "$minisign" ] || minisign="$("$root/scripts/dist/get-minisign.sh" "$work/minisign")"
     shopt -s nullglob
-    for deb in "$work/new"/puzuz_*.deb; do
+    for deb in "$work/new"/puzuz_*_*.deb; do
         (cd "$work/new" && sha256sum --quiet -c "$(basename "$deb").sha256") || die "$(basename "$deb"): checksum mismatch"
         "$minisign" -Vq -p "$work/minisign.pub" -m "$deb" || die "$(basename "$deb"): bad signature"
         new+=("$deb")

@@ -166,6 +166,8 @@ Alma Linux 上可以改用 [.rpm](#installing-the-fedorarhelrocky-package)，在
 每个发布版本针对每个目标（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`）都包含
 `puzuz-v<X>-<target>.tar.gz` 及其 `.sha256` 和 `.minisig` 文件；软件包 `puzuz_<X>_amd64.deb`、
 `puzuz_<X>_arm64.deb`、`puzuz-<X>-1.x86_64.rpm` 和 `puzuz-<X>-1.aarch64.rpm` 也各自带有这两种文件；
+同样的软件包还以不带版本号的名称再附带一份（`puzuz_amd64.deb`、`puzuz_arm64.deb`、`puzuz.x86_64.rpm`、
+`puzuz.aarch64.rpm`，供 `releases/latest/download/<name>` 使用），各自带有自己的这两种文件；
 另外还有 `install.sh` 及其 `install.sh.minisig`；`.rpm` 经过 GPG 签名的发布版本还带有 `RPM-GPG-KEY-puzuz`
 及其 `RPM-GPG-KEY-puzuz.minisig`。要自己校验 tarball（或软件包）：
 
@@ -211,13 +213,52 @@ git commit packaging/minisign.pub scripts/install.sh
 <a id="installing-the-debianubuntu-package"></a>
 ## 安装 Debian/Ubuntu 软件包
 
-每个发布版本都包含面向 amd64 和 arm64 的 `.deb`（可用 `dpkg --print-architecture` 查看架构），适用于
-Debian 12 以及 Ubuntu 22.04、24.04 和 26.04。从发布版本下载 `puzuz_<version>_<arch>.deb`，并用 apt
-安装，apt 会同时拉取其依赖：
+每个发布版本都包含面向 amd64 和 arm64 的 `.deb`，适用于 Debian 12 以及 Ubuntu 22.04、24.04 和 26.04。
+稳定发布版本也收录在 puzuz APT 仓库中，这是位于 GitHub Release `apt`
+（`https://github.com/kaito4681/puzuz/releases/download/apt/`，使用 `/etc/apt/keyrings/puzuz.gpg` 中的密钥签名）中的一个扁平仓库。
+
+**前提条件。**
+
+- 下面的命令需要 `curl` 和 `ca-certificates`（`sudo apt install curl ca-certificates`）。
+  `/etc/apt/keyrings` 在所有受支持的发行版上都由 apt 提供。
+- 以 systemd 240 或更高版本作为 PID 1（软件包依赖它；当 systemd 不是 PID 1 时只启用服务，见下文）。
+- 可选：用于检查点的 CRIU 4.2 或更高版本（发行版自带的往往缺失或过旧，参见 [CRIU](#criu)），以及用于 GPU
+  作业的 NVIDIA 驱动和 cuda-checkpoint（参见 [cuda-checkpoint](#cuda-checkpoint)）。没有它们也可以运行作业。
+
+**从 APT 仓库安装（推荐）。** 添加仓库并从中安装；最新的稳定版本和架构由 apt 自动选择。请使用以下完全一致的
+文件名和内容（它们与软件包安装的文件相同，因此软件包之后不会再就这些文件进行询问）：
 
 ```sh
-sudo apt install ./puzuz_0.1.0_amd64.deb
+sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
+sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
+  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
+sudo apt update && sudo apt install puzuz
 ```
+
+**直接安装 `.deb`。** 或者从最新发布版本下载适合本机架构的软件包，并用 apt 安装；apt 会同时拉取其依赖，
+软件包会注册同一个仓库：
+
+```sh
+arch=$(dpkg --print-architecture)
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb"
+sudo apt install "./puzuz_${arch}.deb"
+```
+
+`releases/latest` 是最新的稳定发布版本（会跳过预发布版本），`puzuz_<arch>.deb` 是其
+`puzuz_<version>_<arch>.deb` 的不带版本号的副本。带版本号的文件也一并附带，用于安装特定版本
+（`https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz_0.1.0_amd64.deb`）。要在安装前校验下载的文件（参见
+[手动验证发布版本](#verifying-a-release-by-hand)）：
+
+```sh
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb.sha256"
+curl -fLO "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz_${arch}.deb.minisig"
+sha256sum -c "puzuz_${arch}.deb.sha256"
+minisign -Vm "puzuz_${arch}.deb" -P RWTK4z+6DPjoIfzjkZTIwZtbHzgq04ifrQnzaIhduY425VWh0CcyUKsv
+```
+
+受信任注释（trusted comment）写明了发布版本和不带版本号的文件名
+（`Trusted comment: puzuz v0.1.0 puzuz_amd64.deb`）。
 
 软件包包含：
 
@@ -247,9 +288,7 @@ sudo apt install ./puzuz_0.1.0_amd64.deb
 会将该软件包的安装报告为发行版 `package`，而 `puzuz service install`、`install.sh` 和 `puzuz update`
 会拒绝改动它。
 
-**更新。** 软件包会注册 puzuz APT 仓库，这是位于 GitHub Release `apt` 中的一个扁平仓库
-（`https://github.com/kaito4681/puzuz/releases/download/apt/`，使用 `/etc/apt/keyrings/puzuz.gpg`
-中的密钥签名）。因此 `.deb` 只需手动安装一次；之后的版本会随系统的其他部分一起到来：
+**更新。** 无论哪种方式，之后的版本都会与系统的其他部分一起从仓库获取：
 
 ```sh
 sudo apt update && sudo apt upgrade
@@ -260,17 +299,6 @@ sudo apt update && sudo apt upgrade
 `/etc/puzuz/config.toml` 和 `/etc/apt/sources.list.d/puzuz.sources` 的修改会被保留；如果你没有改动
 `/etc/apt/keyrings/puzuz.gpg`，它会被新版本的密钥环替换（新的签名密钥就是这样分发的）。在新发布版本上传期间，
 `apt update` 可能会短暂地因哈希不匹配或文件缺失而失败；一分钟后再运行一次即可解决。
-
-**手动添加仓库。** 除了从发布页面安装第一个 `.deb` 之外，也可以先添加仓库再从中安装。请使用以下完全一致的
-文件名和内容（它们正是软件包所安装的内容，因此软件包以后不会再就它们进行询问）：
-
-```sh
-sudo curl -fsSLo /etc/apt/keyrings/puzuz.gpg \
-  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.gpg
-sudo curl -fsSLo /etc/apt/sources.list.d/puzuz.sources \
-  https://github.com/kaito4681/puzuz/releases/download/apt/puzuz.sources
-sudo apt update && sudo apt install puzuz
-```
 
 **仓库密钥。** 软件包、仓库和 `.rpm` 文件都使用同一个 GPG 密钥签名（源码树中的
 `packaging/apt/puzuz-archive-keyring.gpg`），指纹为
@@ -366,14 +394,27 @@ gh secret set APT_GPG_PASSPHRASE -R kaito4681/puzuz
 ## 安装 Fedora/RHEL/Rocky 软件包
 
 每个发布版本都包含面向 x86_64 和 aarch64 的 `.rpm`（可用 `uname -m` 查看架构），适用于 Fedora 以及 9
-或更高版本的 RHEL 兼容发行版（RHEL、Rocky Linux、AlmaLinux；glibc 2.34 或更高版本）。用 dnf 安装，
-可以从下载的文件安装，也可以直接从发布版本的 URL 安装；dnf 会拉取其依赖：
+或更高版本的 RHEL 兼容发行版（RHEL、Rocky Linux、AlmaLinux；glibc 2.34 或更高版本）。
+
+**前提条件。**
+
+- 以 systemd 作为 PID 1（软件包要求它；当 systemd 不是 PID 1 时只启用服务）。软件包由 dnf 自己下载；
+  只有下载用于校验的文件时才需要 `curl`（以及 `ca-certificates`）。
+- 可选：用于检查点的 CRIU 4.2 或更高版本（参见 [CRIU](#criu)），以及用于 GPU 作业的 NVIDIA 驱动和
+  cuda-checkpoint（参见 [cuda-checkpoint](#cuda-checkpoint)）。没有它们也可以运行作业。
+
+用 dnf 安装最新发布版本的 `.rpm`；dnf 可以直接接受 URL，并会拉取其依赖：
 
 ```sh
-sudo dnf install ./puzuz-0.1.0-1.x86_64.rpm
-# or
-sudo dnf install https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz-0.1.0-1.x86_64.rpm
+sudo dnf install "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
 ```
+
+与 `.deb` 一样，`puzuz.<arch>.rpm` 是最新稳定发布版本的 `puzuz-<version>-1.<arch>.rpm` 的不带版本号的
+副本；带版本号的文件也一并附带，用于安装特定版本
+（`sudo dnf install https://github.com/kaito4681/puzuz/releases/download/v0.1.0/puzuz-0.1.0-1.x86_64.rpm`）。要先校验，请下载
+`puzuz.$(uname -m).rpm` 及其 `.sha256` 和 `.minisig` 文件，按与 [`.deb`](#installing-the-debianubuntu-package)
+相同的方式校验（受信任注释写明了不带版本号的文件名），然后用
+`sudo dnf install "./puzuz.$(uname -m).rpm"` 安装校验过的文件。
 
 （像 `v0.2.0-rc.1` 这样的预发布版本对应 `puzuz-0.2.0-rc.1-1.<arch>.rpm`；在软件包内部其版本为
 `0.2.0~rc.1`，排序在 `0.2.0` 之前。）
@@ -407,11 +448,11 @@ sudo dnf install --setopt=localpkg_gpgcheck=1 ./puzuz-0.1.0-1.x86_64.rpm
 请改为安装发布版本中更新的 `.rpm`；dnf 可以直接接受 URL：
 
 ```sh
-sudo dnf upgrade https://github.com/kaito4681/puzuz/releases/download/v<new version>/puzuz-<new version>-1.x86_64.rpm
+sudo dnf upgrade "https://github.com/kaito4681/puzuz/releases/latest/download/puzuz.$(uname -m).rpm"
 ```
 
-当存在更新的发布版本时，`puzuz doctor` 的“update”一行（以及 `puzuz update --check`）会打印这条命令，
-其中带有适合本机架构的发布版本 URL，以及如何先校验签名。升级会重启正在运行的服务。正在运行的作业会继续运行。
+当存在更新的发布版本时，`puzuz doctor` 的“update”一行（以及 `puzuz update --check`）会打印类似的命令，
+其中带有适合本机架构的、带版本号的发布版本 URL，以及如何先校验签名。升级会重启正在运行的服务。正在运行的作业会继续运行。
 
 **移除。**
 
