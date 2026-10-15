@@ -208,8 +208,10 @@ hold a root file opened with the dump-time mode. The helper therefore:
   filesystems such as sshfs have renumbered their inodes) the owner, group, mode, size,
   modification and change times recorded right after the dump; the change time cannot be set by
   users, and renaming or linking another file there changes it (see
-  [Filesystems and mounts](install.md#filesystems-and-mounts)). If the hook finds a problem, it
-  kills the tasks while they are
+  [Filesystems and mounts](install.md#filesystems-and-mounts)). The helper looks these
+  attributes up in a child process with a deadline, so that a filesystem that does not answer
+  cannot hold it up (a file not looked up in time is recorded without them, and only its device
+  and inode identify it). If the hook finds a problem, it kills the tasks while they are
   still stopped (CRIU itself ignores a failed `pre-resume` script), so they never run; the
   restore fails with the reason and the image is kept. If the check passes and the job was
   paused at the dump, the hook stops the tasks (SIGSTOP) instead of letting them run. If the hook did not run at all, the

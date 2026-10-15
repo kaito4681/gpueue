@@ -10,7 +10,7 @@ use puzuz_checkpoint::command::{CudaCheckpointOptions, cuda_get_restore_tid, cud
 use puzuz_checkpoint::exec::run_with_timeout;
 use puzuz_checkpoint::{CommandSpec, probe, procfs, space};
 
-use crate::access::{VerifyReply, VerifyRequest};
+use crate::access::{FileAttrs, VerifyReply, VerifyRequest};
 use crate::deadmounts::{DeadMounts, DetachedMount};
 use crate::mounts::{MountTree, SourceMount};
 
@@ -158,6 +158,15 @@ pub trait HostProbe: Send + Sync + 'static {
             .cloned()
             .collect())
     }
+    /// For each of `files` (held by a job at its dump), the attributes of
+    /// the file its path leads to now if it is the very file (see
+    /// [`crate::access::held_file_attrs`]). Opens the files, which may
+    /// block on a filesystem that does not answer, so the real host asks a
+    /// child process with a deadline (a file it could not look up in time
+    /// has no attributes).
+    fn held_file_attrs(&self, files: &[HeldFile]) -> io::Result<Vec<Option<FileAttrs>>> {
+        Ok(files.iter().map(crate::access::held_file_attrs).collect())
+    }
     /// Runs `restore`, the CUDA restore of the processes `cuda_pids` of a
     /// stopped job (namespace init `init_pid`), with only their CUDA restore
     /// threads running: the job stays stopped and runs none of its own code
@@ -304,6 +313,9 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     }
     fn missing_mount_points(&self, paths: &[String]) -> io::Result<Vec<String>> {
         (**self).missing_mount_points(paths)
+    }
+    fn held_file_attrs(&self, files: &[HeldFile]) -> io::Result<Vec<Option<FileAttrs>>> {
+        (**self).held_file_attrs(files)
     }
 }
 
@@ -948,7 +960,34 @@ impl HostProbe for SystemHost {
         }))
         .map_err(io::Error::other)
     }
+
+    fn held_file_attrs(&self, files: &[HeldFile]) -> io::Result<Vec<Option<FileAttrs>>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let req = VerifyRequest::HeldAttrs(crate::access::HeldAttrsCheck {
+            files: files.to_vec(),
+            timeout_ms: u64::try_from(HELD_ATTRS_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+        });
+        let attrs: Vec<Option<FileAttrs>> = crate::access::run_child(
+            &self.helper_exe,
+            &req,
+            HELD_ATTRS_TIMEOUT + Duration::from_secs(10),
+        )
+        .map_err(io::Error::other)?;
+        if attrs.len() != files.len() {
+            return Err(io::Error::other(format!(
+                "the lookup of held files answered {} of {} files",
+                attrs.len(),
+                files.len()
+            )));
+        }
+        Ok(attrs)
+    }
 }
+
+/// How long [`SystemHost::held_file_attrs`] waits for the files' lookups.
+const HELD_ATTRS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The local address of socket `fd` of process `pid` if it is an internet
 /// socket with `SO_REUSEPORT` (looked at through a duplicate taken with

@@ -446,26 +446,47 @@ pub fn probe(path: &Path) -> Option<String> {
 /// behind, so run this in a process that exits afterwards (the
 /// `verify-access` child).
 pub fn probe_paths(paths: &[String], timeout: Duration) -> Vec<Option<String>> {
+    each_with_deadline(paths.to_vec(), timeout, |p| probe(Path::new(&p)))
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| Some(format!("no answer within {}s", timeout.as_secs()))))
+        .collect()
+}
+
+/// `f` for each of `items`, each in a thread of its own; one entry per
+/// item, `None` for those that did not finish within `timeout` (all
+/// together). The threads that are still stuck (on a filesystem that does
+/// not answer) are left behind, so run this in a process that exits
+/// afterwards (the `verify-access` child).
+pub fn each_with_deadline<I, T>(
+    items: Vec<I>,
+    timeout: Duration,
+    f: impl Fn(I) -> T + Send + Sync + 'static,
+) -> Vec<Option<T>>
+where
+    I: Send + 'static,
+    T: Send + 'static,
+{
+    let f = std::sync::Arc::new(f);
     let (tx, rx) = std::sync::mpsc::channel();
-    for (i, p) in paths.iter().enumerate() {
+    let n = items.len();
+    for (i, item) in items.into_iter().enumerate() {
         let tx = tx.clone();
-        let p = p.clone();
+        let f = f.clone();
         std::thread::spawn(move || {
-            let _ = tx.send((i, probe(Path::new(&p))));
+            let _ = tx.send((i, f(item)));
         });
     }
     drop(tx);
-    let mut out: Vec<Option<String>> =
-        vec![Some(format!("no answer within {}s", timeout.as_secs())); paths.len()];
+    let mut out: Vec<Option<T>> = (0..n).map(|_| None).collect();
     let deadline = std::time::Instant::now() + timeout;
-    let mut left = paths.len();
+    let mut left = n;
     while left > 0 {
         let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
             break;
         };
         match rx.recv_timeout(wait) {
             Ok((i, r)) => {
-                out[i] = r;
+                out[i] = Some(r);
                 left -= 1;
             }
             Err(_) => break,
@@ -812,6 +833,19 @@ mod tests {
             probe_paths(&[], Duration::from_secs(5)),
             Vec::<Option<String>>::new()
         );
+    }
+
+    /// What does not finish in time (as a lookup on a filesystem that does
+    /// not answer) is left behind, without holding up the others.
+    #[test]
+    fn each_with_deadline_leaves_stuck_items_behind() {
+        let start = std::time::Instant::now();
+        let out = each_with_deadline(vec![1u64, 60, 2], Duration::from_millis(300), |s| {
+            std::thread::sleep(Duration::from_millis(s * 10));
+            s
+        });
+        assert_eq!(out, [Some(1), None, Some(2)]);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

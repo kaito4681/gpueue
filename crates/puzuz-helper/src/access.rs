@@ -142,6 +142,21 @@ pub struct ProbeCheck {
     pub timeout_ms: u64,
 }
 
+/// After a dump: the attributes of the files the job held (see
+/// [`held_file_attrs`]), as root. In the child only so that a filesystem
+/// that does not answer cannot hold up the helper (which finalizes dumps
+/// at its start too, before it is ready).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldAttrsCheck {
+    pub files: Vec<HeldFile>,
+    /// How long to wait for all of them; a file not looked up by then has
+    /// no attributes.
+    pub timeout_ms: u64,
+}
+
+/// The reply to a [`HeldAttrsCheck`]: one entry per file.
+pub type HeldAttrsReply = Result<Vec<Option<FileAttrs>>, String>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "check", rename_all = "snake_case")]
 pub enum VerifyRequest {
@@ -152,6 +167,8 @@ pub enum VerifyRequest {
     /// The reply has one entry per path: empty if its filesystem answered,
     /// else why not.
     Probe(ProbeCheck),
+    /// The reply is a [`HeldAttrsReply`].
+    HeldAttrs(HeldAttrsCheck),
 }
 
 /// The problems found (empty: all is well), or why the check could not be
@@ -166,36 +183,25 @@ const MAX_PROBLEMS: usize = 20;
 /// namespace requires it).
 pub fn run_verify_access() -> i32 {
     let mut input = Vec::new();
-    let reply: VerifyReply = io::stdin()
+    let req = io::stdin()
         .read_to_end(&mut input)
         .map_err(|e| format!("reading the request: {e}"))
         .and_then(|_| {
             serde_json::from_slice::<VerifyRequest>(&input)
                 .map_err(|e| format!("decoding the request: {e}"))
-        })
-        .and_then(|req| match req {
-            VerifyRequest::Paths(c) => check_paths(&c).map(truncate),
-            VerifyRequest::Restored(c) => check_restored(&c).map(truncate),
-            VerifyRequest::Exist(c) => Ok(c
-                .paths
-                .into_iter()
-                .filter(|p| {
-                    if c.mount_points {
-                        crate::deadmounts::mount_point_missing(Path::new(p))
-                    } else {
-                        fs::symlink_metadata(p).is_err()
-                    }
-                })
-                .collect()),
-            VerifyRequest::Probe(c) => Ok(crate::deadmounts::probe_paths(
-                &c.paths,
-                std::time::Duration::from_millis(c.timeout_ms),
-            )
-            .into_iter()
-            .map(Option::unwrap_or_default)
-            .collect()),
         });
-    match serde_json::to_vec(&reply) {
+    let out = match req {
+        Ok(VerifyRequest::HeldAttrs(c)) => {
+            let timeout = std::time::Duration::from_millis(c.timeout_ms);
+            let attrs =
+                crate::deadmounts::each_with_deadline(c.files, timeout, |f| held_file_attrs(&f));
+            serde_json::to_vec(&HeldAttrsReply::Ok(
+                attrs.into_iter().map(Option::flatten).collect(),
+            ))
+        }
+        req => serde_json::to_vec(&verify(req)),
+    };
+    match out {
         Ok(out) => {
             let mut stdout = io::stdout();
             if stdout.write_all(&out).and_then(|()| stdout.flush()).is_ok() {
@@ -206,6 +212,33 @@ pub fn run_verify_access() -> i32 {
         }
         Err(_) => 1,
     }
+}
+
+/// The checks of [`run_verify_access`] that reply with a [`VerifyReply`].
+fn verify(req: Result<VerifyRequest, String>) -> VerifyReply {
+    req.and_then(|req| match req {
+        VerifyRequest::Paths(c) => check_paths(&c).map(truncate),
+        VerifyRequest::Restored(c) => check_restored(&c).map(truncate),
+        VerifyRequest::Exist(c) => Ok(c
+            .paths
+            .into_iter()
+            .filter(|p| {
+                if c.mount_points {
+                    crate::deadmounts::mount_point_missing(Path::new(p))
+                } else {
+                    fs::symlink_metadata(p).is_err()
+                }
+            })
+            .collect()),
+        VerifyRequest::Probe(c) => Ok(crate::deadmounts::probe_paths(
+            &c.paths,
+            std::time::Duration::from_millis(c.timeout_ms),
+        )
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect()),
+        VerifyRequest::HeldAttrs(_) => Err("not a check with a list of problems".into()),
+    })
 }
 
 fn truncate(mut problems: Vec<String>) -> Vec<String> {
@@ -219,6 +252,16 @@ pub fn run_verify_child(
     req: &VerifyRequest,
     timeout: std::time::Duration,
 ) -> VerifyReply {
+    run_child(exe, req, timeout)
+}
+
+/// [`run_verify_child`] for a check whose reply is `Result<T, String>`
+/// (see [`VerifyRequest`]).
+pub fn run_child<T: serde::de::DeserializeOwned>(
+    exe: &Path,
+    req: &VerifyRequest,
+    timeout: std::time::Duration,
+) -> Result<T, String> {
     use std::process::{Command, Stdio};
     let input = serde_json::to_vec(req).map_err(|e| e.to_string())?;
     let mut child = Command::new(exe)
@@ -261,7 +304,7 @@ pub fn run_verify_child(
     if !status.success() {
         return Err(format!("the access check failed ({status})"));
     }
-    serde_json::from_slice::<VerifyReply>(&out)
+    serde_json::from_slice::<Result<T, String>>(&out)
         .map_err(|e| format!("reading the access check result: {e}"))?
 }
 
@@ -571,14 +614,25 @@ impl FileAttrs {
 /// job closed or replaced meanwhile is left without them). Files that have
 /// their attributes already keep them (a dump finalized again later, after
 /// a reboot, must not lose what was recorded right after the dump).
+///
+/// Opens and stats each file, which may block on a filesystem that does not
+/// answer: the helper does this in a child process with a deadline (see
+/// [`HeldAttrsCheck`] and [`crate::host::HostProbe::held_file_attrs`]).
 pub fn complete_held_files(files: &mut [HeldFile]) {
     for f in files.iter_mut().filter(|f| f.attrs.is_none()) {
-        f.attrs = open_no_symlinks(&f.path)
-            .and_then(|fd| rustix::fs::fstat(&fd))
-            .ok()
-            .filter(|st| (st.st_dev, st.st_ino) == (f.dev, f.ino))
-            .map(|st| FileAttrs::of(&st));
+        f.attrs = held_file_attrs(f);
     }
+}
+
+/// The attributes of the file the path of `f` leads to, without symlinks,
+/// if it is the same device and inode as at the dump (see
+/// [`complete_held_files`]). May block.
+pub fn held_file_attrs(f: &HeldFile) -> Option<FileAttrs> {
+    open_no_symlinks(&f.path)
+        .and_then(|fd| rustix::fs::fstat(&fd))
+        .ok()
+        .filter(|st| (st.st_dev, st.st_ino) == (f.dev, f.ino))
+        .map(|st| FileAttrs::of(&st))
 }
 
 impl HeldFile {

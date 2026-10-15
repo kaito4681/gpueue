@@ -3,7 +3,8 @@
 # cannot pass in the build sandbox (see `doCheck` in package.nix), so
 # packaging/nix/tests/helper-tests.nix runs all of them in a NixOS VM instead.
 #
-# Installed as $out/bin/<target>-<kind>, e.g. protocol-test.
+# Installed as $out/bin/<target>-<kind>, e.g. protocol-test, and the
+# helper binary the tests run as $out/libexec/puzuz-helper.
 { puzuz, jq }:
 
 puzuz.overrideAttrs (old: {
@@ -27,6 +28,14 @@ puzuz.overrideAttrs (old: {
         install -Dm755 "$exe" "$out/bin/$name"
       done
     test -x "$out/bin/protocol-test"
+    # The helper binary itself, which some tests run (as `verify-access`);
+    # they find it through PUZUZ_HELPER_EXE (see
+    # packaging/nix/tests/helper-tests.nix).
+    helper=$(jq -r 'select(.reason == "compiler-artifact" and (.profile.test | not)
+                            and .target.name == "puzuz-helper"
+                            and .target.kind[0] == "bin" and .executable != null)
+                     | .executable' cargo-test.json | head -n1)
+    install -Dm755 "$helper" "$out/libexec/puzuz-helper"
     runHook postInstall
   '';
 

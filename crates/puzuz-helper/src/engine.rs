@@ -2837,8 +2837,22 @@ pub fn finish_dump<H: HostProbe + ?Sized>(
                     }
                 }
             }
-            // The job is gone now: its files no longer change.
-            crate::access::complete_held_files(&mut held_files);
+            // The job is gone now: its files no longer change. Those that
+            // have their attributes already keep them (see
+            // `crate::access::complete_held_files`); the lookups are made
+            // with a deadline (see `HostProbe::held_file_attrs`).
+            let (idx, missing): (Vec<usize>, Vec<crate::access::HeldFile>) = held_files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.attrs.is_none())
+                .map(|(i, f)| (i, f.clone()))
+                .unzip();
+            let attrs = host
+                .held_file_attrs(&missing)
+                .map_err(|e| format!("looking up the files the job held: {e}"))?;
+            for (i, a) in idx.into_iter().zip(attrs) {
+                held_files[i].attrs = a;
+            }
             SavedMounts::Full {
                 mount_points,
                 external_sources,

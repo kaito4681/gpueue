@@ -38,6 +38,8 @@ pub struct FakeHost {
     unstopped: Mutex<Vec<(u32, u32)>>,
     /// While set, access checks block (see [`FakeHost::hold_access_checks`]).
     held: Mutex<bool>,
+    /// See [`FakeHost::set_held_attrs_failure`].
+    held_attrs_failure: Mutex<Option<String>>,
     released: std::sync::Condvar,
 }
 
@@ -163,6 +165,7 @@ impl HostProbe for FakeHost {
             VerifyRequest::Paths(_) => &self.path_problems,
             VerifyRequest::Restored(_) => &self.restored_problems,
             VerifyRequest::Probe(c) => return Ok(vec![String::new(); c.paths.len()]),
+            VerifyRequest::HeldAttrs(_) => return Err("not a check with a list of problems".into()),
             VerifyRequest::Exist(c) => {
                 return Ok(c
                     .paths
@@ -177,6 +180,16 @@ impl HostProbe for FakeHost {
 
     fn private_tmpfs_bytes(&self, _pid: u32, _private: &[String]) -> io::Result<u64> {
         Ok(*self.tmpfs_bytes.lock().unwrap())
+    }
+
+    fn held_file_attrs(
+        &self,
+        files: &[crate::access::HeldFile],
+    ) -> io::Result<Vec<Option<crate::access::FileAttrs>>> {
+        if let Some(reason) = self.held_attrs_failure.lock().unwrap().clone() {
+            return Err(io::Error::other(reason));
+        }
+        Ok(files.iter().map(crate::access::held_file_attrs).collect())
     }
 
     fn dead_mounts(
@@ -246,6 +259,13 @@ impl FakeHost {
     /// [`HostProbe::unstopped_threads`]).
     pub fn set_unstopped_threads(&self, threads: Vec<(u32, u32)>) {
         *self.unstopped.lock().unwrap() = threads;
+    }
+
+    /// Make [`HostProbe::held_file_attrs`] fail with `reason` (as the real
+    /// host's lookup child does when it cannot be run or does not finish
+    /// in time); `None` to look the files up again.
+    pub fn set_held_attrs_failure(&self, reason: Option<&str>) {
+        *self.held_attrs_failure.lock().unwrap() = reason.map(str::to_owned);
     }
 }
 

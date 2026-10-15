@@ -1295,7 +1295,7 @@ async fn restore_checks_the_images_paths_first() {
         .into_iter()
         .filter_map(|r| match r {
             VerifyRequest::Paths(p) => Some(p.paths),
-            VerifyRequest::Restored(_) | VerifyRequest::Exist(_) | VerifyRequest::Probe(_) => None,
+            _ => None,
         })
         .flatten()
         .collect();
@@ -3318,4 +3318,126 @@ async fn files_opened_just_before_the_dump_are_held() {
         assert_eq!(Path::new(&f.path), p.as_path());
         assert!(f.attrs.is_some(), "{f:?}");
     }
+}
+
+/// The `puzuz-helper` binary: `PUZUZ_HELPER_EXE` if set (the test
+/// executables run elsewhere than where cargo built them, e.g. in the
+/// NixOS VM of packaging/nix/tests/helper-tests.nix), else the one cargo
+/// built for the tests.
+fn helper_exe() -> PathBuf {
+    let exe = std::env::var_os("PUZUZ_HELPER_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_puzuz-helper")));
+    assert!(
+        exe.is_file(),
+        "{} is missing; set PUZUZ_HELPER_EXE to the puzuz-helper binary",
+        exe.display()
+    );
+    exe
+}
+
+/// The real host looks the held files up in a `verify-access` child: the
+/// very file gets its attributes, a replaced or missing one none.
+#[test]
+fn the_real_host_looks_held_files_up_in_a_child() {
+    use puzuz_helper::access::HeldFile;
+    use puzuz_helper::host::{HostProbe, SystemHost};
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let held = |name: &str| {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, name).unwrap();
+        let m = std::fs::metadata(&p).unwrap();
+        HeldFile {
+            path: p.to_str().unwrap().to_owned(),
+            dev: m.dev(),
+            ino: m.ino(),
+            attrs: None,
+        }
+    };
+    let same = held("same");
+    let mut replaced = held("replaced");
+    replaced.ino += 1;
+    let mut missing = held("missing");
+    missing.path.push_str(".gone");
+    let host = SystemHost::new("nvidia-smi".into(), Default::default(), helper_exe());
+    let attrs = host
+        .held_file_attrs(&[same.clone(), replaced, missing])
+        .unwrap();
+    assert_eq!(attrs.len(), 3);
+    assert_eq!(attrs[0], puzuz_helper::access::held_file_attrs(&same));
+    assert!(attrs[0].is_some());
+    assert_eq!(attrs[1], None);
+    assert_eq!(attrs[2], None);
+    assert_eq!(host.held_file_attrs(&[]).unwrap(), []);
+}
+
+/// The files the job held are looked up after the dump with a deadline
+/// (on the real host in a child process, as a filesystem that does not
+/// answer could block the lookup). If that fails, the image is kept as an
+/// unfinalized dump, and a helper start goes on and finalizes it later.
+#[tokio::test]
+async fn a_failed_lookup_of_held_files_leaves_the_dump_unfinalized() {
+    use puzuz_helper::access::HeldFile;
+    use puzuz_helper::engine::{MOUNTS_FILE, SavedMounts};
+    use std::os::unix::fs::MetadataExt;
+    let mut env = Env::new().await;
+    let mut c = env.client().await;
+    let file = env.base().join("held.txt");
+    std::fs::create_dir_all(env.base()).unwrap();
+    std::fs::write(&file, "a").unwrap();
+    let m = std::fs::metadata(&file).unwrap();
+    env.host.set_dump_hazards(DumpHazards {
+        held_files: vec![HeldFile {
+            path: file.to_str().unwrap().to_owned(),
+            dev: m.dev(),
+            ino: m.ino(),
+            attrs: None,
+        }],
+        ..Default::default()
+    });
+    env.host
+        .set_held_attrs_failure(Some("the access check did not finish within 20s"));
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(4))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(4),
+            image_dir: env.base().join("4"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    let Event::CheckpointFinished {
+        outcome:
+            CheckpointOutcome::Failed {
+                reason,
+                code: Some(HelperErrorCode::CheckpointUnfinalized),
+            },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert!(reason.contains("did not finish within"), "{reason}");
+    let dir = CheckpointDir::for_job(&env.base(), 4);
+    assert!(dir.is_unfinalized_dump(), "{:?}", dir.status());
+    c.request(Request::AckEvents {
+        up_to: EventSeq(u64::MAX),
+    })
+    .await;
+    drop(c);
+    // A start while it still fails is not held up and keeps the image.
+    env.restart().await;
+    assert!(dir.is_unfinalized_dump(), "{:?}", dir.status());
+    // Once it works, the next start finalizes the image.
+    env.host.set_held_attrs_failure(None);
+    env.restart().await;
+    assert!(matches!(dir.status(), DirStatus::Complete(_)));
+    let saved: SavedMounts =
+        serde_json::from_slice(&std::fs::read(dir.root().join(MOUNTS_FILE)).unwrap()).unwrap();
+    assert!(saved.held_files()[0].attrs.is_some());
 }
