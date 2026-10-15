@@ -505,6 +505,22 @@ Not tested yet:
 
 Please report what works and what does not on your hardware.
 
+<a id="agent-skill"></a>
+## Agent Skill for coding agents
+
+The repository ships an [Agent Skill](https://agentskills.io) in
+[skills/puzuz](skills/puzuz/SKILL.md) that teaches coding agents (Claude Code, Codex, Cursor and
+others) how to use puzuz as a regular user: checking that the daemon is up, adding jobs with the
+right working directory, environment and `--gpu`, following logs, waiting with `puzuz wait`
+instead of polling, pause/kill/restart, checkpoint/restore, `--json` output, common errors, and
+safety rules (only touch your own jobs, never use `sudo` or administrator commands). Install it
+with the [skills](https://github.com/vercel-labs/skills) CLI:
+
+```sh
+npx skills add kaito4681/puzuz              # this project only; add -g for all projects
+npx skills add kaito4681/puzuz -g -a claude-code -y
+```
+
 ## Documentation
 
 - [docs/install.md](docs/install.md): requirements, building, installing, configuration,

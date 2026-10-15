@@ -458,6 +458,20 @@ puzuz 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 
 请报告在你的硬件上哪些功能可用、哪些不可用。
 
+<a id="agent-skill"></a>
+## 面向编码智能体的 Agent Skill
+
+本仓库在 [skills/puzuz](skills/puzuz/SKILL.md) 中提供一个 [Agent Skill](https://agentskills.io)，
+教编码智能体（Claude Code、Codex、Cursor 等）以普通用户身份使用 puzuz：检查守护进程是否在运行、
+以正确的工作目录、环境变量和 `--gpu` 添加作业、跟踪日志、用 `puzuz wait` 等待而不是轮询、
+pause/kill/restart、checkpoint/restore、`--json` 输出、常见错误，以及安全规则（只操作自己的作业，
+不使用 `sudo` 或管理员命令）。使用 [skills](https://github.com/vercel-labs/skills) CLI 安装：
+
+```sh
+npx skills add kaito4681/puzuz              # 仅当前项目；加 -g 则对所有项目生效
+npx skills add kaito4681/puzuz -g -a claude-code -y
+```
+
 <a id="documentation"></a>
 ## 文档
 

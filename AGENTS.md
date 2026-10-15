@@ -63,6 +63,11 @@
   - `crates/puzuz-helper` — the root helper binary (spawns jobs as their owner, checkpoints)
 - User documentation: `README.md`, `docs/install.md`, `docs/architecture.md`. Update them when
   commands, flags, configuration keys, packaging files or behavior change.
+- Agent Skill: `skills/puzuz/` (`SKILL.md` plus `references/*.md`, installed by users with
+  `npx skills add kaito4681/puzuz`) teaches coding agents to use the CLI. Update it when
+  user-facing commands, flags, JSON output, error messages or scheduling/checkpoint behavior
+  change; every command it shows must exist. Keep the frontmatter `name` equal to the directory
+  name.
 - The English documentation is canonical. It is translated into Japanese (`README.ja.md`,
   `docs/ja/`) and Simplified Chinese (`README.zh-CN.md`, `docs/zh-CN/`). A PR that changes
   `README.md`, `docs/install.md` or `docs/architecture.md` must update both translations in the
