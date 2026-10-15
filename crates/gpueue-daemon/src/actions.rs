@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpueue_core::authz::{self, AdminOperation};
 use gpueue_core::lifecycle::{self, Action, Effect, Transition};
-use gpueue_core::model::{Caller, Gpu, GpuIndex, Group, Job, JobId, JobState, Timestamp};
+use gpueue_core::model::{
+    Caller, Gpu, GpuIndex, Group, Job, JobId, JobSpec, JobState, Timestamp, Uid,
+};
 use gpueue_core::priority::PriorityType;
 use gpueue_core::storage::{JobFilter, StoreOps, Tx};
 use gpueue_protocol::api::{
@@ -96,6 +98,16 @@ fn job_not_found(id: JobId) -> Failure {
     gpueue_core::Error::JobNotFound(id).into()
 }
 
+/// What [`Config::max_job_spec_bytes`](crate::config::Config) limits: the
+/// bytes of a job's command, working directory, label and environment.
+fn spec_bytes(spec: &JobSpec) -> u64 {
+    let envs: usize = spec.envs.iter().map(|(k, v)| k.len() + v.len()).sum();
+    (spec.command.len()
+        + spec.cwd.as_os_str().len()
+        + spec.label.as_ref().map_or(0, String::len)
+        + envs) as u64
+}
+
 fn list_ids(ids: &[JobId]) -> String {
     ids.iter()
         .map(JobId::to_string)
@@ -176,6 +188,26 @@ impl Core {
     // Jobs: add
     // -----------------------------------------------------------------
 
+    /// Fails with `too_many_requests` if `owner`, with `adding` more jobs,
+    /// would have more unfinished jobs than `max_unfinished_jobs_per_user`
+    /// allows. Every scheduling pass reads every unfinished job, so their
+    /// number is what one user must not be able to grow without bound.
+    fn require_job_quota(&self, tx: &Tx<'_>, owner: Uid, adding: u64) -> ApiResult<()> {
+        let max = self.config.max_unfinished_jobs_per_user;
+        let count = tx.count_unfinished_jobs_of(owner)?;
+        if count + adding > max {
+            return Err(Failure::new(
+                ErrorCode::TooManyRequests,
+                format!(
+                    "user {owner} has {count} jobs that have not finished, and at most {max} \
+                     are allowed (max_unfinished_jobs_per_user); wait for some to finish or \
+                     remove some"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// `POST /v1/jobs`. With `immediate` an administrator's job starts
     /// right away, ignoring every limit; while the helper is not connected
     /// it is added as queued instead and started, still ignoring limits, as
@@ -207,6 +239,15 @@ impl Core {
         if let Some(gpu) = spec.gpus.iter().find(|g| !seen.insert(**g)) {
             return Err(Failure::bad_request(format!("GPU {gpu} is listed twice")));
         }
+        let size = spec_bytes(&spec);
+        let max_size = self.config.max_job_spec_bytes;
+        if size > max_size {
+            return Err(Failure::bad_request(format!(
+                "the job is too large: its command, working directory, label and environment \
+                 take {size} bytes, more than the {max_size} allowed (max_job_spec_bytes); \
+                 unset large environment variables or put the command in a script"
+            )));
+        }
         authz::require_nice_value(&caller, 0, spec.nice)?;
         let helper_ready = self.helper_ready();
         let now = now_ms();
@@ -216,6 +257,7 @@ impl Core {
                 if tx.get_group(&spec.group)?.is_none() {
                     return Err(gpueue_core::Error::GroupNotFound(spec.group.clone()).into());
                 }
+                core.require_job_quota(tx, caller.uid, 1)?;
                 for gpu in &spec.gpus {
                     if tx.get_gpu(*gpu)?.is_none() {
                         return Err(Failure::bad_request(format!(
@@ -264,7 +306,7 @@ impl Core {
                     // Also when starting now: should the helper not start
                     // it after all (it is stopping), it is retried the same
                     // way.
-                    core.force_launch(job.id);
+                    ch.force_launch(job.id);
                     effects = t.effects;
                 } else if request.immediate {
                     let t = lifecycle::queue_for_launch(&job, now)?;
@@ -320,7 +362,7 @@ impl Core {
         caller: Caller,
         id: JobId,
         action: JobAction,
-        removed_together: Vec<JobId>,
+        removed_together: Arc<HashSet<JobId>>,
     ) -> ApiResult<ActionDone> {
         self.reject_if_shutting_down()?;
         let (job, effects, copy, launch) = loop {
@@ -356,7 +398,7 @@ impl Core {
         caller: Caller,
         id: JobId,
         action: JobAction,
-        removed_together: Vec<JobId>,
+        removed_together: Arc<HashSet<JobId>>,
     ) -> ApiResult<ActionDone> {
         if let JobAction::Kill(options) = &action
             && caller.is_admin
@@ -420,7 +462,7 @@ impl Core {
         caller: Caller,
         id: JobId,
         action: JobAction,
-        removed_together: Vec<JobId>,
+        removed_together: Arc<HashSet<JobId>>,
     ) -> ApiResult<Option<(Job, Vec<Effect>, Option<(Job, Vec<Effect>)>, LaunchState)>> {
         let helper_ready = self.helper_ready();
         let now = now_ms();
@@ -454,10 +496,12 @@ impl Core {
                     return Err(Core::helper_unavailable());
                 }
                 if action == JobAction::Remove {
-                    let all = tx.list_jobs(&JobFilter::all())?;
-                    let mut together = removed_together;
-                    together.push(id);
-                    let blocking = lifecycle::blocking_dependants(&all, id, &together);
+                    // Only the jobs depending on it are read, so removing
+                    // many jobs does not read every job for each of them.
+                    let blocking =
+                        lifecycle::blocking_dependants_with(id, &removed_together, |dep| {
+                            tx.unfinished_dependants(dep)
+                        })?;
                     if !blocking.is_empty() {
                         return Err(Failure::new(
                             ErrorCode::InvalidState,
@@ -468,6 +512,19 @@ impl Core {
                         ));
                     }
                 }
+                // `restart` brings a job back (a copy, or the job itself
+                // in place): within the owner's limit of unfinished jobs.
+                // Checked first: applying it may reset the log.
+                let finished = |state: &JobState| matches!(state, JobState::Done { .. });
+                let copies = transition
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::CreateRestartedCopy { .. }));
+                let revives = finished(&job.state)
+                    && transition.next.as_ref().is_some_and(|next| !finished(next));
+                if copies || revives {
+                    core.require_job_quota(tx, job.owner, 1)?;
+                }
                 let snapshot = job.clone();
                 let copy = core.apply_in_tx(tx, &mut job, &transition, now, ch)?;
                 let mut queued = None;
@@ -475,13 +532,13 @@ impl Core {
                     // Also when launching now: should the helper not start
                     // it after all (it is stopping), it is retried the same
                     // way.
-                    core.force_launch(id);
+                    ch.force_launch(id);
                 } else if launch {
                     queued = Some(core.queue_first(tx, &mut job, ch)?);
                 }
                 let copy = match copy {
                     Some(mut copy) if immediate_copy && admin => {
-                        core.force_launch(copy.id);
+                        ch.force_launch(copy.id);
                         if helper_ready {
                             let start = lifecycle::start(&copy)?;
                             core.apply_in_tx(tx, &mut copy, &start, now, ch)?;
@@ -575,10 +632,10 @@ impl Core {
                 )
             }
         };
-        let together = if action == JobAction::Remove {
-            ids.clone()
+        let together: Arc<HashSet<JobId>> = if action == JobAction::Remove {
+            Arc::new(ids.iter().copied().collect())
         } else {
-            Vec::new()
+            Arc::default()
         };
         let mut results = Vec::new();
         for id in ids {
@@ -620,17 +677,23 @@ impl Core {
                 {
                     return Err(gpueue_core::Error::GroupNotFound(group.clone()).into());
                 }
-                let all = tx.list_jobs(&JobFilter::all())?;
-                let candidates: Vec<&Job> = all
+                let mut filter = JobFilter::all().state("done");
+                if let Some(group) = request.group.as_deref() {
+                    filter = filter.group(group);
+                }
+                let finished = tx.list_jobs(&filter)?;
+                let candidates: Vec<&Job> = finished
                     .iter()
                     .filter(|j| scope.includes(j))
-                    .filter(|j| request.group.as_ref().is_none_or(|g| *g == j.spec.group))
                     .filter(|j| lifecycle::is_cleanable(j, request.successful_only))
                     .collect();
-                let together: Vec<JobId> = candidates.iter().map(|j| j.id).collect();
+                let together: HashSet<JobId> = candidates.iter().map(|j| j.id).collect();
                 let mut removed = Vec::new();
                 for job in candidates {
-                    if !lifecycle::blocking_dependants(&all, job.id, &together).is_empty() {
+                    let blocking = lifecycle::blocking_dependants_with(job.id, &together, |dep| {
+                        tx.unfinished_dependants(dep)
+                    })?;
+                    if !blocking.is_empty() {
                         continue;
                     }
                     let t = lifecycle::clean(job, request.successful_only)?;
@@ -698,14 +761,16 @@ impl Core {
             results.push(JobActionResult::ok(job.id));
         }
         for job in live {
-            self.mark_for_removal(job.id);
             let killable = matches!(job.state, JobState::Running | JobState::Paused);
+            // A job being checkpointed or restored is killed should it run
+            // again afterwards (see `Core::reap_pending`).
+            self.mark_for_removal(job.id, killable);
             let result = if killable {
                 self.job_action(
                     caller,
                     job.id,
                     JobAction::Kill(KillOptions::default()),
-                    Vec::new(),
+                    Arc::default(),
                 )
                 .await
             } else {
@@ -902,7 +967,7 @@ impl Core {
 
     pub async fn list_gpus(&self) -> ApiResult<Vec<GpuView>> {
         let (gpus, jobs) = self
-            .read(|s| Ok((s.list_gpus()?, s.list_unfinished_jobs()?)))
+            .read(|s| Ok((s.list_gpus()?, s.list_unfinished_jobs_brief()?)))
             .await?;
         Ok(self.gpu_views(gpus, &jobs))
     }
@@ -924,7 +989,7 @@ impl Core {
                     tx.set_gpu_parallel(*index, parallel)?;
                 }
                 ch.touch();
-                Ok((tx.list_gpus()?, tx.list_unfinished_jobs()?))
+                Ok((tx.list_gpus()?, tx.list_unfinished_jobs_brief()?))
             })
             .await?;
         Ok(self.gpu_views(all, &jobs))

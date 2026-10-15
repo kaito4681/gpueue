@@ -14,6 +14,17 @@ use crate::model::{JobId, Timestamp, Uid};
 const USAGE_CALC_AT: &str = "usage_calc_at";
 /// `meta` key: when usage was last reset (or first recorded).
 const USAGE_RESET_AT: &str = "usage_reset_at";
+/// `meta` key: the local day the reset period that usage was last reset
+/// for began on (see `priority::period_start_day`).
+const USAGE_RESET_DAY: &str = "usage_reset_day";
+
+pub(super) fn usage_reset_day(conn: &Connection) -> Result<Option<i64>> {
+    meta::get(conn, USAGE_RESET_DAY)
+}
+
+pub(super) fn set_usage_reset_day(conn: &Connection, day: i64) -> Result<()> {
+    meta::set(conn, USAGE_RESET_DAY, day)
+}
 
 pub(super) fn usage_calc_at(conn: &Connection) -> Result<Option<Timestamp>> {
     meta::get(conn, USAGE_CALC_AT)

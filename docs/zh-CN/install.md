@@ -1150,6 +1150,8 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/gpue
 | `daemon_user` | `"gpueue"` | helper | 唯一允许连接 helper 的用户 |
 | `grace_secs` | `30` | 两者 | 停止作业时 SIGTERM 与 SIGKILL 之间的秒数 |
 | `shell` | `["sh", "-c"]` | 守护进程 | 命令前缀，作业的命令行追加在其后 |
+| `max_unfinished_jobs_per_user` | `10000` | 守护进程 | 每个用户最多可以拥有的未结束作业（排队、stash、运行、暂停、已检查点等）数量；超出后 `add` 以及让作业重新运行的 `restart` 会以 `too_many_requests` 被拒绝 |
+| `max_job_spec_bytes` | `262144`（256 KiB） | 守护进程 | 一个作业的命令、工作目录、标签和环境变量（`gpueue add` 会发送调用者的全部环境变量）合计的字节数上限；更大的作业会以 `bad_request` 被拒绝 |
 | `checkpoint_size_limit_bytes` | 未设置（无上限） | 守护进程 | 所有镜像的总大小超过该值时发出警告（镜像永远不会被自动删除） |
 | `checkpoint_size_warning_interval_secs` | `3600` | 守护进程 | 超出上限期间，每位管理员收到提醒的间隔 |
 | `checkpoint_tcp_close` | `true` | 两者 | 创建检查点时关闭 TCP 连接（`criu --tcp-close`） |
@@ -1312,8 +1314,8 @@ priority = site factor
 检查点或等待恢复的时间不计费，并且一次计费最多覆盖两个计算周期，因此守护进程未运行的时间不会被计费。
 每次计算还会让所有用量以 `priority_decay_half_life_secs` 为半衰期衰减（0：不衰减）。调度器使用在每次计算时
 以及份额变更时算出的 fair-share 因子；在此期间提交第一个作业的用户，在下一次计算之前视为没有用量。用量保存在数据库中，重启后仍然保留，并按
-`priority_usage_reset_period` 的设置重置（`"now"` 在每次守护进程启动时重置；按日历的周期在本地时间 00:00
-重置，按周的周期在周日重置）。低于 0.001 计费秒的用量会被丢弃。
+`priority_usage_reset_period` 的设置重置（`"now"` 在每次守护进程启动时重置，且不计入重置之前的任何时间，包括仍在运行的作业此前的运行时间；
+按日历的周期在本地时间 00:00 重置，按周的周期在周日重置，夏令时开始或结束的那天也只在每个周期重置一次）。低于 0.001 计费秒的用量会被丢弃。
 
 **用户自己的顺序。** pueue 的 `-o/--priority`、`gpueue switch` 和 `gpueue top` 只对同一个用户的作业排序，
 与 HTCondor 的 `condor_prio` 和 Slurm 的 `scontrol top` 一样：顺序是先排被移到最前面的作业（最近一次 `top`

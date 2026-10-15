@@ -1266,6 +1266,8 @@ sudo systemctl restart gpueue-helper.service gpueue.service
 | `daemon_user` | `"gpueue"` | ヘルパー | ヘルパーへの接続を許可される唯一のユーザー |
 | `grace_secs` | `30` | 両方 | ジョブを停止するときの SIGTERM から SIGKILL までの秒数 |
 | `shell` | `["sh", "-c"]` | デーモン | ジョブのコマンドラインを後ろに付け加えるコマンドの接頭辞 |
+| `max_unfinished_jobs_per_user` | `10000` | デーモン | 1 ユーザーが持てる、終了していないジョブ（待機中、stash 中、実行中、一時停止中、チェックポイント済みなど）の数。超えると `add` と、ジョブを再び動かす `restart` は `too_many_requests` で拒否されます |
+| `max_job_spec_bytes` | `262144`（256 KiB） | デーモン | 1 つのジョブのコマンド、作業ディレクトリ、ラベル、環境変数（`gpueue add` は呼び出し元の環境変数をすべて送ります）の合計バイト数の上限。超えるジョブは `bad_request` で拒否されます |
 | `checkpoint_size_limit_bytes` | 未設定（制限なし） | デーモン | 全イメージの合計がこのサイズを超えたら警告します（イメージが自動で削除されることはありません） |
 | `checkpoint_size_warning_interval_secs` | `3600` | デーモン | 上限を超えている間、各管理者に通知する間隔 |
 | `checkpoint_tcp_close` | `true` | 両方 | チェックポイント時に TCP 接続を閉じます（`criu --tcp-close`） |
@@ -1453,8 +1455,9 @@ priority = site factor
 フェアシェアの要素を使います。その間に最初のジョブを投入したユーザーは、次の計算まで使用量なしとして
 扱われます。使用量は再起動をまたいでデータベースに
 保存され、`priority_usage_reset_period` に従ってリセットされます（`"now"` はデーモンが起動するたびに
-リセットします。暦の期間はローカル時刻の 00:00 にリセットし、週は日曜日に始まります）。0.001
-課金秒未満の使用量は破棄されます。
+リセットし、それ以前の分は、実行中のままのジョブのそれまでの実行時間も含めて課金しません。暦の期間は
+ローカル時刻の 00:00 にリセットし、週は日曜日に始まります。夏時間の開始日・終了日も期間ごとに 1 回だけ
+リセットします）。0.001 課金秒未満の使用量は破棄されます。
 
 **ユーザー自身の順序。** pueue の `-o/--priority`、`gpueue switch`、`gpueue top` は、HTCondor の
 `condor_prio` や Slurm の `scontrol top` と同じく、1 人のユーザーのジョブだけを並べ替えます。順序は、

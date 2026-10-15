@@ -370,7 +370,24 @@ pub trait StoreOps: sealed::Sealed {
     /// `done`, plus the `done` jobs that one of those depends on. Reads no
     /// other finished job.
     fn list_unfinished_jobs(&self) -> Result<Vec<Job>> {
-        jobs::list_unfinished(self.conn())
+        jobs::list_unfinished(self.conn(), false)
+    }
+
+    /// [`StoreOps::list_unfinished_jobs`] without what deciding about jobs
+    /// does not need: commands and environments are left empty. Read a job
+    /// to be launched with [`StoreOps::get_job`].
+    fn list_unfinished_jobs_brief(&self) -> Result<Vec<Job>> {
+        jobs::list_unfinished(self.conn(), true)
+    }
+
+    /// How many jobs of `owner` have not finished (are not `done`).
+    fn count_unfinished_jobs_of(&self, owner: Uid) -> Result<u64> {
+        jobs::count_unfinished_of(self.conn(), owner)
+    }
+
+    /// The jobs that have not finished and depend on `id`, by id.
+    fn unfinished_dependants(&self, id: JobId) -> Result<Vec<JobId>> {
+        jobs::unfinished_dependants(self.conn(), id)
     }
 
     /// Sets a job's state and both timestamps, exactly as given, in one
@@ -595,6 +612,17 @@ pub trait StoreOps: sealed::Sealed {
     /// When usage was last reset (or first calculated), if ever.
     fn usage_reset_at(&self) -> Result<Option<Timestamp>> {
         priority::usage_reset_at(self.conn())
+    }
+
+    /// The local day (days since 1970-01-01) on which the reset period
+    /// that usage was last reset for began, if recorded (see
+    /// [`crate::priority::period_start_day`]).
+    fn usage_reset_day(&self) -> Result<Option<i64>> {
+        priority::usage_reset_day(self.conn())
+    }
+
+    fn set_usage_reset_day(&self, day: i64) -> Result<()> {
+        priority::set_usage_reset_day(self.conn(), day)
     }
 
     fn set_usage_reset_at(&self, at: Timestamp) -> Result<()> {

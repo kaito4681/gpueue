@@ -8,6 +8,10 @@
 //! between requests) is closed. A connection over the limit gets one
 //! `too_many_requests` answer and is closed.
 //!
+//! Each request carries its connection's permit ([`ConnectionPermit`]), so
+//! a job operation that outlives its connection keeps counting against the
+//! caller's limit.
+//!
 //! When the daemon stops, the loop stops accepting and every connection
 //! finishes the request it is serving (streams end with the daemon) before
 //! [`serve`] returns.
@@ -33,7 +37,9 @@ use tower_service::Service;
 
 use crate::api::PeerCred;
 use crate::error::Failure;
-use crate::limits::{HEADER_TIMEOUT, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_UID, UidLimiter};
+use crate::limits::{
+    ConnectionPermit, HEADER_TIMEOUT, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_UID, UidLimiter,
+};
 
 /// Connections being refused at once at most; more are closed right away.
 const MAX_REFUSING: usize = 256;
@@ -95,7 +101,10 @@ pub async fn serve(listener: UnixListener, router: Router, cancel: CancellationT
         let refusing = refusing.clone();
         connections.spawn(async move {
             match permit {
-                Some(_permit) => serve_connection(stream, router, PeerCred { uid }, cancel).await,
+                Some(permit) => {
+                    let permit = ConnectionPermit::new(permit);
+                    serve_connection(stream, router, PeerCred { uid }, permit, cancel).await
+                }
                 None => {
                     // Beyond that, close them unanswered.
                     if let Ok(_refusing) = refusing.try_acquire() {
@@ -113,10 +122,12 @@ async fn serve_connection(
     stream: UnixStream,
     router: Router,
     peer: PeerCred,
+    permit: ConnectionPermit,
     cancel: CancellationToken,
 ) {
     let service = service_fn(move |mut request: hyper::Request<Incoming>| {
         request.extensions_mut().insert(ConnectInfo(peer));
+        request.extensions_mut().insert(permit.clone());
         let mut router = router.clone();
         async move { router.call(request).await }
     });

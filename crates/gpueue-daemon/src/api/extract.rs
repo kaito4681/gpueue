@@ -12,6 +12,7 @@ use serde::de::DeserializeOwned;
 
 use super::AppState;
 use crate::error::{ApiResult, Failure};
+use crate::limits::ConnectionPermit;
 
 /// Testing only: overrides the peer uid when the daemon was started with
 /// `trust_uid_header` (never configurable from the config file).
@@ -22,6 +23,18 @@ pub const TEST_UID_HEADER: &str = "x-gpueue-test-uid";
 #[derive(Debug, Clone, Copy)]
 pub struct PeerCred {
     pub uid: Option<u32>,
+}
+
+/// The connection's permit (see [`ConnectionPermit`]), if the request came
+/// through `crate::server`.
+pub struct Permit(pub Option<ConnectionPermit>);
+
+impl<S: Send + Sync> FromRequestParts<S> for Permit {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Permit(parts.extensions.get::<ConnectionPermit>().cloned()))
+    }
 }
 
 /// The authenticated caller.

@@ -109,6 +109,22 @@ const JOB_COLUMNS: &str = "id, owner_uid, command, cwd, group_name, priority, la
                            no_checkpoint, state, state_data, created_at, started_at, finished_at, \
                            nice, site_factor, top_seq";
 
+/// [`JOB_COLUMNS`] without the command (read as an empty string), for
+/// [`Detail::Brief`].
+const JOB_COLUMNS_BRIEF: &str = "id, owner_uid, '', cwd, group_name, priority, label, \
+                                 no_checkpoint, state, state_data, created_at, started_at, \
+                                 finished_at, nice, site_factor, top_seq";
+
+/// How much of each job [`load_where`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Detail {
+    /// Everything.
+    Full,
+    /// No command and no environment (both left empty): what scheduling
+    /// looks at, without the bulk of a job's data.
+    Brief,
+}
+
 /// A `jobs` row before its child tables are loaded.
 struct JobRow {
     job: Job,
@@ -166,17 +182,22 @@ fn decode_state(row: JobRow) -> Result<Job> {
 }
 
 /// The jobs matching `condition` (an SQL expression over the `jobs` table
-/// that qualifies its columns with `jobs.`), ordered by id, with env, GPUs
-/// and dependencies. Four queries however many jobs match: each child table
-/// is read once for all of them.
+/// that qualifies its columns with `jobs.`), ordered by id, with env (unless
+/// [`Detail::Brief`]), GPUs and dependencies. Four queries however many jobs
+/// match: each child table is read once for all of them.
 fn load_where(
     conn: &Connection,
     condition: &str,
     params: &[&dyn rusqlite::ToSql],
+    detail: Detail,
 ) -> Result<Vec<Job>> {
+    let columns = match detail {
+        Detail::Full => JOB_COLUMNS,
+        Detail::Brief => JOB_COLUMNS_BRIEF,
+    };
     let rows = conn
         .prepare_cached(&format!(
-            "SELECT {JOB_COLUMNS} FROM jobs WHERE {condition} ORDER BY jobs.id"
+            "SELECT {columns} FROM jobs WHERE {condition} ORDER BY jobs.id"
         ))?
         .query_map(params, job_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -189,14 +210,16 @@ fn load_where(
         .collect::<Result<Vec<_>>>()?;
     let index: HashMap<JobId, usize> = jobs.iter().enumerate().map(|(i, j)| (j.id, i)).collect();
 
-    let mut env = conn.prepare_cached(&format!(
-        "SELECT c.job_id, c.key, c.value FROM job_env c JOIN jobs ON jobs.id = c.job_id
-         WHERE {condition}"
-    ))?;
-    let mut rows = env.query(params)?;
-    while let Some(row) = rows.next()? {
-        if let Some(&i) = index.get(&JobId(row.get(0)?)) {
-            jobs[i].spec.envs.insert(row.get(1)?, row.get(2)?);
+    if detail == Detail::Full {
+        let mut env = conn.prepare_cached(&format!(
+            "SELECT c.job_id, c.key, c.value FROM job_env c JOIN jobs ON jobs.id = c.job_id
+             WHERE {condition}"
+        ))?;
+        let mut rows = env.query(params)?;
+        while let Some(row) = rows.next()? {
+            if let Some(&i) = index.get(&JobId(row.get(0)?)) {
+                jobs[i].spec.envs.insert(row.get(1)?, row.get(2)?);
+            }
         }
     }
     let mut gpus = conn.prepare_cached(&format!(
@@ -223,7 +246,12 @@ fn load_where(
 }
 
 pub(super) fn get(conn: &Connection, id: JobId) -> Result<Option<Job>> {
-    Ok(load_where(conn, "jobs.id = ?1", &[&id.0])?.pop())
+    // SQLite integers are signed: an id above `i64::MAX` (from a request)
+    // names no job, rather than failing the query.
+    if i64::try_from(id.0).is_err() {
+        return Ok(None);
+    }
+    Ok(load_where(conn, "jobs.id = ?1", &[&id.0], Detail::Full)?.pop())
 }
 
 pub(super) fn list(conn: &Connection, filter: &JobFilter<'_>) -> Result<Vec<Job>> {
@@ -233,14 +261,16 @@ pub(super) fn list(conn: &Connection, filter: &JobFilter<'_>) -> Result<Vec<Job>
          AND (?2 IS NULL OR jobs.group_name = ?2)
          AND (?3 IS NULL OR jobs.state = ?3)",
         &[&filter.owner.map(|u| u.0), &filter.group, &filter.state],
+        Detail::Full,
     )
 }
 
 /// What scheduling looks at: every job that has not finished (`done`), and
 /// the finished jobs those depend on (their result decides whether the
 /// dependants may start). Other finished jobs are not read, so a long
-/// history does not slow scheduling down.
-pub(super) fn list_unfinished(conn: &Connection) -> Result<Vec<Job>> {
+/// history does not slow scheduling down. With `brief`, neither commands
+/// nor environments are read (see [`Detail::Brief`]).
+pub(super) fn list_unfinished(conn: &Connection, brief: bool) -> Result<Vec<Job>> {
     load_where(
         conn,
         "jobs.state != 'done'
@@ -248,7 +278,29 @@ pub(super) fn list_unfinished(conn: &Connection) -> Result<Vec<Job>> {
                         JOIN jobs w ON w.id = d.job_id
                         WHERE w.state != 'done')",
         &[],
+        if brief { Detail::Brief } else { Detail::Full },
     )
+}
+
+/// How many jobs of `owner` have not finished (`done`).
+pub(super) fn count_unfinished_of(conn: &Connection, owner: Uid) -> Result<u64> {
+    Ok(conn
+        .prepare_cached("SELECT COUNT(*) FROM jobs WHERE owner_uid = ?1 AND state != 'done'")?
+        .query_row([owner.0], |row| row.get(0))?)
+}
+
+/// The jobs that have not finished and depend on `id`, by id.
+pub(super) fn unfinished_dependants(conn: &Connection, id: JobId) -> Result<Vec<JobId>> {
+    if i64::try_from(id.0).is_err() {
+        return Ok(Vec::new());
+    }
+    Ok(conn
+        .prepare_cached(
+            "SELECT d.job_id FROM job_deps d JOIN jobs j ON j.id = d.job_id
+             WHERE d.depends_on = ?1 AND j.state != 'done' ORDER BY d.job_id",
+        )?
+        .query_map([id.0], |row| Ok(JobId(row.get(0)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub(super) fn update_state(

@@ -727,3 +727,46 @@ fn reset_due_after_a_boundary() {
     assert!(!reset_due(ResetPeriod::None, last, utc(2030, 1, 1, 0), 0));
     assert!(!reset_due(ResetPeriod::Now, last, utc(2030, 1, 1, 0), 0));
 }
+
+#[test]
+fn a_reset_is_due_once_per_period_across_a_utc_offset_change() {
+    // Central European time: daylight saving time (UTC+2) ends on
+    // 2026-10-25 at 03:00 local, which becomes 02:00 (UTC+1).
+    let (summer, winter) = (2 * 3600, 3600);
+    // The daily reset at local midnight, still in summer time.
+    let reset = utc(2026, 10, 24, 22) + 60 * 1000;
+    let day = period_start_day(reset, summer, ResetPeriod::Daily).unwrap();
+    assert_eq!(
+        period_start(reset, summer, ResetPeriod::Daily),
+        Some(utc(2026, 10, 24, 22))
+    );
+    // After the change the day's midnight is 23:00 UTC, after the reset:
+    // compared as instants, the reset would be due again.
+    let later = utc(2026, 10, 25, 12);
+    assert!(reset_due(ResetPeriod::Daily, reset, later, winter));
+    assert!(!reset_due_since_day(ResetPeriod::Daily, day, later, winter));
+    // The next midnight is due.
+    assert!(reset_due_since_day(
+        ResetPeriod::Daily,
+        day,
+        utc(2026, 10, 25, 23) + 1,
+        winter
+    ));
+    // Spring forward does not skip a reset either.
+    let reset = utc(2026, 3, 28, 23) + 60 * 1000; // 2026-03-29 00:01 CET
+    let day = period_start_day(reset, winter, ResetPeriod::Daily).unwrap();
+    assert!(!reset_due_since_day(
+        ResetPeriod::Daily,
+        day,
+        utc(2026, 3, 29, 12),
+        summer
+    ));
+    assert!(reset_due_since_day(
+        ResetPeriod::Daily,
+        day,
+        utc(2026, 3, 29, 22) + 1,
+        summer
+    ));
+    assert!(!reset_due_since_day(ResetPeriod::None, 0, later, winter));
+    assert!(!reset_due_since_day(ResetPeriod::Now, 0, later, winter));
+}

@@ -11,8 +11,10 @@
 //!
 //! Stopping the daemon (SIGTERM, [`Daemon::stop`]) only stops serving: jobs
 //! live in their own systemd units and keep running, and the next daemon
-//! reconciles with the helper. `gpueue shutdown` (`POST /v1/daemon/shutdown`)
-//! is the way to checkpoint or stop every job first.
+//! reconciles with the helper. Launches decided on but not sent to the
+//! helper yet are put back in line first. `gpueue shutdown`
+//! (`POST /v1/daemon/shutdown`) is the way to checkpoint or stop every job
+//! first.
 //!
 //! GPUs are detected once at start-up (NVML, see [`gpu`]); restart the
 //! daemon after adding or removing GPUs.
@@ -246,7 +248,14 @@ impl Daemon {
     }
 
     /// Stops serving and disconnects from the helper. Jobs are not touched.
+    ///
+    /// Launches the scheduler had decided on but not sent to the helper yet
+    /// are put back in line first (the next daemon would find their jobs
+    /// gone and mark them lost), and the helper gets a few seconds to
+    /// answer the spawn and restore requests already sent (see
+    /// `Core::stop_launches`).
     pub async fn stop(self) {
+        self.core.stop_launches(state::STOP_LAUNCH_WAIT).await;
         self.core.cancel.cancel();
         self.core.helper.close();
         if tokio::time::timeout(Duration::from_secs(10), self.server)

@@ -26,6 +26,8 @@
 //! daemon_user = "gpueue"
 //! grace_secs = 30
 //! shell = ["sh", "-c"]
+//! max_unfinished_jobs_per_user = 10000
+//! max_job_spec_bytes = 262144         # 256 KiB
 //! checkpoint_size_warning_interval_secs = 3600
 //! checkpoint_tcp_close = true
 //! criu_path = "criu"
@@ -97,6 +99,12 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/gpueue/config.toml";
 /// Default of [`Config::update_source`].
 pub const DEFAULT_UPDATE_SOURCE: &str = "github:kaito4681/gpueue";
 
+/// Default of [`Config::max_unfinished_jobs_per_user`].
+pub const DEFAULT_MAX_UNFINISHED_JOBS_PER_USER: u64 = 10_000;
+
+/// Default of [`Config::max_job_spec_bytes`] (256 KiB).
+pub const DEFAULT_MAX_JOB_SPEC_BYTES: u64 = 256 * 1024;
+
 /// Upper bound of every `*_secs` key (one year). Larger values are surely
 /// mistakes, and would overflow deadline arithmetic in the daemon and helper.
 pub const MAX_SECS: u64 = 365 * 24 * 60 * 60;
@@ -130,6 +138,14 @@ pub struct Config {
     pub grace_secs: u64,
     /// Command prefix a job's command line is appended to.
     pub shell: Vec<String>,
+    /// Jobs one user may have that have not finished (queued, stashed,
+    /// running, paused, checkpointed, ...) (daemon only). `add`, and a
+    /// `restart` that brings back a job, are refused beyond it.
+    pub max_unfinished_jobs_per_user: u64,
+    /// Bytes a job's command, working directory, label and environment
+    /// (names and values) may take together (daemon only). `add` refuses
+    /// larger jobs.
+    pub max_job_spec_bytes: u64,
     /// Warn when all checkpoint images together exceed this size (images
     /// are never deleted automatically).
     pub checkpoint_size_limit_bytes: Option<u64>,
@@ -406,6 +422,8 @@ impl Default for Config {
             daemon_user: "gpueue".to_owned(),
             grace_secs: 30,
             shell: vec!["sh".to_owned(), "-c".to_owned()],
+            max_unfinished_jobs_per_user: DEFAULT_MAX_UNFINISHED_JOBS_PER_USER,
+            max_job_spec_bytes: DEFAULT_MAX_JOB_SPEC_BYTES,
             checkpoint_size_limit_bytes: None,
             checkpoint_size_warning_interval_secs: 3600,
             checkpoint_tcp_close: true,
@@ -505,6 +523,12 @@ impl Config {
         }
         if self.checkpoint_deadline_base_secs == 0 {
             return Err("`checkpoint_deadline_base_secs` must be positive".to_owned());
+        }
+        if self.max_unfinished_jobs_per_user == 0 {
+            return Err("`max_unfinished_jobs_per_user` must be positive".to_owned());
+        }
+        if self.max_job_spec_bytes == 0 {
+            return Err("`max_job_spec_bytes` must be positive".to_owned());
         }
         let secs = [
             ("grace_secs", Some(self.grace_secs)),
@@ -803,6 +827,8 @@ mod tests {
             helper_socket = "/tmp/h.sock"
             grace_secs = 5
             shell = ["bash", "-lc"]
+            max_unfinished_jobs_per_user = 50
+            max_job_spec_bytes = 4096
             checkpoint_size_limit_bytes = 1000
             checkpoint_size_warning_interval_secs = 60
             checkpoint_tcp_close = false
@@ -845,6 +871,8 @@ mod tests {
         assert_eq!(config.checkpoints_dir(), PathBuf::from("/big/ckpt"));
         assert_eq!(config.grace_secs, 5);
         assert_eq!(config.shell, ["bash", "-lc"]);
+        assert_eq!(config.max_unfinished_jobs_per_user, 50);
+        assert_eq!(config.max_job_spec_bytes, 4096);
         assert_eq!(config.checkpoint_size_limit_bytes, Some(1000));
         assert_eq!(config.checkpoint_size_warning_interval_secs, 60);
         assert!(!config.checkpoint_tcp_close);
@@ -941,6 +969,8 @@ mod tests {
             Config::parse("checkpoint_deadline_base_secs = 0"),
             Err(ParseError::Invalid(_))
         ));
+        assert!(invalid("max_unfinished_jobs_per_user = 0").contains("max_unfinished_jobs"));
+        assert!(invalid("max_job_spec_bytes = 0").contains("max_job_spec_bytes"));
         assert!(matches!(
             Config::parse("[[gpus]]\nindex = 0\n[[gpus]]\nindex = 0\n"),
             Err(ParseError::Invalid(_))

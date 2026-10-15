@@ -213,6 +213,10 @@ struct Harness {
     warning_interval_secs: u64,
     /// The `[priority]` table of the next start.
     priority: gpueue_daemon::config::PriorityConfig,
+    /// `max_unfinished_jobs_per_user` and `max_job_spec_bytes` of the next
+    /// start.
+    max_jobs: u64,
+    max_spec_bytes: u64,
 }
 
 impl Harness {
@@ -230,6 +234,8 @@ impl Harness {
             checkpoint_limit: None,
             warning_interval_secs: Config::default().checkpoint_size_warning_interval_secs,
             priority: Config::default().priority,
+            max_jobs: Config::default().max_unfinished_jobs_per_user,
+            max_spec_bytes: Config::default().max_job_spec_bytes,
         };
         harness.start_with(detector).await;
         harness
@@ -242,6 +248,8 @@ impl Harness {
             checkpoint_size_limit_bytes: self.checkpoint_limit,
             checkpoint_size_warning_interval_secs: self.warning_interval_secs,
             priority: self.priority.clone(),
+            max_unfinished_jobs_per_user: self.max_jobs,
+            max_job_spec_bytes: self.max_spec_bytes,
             ..Config::default()
         }
         .with_data_dir(self.dir.path())
@@ -2713,6 +2721,63 @@ async fn a_helper_reconnect_during_a_spawn_does_not_lose_the_job() {
     h.stop().await;
 }
 
+/// A daemon stopped (SIGTERM, e.g. `systemctl restart gpueue`) while the
+/// scheduler's launches wait for a launch slot puts them back in line
+/// instead of leaving them `Running` for the next daemon to mark lost, and
+/// lets the helper answer the requests already sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_the_daemon_requeues_launches_not_sent_yet() {
+    use gpueue_core::storage::StoreOps;
+
+    // The scheduler sends 8 spawn requests at a time.
+    const SENT: usize = 8;
+    const JOBS: usize = SENT + 3;
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(JOBS as u32).await;
+    let alice = h.client(ALICE);
+    h.helper.hold_launches();
+    let mut ids = Vec::new();
+    for n in 0..JOBS {
+        ids.push(alice.add(&job_request(&format!("job {n}"), &[])).await);
+    }
+    for id in &ids {
+        alice.wait_state(*id, &JobState::Running).await;
+    }
+    h.helper.wait_held(SENT).await;
+
+    // Stopping waits (a while) for the requests sent; they are answered.
+    let daemon = h.daemon.take().unwrap();
+    let stopping = tokio::spawn(daemon.stop());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    h.helper.release_launches();
+    tokio::time::timeout(Duration::from_secs(5), stopping)
+        .await
+        .expect("the daemon stops once the requests are answered")
+        .unwrap();
+    assert_eq!(h.helper.spawned().len(), SENT);
+    let store = h.store();
+    let states: Vec<JobState> = ids
+        .iter()
+        .map(|id| store.get_job(*id).unwrap().unwrap().state)
+        .collect();
+    let running = states.iter().filter(|s| **s == JobState::Running).count();
+    let queued = states
+        .iter()
+        .filter(|s| matches!(s, JobState::Queued { .. }))
+        .count();
+    assert_eq!((running, queued), (SENT, JOBS - SENT), "{states:?}");
+
+    // The next daemon starts the requeued jobs; none is lost.
+    h.start(0).await;
+    let alice = h.client(ALICE);
+    for id in &ids {
+        alice.wait_state(*id, &JobState::Running).await;
+        h.wait_spawned(*id).await;
+    }
+    assert_eq!(h.helper.spawned().len(), JOBS);
+    h.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_daemon_restart_during_a_spawn_marks_the_job_lost() {
     let mut h = Harness::new(0).await;
@@ -3375,6 +3440,271 @@ async fn connections_and_streams_are_limited_per_user() {
     h.stop().await;
 }
 
+/// A job operation whose client went away runs to completion, and counts
+/// against the caller's connections until it has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operations_left_by_closed_connections_count_as_connections() {
+    const MAX_CONNECTIONS_PER_UID: usize = 64;
+    let mut h = Harness::new(0).await;
+    let admin = h.client(ADMIN);
+    h.helper.hold_launches();
+    let mut request = job_request("held", &[]);
+    request.immediate = true;
+    let pending = {
+        let admin = admin.clone();
+        tokio::spawn(async move { admin.add(&request).await })
+    };
+    h.helper.wait_held(1).await;
+    // The client gives up; the operation goes on.
+    pending.abort();
+    let _ = pending.await;
+
+    let socket = h.dir.path().join("gpueue.sock");
+    let mut idle = Vec::new();
+    for _ in 0..MAX_CONNECTIONS_PER_UID - 1 {
+        idle.push(tokio::net::UnixStream::connect(&socket).await.unwrap());
+    }
+    let mut refused = false;
+    for _ in 0..250 {
+        let reply = admin.get("/v1/version").await;
+        if reply.status == StatusCode::TOO_MANY_REQUESTS {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refused, "the operation left behind holds a connection");
+
+    // Once it has finished, its place is free again.
+    h.helper.release_launches();
+    let mut served = false;
+    for _ in 0..250 {
+        if admin.get("/v1/version").await.status == StatusCode::OK {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(served);
+    assert_eq!(h.helper.spawned().len(), 1);
+    drop(idle);
+    h.stop().await;
+}
+
+/// Each user may have a limited number of unfinished jobs, and each job a
+/// limited size; requests beyond are refused with clear errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jobs_per_user_and_job_size_are_limited() {
+    let mut h = Harness::new(0).await;
+    h.max_jobs = 2;
+    h.max_spec_bytes = 1000;
+    h.stop().await;
+    h.start(0).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+
+    let first = alice.add(&job_request("a", &[])).await;
+    alice.wait_state(first, &JobState::Running).await;
+    let mut stashed = job_request("b", &[]);
+    stashed.stashed = true;
+    let second = alice.add(&stashed).await;
+    let reply = alice
+        .post(
+            "/v1/jobs",
+            serde_json::to_value(job_request("c", &[])).unwrap(),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS);
+    let error = reply.error();
+    assert_eq!(error.code, ErrorCode::TooManyRequests);
+    assert!(
+        error.message.contains("max_unfinished_jobs_per_user"),
+        "{}",
+        error.message
+    );
+    // Per user.
+    bob.add(&job_request("d", &[])).await;
+
+    // A finished job does not count, until restarting brings it back.
+    h.exit(first, 0).await;
+    alice.wait_state(first, &done(JobResult::Success)).await;
+    let third = alice.add(&job_request("c", &[])).await;
+    let reply = alice.action(first, "restart", json!({})).await;
+    assert_eq!(reply.error().code, ErrorCode::TooManyRequests);
+    let reply = alice
+        .action(first, "restart", json!({"in_place": true}))
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::TooManyRequests);
+    assert_eq!(alice.job(first).await.state, done(JobResult::Success));
+    let reply = alice
+        .call(Method::DELETE, &format!("/v1/jobs/{second}"), None)
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let reply = alice.action(first, "restart", json!({})).await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.error());
+    let _ = third;
+
+    // The command, working directory, label and environment together.
+    let mut big = job_request("e", &[]);
+    big.spec.envs.insert("BIG".to_owned(), "x".repeat(1000));
+    let reply = bob
+        .post("/v1/jobs", serde_json::to_value(&big).unwrap())
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(
+        reply.error().message.contains("max_job_spec_bytes"),
+        "{:?}",
+        reply.error()
+    );
+    h.stop().await;
+}
+
+/// Job ids SQLite cannot store name no job, rather than failing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn job_ids_beyond_the_database_range_are_not_found() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let huge = u64::MAX;
+    let reply = alice.get(&format!("/v1/jobs/{huge}")).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(reply.error().code, ErrorCode::JobNotFound);
+    let reply = alice.action(JobId(huge), "kill", json!({})).await;
+    assert_eq!(reply.error().code, ErrorCode::JobNotFound);
+    let reply = alice
+        .call(Method::DELETE, &format!("/v1/jobs/{huge}"), None)
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::JobNotFound);
+    let results = bulk_results(
+        &alice
+            .post(
+                "/v1/jobs/bulk",
+                json!({"target": {"kind": "ids", "ids": [huge]}, "action": "remove"}),
+            )
+            .await,
+    );
+    assert_eq!(results, [(huge, Some(ErrorCode::JobNotFound))]);
+    let mut request = job_request("x", &[]);
+    request.spec.dependencies = vec![JobId(huge)];
+    let reply = alice
+        .post("/v1/jobs", serde_json::to_value(&request).unwrap())
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    h.stop().await;
+}
+
+/// `reset` cannot kill a job that is being checkpointed or restored; when
+/// it runs again afterwards (the dump was refused, the restore succeeded),
+/// it is killed and removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_jobs_that_run_again_after_a_checkpoint_or_restore_are_removed() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let admin = h.client(ADMIN);
+    let gone = |client: Client, id: JobId| async move {
+        for _ in 0..250 {
+            if client.get(&format!("/v1/jobs/{id}")).await.status == StatusCode::NOT_FOUND {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "job {id} was never removed: {:?}",
+            client.job(id).await.state
+        );
+    };
+
+    // A dump the helper refuses once it is due.
+    let id = alice.add(&job_request("a", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+    h.helper.hold_checkpoints();
+    h.helper
+        .set_checkpoint_outcome(FakeOutcome::Refuse("hidden mount /run/x".to_owned()));
+    let checkpoint = send_action(&alice, id, "checkpoint", json!(null));
+    h.helper.wait_held_checkpoints(1).await;
+    assert_eq!(alice.job(id).await.state, JobState::Checkpointing);
+    let reset: BulkJobResponse = alice.post("/v1/jobs/reset", json!({})).await.json();
+    assert!(reset.all_ok(), "{reset:?}");
+    h.helper.release_checkpoints();
+    let _ = checkpoint.await;
+    gone(alice.clone(), id).await;
+    assert_eq!(sigterms(&h, id), 1);
+    assert!(!h.helper.is_running(id));
+
+    // A restore that succeeds.
+    h.helper.set_checkpoint_outcome(FakeOutcome::Succeed);
+    let id = h.checkpointed_job().await;
+    h.helper.hold_launches();
+    let restore = send_action(&admin, id, "restore", json!({"immediate": true}));
+    h.helper.wait_held(1).await;
+    assert_eq!(alice.job(id).await.state, JobState::Restoring);
+    let reset: BulkJobResponse = alice.post("/v1/jobs/reset", json!({})).await.json();
+    assert!(reset.all_ok(), "{reset:?}");
+    h.helper.release_launches();
+    let _ = restore.await;
+    gone(alice.clone(), id).await;
+    assert_eq!(sigterms(&h, id), 1);
+    assert!(!h.helper.is_running(id));
+
+    // A running job is killed by `reset` itself, once.
+    let id = alice.add(&job_request("b", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+    let reset: BulkJobResponse = alice.post("/v1/jobs/reset", json!({})).await.json();
+    assert!(reset.all_ok(), "{reset:?}");
+    gone(alice.clone(), id).await;
+    assert_eq!(sigterms(&h, id), 1);
+    h.stop().await;
+}
+
+/// How many SIGTERMs the helper got for `id`.
+fn sigterms(h: &Harness, id: JobId) -> usize {
+    h.helper
+        .signals()
+        .iter()
+        .filter(|s| **s == (id, signal::SIGTERM))
+        .count()
+}
+
+/// A `/v1/events` subscriber that falls behind is told to resync rather
+/// than silently missing events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lagging_event_subscriber_is_told_to_resync() {
+    let mut h = Harness::new(0).await;
+    let admin = h.client(ADMIN);
+    // Not read while the daemon publishes more events than it buffers.
+    let mut events = admin
+        .open(Method::GET, "/v1/events", None)
+        .await
+        .into_body();
+    for n in 0..3000u32 {
+        let reply = admin
+            .call(
+                Method::PUT,
+                "/v1/groups/default/parallel",
+                Some(json!({ "parallel": n % 7 + 1 })),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK);
+    }
+    let mut decoder = SseDecoder::new();
+    let mut resynced = false;
+    while !resynced {
+        let frame = tokio::time::timeout(Duration::from_secs(5), events.frame())
+            .await
+            .expect("an event")
+            .unwrap()
+            .unwrap();
+        if let Ok(data) = frame.into_data() {
+            resynced = decoder
+                .push(&data)
+                .iter()
+                .any(|m| m.parse_event().ok() == Some(ApiEvent::Resync));
+        }
+    }
+    h.stop().await;
+}
+
 // ---------------------------------------------------------------------------
 // Priority and fair share
 // ---------------------------------------------------------------------------
@@ -3823,6 +4153,33 @@ async fn only_running_time_is_billed() {
     h.stop().await;
     h.start(0).await;
     assert!(raw_usage(&h.client(ADMIN), ALICE).await >= after * 0.99);
+}
+
+/// `priority_usage_reset_period = "now"` charges nothing from before the
+/// reset, not even the run time of jobs running since before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_at_start_charges_nothing_from_before_it() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let id = alice.add(&job_request("train", &[])).await;
+    alice.wait_state(id, &JobState::Running).await;
+    h.wait_spawned(id).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    h.stop().await;
+    h.priority.priority_usage_reset_period = gpueue_daemon::config::ResetPeriod::Now;
+    h.start(0).await;
+    let alice = h.client(ALICE);
+    assert_eq!(raw_usage(&alice, ALICE).await, 0.0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Pausing charges the run since the reset only.
+    assert_eq!(
+        alice.action(id, "pause", json!({})).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(id, &JobState::Paused).await;
+    let usage = raw_usage(&alice, ALICE).await;
+    assert!((0.2..1.0).contains(&usage), "{usage}");
+    h.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

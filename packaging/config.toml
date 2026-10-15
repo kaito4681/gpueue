@@ -49,6 +49,16 @@
 # Command prefix a job's command line is appended to.
 # shell = ["sh", "-c"]
 
+# Jobs one user may have that have not finished (queued, stashed, running,
+# paused, checkpointed, ...). `gpueue add`, and a `restart` that brings a job
+# back, are refused with `too_many_requests` beyond it.
+# max_unfinished_jobs_per_user = 10000
+
+# Bytes a job's command, working directory, label and environment (names and
+# values; `gpueue add` sends the caller's whole environment) may take
+# together. Larger jobs are refused with `bad_request`.
+# max_job_spec_bytes = 262144
+
 # Warn when all checkpoint images together exceed this many bytes. Images are
 # never deleted automatically: the owner of a job whose checkpoint crosses the
 # limit is told once, administrators (root, gpueue-admin) on their commands

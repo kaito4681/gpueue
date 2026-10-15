@@ -1259,6 +1259,8 @@ Every `*_secs` key is at most one year (31536000).
 | `daemon_user` | `"gpueue"` | helper | the only user allowed to connect to the helper |
 | `grace_secs` | `30` | both | seconds between SIGTERM and SIGKILL when a job is stopped |
 | `shell` | `["sh", "-c"]` | daemon | command prefix that the job's command line is appended to |
+| `max_unfinished_jobs_per_user` | `10000` | daemon | jobs one user may have that have not finished (queued, stashed, running, paused, checkpointed, ...); `add`, and a `restart` that brings a job back, are refused with `too_many_requests` beyond it |
+| `max_job_spec_bytes` | `262144` (256 KiB) | daemon | bytes a job's command, working directory, label and environment (`gpueue add` sends the caller's whole environment) may take together; larger jobs are refused with `bad_request` |
 | `checkpoint_size_limit_bytes` | unset (no limit) | daemon | warn when all images together exceed this size (images are never deleted automatically) |
 | `checkpoint_size_warning_interval_secs` | `3600` | daemon | how often each administrator is reminded while the limit is exceeded |
 | `checkpoint_tcp_close` | `true` | both | close TCP connections when checkpointing (`criu --tcp-close`) |
@@ -1452,8 +1454,10 @@ Every calculation also decays all usage with a half-life of `priority_decay_half
 no decay). The scheduler uses fair-share factors computed at each calculation and when shares
 change; a user who submits their first job in between counts as having no usage until the next
 calculation. Usage is kept in the database across restarts and reset as `priority_usage_reset_period`
-says (`"now"` resets it whenever the daemon starts; the calendar periods reset at 00:00 local
-time, weeks on Sunday). Usage below 0.001 billing-seconds is dropped.
+says (`"now"` resets it whenever the daemon starts, and charges nothing from before, not even the
+earlier run time of jobs still running; the calendar periods reset at 00:00 local time, weeks on
+Sunday, once per period also when daylight saving time begins or ends). Usage below 0.001
+billing-seconds is dropped.
 
 **A user's own order.** pueue's `-o/--priority`, `gpueue switch` and `gpueue top` only order the
 jobs of one user, like HTCondor's `condor_prio` and Slurm's `scontrol top`: the order is jobs

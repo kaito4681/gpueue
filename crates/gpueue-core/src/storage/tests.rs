@@ -464,6 +464,42 @@ fn scheduling_reads_only_unfinished_jobs_and_their_dependencies() {
     let (all, statements, _) = sql_counts(&store, |s| s.list_jobs(&JobFilter::all()).unwrap());
     assert_eq!(all.len(), 2006);
     assert_eq!(statements, 4);
+
+    // The brief list: the same jobs without commands and environments,
+    // and no query of the environment table.
+    let (brief, statements, _) = sql_counts(&store, |s| s.list_unfinished_jobs_brief().unwrap());
+    assert_eq!(statements, 3);
+    assert_eq!(brief.len(), jobs.len());
+    for (brief, full) in brief.iter().zip(&jobs) {
+        let mut expected = full.clone();
+        expected.spec.command.clear();
+        expected.spec.envs.clear();
+        assert_eq!(*brief, expected);
+    }
+
+    // Unfinished jobs per owner, and those depending on a job.
+    assert_eq!(store.count_unfinished_jobs_of(Uid(1)).unwrap(), 2);
+    assert_eq!(store.count_unfinished_jobs_of(Uid(2)).unwrap(), 1);
+    assert_eq!(store.count_unfinished_jobs_of(Uid(3)).unwrap(), 0);
+    assert_eq!(
+        store.unfinished_dependants(dep_ok.id).unwrap(),
+        [waiting.id]
+    );
+    // The finished job depending on job 3 does not count.
+    assert!(store.unfinished_dependants(JobId(3)).unwrap().is_empty());
+}
+
+#[test]
+fn ids_beyond_the_sqlite_range_name_no_job() {
+    let store = Store::open_in_memory().unwrap();
+    assert_eq!(store.get_job(JobId(u64::MAX)).unwrap(), None);
+    assert_eq!(store.get_job(JobId(i64::MAX as u64 + 1)).unwrap(), None);
+    assert!(
+        store
+            .unfinished_dependants(JobId(u64::MAX))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

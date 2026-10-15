@@ -2,6 +2,11 @@
 //!
 //! Job payloads are rendered per subscriber, so users only ever receive the
 //! redacted view of other users' jobs.
+//!
+//! A subscriber that falls more than the channel's capacity behind misses
+//! events; it is sent [`api::Event::Resync`](gpueue_protocol::api::Event)
+//! instead, so it re-reads the state rather than waiting for a change it
+//! will never hear about.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -46,25 +51,24 @@ pub async fn events(
         if sub.done {
             return None;
         }
-        loop {
-            let event = tokio::select! {
-                _ = sub.cancel.cancelled() => return None,
-                event = sub.events.recv() => event,
-            };
-            match event {
-                Ok(event) => {
-                    sub.done = matches!(event, DaemonEvent::Shutdown);
-                    let api_event = event.to_api(&sub.caller);
-                    let data = serde_json::to_string(&api_event).expect("events serialize");
-                    let sse = SseEvent::default().event(api_event.name()).data(data);
-                    return Some((Ok(sse), sub));
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::debug!(skipped, "an event subscriber lagged behind");
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
+        let event = tokio::select! {
+            _ = sub.cancel.cancelled() => return None,
+            event = sub.events.recv() => event,
+        };
+        let api_event = match event {
+            Ok(event) => {
+                sub.done = matches!(event, DaemonEvent::Shutdown);
+                event.to_api(&sub.caller)
             }
-        }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::debug!(skipped, "an event subscriber lagged behind; resyncing it");
+                gpueue_protocol::api::Event::Resync
+            }
+            Err(broadcast::error::RecvError::Closed) => return None,
+        };
+        let data = serde_json::to_string(&api_event).expect("events serialize");
+        let sse = SseEvent::default().event(api_event.name()).data(data);
+        Some((Ok(sse), sub))
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
