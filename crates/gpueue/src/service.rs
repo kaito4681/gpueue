@@ -37,7 +37,8 @@ const CONFIG_DIR: &str = "/etc/gpueue";
 /// Directories the units may run the binaries from without copying them.
 const SYSTEM_BIN_DIRS: &[&str] = &["/usr/bin", "/usr/local/bin"];
 
-/// Data removed by `uninstall --purge`.
+/// Data removed by `uninstall --purge`, with the directories `config.toml` moves it to (see
+/// [`PurgePlan::new`]).
 const PURGE_DIRS: &[&str] = &[
     "/var/lib/gpueue",
     CONFIG_DIR,
@@ -1053,10 +1054,20 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
         )
         .ok();
     }
+    // What --purge deletes depends on config.toml (which it deletes too): read it first.
+    let plan = if options.purge {
+        PurgePlan::new(sys)?
+    } else {
+        PurgePlan::default()
+    };
     if options.purge && !options.yes {
         let prompt = format!(
             "Delete {} (configuration, state, logs and checkpoint images)?",
-            PURGE_DIRS.join(", ")
+            plan.dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         if !sys.confirm(&prompt) {
             return Err("aborted; nothing was changed".to_owned());
@@ -1119,7 +1130,15 @@ pub fn uninstall(sys: &dyn System, options: &UninstallOptions, out: &mut dyn Wri
     }
 
     if options.purge {
-        purge(sys, &remove_dir, out)?;
+        purge(sys, &plan.dirs, &remove_dir, out)?;
+        for file in &plan.kept_files {
+            writeln!(
+                out,
+                "kept {} (state_db is outside the purged directories; delete it by hand)",
+                file.display()
+            )
+            .ok();
+        }
         writeln!(
             out,
             "The system user gpueue and the group {ADMIN_GROUP} are kept."
@@ -1144,13 +1163,86 @@ fn remove_dir(parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> nix::Res
     nix::unistd::unlinkat(parent, name, nix::unistd::UnlinkatFlags::RemoveDir)
 }
 
-/// Deletes [`PURGE_DIRS`] with [`remove_tree`], reporting what is kept. What cannot be deleted
-/// below a purge directory (a mount point, or a directory a user keeps adding files to) is
-/// reported and the rest is still deleted.
-fn purge(sys: &dyn System, remove_dir: &RemoveDir<'_>, out: &mut dyn Write) -> Result<()> {
+/// What `uninstall --purge` deletes.
+#[derive(Debug, Default)]
+struct PurgePlan {
+    /// [`PURGE_DIRS`], then the directories `config.toml` sets outside them (system paths).
+    dirs: Vec<PathBuf>,
+    /// A `state_db` outside `dirs`: it is in a directory of the daemon user's, so it is not
+    /// deleted.
+    kept_files: Vec<PathBuf>,
+}
+
+impl PurgePlan {
+    /// [`PURGE_DIRS`] and the directories `config.toml` moves the data to (`data_dir`,
+    /// `helper_state_dir`, `logs_dir`, `checkpoints_dir`). The file must pass the helper's trust
+    /// check, and each configured directory must be one the helper accepts: it and the
+    /// directories above it owned by root and not group/world-writable
+    /// ([`check_root_owned_chain`]). `/`, and a directory that contains another one deleted
+    /// here, are refused.
+    fn new(sys: &dyn System) -> Result<Self> {
+        let loaded = doctor::load_config(sys);
+        if !loaded.trusted || loaded.check.level == doctor::Level::Fail {
+            return Err(format!(
+                "refusing to purge: {DEFAULT_CONFIG_PATH} cannot be used ({}), so the \
+                 directories it names are unknown; fix it, or delete it to purge only the \
+                 default directories",
+                loaded.check.message
+            ));
+        }
+        let config = loaded.config;
+        let mut dirs: Vec<PathBuf> = PURGE_DIRS.iter().map(PathBuf::from).collect();
+        let configured = [
+            ("data_dir", config.data_dir.clone()),
+            ("helper_state_dir", config.helper_state_dir()),
+            ("logs_dir", config.logs_dir()),
+            ("checkpoints_dir", config.checkpoints_dir()),
+        ];
+        for (key, dir) in configured {
+            if dirs.iter().any(|purged| dir.starts_with(purged)) {
+                continue;
+            }
+            // `/`, or a directory with more in it than gpueue's (`data_dir = "/var/lib"`).
+            if !dir.is_absolute()
+                || dir.parent().is_none()
+                || dirs.iter().any(|d| d.starts_with(&dir))
+            {
+                return Err(format!(
+                    "refusing to purge `{key}` = {}: not a directory gpueue may delete",
+                    dir.display()
+                ));
+            }
+            check_root_owned_chain(sys, &dir).map_err(|err| {
+                format!(
+                    "refusing to purge `{key}` = {}: {err} (the helper does not use it either)",
+                    dir.display()
+                )
+            })?;
+            dirs.push(dir);
+        }
+        let state_db = config.state_db_path();
+        let kept_files = if dirs.iter().any(|dir| state_db.starts_with(dir)) {
+            Vec::new()
+        } else {
+            vec![state_db]
+        };
+        Ok(Self { dirs, kept_files })
+    }
+}
+
+/// Deletes `dirs` (a [`PurgePlan`]) with [`remove_tree`], reporting what is kept. What cannot be
+/// deleted below a purge directory (a mount point, or a directory a user keeps adding files to)
+/// is reported and the rest is still deleted.
+fn purge(
+    sys: &dyn System,
+    dirs: &[PathBuf],
+    remove_dir: &RemoveDir<'_>,
+    out: &mut dyn Write,
+) -> Result<()> {
     let mounts = mount_points(sys);
-    for dir in PURGE_DIRS {
-        let path = Path::new(dir);
+    for path in dirs {
+        let path = path.as_path();
+        let dir = path.display();
         if sys.path(path).symlink_metadata().is_err() {
             continue;
         }
@@ -1249,7 +1341,8 @@ fn remove_tree(
     let (Some(parent), Some(name)) = (local.parent(), local.file_name()) else {
         return Err(format!("refusing to remove {}", path.display()));
     };
-    // The parents (/var/lib, /etc, /run) are root's; only what is below them is walked by fd.
+    // The parents (/var/lib, /etc, /run, or those of configured directories, which
+    // `PurgePlan::new` checked) are root's; only what is below them is walked by fd.
     let parent_fd = open(
         parent,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
