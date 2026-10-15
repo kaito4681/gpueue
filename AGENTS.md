@@ -43,8 +43,13 @@
   its list in sync with the source fileset in `packaging/nix/package.nix`). Pushing a `v<version>` tag runs
   `.github/workflows/release.yml`, which builds and signs the tarballs, `.deb` and `.rpm`
   packages and attaches them, with `install.sh` and `RPM-GPG-KEY-gpueue`, to a draft GitHub
-  release. Publishing the release triggers `release-apt.yml` (APT repository) and `release-aur.yml`
-  (AUR); the tag itself triggers `release-nix.yml` (moves the `stable` branch).
+  release. Publishing the release as a stable one (`release: released`, not the tag push) triggers
+  `release-apt.yml` (APT repository), `release-aur.yml` (AUR) and `release-nix.yml` (moves the
+  `stable` branch); each can also be run by hand (`workflow_dispatch`), which is needed when the
+  release was published with a workflow's `GITHUB_TOKEN`. Release workflows are read-only by
+  default and grant `contents: write` only to the job that writes (creates the release, uploads
+  the APT files, pushes `stable`); checkouts use `persist-credentials: false` except where the job
+  pushes with git.
 - Other test scripts: `scripts/service-install-test.sh` (`gpueue service install` / `status` /
   `uninstall` and `doctor`), `scripts/helper-systemd-test.sh` (the helper alone under systemd),
   `scripts/measure-checkpoint.sh` (times each checkpoint step; not a pass/fail test).

@@ -26,7 +26,7 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 # One update of the `apt` release at a time, none cancelled.
 concurrency:
@@ -36,6 +36,10 @@ concurrency:
 jobs:
   apt-repo:
     runs-on: ubuntu-24.04
+    # Uploads the repository's files to the `apt` release with gh (GH_TOKEN);
+    # the checkout keeps no token.
+    permissions:
+      contents: write
     timeout-minutes: 30
     env:
       TAG: ${{ inputs.tag || github.event.release.tag_name }}
@@ -56,6 +60,8 @@ jobs:
       # minisign key from the tag's commit.
       - if: steps.gate.outputs.publish == 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - if: steps.gate.outputs.publish == 'true'
         name: Install apt-ftparchive
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends apt-utils
