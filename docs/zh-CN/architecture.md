@@ -238,7 +238,9 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   `nvidia-persistenced` 和 `nvidia-fabricmanager` 之后运行，因此在它停止期间这些服务仍然可用。
   收到 SIGTERM 时，helper 会询问 systemd 整个系统是否正在停止。如果是，它会拒绝新的工作，
   逐个转储每个运行中的作业（`--no-checkpoint` 作业除外），并不断延长自己的停止超时，直到正在进行的转储的期限结束
-  （再加上其回滚时间），然后写入 `shutdown-manifest.json`。每次检查点和恢复都有一个随作业大小而变化的期限；
+  （再加上其回滚时间），然后写入 `shutdown-manifest.json`。整个关机过程受关机目标（`reboot.target` 等）的
+  `JobTimeoutSec=` 限制，超过后 systemd 会强制关闭机器；gpueue 的 drop-in 将其从 systemd 的 30 分钟调高到
+  2 小时（见 [关机超时](install.md#shutdown-timeouts)）。每次检查点和恢复都有一个随作业大小而变化的期限；
   超过期限时，该工具的整个进程树会被终止，检查点会被回滚（作业被解冻，其 CUDA 状态被恢复并解锁；
   在插件模式下，被终止的 CRIU 的插件可能让 CUDA 进程停留在锁定或已创建检查点的状态，helper 会通过
   `cuda-checkpoint --get-state` 查询，并按需恢复和解锁它们）。暂停的作业也会被转储

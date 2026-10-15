@@ -46,8 +46,15 @@ KillMode=mixed
 # without that. Jobs are dumped sequentially; measured on an NVMe disk, a
 # dump takes about 2-2.5 s per GiB of RSS + VRAM, so 30 min covers several
 # hundred GiB in total, and ~50 GiB even at the deadline's rate of 30 s/GiB
-# (see docs/install.md, "Checkpoint timeouts"). Raise it for larger jobs or
-# slower disks.
+# (see docs/install.md, "Checkpoint timeouts").
+# Neither this nor the extensions can make a shutdown last longer than the
+# JobTimeoutSec= of reboot.target, poweroff.target, halt.target, kexec.target
+# and soft-reboot.target: it runs from when the shutdown is queued, and when
+# it passes systemd forces the machine down, also in the middle of a dump.
+# systemd's default is 30 min; gpueue ships drop-ins
+# (<target>.d/gpueue.conf, from packaging/systemd/shutdown-target-timeout.conf)
+# that raise it to 2 h. For larger jobs or slower disks raise both, and keep
+# JobTimeoutSec= above this (docs/install.md, "Shutdown timeouts").
 TimeoutStopSec=30min
 Restart=on-failure
 RestartSec=2s

@@ -81,6 +81,13 @@ test -S /run/gpueue/gpueue.sock || fail "no daemon socket"
 test -f /var/lib/gpueue/daemon/state.sqlite || fail "no state db"
 [ "$(stat -c %U /var/lib/gpueue)" = root ] || fail "/var/lib/gpueue not root-owned"
 grep -q "OK    helper: connected" /tmp/install.out || fail "helper not connected after install"
+# The drop-ins raise the shutdown targets' JobTimeoutSec= (30 min by default).
+for target in reboot poweroff halt kexec; do
+    [ "$(systemctl show -p JobTimeoutUSec --value "$target.target")" = 2h ] ||
+        fail "$target.target: $(systemctl show -p JobTimeoutUSec -p JobRunningTimeoutUSec "$target.target")"
+    [ "$(systemctl show -p JobRunningTimeoutUSec --value "$target.target")" = 2h ] ||
+        fail "$target.target: JobRunningTimeoutUSec not raised"
+done
 
 step "status (as alice)"
 runuser -u alice -- gpueue service status
@@ -126,6 +133,11 @@ dpkg -r gpueue >/dev/null
 step "gpueue uninstall keeps data and removes the copied binaries"
 /usr/local/bin/gpueue uninstall | tee /tmp/uninstall.out
 test ! -e /etc/systemd/system/gpueue.service || fail "unit left behind"
+for target in reboot poweroff halt kexec soft-reboot; do
+    test ! -e "/etc/systemd/system/$target.target.d" || fail "$target.target.d left behind"
+done
+[ "$(systemctl show -p JobTimeoutUSec --value reboot.target)" = 30min ] ||
+    fail "reboot.target still has JobTimeoutUSec=$(systemctl show -p JobTimeoutUSec --value reboot.target)"
 systemctl is-active gpueue.service && fail "daemon still active"
 test -f /var/lib/gpueue/daemon/state.sqlite || fail "state removed without --purge"
 test ! -e /usr/local/bin/gpueue || fail "copied gpueue left behind"

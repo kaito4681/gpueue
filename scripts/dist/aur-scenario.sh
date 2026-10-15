@@ -53,7 +53,9 @@ for f in /usr/bin/gpueue /usr/bin/gpueue-helper \
     /usr/lib/sysusers.d/gpueue.conf /usr/lib/tmpfiles.d/gpueue.conf /etc/gpueue/config.toml \
     /usr/share/bash-completion/completions/gpueue /usr/share/zsh/site-functions/_gpueue \
     /usr/share/fish/vendor_completions.d/gpueue.fish /usr/share/licenses/gpueue-bin/LICENSE \
-    /usr/share/doc/gpueue-bin/install.md; do
+    /usr/share/doc/gpueue-bin/install.md /usr/lib/systemd/system/reboot.target.d/gpueue.conf \
+    /usr/lib/systemd/system/poweroff.target.d/gpueue.conf /usr/lib/systemd/system/halt.target.d/gpueue.conf \
+    /usr/lib/systemd/system/kexec.target.d/gpueue.conf /usr/lib/systemd/system/soft-reboot.target.d/gpueue.conf; do
     [ -s "$f" ] || fail "$f is missing or empty"
 done
 grep -qx 'ExecStart=/usr/bin/gpueue daemon' /usr/lib/systemd/system/gpueue.service ||
@@ -67,6 +69,8 @@ getent group gpueue-admin >/dev/null || fail "no gpueue-admin group (sysusers ho
 [ "$(stat -c %U:%a /etc/gpueue /etc/gpueue/config.toml)" = "$(printf 'root:755\nroot:644')" ] ||
     fail "/etc/gpueue must be owned by root"
 systemctl is-enabled -q gpueue.service && fail "gpueue.service was enabled by the package"
+[ "$(systemctl show -p JobTimeoutUSec --value reboot.target)" = 2h ] ||
+    fail "reboot.target: JobTimeoutUSec=$(systemctl show -p JobTimeoutUSec --value reboot.target)"
 
 step "enable the services and run a job"
 systemctl enable --now gpueue-helper.service gpueue.service

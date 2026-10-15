@@ -31,3 +31,9 @@ for _ in $(seq 100); do
     sleep 0.1
 done
 systemctl is-active gpueue-helper.service gpueue.service
+# The simulated reboot stops the container through the shutdown targets, whose
+# JobTimeoutSec= (30 min by default) the installed drop-ins raise.
+for target in reboot poweroff halt kexec; do
+    timeout="$(systemctl show -p JobTimeoutUSec --value "$target.target")"
+    [ "$timeout" = 2h ] || { echo "FAIL: $target.target has JobTimeoutUSec=$timeout" >&2; exit 1; }
+done

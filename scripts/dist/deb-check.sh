@@ -38,7 +38,10 @@ for f in ./usr/bin/gpueue ./usr/bin/gpueue-helper \
     ./usr/lib/sysusers.d/gpueue.conf ./usr/lib/tmpfiles.d/gpueue.conf ./etc/gpueue/config.toml \
     ./etc/apt/sources.list.d/gpueue.sources ./etc/apt/keyrings/gpueue.gpg \
     ./usr/share/bash-completion/completions/gpueue ./usr/share/zsh/vendor-completions/_gpueue \
-    ./usr/share/fish/vendor_completions.d/gpueue.fish ./usr/share/doc/gpueue/copyright; do
+    ./usr/share/fish/vendor_completions.d/gpueue.fish ./usr/share/doc/gpueue/copyright \
+    ./usr/lib/systemd/system/reboot.target.d/gpueue.conf ./usr/lib/systemd/system/poweroff.target.d/gpueue.conf \
+    ./usr/lib/systemd/system/halt.target.d/gpueue.conf ./usr/lib/systemd/system/kexec.target.d/gpueue.conf \
+    ./usr/lib/systemd/system/soft-reboot.target.d/gpueue.conf; do
     grep -q " $f\$" /tmp/contents || fail "$f is not in the package"
 done
 dpkg-deb --ctrl-tarfile "$deb" | tar -xOf - ./conffiles >/tmp/conffiles
@@ -66,6 +69,10 @@ for unit in gpueue.service gpueue-helper.service; do
 done
 grep -qx 'ExecStart=/usr/bin/gpueue daemon' /usr/lib/systemd/system/gpueue.service || fail "daemon ExecStart="
 grep -qx 'ExecStart=/usr/bin/gpueue-helper serve' /usr/lib/systemd/system/gpueue-helper.service || fail "helper ExecStart="
+for target in reboot poweroff halt kexec soft-reboot; do
+    grep -qx 'JobTimeoutSec=2h' "/usr/lib/systemd/system/$target.target.d/gpueue.conf" ||
+        fail "$target.target.d/gpueue.conf does not raise JobTimeoutSec="
+done
 getent passwd gpueue >/dev/null || fail "no user gpueue"
 getent group gpueue-admin >/dev/null || fail "no group gpueue-admin"
 [ "$(stat -c '%U %G %a' /var/lib/gpueue)" = "root root 755" ] || fail "/var/lib/gpueue: $(stat -c '%U %G %a' /var/lib/gpueue)"
@@ -102,7 +109,8 @@ mkdir -p /var/lib/gpueue/logs/1000
 echo log >/var/lib/gpueue/logs/1000/job.log
 dpkg -r gpueue
 must_not_exist /usr/bin/gpueue /usr/bin/gpueue-helper /usr/lib/systemd/system/gpueue.service \
-    /etc/systemd/system/multi-user.target.wants/gpueue.service
+    /etc/systemd/system/multi-user.target.wants/gpueue.service \
+    /usr/lib/systemd/system/reboot.target.d/gpueue.conf
 must_exist /etc/gpueue/config.toml /etc/apt/sources.list.d/gpueue.sources /etc/apt/keyrings/gpueue.gpg \
     /var/lib/gpueue/logs/1000/job.log
 [ "$(dpkg-query -W -f='${Status}' gpueue)" = "deinstall ok config-files" ] || fail "not in config-files state"

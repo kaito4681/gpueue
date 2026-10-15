@@ -343,6 +343,7 @@ trusted comment にはリリースとバージョンなしのファイル名が�
 | --- | --- |
 | `/usr/bin/gpueue`、`/usr/bin/gpueue-helper` | バイナリ |
 | `/usr/lib/systemd/system/gpueue.service`、`gpueue-helper.service` | ユニット（`ExecStart=/usr/bin/...`） |
+| `/usr/lib/systemd/system/<target>.d/gpueue.conf` | `reboot.target`、`poweroff.target`、`halt.target`、`kexec.target`、`soft-reboot.target` の `JobTimeoutSec=` を延ばすドロップイン（[シャットダウンのタイムアウト](#shutdown-timeouts) を参照） |
 | `/usr/lib/sysusers.d/gpueue.conf`、`/usr/lib/tmpfiles.d/gpueue.conf` | `gpueue` ユーザー、`gpueue-admin` グループ、ディレクトリ |
 | `/etc/gpueue/config.toml` | デフォルトの設定（conffile：アップグレードしても編集内容は保持されます） |
 | `/etc/apt/sources.list.d/gpueue.sources`、`/etc/apt/keyrings/gpueue.gpg` | gpueue の APT リポジトリとその署名鍵（conffile、後述） |
@@ -647,8 +648,9 @@ flake の NixOS モジュール（`nixosModules.default`、ファイル `packagi
 
 - **ユニット。** `gpueue.service` と `gpueue-helper.service` は、モジュールの flake のリビジョンにある
   `packaging/systemd` のファイルで、`ExecStart=` はストアを指します。tmpfiles.d のエントリーは
-  `packaging/tmpfiles.d/gpueue.conf` です。`package` を別のリビジョンにしても、ユニットはモジュールの
-  リビジョンのものになります。2 つは揃えておいてください。
+  `packaging/tmpfiles.d/gpueue.conf` です。シャットダウン用ターゲットの `JobTimeoutSec=` を延ばすドロップイン
+  （[シャットダウンのタイムアウト](#shutdown-timeouts) を参照）もそこから来ます。`package` を別のリビジョンにしても、
+  ユニットはモジュールのリビジョンのものになります。2 つは揃えておいてください。
 - **設定ファイル。** ヘルパーは root として動き、root 以外の誰も変更できない通常ファイルだけを読み、
   シンボリックリンクは決して読みません。そのためモジュールは、ファイルをストアにリンクする代わりに、NixOS に
   `/etc/gpueue/config.toml`（モード 0644、root の所有）へコピーさせます。
@@ -823,7 +825,8 @@ cd gpueue-bin
 makepkg -si
 ```
 
-`/usr/bin/gpueue` と `/usr/bin/gpueue-helper`、`/usr/lib/systemd/system` のユニット、`/usr/lib` の
+`/usr/bin/gpueue` と `/usr/bin/gpueue-helper`、`/usr/lib/systemd/system` のユニットとシャットダウン用ターゲットの
+ドロップイン（[シャットダウンのタイムアウト](#shutdown-timeouts) を参照）、`/usr/lib` の
 `sysusers.d` と `tmpfiles.d` の断片、デフォルトの `/etc/gpueue/config.toml`（変更した場合はアップグレードや
 削除のときも保持されます）、bash、zsh、fish の補完をインストールします。pacman の systemd フックが
 `gpueue` ユーザー、`gpueue-admin` グループ、ディレクトリを作成します。Arch の慣例どおり、サービスは自動では
@@ -985,6 +988,10 @@ NixOS 以外で Nix でビルドした場合（`nix build` のあと `sudo ./res
      [packaging/systemd/gpueue.service](../../packaging/systemd/gpueue.service) から）
    - `/etc/sysusers.d/gpueue.conf`：システムユーザー `gpueue` とグループ `gpueue-admin` を定義します
    - `/etc/tmpfiles.d/gpueue.conf`：下に挙げるディレクトリ
+   - `reboot.target`、`poweroff.target`、`halt.target`、`kexec.target`、`soft-reboot.target` の
+     `/etc/systemd/system/<target>.d/gpueue.conf`：シャットダウンにかけられる時間を延ばします（
+     [packaging/systemd/shutdown-target-timeout.conf](../../packaging/systemd/shutdown-target-timeout.conf) から。
+     [シャットダウンのタイムアウト](#shutdown-timeouts) を参照）
 3. そのファイルについて `systemd-sysusers` を実行し、必要なら `groupadd --system gpueue-admin` を実行します。
 4. そのファイルについて `systemd-tmpfiles --create` を実行し、次のものを作成します。
 
@@ -1086,13 +1093,51 @@ sudo systemctl restart gpueue.service
 設定したディレクトリがユニットの実効的な `ReadWritePaths=` の外にあると、`gpueue doctor` が警告します
 （`daemon write paths`）。
 
-ヘルパーの `TimeoutStopSec=30min` は、システムのシャットダウン時にすべてのジョブをチェックポイントするための
-初期の持ち時間です。ダンプの間、ヘルパーは systemd に時間の延長を求め続けます（`EXTEND_TIMEOUT_USEC`）が、
-それは実行中のダンプの期限とそのロールバックの終わりまでなので（[チェックポイントのタイムアウト](#checkpoint-timeouts)
-を参照）、止まったダンプがシャットダウンを永遠に引き止めることはありません。ジョブは 1 つずつダンプされます。
-延長を無視する systemd のバージョンでは、30 分で、期限が許す速度（30 s/GiB）なら合計約 50 GiB の RSS + VRAM、
-NVMe ディスクで測定した速度（約 2.5 s/GiB）なら数百 GiB をカバーします。ジョブがもっと大きいかディスクが
-もっと遅い場合は、ドロップインで延ばしてください。
+<a id="shutdown-timeouts"></a>
+### シャットダウンのタイムアウト
+
+システムのシャットダウン時に、ヘルパーがジョブのチェックポイントに使える時間は、systemd の 2 つのタイムアウトで
+制限されます。
+
+- **ヘルパーの `TimeoutStopSec=30min`** は、すべてのジョブをダンプするための初期の持ち時間です。ダンプの間、
+  ヘルパーは systemd に時間の延長を求め続けます（`EXTEND_TIMEOUT_USEC`）が、それは実行中のダンプの期限と
+  そのロールバックの終わりまでなので（[チェックポイントのタイムアウト](#checkpoint-timeouts) を参照）、
+  止まったダンプがシャットダウンを永遠に引き止めることはありません。ジョブは 1 つずつダンプされます。
+- **シャットダウン用ターゲット**（`reboot.target`、`poweroff.target`、`halt.target`、`kexec.target`、
+  `soft-reboot.target`）**の `JobTimeoutSec=`** は、シャットダウン全体の上限です。シャットダウンがキューに
+  入った時点から数えられ、これを過ぎると systemd はマシンを即座に強制停止します（`JobTimeoutAction=reboot-force`
+  など）。`criu dump` の途中でも同じで、そのジョブにはチェックポイントが残りません。`TimeoutStopSec=` も
+  ヘルパーの延長も、シャットダウンをこれより長くすることはできません。systemd の値は 30 分です。gpueue の
+  すべてのインストール方法（`.deb` と `.rpm`、AUR パッケージ、NixOS モジュール、`gpueue service install`）は
+  ドロップイン `<target>.d/gpueue.conf`（
+  [packaging/systemd/shutdown-target-timeout.conf](../../packaging/systemd/shutdown-target-timeout.conf) から）を
+  追加し、これを **2 時間** に延ばします。
+
+2 時間あれば、期限が許す速度（30 s/GiB）で合計約 200 GiB の RSS + VRAM、NVMe ディスクで測定した速度
+（約 2.5 s/GiB）なら数 TiB をカバーします。有効な値は次のように確認できます。
+
+```sh
+systemctl show -p TimeoutStopUSec gpueue-helper.service
+systemctl show -p JobTimeoutUSec reboot.target poweroff.target halt.target kexec.target
+```
+
+ジョブがもっと大きいかディスクがもっと遅い場合は両方を延ばし、`JobTimeoutSec=` は `TimeoutStopSec=` に
+他のサービスの停止にかかる時間を足したものより大きく保ってください。`/etc` にあり、並び順で `gpueue.conf` より
+後になる名前のドロップイン（`systemctl edit` が書く `override.conf` など）が優先されます。
+
+```sh
+sudo systemctl edit gpueue-helper.service
+# [Service]
+# TimeoutStopSec=2h
+for target in reboot poweroff halt kexec soft-reboot; do
+  sudo mkdir -p /etc/systemd/system/$target.target.d
+  printf '[Unit]\nJobTimeoutSec=4h\n' | sudo tee /etc/systemd/system/$target.target.d/override.conf
+done
+sudo systemctl daemon-reload
+```
+
+`JobTimeoutSec=infinity` にすると上限はなくなりますが、別の理由で止まったシャットダウンが自力で終わることも
+なくなります。
 
 <a id="checkpoint-timeouts"></a>
 ### チェックポイントのタイムアウト

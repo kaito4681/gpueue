@@ -19,7 +19,7 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-nix-stable
@@ -28,6 +28,10 @@ concurrency:
 jobs:
   stable-branch:
     runs-on: ubuntu-24.04
+    # Pushes the stable branch with the token the checkout keeps in
+    # .git/config; the job runs nothing but its own shell, git and gh.
+    permissions:
+      contents: write
     env:
       TAG: ${{ inputs.tag || github.event.release.tag_name }}
       GH_TOKEN: ${{ github.token }}
