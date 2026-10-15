@@ -256,7 +256,9 @@ pub struct PriorityConfig {
     pub tres_billing_weights: String,
     /// Slurm's `SchedulerParameters=enable_user_top`: users may move their
     /// own jobs to the top of their queue (`puzuz top`); administrators
-    /// always may.
+    /// always may. A user's immediate launches (`start <id>`, `add -i`,
+    /// `restart -i`, `restore -i`) queue the job first among their jobs
+    /// with it, and just queue it without it.
     pub enable_user_top: bool,
 }
 

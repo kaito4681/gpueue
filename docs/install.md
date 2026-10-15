@@ -1333,13 +1333,30 @@ time, weeks on Sunday). Usage below 0.001 billing-seconds is dropped.
 **A user's own order.** pueue's `-o/--priority`, `puzuz switch` and `puzuz top` only order the
 jobs of one user, like HTCondor's `condor_prio` and Slurm's `scontrol top`: the order is jobs
 moved to the top first (the most recent `top` first), then higher `-o` priority, then lower id.
-puzuz applies it by handing out the ages of a user's pending jobs that can start (their
-dependencies are done) in that order (the oldest age to the first job), so the sum of the user's
-priorities, and every other user's position, stays the same; a job waiting for a dependency
-keeps an age of 0. Remaining ties go by the user's order, then by id. **This is a change from pueue,**
+puzuz applies it by pooling the ages of a user's pending jobs that could launch now and handing
+them out in that order (the oldest age to the first job), so the sum of the user's priorities,
+and every other user's position, stays the same. A job could launch now when its group exists
+and is not paused, every GPU it asks for was detected, and its dependencies are done; waiting
+for a free group or GPU slot is ordinary queueing and does not exclude a job. A job that cannot
+launch now lends no age to the user's other jobs: it keeps its own age (a job waiting for a
+dependency has an age of 0, counted from when the dependency finished) and joins the pool once
+it can launch, so an old job parked in a paused group cannot lift the user's newest job ahead of
+other users' jobs. Remaining ties go by the user's order, then by id. **This is a change from pueue,**
 where a higher `-o` priority wins over every other job. `priority_type = "basic"` restores
 pueue's order (higher `-o` priority first, then lower id, for all jobs; nice, site factors, `top`
 and fair share are then ignored).
+
+**Immediate launches.** In pueue, `start <id>` of a queued or stashed job, `add -i`, `restart -i`
+and `restore -i` start the job right away. In puzuz only administrators' do: their job starts at
+once, ignoring the group's `parallel` limit, GPU slots, a paused group and dependencies. For
+anybody else these commands put the job (for `restart -i`, the new copy; for `restore -i`, the
+restore) first among their own queued jobs, exactly like `puzuz top`. The job then competes with
+other users' jobs by the priority above, and the group's `parallel` limit, GPU slots, a paused
+group and its dependencies apply as for any queued job; the command says that the job was queued
+first among your jobs rather than started, and the API reply carries `"queued": "first"`. With
+`enable_user_top = false`, or with `priority_type = "basic"` (where the owner's order does not
+apply), the job is queued like any other job without being moved (`"queued": "in_line"`).
+`start` of a paused job resumes it, as before.
 
 **Commands.**
 

@@ -27,25 +27,28 @@
 //! [`puzuz_protocol::api::WARNINGS_HEADER`]). `GET /v1/version` reports the
 //! usage for `puzuz doctor`.
 //!
-//! When the helper is not connected, launches asked for explicitly (`add
-//! --immediate`, `start` of a queued or stashed job, `restore --immediate`,
-//! `restart --immediate`) do not fail: the job is queued (or queued for
-//! restore) and launched as soon as the helper is back, still ignoring
-//! slots and dependencies; the reply's `launch_pending` says so. Actions on
+//! Launches asked for explicitly (`add --immediate`, `start` of a queued
+//! or stashed job, `restore --immediate`, `restart --immediate`) are
+//! immediate only for administrators (root or `puzuz-admin`): their job
+//! starts right away, ignoring the group's and the GPUs' slots, a paused
+//! group and dependencies. Anybody else's job is queued (or queued for
+//! restore) first among their own jobs, like `puzuz top`, and then competes
+//! with other users' jobs by priority under every limit, dependencies
+//! included; with `enable_user_top = false` or `priority_type = "basic"`
+//! it is just queued. The reply's `queued` says which.
+//!
+//! When the helper is not connected, an administrator's explicit launches
+//! do not fail: the job is queued (or queued for restore) and launched as
+//! soon as the helper is back, still ignoring slots and dependencies; the
+//! reply's `launch_pending` says so. Actions on
 //! a live process (`pause`, `kill`, `checkpoint`, resuming a paused job)
 //! still fail with `helper_unavailable`. A spawn or restore the helper did
 //! not carry out because it is stopping (refused with `shutting_down`, or
 //! accepted and then abandoned before systemd started its unit), or whose
 //! answer was lost while the helper never started it, is put back in line
 //! the same way and retried; no restore error is recorded for it. The "launch
-//! ahead of the queue" mark is kept in memory only: after a daemon restart
+//! regardless of slots" mark is kept in memory only: after a daemon restart
 //! such a job waits for a slot like any other.
-//!
-//! Launching actions skip the queue and the group's `parallel` limit. Only
-//! an administrator's (root or `puzuz-admin`) also ignore GPU slots and a
-//! paused group; anybody else's job waits in line, ahead of all others,
-//! until its GPUs have a free slot and its group is resumed (the reply and
-//! the job's view say why it waits, see [`puzuz_core::scheduler::LaunchWait`]).
 //!
 //! Job logs live in `<logs_dir>/<uid>/`, which the helper creates owned by
 //! the job's owner and writable by the daemon's group. The owner controls

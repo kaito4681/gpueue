@@ -244,5 +244,8 @@
 
 # Users may move their own queued jobs to the top of their queue with
 # `puzuz top` (Slurm's SchedulerParameters=enable_user_top); administrators
-# always may.
+# always may. It also decides what a user's `start <id>`, `add -i`,
+# `restart -i` and `restore -i` do: with true the job is queued first among
+# the user's jobs, with false it is just queued (only administrators start
+# jobs right away).
 # enable_user_top = true

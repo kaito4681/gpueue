@@ -469,9 +469,8 @@ impl App {
             Some(render::launch_pending_note(id))
         } else {
             response
-                .waiting
-                .as_ref()
-                .map(|wait| render::launch_wait_note(id, wait))
+                .queued
+                .map(|queued| render::queued_note(id, queued))
         };
         if let Some(note) = note {
             if print_task_id {

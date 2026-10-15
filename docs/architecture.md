@@ -40,13 +40,12 @@ puzuz add ──HTTP /v1 over /run/puzuz/puzuz.sock──▶ puzuz daemon ──
 2. **Scheduling.** A queued job starts when its group has a free slot and every requested GPU has
    a free slot. Candidates are considered in priority order (see
    [Priority and fair share](#priority-and-fair-share)). The daemon then asks the helper to spawn
-   it. Immediate launches (`start <id>`, `add -i`, `restart -i`, `restore -i`) are marked as
-   forced, in memory. An administrator's is launched at once, ignoring every limit. Anybody else's
-   is part of the plan (`scheduler::Reserved::forced`): it goes before every other candidate and
-   skips the group's `parallel` limit and its dependencies, but it still needs a free slot on each
-   of its GPUs and an unpaused group. The action checks this in the same transaction, so a launch
-   that fits starts right away and one that does not is queued with the reason
-   (`scheduler::LaunchWait`), which the reply and the job's view (`waiting`) carry.
+   it. Immediate launches (`start <id>`, `add -i`, `restart -i`, `restore -i`) by an
+   administrator are marked as forced, in memory, and launched at once, ignoring every limit.
+   Anybody else's are not forced: the action queues the job (or queues it for restore) and, in
+   the same transaction, moves it first among the owner's jobs like `puzuz top`
+   (`Core::queue_first`; not with `enable_user_top = false` or `priority_type = "basic"`). The
+   plan then treats it like any queued job; the reply's `queued` says so.
 3. **Daemon → helper.** The daemon keeps one connection to `/run/puzuz/helper.sock` and exchanges
    newline-delimited JSON. A Hello message checks the protocol version first. Then come requests
    with ids, and numbered events from the helper (job exited, checkpoint or restore finished).
@@ -305,7 +304,8 @@ The order of queued jobs is Slurm's multifactor priority (the formula and settin
 scheduler:
 
 - `puzuz-core::priority` is pure: the factors, the formula, the owner's order (top, `-o`
-  priority, id; applied by handing out the ages of a user's eligible jobs in that order), the
+  priority, id; applied by pooling the ages of a user's jobs that could launch now, i.e. group
+  present and not paused, GPUs detected, dependencies done, and handing them out in that order), the
   classic fair-share
   factor `2^(-U/S)`, the decay, the billing of a job and the reset-period boundaries (computed
   from the local UTC offset the daemon passes in). `scheduler::plan_prioritized` orders the

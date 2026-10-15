@@ -281,14 +281,15 @@ s3_limits() {
     grep -qx 'CVD=0' "$LOGS/1001/$b.log" || fail "CUDA_VISIBLE_DEVICES of job $b"
     grep -qx 'CVD=1' "$LOGS/1000/$c.log" || fail "CUDA_VISIBLE_DEVICES of job $c"
 
-    # Immediate launches: a regular user's waits for the GPU slot (ahead of
-    # the queue), an administrator's ignores it.
+    # Immediate launches: a regular user's job is only queued first among
+    # their jobs and waits for the GPU slot; an administrator's ignores it.
     a=$(add alice -g free --gpu 0 -- 'sleep 3')
     wait_state "$a" running
-    b=$(add bob -i -g free --gpu 0 -- 'sleep 0.5')
+    mkdir -p "$STATE"
+    b=$(add bob -i -g free --gpu 0 -- 'sleep 0.5' 2>"$STATE/immediate-note")
     expect_state "$b" queued
-    [ "$(q bob "job($b).get('waiting', {}).get('reason')")" = gpu_slots ] \
-        || fail "job $b does not say it waits for a GPU slot"
+    grep -q "was queued first among your jobs" "$STATE/immediate-note" \
+        || fail "job $b's add -i does not say it was queued: $(cat "$STATE/immediate-note")"
     c=$(add carol -i -g free --gpu 0 -- 'sleep 0.5')
     expect_state "$c" '@(running|done/*)'
     for i in "$a" "$b" "$c"; do wait_state "$i" 'done/*' 30 && expect_state "$i" done/success; done

@@ -87,8 +87,25 @@ impl Env {
         }
     }
 
-    /// Jobs are eligible since they were queued.
+    /// Queued jobs are eligible since they were queued, and launchable.
     fn run(&self, jobs: &[Job]) -> Vec<JobPriority> {
+        self.run_with(jobs, |job| match job.state {
+            JobState::Queued { enqueued_at } => Eligibility {
+                since: Some(enqueued_at),
+                launchable: true,
+            },
+            _ => Eligibility {
+                since: None,
+                launchable: false,
+            },
+        })
+    }
+
+    fn run_with(
+        &self,
+        jobs: &[Job],
+        eligibility: impl Fn(&Job) -> Eligibility,
+    ) -> Vec<JobPriority> {
         let refs: Vec<&Job> = jobs.iter().collect();
         let ctx = Context {
             params: &self.params,
@@ -97,10 +114,7 @@ impl Env {
             groups: &self.groups,
             resources: self.resources,
         };
-        prioritize(&refs, &ctx, |job| match job.state {
-            JobState::Queued { enqueued_at } => Some(enqueued_at),
-            _ => None,
-        })
+        prioritize(&refs, &ctx, eligibility)
     }
 
     fn order(&self, jobs: &[Job]) -> Vec<u64> {
@@ -399,23 +413,52 @@ fn ineligible_jobs_take_no_age_from_runnable_ones() {
     let mut blocked = queued_at(job(1, 1), NOW - 7 * DAY / 2);
     blocked.spec.priority = 10;
     let runnable = queued_at(job(2, 1), NOW - 7 * DAY / 4);
-    let refs = [&blocked, &runnable];
-    let ctx = Context {
-        params: &env.params,
-        now: NOW,
-        fairshare: &env.fairshare,
-        groups: &env.groups,
-        resources: env.resources,
-    };
-    let p = prioritize(&refs, &ctx, |job| match (job.id.0, &job.state) {
-        (1, _) => None,
-        (_, JobState::Queued { enqueued_at }) => Some(*enqueued_at),
-        _ => None,
+    let p = env.run_with(&[blocked, runnable], |job| match (job.id.0, &job.state) {
+        (1, _) => Eligibility {
+            since: None,
+            launchable: false,
+        },
+        (_, JobState::Queued { enqueued_at }) => Eligibility {
+            since: Some(*enqueued_at),
+            launchable: true,
+        },
+        _ => unreachable!(),
     });
     let of = |id| p.iter().find(|p| p.id.0 == id).unwrap();
     assert!(close(of(1).factors.age, 0.0));
     assert!(close(of(2).factors.age, 0.25));
     assert_eq!(p[0].id, JobId(2));
+}
+
+#[test]
+fn unlaunchable_jobs_keep_their_own_age_and_lend_none() {
+    let env = Env::new(only("age", 1000));
+    // User 1: job 1 is 3.5 days old but cannot launch (say its group is
+    // paused); job 2 is new and first in the owner's order (-o 10). User
+    // 2: job 3 is 3 days old. Job 1 must not lend its age to job 2.
+    let parked = queued_at(job(1, 1), NOW - 7 * DAY / 2);
+    let mut new = queued_at(job(2, 1), NOW);
+    new.spec.priority = 10;
+    let other = queued_at(job(3, 2), NOW - 3 * DAY);
+    let p = env.run_with(&[parked, new, other], |job| {
+        let JobState::Queued { enqueued_at } = job.state else {
+            unreachable!()
+        };
+        Eligibility {
+            since: Some(enqueued_at),
+            launchable: job.id.0 != 1,
+        }
+    });
+    let of = |id| p.iter().find(|p| p.id.0 == id).unwrap();
+    // Job 1 keeps its own age, for when it can launch again.
+    assert!(close(of(1).factors.age, 0.5));
+    assert!(close(of(2).factors.age, 0.0));
+    assert!(close(of(3).factors.age, 3.0 / 7.0));
+    let order: Vec<u64> = p.iter().map(|p| p.id.0).collect();
+    assert!(
+        order.iter().position(|&id| id == 3) < order.iter().position(|&id| id == 2),
+        "{order:?}"
+    );
 }
 
 #[test]

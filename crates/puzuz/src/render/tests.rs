@@ -50,7 +50,6 @@ pub(crate) fn job(id: u64, state: JobState) -> JobView {
             envs: None,
             last_error: None,
         }),
-        waiting: None,
     }
 }
 
@@ -355,7 +354,7 @@ fn action_report_lists_successes_and_failures() {
             outcome: ActionOutcome::Ok {
                 new_id: Some(JobId(9)),
                 launch_pending: false,
-                waiting: None,
+                queued: None,
             },
         },
         JobActionResult::error(
@@ -391,7 +390,7 @@ fn action_report_lists_successes_and_failures() {
         outcome: ActionOutcome::Ok {
             new_id,
             launch_pending: true,
-            waiting: None,
+            queued: None,
         },
     };
     let report = action_report(
@@ -410,25 +409,21 @@ fn action_report_lists_successes_and_failures() {
         ]
     );
 
-    // So are forced launches waiting for a GPU slot or a paused group.
-    let waiting = |id, new_id, wait| JobActionResult {
+    // A non-administrator's immediate launches were only queued: the job
+    // is not listed as started; a restarted copy still is.
+    let queued = |id, new_id, queued| JobActionResult {
         id: JobId(id),
         outcome: ActionOutcome::Ok {
             new_id,
             launch_pending: false,
-            waiting: Some(wait),
+            queued: Some(queued),
         },
     };
     let report = action_report(
         &[
-            waiting(
-                6,
-                None,
-                LaunchWait::GpuSlots {
-                    gpus: vec![GpuIndex(0), GpuIndex(2)],
-                },
-            ),
-            waiting(7, Some(JobId(9)), LaunchWait::GroupPaused),
+            JobActionResult::ok(JobId(5)),
+            queued(6, None, QueuedLaunch::First),
+            queued(7, Some(JobId(9)), QueuedLaunch::InLine),
         ],
         "Jobs are being started",
         None,
@@ -437,39 +432,27 @@ fn action_report_lists_successes_and_failures() {
     assert_eq!(
         report.stdout,
         vec![
-            "Jobs are being started: 6, 7 (new id 9)".to_owned(),
-            "Job 6 will start ahead of the queue as soon as GPUs 0, 2 have a free slot \
-             (see `puzuz gpu`) (only the group's parallel limit is skipped)."
+            "Jobs are being started: 5, 7 (new id 9)".to_owned(),
+            "Job 6 was queued first among your jobs instead of being launched right away: \
+             only administrators launch jobs immediately. It runs when its priority allows \
+             (see `puzuz prio`)."
                 .to_owned(),
-            "Job 9 will start ahead of the queue as soon as its group is resumed \
-             (it is paused) (only the group's parallel limit is skipped)."
+            "Job 9 was queued instead of being launched right away: only administrators \
+             launch jobs immediately. It runs when its priority allows (see `puzuz prio`)."
                 .to_owned(),
         ]
     );
-}
-
-#[test]
-fn waiting_forced_launches_say_why_in_status_and_log() {
-    let mut queued = job(4, JobState::Queued { enqueued_at: NOW });
-    queued.waiting = Some(LaunchWait::GpuSlots {
-        gpus: vec![GpuIndex(1)],
-    });
-    assert_eq!(
-        super::state_text(&queued).0,
-        "Queued (waiting for a GPU slot)"
+    // Only queued jobs: no "started" line at all.
+    let report = action_report(
+        &[queued(6, None, QueuedLaunch::First)],
+        "Jobs are being started",
+        None,
+        &Style::PLAIN,
     );
     assert_eq!(
-        super::log_state_text(&queued).0,
-        "queued, starts as soon as GPU 1 has a free slot (see `puzuz gpu`)"
+        report.stdout,
+        vec![super::queued_note(JobId(6), QueuedLaunch::First)]
     );
-    let mut restore = job(5, JobState::RestoreQueued { enqueued_at: NOW });
-    restore.waiting = Some(LaunchWait::GroupPaused);
-    assert_eq!(
-        super::state_text(&restore).0,
-        "Restore queued (waiting, group paused)"
-    );
-    restore.waiting = None;
-    assert_eq!(super::state_text(&restore).0, "Restore queued");
 }
 
 #[test]

@@ -33,16 +33,10 @@
 //!    Restore-queued jobs skip the dependency check: they already ran, so
 //!    their dependencies were satisfied when they first started.
 //!
-//! 4. **Forced launches.** Jobs in [`Reserved::forced`] (`start`, `add
-//!    --immediate`, `restart --immediate` or `restore --immediate` by a
-//!    non-administrator) are considered before every other candidate, in
-//!    id order. They skip the queue order, their group's `parallel` limit
-//!    and (queued jobs) their dependencies, but still need their group to
-//!    exist and not be paused, and a free slot on each of their GPUs. One
-//!    that cannot launch yet is listed in [`Plan::waiting`] with the
-//!    reason ([`LaunchWait`]). It still takes a group slot once launched.
-//!    (An administrator's forced launch ignores every limit; the daemon
-//!    launches those itself before planning.)
+//! There are no forced launches in the plan: an administrator's immediate
+//! launch ignores every limit and the daemon launches it itself before
+//! planning; anybody else's is queued first among their own jobs (like
+//! `puzuz top`) and goes through the rules above like any other job.
 //!
 //! Slots are counted from jobs whose state [`occupies_slot`] plus the jobs
 //! launched earlier in the same plan. A `parallel` value of `0` means
@@ -67,22 +61,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
-
 use crate::model::{Gpu, GpuIndex, Group, Job, JobId, JobResult, JobState, Timestamp, Uid};
 use crate::priority::{self, JobPriority, Params, Resources};
-
-/// Why a forced launch (see [`Reserved::forced`]) cannot launch yet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "reason", rename_all = "snake_case")]
-pub enum LaunchWait {
-    /// Its group is paused; it launches once the group is resumed.
-    GroupPaused,
-    /// These of its GPUs have no free slot.
-    GpuSlots { gpus: Vec<GpuIndex> },
-    /// Its group or one of its GPUs is unknown (or was not detected).
-    Unavailable,
-}
 
 /// What the daemon should do, as decided by [`plan`].
 ///
@@ -101,8 +81,6 @@ pub struct Plan {
     pub start: Vec<JobId>,
     /// Restore-queued jobs to restore from their checkpoint.
     pub restore: Vec<JobId>,
-    /// Forced launches that cannot launch yet, and why (in id order).
-    pub waiting: Vec<(JobId, LaunchWait)>,
 }
 
 impl Plan {
@@ -152,11 +130,6 @@ pub struct Reserved {
     pub gpus: HashMap<GpuIndex, u32>,
     /// Jobs not to launch (a process with their id is still running).
     pub held: HashSet<JobId>,
-    /// Queued or restore-queued jobs to launch before all others, ignoring
-    /// their group's `parallel` limit and dependencies but not paused
-    /// groups and GPU slots (a non-administrator's forced launch, see the
-    /// [module documentation](self)).
-    pub forced: HashSet<JobId>,
 }
 
 /// Decides which jobs to enqueue, fail, start and restore at time `now`.
@@ -210,6 +183,7 @@ pub fn pending_priorities(
     now: Timestamp,
     jobs: &[Job],
     groups: &[Group],
+    gpus: &[Gpu],
     reserved: &Reserved,
     input: &PriorityInput<'_>,
 ) -> Vec<JobPriority> {
@@ -220,6 +194,7 @@ pub fn pending_priorities(
         &prepared.status,
         &prepared.candidates,
         groups,
+        gpus,
         input,
     )
 }
@@ -261,11 +236,7 @@ fn prepare<'a>(
     loop {
         let mut changed = false;
         for job in &by_id {
-            // A forced launch ignores its dependencies.
-            if status[&job.id] != Status::Queued
-                || group_paused(&job.spec.group)
-                || reserved.forced.contains(&job.id)
-            {
+            if status[&job.id] != Status::Queued || group_paused(&job.spec.group) {
                 continue;
             }
             let failed = job
@@ -295,6 +266,31 @@ fn prepare<'a>(
         dependency_failed,
         candidates,
     }
+}
+
+/// How `job`'s age is counted (see [`priority::Eligibility`]): since when
+/// it is eligible, and whether it could launch now if a slot were free.
+///
+/// "Could launch now" uses the same conditions as the launch loop of
+/// [`plan_inner`], except free slots: the group exists and is not paused,
+/// every GPU of `spec.gpus` is in `gpus` (detected), and (queued jobs)
+/// every dependency is done. A job waiting for a busy group or GPU slot is
+/// ordinary queueing and counts as launchable.
+fn eligibility(
+    job: &Job,
+    now: Timestamp,
+    status: &HashMap<JobId, Status>,
+    by_id: &HashMap<JobId, &Job>,
+    groups: &HashMap<&str, &Group>,
+    gpus: &HashSet<GpuIndex>,
+) -> priority::Eligibility {
+    let since = eligible_since(job, now, status, by_id);
+    let launchable = since.is_some()
+        && groups
+            .get(job.spec.group.as_str())
+            .is_some_and(|g| !g.paused)
+        && job.spec.gpus.iter().all(|idx| gpus.contains(idx));
+    priority::Eligibility { since, launchable }
 }
 
 /// When `job` became eligible to start (for the age factor): when it was
@@ -334,19 +330,22 @@ fn order(
     jobs: &[Job],
     status: &HashMap<JobId, Status>,
     candidates: &[&Job],
-    groups: &[Group],
+    group_list: &[Group],
+    gpu_list: &[Gpu],
     input: &PriorityInput<'_>,
 ) -> Vec<JobPriority> {
     let by_id: HashMap<JobId, &Job> = jobs.iter().map(|j| (j.id, j)).collect();
+    let groups: HashMap<&str, &Group> = group_list.iter().map(|g| (g.name.as_str(), g)).collect();
+    let gpus: HashSet<GpuIndex> = gpu_list.iter().map(|g| g.index).collect();
     let ctx = priority::Context {
         params: input.params,
         now,
         fairshare: input.fairshare,
-        groups,
+        groups: group_list,
         resources: input.resources,
     };
     priority::prioritize(candidates, &ctx, |job| {
-        eligible_since(job, now, status, &by_id)
+        eligibility(job, now, status, &by_id, &groups, &gpus)
     })
 }
 
@@ -370,6 +369,7 @@ fn plan_inner(
         ..Plan::default()
     };
 
+    let gpu_list = gpus;
     let groups: HashMap<&str, &Group> = group_list.iter().map(|g| (g.name.as_str(), g)).collect();
     let gpus: HashMap<GpuIndex, &Gpu> = gpus.iter().map(|g| (g.index, g)).collect();
 
@@ -385,7 +385,7 @@ fn plan_inner(
 
     match input {
         Some(input) => {
-            let ordered = order(now, jobs, &status, &candidates, group_list, input);
+            let ordered = order(now, jobs, &status, &candidates, group_list, gpu_list, input);
             let by_id: HashMap<JobId, &Job> = candidates.iter().map(|j| (j.id, *j)).collect();
             candidates = ordered.iter().map(|p| by_id[&p.id]).collect();
         }
@@ -399,56 +399,7 @@ fn plan_inner(
 
     let has_room = |parallel: u32, used: u32| parallel == 0 || used < parallel;
 
-    // Forced launches first, in id order.
-    let mut forced: Vec<&Job> = jobs
-        .iter()
-        .filter(|j| reserved.forced.contains(&j.id) && !reserved.held.contains(&j.id))
-        .filter(|j| {
-            matches!(
-                j.state,
-                JobState::Queued { .. } | JobState::RestoreQueued { .. }
-            )
-        })
-        .collect();
-    forced.sort_by_key(|j| j.id);
-    for job in forced {
-        let job_gpus = dedup(&job.spec.gpus);
-        let wait = match groups.get(job.spec.group.as_str()) {
-            None => Some(LaunchWait::Unavailable),
-            Some(_) if job_gpus.iter().any(|idx| !gpus.contains_key(idx)) => {
-                Some(LaunchWait::Unavailable)
-            }
-            Some(group) if group.paused => Some(LaunchWait::GroupPaused),
-            Some(_) => {
-                let busy: Vec<GpuIndex> = job_gpus
-                    .iter()
-                    .copied()
-                    .filter(|idx| {
-                        !has_room(gpus[idx].parallel, gpu_used.get(idx).copied().unwrap_or(0))
-                    })
-                    .collect();
-                (!busy.is_empty()).then_some(LaunchWait::GpuSlots { gpus: busy })
-            }
-        };
-        if let Some(wait) = wait {
-            out.waiting.push((job.id, wait));
-            continue;
-        }
-        *group_used.entry(job.spec.group.as_str()).or_default() += 1;
-        for idx in job_gpus {
-            *gpu_used.entry(idx).or_default() += 1;
-        }
-        if matches!(job.state, JobState::RestoreQueued { .. }) {
-            out.restore.push(job.id);
-        } else {
-            out.start.push(job.id);
-        }
-    }
-
-    for job in candidates
-        .into_iter()
-        .filter(|j| !reserved.forced.contains(&j.id))
-    {
+    for job in candidates {
         let restoring = status[&job.id] == Status::RestoreQueued;
 
         let Some(group) = groups.get(job.spec.group.as_str()) else {
@@ -623,7 +574,6 @@ mod tests {
         let reserved = Reserved {
             gpus: HashMap::from([(GpuIndex(0), 1)]),
             held: HashSet::from([JobId(3)]),
-            ..Reserved::default()
         };
         let out = plan_with(
             NOW,
@@ -1331,6 +1281,7 @@ mod tests {
             NOW,
             &jobs,
             &[group(DEFAULT_GROUP, 0)],
+            &[],
             &Reserved::default(),
             &input,
         );
@@ -1338,6 +1289,65 @@ mod tests {
         assert_eq!(p.iter().map(|p| p.id.0).collect::<Vec<_>>(), [3, 2]);
         assert!((p[1].factors.age - 0.1).abs() < 1e-9);
         assert!((p[0].factors.age - 0.3).abs() < 1e-9);
+    }
+
+    /// The review scenario of the "age bank": user 1 has an 8-day-old job
+    /// that cannot launch and a new job first in their own order (`-o
+    /// 10`); user 2 has a 3-day-old job. One CPU slot is free.
+    fn parked_job_scenario(parked: J, groups: &[Group], gpus: &[Gpu]) -> (Plan, Vec<JobPriority>) {
+        const DAY: Timestamp = 24 * 60 * 60 * 1000;
+        let jobs: Vec<Job> = vec![
+            parked.owner(1).at(NOW - 8 * DAY).0,
+            job(2, queued()).owner(1).prio(10).at(NOW).0,
+            job(3, queued()).owner(2).at(NOW - 3 * DAY).0,
+            job(4, JobState::Running).owner(3).group("gpu").gpus(&[0]).0,
+        ];
+        let params = Params::default();
+        let fairshare = HashMap::new();
+        let input = PriorityInput {
+            params: &params,
+            fairshare: &fairshare,
+            resources: Resources {
+                gpus: gpus.len() as u32,
+                cpus: 8,
+            },
+        };
+        let reserved = Reserved::default();
+        (
+            plan_prioritized(NOW, &jobs, groups, gpus, &reserved, &input),
+            pending_priorities(NOW, &jobs, groups, gpus, &reserved, &input),
+        )
+    }
+
+    #[test]
+    fn jobs_that_cannot_launch_lend_no_age() {
+        let age = |p: &[JobPriority], id: u64| p.iter().find(|p| p.id.0 == id).unwrap().factors.age;
+        let groups = [group(DEFAULT_GROUP, 1), paused("held", 0), group("gpu", 0)];
+        let gpus = [gpu(0, 1)];
+        for (what, parked) in [
+            ("paused group", job(1, queued()).group("held")),
+            ("missing group", job(1, queued()).group("gone")),
+            ("undetected GPU", job(1, queued()).group("gpu").gpus(&[7])),
+        ] {
+            let (plan, p) = parked_job_scenario(parked, &groups, &gpus);
+            assert_eq!(plan.start, ids(&[3]), "{what}");
+            assert_eq!(age(&p, 2), 0.0, "{what}");
+            assert!((age(&p, 3) - 3.0 / 7.0).abs() < 1e-9, "{what}");
+            // The parked job keeps its own age for when it can launch.
+            assert_eq!(age(&p, 1), 1.0, "{what}");
+        }
+        // Once the group is resumed the parked job pools its age again:
+        // the owner's first job gets it.
+        let resumed = [group(DEFAULT_GROUP, 1), group("held", 0), group("gpu", 0)];
+        let (_, p) = parked_job_scenario(job(1, queued()).group("held"), &resumed, &gpus);
+        assert_eq!(age(&p, 2), 1.0);
+        assert_eq!(age(&p, 1), 0.0);
+        // Waiting for a busy GPU is ordinary queueing: the job could launch
+        // as soon as the slot frees, so it pools its age.
+        let (plan, p) =
+            parked_job_scenario(job(1, queued()).group("gpu").gpus(&[0]), &groups, &gpus);
+        assert_eq!(age(&p, 2), 1.0);
+        assert_eq!(plan.start, ids(&[2]));
     }
 
     #[test]
@@ -1361,7 +1371,6 @@ mod tests {
         let reserved = Reserved {
             gpus: HashMap::new(),
             held: HashSet::from([JobId(3)]),
-            ..Reserved::default()
         };
         let params = Params::default();
         let fairshare = HashMap::new();
@@ -1371,7 +1380,7 @@ mod tests {
             resources: Resources::default(),
         };
         let groups = [group(DEFAULT_GROUP, 0)];
-        let listed: HashSet<u64> = pending_priorities(NOW, &jobs, &groups, &reserved, &input)
+        let listed: HashSet<u64> = pending_priorities(NOW, &jobs, &groups, &[], &reserved, &input)
             .iter()
             .map(|p| p.id.0)
             .collect();
@@ -1384,135 +1393,5 @@ mod tests {
             .map(|id| id.0)
             .collect();
         assert_eq!(launched, listed);
-    }
-
-    fn forced(ids: &[u64]) -> Reserved {
-        Reserved {
-            forced: ids.iter().map(|&i| JobId(i)).collect(),
-            ..Reserved::default()
-        }
-    }
-
-    #[test]
-    fn forced_launch_skips_group_limit_order_and_dependencies() {
-        let jobs: Vec<Job> = vec![
-            job(1, JobState::Running).0,
-            job(2, queued()).prio(10).0,
-            job(3, queued()).deps(&[9]).0,
-            job(9, failed()).0,
-        ];
-        let groups = [group(DEFAULT_GROUP, 1)];
-        // Without forcing, the group's only slot is taken and job 3 fails
-        // for its dependency.
-        let out = plan_with(NOW, &jobs, &groups, &[], &Reserved::default());
-        assert!(out.start.is_empty());
-        assert_eq!(out.dependency_failed, ids(&[3]));
-        let out = plan_with(NOW, &jobs, &groups, &[], &forced(&[3]));
-        assert_eq!(out.start, ids(&[3]));
-        assert!(out.dependency_failed.is_empty());
-        assert!(out.waiting.is_empty());
-    }
-
-    #[test]
-    fn forced_launch_waits_for_gpu_slots() {
-        let jobs: Vec<Job> = vec![
-            job(1, JobState::Running).gpus(&[0]).0,
-            job(2, queued()).gpus(&[0, 1]).0,
-            job(3, restore_queued()).gpus(&[1]).0,
-        ];
-        let groups = [group(DEFAULT_GROUP, 0)];
-        let gpus = [gpu(0, 1), gpu(1, 1)];
-        let out = plan_with(NOW, &jobs, &groups, &gpus, &forced(&[2, 3]));
-        assert!(out.start.is_empty());
-        assert_eq!(out.restore, ids(&[3]));
-        assert_eq!(
-            out.waiting,
-            vec![(
-                JobId(2),
-                LaunchWait::GpuSlots {
-                    gpus: vec![GpuIndex(0)]
-                }
-            )]
-        );
-        // Orphans take slots as well.
-        let mut reserved = forced(&[3]);
-        reserved.gpus.insert(GpuIndex(1), 1);
-        let out = plan_with(NOW, &jobs, &groups, &gpus, &reserved);
-        assert!(out.restore.is_empty());
-        assert_eq!(
-            out.waiting,
-            vec![(
-                JobId(3),
-                LaunchWait::GpuSlots {
-                    gpus: vec![GpuIndex(1)]
-                }
-            )]
-        );
-    }
-
-    #[test]
-    fn forced_launch_goes_ahead_of_better_candidates() {
-        let jobs: Vec<Job> = vec![
-            job(1, queued()).gpus(&[0]).prio(100).0,
-            job(2, queued()).gpus(&[0]).0,
-        ];
-        let out = plan_with(
-            NOW,
-            &jobs,
-            &[group(DEFAULT_GROUP, 0)],
-            &[gpu(0, 1)],
-            &forced(&[2]),
-        );
-        assert_eq!(out.start, ids(&[2]));
-        // Earlier forced launches go first.
-        let jobs: Vec<Job> = vec![job(5, queued()).gpus(&[0]).0, job(4, queued()).gpus(&[0]).0];
-        let out = plan_with(
-            NOW,
-            &jobs,
-            &[group(DEFAULT_GROUP, 0)],
-            &[gpu(0, 1)],
-            &forced(&[4, 5]),
-        );
-        assert_eq!(out.start, ids(&[4]));
-        assert_eq!(out.waiting.len(), 1);
-        assert_eq!(out.waiting[0].0, JobId(5));
-    }
-
-    #[test]
-    fn forced_launch_waits_for_a_paused_group_and_known_resources() {
-        let jobs: Vec<Job> = vec![
-            job(1, queued()).group("p").0,
-            job(2, queued()).gpus(&[7]).0,
-            job(3, queued()).group("missing").0,
-            // Not waiting in line: ignored.
-            job(4, JobState::Stashed { enqueue_at: None }).0,
-        ];
-        let out = plan_with(
-            NOW,
-            &jobs,
-            &[group(DEFAULT_GROUP, 0), paused("p", 0)],
-            &[gpu(0, 1)],
-            &forced(&[1, 2, 3, 4]),
-        );
-        assert!(out.start.is_empty());
-        assert_eq!(
-            out.waiting,
-            vec![
-                (JobId(1), LaunchWait::GroupPaused),
-                (JobId(2), LaunchWait::Unavailable),
-                (JobId(3), LaunchWait::Unavailable),
-            ]
-        );
-    }
-
-    #[test]
-    fn launch_wait_serializes_with_a_reason_tag() {
-        let json = serde_json::to_string(&LaunchWait::GpuSlots {
-            gpus: vec![GpuIndex(1)],
-        })
-        .unwrap();
-        assert_eq!(json, r#"{"reason":"gpu_slots","gpus":[1]}"#);
-        let back: LaunchWait = serde_json::from_str(r#"{"reason":"group_paused"}"#).unwrap();
-        assert_eq!(back, LaunchWait::GroupPaused);
     }
 }
