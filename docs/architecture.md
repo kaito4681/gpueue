@@ -127,7 +127,10 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    unit's main process, the outer shim (or, after a restore, the init), and are forwarded to the
    job's process group; STOP, CONT and KILL go to every process of the unit. The helper refuses
    any other signal, which would reach the root shim instead of the job.
-6. **Checkpoint.** The helper checks free space (for RSS and VRAM, deleted files saved in the
+6. **Checkpoint.** The helper first refuses every dump when the configured `criu` was missing,
+   could not be run or was older than 4.2 when it started (it runs `criu --version` once at
+   start-up; an output without a version is only warned about): such a dump would fail and end
+   the job. Then it checks free space (for RSS and VRAM, deleted files saved in the
    image and the contents of the job's `/tmp` and `/dev/shm`), the mounts and the job's sockets.
    FUSE and network mounts of the job's namespace that the host no longer has, whose `statfs`
    fails with a connection error or does not return within 5 s (asked in a child process), or
@@ -359,7 +362,17 @@ neither its own nor named by a job record or an image's record, nor mapped by an
 (`files.img`); if a checkpoint cannot be read, nothing is removed. On NixOS the helper runs from
 the Nix store, whose paths do not change; it makes no copy, and the Nix GC roots
 (`/nix/var/nix/gcroots/gpueue/job-<id>`) keep the old store path instead. If the copy cannot be
-made, the helper logs a warning and job units run the installed binary.
+made, the helper logs a warning and job units run the installed binary. With SELinux, a file
+created in `/var/lib` gets the type `var_lib_t`, which systemd (`init_t`) may not execute (the job
+unit fails with status 203/EXEC). So the helper copies the `security.selinux` attribute of its own
+binary (`bin_t` for `/usr/bin/gpueue-helper`; systemd started the helper from it, so it may run
+it) onto the temporary file before the rename, relabels the existing copies at each start, and
+checks the label of a copy before a job unit or a restore uses it, which repairs a relabel such
+as `restorecon -R /var/lib`. Without SELinux the binary has no such attribute and nothing is
+labelled; a failure to label is logged. No file-context rule is installed: `semanage` is not
+installed everywhere, and the helper's own labelling also covers `install.sh` and
+`gpueue service install`. The fork guard library in the same directory keeps `var_lib_t`: jobs
+run unconfined (`unconfined_service_t`), which may map it.
 
 ## Shutdown ordering
 

@@ -1573,6 +1573,88 @@ async fn dump_refuses_sockets_bound_on_host_filesystems() {
     assert_eq!(c.running().await, [(JobId(3), RunningPhase::Running)]);
 }
 
+/// Without a usable criu (missing when the helper started, or older than
+/// 4.2), a dump would fail and end the job: it is refused before the job is
+/// touched, also at shutdown, where the job is then left for systemd to
+/// stop like other refused ones.
+#[tokio::test]
+async fn dumps_are_refused_without_a_usable_criu() {
+    let mut env = Env::new().await;
+    let mut cfg = with_mode(config(&env.root, uid()), &env.root, env.mode);
+    cfg.criu_refusal = Some("the helper did not find criu when it started".into());
+    env.restart_with(cfg).await;
+    let mut c = env.client().await;
+    for job in [3, 4] {
+        assert!(matches!(
+            c.request(Request::Spawn(env.spawn_req(job))).await,
+            ResponseResult::Spawned { .. }
+        ));
+    }
+    assert_eq!(
+        c.request(Request::Signal {
+            job: JobId(4),
+            signal: signal::SIGSTOP
+        })
+        .await,
+        ResponseResult::Ok
+    );
+    for job in [3, 4] {
+        let r = c
+            .request(Request::Checkpoint {
+                job: JobId(job),
+                image_dir: env.base().join(job.to_string()),
+                options: Default::default(),
+            })
+            .await;
+        let ResponseResult::Error { code, message } = &r else {
+            panic!("{r:?}")
+        };
+        assert_eq!(*code, HelperErrorCode::CheckpointRefused, "{r:?}");
+        assert!(message.contains("did not find criu"), "{message}");
+    }
+    assert_eq!(
+        c.running().await,
+        [
+            (JobId(3), RunningPhase::Running),
+            (JobId(4), RunningPhase::Stopped)
+        ]
+    );
+
+    let manifest = env.helper.shutdown(|_| {}, |_| {}).await;
+    assert_eq!(manifest.jobs.len(), 2, "{manifest:?}");
+    for entry in &manifest.jobs {
+        let ManifestResult::Failed {
+            reason,
+            refused: true,
+        } = &entry.result
+        else {
+            panic!("{entry:?}")
+        };
+        assert!(reason.contains("did not find criu"), "{reason}");
+    }
+    let outcomes = events(&mut c, 2, |e| match e {
+        Event::CheckpointFinished { job, outcome } => Some((job, outcome.is_refused())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(outcomes, [(JobId(3), true), (JobId(4), true)]);
+    // Nothing ran against the jobs: no plan step, and the stopped one was
+    // not resumed for the dump.
+    assert!(env.exec.lock().unwrap().actions.is_empty());
+    assert_eq!(
+        env.launcher.unit(JobId(4)).unwrap().signals,
+        [signal::SIGSTOP]
+    );
+    assert!(!env.base().join("3").exists() && !env.base().join("4").exists());
+    assert_eq!(
+        c.running().await,
+        [
+            (JobId(3), RunningPhase::Running),
+            (JobId(4), RunningPhase::Stopped)
+        ]
+    );
+}
+
 /// Deleted files on the host's filesystems go into the image instead of
 /// being linked back by root (`--link-remap`) through a path the owner
 /// controls.

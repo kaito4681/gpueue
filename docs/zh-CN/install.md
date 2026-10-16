@@ -48,7 +48,9 @@
 ### CRIU
 
 gpueue 需要 CRIU 4.2 或更高版本才能创建检查点；没有它作业也能运行。`gpueue doctor` 会报告 CRIU
-缺失或版本过旧。在 Ubuntu 26.04（`sudo apt install criu`，universe）、Fedora（`sudo dnf install criu`，4.2）
+缺失或版本过旧。helper 只在启动时检查一次 CRIU：没有 CRIU 或版本过旧时，它会在触碰作业之前拒绝所有检查点，
+作业继续运行（关机时这类作业会像其他检查点被拒绝的作业一样被停止）。安装或升级 CRIU 后请重启 helper
+（`sudo systemctl restart gpueue-helper`）。在 Ubuntu 26.04（`sudo apt install criu`，universe）、Fedora（`sudo dnf install criu`，4.2）
 和 Arch（`sudo pacman -S criu`）上，发行版的软件包版本足够新。Ubuntu 22.04（3.16）、Ubuntu 24.04（无软件包）、
 Debian 12（3.17）、Debian 13（4.1）以及 RHEL/Rocky/Alma 9（3.19）则不满足：请按照
 <https://criu.org/Installation> 从源码构建 CRIU（使用上游发布的源码包，执行 `make` 和 `sudo make install`
@@ -470,7 +472,9 @@ sudo dnf install "https://github.com/kaito4681/gpueue/releases/latest/download/g
 （当 systemd 不是 PID 1 时只启用服务），并且拒绝与由 `gpueue service install` 或 `install.sh` 进行的安装并存。
 它要求 systemd 和 glibc 2.34，并且只是**推荐**（recommends）`criu`（一种弱依赖，发行版提供时 dnf 默认会安装它）：
 Fedora 的 CRIU（4.2）足够新，RHEL/Rocky/Alma 9 的 3.19 则不够，因此在那些系统上创建检查点需要更新的 CRIU
-（参见 [CRIU](#criu)）。没有它也可以运行作业。
+（参见 [CRIU](#criu)）。没有它也可以运行作业。在 SELinux 为 enforcing 时，helper 会给作业单元运行的自身副本
+（`/var/lib/gpueue/lib/gpueue-helper-<hash>`）设置与 `/usr/bin/gpueue-helper` 本身相同的标签；该软件包不添加
+SELinux 文件上下文规则（那需要 policycoreutils-python-utils 中的 `semanage`），也不添加 SELinux 相关的依赖。
 
 **验证。** 与所有发布版本资源文件一样，`.rpm` 带有 `.sha256` 和 `.minisig` 文件（参见
 [手动验证发布版本](#verifying-a-release-by-hand)）。使用 GPG 密钥构建的发布版本还会对 `.rpm` 本身签名，
@@ -1851,8 +1855,10 @@ sudo gpueue update --version 0.2.0 --yes
   作业单元运行这个副本（`journalctl -u gpueue-helper` 会显示 `job units run ...`）。作业在运行期间以及
   经过检查点和恢复后，都继续使用启动它的那个副本；升级会为新作业添加一个新副本。helper 启动时会删除
   既没有作业记录也没有检查点需要的副本，因此存在一两个副本（每个仍在使用的版本一个）是正常的。不要
-  手动删除它们：副本丢失的检查点无法恢复。NixOS 上不会创建副本，旧的二进制文件由 Nix store 保留
-  （见 [NixOS](#nixos)）。
+  手动删除它们：副本丢失的检查点无法恢复。在启用 SELinux 的系统（Fedora、RHEL）上，副本带有已安装二进制文件的
+  标签（`bin_t`），而不是 `/var/lib` 中其他文件的 `var_lib_t`（systemd 可能无权执行它）；helper 每次启动时以及
+  作业单元运行副本之前都会重新设置该标签，因此重新打标签（`restorecon -R /var/lib`）不会造成问题。NixOS 上不会
+  创建副本，旧的二进制文件由 Nix store 保留（见 [NixOS](#nixos)）。
 - **从 0.1.1 或更早版本升级：** 这些版本启动的作业直接运行已安装的二进制文件，而升级会替换它。请在
   升级前恢复已创建检查点的作业：升级后它们的恢复会失败（`restore.log` 中出现 `File
   usr/bin/gpueue-helper has bad size`）。正在运行的作业会继续运行，但无法再创建检查点（`Can't dump
@@ -1982,6 +1988,10 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
 - `not enough free space for the checkpoint: need N bytes, M available`：释放空间或移动
   `checkpoints_dir`，然后再次创建检查点。所需空间包括作业存储在其自己的 `/tmp` 和 `/dev/shm` 中的内容
   （此时消息会给出具体大小）。
+- `the helper did not find criu when it started (install CRIU 4.2 or newer and restart
+  gpueue-helper)`、`criu /usr/sbin/criu is version 3.17.1, but gpueue needs CRIU 4.2 or newer
+  ...`：使用这个 CRIU 无法为任何作业创建检查点（见 [CRIU](#criu)）。请安装 CRIU 4.2 或更新版本（或让
+  `criu_path` 指向它）并重启 helper；helper 只在启动时检查 CRIU。
 - `finding CUDA processes: the helper did not find cuda-checkpoint when it started ...`：没有
   cuda-checkpoint 就无法为 GPU 作业创建检查点。请安装它（见 [cuda-checkpoint](#cuda-checkpoint)）并重启
   helper。``... process N uses an NVIDIA device but `cuda-checkpoint --get-state` does not know its CUDA

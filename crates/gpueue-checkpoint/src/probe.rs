@@ -51,6 +51,11 @@ impl fmt::Display for Version {
     }
 }
 
+/// The oldest CRIU gpueue checkpoints with, as `(major, minor, patch)`:
+/// `gpueue doctor` reports an older one, and the helper refuses dumps with
+/// it.
+pub const MIN_CRIU_VERSION: (u32, u32, u32) = (4, 2, 0);
+
 /// Parsed `criu --version` output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CriuVersion {
@@ -62,6 +67,12 @@ impl CriuVersion {
     /// CRIU 4.0 introduced `cuda_plugin.so`.
     pub fn supports_cuda_plugin(&self) -> bool {
         self.version.at_least(4, 0, 0)
+    }
+
+    /// At least [`MIN_CRIU_VERSION`].
+    pub fn is_supported(&self) -> bool {
+        let (major, minor, patch) = MIN_CRIU_VERSION;
+        self.version.at_least(major, minor, patch)
     }
 }
 
@@ -352,6 +363,18 @@ Version 550.54.14. Copyright (C) 2024 NVIDIA Corporation. All rights reserved.
         assert!(v.supports_cuda_plugin());
 
         let v = parse_criu_version("Version: 3.19\n").unwrap();
+        assert!(!v.is_supported());
+        assert!(
+            !parse_criu_version("Version: 4.1.1\n")
+                .unwrap()
+                .is_supported()
+        );
+        assert!(parse_criu_version("Version: 4.2\n").unwrap().is_supported());
+        assert!(
+            parse_criu_version("Version: 4.2.1\n")
+                .unwrap()
+                .is_supported()
+        );
         assert_eq!(v.git_id, None);
         assert!(!v.supports_cuda_plugin());
 

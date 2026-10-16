@@ -20,7 +20,7 @@ use crate::system::{
 mod sudo_path;
 
 /// Oldest CRIU that works with the helper (restoring into systemd units, CUDA support).
-const MIN_CRIU: (u32, u32, u32) = (4, 2, 0);
+const MIN_CRIU: (u32, u32, u32) = gpueue_checkpoint::probe::MIN_CRIU_VERSION;
 /// `Type=exec` in the units.
 const MIN_SYSTEMD: u32 = 240;
 /// clone3() with set_tid, which CRIU uses to restore PIDs.
