@@ -143,16 +143,18 @@ trigger() {
     systemctl "$action"
 }
 
-# check_journal <scenario>: the stop order in the previous boot's journal.
+# check_journal <scenario>: the stop order in the previous boot's journal,
+# and the state disk's fsck in this boot (see "clean unmount" below).
 check_journal() {
     local s=$1 a b c big
     load_ids "$s"
     journalctl -b -1 -o short-monotonic --no-pager >"$STATE/$s/journal.txt"
-    python3 - "$STATE/$s/journal.txt" "$a" "$b" "$c" "${big:-}" <<'EOF'
+    journalctl -b 0 -o cat --no-pager -u 'systemd-fsck@*' >"$STATE/$s/fsck.txt"
+    python3 - "$STATE/$s/journal.txt" "$a" "$b" "$c" "${big:-}" "$STATE/$s/fsck.txt" <<'EOF'
 import re
 import sys
 
-path, a, b, c, big = sys.argv[1:6]
+path, a, b, c, big, fsck_path = sys.argv[1:7]
 rows = []
 for line in open(path, errors="replace"):
     m = re.match(r"\[\s*([0-9.]+)\] \S+ ([^:\[]+)(?:\[\d+\])?: (.*)", line)
@@ -197,12 +199,26 @@ manifest = first(lambda i, m: i == "gpueue-helper" and "shutdown manifest writte
 helper_stopped = first(sysd("Stopped gpueue-helper.service"))
 umount_start = first(sysd("Unmounting var-lib-gpueue.mount"))
 umounted = first(sysd("Unmounted var-lib-gpueue.mount"))
-localfs = first(sysd("Stopped target local-fs.target"))
+umount_failed = first(lambda i, m: i == "systemd" and "var-lib-gpueue.mount" in m
+                      and re.search(r"Failed unmounting|Failed with result|Unmount process exited", m))
+# The initrd stops a local-fs.target too: only the one of the shutdown.
+localfs = first(sysd("Stopped target local-fs.target"), shutdown or 0)
 journald_last = rows[-1][0] if rows else None
 first_stop = first(lambda i, m: i == "systemd" and m.startswith("Stopping "), (shutdown or 0) - 30)
+# systemd stops systemd-journal-flush.service during the shutdown, in
+# parallel with the unmounts: journald then relinquishes /var/log/journal,
+# and what is logged afterwards stays in /run and is lost by the reboot.
+# Where /var is a mount of its own (Fedora's btrfs subvolume), that happens
+# as soon as the other mounts are gone, while /var/lib/gpueue still waits
+# for the helper's dumps; its "Unmounting"/"Unmounted" lines then come
+# after the journal's last line.
+relinquished = first(lambda i, m: (i == "systemd" and m.startswith("Stopping systemd-journal-flush"))
+                     or (i == "systemd-journald" and "relinquish" in m), shutdown or 0)
 
 need = dict(shutdown=shutdown, daemon_stopped=daemon_stopped, helper_sys=helper_sys,
-            manifest=manifest, helper_stopped=helper_stopped, umount_start=umount_start)
+            manifest=manifest, helper_stopped=helper_stopped)
+if relinquished is None:
+    need["umount_start"] = umount_start
 for k, v in need.items():
     if v is None:
         errors.append(f"journal has no {k} event")
@@ -228,10 +244,25 @@ if not errors:
             print(f"in-flight dump of job {big} ended {gone - shutdown:.2f}s after the shutdown began, "
                   f"{'after' if gone >= helper_sys else 'before'} the helper got SIGTERM")
     last_job = max(filter(None, (unit_gone(j) for j in (a, b, c, big) if j)), default=0)
-    if umount_start < helper_stopped or umount_start < last_job:
+    # Not journalled: it came after the journal's last line (see above).
+    start = umount_start if umount_start is not None else journald_last
+    if start < helper_stopped or start < last_job:
         errors.append("/var/lib/gpueue was unmounted before the helper or a job unit stopped")
-    if umounted is None:
-        errors.append("/var/lib/gpueue was not unmounted cleanly (no 'Unmounted' line)")
+    if umount_failed is not None:
+        errors.append(f"unmounting /var/lib/gpueue failed at {umount_failed}")
+# Clean unmount: whether or not the journal still recorded it, the file
+# system was unmounted (or remounted read-only by systemd-shutdown) with
+# nothing writing to it if fsck in this boot found it clean without
+# replaying its journal. Anything that still held it open for writing at
+# the end (criu, a job, the helper) leaves the journal dirty, and fsck then
+# says "gpueue-state: recovering journal".
+fsck = [line.strip() for line in open(fsck_path, errors="replace") if line.startswith("gpueue-state:")]
+if not fsck:
+    errors.append("no fsck result for the state disk in this boot's journal")
+elif any("recovering journal" in line or "clean" not in line for line in fsck):
+    errors.append("/var/lib/gpueue was not unmounted cleanly: " + "; ".join(fsck))
+else:
+    print("state disk at this boot: " + "; ".join(fsck))
 for t, ident, msg in rows:
     if re.search(r"gpueue", msg) and re.search(r"timed out|Killing process|SIGKILL", msg):
         errors.append(f"timeout: [{t}] {msg}")
@@ -243,6 +274,7 @@ for k, v in [("daemon stopped", daemon_stopped), ("helper: system shutdown, dump
              ("helper: manifest written", manifest), ("gpueue-helper.service stopped", helper_stopped),
              ("no-checkpoint job unit stopping", unit_stopping(c)),
              ("no-checkpoint job unit gone", unit_gone(c)),
+             ("journald relinquished /var", relinquished),
              ("unmounting /var/lib/gpueue", umount_start), ("unmounted /var/lib/gpueue", umounted),
              ("local-fs.target stopped", localfs), ("last journal line", journald_last)]:
     print(f"  {rel(v):>9}  {k}")

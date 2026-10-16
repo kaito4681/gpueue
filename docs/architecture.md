@@ -163,7 +163,8 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    default plugin directory, and CRIU's `cuda_plugin.so` calls cuda-checkpoint (in plugin mode a
    CUDA job is refused when the plugin is missing). Before the dump it writes what a restore needs
    besides CRIU's images (the owner record, the job's mounts and files, a draft `meta.json`);
-   right after a successful dump a `DUMPED` marker, then the external mounts from CRIU's log,
+   right after a successful dump it flushes the images to disk (CRIU does not fsync them, and the
+   processes are gone) and writes a `DUMPED` marker, then the external mounts from CRIU's log,
    the final `meta.json` (including the mode) and the `COMPLETE` marker last. A successful dump
    stops the process, so from then on the image is never deleted: if finishing it fails, the
    helper retries, keeps the image and reports the checkpoint as not finalized (the daemon counts
