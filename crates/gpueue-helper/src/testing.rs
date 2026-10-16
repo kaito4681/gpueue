@@ -168,9 +168,8 @@ impl HostProbe for FakeHost {
         let problems = match req {
             VerifyRequest::Paths(_) => &self.path_problems,
             VerifyRequest::Restored(_) => &self.restored_problems,
-            VerifyRequest::Probe(c) | VerifyRequest::BindSources(c) => {
-                return Ok(vec![String::new(); c.paths.len()]);
-            }
+            VerifyRequest::Probe(c) => return Ok(vec![String::new(); c.paths.len()]),
+            VerifyRequest::BindSources(c) => return Ok(vec![String::new(); c.paths.len()]),
             VerifyRequest::HeldAttrs(_) => return Err("not a check with a list of problems".into()),
             VerifyRequest::Exist(c) => {
                 return Ok(c

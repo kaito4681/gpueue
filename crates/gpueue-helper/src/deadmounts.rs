@@ -49,6 +49,10 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// of a detached mount whose filesystem is not back.
 pub const PLACEHOLDER_DIR: &str = "detached-mount";
 
+/// The file, below the checkpoint base, that a restore binds in place of
+/// a detached mount of a file or a socket (see [`Placeholders`]).
+pub const PLACEHOLDER_FILE: &str = "detached-mount-file";
+
 /// Whether CRIU can only dump a mount of this filesystem type as an
 /// external bind (it cannot save or recreate the filesystem itself), and
 /// the filesystem may disappear or stop answering on its own: FUSE and
@@ -115,6 +119,10 @@ pub struct DeadMount {
     /// Why, for messages: "is no longer mounted on the host", "does not
     /// answer (...)" or [`NO_ROOT_ACCESS`].
     pub why: String,
+    /// See [`DetachedMount::not_dir`] (set by [`describe_mount_points`]).
+    pub not_dir: bool,
+    /// See [`DetachedMount::in_image`] (set by [`describe_mount_points`]).
+    pub in_image: bool,
 }
 
 impl DeadMount {
@@ -158,6 +166,8 @@ pub fn dead_mounts(
             fstype: m.fstype.clone(),
             dev: m.dev.clone(),
             why,
+            not_dir: false,
+            in_image: false,
         });
     }
     let below_dead = |id: u64| {
@@ -172,6 +182,31 @@ pub fn dead_mounts(
     }
     out.dead = all.iter().filter(|d| !below_dead(d.id)).cloned().collect();
     out
+}
+
+/// Records what a restore needs at the mount point of each of `dead`'s
+/// mounts: whether it is not a directory (`not_dir(mount)`: a bind mount
+/// of a file or a socket, which the caller looks up in the job's
+/// namespace), and whether it lies in a tmpfs of the job's own (one that
+/// `helper`, the helper's namespace, does not have, such as the shim's
+/// `/run/systemd`, `/tmp` and `/dev/shm`, or a directory hidden behind a
+/// tmpfs): CRIU saves such a tmpfs in the image, the mount point
+/// included, so the restoring host need not have it.
+pub fn describe_mount_points(
+    job: &MountTree,
+    helper: &MountTree,
+    dead: &mut DeadMounts,
+    not_dir: impl Fn(&DeadMount) -> bool,
+) {
+    for d in &mut dead.dead {
+        d.not_dir = not_dir(d);
+        d.in_image = job
+            .get(d.id)
+            .and_then(|e| job.get(e.parent))
+            .is_some_and(|p| {
+                p.fstype == "tmpfs" && !helper.entries().iter().any(|h| h.dev == p.dev)
+            });
+    }
 }
 
 /// What one process of a job holds, as read from `/proc/<pid>` (paths as
@@ -325,6 +360,19 @@ pub struct DetachedMount {
     /// Why it was detached, for messages.
     #[serde(default)]
     pub why: String,
+    /// The mount point is not a directory: a bind mount of a file or a
+    /// socket. A restore needs a file there and binds a placeholder file
+    /// (see [`Placeholders`]). Not recorded by older versions (then a
+    /// directory), nor for FUSE and network mounts, which may not answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_dir: bool,
+    /// Whether the mount point lies in a tmpfs of the job's own, which
+    /// the image restores with the mount point in it (see
+    /// [`describe_mount_points`]): the restoring host need not have it.
+    /// `None` in images of older versions (see
+    /// [`crate::jobs::MountPlan::restores_from_image`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_image: Option<bool>,
 }
 
 impl DetachedMount {
@@ -339,6 +387,8 @@ impl DetachedMount {
                 fstype: d.fstype.clone(),
                 key: format!("gpueue-detached-{i}"),
                 why: d.why.clone(),
+                not_dir: d.not_dir,
+                in_image: Some(d.in_image),
             })
             .collect()
     }
@@ -373,9 +423,19 @@ pub fn restore_args(mounts: &[DetachedMount], sources: &[String]) -> Vec<String>
 /// Whether `now` (the helper's namespace at restore time) has the
 /// filesystem of `m` mounted at its mount point again: a lookup of the
 /// mount point ends in a mount of that type there.
+///
+/// A local filesystem's mount that was only detached because its host
+/// path seemed redirectable ([`UNSAFE_BIND`]; gpueue 0.1.2 did so for
+/// every directory not owned by root, such as systemd-resolve's
+/// `/run/systemd/resolve`, whose files the shim binds into each job) is
+/// a bind of that host path: it is back where a lookup of the path ends
+/// on a filesystem of that type, mounted there or above. The caller
+/// still checks that the path may be bound now (see
+/// [`crate::mountfd::bind_source_problem`]).
 pub fn is_back(m: &DetachedMount, now: &MountTree) -> bool {
+    let bind = m.why.starts_with(UNSAFE_BIND) && !is_remote_fstype(&m.fstype);
     now.top(&m.mount_point)
-        .is_some_and(|t| t.mount_point == m.mount_point && t.fstype == m.fstype)
+        .is_some_and(|t| (bind || t.mount_point == m.mount_point) && t.fstype == m.fstype)
 }
 
 /// Create (if needed) the empty directory that a restore binds in place of
@@ -407,14 +467,84 @@ pub fn ensure_placeholder(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Like [`ensure_placeholder`], for mounts of files and sockets (see
+/// [`DetachedMount::not_dir`]): an empty regular file, root's, mode 0.
+pub fn ensure_placeholder_file(file: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    // `create_new` (`O_EXCL`) never follows a symlink; one that is there
+    // already is refused below.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o000)
+        .open(file)
+    {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(std::io::Error::other(format!(
+                "creating {}: {e}",
+                file.display()
+            )));
+        }
+    }
+    let meta = std::fs::symlink_metadata(file)?;
+    if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a file of the helper's own",
+            file.display()
+        )));
+    }
+    if meta.mode() & 0o7777 != 0 {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o000))?;
+    }
+    Ok(())
+}
+
+/// What a restore binds in place of a detached mount whose filesystem is
+/// not back: an empty, inaccessible directory, or for a mount of a file or
+/// a socket an empty, inaccessible file (a directory cannot be bound onto
+/// a file). Both in the checkpoint base (see [`PLACEHOLDER_DIR`] and
+/// [`PLACEHOLDER_FILE`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placeholders {
+    pub dir: std::path::PathBuf,
+    pub file: std::path::PathBuf,
+}
+
+impl Placeholders {
+    /// The placeholders in the checkpoint base `base`.
+    pub fn in_base(base: &Path) -> Self {
+        Self {
+            dir: base.join(PLACEHOLDER_DIR),
+            file: base.join(PLACEHOLDER_FILE),
+        }
+    }
+
+    /// Create both (see [`ensure_placeholder`]).
+    pub fn ensure(&self) -> std::io::Result<()> {
+        ensure_placeholder(&self.dir)?;
+        ensure_placeholder_file(&self.file)
+    }
+
+    /// The one for `m`.
+    pub fn for_mount(&self, m: &DetachedMount) -> &Path {
+        if m.not_dir { &self.file } else { &self.dir }
+    }
+}
+
 /// Whether the mount point `path` of a detached mount is missing on this
 /// host, so that a restore could not mount anything there (CRIU restores
-/// the job's root from a non-recursive bind of `/`, so it needs the
-/// directory itself, not what is mounted on it). A path that cannot be
-/// looked at because a filesystem that does not answer is mounted on it
-/// is there: one can only mount on an existing directory.
-pub fn mount_point_missing(path: &Path) -> bool {
+/// the job's root from a non-recursive bind of `/`, so it needs the mount
+/// point itself, not what is mounted on it): a directory, or with
+/// `not_dir` (a bind mount of a file or a socket, see
+/// [`DetachedMount::not_dir`]) anything but a directory or a symlink. A
+/// path that cannot be looked at because a filesystem that does not
+/// answer is mounted on it is there: one can only mount on an existing
+/// path.
+pub fn mount_point_missing(path: &Path, not_dir: bool) -> bool {
     match std::fs::symlink_metadata(path) {
+        Ok(m) if not_dir => m.is_dir() || m.file_type().is_symlink(),
         Ok(m) => !m.is_dir(),
         Err(e) => {
             e.kind() == std::io::ErrorKind::NotFound
@@ -832,6 +962,8 @@ mod tests {
                 fstype: "fuse.sshfs".into(),
                 key: "gpueue-detached-0".into(),
                 why: "is no longer mounted on the host".into(),
+                not_dir: false,
+                in_image: Some(false),
             }]
         );
         assert_eq!(
@@ -862,6 +994,8 @@ mod tests {
         let old: DetachedMount =
             serde_json::from_str(r#"{"mount_point":"/a","fstype":"fuse","key":"k"}"#).unwrap();
         assert_eq!(old.why, "");
+        assert!(!old.not_dir);
+        assert_eq!(old.in_image, None);
         // A mount point CRIU's syntax cannot carry.
         let odd = DeadMounts {
             dead: vec![DeadMount {
@@ -870,6 +1004,8 @@ mod tests {
                 fstype: "fuse".into(),
                 dev: "0:1".into(),
                 why: "is no longer mounted on the host".into(),
+                not_dir: false,
+                in_image: false,
             }],
             ..DeadMounts::default()
         };
@@ -883,6 +1019,8 @@ mod tests {
             fstype: "fuse.sshfs".into(),
             key: "k".into(),
             why: String::new(),
+            not_dir: false,
+            in_image: Some(false),
         };
         assert!(!is_back(&m, &MountTree::parse(HELPER)));
         let back =
@@ -892,6 +1030,107 @@ mod tests {
         let other =
             MountTree::parse("1 0 8:1 / / rw - ext4 a rw\n7 1 0:90 / /nfs rw - tmpfs t rw\n");
         assert!(!is_back(&m, &other));
+        // A FUSE mount detached as redirectable: only its own mount.
+        let unsafe_fuse = DetachedMount {
+            mount_point: "/home/alice/fuse".into(),
+            why: format!("{UNSAFE_BIND} /home/alice/fuse (...)"),
+            ..m.clone()
+        };
+        let home =
+            MountTree::parse("1 0 8:1 / / rw - ext4 a rw\n7 1 0:90 / /home rw - fuse.sshfs h rw\n");
+        assert!(!is_back(&unsafe_fuse, &home));
+
+        // gpueue 0.1.2 detached the shim's binds of resolved's files from
+        // the host's /run (systemd-resolve's /run/systemd/resolve seemed
+        // redirectable): they are back where the host's /run is a tmpfs.
+        let resolv = DetachedMount {
+            mount_point: "/run/systemd/resolve/resolv.conf".into(),
+            fstype: "tmpfs".into(),
+            key: "gpueue-detached-0".into(),
+            why: format!(
+                "{UNSAFE_BIND} /run/systemd/resolve/resolv.conf (/run/systemd/resolve is not a \
+                 directory that only root can change)"
+            ),
+            not_dir: false,
+            in_image: None,
+        };
+        let run = MountTree::parse("1 0 8:1 / / rw - ext4 a rw\n7 1 0:28 / /run rw - tmpfs t rw\n");
+        assert!(is_back(&resolv, &run));
+        let no_run = MountTree::parse("1 0 8:1 / / rw - ext4 a rw\n");
+        assert!(!is_back(&resolv, &no_run));
+        // Other reasons: only its own mount.
+        let gone = DetachedMount {
+            why: "is no longer mounted on the host".into(),
+            ..resolv.clone()
+        };
+        assert!(!is_back(&gone, &run));
+    }
+
+    /// What a restore needs at a detached mount's mount point: the shim's
+    /// binds of files on its own /run/systemd tmpfs are files, and lie in
+    /// a tmpfs that the image restores.
+    #[test]
+    fn describes_mount_points() {
+        let job = MountTree::parse(
+            "\
+100 99 8:1 / / rw - ext4 /dev/sda1 rw
+110 100 0:28 / /run rw - tmpfs tmpfs rw
+120 110 0:70 / /run/systemd rw - tmpfs tmpfs rw
+121 120 0:28 /systemd/resolve/resolv.conf /run/systemd/resolve/resolv.conf rw - tmpfs tmpfs rw
+122 120 0:28 /systemd/resolve/io.systemd.Resolve /run/systemd/resolve/io.systemd.Resolve rw - tmpfs tmpfs rw
+130 100 0:60 / /home/alice/fuse rw - fuse.sshfs h rw
+140 100 0:28 /x /srv/x rw - tmpfs tmpfs rw
+",
+        );
+        let helper = MountTree::parse(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:28 / /run rw - tmpfs tmpfs rw\n",
+        );
+        let dead = |id: u64, mp: &str, fstype: &str| DeadMount {
+            id,
+            mount_point: mp.into(),
+            fstype: fstype.into(),
+            dev: String::new(),
+            why: UNSAFE_BIND.into(),
+            not_dir: false,
+            in_image: false,
+        };
+        let mut d = DeadMounts {
+            dead: vec![
+                dead(121, "/run/systemd/resolve/resolv.conf", "tmpfs"),
+                dead(122, "/run/systemd/resolve/io.systemd.Resolve", "tmpfs"),
+                dead(130, "/home/alice/fuse", "fuse.sshfs"),
+                dead(140, "/srv/x", "tmpfs"),
+            ],
+            ..DeadMounts::default()
+        };
+        describe_mount_points(&job, &helper, &mut d, |m| m.mount_point.contains("resolve"));
+        let got: Vec<(bool, bool)> = d.dead.iter().map(|m| (m.not_dir, m.in_image)).collect();
+        // The shim's /run/systemd tmpfs (0:70) is the job's own; the
+        // host's /run (0:28) and / are not.
+        assert_eq!(
+            got,
+            [(true, true), (true, true), (false, false), (false, false)]
+        );
+        let detached = DetachedMount::for_dump(&d);
+        assert!(detached[0].not_dir);
+        assert_eq!(detached[0].in_image, Some(true));
+        assert_eq!(detached[2].in_image, Some(false));
+        let json = serde_json::to_string(&detached[0]).unwrap();
+        assert!(json.contains(r#""not_dir":true"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<DetachedMount>(&json).unwrap(),
+            detached[0]
+        );
+        // A placeholder file for a file or socket, a directory otherwise.
+        let p = Placeholders::in_base(Path::new("/var/lib/gpueue/checkpoints"));
+        assert_eq!(
+            p.for_mount(&detached[1]),
+            Path::new("/var/lib/gpueue/checkpoints/detached-mount-file")
+        );
+        assert_eq!(
+            p.for_mount(&detached[2]),
+            Path::new("/var/lib/gpueue/checkpoints/detached-mount")
+        );
     }
 
     #[test]
@@ -1002,10 +1241,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("f");
         std::fs::write(&file, "x").unwrap();
-        assert!(!mount_point_missing(dir.path()));
-        assert!(mount_point_missing(&dir.path().join("missing")));
-        assert!(mount_point_missing(&file));
-        assert!(mount_point_missing(&file.join("below")));
+        assert!(!mount_point_missing(dir.path(), false));
+        assert!(mount_point_missing(&dir.path().join("missing"), false));
+        assert!(mount_point_missing(&file, false));
+        assert!(mount_point_missing(&file.join("below"), false));
+
+        // Bind mounts of files and sockets (resolved's `resolv.conf` and
+        // `io.systemd.Resolve`) have such a mount point.
+        let sock = dir.path().join("io.systemd.Resolve");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(!mount_point_missing(&file, true));
+        assert!(!mount_point_missing(&sock, true));
+        assert!(mount_point_missing(&sock, false));
+        assert!(mount_point_missing(dir.path(), true));
+        assert!(mount_point_missing(&dir.path().join("missing"), true));
+        assert!(mount_point_missing(&file.join("below"), true));
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(mount_point_missing(&link, true));
+        assert!(mount_point_missing(&link, false));
+    }
+
+    #[test]
+    fn creates_the_placeholder_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = Placeholders::in_base(dir.path());
+        p.ensure().unwrap();
+        p.ensure().unwrap();
+        let meta = std::fs::symlink_metadata(&p.file).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o7777, 0);
+        assert!(std::fs::symlink_metadata(&p.dir).unwrap().is_dir());
+        // Not a symlink to somewhere else, nor a directory.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&p.file, &link).unwrap();
+        assert!(ensure_placeholder_file(&link).is_err());
+        assert!(ensure_placeholder_file(&p.dir).is_err());
+        std::fs::set_permissions(&p.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

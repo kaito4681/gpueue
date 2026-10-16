@@ -1368,6 +1368,10 @@ root ヘルパーがすべてのジョブをその所有者として起動する
 - `job_min_uid`：uid がこれより小さいユーザーは拒否されます。未設定のときは `/etc/login.defs` の `UID_MIN`
   （ほとんどのディストリビューションで 1000）、ファイルに有効な `UID_MIN` がなければ 1000 です。これにより
   システムアカウント（`www-data`、`postgres`、デーモン自身の `gpueue` ユーザーなど）はジョブを実行できません。
+  この値は、どのジョブの所有者も変更できないディレクトリをヘルパーが判断するのにも使われます。CRIU がリストア
+  したジョブにバインドするホストのパスは、uid がこれより小さいアカウントのディレクトリ（`systemd-resolve` の
+  `/run/systemd/resolve` など）の下にあってもかまいませんが、ジョブを実行できるユーザーのディレクトリや
+  デーモンのユーザーのディレクトリの下にあってはいけません（[応答しなくなったネットワークと FUSE のファイルシステム](#network-and-fuse-filesystems-that-stop-answering)を参照）。
 - `job_denied_groups`：メンバーがパスワードなしで root として振る舞えるグループです。これらはジョブの補助
   グループから外されるので、`docker` に属するユーザーのジョブは `docker` なしで実行されます。どのグループを
   外したかはヘルパーのジャーナルに記録されます（ジョブの出力には何も加えません）。プライマリグループがこれらの
@@ -1832,7 +1836,8 @@ automount ポイントをトリガーしながら）確認し、なければ分�
 | 同上で、ジョブの作業ディレクトリがその上にある | チェックポイントされない：`... /home/alice/pfuse (fuse.sshfs) cannot be accessed by root (a FUSE mount without `allow_other`); the job uses it: the working directory /home/alice/pfuse` |
 | ホストの `/tmp` の下にマウントされた FUSE ファイルシステム（AppImage のもの。例：`/tmp/.mount_*`）。`/tmp` が普通のディレクトリのときのユーザーのディレクトリの中のもの（`/tmp/alice-dir/fuse`）も | 動作する：ジョブ専用の `/tmp` がそれを覆うので、ジョブの名前空間にはそもそも含まれない |
 | ジョブの所有者が自分のディレクトリに `allow_other` でマウントした FUSE ファイルシステム（`/home/alice/a22/afuse`）と、それを使っていないジョブ | 動作する：それを除いてチェックポイントされ、そこに空のアクセスできないディレクトリを得る（CRIU はホストのパスを名前で再びバインドするが、所有者はそれを差し替えられる） |
-| 同上で、ジョブの作業ディレクトリがその上にある | チェックポイントされない：`... /home/alice/a22/afuse (fuse.sshfs) could only be restored by binding a host path that someone other than root can redirect: /home/alice/a22/afuse (/home/alice is not a directory that only root can change); the job uses it: ...` |
+| 同上で、ジョブの作業ディレクトリがその上にある | チェックポイントされない：`... /home/alice/a22/afuse (fuse.sshfs) could only be restored by binding a host path that someone other than root can redirect: /home/alice/a22/afuse (/home/alice is not a directory that only root or a system account can change); the job uses it: ...` |
+| systemd-resolved のソケットと `resolv.conf` ファイル。shim が `/run/systemd/resolve`（システムユーザー `systemd-resolve` の所有、モード 0755）から各ジョブの `/run/systemd` にバインドする | 動作する：チェックポイントされ、リストア時にホストから再びバインドされる（gpueue 0.1.2 はこれらを除いてダンプし、その後すべてのリストアを `the mount points [...] of filesystems that were left out of the checkpoint ... are missing on this host` で拒否していた。そうしたイメージは、ヘルパーを更新すればホストのファイルとともにリストアされる） |
 | 管理者がマウントした tmpfs（例：`/scratch`）にジョブのファイルや作業ディレクトリがある | 拒否：再起動後は中身が消えています。tmpfs は再起動を生き延びる必要のないジョブにだけ使ってください。同じブート中のリストアは動作します。 |
 
 テストしていないもの、または対応していないもの：
@@ -1884,9 +1889,14 @@ root を拒否する FUSE マウントも同じように扱われます。ユー
 - **それ以外のジョブは、そのマウントを除いてチェックポイントされます**。リストア時、そのマウントポイントには、
   同じタイプのファイルシステムがそこにマウントされていて応答すればそのファイルシステムが、そうでなければ
   ジョブが開けない空のディレクトリ（root のもの、モード 0、`/var/lib/gpueue/checkpoints/detached-mount`）が
-  与えられます。マウントポイントへの経路が root 以外が変更できるディレクトリを通る場合は常に後者です。ジョブがホスト上でマウントポイントの下にあるものを見ることはありません。死んだマウントの下の
-  マウントは除かれます。リストアにはマウントポイントのディレクトリ自体が必要です。それがなくなっている場合
-  （ブート時に作られるマウントポイント）、ディレクトリが再び存在するまでリストアは拒否されます。
+  与えられます。マウントポイントへの経路がジョブの所有者が変更できるディレクトリ（root でも `job_min_uid`
+  未満のシステムアカウントでもない所有者のもの、またはグループやその他のユーザーが書き込めるもの）を通る場合は
+  常に後者です。ファイルやソケットのバインドマウントには、代わりにジョブが開けない空のファイル
+  （`/var/lib/gpueue/checkpoints/detached-mount-file`）が与えられます。ジョブがホスト上でマウントポイントの下にあるものを見ることはありません。死んだマウントの下の
+  マウントは除かれます。リストアにはマウントポイント自体（ディレクトリ、ファイルやソケットのマウントでは
+  ファイル）が必要です。それがなくなっている場合（ブート時に作られるマウントポイント）、再び存在するまで
+  リストアは拒否されます。ジョブ自身の tmpfs（shim の `/run/systemd`、`/tmp`、`/dev/shm`、隠すディレクトリ）
+  の中にあるマウントポイントはイメージからリストアされるので、ホストになくてもかまいません。
 
 ヘルパーは除いた各マウントをログに記録します（`journalctl -u gpueue-helper`：`job N: /nfs (fuse.sshfs) is no
 longer mounted on the host; the job does not use it, so it is checkpointed without it`）。
@@ -2154,9 +2164,10 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
   `/etc/fuse.conf` の `user_allow_other` が必要です）、もう一度チェックポイントしてください。[応答しなくなったネットワークと FUSE のファイルシステム](#network-and-fuse-filesystems-that-stop-answering) を参照してください。
 - `the job depends on a filesystem that is gone, does not answer, root cannot access, or that CRIU
   could only restore by binding a host path that someone other than root can redirect: <mount
-  point> (<type>) could only be restored by binding a host path ...`：ジョブが、ホストのパスが root 以外の
-  変更できるディレクトリの下にあるマウント（ユーザーが自分のホームに作った `allow_other` の FUSE マウント）を
-  使っています。チェックポイントする必要のあるジョブには、`/mnt` の下など、親ディレクトリを root しか変更
+  point> (<type>) could only be restored by binding a host path ...`：ジョブが、ホストのパスがジョブの
+  所有者の変更できるディレクトリの下にあるマウント（ユーザーが自分のホームに作った `allow_other` の FUSE
+  マウント）を使っています。root と、デーモンのユーザー以外の `job_min_uid` 未満のシステムアカウントの
+  ディレクトリは、グループやその他のユーザーが書き込めない限り問題ありません。チェックポイントする必要のあるジョブには、`/mnt` の下など、親ディレクトリを root しか変更
   できない場所にファイルシステムをマウントしてください。
 - `the job has processes in a PID or user namespace of their own (...)`：ジョブが `unshare`、`bwrap`、
   rootless のコンテナランタイムを実行しており、CRIU は入れ子の PID 名前空間とユーザー名前空間をダンプできません。
@@ -2215,12 +2226,17 @@ OS のシャットダウンや再起動の間に、ダンプが失敗したか�
   マウントして（`systemctl start data.mount`、`mount -a`、NFS サーバーを起動する、など）もう一度リストアして
   ください。[ファイルシステムとマウント](#filesystems-and-mounts) を参照してください。
 - `the mount points [...] of filesystems that were left out of the checkpoint (they were gone, did not
-  answer or refused root at the dump) are missing on this host`：CRIU には何かをマウントするためのディレクトリが必要です。
-  それを作成して（またはそこにファイルシステムをマウントして）もう一度リストアしてください。
+  answer or refused root at the dump) are missing on this host`：CRIU には何かをマウントするための
+  マウントポイント（ディレクトリ、ファイルやソケットのバインドマウントではファイル）が必要です。
+  それを作成して（またはそこにファイルシステムをマウントして）もう一度リストアしてください。ジョブ自身の
+  tmpfs の中のマウントポイントは確かめません（イメージがリストアします）。gpueue 0.1.2 は systemd-resolved の
+  あるホストですべてのジョブについてこれを報告していました（`/run/systemd/resolve/io.systemd.Resolve` など）。
+  ヘルパーを更新して、それらのジョブをもう一度リストアしてください。
   [応答しなくなったネットワークと FUSE のファイルシステム](#network-and-fuse-filesystems-that-stop-answering) を参照してください。
 - `the checkpoint binds host paths below directories that someone other than root can change,
   which CRIU would follow as root, so it is not restored: ...`：ヘルパーがダンプ時にこれを確かめるようになる
-  前に作られたイメージに、root 以外が差し替えられるホストのパスからの外部マウントがあります。安全にはリストア
+  前に作られたイメージに、ジョブの所有者が差し替えられるホストのパスからの外部マウントがあります（root と
+  `job_min_uid` 未満のシステムアカウントのディレクトリは問題ありません）。安全にはリストア
   できません。削除して（`gpueue remove`）ジョブを実行し直してください。
 - `files or directories the job used are missing on this host: [...]`：ジョブが開いていたファイルや作業
   ディレクトリがなくなっています。典型的には、それらが再起動後に空になる tmpfs（`/scratch`）上にあった場合です。

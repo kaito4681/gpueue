@@ -131,11 +131,13 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    fails with a connection error or does not return within 5 s (asked in a child process), or
    that refuse root (`lstat` fails with `EACCES`: a FUSE mount without `allow_other`) are
    dead, and so is any mount that CRIU could only bind again from a host path below a directory
-   that someone other than root can change (see [Restores and paths](#restores-and-paths)): a job with an open file, its working or root directory, its executable, a mapping or a
+   that a job's owner could change (see [Restores and paths](#restores-and-paths)): a job with an open file, its working or root directory, its executable, a mapping or a
    bound Unix socket on one is refused with a reason that names the mount. For any other job the
    helper passes them to CRIU as external mounts with keys of its own
    (`--external mnt[<mount point>]:gpueue-detached-<n>`, mounts below them with `--skip-mnt`) and
-   records them in `helper-mounts.json`, so that one dead filesystem does not keep every job
+   records them in `helper-mounts.json`, with whether each mount point is a file (a bind mount
+   of a file or socket) and whether it lies in a tmpfs of the job's own (whose contents, mount
+   points included, CRIU saves in the image), so that one dead filesystem does not keep every job
    from being checkpointed (see
    [Network and FUSE filesystems that stop answering](install.md#network-and-fuse-filesystems-that-stop-answering)).
    A job with processes in a PID or user namespace of their own (`unshare`, `bwrap`, a rootless
@@ -174,8 +176,12 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    must be mounted at the same place with the same type (automount points are triggered), and
    the files and working directories the job had open must exist. A mount left out at the dump
    is bound from the host's mount at the same place if a filesystem of the same type is mounted
-   there again and answers, and otherwise from an empty, root-owned directory of mode 0
-   (`/var/lib/gpueue/checkpoints/detached-mount`); its mount point must exist. It starts a
+   there again and answers (for a bind of a local filesystem's host path left out because the
+   path seemed redirectable, if the path is on a filesystem of the same type again), and
+   otherwise from an empty, root-owned directory of mode 0
+   (`/var/lib/gpueue/checkpoints/detached-mount`), or for a mount of a file or socket an empty,
+   root-owned file of mode 0 (`detached-mount-file` there); its mount point must exist on the
+   host (a directory, or a file), unless it lies in a tmpfs of the job's own. It starts a
    new unit `gpueue-job-<id>-r<n>.service` that runs `criu restore --root` on a bind mount of `/`
    (`/run/gpueue-helper/criu-root`), with the device access of the GPUs of the restore. In manual
    mode it then runs cuda-checkpoint `restore` and
@@ -227,9 +233,14 @@ hold a root file opened with the dump-time mode. The helper therefore:
   the host's filesystem in place of a mount left out at the dump): CRIU looks each source up by
   its path, as root, following symlinks on the way (`open_tree(AT_SYMLINK_NOFOLLOW)` only
   protects the last component), and the restore hook checks only the files the tasks hold, not
-  their mounts. So every directory on the way to such a source must be one that only root can
-  change (root's, not group- or world-writable unless sticky, not on a FUSE filesystem),
-  walked without following symlinks; nobody else can then redirect it before CRIU binds it.
+  their mounts. So every directory on the way to such a source must be one that no job's owner
+  can change (owned by root or by a system account below `job_min_uid` other than the daemon's
+  user, not group- or world-writable unless sticky, not on a FUSE filesystem), walked without
+  following symlinks; no job's owner can then redirect it before CRIU binds it. No job runs as
+  such a system account, so its directories are as safe as root's: systemd-resolved's
+  `/run/systemd/resolve` (owned by `systemd-resolve`), from which the shim binds resolved's
+  socket and `resolv.conf` files into every job, passes. (gpueue 0.1.2 accepted only root's
+  directories, left these binds out of every dump and then refused every restore.)
   Otherwise the owner of, say, an `allow_other` FUSE mount in their home could rename a
   directory on the way after the checks and leave a symlink in its place, and the restored job
   would get another host directory bound there, such as one below another user's home it could

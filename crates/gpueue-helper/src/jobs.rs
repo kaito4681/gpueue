@@ -181,6 +181,20 @@ pub fn ensure_restore_mount_points(plan: &MountPlan) {
 }
 
 impl MountPlan {
+    /// Whether the mount point `m` lies in one of the tmpfs mounts that
+    /// the shim gives a job (the private `/tmp` and `/dev/shm`, the hidden
+    /// directories, the `/run/systemd` mask): CRIU saves them in the
+    /// image, the mount points in them included. For images of older
+    /// versions, which do not record it (see
+    /// [`crate::deadmounts::DetachedMount::in_image`]).
+    pub fn restores_from_image(&self, m: &str) -> bool {
+        use crate::mounts::path_under;
+        let below = |dir: &str| m != dir && path_under(m, dir);
+        self.tmpfs.iter().any(|t| below(t))
+            || self.hidden_dirs.iter().any(|d| below(d))
+            || (self.systemd_run_keep.is_some() && below("/run/systemd"))
+    }
+
     /// Whether the mount point `m` is detached: everything a private
     /// tmpfs will cover, and what `prune` names but `keep` does not.
     /// Covered mounts are of no use to the job, but would stay hidden in
@@ -427,6 +441,35 @@ mod tests {
             Uid(nix::unistd::getuid().as_raw()),
             Gid(nix::unistd::getgid().as_raw()),
         )
+    }
+
+    #[test]
+    fn mount_points_in_the_shims_tmpfs_mounts_come_from_the_image() {
+        let plan = MountPlan::default();
+        for m in [
+            "/run/systemd/resolve/resolv.conf",
+            "/run/systemd/resolve/io.systemd.Resolve",
+            "/tmp/x",
+            "/dev/shm/x",
+            "/run/dbus/x",
+            "/run/cups/x",
+        ] {
+            assert!(plan.restores_from_image(m), "{m}");
+        }
+        for m in [
+            "/run/systemd",
+            "/tmp",
+            "/run/user/1000",
+            "/home/a",
+            "/run/systemdx/a",
+        ] {
+            assert!(!plan.restores_from_image(m), "{m}");
+        }
+        let unmasked = MountPlan {
+            systemd_run_keep: None,
+            ..MountPlan::default()
+        };
+        assert!(!unmasked.restores_from_image("/run/systemd/resolve/resolv.conf"));
     }
 
     #[test]

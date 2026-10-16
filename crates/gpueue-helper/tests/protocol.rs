@@ -2168,6 +2168,8 @@ async fn dead_mounts_are_detached_unless_the_job_uses_them() {
             fstype: "fuse.sshfs".into(),
             dev: "0:60".into(),
             why: "is no longer mounted on the host".into(),
+            not_dir: false,
+            in_image: false,
         }],
         below: vec![below.clone()],
         used: Vec::new(),
@@ -2202,6 +2204,8 @@ async fn dead_mounts_are_detached_unless_the_job_uses_them() {
             fstype: "fuse.sshfs".into(),
             key: "gpueue-detached-0".into(),
             why: "is no longer mounted on the host".into(),
+            not_dir: false,
+            in_image: Some(false),
         }]
     );
     assert_eq!(saved.required_paths(), ["/"]);
@@ -2284,6 +2288,116 @@ async fn dead_mounts_are_detached_unless_the_job_uses_them() {
     assert!(!env.base().join("6").exists());
     assert_eq!(c.running().await.len(), 2, "both jobs run");
     std::fs::set_permissions(&placeholder, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// A detached bind mount of a file (or a socket) needs a file at its
+/// mount point, and gets the placeholder file; one in a tmpfs of the job's
+/// own (the shim's /run/systemd, /tmp) needs nothing on the host, as the
+/// image restores its mount point.
+#[tokio::test]
+async fn detached_mounts_of_files_and_in_the_jobs_own_tmpfs() {
+    use gpueue_helper::deadmounts::{
+        DeadMount, DeadMounts, PLACEHOLDER_DIR, PLACEHOLDER_FILE, UNSAFE_BIND,
+    };
+    use gpueue_helper::engine::{MOUNTS_FILE, SavedMounts};
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let file = env.root.join("resolv.conf").to_str().unwrap().to_owned();
+    let in_image = env
+        .root
+        .join("gone/io.systemd.Resolve")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let dead = |id: u64, mp: &str, in_image: bool| DeadMount {
+        id,
+        mount_point: mp.to_owned(),
+        fstype: "tmpfs".into(),
+        dev: "0:28".into(),
+        why: format!("{UNSAFE_BIND} {mp} (...)"),
+        not_dir: true,
+        in_image,
+    };
+    env.host.set_dead_mounts(DeadMounts {
+        dead: vec![dead(101, &file, false), dead(102, &in_image, true)],
+        ..DeadMounts::default()
+    });
+    env.host.set_mount_points(vec!["/".into()]);
+    let image_dir = spawn_and_dump(&env, &mut c, 5).await;
+    let saved: SavedMounts = serde_json::from_slice(
+        &std::fs::read(
+            CheckpointDir::for_job(&env.base(), 5)
+                .root()
+                .join(MOUNTS_FILE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let flags: Vec<(bool, Option<bool>)> = saved
+        .detached_mounts()
+        .iter()
+        .map(|m| (m.not_dir, m.in_image))
+        .collect();
+    assert_eq!(flags, [(true, Some(false)), (true, Some(true))]);
+
+    // Only the mount point outside the job's tmpfs counts, and it must
+    // be a file: a directory cannot take a bind of a file.
+    let refused = |r: ResponseResult| {
+        let ResponseResult::Error {
+            code: HelperErrorCode::InvalidRequest,
+            message,
+        } = r
+        else {
+            panic!("{r:?}")
+        };
+        assert!(
+            message.contains(&format!(
+                "the mount points [\"{file}\"] of filesystems that were left out of the \
+                 checkpoint"
+            )),
+            "{message}"
+        );
+    };
+    refused(c.request(restore_req(5, &image_dir)).await);
+    std::fs::create_dir(&file).unwrap();
+    refused(c.request(restore_req(5, &image_dir)).await);
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::write(&file, "nameserver 127.0.0.53\n").unwrap();
+    let r = c.request(restore_req(5, &image_dir)).await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    assert!(
+        matches!(
+            ev.event,
+            Event::RestoreFinished {
+                outcome: RestoreOutcome::Success { .. },
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    // The fake host never has a filesystem back: both get the placeholder
+    // file.
+    let placeholder = env.base().join(PLACEHOLDER_FILE);
+    let restored = env.launcher.restored();
+    let args = restored[0].command.args_lossy();
+    for key in ["gpueue-detached-0", "gpueue-detached-1"] {
+        let want = format!("mnt[{key}]:{}", placeholder.display());
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--external" && w[1] == want),
+            "{args:?}"
+        );
+    }
+    let meta = std::fs::symlink_metadata(&placeholder).unwrap();
+    assert!(meta.is_file());
+    assert_eq!(meta.permissions().mode() & 0o7777, 0);
+    std::fs::set_permissions(
+        env.base().join(PLACEHOLDER_DIR),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
 }
 
 #[tokio::test]
