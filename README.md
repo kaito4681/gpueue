@@ -520,8 +520,7 @@ Pre-release (version 0.1.0). Tested so far:
   previous release's `.deb` (downloaded from GitHub and verified like `install.sh` does) with
   checkpointed and running jobs. The `all` set adds Ubuntu 24.04, Debian 12 and 13 (whose CRIU is
   missing or too old: the install and jobs without checkpoints only) and Fedora 44 with the `.rpm`.
-  (Known issue, until it is fixed: on Fedora 44 the test fails, since under SELinux (enforcing)
-  systemd may not run the helper's copy in `/var/lib/gpueue/lib`, so no job starts.) CI runs the quick set (Ubuntu 26.04) on pull requests
+  CI runs the quick set (Ubuntu 26.04) on pull requests
   that touch the helper, the daemon, checkpointing or packaging, and on every push to `main`; a
   release is not created, not even as a draft, unless it passes with the release's own `.deb`.
 
