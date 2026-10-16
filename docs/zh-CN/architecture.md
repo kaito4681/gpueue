@@ -95,7 +95,11 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    `CUDA_DEVICE_ORDER=PCI_BUS_ID` 以及 `LD_PRELOAD` 中的 fork guard。发给作业的信号（TERM、
    INT、HUP、QUIT、USR1、USR2、TSTP、ALRM、WINCH 以及其他非故障信号）会送到单元的主进程，即外层 shim
    （恢复后则是 init），并被转发给作业的进程组；STOP、CONT 和 KILL 会送到单元的每个进程。helper 会拒绝
-   任何其他信号，因为它们会送达 root 的 shim 而不是作业。
+   任何其他信号，因为它们会送达 root 的 shim 而不是作业。init 为了通过 signalfd 接收要转发的信号而
+   一直阻塞它们，但启动命令时（通过 `posix_spawn`）不阻塞任何信号，并把每个信号恢复为默认处理方式，
+   与登录 shell 或 systemd 服务的初始状态相同，因此 shell 用 exec 运行的程序（`exec python3 train.py`）
+   也能收到 SIGTERM 和 SIGINT。gpueue 0.1.2 及更早版本会把被阻塞的信号原样传给作业（见
+   [升级](install.md#upgrading)）。
 6. **检查点。** 如果配置的 `criu` 在 helper 启动时缺失、无法运行或早于 4.2，helper 首先拒绝所有转储
    （它在启动时运行一次 `criu --version`；没有版本号的输出只会给出警告）：这样的转储会失败并结束作业。然后
    helper 检查可用空间（用于 RSS 和显存、保存在镜像中的已删除文件，以及作业的 `/tmp` 和
