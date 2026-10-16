@@ -1260,6 +1260,46 @@ gpueue checkpoint 0 && gpueue status
 gpueue restore -i 0 && gpueue follow 0
 ```
 
+### Testing checkpoint/restore on a GPU host
+
+`scripts/gpu-host-test.sh` (in the source tree) tests checkpoint and restore of real CUDA jobs
+against the gpueue installed on the machine. It runs as a normal user, needs no root and changes
+nothing outside its own jobs and a temporary directory under `~/.cache`. It needs `jq`,
+`nvidia-smi`, a C compiler (`cc`, or `CC=...`) and the NVIDIA driver's `libcuda.so.1`; no CUDA
+toolkit, since its test program is built from C with inline PTX that the driver compiles for the
+GPU at hand.
+
+```sh
+scripts/gpu-host-test.sh                 # every scenario on GPU 0
+scripts/gpu-host-test.sh --only a,c      # only some scenarios
+scripts/gpu-host-test.sh --gpu 1         # another GPU
+scripts/gpu-host-test.sh --keep          # keep the jobs and files for debugging
+```
+
+The preflight requires `gpueue doctor` without FAIL and a free slot on the GPU, and prints the
+gpueue version, the driver and the GPU model. Each job is a counter that adds `i+1` to 4096
+integers every second (in GPU memory, or in process memory for the CPU job) and checks
+`value[i] == step*(i+1)`, so a restore that loses or resets its state fails. The scenarios:
+
+| | scenario |
+|---|---|
+| a | a GPU job, three checkpoint/restore cycles |
+| b | a paused GPU job is checkpointed, comes back Paused after the restore, and `gpueue start` continues it |
+| c | a CPU job, two checkpoint/restore cycles |
+| d | a GPU job stays Checkpointed while another GPU job runs and finishes, then is restored |
+| e | a GPU job with `--no-checkpoint` runs to Success |
+
+After every dump the script checks that the job is Checkpointed with an image size, that its GPU
+slot is free, that `nvidia-smi` shows none of its processes and that its counter stands still.
+After every restore it checks that the counter continues from the dumped step, every step counted
+once. Every job is stopped through a stop file and must end with Success. A failure prints the
+job's `last_error`, its last log lines and, when the journal is readable (groups `adm` or
+`systemd-journal`), the `gpueue`/`gpueue-helper` journal lines about the job. The jobs carry a
+label unique to the run and are killed and removed when the script exits; jobs that existed
+before are not touched. The script exits non-zero when any scenario failed.
+
+Maintainers run it on a GPU host, with the release candidate installed, before every release.
+
 ## Configuration
 
 The daemon and the helper read `/etc/gpueue/config.toml`. Every key is optional. Unknown keys are

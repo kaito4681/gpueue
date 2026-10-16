@@ -1149,6 +1149,41 @@ gpueue checkpoint 0 && gpueue status
 gpueue restore -i 0 && gpueue follow 0
 ```
 
+<a id="testing-checkpointrestore-on-a-gpu-host"></a>
+### 在 GPU 主机上测试检查点/恢复
+
+`scripts/gpu-host-test.sh`（位于源码树中）针对本机已安装的 gpueue，测试真实 CUDA 作业的检查点与恢复。
+它以普通用户身份运行，不需要 root，除了自己的作业和 `~/.cache` 下的临时目录外不做任何更改。它需要
+`jq`、`nvidia-smi`、C 编译器（`cc`，或 `CC=...`）以及 NVIDIA 驱动的 `libcuda.so.1`；不需要 CUDA
+工具包，因为测试程序由带内联 PTX 的 C 代码构建，PTX 由驱动为当前 GPU 编译。
+
+```sh
+scripts/gpu-host-test.sh                 # every scenario on GPU 0
+scripts/gpu-host-test.sh --only a,c      # only some scenarios
+scripts/gpu-host-test.sh --gpu 1         # another GPU
+scripts/gpu-host-test.sh --keep          # keep the jobs and files for debugging
+```
+
+预检要求 `gpueue doctor` 没有 FAIL 且 GPU 有空闲槽位，并打印 gpueue 版本、驱动版本和 GPU 型号。每个作业
+都是一个计数器：每秒给 4096 个整数加上 `i+1`（在 GPU 显存中，CPU 作业则在进程内存中）并检查
+`value[i] == step*(i+1)`，因此丢失或重置状态的恢复会失败。场景如下：
+
+| | 场景 |
+|---|---|
+| a | GPU 作业，三次检查点/恢复循环 |
+| b | 暂停的 GPU 作业被检查点，恢复后回到 Paused，`gpueue start` 使其继续 |
+| c | CPU 作业，两次检查点/恢复循环 |
+| d | GPU 作业保持 Checkpointed，期间另一个 GPU 作业运行并结束，然后恢复 |
+| e | 带 `--no-checkpoint` 的 GPU 作业以 Success 结束 |
+
+每次转储后，脚本检查作业为带镜像大小的 Checkpointed、其 GPU 槽位已空出、`nvidia-smi` 中没有它的进程，
+且计数器停止不动。每次恢复后，检查计数器从转储时的步数继续，且每一步恰好计数一次。每个作业都通过停止文件
+结束，并且必须以 Success 结束。失败时会打印作业的 `last_error`、日志的最后几行，以及在日志可读时（`adm`
+或 `systemd-journal` 组）`gpueue`/`gpueue-helper` 中有关该作业的 journal 行。作业带有本次运行唯一的标签，
+脚本退出时会被 kill 并删除；之前已存在的作业不会被触碰。任一场景失败时脚本以非零状态退出。
+
+维护者在每次发布前，在安装了候选版本的 GPU 主机上运行它。
+
 <a id="configuration"></a>
 ## 配置
 
