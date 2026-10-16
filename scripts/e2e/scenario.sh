@@ -1275,7 +1275,7 @@ s22_owner_fuse() {
         || fail "the restored job $u has $UFUSE"
     err=$(pz alice checkpoint "$d" 2>&1) && fail "the checkpoint of job $d was not refused"
     echo "checkpoint of job $d: $err"
-    grep -q "$AFUSE (fuse.sshfs) could only be restored by binding a host path that someone other than root can redirect: $AFUSE (/home/alice is not a directory that only root can change)" <<<"$err" \
+    grep -q "$AFUSE (fuse.sshfs) could only be restored by binding a host path that someone other than root can redirect: $AFUSE (/home/alice is not a directory that only root or a system account can change)" <<<"$err" \
         || fail "the refusal does not name $AFUSE: $err"
     grep -q "the working directory $AFUSE" <<<"$err" || fail "the refusal does not say why: $err"
     expect_state "$d" running
@@ -1777,7 +1777,9 @@ s24_helper_upgrade() {
 RESOLVE_RE=' /run/systemd/resolve/(io\.systemd\.Resolve|stub-resolv\.conf|resolv\.conf) '
 s25_resolved_binds() {
     local dir=/run/systemd/resolve id pid
-    [ ! -e "$dir" ] || fail "$dir exists already"
+    # Scenario 19 leaves it behind empty (and root's).
+    rmdir "$dir" 2>/dev/null || true
+    [ ! -e "$dir" ] || fail "$dir exists already, and is not empty"
     # Remove it again whatever happens (also via `fail`).
     # shellcheck disable=SC2064 # expanded now, on purpose
     trap "pkill -f e2e-resolved-socket || true; rm -rf '$dir'" EXIT
