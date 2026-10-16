@@ -98,7 +98,9 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
 5. **Shim.** Still root, the shim creates a PID namespace and a mount namespace and starts the
    namespace's init, after it triggered the host's automount points (so that the namespace gets
    the automounted filesystems). The init makes the mounts private and mounts a fresh `/proc`. It removes mounts hidden under other mounts and mounts that do not survive a
-   reboot (`/run/*`, `/media/*`), replaces each automounted filesystem stacked on its `autofs`
+   reboot (`/run/*`, `/media/*`) or that belong to other containers (below `/var/lib/docker/`,
+   `/var/lib/containers/`, `/var/lib/containerd/`, `/var/lib/kubelet/pods/` and the Docker snap's
+   and k3s's equivalents; they come and go with their containers), replaces each automounted filesystem stacked on its `autofs`
    mount with a plain copy, and mounts private tmpfs on `/tmp` and `/dev/shm`, after detaching
    whatever is mounted at or below them (the host's tmpfs `/tmp` and mounts on it, such as an
    AppImage's FUSE mount, which would otherwise stay hidden in the namespace). A mount it cannot
@@ -309,7 +311,7 @@ failed and keeps the image as well.
   at a time (a new one replaces the old), at most a few connections waiting for their Hello, and
   bounds the queues and requests in flight of a session.
 - The shim works on the job's mount namespace as root before it drops privileges. It moves and detaches mounts (including
-  the volatile ones below `/run` and `/media`) only through file descriptors, reached once
+  the volatile ones below `/run` and `/media` and other containers' mounts) only through file descriptors, reached once
   through directories that only root can change and without following symlinks, so the owner
   cannot redirect a mount operation onto a system directory. A mount below a directory that
   someone else can change is left alone. The supplementary groups come from the helper (see

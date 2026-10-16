@@ -209,10 +209,34 @@ impl MountPlan {
     }
 }
 
+/// Where container runtimes mount the root filesystems, volumes and
+/// secrets of the containers they run (Docker's
+/// `/var/lib/docker/overlay2/<id>/merged`, containerd's snapshots and
+/// task rootfs, podman's and CRI-O's `/var/lib/containers/storage`,
+/// kubelet's pod volumes, and the same below the Docker snap and k3s).
+/// They come and go with those containers, independently of a job, and
+/// no job has any business with them: a job dumped while some container
+/// ran could not be restored once it ended. Strictly below (trailing
+/// `/`), so a separate filesystem mounted on `/var/lib/docker` itself
+/// stays. Rootless podman mounts its containers in a mount namespace of
+/// its own, so they never show up in the host's.
+pub const CONTAINER_MOUNT_ROOTS: [&str; 6] = [
+    "/var/lib/docker/",
+    "/var/lib/containers/",
+    "/var/lib/containerd/",
+    "/var/lib/kubelet/pods/",
+    "/var/snap/docker/common/var-lib-docker/",
+    "/var/lib/rancher/k3s/agent/containerd/",
+];
+
 impl Default for MountPlan {
     fn default() -> Self {
         Self {
-            prune: vec!["/run/".into(), "/media/".into(), "/dev/shm".into()],
+            prune: ["/run/", "/media/", "/dev/shm"]
+                .iter()
+                .chain(CONTAINER_MOUNT_ROOTS.iter())
+                .map(|p| (*p).to_owned())
+                .collect(),
             keep: vec!["/run/nvidia-persistenced".into()],
             tmpfs: vec!["/tmp".into(), "/dev/shm".into()],
             hidden_dirs: SYSTEM_BUS_DIRS

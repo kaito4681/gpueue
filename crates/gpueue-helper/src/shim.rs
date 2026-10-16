@@ -635,8 +635,9 @@ fn flatten_automounts() -> Result<(), String> {
     Ok(())
 }
 
-/// Detach the mounts that `plan` prunes (volatile ones such as `/run/*`
-/// and `/media/*`), deepest first.
+/// Detach the mounts that `plan` prunes (volatile ones such as `/run/*`,
+/// `/media/*` and other containers' root filesystems, see
+/// [`crate::jobs::CONTAINER_MOUNT_ROOTS`]), deepest first.
 ///
 /// Like [`remove_hidden_mounts`], by descriptor only (see [`mountfd`]):
 /// mount points such as `/run/user/<uid>/doc` lie below directories that
@@ -976,10 +977,33 @@ mod tests {
 8 1 0:8 / /mnt/data rw - ext4 /dev/w rw
 6 1 0:6 / /dev/shm rw - tmpfs tmpfs rw
 7 1 0:7 / /runner rw - ext4 /dev/z rw
+9 1 0:9 / /var/lib/docker rw - ext4 /dev/v rw
+10 9 0:10 / /var/lib/docker/overlay2/3f2a/merged rw - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A
+11 9 0:11 / /var/lib/docker/containers/3f2a/mounts/shm rw - tmpfs shm rw
+12 1 0:12 / /var/lib/containers/storage/overlay/9c1d/merged rw - overlay overlay rw
+13 1 0:13 / /run/containerd/io.containerd.runtime.v2.task/k8s.io/5e/rootfs rw - overlay overlay rw
+14 1 0:14 / /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs rw - overlay overlay rw
+15 1 0:15 / /var/lib/kubelet/pods/0b9e/volumes/kubernetes.io~projected/kube-api-access rw - tmpfs tmpfs rw
+16 1 0:16 / /var/lib/kubelet rw - ext4 /dev/u rw
+17 1 0:17 / /var/lib/dockerx rw - ext4 /dev/t rw
+18 1 0:18 / /var/snap/docker/common/var-lib-docker/overlay2/8/merged rw - overlay overlay rw
 ";
         assert_eq!(
             mounts_to_prune(mi, &MountPlan::default()),
-            ["/run/user/1000", "/media/usb disk", "/dev/shm"]
+            [
+                "/run/user/1000",
+                "/media/usb disk",
+                "/dev/shm",
+                // Other containers' root filesystems and volumes; a
+                // filesystem on /var/lib/docker itself stays.
+                "/var/lib/docker/overlay2/3f2a/merged",
+                "/var/lib/docker/containers/3f2a/mounts/shm",
+                "/var/lib/containers/storage/overlay/9c1d/merged",
+                "/run/containerd/io.containerd.runtime.v2.task/k8s.io/5e/rootfs",
+                "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs",
+                "/var/lib/kubelet/pods/0b9e/volumes/kubernetes.io~projected/kube-api-access",
+                "/var/snap/docker/common/var-lib-docker/overlay2/8/merged",
+            ]
         );
         assert!(path_under("/run/a", "/run/"));
         assert!(!path_under("/run", "/run/"));

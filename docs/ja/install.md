@@ -1786,6 +1786,16 @@ DataLoader のワーカーをチェックポイントできるようにしてい
   ジョブには現れません。それらを使うには新しいジョブを開始してください。
 - `/run` と `/media` 以下のマウントと、他のマウントの下に隠れたマウントは取り除かれます。各ジョブは `/tmp` と
   `/dev/shm` に専用の tmpfs を持ち、それはチェックポイントに保存されます。
+- ほかのコンテナのマウントも取り除かれます：`/var/lib/docker/` 以下のすべて（実行中の各コンテナの
+  `overlay2/<id>/merged` のルートファイルシステムや `/dev/shm`）、`/var/lib/containers/`（root で動く podman と
+  CRI-O）、`/var/lib/containerd/`、`/var/lib/kubelet/pods/`、`/var/snap/docker/common/var-lib-docker/`（Docker の
+  snap）、`/var/lib/rancher/k3s/agent/containerd/`（k3s）です。これらはコンテナとともに現れては消えるので、
+  コンテナの実行中にダンプしたジョブは、そのコンテナが終わるとリストアできませんでした（gpueue 0.1.2：`paths the
+  checkpoint's mounts depend on are missing on this host:
+  ["/var/lib/docker/overlay2/<id>/merged"]`。そうしたイメージにはそのコンテナのマウントが必要なので、ジョブを
+  実行し直してください）。`/var/lib/docker` 自体にマウントされたファイルシステムは残ります。rootless の podman は
+  コンテナ（`~/.local/share/containers` 以下）を独自のマウント名前空間にマウントするので、ジョブから見えることは
+  ありません。
 
 CRIU はリストア時に、ジョブの名前空間のすべてのマウントを、同じホストのパスをバインドマウントすることで再作成
 します。そのため、**ジョブの開始時にマウントされていたすべてのファイルシステムが、同じパスに同じタイプで

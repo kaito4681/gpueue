@@ -83,7 +83,7 @@ only="${only//,/ }"
 # GPU scenarios without GPUEUE_E2E_GPU=1 (they would be skipped silently).
 for n in $only; do
     case "$n" in
-    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25) ;;
+    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 13 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26) ;;
     9 | 11 | 12 | 14)
         if [ "${GPUEUE_E2E_GPU:-}" != 1 ]; then
             echo "scenario $n needs GPUEUE_E2E_GPU=1" >&2

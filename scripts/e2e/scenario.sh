@@ -1819,6 +1819,41 @@ time.sleep(1e6)' "$dir/io.systemd.Resolve" e2e-resolved-socket </dev/null >/dev/
     wait_state "$id" 'done/*'
 }
 
+# s26: another container's root filesystem (Docker mounts each running
+# container's overlay at /var/lib/docker/overlay2/<id>/merged) is not part
+# of a job's namespace: it comes and goes with that container, and a job
+# dumped while it ran could not be restored once it was gone (gpueue 0.1.2:
+# `paths the checkpoint's mounts depend on are missing on this host`).
+s26_container_mounts() {
+    local root=/var/lib/docker merged=/var/lib/docker/overlay2/e2e/merged created='' id pid
+    [ -e "$root" ] || created=1
+    # Remove what this scenario made whatever happens (also via `fail`).
+    # shellcheck disable=SC2064 # expanded now, on purpose
+    trap "umount '$merged' 2>/dev/null || true; rm -rf '$(dirname "$merged")'; [ -z '$created' ] || rm -rf '$root'" EXIT
+    mkdir -p "$merged"
+    mount -t tmpfs e2e-container "$merged"
+    echo container >"$merged/rootfs"
+    free_group
+    id=$(add alice -g free -- "$COUNTER")
+    wait_state "$id" running
+    wait_unit "$id"
+    pid=$(live_pid "$id")
+    # Checked at the end, so that a failure also shows what the restore
+    # makes of it.
+    local seen=
+    ! grep -F " $merged " "/proc/$pid/mountinfo" || seen=1
+    sleep 1.5
+    pz alice checkpoint "$id" || fail "checkpoint $id"
+    wait_state "$id" checkpointed 120
+    # The container ends.
+    umount "$merged"
+    rm -rf "$(dirname "$merged")"
+    restore_continues "$id" "$LOGS/1000/$id.log"
+    pz alice kill "$id" || fail "kill $id"
+    wait_state "$id" 'done/*'
+    [ -z "$seen" ] || fail "the job had the container's mount $merged"
+}
+
 case "${1:-main}" in
 main)
     run "1 add/status/log/follow/wait" s1_lifecycle
@@ -1836,6 +1871,7 @@ main)
     run "23 nested namespaces" s23_nested_namespaces
     run "24 helper binary replaced by an upgrade" s24_helper_upgrade
     run "25 resolved's files in a system account's directory" s25_resolved_binds
+    run "26 other containers' mounts" s26_container_mounts
     if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers

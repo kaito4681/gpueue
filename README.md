@@ -433,7 +433,8 @@ Details are in [docs/install.md](docs/install.md).
   restore the program sees a broken connection and must reconnect.
 - **Private `/tmp` and `/dev/shm`:** each job has its own empty tmpfs on `/tmp` and `/dev/shm`. It
   is saved in the checkpoint and is not shared with other jobs or with your shell. Mounts that do
-  not survive a reboot (anything below `/run` and `/media`) are not visible inside jobs. Use a
+  not survive a reboot (anything below `/run` and `/media`) and other containers' mounts (below
+  `/var/lib/docker/` and the like) are not visible inside jobs. Use a
   path on a persistent filesystem to exchange files.
 - **Mounts are fixed at the start:** a job sees the filesystems that were mounted when it started
   (automount points are triggered then), not those mounted later. To restore a job, every one of

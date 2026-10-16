@@ -1613,6 +1613,14 @@ DataLoader worker 能够创建检查点：没有它，插件模式同样会在�
   要使用它们，请启动新作业。
 - `/run` 和 `/media` 下的挂载，以及被其他挂载遮盖的挂载，会被移除。每个作业在 `/tmp` 和
   `/dev/shm` 上有自己的 tmpfs，并会保存在检查点中。
+- 其他容器的挂载也会被移除：`/var/lib/docker/` 下的一切（每个运行中容器位于 `overlay2/<id>/merged` 的根文件
+  系统及其 `/dev/shm`）、`/var/lib/containers/`（以 root 运行的 podman 和 CRI-O）、`/var/lib/containerd/`、
+  `/var/lib/kubelet/pods/`、`/var/snap/docker/common/var-lib-docker/`（Docker snap）和
+  `/var/lib/rancher/k3s/agent/containerd/`（k3s）。它们随容器出现和消失，在某个容器运行期间转储的作业，在该
+  容器结束后便无法恢复（gpueue 0.1.2：`paths the checkpoint's mounts depend on are missing on this host:
+  ["/var/lib/docker/overlay2/<id>/merged"]`；这样的镜像需要该容器的挂载，请重新运行作业）。挂载在
+  `/var/lib/docker` 本身上的文件系统会保留。rootless podman 在自己的挂载命名空间中挂载其容器（位于
+  `~/.local/share/containers` 之下），因此作业永远看不到它们。
 
 CRIU 在恢复时通过绑定挂载相同的主机路径来重建作业命名空间中的每个挂载，因此**作业启动时已
 挂载的每个文件系统，都必须在相同路径以相同类型重新挂载，作业才能恢复**，即使作业从未使用

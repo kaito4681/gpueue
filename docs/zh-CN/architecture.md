@@ -77,7 +77,8 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    `DevicePolicy=closed` 和只允许作业 GPU 的 `DeviceAllow=`（见 [GPU 隔离](#gpu-isolation)）。
 5. **Shim。** shim 仍以 root 身份运行，它创建一个 PID 命名空间和一个挂载命名空间，并在触发主机的自动挂载点之后
    （以便命名空间获得自动挂载的文件系统）启动该命名空间的 init。init 把挂载设为私有，并挂载一个新的 `/proc`。它会移除被其他挂载遮盖的挂载以及重启后不会保留的挂载
-   （`/run/*`、`/media/*`），把每个叠加在其 `autofs` 挂载之上的自动挂载文件系统替换为普通的副本，
+   （`/run/*`、`/media/*`）以及属于其他容器的挂载（位于 `/var/lib/docker/`、`/var/lib/containers/`、
+   `/var/lib/containerd/`、`/var/lib/kubelet/pods/` 以及 Docker snap 和 k3s 的对应位置之下；它们随容器出现和消失），把每个叠加在其 `autofs` 挂载之上的自动挂载文件系统替换为普通的副本，
    并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs（在此之前先卸下挂载在那里及其下方的东西，例如主机的 tmpfs
    `/tmp` 以及其上的 AppImage FUSE 挂载，否则它们会隐藏在命名空间中保留下来）。因位于 root 以外的人可以修改的
    目录之下而无法这样够到的挂载（`/tmp` 是普通目录时，用户在 `/tmp/<自己的目录>/` 中的 FUSE 挂载），会在挂载
@@ -220,7 +221,7 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 - helper 通过一个私有的、归 root 所有的暂存目录（只通过文件描述符使用）把它的套接字绑定到守护进程用户所拥有的
   `/run/gpueue` 中。它一次只服务一个守护进程会话（新会话会取代旧会话），最多允许少量连接等待其 Hello，
   并限制一个会话的队列和进行中请求的数量。
-- shim 在降低权限之前以 root 身份处理作业的挂载命名空间。它只通过文件描述符移动和卸离挂载（包括 `/run` 和 `/media` 下的易失挂载），这些文件描述符只经由只有 root
+- shim 在降低权限之前以 root 身份处理作业的挂载命名空间。它只通过文件描述符移动和卸离挂载（包括 `/run` 和 `/media` 下的易失挂载以及其他容器的挂载），这些文件描述符只经由只有 root
   能修改的目录、且不跟随符号链接地获取一次，因此所有者无法把挂载操作重定向到系统目录上。位于其他人可以修改的
   目录下的挂载会保持不动。附加组由 helper 传入（见上文），因此 shim 不会再次查找。
 - 启动时，helper 会在其 `PATH` 中查找一次以名称给出的程序（`criu`、`cuda-checkpoint`、`nvidia-smi`），

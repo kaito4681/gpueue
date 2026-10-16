@@ -1794,6 +1794,17 @@ restore:
   later do not show up in running jobs. Start new jobs to use them.
 - Mounts below `/run` and `/media`, and mounts hidden under other mounts, are removed. Each job
   gets its own tmpfs on `/tmp` and `/dev/shm`, which is saved in the checkpoint.
+- Other containers' mounts are removed too: everything below `/var/lib/docker/` (each running
+  container's root filesystem at `overlay2/<id>/merged`, its `/dev/shm`), `/var/lib/containers/`
+  (podman and CRI-O as root), `/var/lib/containerd/`, `/var/lib/kubelet/pods/`,
+  `/var/snap/docker/common/var-lib-docker/` (the Docker snap) and
+  `/var/lib/rancher/k3s/agent/containerd/` (k3s). They come and go with their containers, and a
+  job dumped while one ran could not be restored once it had ended (gpueue 0.1.2: `paths the
+  checkpoint's mounts depend on are missing on this host:
+  ["/var/lib/docker/overlay2/<id>/merged"]`; such an image needs the container's mount back, so
+  run the job again). A filesystem mounted on `/var/lib/docker` itself stays. Rootless podman
+  mounts its containers (below `~/.local/share/containers`) in a mount namespace of its own, so
+  jobs never see them.
 
 CRIU recreates every mount of the job's namespace on restore by bind-mounting the same host path,
 so **every filesystem that was mounted when the job started must be mounted again, at the same
