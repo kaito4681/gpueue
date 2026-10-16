@@ -142,6 +142,23 @@ fn main() -> ExitCode {
     ExitCode::from(u8::try_from(code & 0xff).unwrap_or(1))
 }
 
+/// `<criu> --version`'s output (see `HelperConfig::check_criu`).
+fn criu_version(criu: &std::path::Path) -> Result<String, String> {
+    let out = std::process::Command::new(criu)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "{}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Flag > `config.toml` > built-in default.
 fn config(args: ServeArgs) -> Result<HelperConfig, String> {
     let file = gpueue_config::Config::load_trusted(&args.config).map_err(|e| e.to_string())?;
@@ -218,6 +235,8 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
         cfg.checkpoint.cuda.path.display(),
         cfg.nvidia_smi.display()
     );
+    let criu = cfg.check_criu(criu_version);
+    eprintln!("gpueue-helper: {criu}");
     eprintln!("gpueue-helper: job policy: {}", cfg.job_policy.describe());
     for path in cfg.paths_to_check() {
         gpueue_helper::validate::check_root_owned_path(path)?;
@@ -256,6 +275,7 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
                 }) {
                 Ok(copy) => {
                     eprintln!("gpueue-helper: job units run {}", copy.display());
+                    cfg.shim_label = gpueue_helper::helperbin::label_of(&cfg.helper_exe);
                     cfg.shim_exe = Some(copy);
                 }
                 Err(e) => eprintln!(

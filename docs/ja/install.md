@@ -61,7 +61,10 @@ NVIDIA ドライバーがなくても、gpueue は CPU のみのジョブを実�
 ### CRIU
 
 チェックポイントには CRIU 4.2 以降が必要です。CRIU がなくてもジョブは実行できます。`gpueue doctor` は CRIU が
-ない場合や古い場合に報告します。ディストリビューションのパッケージが十分に新しいのは Ubuntu 26.04
+ない場合や古い場合に報告します。ヘルパーは起動時に一度だけ CRIU を確認し、CRIU がない場合や古い場合は、ジョブに
+触れる前にすべてのチェックポイントを拒否します。ジョブは動き続けます（シャットダウン時には、チェックポイントを
+拒否された他のジョブと同じく停止されます）。CRIU をインストールまたは更新したらヘルパーを再起動してください
+（`sudo systemctl restart gpueue-helper`）。ディストリビューションのパッケージが十分に新しいのは Ubuntu 26.04
 （`sudo apt install criu`、universe）、Fedora（`sudo dnf install criu`、4.2）、Arch
 （`sudo pacman -S criu`）です。Ubuntu 22.04（3.16）、Ubuntu 24.04（パッケージなし）、Debian 12（3.17）、
 Debian 13（4.1）、RHEL/Rocky/Alma 9（3.19）では足りません。<https://criu.org/Installation> に従って CRIU を
@@ -522,7 +525,10 @@ sudo dnf install "https://github.com/kaito4681/gpueue/releases/latest/download/g
 並べてのインストールは拒否します。systemd と glibc 2.34 を必要とし、`criu` は**推奨**するだけです（弱い
 依存関係で、ディストリビューションにあれば dnf がデフォルトでインストールします）。Fedora の CRIU（4.2）は
 十分に新しいですが、RHEL/Rocky/Alma 9 の 3.19 は足りないので、そこでチェックポイントを取るにはより新しい
-CRIU が必要です（[CRIU](#criu) を参照）。ジョブの実行は CRIU なしでもできます。
+CRIU が必要です（[CRIU](#criu) を参照）。ジョブの実行は CRIU なしでもできます。SELinux が enforcing の
+場合、ヘルパーはジョブのユニットが実行する自分自身のコピー（`/var/lib/gpueue/lib/gpueue-helper-<hash>`）に
+`/usr/bin/gpueue-helper` 自身のラベルを付けます。パッケージは SELinux のファイルコンテキストの規則（policycoreutils-python-utils
+の `semanage` が必要です）も、SELinux 関連の依存も追加しません。
 
 **検証。** 他のリリースアセットと同様に、`.rpm` にも `.sha256` と `.minisig` ファイルがあります
 （[リリースを手動で検証する](#verifying-a-release-by-hand) を参照）。GPG 鍵でビルドされたリリースでは
@@ -2057,8 +2063,11 @@ sudo gpueue update --version 0.2.0 --yes
   ジョブは自分を起動したコピーを、実行中もチェックポイントとリストアを経ても使い続け、アップグレードは新しい
   ジョブのために新しいコピーを追加します。ヘルパーは起動時に、ジョブの記録からもチェックポイントからも必要と
   されなくなったコピーを削除するので、コピーが 1 つか 2 つ（まだ使われているバージョンごとに 1 つ）あるのは
-  正常です。手で削除しないでください。コピーがなくなったチェックポイントはリストアできません。NixOS ではコピーは
-  作られず、Nix ストアが古いバイナリを保持します（[NixOS](#nixos) を参照）。
+  正常です。手で削除しないでください。コピーがなくなったチェックポイントはリストアできません。SELinux のある
+  システム（Fedora、RHEL）では、コピーには `/var/lib` の他のファイルの `var_lib_t`（systemd が実行できないこと
+  があります）ではなく、インストールされたバイナリのラベル（`bin_t`）が付きます。ヘルパーは起動のたびと、ジョブの
+  ユニットがコピーを実行する前にそれを付け直すので、再ラベル付け（`restorecon -R /var/lib`）をしても問題ありません。
+  NixOS ではコピーは作られず、Nix ストアが古いバイナリを保持します（[NixOS](#nixos) を参照）。
 - **0.1.1 以前からのアップグレード：** これらのバージョンが起動したジョブは、インストールされたバイナリそのものを
   実行しており、アップグレードはそれを置き換えます。チェックポイント済みのジョブはアップグレードの前にリストア
   してください。アップグレード後はリストアが失敗します（`restore.log` に `File usr/bin/gpueue-helper has bad
@@ -2194,6 +2203,11 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
 - `not enough free space for the checkpoint: need N bytes, M available`：空き容量を作るか
   `checkpoints_dir` を移してから、もう一度チェックポイントします。必要量には、ジョブが自分の `/tmp` と
   `/dev/shm` に保存している分も含まれます（その場合、メッセージにその量が示されます）。
+- `the helper did not find criu when it started (install CRIU 4.2 or newer and restart
+  gpueue-helper)`、`criu /usr/sbin/criu is version 3.17.1, but gpueue needs CRIU 4.2 or newer
+  ...`：この CRIU ではどのジョブもチェックポイントできません（[CRIU](#criu) を参照）。CRIU 4.2 以降を
+  インストールして（または `criu_path` をそれに向けて）ヘルパーを再起動してください。ヘルパーは起動時にしか
+  CRIU を確認しません。
 - `finding CUDA processes: the helper did not find cuda-checkpoint when it started ...`：GPU ジョブは
   cuda-checkpoint なしではチェックポイントできません。インストールして（[cuda-checkpoint](#cuda-checkpoint)
   を参照）ヘルパーを再起動してください。``... process N uses an NVIDIA device but `cuda-checkpoint

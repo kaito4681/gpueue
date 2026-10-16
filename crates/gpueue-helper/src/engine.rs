@@ -545,6 +545,11 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             dumping: false,
             restoring: false,
         };
+        // A relabel since the start may have taken away the copy's SELinux
+        // label, without which systemd cannot run it.
+        if let Some(exe) = &self.cfg.shim_exe {
+            crate::helperbin::ensure_label(exe, self.cfg.shim_label.as_deref());
+        }
         {
             let mut table = self.table();
             if table.contains_key(&req.job) {
@@ -1227,6 +1232,9 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
     /// The dump's pre-checks ([`precheck_dump`]) for a claimed job, without
     /// touching it.
     async fn precheck(&self, job: JobId) -> Result<(), String> {
+        if let Some(reason) = &self.cfg.criu_refusal {
+            return Err(reason.clone());
+        }
         let Some(entry) = self.table().get(&job).cloned() else {
             return Err("job vanished".into());
         };
@@ -1297,6 +1305,16 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             return CheckpointOutcome::refused("job vanished");
         };
         let unit = entry.record.unit.clone();
+        // Without a usable criu the dump would fail and end the job (also
+        // at shutdown, which comes here without the pre-check).
+        if let Some(reason) = &self.cfg.criu_refusal {
+            self.unclaim(job, was_stopped);
+            eprintln!(
+                "gpueue-helper: refusing to checkpoint job {}: {reason}",
+                job.0
+            );
+            return CheckpointOutcome::refused(reason.clone());
+        }
         // cuda-checkpoint hangs on stopped processes.
         if was_stopped && let Err(e) = self.launcher.signal(&unit, signal::SIGCONT).await {
             self.unclaim(job, was_stopped);
@@ -1595,6 +1613,12 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     exe.display()
                 ),
             ));
+        }
+        if let Some(exe) = &record.shim_exe
+            && let Some(dir) = &self.cfg.helper_copy_dir
+            && crate::helperbin::is_copy(dir, exe)
+        {
+            crate::helperbin::ensure_label(exe, self.cfg.shim_label.as_deref());
         }
         let allowed_gids = creds.allowed_gids();
         self.check_image_paths(&dir, &record, &allowed_gids)?;

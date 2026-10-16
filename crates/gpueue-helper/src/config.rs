@@ -82,6 +82,13 @@ pub struct HelperConfig {
     /// helper in `helper_copy_dir`, set at start-up when it could be made;
     /// `None` runs `helper_exe` itself (NixOS, tests).
     pub shim_exe: Option<PathBuf>,
+    /// The SELinux label of `helper_exe`, which the copies get (see
+    /// [`crate::helperbin`]); `None` without SELinux.
+    pub shim_label: Option<Vec<u8>>,
+    /// Why every dump is refused before the job is touched: criu was
+    /// missing or too old when the helper started (see
+    /// [`HelperConfig::check_criu`]). `None`: dumps are attempted.
+    pub criu_refusal: Option<String>,
     /// `nvidia-smi`, used to find CUDA processes and GPU memory.
     pub nvidia_smi: PathBuf,
     /// Where the fork guard is installed at start-up (see
@@ -118,6 +125,8 @@ impl Default for HelperConfig {
             gc_roots: crate::gcroots::GcRoots::disabled(),
             helper_copy_dir: None,
             shim_exe: None,
+            shim_label: None,
+            criu_refusal: None,
             nvidia_smi: PathBuf::from("nvidia-smi"),
             fork_guard_dir: Some(PathBuf::from(DEFAULT_FORK_GUARD_DIR)),
             job_preload: None,
@@ -259,6 +268,58 @@ impl HelperConfig {
             }
         }
         Ok(warnings)
+    }
+
+    /// Checks the configured criu once, at start-up (after
+    /// [`Self::resolve_programs`]), and sets [`Self::criu_refusal`] when it
+    /// is missing, cannot be run or is older than
+    /// [`MIN_CRIU_VERSION`](gpueue_checkpoint::probe::MIN_CRIU_VERSION):
+    /// such a dump would fail and end the job, so it is refused instead.
+    /// `version` runs `<criu> --version` and returns its output. Returns
+    /// what to log. An output without a version is only warned about.
+    pub fn check_criu(&mut self, version: impl FnOnce(&Path) -> Result<String, String>) -> String {
+        let (major, minor, _) = gpueue_checkpoint::probe::MIN_CRIU_VERSION;
+        let criu = self.checkpoint.criu.criu_path.clone();
+        let install = format!("install CRIU {major}.{minor} or newer and restart gpueue-helper");
+        let refusal = if criu.starts_with(MISSING_PROGRAM_DIR) {
+            format!("the helper did not find criu when it started ({install})")
+        } else if !criu.is_file() {
+            format!(
+                "criu {} did not exist when the helper started ({install}, or fix criu_path)",
+                criu.display()
+            )
+        } else {
+            match version(&criu) {
+                Err(e) => format!(
+                    "running `{} --version` failed when the helper started: {e} ({install})",
+                    criu.display()
+                ),
+                Ok(out) => match gpueue_checkpoint::probe::parse_criu_version(&out) {
+                    // An unusual build: let the dump tell.
+                    None => {
+                        self.criu_refusal = None;
+                        return format!(
+                            "WARN cannot parse the version of criu {} from `--version`; \
+                             assuming it is {major}.{minor} or newer",
+                            criu.display()
+                        );
+                    }
+                    Some(v) if !v.is_supported() => format!(
+                        "criu {} is version {}, but gpueue needs CRIU {major}.{minor} or newer \
+                         ({install})",
+                        criu.display(),
+                        v.version
+                    ),
+                    Some(v) => {
+                        self.criu_refusal = None;
+                        return format!("criu {} is version {}", criu.display(), v.version);
+                    }
+                },
+            }
+        };
+        let log = format!("WARN checkpoints are refused: {refusal}");
+        self.criu_refusal = Some(refusal);
+        log
     }
 
     /// The programs [`Self::resolve_programs`] did not find (by name), for
@@ -628,6 +689,54 @@ mod tests {
         .config;
         let e = c.resolve_programs(dir.path().as_os_str()).unwrap_err();
         assert!(e.contains("criu_path"), "{e}");
+    }
+
+    #[test]
+    fn criu_that_is_missing_or_too_old_refuses_dumps() {
+        let dir = tempfile::tempdir().unwrap();
+        let criu = dir.path().join("criu");
+        std::fs::write(&criu, "").unwrap();
+        let with = |path: &Path| {
+            let mut c = HelperConfig::default();
+            c.checkpoint.criu.criu_path = path.to_owned();
+            c
+        };
+        let never = |_: &Path| -> Result<String, String> { panic!("not run") };
+
+        let mut c = with(&Path::new(MISSING_PROGRAM_DIR).join("criu"));
+        let log = c.check_criu(never);
+        let r = c.criu_refusal.clone().unwrap();
+        assert!(r.contains("did not find criu"), "{r}");
+        assert!(r.contains("CRIU 4.2 or newer"), "{r}");
+        assert!(log.contains("refused"), "{log}");
+
+        let mut c = with(&dir.path().join("gone"));
+        c.check_criu(never);
+        assert!(c.criu_refusal.unwrap().contains("did not exist"));
+
+        for (out, refused) in [
+            (Ok("Version: 4.1.1\n"), true),
+            (Ok("Version: 3.17.1\n"), true),
+            (Err("exit status: 1"), true),
+            (Ok("Version: 4.2\nGitID: v4.2\n"), false),
+            (Ok("Version: 4.2.1\n"), false),
+            // An unusual build is let through, with a warning.
+            (Ok("criu (custom build)\n"), false),
+        ] {
+            let mut c = with(&criu);
+            let log = c.check_criu(|p| {
+                assert_eq!(p, criu);
+                out.map(str::to_owned).map_err(str::to_owned)
+            });
+            assert_eq!(c.criu_refusal.is_some(), refused, "{out:?}: {log}");
+            if let Ok(v) = out
+                && refused
+            {
+                let r = c.criu_refusal.unwrap();
+                let v = v.trim_start_matches("Version: ").trim();
+                assert!(r.contains(&format!("version {v}")), "{r}");
+            }
+        }
     }
 
     #[test]

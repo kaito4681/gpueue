@@ -96,7 +96,9 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    INT、HUP、QUIT、USR1、USR2、TSTP、ALRM、WINCH 以及其他非故障信号）会送到单元的主进程，即外层 shim
    （恢复后则是 init），并被转发给作业的进程组；STOP、CONT 和 KILL 会送到单元的每个进程。helper 会拒绝
    任何其他信号，因为它们会送达 root 的 shim 而不是作业。
-6. **检查点。** helper 检查可用空间（用于 RSS 和显存、保存在镜像中的已删除文件，以及作业的 `/tmp` 和
+6. **检查点。** 如果配置的 `criu` 在 helper 启动时缺失、无法运行或早于 4.2，helper 首先拒绝所有转储
+   （它在启动时运行一次 `criu --version`；没有版本号的输出只会给出警告）：这样的转储会失败并结束作业。然后
+   helper 检查可用空间（用于 RSS 和显存、保存在镜像中的已删除文件，以及作业的 `/tmp` 和
    `/dev/shm` 的内容）、挂载和作业的套接字。作业命名空间中的 FUSE 和网络挂载，如果主机上已没有它，
    或者其 `statfs` 以连接错误失败或在 5 秒内没有返回（在子进程中检查），或者它拒绝 root 访问（`lstat`
    以 `EACCES` 失败：未使用 `allow_other` 的 FUSE 挂载），就被视为已死；CRIU 只能从位于作业所有者可以修改的
@@ -254,7 +256,14 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 缺失时拒绝恢复并说明原因。helper 每次启动时都会删除既不是它自己的、也没有被作业记录或镜像记录指明、也没有
 被镜像（`files.img`）映射的副本；如果有检查点无法读取，则不删除任何副本。在 NixOS 上 helper 从路径不变的
 Nix store 运行，不创建副本，而由 Nix GC root（`/nix/var/nix/gcroots/gpueue/job-<id>`）保留旧的 store 路径。
-如果无法创建副本，helper 会记录警告，作业单元则运行已安装的二进制文件。
+如果无法创建副本，helper 会记录警告，作业单元则运行已安装的二进制文件。在 SELinux 下，在 `/var/lib` 中创建的
+文件类型为 `var_lib_t`，systemd（`init_t`）可能无权执行它（作业单元以状态 203/EXEC 失败）。因此 helper 会把
+自身二进制文件的 `security.selinux` 属性（`/usr/bin/gpueue-helper` 为 `bin_t`；systemd 正是从它启动了
+helper，所以可以执行它）复制到 rename 之前的临时文件上，每次启动时重新给已有副本打标签，并在作业单元或恢复
+使用副本之前检查其标签，这也能修复 `restorecon -R /var/lib` 之类的重新打标签。没有 SELinux 时二进制文件没有该
+属性，不会设置任何标签；设置标签失败会记录到日志。不安装文件上下文规则：并非所有系统都有 `semanage`，而 helper
+自己打标签也适用于 `install.sh` 和 `gpueue service install` 的安装。同一目录下的 fork guard 库保持
+`var_lib_t`：作业运行在不受限的域（`unconfined_service_t`）中，可以映射它。
 
 <a id="shutdown-ordering"></a>
 ## 关机顺序

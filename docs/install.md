@@ -46,7 +46,10 @@ Without an NVIDIA driver gpueue still runs CPU-only jobs, and checkpoints them a
 ### CRIU
 
 gpueue needs CRIU 4.2 or newer to checkpoint; jobs run without it. `gpueue doctor` reports a
-missing or older CRIU. The distribution's package is new enough on Ubuntu 26.04
+missing or older CRIU. The helper checks CRIU once when it starts: without CRIU, or with an older
+one, it refuses every checkpoint before touching the job, which keeps running (at a shutdown such
+jobs are stopped, like other jobs whose checkpoint is refused). Restart it after installing or
+upgrading CRIU (`sudo systemctl restart gpueue-helper`). The distribution's package is new enough on Ubuntu 26.04
 (`sudo apt install criu`, universe), Fedora (`sudo dnf install criu`, 4.2) and Arch
 (`sudo pacman -S criu`). Ubuntu 22.04 (3.16), Ubuntu 24.04 (no package), Debian 12 (3.17),
 Debian 13 (4.1) and RHEL/Rocky/Alma 9 (3.19) do not have it: build CRIU from source following
@@ -503,7 +506,10 @@ PID 1), and refuses to install next to an installation made by `gpueue service i
 `install.sh`. It requires systemd and glibc 2.34 and only **recommends** `criu` (a weak
 dependency, which dnf installs by default when the distribution has it): Fedora's CRIU (4.2) is
 new enough, the 3.19 of RHEL/Rocky/Alma 9 is not, so checkpointing there needs a newer CRIU (see
-[CRIU](#criu)). Running jobs works without it.
+[CRIU](#criu)). Running jobs works without it. With SELinux enforcing, the helper gives the copies
+of itself that job units run (`/var/lib/gpueue/lib/gpueue-helper-<hash>`) the label of
+`/usr/bin/gpueue-helper` itself; the package adds no SELinux file-context rule (which would need
+`semanage` from policycoreutils-python-utils) and no SELinux dependency.
 
 **Verifying.** Like every release asset, the `.rpm` has `.sha256` and `.minisig` files (see
 [Verifying a release by hand](#verifying-a-release-by-hand)). Releases built with the GPG key also
@@ -2071,7 +2077,10 @@ for example) never leaves a new `gpueue` next to an old `gpueue-helper`. The con
   the copy that started it while it runs, through checkpoints and restores, and an upgrade adds a
   new copy for new jobs. The helper removes a copy when it starts and neither a job record nor a
   checkpoint needs it any more, so one or two copies (one per version still in use) are normal.
-  Do not remove them by hand: a checkpoint whose copy is gone cannot be restored. On NixOS no copy
+  Do not remove them by hand: a checkpoint whose copy is gone cannot be restored. With SELinux
+  (Fedora, RHEL), the copies get the label of the installed binary (`bin_t`), not the `var_lib_t`
+  of other files in `/var/lib`, which systemd may not execute; the helper sets it again at every
+  start and before a job unit runs a copy, so a relabel (`restorecon -R /var/lib`) does no harm. On NixOS no copy
   is made; the Nix store keeps the old binary (see [NixOS](#nixos)).
 - **Upgrading from 0.1.1 or older:** jobs started by those versions run the installed binary
   itself, which the upgrade replaces. Restore checkpointed jobs before upgrading: after the
@@ -2209,6 +2218,10 @@ warned on their next command. Refusals:
 - `not enough free space for the checkpoint: need N bytes, M available`: free space or move
   `checkpoints_dir`, then checkpoint again. The need includes what the job stores in its own
   `/tmp` and `/dev/shm` (the message then says how much).
+- `the helper did not find criu when it started (install CRIU 4.2 or newer and restart
+  gpueue-helper)`, `criu /usr/sbin/criu is version 3.17.1, but gpueue needs CRIU 4.2 or newer
+  ...`: no job can be checkpointed with this CRIU (see [CRIU](#criu)). Install CRIU 4.2 or newer
+  (or point `criu_path` at it) and restart the helper, which checks CRIU only when it starts.
 - `finding CUDA processes: the helper did not find cuda-checkpoint when it started ...`: a GPU job
   cannot be checkpointed without cuda-checkpoint. Install it (see
   [cuda-checkpoint](#cuda-checkpoint)) and restart the helper. ``... process N uses an NVIDIA
