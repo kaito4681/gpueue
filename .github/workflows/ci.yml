@@ -82,16 +82,20 @@ jobs:
             rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
             -color
 
-  # Whether this run needs the Nix jobs below. Pull requests that change only
-  # files that no flake output and no test reads (other workflows, skills/,
-  # AGENTS.md, the translated READMEs, docker/, the test and release scripts
-  # other than those packaging/nix/package.nix embeds) skip them; pushes and
-  # manual runs always run them. A skipped job passes a required check,
+  # Whether this run needs the Nix jobs and the VM test below. Pull requests
+  # that change only files that no flake output and no test reads (other
+  # workflows, skills/, AGENTS.md, the translated READMEs, docker/, the test
+  # and release scripts other than those packaging/nix/package.nix embeds)
+  # skip the Nix jobs; the VM test runs for pull requests that change the
+  # helper, checkpointing, the daemon, the packaging, the VM or e2e test
+  # scripts, the package build scripts, Cargo.lock or this workflow. Pushes
+  # and manual runs always run both. A skipped job passes a required check,
   # unlike a workflow-level paths filter, which would leave it pending.
   changes:
     runs-on: ubuntu-24.04
     outputs:
       nix: ${{ steps.filter.outputs.nix }}
+      vm: ${{ steps.filter.outputs.vm }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -104,9 +108,18 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           nix=true
+          vm=true
           if [ "$EVENT" = pull_request ]; then
             nix=false
+            vm=false
             while IFS= read -r file; do
+              case "$file" in
+                crates/gpueue-helper/* | crates/gpueue-checkpoint/* | crates/gpueue-daemon/* | packaging/* | \
+                  scripts/vm* | scripts/dist/* | scripts/e2e/* | Cargo.lock | .github/workflows/ci.yml)
+                  [ "$vm" = true ] || echo "Running the VM test, for $file"
+                  vm=true ;;
+              esac
+              [ "$nix" = false ] || continue
               case "$file" in
                 # Read by the package (keep in sync with the source fileset
                 # in packaging/nix/package.nix), or this workflow.
@@ -116,10 +129,10 @@ jobs:
               esac
               echo "Running the Nix jobs, for $file"
               nix=true
-              break
             done < <(git diff --name-only HEAD^1 HEAD)
           fi
           echo "nix=$nix" >> "$GITHUB_OUTPUT"
+          echo "vm=$vm" >> "$GITHUB_OUTPUT"
 
   # flake.nix, in parallel jobs: every check, an evaluation of all outputs,
   # the whole test suite with the Nix toolchain outside the build sandbox
@@ -373,3 +386,37 @@ jobs:
         env:
           # The FUSE part of scenario 15 must not be skipped silently.
           GPUEUE_E2E_REQUIRE_SSHFS: "1"
+
+  # gpueue on real distributions in QEMU/KVM VMs (scripts/vm-reboot-test.sh,
+  # the quick set on Ubuntu 26.04): the tree's .deb installed with apt, real
+  # reboots with checkpointed, running and paused jobs, a desktop-like host
+  # (systemd-resolved, a tmpfs /tmp, users' FUSE mounts), the upgrade from the
+  # previous release's .deb, and `gpueue service install`. The prepared VM
+  # image is cached (keyed on its provisioning, and renewed monthly).
+  vm:
+    needs: [changes]
+    if: needs.changes.outputs.vm == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # GitHub's x86_64 Linux runners have /dev/kvm, but only for root.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/vm-cache
+          key: vm-images-${{ steps.month.outputs.month }}-${{ hashFiles('scripts/vm/distros.sh', 'scripts/vm/user-data.yaml') }}
+      - run: scripts/vm-reboot-test.sh quick
+        env:
+          GPUEUE_VM_CACHE: ${{ runner.temp }}/vm-cache
+          # The releases API (the previous release for the upgrade scenario).
+          GH_TOKEN: ${{ github.token }}

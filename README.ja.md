@@ -511,15 +511,27 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
   CUDA のカウンターと、fork された DataLoader ワーカーを使う PyTorch の学習のチェックポイント/リストア
   （結果は中断しなかった実行と同一）、およびパッケージ化されサンドボックス化された `gpueue.service` 内での
   デーモンによる NVML の GPU 検出。
-- QEMU/KVM 仮想マシンの実際の OS の再起動と電源断（`scripts/vm-reboot-test.sh`）：systemd 259 と CRIU 4.2
-  の Ubuntu 26.04 に `gpueue service install` で gpueue をインストールし、`/var/lib/gpueue` を専用の ext4
-  ディスクに置き、2 ユーザーの CPU ジョブと `--no-checkpoint` のジョブを動かします。シナリオは
-  `systemctl reboot`、`systemctl poweroff` の後の新規起動、そして 1 GiB のジョブの `gpueue checkpoint` が
-  まだ実行中の再起動です。起動のたびに、前回の起動のジャーナルが停止順序（最初にデーモンが停止し、ヘルパーは
-  自身が停止する前にジョブをダンプし、`--no-checkpoint` のジョブのユニットはヘルパーの後にだけ停止し、最後に
-  `/var/lib/gpueue` がアンマウントされる）を示し、
-  タイムアウトや SIGKILL がないこと、`--no-checkpoint` のジョブが SIGTERM を受け取ったこと、リストアした
-  ジョブが止まったところからカウントを続けることを確認します。
+- QEMU/KVM 仮想マシン上の実際の OS（`scripts/vm-reboot-test.sh`）：各ディストリビューションのクラウド
+  イメージから起動し、ユーザーと同じ方法で gpueue をインストールします。`.deb` は
+  `apt install ./gpueue_<version>_amd64.deb`（Fedora では `.rpm` を `dnf` で）、または
+  `gpueue service install` を使い、`/var/lib/gpueue` は専用の ext4 ディスクに置きます。Ubuntu 26.04
+  （systemd 259、CRIU 4.2）では、`systemctl reboot`、`systemctl poweroff` の後の新規起動、そして 1 GiB の
+  ジョブの `gpueue checkpoint` がまだ実行中の再起動を、2 ユーザーの CPU ジョブと `--no-checkpoint` のジョブで
+  行います。起動のたびに、前回の起動のジャーナルが停止順序（最初にデーモンが停止し、ヘルパーは自身が停止する
+  前にジョブをダンプし、`--no-checkpoint` のジョブのユニットはヘルパーの後にだけ停止し、最後に
+  `/var/lib/gpueue` がアンマウントされる）を示し、タイムアウトや SIGKILL がないこと、`--no-checkpoint` の
+  ジョブが SIGTERM を受け取ったこと、リストアしたジョブが止まったところからカウントを続けることを確認します。
+  デスクトップに近いホスト：systemd-resolved が動作し、`/tmp` は tmpfs、ユーザーの `allow_other` なしの
+  FUSE マウントが `/tmp` の下（AppImage のもののように）とホームディレクトリにあり、実行中と一時停止中の
+  ジョブのチェックポイントとリストア、プライベートな `/tmp` に状態を持つジョブ、チェックポイント済み・
+  実行中・一時停止中のジョブを抱えた再起動を行います。前のリリースの `.deb`（GitHub からダウンロードし、
+  `install.sh` と同じように検証）からの、チェックポイント済みと実行中のジョブを抱えたアップグレード。
+  `all` セットは Ubuntu 24.04、Debian 12 と 13（CRIU がないか古すぎるため、インストールとチェックポイント
+  なしのジョブのみ）と、`.rpm` を使う Fedora 44 を加えます。Fedora 44 では現在失敗します：SELinux
+  （enforcing）の下では systemd が `/var/lib/gpueue/lib` にあるヘルパーのコピーを実行できず、どのジョブも
+  起動しません。CI は、ヘルパー、デーモン、チェックポイント、パッケージングに触れるプルリクエストと
+  `main` へのすべての push でクイックセット（Ubuntu 26.04）を実行します。リリース自身の `.deb` で
+  これが通らない限り、リリースはドラフトとしても作成されません。
 
 まだテストしていないもの：
 
@@ -527,11 +539,11 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
   リストア、ドライバーの再読み込み、`nvidia-persistenced` に対する停止順序。
 - 実際の GitHub リリースからの `install.sh` によるインストール（偽のリリースサーバーに対しては、
   Ubuntu 22.04/24.04/26.04 と Debian 12 のコンテナで `scripts/dist-test.sh` によりテスト済み）。
-- 動作中の systemd の下での `.deb`（インストール、再インストール、削除、purge は systemd のない素の
-  Debian 12 と Ubuntu のコンテナで `scripts/deb-test.sh` によりテスト済み。APT リポジトリのローカルコピーを
-  通したアップグレードも `scripts/apt-repo-test.sh` でテスト済み）、`.rpm` についても同様（インストール、
-  アップグレード、削除は素の Rocky Linux 9 と Fedora のコンテナで `scripts/rpm-test.sh` によりテスト済み）、
-  実際の `apt` リリースにある APT リポジトリ、実機での arm64。
+- 動作中の systemd の下での `.deb` の再インストール、削除、purge（systemd のない素の Debian 12 と Ubuntu の
+  コンテナで `scripts/deb-test.sh` によりテスト済み。APT リポジトリのローカルコピーを通したアップグレードも
+  `scripts/apt-repo-test.sh` でテスト済み。インストールとアップグレードは上記の VM でテスト済み）、
+  systemd の下での Rocky Linux 9 の `.rpm`（インストール、アップグレード、削除は素のコンテナで
+  `scripts/rpm-test.sh` によりテスト済み）、実際の `apt` リリースにある APT リポジトリ、実機での arm64。
 - カーネルの NFS と autofs の間接マップ（FUSE のネットワークファイルシステムと `x-systemd.automount` は
   テスト済み）。
 - マルチ GPU と NCCL のジョブ、テストに使ったもの以外の GPU モデル。
@@ -572,7 +584,7 @@ scripts/test-in-docker.sh                                   # cargo test --works
 scripts/test-in-docker.sh clippy --workspace --all-targets
 scripts/test-in-docker.sh fmt --all
 scripts/e2e-test.sh               # full stack under systemd in a privileged container
-scripts/vm-reboot-test.sh         # real reboot/poweroff of a QEMU/KVM VM with CPU jobs (needs /dev/kvm)
+scripts/vm-reboot-test.sh         # real OS in QEMU/KVM VMs: install, reboots, upgrade (needs /dev/kvm; `all` for every distro)
 scripts/gpu-host-test.sh          # checkpoint/restore of real CUDA jobs on the installed gpueue (GPU host, no root)
 scripts/service-install-test.sh   # service install / status / uninstall and doctor
 scripts/helper-systemd-test.sh    # the helper alone under systemd

@@ -262,6 +262,11 @@ git commit packaging/minisign.pub scripts/install.sh
 Back up the secret key and its password. A new key needs a new release of `gpueue` before
 `gpueue update` accepts releases signed with it. Releases are created as drafts: publish the
 draft on GitHub, or `install.sh` (which asks for the latest published release) does not see it.
+The draft is only created when the VM test (`scripts/vm-reboot-test.sh quick`, the job `vm-test`)
+passes with the release's own `.deb` on the tagged commit: it installs the package with apt in an
+Ubuntu 26.04 VM, reboots it with checkpointed, running and paused jobs, upgrades from the previous
+release and restores the jobs. If it fails, nothing is created: fix the cause and tag a new
+version, or rerun the failed jobs when the failure was not the release's.
 
 ## Installing the Debian/Ubuntu package
 

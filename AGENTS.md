@@ -7,8 +7,18 @@
 - Full-stack e2e (daemon + helper + CLI under systemd in a privileged container, incl. a
   simulated reboot): `scripts/e2e-test.sh` (`GPUEUE_SYSTEMD_BASE=gpueue-poc/systemd259:0.1`
   where apt is offline; `GPUEUE_E2E_GPU=1` with a CUDA base image adds a GPU scenario).
-- Real OS reboot/poweroff in a QEMU/KVM VM (Ubuntu 26.04, CPU jobs; needs /dev/kvm, image cached in
-  the `gpueue-vm-cache` volume): `scripts/vm-reboot-test.sh [reboot|poweroff|inflight]`.
+- Real OS in QEMU/KVM VMs (CPU jobs; needs /dev/kvm; the VM runs in an unprivileged Docker
+  container; prepared images cached in the `gpueue-vm-cache` volume or the directory
+  `GPUEUE_VM_CACHE`): `scripts/vm-reboot-test.sh [quick|all|[DISTRO/]SCENARIO...]`, `list` shows
+  the sets. gpueue is installed as users install it: the tree's `.deb`/`.rpm` with apt/dnf, or
+  `gpueue service install` (`service-install`). Scenarios: `basic`, `reboot`, `poweroff`,
+  `inflight` (reboot during a checkpoint), `desktop` (systemd-resolved, tmpfs `/tmp`, users' FUSE
+  mounts without allow_other, paused jobs, a reboot with checkpointed jobs), `upgrade` (the
+  previous release's package from GitHub, checked like install.sh does, to the tree's;
+  `GPUEUE_VM_UPGRADE_FROM`). Distributions (`scripts/vm/distros.sh`): ubuntu-26.04 (default),
+  ubuntu-24.04, debian-13, debian-12, fedora-44; where the distribution has no CRIU 4.2+ the
+  checkpointing scenarios print SKIP. `quick` (the default) is what CI and the release workflow
+  run; `GPUEUE_VM_DEB`/`GPUEUE_VM_RPM` test a given package instead of building one.
 - The `.deb` (nfpm, `packaging/nfpm.yaml`): `scripts/dist/build-package.sh BIN_DIR OUT_DIR` builds
   it, `scripts/deb-test.sh [DEB]` installs/removes/purges it in a container (`GPUEUE_DEB_BASE`,
   `GPUEUE_DEB_HTTPS=1` where plain-HTTP apt is blocked).
@@ -35,15 +45,20 @@
   these jobs: `lint` (fmt, clippy), `test`, `msrv` (`rust-version`), `shellcheck`, `actionlint`
   (the workflow files), the CPU e2e (`e2e`), `service-install`, `dist-build` and `dist` (tarball
   and `install.sh`), `deb`, `rpm`, `apt-repo`, `aur` (builds and installs the AUR package from a
-  locally built tarball with `scripts/dist/aur-test.sh`) and `nix`. `nix` is a matrix of four
+  locally built tarball with `scripts/dist/aur-test.sh`), `vm` (`scripts/vm-reboot-test.sh quick`
+  with KVM, its prepared image in actions/cache) and `nix`. `nix` is a matrix of four
   runners: on x86_64 the NixOS module VM test (with the home-manager check and the package/CRIU
   smoke checks), the helper-tests VM, and `nix flake check --no-build --all-systems` plus
   `nix develop -c cargo test`; on aarch64 `nix flake check` plus the same tests and smoke checks.
   A `changes` job skips `nix` on pull requests whose files no flake output or test reads (keep
-  its list in sync with the source fileset in `packaging/nix/package.nix`). Pushing a `v<version>` tag runs
+  its list in sync with the source fileset in `packaging/nix/package.nix`), and `vm` on pull
+  requests that touch none of the helper, checkpoint and daemon crates, `packaging/`,
+  `scripts/vm*`, `scripts/dist/`, `scripts/e2e/`, `Cargo.lock` and `ci.yml`; pushes to `main` run
+  both. Pushing a `v<version>` tag runs
   `.github/workflows/release.yml`, which builds and signs the tarballs, `.deb` and `.rpm`
   packages and attaches them, with `install.sh` and `RPM-GPG-KEY-gpueue`, to a draft GitHub
-  release. Publishing the release as a stable one (`release: released`, not the tag push) triggers
+  release. The `release` job needs `vm-test`, the quick VM test with the release's own `.deb` on
+  the tagged commit: without it passing, not even the draft is created. Publishing the release as a stable one (`release: released`, not the tag push) triggers
   `release-apt.yml` (APT repository), `release-aur.yml` (AUR) and `release-nix.yml` (moves the
   `stable` branch); each can also be run by hand (`workflow_dispatch`), which is needed when the
   release was published with a workflow's `GITHUB_TOKEN`. Release workflows are read-only by

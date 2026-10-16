@@ -458,13 +458,22 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - 在 Docker 中使用真实 GPU（驱动 595、手动模式的 CRIU 4.2.1、Python 3.12 上的 PyTorch 2.8）：
   CUDA 计数器以及使用 fork 出的 DataLoader worker 的 PyTorch 训练的检查点/恢复，
   其结果与未中断的运行完全相同；以及守护进程在打包好的、沙箱化的 `gpueue.service` 中通过 NVML 检测 GPU。
-- QEMU/KVM 虚拟机的真实操作系统重启和关机（`scripts/vm-reboot-test.sh`）：Ubuntu 26.04、systemd 259 和
-  CRIU 4.2，gpueue 通过 `gpueue service install` 安装，`/var/lib/gpueue` 位于独立的 ext4 磁盘上，运行两个用户的
-  CPU 作业以及一个 `--no-checkpoint` 作业。场景包括 `systemctl reboot`、`systemctl poweroff` 后重新启动，
-  以及在一个 1 GiB 作业的 `gpueue checkpoint` 仍在进行时重启。每次启动后，上一次启动的 journal 必须显示正确的
-  停止顺序（守护进程最先停止，helper 在自身停止之前转储作业，`--no-checkpoint` 作业的 unit 只在 helper 之后
-  停止，最后卸载 `/var/lib/gpueue`），且没有超时或
-  SIGKILL；`--no-checkpoint` 作业必须收到了 SIGTERM；恢复后的作业必须从停止处继续计数。
+- QEMU/KVM 虚拟机中的真实操作系统（`scripts/vm-reboot-test.sh`）：从各发行版的云镜像启动，并以用户的方式
+  安装 gpueue：用 `apt install ./gpueue_<version>_amd64.deb` 安装 `.deb`（在 Fedora 上用 `dnf` 安装
+  `.rpm`），或者用 `gpueue service install`，`/var/lib/gpueue` 位于独立的 ext4 磁盘上。在 Ubuntu 26.04
+  （systemd 259、CRIU 4.2）上，使用两个用户的 CPU 作业以及一个 `--no-checkpoint` 作业，测试
+  `systemctl reboot`、`systemctl poweroff` 后重新启动，以及在一个 1 GiB 作业的 `gpueue checkpoint` 仍在进行时
+  重启。每次启动后，上一次启动的 journal 必须显示正确的停止顺序（守护进程最先停止，helper 在自身停止之前转储
+  作业，`--no-checkpoint` 作业的 unit 只在 helper 之后停止，最后卸载 `/var/lib/gpueue`），且没有超时或
+  SIGKILL；`--no-checkpoint` 作业必须收到了 SIGTERM；恢复后的作业必须从停止处继续计数。类桌面主机：
+  systemd-resolved 在运行，`/tmp` 是 tmpfs，用户不带 `allow_other` 的 FUSE 挂载位于 `/tmp` 下（如 AppImage
+  的挂载）和家目录中；测试运行中和已暂停作业的检查点与恢复、一个在私有 `/tmp` 中保存状态的作业，以及带着已检查点、
+  运行中和已暂停作业的重启。从上一个发布版本的 `.deb`（从 GitHub 下载，并像 `install.sh` 那样校验）升级，
+  期间有已检查点和运行中的作业。`all` 集合还加入 Ubuntu 24.04、Debian 12 和 13（其 CRIU 缺失或过旧：只测试
+  安装和不做检查点的作业）以及使用 `.rpm` 的 Fedora 44；在 Fedora 44 上目前会失败：在 SELinux（enforcing）
+  下 systemd 不能执行 `/var/lib/gpueue/lib` 中 helper 的副本，因此任何作业都无法启动。CI 在涉及 helper、
+  守护进程、检查点或打包的拉取请求上以及每次推送到 `main` 时运行快速集合（Ubuntu 26.04）；除非它在该发布版本
+  自己的 `.deb` 上通过，否则不会创建发布版本，连草稿也不会。
 
 尚未测试：
 
@@ -472,9 +481,9 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   以及相对于 `nvidia-persistenced` 的停止顺序。
 - 从真实的 GitHub Release 用 `install.sh` 安装（已在 Ubuntu 22.04/24.04/26.04 和 Debian 12 容器中针对伪造的发布服务器测试，
   `scripts/dist-test.sh`）。
-- 在运行着 systemd 的环境中使用 `.deb`（其安装、重新安装、卸载和清除已在不带 systemd 的普通 Debian 12 和 Ubuntu 容器中测试，
-  `scripts/deb-test.sh`；通过 APT 仓库的本地副本进行升级也已测试，`scripts/apt-repo-test.sh`），`.rpm`
-  同样如此（安装、升级和卸载已在普通的 Rocky Linux 9 和 Fedora 容器中测试，
+- 在运行着 systemd 的环境中 `.deb` 的重新安装、卸载和清除（已在不带 systemd 的普通 Debian 12 和 Ubuntu 容器中测试，
+  `scripts/deb-test.sh`；通过 APT 仓库的本地副本进行升级也已测试，`scripts/apt-repo-test.sh`；安装和升级已在
+  上述虚拟机中测试），在 systemd 下 Rocky Linux 9 上的 `.rpm`（安装、升级和卸载已在普通容器中测试，
   `scripts/rpm-test.sh`），真实 `apt` 发布版本中的 APT 仓库，以及真实硬件上的 arm64。
 - 内核 NFS 和 autofs 间接映射（FUSE 网络文件系统和 `x-systemd.automount` 已测试）。
 - 多 GPU 和 NCCL 作业，以及测试所用型号以外的 GPU 型号。
@@ -513,7 +522,7 @@ scripts/test-in-docker.sh                                   # cargo test --works
 scripts/test-in-docker.sh clippy --workspace --all-targets
 scripts/test-in-docker.sh fmt --all
 scripts/e2e-test.sh               # full stack under systemd in a privileged container
-scripts/vm-reboot-test.sh         # real reboot/poweroff of a QEMU/KVM VM with CPU jobs (needs /dev/kvm)
+scripts/vm-reboot-test.sh         # real OS in QEMU/KVM VMs: install, reboots, upgrade (needs /dev/kvm; `all` for every distro)
 scripts/gpu-host-test.sh          # checkpoint/restore of real CUDA jobs on the installed gpueue (GPU host, no root)
 scripts/service-install-test.sh   # service install / status / uninstall and doctor
 scripts/helper-systemd-test.sh    # the helper alone under systemd

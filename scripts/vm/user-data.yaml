@@ -1,8 +1,10 @@
 #cloud-config
-# Provisioning of the cached VM image of scripts/vm-reboot-test.sh (runs
-# once; run.sh substitutes @SSH_KEY@). Users as in scripts/e2e: alice
-# (1000) and bob (1001) are regular users, carol (1002) is in gpueue-admin
-# (the group is created here; gpueue's sysusers.d entry keeps it).
+# Provisioning of the cached VM images of scripts/vm-reboot-test.sh (runs
+# once per distribution; run.sh substitutes @SSH_KEY@ and appends the
+# distribution's package sources and packages from distros.sh). Users as in
+# scripts/e2e: alice (1000) and bob (1001) are regular users, carol (1002)
+# is in gpueue-admin (the group is created here; gpueue's sysusers.d entry
+# keeps it).
 hostname: gpueue-vm
 disable_root: false
 ssh_pwauth: false
@@ -17,37 +19,27 @@ write_files:
     permissions: "0600"
     content: |
       @SSH_KEY@
-# Plain HTTP (port 80) may be blocked; the image has CA certificates.
-apt:
-  preserve_sources_list: false
-  primary:
-    - arches: [default]
-      uri: https://archive.ubuntu.com/ubuntu
-  security:
-    - arches: [default]
-      uri: https://security.ubuntu.com/ubuntu
-package_update: true
-package_upgrade: false
-packages:
-  - criu
-  - python3
-  - e2fsprogs
 runcmd:
+  # SELinux (Fedora): the key file needs its label for sshd.
+  - restorecon -R /root/.ssh || true
   # A persistent journal, to read the previous boot's shutdown.
   - mkdir -p /var/log/journal
   - systemd-tmpfiles --create --prefix /var/log/journal
   # Nothing that runs on its own timer during the test, and no cloud-init
   # on later boots (it would look for a datasource).
-  - systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service motd-news.timer || true
+  - systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service motd-news.timer dnf-makecache.timer || true
   - touch /etc/cloud/cloud-init.disabled
-  - apt-get clean
-  - rm -rf /var/lib/apt/lists/*
+  # No package lists are kept: the tests install the gpueue package with
+  # what is already installed (apt/dnf from a local file), offline.
+  - if command -v apt-get >/dev/null; then apt-get clean; rm -rf /var/lib/apt/lists/*; fi
+  - if command -v dnf >/dev/null; then dnf clean all; fi
   - fstrim -av || true
   - |
-    if [ -e /proc/sys/kernel/ns_last_pid ] && command -v criu >/dev/null; then
-      echo "GPUEUE-PROVISION-OK kernel $(uname -r), $(criu --version | head -n1), $(systemctl --version | head -n1)" >/dev/ttyS0
+    criu=$(criu --version 2>/dev/null | head -n1) || criu="no criu"
+    if [ -e /proc/sys/kernel/ns_last_pid ] && command -v python3 >/dev/null && command -v sshfs >/dev/null; then
+      echo "GPUEUE-PROVISION-OK $(. /etc/os-release && echo "$PRETTY_NAME"), kernel $(uname -r), ${criu:-no criu}, $(systemctl --version | head -n1)" >/dev/ttyS0
     else
-      echo "GPUEUE-PROVISION-FAILED kernel $(uname -r), ns_last_pid: $(ls /proc/sys/kernel/ns_last_pid 2>&1), criu: $(command -v criu)" >/dev/ttyS0
+      echo "GPUEUE-PROVISION-FAILED kernel $(uname -r), ns_last_pid: $(ls /proc/sys/kernel/ns_last_pid 2>&1), python3: $(command -v python3), sshfs: $(command -v sshfs)" >/dev/ttyS0
     fi
 power_state:
   mode: poweroff

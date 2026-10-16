@@ -503,15 +503,27 @@ Pre-release (version 0.1.0). Tested so far:
   checkpoint/restore of a CUDA counter and of PyTorch training with forked DataLoader workers,
   with results identical to an uninterrupted run, and NVML GPU detection by the daemon inside the
   packaged, sandboxed `gpueue.service`.
-- A real OS reboot and power-off of a QEMU/KVM virtual machine (`scripts/vm-reboot-test.sh`):
-  Ubuntu 26.04 with systemd 259 and CRIU 4.2, gpueue installed with `gpueue service install` and
-  `/var/lib/gpueue` on an ext4 disk of its own, CPU jobs of two users plus a `--no-checkpoint` job.
-  The scenarios are `systemctl reboot`, `systemctl poweroff` followed by a fresh boot, and a reboot
-  while `gpueue checkpoint` of a 1 GiB job is still running. After each boot, the previous boot's
-  journal must show the stop order (the daemon stops first, the helper dumps the jobs before it
-  stops, the `--no-checkpoint` job's unit stops only after the helper, and `/var/lib/gpueue` is
-  unmounted last) with no timeout or SIGKILL, the `--no-checkpoint` job must have received
-  SIGTERM, and the restored jobs must continue counting where they stopped.
+- Real operating systems in QEMU/KVM virtual machines (`scripts/vm-reboot-test.sh`), booted from
+  the distributions' cloud images, with gpueue installed as users install it: the `.deb` with
+  `apt install ./gpueue_<version>_amd64.deb` (the `.rpm` with `dnf` on Fedora), or
+  `gpueue service install`, and `/var/lib/gpueue` on an ext4 disk of its own. On Ubuntu 26.04
+  (systemd 259, CRIU 4.2): `systemctl reboot`, `systemctl poweroff` followed by a fresh boot, and a
+  reboot while `gpueue checkpoint` of a 1 GiB job is still running, with CPU jobs of two users plus
+  a `--no-checkpoint` job. After each boot, the previous boot's journal must show the stop order
+  (the daemon stops first, the helper dumps the jobs before it stops, the `--no-checkpoint` job's
+  unit stops only after the helper, and `/var/lib/gpueue` is unmounted last) with no timeout or
+  SIGKILL, the `--no-checkpoint` job must have received SIGTERM, and the restored jobs must
+  continue counting where they stopped. A desktop-like host: systemd-resolved running, `/tmp` a
+  tmpfs, a user's FUSE mounts without `allow_other` under `/tmp` (as an AppImage's) and in the home
+  directory, checkpoints and restores of running and paused jobs, a job that keeps its state in
+  its private `/tmp`, and a reboot with checkpointed, running and paused jobs. An upgrade from the
+  previous release's `.deb` (downloaded from GitHub and verified like `install.sh` does) with
+  checkpointed and running jobs. The `all` set adds Ubuntu 24.04, Debian 12 and 13 (whose CRIU is
+  missing or too old: the install and jobs without checkpoints only) and Fedora 44 with the `.rpm`,
+  where it currently fails: under SELinux (enforcing) systemd may not run the helper's copy in
+  `/var/lib/gpueue/lib`, so no job starts. CI runs the quick set (Ubuntu 26.04) on pull requests
+  that touch the helper, the daemon, checkpointing or packaging, and on every push to `main`; a
+  release is not created, not even as a draft, unless it passes with the release's own `.deb`.
 
 Not tested yet:
 
@@ -519,11 +531,12 @@ Not tested yet:
   restored across it, the driver reload, and the stop order relative to `nvidia-persistenced`.
 - Installing with `install.sh` from the real GitHub releases (tested against a fake release
   server, `scripts/dist-test.sh`, on Ubuntu 22.04/24.04/26.04 and Debian 12 containers).
-- The `.deb` under a running systemd (its install, reinstall, remove and purge are tested in
-  plain Debian 12 and Ubuntu containers without systemd, `scripts/deb-test.sh`, and so is an
-  upgrade through a local copy of the APT repository, `scripts/apt-repo-test.sh`), the same for the
-  `.rpm` (install, upgrade and remove are tested in plain Rocky Linux 9 and Fedora containers,
-  `scripts/rpm-test.sh`), the APT repository in the real `apt` release, and arm64 on real hardware.
+- The `.deb`'s reinstall, remove and purge under a running systemd (they are tested in plain
+  Debian 12 and Ubuntu containers without systemd, `scripts/deb-test.sh`, and so is an upgrade
+  through a local copy of the APT repository, `scripts/apt-repo-test.sh`; install and upgrade are
+  tested in the VMs above), the `.rpm` on Rocky Linux 9 under systemd (install, upgrade and remove
+  are tested in plain containers, `scripts/rpm-test.sh`), the APT repository in the real `apt`
+  release, and arm64 on real hardware.
 - Kernel NFS and autofs indirect maps (FUSE network filesystems and `x-systemd.automount` are
   tested).
 - Multi-GPU and NCCL jobs, and GPU models other than the one used for testing.
@@ -563,7 +576,7 @@ scripts/test-in-docker.sh                                   # cargo test --works
 scripts/test-in-docker.sh clippy --workspace --all-targets
 scripts/test-in-docker.sh fmt --all
 scripts/e2e-test.sh               # full stack under systemd in a privileged container
-scripts/vm-reboot-test.sh         # real reboot/poweroff of a QEMU/KVM VM with CPU jobs (needs /dev/kvm)
+scripts/vm-reboot-test.sh         # real OS in QEMU/KVM VMs: install, reboots, upgrade (needs /dev/kvm; `all` for every distro)
 scripts/gpu-host-test.sh          # checkpoint/restore of real CUDA jobs on the installed gpueue (GPU host, no root)
 scripts/service-install-test.sh   # service install / status / uninstall and doctor
 scripts/helper-systemd-test.sh    # the helper alone under systemd
