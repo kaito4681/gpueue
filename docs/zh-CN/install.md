@@ -1864,6 +1864,12 @@ sudo gpueue update --version 0.2.0 --yes
   usr/bin/gpueue-helper has bad size`）。正在运行的作业会继续运行，但无法再创建检查点（`Can't dump
   ghost file /usr/bin/gpueue-helper`），关机时也一样，因此请让它们在下次重启之前结束。升级后启动的
   作业不受影响。
+- **由 0.1.2 或更早版本启动的作业**中，shell 用 exec 运行的程序（例如 `exec python3 train.py`
+  这样的命令；在 `/bin/sh` 是 bash 的系统上（Fedora、RHEL、Arch），也包括 `python3 train.py`
+  这样只有单个程序的命令）阻塞了 SIGTERM、SIGINT、SIGHUP 以及 shim 转发的其他信号。这样的程序不会运行这些信号的
+  处理函数：`gpueue kill`，以及关机时未创建检查点的作业收到的 SIGTERM，都只能在 `grace_secs` 之后由
+  SIGKILL 结束它。shell fork 后运行的程序不受影响。被阻塞的信号在升级后仍然存在，作业创建检查点并
+  恢复后也一样（CRIU 会恢复它们），因此依赖信号处理函数（例如自行保存检查点）的作业请重新启动。
 - `/var/lib/gpueue/lib` 中旧的 fork guard 库会被有意保留：升级前创建检查点的作业需要完全相同的
   文件才能恢复。
 - 升级 NVIDIA 驱动之前，请恢复或删除已创建检查点的作业。驱动版本不同的恢复会被拒绝。

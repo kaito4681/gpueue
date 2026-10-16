@@ -126,7 +126,12 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    INT, HUP, QUIT, USR1, USR2, TSTP, ALRM, WINCH and the other non-fault signals) go to the
    unit's main process, the outer shim (or, after a restore, the init), and are forwarded to the
    job's process group; STOP, CONT and KILL go to every process of the unit. The helper refuses
-   any other signal, which would reach the root shim instead of the job.
+   any other signal, which would reach the root shim instead of the job. The init reads the
+   signals it forwards from a signalfd and keeps them blocked, but starts the command (with
+   `posix_spawn`) with no signal blocked and every signal at its default action, as a login
+   shell or a systemd service would, so a program that the shell execs (`exec python3 train.py`)
+   gets SIGTERM and SIGINT too. gpueue 0.1.2 and earlier passed the blocked signals on (see
+   [Upgrading](install.md#upgrading)).
 6. **Checkpoint.** The helper first refuses every dump when the configured `criu` was missing,
    could not be run or was older than 4.2 when it started (it runs `criu --version` once at
    start-up; an output without a version is only warned about): such a dump would fail and end

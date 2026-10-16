@@ -38,10 +38,12 @@
 //! fd it opened before the dump.
 //!
 //! Signals are received through a signalfd with the signals blocked, so no
-//! signal handlers (and no `unsafe`) are needed. Blocked signals count as
-//! handled for a namespace init, so they are delivered from the host
-//! namespace too.
+//! signal handlers are needed. Blocked signals count as handled for a
+//! namespace init, so they are delivered from the host namespace too. The
+//! job starts with them unblocked, and with every signal at its default
+//! action (see [`spawn_job`]).
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -163,6 +165,88 @@ fn signal_fd() -> nix::Result<SignalFd> {
     SignalFd::with_flags(&set, SfdFlags::SFD_CLOEXEC)
 }
 
+/// Starts the job: `argv` with exactly `envs` as its environment, in a
+/// process group of its own, with stdin from `/dev/null` and stdout and
+/// stderr on `log`. Returns its PID.
+///
+/// A process starts with the blocked and the ignored signals of its parent
+/// and keeps them across exec (std's `Command` only resets SIGPIPE). The
+/// init blocks [`FORWARDED`] and SIGCHLD for its signalfd and std ignores
+/// SIGPIPE, so the job is started with `posix_spawn` and told to unblock
+/// every signal and put each one back to its default action, the state a
+/// shell or a systemd service starts in. Otherwise a program that the shell
+/// execs (`exec python3 train.py`) would never see SIGTERM or SIGINT, and
+/// `gpueue kill` would only end it with SIGKILL after `grace_secs`.
+///
+/// A process restored by CRIU gets the mask it had at the dump, so a job
+/// checkpointed by gpueue 0.1.2 or earlier keeps the blocked signals after
+/// a restore.
+fn spawn_job(argv: &[String], envs: &BTreeMap<String, String>, log: &File) -> Result<Pid, String> {
+    use nix::spawn::{PosixSpawnAttr, PosixSpawnFileActions, PosixSpawnFlags, posix_spawn};
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    let program = argv.first().ok_or("empty command line")?;
+    let running = |e: &dyn std::fmt::Display| format!("running {program}: {e}");
+    let path =
+        find_program(program, envs.get("PATH").map(String::as_str)).map_err(|e| running(&e))?;
+    let cstring = |s: String| CString::new(s).map_err(|_| running(&"contains a NUL byte"));
+    let args = argv
+        .iter()
+        .map(|a| cstring(a.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let env = envs
+        .iter()
+        .map(|(k, v)| cstring(format!("{k}={v}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Opened with O_CLOEXEC like the log, so only the copies on 0, 1 and 2
+    // reach the job.
+    let null = File::open("/dev/null").map_err(|e| format!("opening /dev/null: {e}"))?;
+    let setup = |e: nix::Error| format!("preparing to run {program}: {e}");
+    let mut attr = PosixSpawnAttr::init().map_err(setup)?;
+    attr.set_flags(
+        PosixSpawnFlags::POSIX_SPAWN_SETPGROUP
+            | PosixSpawnFlags::POSIX_SPAWN_SETSIGMASK
+            | PosixSpawnFlags::POSIX_SPAWN_SETSIGDEF,
+    )
+    .map_err(setup)?;
+    attr.set_pgroup(Pid::from_raw(0)).map_err(setup)?;
+    attr.set_sigmask(&SigSet::empty()).map_err(setup)?;
+    attr.set_sigdefault(&SigSet::all()).map_err(setup)?;
+    let mut actions = PosixSpawnFileActions::init().map_err(setup)?;
+    actions.add_dup2(null.as_raw_fd(), 0).map_err(setup)?;
+    actions.add_dup2(log.as_raw_fd(), 1).map_err(setup)?;
+    actions.add_dup2(log.as_raw_fd(), 2).map_err(setup)?;
+    posix_spawn(path.as_path(), &actions, &attr, &args, &env).map_err(|e| running(&e))
+}
+
+/// The file `execvp` would run for `program` with the job's `PATH` (glibc's
+/// default when the job has none): a name with a slash as it is, otherwise
+/// the first executable regular file in the `PATH` directories.
+fn find_program(program: &str, path: Option<&str>) -> io::Result<PathBuf> {
+    use nix::unistd::{AccessFlags, access};
+
+    if program.contains('/') {
+        return Ok(PathBuf::from(program));
+    }
+    let mut denied = false;
+    if !program.is_empty() {
+        for dir in path.unwrap_or("/bin:/usr/bin").split(':') {
+            let file = Path::new(if dir.is_empty() { "." } else { dir }).join(program);
+            match access(&file, AccessFlags::X_OK) {
+                Ok(()) if file.is_file() => return Ok(file),
+                Ok(()) | Err(nix::errno::Errno::EACCES) => denied = true,
+                Err(_) => {}
+            }
+        }
+    }
+    Err(io::Error::from_raw_os_error(if denied {
+        nix::libc::EACCES
+    } else {
+        nix::libc::ENOENT
+    }))
+}
+
 fn status_of(ws: WaitStatus) -> Option<(Pid, ExitStatus)> {
     match ws {
         WaitStatus::Exited(pid, code) => Some((pid, ExitStatus::Exited { code })),
@@ -201,7 +285,8 @@ fn outer(files: &JobFiles) -> Result<i32, Failure> {
         .map_err(|e| Failure::other(format!("creating PID/mount namespaces: {e}")))?;
     let exe = std::env::current_exe()
         .map_err(|e| Failure::other(format!("locating the helper binary: {e}")))?;
-    // std resets the signal mask in the child.
+    // The init inherits the blocked signals, which it blocks anyway: one
+    // that arrives before its signalfd exists stays pending.
     let init = Command::new(exe)
         .arg("shim-init")
         .arg(files.dir())
@@ -291,26 +376,10 @@ fn init(files: &JobFiles, start: &mut Option<File>) -> Result<i32, Failure> {
     let log = open_log(&spec.log_path, spec.log_mode)?;
     std::env::set_current_dir(&spec.cwd)
         .map_err(|e| Failure::denied(format!("cannot enter {}: {e}", spec.cwd.display())))?;
-    let (program, args) = spec
-        .argv
-        .split_first()
-        .ok_or_else(|| Failure::other("empty command line"))?;
-    let stderr = log
-        .try_clone()
-        .map_err(|e| Failure::other(format!("duplicating the log fd: {e}")))?;
-    let child = Command::new(program)
-        .args(args)
-        .env_clear()
-        .envs(&spec.envs)
-        .stdin(Stdio::null())
-        .stdout(log)
-        .stderr(stderr)
-        .process_group(0)
-        .spawn()
-        .map_err(|e| Failure::other(format!("running {program}: {e}")))?;
-    let job = Pid::from_raw(child.id() as i32);
+    let job = spawn_job(&spec.argv, &spec.envs, &log).map_err(Failure::other)?;
+    drop(log);
     let report = StartReport::Started {
-        ns_pid: child.id(),
+        ns_pid: job.as_raw() as u32,
         init_host_pid,
     };
     if let Some(mut file) = start.take()
@@ -965,6 +1034,133 @@ pub fn run_criu_wrap(root: PathBuf, argv: Vec<String>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Prints the SigBlk and SigIgn lines of the shell's own status with
+    /// builtins only: no fork, and no external tool (the NixOS test VM has
+    /// no `grep` in `PATH`). Also prints `bash` when the shell is bash (`sh`
+    /// in Nix's build sandbox and on NixOS), which ignores SIGQUIT in its own
+    /// process whatever it inherited (and resets it for what it execs).
+    const SHELL_SIGNALS: &str = "[ -z \"$BASH_VERSION\" ] || echo bash; while read -r k v; do case $k in SigBlk:|SigIgn:) echo $k $v;; esac; done </proc/self/status";
+
+    /// The test's own PATH first, so that `sh` is found wherever it lives.
+    fn test_path() -> String {
+        format!(
+            "{}:/usr/bin:/bin",
+            std::env::var("PATH").unwrap_or_default()
+        )
+    }
+
+    /// Runs `sh -c <script>` as a job and returns its output.
+    fn job_output(script: &str) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = File::create(tmp.path().join("log")).unwrap();
+        let argv = ["sh", "-c", script].map(String::from);
+        let envs = BTreeMap::from([("PATH".to_owned(), test_path())]);
+        let pid = spawn_job(&argv, &envs, &log).unwrap();
+        assert_eq!(
+            waitpid(pid, None).unwrap(),
+            WaitStatus::Exited(pid, 0),
+            "{script}"
+        );
+        std::fs::read_to_string(tmp.path().join("log")).unwrap()
+    }
+
+    /// The SigBlk and SigIgn masks in a `/proc/<pid>/status`.
+    fn signal_masks(text: &str) -> (u64, u64) {
+        let mask = |name: &str| {
+            let line = text
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap_or_else(|| panic!("no {name} in {text}"));
+            u64::from_str_radix(line.trim(), 16).unwrap()
+        };
+        (mask("SigBlk:"), mask("SigIgn:"))
+    }
+
+    /// A job starts with no signal blocked or ignored, also when the shell
+    /// execs the program, although the init that spawns it blocks the
+    /// signals it forwards and SIGCHLD, and ignores SIGPIPE (std does that
+    /// in every Rust program, this test binary too).
+    #[test]
+    fn jobs_start_with_default_signals() {
+        let sigpipe = 1u64 << (Signal::SIGPIPE as i32 - 1);
+        let (_, ignored) = signal_masks(&std::fs::read_to_string("/proc/self/status").unwrap());
+        assert_ne!(ignored & sigpipe, 0, "the test binary ignores SIGPIPE");
+        // A thread of its own: the mask is per thread.
+        std::thread::spawn(move || {
+            let mut set = SigSet::empty();
+            for s in FORWARDED {
+                set.add(s);
+            }
+            set.add(Signal::SIGCHLD);
+            set.thread_block().unwrap();
+            // glibc reserves signals 32 and 33 for itself and refuses to
+            // change them; systemd starts the units with neither ignored.
+            let reserved = (1u64 << 31) | (1 << 32);
+            let sigquit = 1u64 << (Signal::SIGQUIT as i32 - 1);
+            let mut scripts = vec![
+                // A program that the shell execs: the shell again.
+                format!("exec sh -c '{SHELL_SIGNALS}'"),
+                // The shell itself.
+                SHELL_SIGNALS.to_owned(),
+            ];
+            // A program that is not a shell, where there is one.
+            if find_program("cat", Some(&test_path())).is_ok() {
+                scripts.push("exec cat /proc/self/status".to_owned());
+            }
+            for script in scripts {
+                let out = job_output(&script);
+                let (blocked, ignored) = signal_masks(&out);
+                // bash's own, not inherited.
+                let own = if out.lines().any(|l| l == "bash") {
+                    sigquit
+                } else {
+                    0
+                };
+                assert_eq!(blocked, 0, "{script}: blocked {blocked:#x}");
+                assert_eq!(
+                    ignored & !reserved & !own,
+                    0,
+                    "{script}: ignored {ignored:#x}"
+                );
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn finds_programs_like_execvp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |name: &str, mode: u32| {
+            std::fs::write(tmp.path().join(name), "").unwrap();
+            std::fs::set_permissions(tmp.path().join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        mode("exe", 0o755);
+        mode("plain", 0o644);
+        std::fs::create_dir(tmp.path().join("dir")).unwrap();
+        let path = format!("/nonexistent:{dir}");
+        assert_eq!(
+            find_program("exe", Some(&path)).unwrap(),
+            tmp.path().join("exe")
+        );
+        assert_eq!(
+            find_program("./x/y", Some(&path)).unwrap(),
+            Path::new("./x/y")
+        );
+        let errno = |p: &str| find_program(p, Some(&path)).unwrap_err().raw_os_error();
+        assert_eq!(errno("missing"), Some(nix::libc::ENOENT));
+        assert_eq!(errno(""), Some(nix::libc::ENOENT));
+        // Unless run as root, which may execute anything with an x bit.
+        if !nix::unistd::geteuid().is_root() {
+            assert_eq!(errno("plain"), Some(nix::libc::EACCES));
+        }
+        assert_eq!(errno("dir"), Some(nix::libc::EACCES));
+        assert!(find_program("sh", None).is_ok(), "glibc's default PATH");
+    }
 
     #[test]
     fn prunes_volatile_mounts_but_keeps_exceptions() {

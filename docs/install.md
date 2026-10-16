@@ -2093,6 +2093,15 @@ for example) never leaves a new `gpueue` next to an old `gpueue-helper`. The con
   that are running keep running, but can no longer be checkpointed (`Can't dump ghost file
   /usr/bin/gpueue-helper`), also not at a shutdown, so let them finish before the next reboot.
   Jobs started after the upgrade are not affected.
+- **Jobs started by 0.1.2 or older** have SIGTERM, SIGINT, SIGHUP and the other signals that the
+  shim forwards blocked in the program that the shell execs: a command such as
+  `exec python3 train.py`, and, where `/bin/sh` is bash (Fedora, RHEL, Arch), also a command that
+  is a single program such as `python3 train.py`. Such a program never runs its handlers for
+  them: `gpueue kill`, and the SIGTERM of a shutdown for a job that is not checkpointed, only end
+  it with SIGKILL after `grace_secs`. Programs that the shell forks are not affected. The blocked
+  signals stay after an upgrade, also when the job is checkpointed and restored (CRIU restores
+  them), so restart such jobs if they rely on a signal handler (for example to save their own
+  checkpoint).
 - Old fork guard libraries in `/var/lib/gpueue/lib` are kept on purpose: jobs checkpointed before
   the upgrade need the exact file to restore.
 - Restore or remove checkpointed jobs before upgrading the NVIDIA driver. A restore with a

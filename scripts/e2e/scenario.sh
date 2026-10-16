@@ -1854,6 +1854,61 @@ s26_container_mounts() {
     [ -z "$seen" ] || fail "the job had the container's mount $merged"
 }
 
+# s27: a job starts with no signal blocked or ignored, and `gpueue kill`
+# runs its SIGTERM handler at once. The shim's init blocks the signals it
+# forwards (it reads them from a signalfd); gpueue 0.1.2 and earlier passed
+# that mask on to the job, so a program that the shell execs (`exec python3
+# train.py`) never ran its handler and was only ended by SIGKILL after
+# grace_secs (5 s here). Also after a checkpoint and restore.
+# signals_clear <id> <n>: job <id> logged <n> SigBlk and SigIgn lines, all 0.
+signals_clear() {
+    local log
+    PZ_TIMEOUT=30 pz alice wait -q "$1" || true
+    log=$(pz alice log --full "$1") || fail "log $1"
+    echo "$log"
+    [ "$(grep -cE '^Sig(Blk|Ign):[[:space:]]+0+$' <<<"$log")" -eq "$2" ] ||
+        fail "job $1 has blocked or ignored signals"
+}
+# kill_runs_handler <id> <expected state>: `gpueue kill` runs the SIGTERM
+# handler of term_trap.py job <id> within 2 s, well before grace_secs.
+kill_runs_handler() {
+    local id=$1 log=$LOGS/1000/$1.log
+    wait_for 30 "job $id to install its handler" grep -qsx ready "$log"
+    pz alice kill "$id" || fail "kill $id"
+    timeout 2 bash -c "until grep -qx 'got TERM' '$log'; do sleep 0.05; done" ||
+        fail "the SIGTERM handler of job $id did not run within 2 s of the kill"
+    wait_state "$id" "$2"
+}
+s27_job_signals() {
+    local id
+    free_group
+    # The program itself (exec) and the shell around it.
+    id=$(add alice -- "exec grep -E 'SigBlk|SigIgn' /proc/self/status")
+    signals_clear "$id" 2
+    # The shell itself (`read` is a builtin, so no fork) and a program it
+    # forks.
+    id=$(add alice -- 'while read -r k v; do case $k in SigBlk:|SigIgn:) echo $k $v;; esac; done </proc/self/status; grep -E "SigBlk|SigIgn" /proc/self/status; true')
+    signals_clear "$id" 4
+
+    id=$(add alice -g free -- 'exec python3 /e2e/term_trap.py')
+    wait_state "$id" running
+    kill_runs_handler "$id" done/success
+    # Not the last command, so the shell does not exec it: both the shell
+    # and python3 get the SIGTERM.
+    id=$(add alice -g free -- 'python3 /e2e/term_trap.py; echo after')
+    wait_state "$id" running
+    kill_runs_handler "$id" 'done/*'
+
+    id=$(add alice -g free -- 'exec python3 /e2e/term_trap.py')
+    wait_state "$id" running
+    wait_for 30 "job $id to install its handler" grep -qsx ready "$LOGS/1000/$id.log"
+    pz alice checkpoint "$id" || fail "checkpoint $id"
+    wait_state "$id" checkpointed 120
+    pz alice restore "$id" || fail "restore $id"
+    wait_state "$id" running 120
+    kill_runs_handler "$id" done/success
+}
+
 case "${1:-main}" in
 main)
     run "1 add/status/log/follow/wait" s1_lifecycle
@@ -1872,6 +1927,7 @@ main)
     run "24 helper binary replaced by an upgrade" s24_helper_upgrade
     run "25 resolved's files in a system account's directory" s25_resolved_binds
     run "26 other containers' mounts" s26_container_mounts
+    run "27 signals of a job" s27_job_signals
     if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers
