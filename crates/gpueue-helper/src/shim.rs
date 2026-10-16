@@ -1037,27 +1037,32 @@ mod tests {
 
     /// Prints the SigBlk and SigIgn lines of the shell's own status with
     /// builtins only: no fork, and no external tool (the NixOS test VM has
-    /// no `grep` in `PATH`).
-    const SHELL_SIGNALS: &str = "while read -r k v; do case $k in SigBlk:|SigIgn:) echo $k $v;; esac; done </proc/self/status";
+    /// no `grep` in `PATH`). Also prints `bash` when the shell is bash (`sh`
+    /// in Nix's build sandbox and on NixOS), which ignores SIGQUIT in its own
+    /// process whatever it inherited (and resets it for what it execs).
+    const SHELL_SIGNALS: &str = "[ -z \"$BASH_VERSION\" ] || echo bash; while read -r k v; do case $k in SigBlk:|SigIgn:) echo $k $v;; esac; done </proc/self/status";
 
-    /// The SigBlk and SigIgn masks a job's program reports.
-    fn job_signal_masks(script: &str) -> (u64, u64) {
+    /// The test's own PATH first, so that `sh` is found wherever it lives.
+    fn test_path() -> String {
+        format!(
+            "{}:/usr/bin:/bin",
+            std::env::var("PATH").unwrap_or_default()
+        )
+    }
+
+    /// Runs `sh -c <script>` as a job and returns its output.
+    fn job_output(script: &str) -> String {
         let tmp = tempfile::tempdir().unwrap();
         let log = File::create(tmp.path().join("log")).unwrap();
         let argv = ["sh", "-c", script].map(String::from);
-        // The test's own PATH first, so that `sh` is found wherever it lives.
-        let path = format!(
-            "{}:/usr/bin:/bin",
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let envs = BTreeMap::from([("PATH".to_owned(), path)]);
+        let envs = BTreeMap::from([("PATH".to_owned(), test_path())]);
         let pid = spawn_job(&argv, &envs, &log).unwrap();
         assert_eq!(
             waitpid(pid, None).unwrap(),
             WaitStatus::Exited(pid, 0),
             "{script}"
         );
-        signal_masks(&std::fs::read_to_string(tmp.path().join("log")).unwrap())
+        std::fs::read_to_string(tmp.path().join("log")).unwrap()
     }
 
     /// The SigBlk and SigIgn masks in a `/proc/<pid>/status`.
@@ -1092,15 +1097,32 @@ mod tests {
             // glibc reserves signals 32 and 33 for itself and refuses to
             // change them; systemd starts the units with neither ignored.
             let reserved = (1u64 << 31) | (1 << 32);
-            for script in [
+            let sigquit = 1u64 << (Signal::SIGQUIT as i32 - 1);
+            let mut scripts = vec![
                 // A program that the shell execs: the shell again.
                 format!("exec sh -c '{SHELL_SIGNALS}'"),
                 // The shell itself.
                 SHELL_SIGNALS.to_owned(),
-            ] {
-                let (blocked, ignored) = job_signal_masks(&script);
+            ];
+            // A program that is not a shell, where there is one.
+            if find_program("cat", Some(&test_path())).is_ok() {
+                scripts.push("exec cat /proc/self/status".to_owned());
+            }
+            for script in scripts {
+                let out = job_output(&script);
+                let (blocked, ignored) = signal_masks(&out);
+                // bash's own, not inherited.
+                let own = if out.lines().any(|l| l == "bash") {
+                    sigquit
+                } else {
+                    0
+                };
                 assert_eq!(blocked, 0, "{script}: blocked {blocked:#x}");
-                assert_eq!(ignored & !reserved, 0, "{script}: ignored {ignored:#x}");
+                assert_eq!(
+                    ignored & !reserved & !own,
+                    0,
+                    "{script}: ignored {ignored:#x}"
+                );
             }
         })
         .join()
