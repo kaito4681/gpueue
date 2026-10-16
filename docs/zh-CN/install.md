@@ -249,7 +249,10 @@ git commit packaging/minisign.pub scripts/install.sh
 
 请备份私钥及其密码。启用新密钥后，需要先发布一个新版本的 `gpueue`，`gpueue update` 才会接受用新密钥签名的
 发布版本。发布版本以草稿形式创建：请在 GitHub 上发布该草稿，否则 `install.sh`（它请求的是最新的已发布版本）
-看不到它。
+看不到它。只有当 VM 测试（`scripts/vm-reboot-test.sh quick`，作业 `vm-test`）在打标签的提交上使用该发布版本自己的
+`.deb` 通过时，才会创建草稿：它在 Ubuntu 26.04 虚拟机中用 apt 安装软件包，在有已检查点、运行中和已暂停作业的
+情况下重启，从上一个发布版本升级，并恢复这些作业。如果失败，则不会创建任何内容：修复原因后为新版本打标签；
+如果失败并非由该发布版本引起，则重新运行失败的作业。
 
 <a id="installing-the-debianubuntu-package"></a>
 ## 安装 Debian/Ubuntu 软件包
