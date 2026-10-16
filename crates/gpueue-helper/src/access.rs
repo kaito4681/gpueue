@@ -130,6 +130,23 @@ pub struct ExistCheck {
     /// it is there.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mount_points: bool,
+    /// With `mount_points`: those of `paths` that are mount points of
+    /// files or sockets (bind mounts), not of directories.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_dirs: Vec<String>,
+}
+
+/// Whether `criu restore` may bind these host paths by their names (see
+/// [`crate::mountfd::bind_source_problem`]), as root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindSourceCheck {
+    pub paths: Vec<String>,
+    /// How long to wait for each path.
+    pub timeout_ms: u64,
+    /// Whose directories may be on the way; root's only in requests of
+    /// older helpers.
+    #[serde(default)]
+    pub trust: crate::mountfd::OwnerTrust,
 }
 
 /// Whether the filesystems at these paths answer (see
@@ -171,7 +188,7 @@ pub enum VerifyRequest {
     /// (see [`crate::mountfd::bind_source_problem`]); the reply has one
     /// entry per path: empty if it may, else why not. As root, each with
     /// `timeout_ms`.
-    BindSources(ProbeCheck),
+    BindSources(BindSourceCheck),
     /// The reply is a [`HeldAttrsReply`].
     HeldAttrs(HeldAttrsCheck),
 }
@@ -242,7 +259,7 @@ fn verify(req: Result<VerifyRequest, String>) -> VerifyReply {
             .into_iter()
             .filter(|p| {
                 if c.mount_points {
-                    crate::deadmounts::mount_point_missing(Path::new(p))
+                    crate::deadmounts::mount_point_missing(Path::new(p), c.not_dirs.contains(p))
                 } else {
                     path_missing(Path::new(p))
                 }
@@ -257,9 +274,10 @@ fn verify(req: Result<VerifyRequest, String>) -> VerifyReply {
         .collect()),
         VerifyRequest::BindSources(c) => {
             let timeout = std::time::Duration::from_millis(c.timeout_ms);
+            let trust = c.trust;
             Ok(
-                crate::deadmounts::each_with_deadline(c.paths, timeout, |p| {
-                    crate::mountfd::bind_source_problem(&p)
+                crate::deadmounts::each_with_deadline(c.paths, timeout, move |p| {
+                    crate::mountfd::bind_source_problem(&p, trust)
                 })
                 .into_iter()
                 .map(|r| match r {

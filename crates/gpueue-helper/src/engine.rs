@@ -1700,11 +1700,18 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 ));
             }
             // A mount left out of the checkpoint (see `crate::deadmounts`)
-            // is replaced by the restore, but it needs its mount point.
-            let detached: Vec<String> = mounts
+            // is replaced by the restore, but it needs its mount point:
+            // on the host, unless it lies in a tmpfs of the job's own,
+            // which the image restores with the mount point in it.
+            let plan = &self.cfg.mounts;
+            let detached: Vec<DetachedMount> = mounts
                 .detached_mounts()
                 .iter()
-                .map(|m| m.mount_point.clone())
+                .filter(|m| {
+                    !m.in_image
+                        .unwrap_or_else(|| plan.restores_from_image(&m.mount_point))
+                })
+                .cloned()
                 .collect();
             let no_mount_point = self.host.missing_mount_points(&detached).map_err(|e| {
                 error(
@@ -1718,8 +1725,8 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     format!(
                         "the mount points {no_mount_point:?} of filesystems that were left out \
                          of the checkpoint (they were gone, did not answer or refused root at the \
-                         dump) are missing on this host; create these directories, or mount \
-                         the filesystems there, and restore again"
+                         dump) are missing on this host; create them (directories, or files \
+                         for mounts of files), or mount the filesystems there, and restore again"
                     ),
                 ));
             }
@@ -2000,15 +2007,12 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             .map(|m| m.detached_mounts().to_vec())
             .unwrap_or_default();
         if !detached.is_empty() {
-            let placeholder = self
-                .cfg
-                .checkpoint_base
-                .join(crate::deadmounts::PLACEHOLDER_DIR);
+            let placeholders = crate::deadmounts::Placeholders::in_base(&self.cfg.checkpoint_base);
             let host = self.host.clone();
             let mounts = detached.clone();
             let sources = tokio::task::spawn_blocking(move || {
-                crate::deadmounts::ensure_placeholder(&placeholder)?;
-                host.detached_sources(&mounts, &placeholder)
+                placeholders.ensure()?;
+                host.detached_sources(&mounts, &placeholders)
             })
             .await
             .map_err(io::Error::other)
@@ -2018,6 +2022,8 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                     for (m, src) in detached.iter().zip(&sources) {
                         let what = if src == &m.mount_point {
                             "the host's filesystem, which is back"
+                        } else if m.not_dir {
+                            "an empty, inaccessible file (the filesystem is not back)"
                         } else {
                             "an empty, inaccessible directory (the filesystem is not back)"
                         };

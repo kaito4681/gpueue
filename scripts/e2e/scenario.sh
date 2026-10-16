@@ -1275,7 +1275,7 @@ s22_owner_fuse() {
         || fail "the restored job $u has $UFUSE"
     err=$(pz alice checkpoint "$d" 2>&1) && fail "the checkpoint of job $d was not refused"
     echo "checkpoint of job $d: $err"
-    grep -q "$AFUSE (fuse.sshfs) could only be restored by binding a host path that someone other than root can redirect: $AFUSE (/home/alice is not a directory that only root can change)" <<<"$err" \
+    grep -q "$AFUSE (fuse.sshfs) could only be restored by binding a host path that someone other than root can redirect: $AFUSE (/home/alice is not a directory that only root or a system account can change)" <<<"$err" \
         || fail "the refusal does not name $AFUSE: $err"
     grep -q "the working directory $AFUSE" <<<"$err" || fail "the refusal does not say why: $err"
     expect_state "$d" running
@@ -1767,6 +1767,93 @@ s24_helper_upgrade() {
         || fail "the helper did not log the removal of $new"
 }
 
+# s25: systemd-resolved's entries in /run/systemd/resolve, a directory of
+# the system user systemd-resolve (mode 0755, as on Ubuntu). The shim keeps
+# resolved's socket and the resolv.conf files, bound from the host, in each
+# job's /run/systemd tmpfs. A directory of a system account is not one that
+# a job's owner can redirect, so these binds are checkpointed and restored
+# like any other (gpueue 0.1.2 left them out at the dump and then refused
+# every restore: their mount points are files and a socket).
+RESOLVE_RE=' /run/systemd/resolve/(io\.systemd\.Resolve|stub-resolv\.conf|resolv\.conf) '
+s25_resolved_binds() {
+    local dir=/run/systemd/resolve id pid
+    # Scenario 19 leaves it behind empty (and root's).
+    rmdir "$dir" 2>/dev/null || true
+    [ ! -e "$dir" ] || fail "$dir exists already, and is not empty"
+    # Remove it again whatever happens (also via `fail`).
+    # shellcheck disable=SC2064 # expanded now, on purpose
+    trap "pkill -f e2e-resolved-socket || true; rm -rf '$dir'" EXIT
+    id -u systemd-resolve >/dev/null 2>&1 ||
+        useradd -r -M -d / -s /usr/sbin/nologin systemd-resolve
+    [ "$(id -u systemd-resolve)" -lt 1000 ] || fail "systemd-resolve is not a system account"
+    install -d -o systemd-resolve -g systemd-resolve -m 0755 "$dir"
+    printf 'nameserver 127.0.0.53\n' >"$dir/stub-resolv.conf"
+    printf 'nameserver 192.0.2.53\n' >"$dir/resolv.conf"
+    chown systemd-resolve: "$dir/stub-resolv.conf" "$dir/resolv.conf"
+    # A listening Unix socket, kept alive in the background.
+    setsid python3 -c 'import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+s.listen()
+time.sleep(1e6)' "$dir/io.systemd.Resolve" e2e-resolved-socket </dev/null >/dev/null 2>&1 &
+    wait_for 10 "the socket $dir/io.systemd.Resolve" test -S "$dir/io.systemd.Resolve"
+    ls -la "$dir"
+    free_group
+    id=$(add alice -g free -- "$COUNTER")
+    wait_state "$id" running
+    wait_unit "$id"
+    # The job has the host's entries, bound on its own /run/systemd tmpfs.
+    pid=$(live_pid "$id")
+    grep -E "$RESOLVE_RE" "/proc/$pid/mountinfo" || true
+    [ "$(grep -cE "$RESOLVE_RE" "/proc/$pid/mountinfo")" -eq 3 ] ||
+        fail "the job does not have the three binds of $dir"
+    sleep 1.5
+    pz alice checkpoint "$id" || fail "checkpoint $id"
+    restore_continues "$id" "$LOGS/1000/$id.log"
+    pid=$(live_pid "$id")
+    [ "$(grep -cE "$RESOLVE_RE" "/proc/$pid/mountinfo")" -eq 3 ] ||
+        fail "the restored job does not have the three binds of $dir"
+    nsenter -t "$pid" -m cat /run/systemd/resolve/resolv.conf | grep -q 192.0.2.53 ||
+        fail "the restored job does not see the host's $dir/resolv.conf"
+    pz alice kill "$id" || fail "kill $id"
+    wait_state "$id" 'done/*'
+}
+
+# s26: another container's root filesystem (Docker mounts each running
+# container's overlay at /var/lib/docker/overlay2/<id>/merged) is not part
+# of a job's namespace: it comes and goes with that container, and a job
+# dumped while it ran could not be restored once it was gone (gpueue 0.1.2:
+# `paths the checkpoint's mounts depend on are missing on this host`).
+s26_container_mounts() {
+    local root=/var/lib/docker merged=/var/lib/docker/overlay2/e2e/merged created='' id pid
+    [ -e "$root" ] || created=1
+    # Remove what this scenario made whatever happens (also via `fail`).
+    # shellcheck disable=SC2064 # expanded now, on purpose
+    trap "umount '$merged' 2>/dev/null || true; rm -rf '$(dirname "$merged")'; [ -z '$created' ] || rm -rf '$root'" EXIT
+    mkdir -p "$merged"
+    mount -t tmpfs e2e-container "$merged"
+    echo container >"$merged/rootfs"
+    free_group
+    id=$(add alice -g free -- "$COUNTER")
+    wait_state "$id" running
+    wait_unit "$id"
+    pid=$(live_pid "$id")
+    # Checked at the end, so that a failure also shows what the restore
+    # makes of it.
+    local seen=
+    ! grep -F " $merged " "/proc/$pid/mountinfo" || seen=1
+    sleep 1.5
+    pz alice checkpoint "$id" || fail "checkpoint $id"
+    wait_state "$id" checkpointed 120
+    # The container ends.
+    umount "$merged"
+    rm -rf "$(dirname "$merged")"
+    restore_continues "$id" "$LOGS/1000/$id.log"
+    pz alice kill "$id" || fail "kill $id"
+    wait_state "$id" 'done/*'
+    [ -z "$seen" ] || fail "the job had the container's mount $merged"
+}
+
 case "${1:-main}" in
 main)
     run "1 add/status/log/follow/wait" s1_lifecycle
@@ -1783,6 +1870,8 @@ main)
     run "19 no privilege escalation from jobs" s19_no_escalation
     run "23 nested namespaces" s23_nested_namespaces
     run "24 helper binary replaced by an upgrade" s24_helper_upgrade
+    run "25 resolved's files in a system account's directory" s25_resolved_binds
+    run "26 other containers' mounts" s26_container_mounts
     if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers

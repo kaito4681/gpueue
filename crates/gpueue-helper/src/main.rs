@@ -295,11 +295,16 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     )
     .await
     .map_err(|e| format!("connecting to systemd: {e}"))?;
-    let host = SystemHost::new(
+    let mut host = SystemHost::new(
         cfg.nvidia_smi.clone(),
         cfg.checkpoint.cuda.clone(),
         cfg.helper_exe.clone(),
     );
+    // Directories of system accounts that no job runs as (such as
+    // systemd-resolve's /run/systemd/resolve) may lie on the way to a host
+    // path that CRIU binds; jobs' owners cannot change them.
+    host.bind_trust =
+        gpueue_helper::mountfd::OwnerTrust::system(cfg.job_policy.min_uid, cfg.daemon_uid);
     let factory: gpueue_helper::ExecutorFactory =
         Arc::new(|| Box::new(SystemExecutor::default()) as Box<dyn Executor + Send>);
     let socket_path = cfg.socket_path.clone();

@@ -1245,7 +1245,10 @@ root helper 以所有者身份启动每个作业，因此由它决定运行谁�
 
 - `job_min_uid`：uid 小于此值的用户会被拒绝。未设置时为 `/etc/login.defs` 的 `UID_MIN`（大多数发行版为
   1000），文件中没有有效的 `UID_MIN` 时为 1000。这样系统账户（`www-data`、`postgres`、守护进程自己的
-  `gpueue` 用户等）就不能运行作业。
+  `gpueue` 用户等）就不能运行作业。helper 也用它判断哪些目录是任何作业的所有者都无法修改的：CRIU 绑定到
+  恢复的作业中的主机路径可以位于 uid 小于此值的账户的目录之下（例如 `systemd-resolve` 的
+  `/run/systemd/resolve`），但不能位于可以运行作业的用户的目录之下，也不能位于守护进程用户的目录之下（见
+  [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)）。
 - `job_denied_groups`：其成员无需密码即可以 root 身份行事的组。它们会从作业的附加组中去掉，因此属于
   `docker` 的用户的作业在没有 `docker` 的情况下运行；去掉了哪些组会记录在 helper 的日志中
   （不会改动作业的输出）。主组为其中之一的作业会被拒绝，进程带有其中之一的检查点也会被拒绝恢复（CRIU 会恢复该组）。
@@ -1610,6 +1613,14 @@ DataLoader worker 能够创建检查点：没有它，插件模式同样会在�
   要使用它们，请启动新作业。
 - `/run` 和 `/media` 下的挂载，以及被其他挂载遮盖的挂载，会被移除。每个作业在 `/tmp` 和
   `/dev/shm` 上有自己的 tmpfs，并会保存在检查点中。
+- 其他容器的挂载也会被移除：`/var/lib/docker/` 下的一切（每个运行中容器位于 `overlay2/<id>/merged` 的根文件
+  系统及其 `/dev/shm`）、`/var/lib/containers/`（以 root 运行的 podman 和 CRI-O）、`/var/lib/containerd/`、
+  `/var/lib/kubelet/pods/`、`/var/snap/docker/common/var-lib-docker/`（Docker snap）和
+  `/var/lib/rancher/k3s/agent/containerd/`（k3s）。它们随容器出现和消失，在某个容器运行期间转储的作业，在该
+  容器结束后便无法恢复（gpueue 0.1.2：`paths the checkpoint's mounts depend on are missing on this host:
+  ["/var/lib/docker/overlay2/<id>/merged"]`；这样的镜像需要该容器的挂载，请重新运行作业）。挂载在
+  `/var/lib/docker` 本身上的文件系统会保留。rootless podman 在自己的挂载命名空间中挂载其容器（位于
+  `~/.local/share/containers` 之下），因此作业永远看不到它们。
 
 CRIU 在恢复时通过绑定挂载相同的主机路径来重建作业命名空间中的每个挂载，因此**作业启动时已
 挂载的每个文件系统，都必须在相同路径以相同类型重新挂载，作业才能恢复**，即使作业从未使用
@@ -1654,7 +1665,8 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 | 同上，但作业的工作目录位于其上 | 不会被检查点：`... /home/alice/pfuse (fuse.sshfs) cannot be accessed by root (a FUSE mount without `allow_other`); the job uses it: the working directory /home/alice/pfuse` |
 | 挂载在主机 `/tmp` 下的 FUSE 文件系统（AppImage 的挂载，例如 `/tmp/.mount_*`），`/tmp` 是普通目录时位于用户自己目录中的也一样（`/tmp/alice-dir/fuse`） | 可行：作业私有的 `/tmp` 覆盖了它，因此它根本不在作业的命名空间中 |
 | 作业所有者在自己的目录中以 `allow_other` 挂载的 FUSE 文件系统（`/home/alice/a22/afuse`），以及不使用它的作业 | 可行：作业在不包含该挂载的情况下被检查点，并在那里得到一个空的、无法访问的目录（CRIU 会按名称再次绑定该主机路径，而所有者可以改变它） |
-| 同上，但作业的工作目录位于其上 | 不会被检查点：`... /home/alice/a22/afuse (fuse.sshfs) could only be restored by binding a host path that someone other than root can redirect: /home/alice/a22/afuse (/home/alice is not a directory that only root can change); the job uses it: ...` |
+| 同上，但作业的工作目录位于其上 | 不会被检查点：`... /home/alice/a22/afuse (fuse.sshfs) could only be restored by binding a host path that someone other than root can redirect: /home/alice/a22/afuse (/home/alice is not a directory that only root or a system account can change); the job uses it: ...` |
+| systemd-resolved 的套接字和 `resolv.conf` 文件，shim 从 `/run/systemd/resolve`（属于系统用户 `systemd-resolve`，权限 0755）把它们绑定到每个作业的 `/run/systemd` 中 | 可行：它们会被检查点，恢复时再次从主机绑定（gpueue 0.1.2 在转储时略去了它们，随后以 `the mount points [...] of filesystems that were left out of the checkpoint ... are missing on this host` 拒绝每一次恢复；升级 helper 之后，这样的镜像会带着主机的文件恢复） |
 | 管理员挂载的 tmpfs（例如 `/scratch`），作业的文件或工作目录位于其上 | 拒绝：重启后其内容已丢失。只把 tmpfs 用于不需要跨重启保留的作业。同一次启动内的恢复可行。 |
 
 未测试或不支持：
@@ -1698,9 +1710,12 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
   并带着该原因显示为 `Checkpoint failed`。
 - **其他所有作业都会在不包含该挂载的情况下被检查点**。恢复时，如果该处挂载着同一类型的文件系统且
   它响应，其挂载点就得到该文件系统，否则得到一个作业无法打开的空目录（属于 root，权限 0，
-  `/var/lib/gpueue/checkpoints/detached-mount`）；如果到挂载点的路径经过 root 以外的人可以修改的目录，则总是后者。作业永远看不到主机上挂载点之下的内容。已死挂载之下
-  的挂载会被略去。恢复需要挂载点目录本身；如果它已不存在（在启动时创建的挂载点），在该目录再次存在
-  之前恢复会被拒绝。
+  `/var/lib/gpueue/checkpoints/detached-mount`）；如果到挂载点的路径经过作业所有者可以修改的目录（所有者
+  既不是 root 也不是低于 `job_min_uid` 的系统账户，或者可被组或其他用户写入），则总是后者。文件或套接字的
+  bind 挂载则改为得到一个作业无法打开的空文件（`/var/lib/gpueue/checkpoints/detached-mount-file`）。作业永远看不到主机上挂载点之下的内容。已死挂载之下
+  的挂载会被略去。恢复需要挂载点本身（目录，对文件或套接字的挂载则为文件）；如果它已不存在（在启动时创建的
+  挂载点），在它再次存在之前恢复会被拒绝。位于作业自己的 tmpfs（shim 的 `/run/systemd`、`/tmp`、`/dev/shm`、
+  被隐藏的目录）中的挂载点从镜像恢复，主机上不需要有。
 
 helper 会把它略去的每个挂载记入日志（`journalctl -u gpueue-helper`：`job N: /nfs (fuse.sshfs) is no
 longer mounted on the host; the job does not use it, so it is checkpointed without it`）。
@@ -1947,8 +1962,9 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
   [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)。
 - `the job depends on a filesystem that is gone, does not answer, root cannot access, or that CRIU
   could only restore by binding a host path that someone other than root can redirect: <mount
-  point> (<type>) could only be restored by binding a host path ...`：作业使用的挂载，其主机路径位于 root 以外的
-  人可以修改的目录之下（用户在自己主目录中的 `allow_other` FUSE 挂载）。对需要做检查点的作业，请把文件系统
+  point> (<type>) could only be restored by binding a host path ...`：作业使用的挂载，其主机路径位于作业所有者
+  可以修改的目录之下（用户在自己主目录中的 `allow_other` FUSE 挂载；root 以及除守护进程用户以外低于
+  `job_min_uid` 的系统账户的目录，只要不可被组或其他用户写入，就没有问题）。对需要做检查点的作业，请把文件系统
   挂载在父目录只有 root 能修改的目录上（例如 `/mnt` 之下）。
 - `the job has processes in a PID or user namespace of their own (...)`：作业运行了 `unshare`、`bwrap` 或
   rootless 容器运行时，而 CRIU 无法转储嵌套的 PID 和用户命名空间。请用 `--no-checkpoint` 运行该作业，或不使用
@@ -2003,11 +2019,13 @@ refused:` 开头），其所有者会收到警告。
   下层的文件系统。请挂载它（`systemctl start data.mount`、`mount -a`、启动 NFS 服务器……），然后
   再次恢复。见 [文件系统和挂载](#filesystems-and-mounts)。
 - `the mount points [...] of filesystems that were left out of the checkpoint (they were gone,
-  did not answer or refused root at the dump) are missing on this host`：CRIU 需要一个目录来在其上挂载东西。请创建它
-  （或在该处挂载文件系统），然后再次恢复。见 [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)。
+  did not answer or refused root at the dump) are missing on this host`：CRIU 需要一个挂载点来在其上挂载东西
+  （目录，对文件或套接字的 bind 挂载则为文件）。请创建它（或在该处挂载文件系统），然后再次恢复。作业自己的
+  tmpfs 中的挂载点不做检查（由镜像恢复）。gpueue 0.1.2 在运行 systemd-resolved 的主机上对每个作业都报告了
+  这个错误（`/run/systemd/resolve/io.systemd.Resolve` 等）；请升级 helper 后再次恢复这些作业。见 [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)。
 - `the checkpoint binds host paths below directories that someone other than root can change,
   which CRIU would follow as root, so it is not restored: ...`：在 helper 于转储时检查这一点之前创建的镜像中，
-  有一个外部挂载的主机路径可以被 root 以外的人改变。它无法被安全地恢复；请删除它（`gpueue remove`）并重新运行作业。
+  有一个外部挂载的主机路径可以被作业的所有者改变（root 和低于 `job_min_uid` 的系统账户的目录没有问题）。它无法被安全地恢复；请删除它（`gpueue remove`）并重新运行作业。
 - `files or directories the job used are missing on this host: [...]`：作业打开的文件或其工作目录
   已不存在，通常是因为它们位于重启后变空的 tmpfs（`/scratch`）上。该作业无法恢复。请删除它
   （`gpueue remove`）。

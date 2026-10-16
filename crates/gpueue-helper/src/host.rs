@@ -11,7 +11,7 @@ use gpueue_checkpoint::exec::run_with_timeout;
 use gpueue_checkpoint::{CommandSpec, probe, procfs, space};
 
 use crate::access::{FileAttrs, VerifyReply, VerifyRequest};
-use crate::deadmounts::{DeadMounts, DetachedMount};
+use crate::deadmounts::{DeadMounts, DetachedMount, Placeholders};
 use crate::mounts::{MountTree, SourceMount};
 
 /// One process of a job.
@@ -87,16 +87,17 @@ pub trait HostProbe: Send + Sync + 'static {
     }
     /// For each of `mounts` (detached at dump time), what a restore binds
     /// in its place: the host's mount at its mount point if the filesystem
-    /// is mounted there again and answers, else `placeholder`.
+    /// is mounted there again and answers, else a placeholder (see
+    /// [`Placeholders::for_mount`]).
     fn detached_sources(
         &self,
         mounts: &[DetachedMount],
-        placeholder: &Path,
+        placeholders: &Placeholders,
     ) -> io::Result<Vec<String>> {
-        Ok(vec![
-            placeholder.to_string_lossy().into_owned();
-            mounts.len()
-        ])
+        Ok(mounts
+            .iter()
+            .map(|m| placeholders.for_mount(m).to_string_lossy().into_owned())
+            .collect())
     }
     /// Where the external mount sources `paths` live in the helper's own
     /// namespace (see [`SourceMount`]), recorded at dump time.
@@ -160,14 +161,17 @@ pub trait HostProbe: Send + Sync + 'static {
             .cloned()
             .collect())
     }
-    /// Which of `paths`, mount points of mounts detached at the dump, are
-    /// missing on this host (see [`crate::deadmounts::mount_point_missing`]);
-    /// in a child process with a deadline like [`Self::missing_paths`].
-    fn missing_mount_points(&self, paths: &[String]) -> io::Result<Vec<String>> {
-        Ok(paths
+    /// The mount points of those of `mounts` (detached at the dump) that
+    /// are missing on this host (see
+    /// [`crate::deadmounts::mount_point_missing`]); in a child process
+    /// with a deadline like [`Self::missing_paths`].
+    fn missing_mount_points(&self, mounts: &[DetachedMount]) -> io::Result<Vec<String>> {
+        Ok(mounts
             .iter()
-            .filter(|p| crate::deadmounts::mount_point_missing(Path::new(p)))
-            .cloned()
+            .filter(|m| {
+                crate::deadmounts::mount_point_missing(Path::new(&m.mount_point), m.not_dir)
+            })
+            .map(|m| m.mount_point.clone())
             .collect())
     }
     /// For each of `files` (held by a job at its dump), the attributes of
@@ -284,9 +288,9 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     fn detached_sources(
         &self,
         mounts: &[DetachedMount],
-        placeholder: &Path,
+        placeholders: &Placeholders,
     ) -> io::Result<Vec<String>> {
-        (**self).detached_sources(mounts, placeholder)
+        (**self).detached_sources(mounts, placeholders)
     }
     fn source_mounts(&self, paths: &[String]) -> io::Result<Vec<SourceMount>> {
         (**self).source_mounts(paths)
@@ -329,8 +333,8 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     fn nested_namespace_processes(&self, init_pid: u32) -> io::Result<Vec<String>> {
         (**self).nested_namespace_processes(init_pid)
     }
-    fn missing_mount_points(&self, paths: &[String]) -> io::Result<Vec<String>> {
-        (**self).missing_mount_points(paths)
+    fn missing_mount_points(&self, mounts: &[DetachedMount]) -> io::Result<Vec<String>> {
+        (**self).missing_mount_points(mounts)
     }
     fn held_file_attrs(&self, files: &[HeldFile]) -> io::Result<Vec<Option<FileAttrs>>> {
         (**self).held_file_attrs(files)
@@ -360,6 +364,13 @@ pub struct SystemHost {
     pub helper_exe: PathBuf,
     /// Timeout of one access check.
     pub verify_timeout: Duration,
+    /// Whose directories may lie on the way to a host path that CRIU
+    /// binds (see [`crate::mountfd::bind_source_problem`]): root's only
+    /// unless set (the helper sets [`OwnerTrust::system`] from its job
+    /// policy).
+    ///
+    /// [`OwnerTrust::system`]: crate::mountfd::OwnerTrust::system
+    pub bind_trust: crate::mountfd::OwnerTrust,
 }
 
 impl SystemHost {
@@ -376,6 +387,7 @@ impl SystemHost {
             get_state_timeout: Duration::from_secs(10),
             helper_exe,
             verify_timeout: Duration::from_secs(120),
+            bind_trust: crate::mountfd::OwnerTrust::ROOT_ONLY,
         }
     }
 
@@ -836,8 +848,8 @@ impl HostProbe for SystemHost {
             })
             .collect();
         // Mounts that CRIU could only bind again by a host path below a
-        // directory that someone other than root can change are treated
-        // the same way (see `crate::deadmounts::add_unsafe_binds`).
+        // directory that a job's owner could change are treated the same
+        // way (see `crate::deadmounts::add_unsafe_binds`).
         let candidates = crate::mounts::bind_source_candidates(&job, &own);
         let mut paths: Vec<String> = Vec::new();
         for (_, c) in &candidates {
@@ -862,6 +874,16 @@ impl HostProbe for SystemHost {
             &problems,
         );
         let mut dead = dead_mounts(&job, &remote, &answers);
+        // What a restore needs at each mount point (see
+        // `crate::deadmounts::describe_mount_points`). Only filesystems
+        // that cannot block are looked at: FUSE and network mounts are
+        // mounted on directories (as assumed before).
+        let root = self.proc_root.join(init_pid.to_string()).join("root");
+        crate::deadmounts::describe_mount_points(&job, &own, &mut dead, |m| {
+            !crate::deadmounts::is_remote_fstype(&m.fstype)
+                && fs::symlink_metadata(root.join(m.mount_point.trim_start_matches('/')))
+                    .is_ok_and(|meta| !meta.is_dir())
+        });
         if !dead.dead.is_empty() {
             let procs: Vec<_> = host_pids
                 .iter()
@@ -875,7 +897,7 @@ impl HostProbe for SystemHost {
     fn detached_sources(
         &self,
         mounts: &[DetachedMount],
-        placeholder: &Path,
+        placeholders: &Placeholders,
     ) -> io::Result<Vec<String>> {
         use crate::deadmounts::is_back;
         let own = MountTree::parse(&fs::read_to_string(self.proc_root.join("self/mountinfo"))?);
@@ -886,12 +908,12 @@ impl HostProbe for SystemHost {
             .collect();
         let answers = self.probe(&back)?;
         // CRIU binds the host's mount by its path, as root: only one that
-        // nobody but root can redirect (see `crate::mountfd`).
+        // no job's owner can redirect (see `crate::mountfd`).
         let unsafe_paths = self.bind_source_problems(&back)?;
-        let placeholder = placeholder.to_string_lossy().into_owned();
         Ok(mounts
             .iter()
             .map(|m| {
+                let placeholder = placeholders.for_mount(m).to_string_lossy().into_owned();
                 let i = back.iter().position(|p| p == &m.mount_point);
                 let alive = i.is_some_and(|i| answers.get(i).is_some_and(Option::is_none));
                 match i.and_then(|i| unsafe_paths.get(i).cloned().flatten()) {
@@ -901,10 +923,10 @@ impl HostProbe for SystemHost {
                              restored job: {why}",
                             m.mount_point
                         );
-                        placeholder.clone()
+                        placeholder
                     }
                     _ if alive => m.mount_point.clone(),
-                    _ => placeholder.clone(),
+                    _ => placeholder,
                 }
             })
             .collect())
@@ -1101,6 +1123,7 @@ impl HostProbe for SystemHost {
         self.run_verify(&VerifyRequest::Exist(crate::access::ExistCheck {
             paths: paths.to_vec(),
             mount_points: false,
+            not_dirs: Vec::new(),
         }))
         .map_err(io::Error::other)
     }
@@ -1110,9 +1133,10 @@ impl HostProbe for SystemHost {
             return Ok(Vec::new());
         }
         let timeout = crate::deadmounts::PROBE_TIMEOUT;
-        let req = VerifyRequest::BindSources(crate::access::ProbeCheck {
+        let req = VerifyRequest::BindSources(crate::access::BindSourceCheck {
             paths: paths.to_vec(),
             timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            trust: self.bind_trust,
         });
         let reply = crate::access::run_verify_child(
             &self.helper_exe,
@@ -1137,13 +1161,18 @@ impl HostProbe for SystemHost {
         nested_namespace_processes(&self.proc_root, init_pid)
     }
 
-    fn missing_mount_points(&self, paths: &[String]) -> io::Result<Vec<String>> {
-        if paths.is_empty() {
+    fn missing_mount_points(&self, mounts: &[DetachedMount]) -> io::Result<Vec<String>> {
+        if mounts.is_empty() {
             return Ok(Vec::new());
         }
         self.run_verify(&VerifyRequest::Exist(crate::access::ExistCheck {
-            paths: paths.to_vec(),
+            paths: mounts.iter().map(|m| m.mount_point.clone()).collect(),
             mount_points: true,
+            not_dirs: mounts
+                .iter()
+                .filter(|m| m.not_dir)
+                .map(|m| m.mount_point.clone())
+                .collect(),
         }))
         .map_err(io::Error::other)
     }

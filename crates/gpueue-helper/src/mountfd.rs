@@ -6,8 +6,9 @@
 //! or replace them with symlinks at any time (e.g. on a FUSE mount of their
 //! own). Root never resolves such a path twice and never follows a
 //! symlink: it walks to the parent once, one component at a time,
-//! accepting only directories that nobody but root can change, and then
-//! works relative to descriptors.
+//! accepting only directories that nobody but root can change (for the
+//! host paths CRIU binds, also those of system accounts that no job runs
+//! as, see [`OwnerTrust`]), and then works relative to descriptors.
 //!
 //! Used by the shim (in the job's namespace, see [`crate::shim`]), by the
 //! helper for the mount points it creates before a restore (see
@@ -18,6 +19,7 @@
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
 use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags, StatxFlags};
+use serde::{Deserialize, Serialize};
 
 const PATH_FLAGS: OFlags = OFlags::PATH
     .union(OFlags::DIRECTORY)
@@ -32,12 +34,72 @@ const RESOLVE: ResolveFlags = ResolveFlags::NO_SYMLINKS.union(ResolveFlags::NO_M
 /// `f_type` of a FUSE filesystem (`statfs(2)`).
 const FUSE_SUPER_MAGIC: i128 = 0x6573_5546;
 
-/// Whether a directory with the owner `uid` and this mode can only be
-/// changed by `owner` (root, except in tests): owned by `owner` and not
-/// group/world-writable, or sticky (then others cannot rename
-/// `owner`'s entries, and the next component is checked in turn).
-pub fn controlled_by(owner: u32, uid: u32, mode: u32) -> bool {
-    uid == owner && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+/// Whose directories a walk accepts on the way to a path: root's, and
+/// with [`OwnerTrust::system`] also those of system accounts that no job
+/// may run as.
+///
+/// A job's owner can redirect a path through a directory they own (rename
+/// an entry, leave a symlink). A system account's directory, such as
+/// `/run/systemd/resolve` (systemd-resolve's on Ubuntu), is out of their
+/// reach: no job runs as such an account (see `job_min_uid`), and the
+/// daemon's user, the one system account that acts for users, is never
+/// trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerTrust {
+    /// Owners with a uid below this one count like root (`0`: only root).
+    #[serde(default)]
+    pub system_below: u32,
+    /// An owner that never counts, even below `system_below`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub except: Option<u32>,
+}
+
+impl Default for OwnerTrust {
+    fn default() -> Self {
+        Self::ROOT_ONLY
+    }
+}
+
+impl OwnerTrust {
+    /// Only root's directories.
+    pub const ROOT_ONLY: Self = Self {
+        system_below: 0,
+        except: None,
+    };
+
+    /// Root's directories and those of the accounts below `job_min_uid`
+    /// (the job policy's minimum uid: no job runs as them, whatever
+    /// `job_allowed_users` says), but the daemon's user `daemon_uid`.
+    pub fn system(job_min_uid: u32, daemon_uid: u32) -> Self {
+        Self {
+            system_below: job_min_uid,
+            except: Some(daemon_uid),
+        }
+    }
+
+    /// Whether a directory owned by `uid` is out of the reach of jobs'
+    /// owners.
+    pub fn trusts(&self, uid: u32) -> bool {
+        uid == 0 || (uid < self.system_below && self.except != Some(uid))
+    }
+
+    /// Who may change the directories that a walk accepts, for messages.
+    fn who(&self) -> &'static str {
+        if self.system_below > 1 {
+            "only root or a system account"
+        } else {
+            "only root"
+        }
+    }
+}
+
+/// Whether a directory with this mode, owned by one that the walk
+/// trusts (`trusted_owner`: root, a system account, or a test's own
+/// user), can only be changed by its owner: not group/world-writable, or
+/// sticky (then others cannot rename the owner's entries, and the next
+/// component is checked in turn).
+pub fn controlled_by(trusted_owner: bool, mode: u32) -> bool {
+    trusted_owner && (mode & 0o022 == 0 || mode & 0o1000 != 0)
 }
 
 /// The parent directory of the absolute `path` and its last
@@ -46,18 +108,26 @@ pub fn controlled_by(owner: u32, uid: u32, mode: u32) -> bool {
 /// filesystem (its daemon decides what owner and mode it reports and
 /// what a lookup in it returns, a symlink included).
 pub fn open_parent(path: &str) -> Result<(OwnedFd, String), String> {
-    open_parent_in("/", path, 0)
+    open_parent_trusting(path, OwnerTrust::ROOT_ONLY)
+}
+
+/// [`open_parent`], accepting the directories of the owners that `trust`
+/// trusts.
+pub fn open_parent_trusting(path: &str, trust: OwnerTrust) -> Result<(OwnedFd, String), String> {
+    open_parent_in("/", path, |uid| trust.trusts(uid), trust.who())
 }
 
 /// [`open_parent`] with the walk starting at the directory `top`
-/// (instead of `/`) and every directory on the way required to be
-/// controlled by `owner` (instead of root): `path`'s components are
-/// looked up from `top`. For tests, which cannot rely on `/` and the
+/// (instead of `/`) and every directory on the way required to be owned
+/// by one that `trusted` accepts (`who` says who that is, for messages)
+/// and controlled by them: `path`'s components are looked up from `top`.
+/// Tests use it with their own user, as they cannot rely on `/` and the
 /// system directories being root's (e.g. in a Nix build sandbox).
 pub(crate) fn open_parent_in(
     top: &str,
     path: &str,
-    owner: u32,
+    trusted: impl Fn(u32) -> bool,
+    who: &str,
 ) -> Result<(OwnedFd, String), String> {
     let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
     let Some((last, dirs)) = comps.split_last() else {
@@ -71,24 +141,27 @@ pub(crate) fn open_parent_in(
     }
     let mut fd = rustix::fs::open(top, PATH_FLAGS, Mode::empty())
         .map_err(|e| format!("opening {top}: {e}"))?;
-    check(&fd, top, owner)?;
+    check(&fd, top, &trusted, who)?;
     let mut walked = String::new();
     for c in dirs {
         walked.push('/');
         walked.push_str(c);
         fd = rustix::fs::openat2(&fd, *c, PATH_FLAGS, Mode::empty(), RESOLVE)
             .map_err(|e| format!("opening {walked} without following symlinks: {e}"))?;
-        check(&fd, &walked, owner)?;
+        check(&fd, &walked, &trusted, who)?;
     }
     Ok((fd, (*last).to_owned()))
 }
 
-fn check(fd: &OwnedFd, what: &str, owner: u32) -> Result<(), String> {
+fn check(
+    fd: &OwnedFd,
+    what: &str,
+    trusted: &impl Fn(u32) -> bool,
+    who: &str,
+) -> Result<(), String> {
     let st = rustix::fs::fstat(fd).map_err(|e| format!("{what}: {e}"))?;
-    if !controlled_by(owner, st.st_uid, st.st_mode) {
-        return Err(format!(
-            "{what} is not a directory that only root can change"
-        ));
+    if !controlled_by(trusted(st.st_uid), st.st_mode) {
+        return Err(format!("{what} is not a directory that {who} can change"));
     }
     let fs = rustix::fs::fstatfs(fd).map_err(|e| format!("{what}: {e}"))?;
     #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
@@ -200,15 +273,15 @@ pub fn ensure_root_dir(dir: &str) -> Result<Option<(OwnedFd, String)>, String> {
 /// Why `criu restore` must not bind the host path `path` (an external
 /// mount source, which CRIU looks up by its name, as root, following
 /// symlinks on the way), if it must not: a directory on the way is one
-/// that someone other than root can change (or on a FUSE filesystem), so
-/// whoever controls it could make the lookup end somewhere else, such as
-/// in another user's directory, between the checks and the restore. `/`
-/// itself is always fine.
-pub fn bind_source_problem(path: &str) -> Option<String> {
+/// that someone `trust` does not trust can change (see [`OwnerTrust`]),
+/// or is on a FUSE filesystem, so whoever controls it could make the
+/// lookup end somewhere else, such as in another user's directory, between
+/// the checks and the restore. `/` itself is always fine.
+pub fn bind_source_problem(path: &str, trust: OwnerTrust) -> Option<String> {
     if path.split('/').all(|c| c.is_empty()) {
         return None;
     }
-    open_parent(path).err()
+    open_parent_trusting(path, trust).err()
 }
 
 #[cfg(test)]
@@ -217,11 +290,13 @@ mod tests {
 
     #[test]
     fn mount_surgery_only_walks_root_controlled_directories() {
-        assert!(controlled_by(0, 0, 0o40755));
-        assert!(controlled_by(0, 0, 0o41777), "sticky like /tmp");
-        assert!(!controlled_by(0, 0, 0o40777));
-        assert!(!controlled_by(0, 0, 0o40775));
-        assert!(!controlled_by(0, 1000, 0o40755));
+        let root = OwnerTrust::ROOT_ONLY;
+        assert!(controlled_by(root.trusts(0), 0o40755));
+        assert!(controlled_by(root.trusts(0), 0o41777), "sticky like /tmp");
+        assert!(!controlled_by(root.trusts(0), 0o40777));
+        assert!(!controlled_by(root.trusts(0), 0o40775));
+        assert!(!controlled_by(root.trusts(1000), 0o40755));
+        assert!(!controlled_by(root.trusts(991), 0o40755));
 
         // The walk starts at a directory tree of our own, with ourselves
         // as the owner that must control it: `/` and the system
@@ -248,29 +323,108 @@ mod tests {
         mkdir("home", 0o777);
         mkdir("srv", 0o775);
 
-        let (_, name) = open_parent_in(top, "/usr/bin/env", me).unwrap();
+        let mine = |uid: u32| uid == me;
+        let who = "only root";
+        let (_, name) = open_parent_in(top, "/usr/bin/env", mine, who).unwrap();
         assert_eq!(name, "env");
         // Sticky (like /tmp): the next component is checked in turn.
-        open_parent_in(top, "/tmp/d/x", me).unwrap();
+        open_parent_in(top, "/tmp/d/x", mine, who).unwrap();
         // A symlink on the way (like `/proc/self`) is not followed.
-        let e = open_parent_in(top, "/proc/self/fd/0", me).unwrap_err();
+        let e = open_parent_in(top, "/proc/self/fd/0", mine, who).unwrap_err();
         assert!(e.contains("/proc/self"), "{e}");
         // A directory that others than its owner can change: entries
         // could be renamed or replaced by a symlink.
-        let e = open_parent_in(top, "/home/mnt", me).unwrap_err();
+        let e = open_parent_in(top, "/home/mnt", mine, who).unwrap_err();
         assert!(
             e.contains("/home is not") && e.contains("only root can change"),
             "{e}"
         );
-        let e = open_parent_in(top, "/srv/mnt", me).unwrap_err();
+        let e = open_parent_in(top, "/srv/mnt", mine, who).unwrap_err();
         assert!(e.contains("/srv is not"), "{e}");
         // A directory owned by someone else (e.g. a user's directory when
         // the walk wants root's): already the top is refused.
-        let e = open_parent_in(top, "/usr/bin/env", me ^ 1).unwrap_err();
+        let e = open_parent_in(top, "/usr/bin/env", |uid| uid == me ^ 1, who).unwrap_err();
         assert!(e.contains("only root can change"), "{e}");
         assert!(open_parent("/").is_err());
         assert!(open_parent("/usr/../etc/x").is_err());
         assert!(open_parent("usr/bin").is_err());
-        assert_eq!(bind_source_problem("/"), None);
+        assert_eq!(bind_source_problem("/", OwnerTrust::ROOT_ONLY), None);
+    }
+
+    /// Bind sources below a directory of a system account (such as
+    /// `/run/systemd/resolve`, systemd-resolve's on Ubuntu) are out of
+    /// the reach of jobs' owners; a user's own directory is not.
+    #[test]
+    fn bind_sources_may_lie_below_system_accounts_directories() {
+        // UID_MIN 1000; the daemon runs as 997.
+        let trust = OwnerTrust::system(1000, 997);
+        assert!(trust.trusts(0));
+        assert!(trust.trusts(991), "systemd-resolve");
+        assert!(trust.trusts(1), "daemon");
+        assert!(!trust.trusts(997), "the daemon's user acts for users");
+        assert!(!trust.trusts(1000), "a user who may run jobs");
+        assert!(!trust.trusts(65534));
+        assert!(controlled_by(trust.trusts(991), 0o40755));
+        assert!(controlled_by(trust.trusts(991), 0o41777));
+        assert!(!controlled_by(trust.trusts(991), 0o40775), "group-writable");
+        assert!(!controlled_by(trust.trusts(991), 0o40757), "world-writable");
+        assert!(!controlled_by(trust.trusts(1000), 0o40755));
+        assert!(!controlled_by(trust.trusts(997), 0o40755));
+        // A lower job_min_uid trusts fewer accounts.
+        assert!(!OwnerTrust::system(500, 997).trusts(991));
+        // The test policy (job_min_uid 1) and older requests: root only.
+        assert!(!OwnerTrust::system(1, 997).trusts(991));
+        assert_eq!(OwnerTrust::default(), OwnerTrust::ROOT_ONLY);
+        let old: OwnerTrust = serde_json::from_str("{}").unwrap();
+        assert_eq!(old, OwnerTrust::ROOT_ONLY);
+
+        // A walk through directories of a trusted owner (ourselves, as
+        // for a system account) passes; a user's (anyone else) does not.
+        use std::os::unix::fs::PermissionsExt;
+        let me = nix::unistd::geteuid().as_raw();
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().to_str().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(tmp.path().join("run/systemd/resolve")).unwrap();
+        for d in ["run", "run/systemd", "run/systemd/resolve"] {
+            std::fs::set_permissions(tmp.path().join(d), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let system = OwnerTrust::system(me.saturating_add(1), u32::MAX);
+        let who = system.who();
+        assert_eq!(who, "only root or a system account");
+        let (_, name) = open_parent_in(
+            top,
+            "/run/systemd/resolve/io.systemd.Resolve",
+            |uid| system.trusts(uid),
+            who,
+        )
+        .unwrap();
+        assert_eq!(name, "io.systemd.Resolve");
+        let e = open_parent_in(
+            top,
+            "/run/systemd/resolve/io.systemd.Resolve",
+            |uid| uid != me,
+            who,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("only root or a system account can change"),
+            "{e}"
+        );
+        // Group-writable: a member of the group could rename entries.
+        std::fs::set_permissions(
+            tmp.path().join("run/systemd/resolve"),
+            std::fs::Permissions::from_mode(0o775),
+        )
+        .unwrap();
+        let e = open_parent_in(
+            top,
+            "/run/systemd/resolve/io.systemd.Resolve",
+            |uid| system.trusts(uid),
+            who,
+        )
+        .unwrap_err();
+        assert!(e.contains("/run/systemd/resolve is not"), "{e}");
     }
 }
