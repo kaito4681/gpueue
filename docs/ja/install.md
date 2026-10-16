@@ -1264,6 +1264,47 @@ gpueue checkpoint 0 && gpueue status
 gpueue restore -i 0 && gpueue follow 0
 ```
 
+<a id="testing-checkpointrestore-on-a-gpu-host"></a>
+### GPU ホストでのチェックポイント/リストアのテスト
+
+`scripts/gpu-host-test.sh`（ソースツリー内）は、マシンにインストールされている gpueue に対して、実際の
+CUDA ジョブのチェックポイントとリストアをテストします。通常ユーザーとして実行し、root は不要で、自分の
+ジョブと `~/.cache` 以下の一時ディレクトリ以外には何も変更しません。必要なのは `jq`、`nvidia-smi`、
+C コンパイラ（`cc`、または `CC=...`）と NVIDIA ドライバーの `libcuda.so.1` です。テストプログラムは
+インライン PTX を含む C から作られ、PTX はドライバーがその GPU 向けにコンパイルするので、CUDA
+ツールキットは不要です。
+
+```sh
+scripts/gpu-host-test.sh                 # every scenario on GPU 0
+scripts/gpu-host-test.sh --only a,c      # only some scenarios
+scripts/gpu-host-test.sh --gpu 1         # another GPU
+scripts/gpu-host-test.sh --keep          # keep the jobs and files for debugging
+```
+
+事前チェックでは `gpueue doctor` に FAIL がないことと GPU に空きスロットがあることを確認し、gpueue の
+バージョン、ドライバー、GPU モデルを表示します。各ジョブは毎秒 4096 個の整数に `i+1` を加え（GPU
+メモリ上、CPU ジョブではプロセスのメモリ上）、`value[i] == step*(i+1)` を確認するカウンターなので、
+状態を失ったりリセットしたりするリストアは失敗します。シナリオは次のとおりです。
+
+| | シナリオ |
+|---|---|
+| a | GPU ジョブ、チェックポイント/リストアを 3 回 |
+| b | 一時停止した GPU ジョブをチェックポイントし、リストア後に Paused で戻り、`gpueue start` で続行する |
+| c | CPU ジョブ、チェックポイント/リストアを 2 回 |
+| d | GPU ジョブが Checkpointed のまま別の GPU ジョブが実行・終了し、その後リストアする |
+| e | `--no-checkpoint` の GPU ジョブが Success で終わる |
+
+ダンプのたびに、ジョブがイメージサイズ付きの Checkpointed であること、GPU スロットが空いていること、
+`nvidia-smi` にそのプロセスがないこと、カウンターが止まっていることを確認します。リストアのたびに、
+カウンターがダンプしたステップから続き、各ステップがちょうど 1 回ずつ数えられていることを確認します。
+どのジョブも停止ファイルで止め、Success で終わる必要があります。失敗すると、ジョブの `last_error`、
+ログの最後の行、およびジャーナルが読める場合（`adm` か `systemd-journal` グループ）はそのジョブに関する
+`gpueue`/`gpueue-helper` のジャーナルの行を表示します。ジョブには実行ごとに一意なラベルが付き、
+スクリプトの終了時に kill して削除されます。以前からあったジョブには触れません。どれかのシナリオが
+失敗するとスクリプトは 0 以外で終了します。
+
+メンテナーは毎回のリリース前に、リリース候補をインストールした GPU ホストでこれを実行します。
+
 <a id="configuration"></a>
 ## 設定
 

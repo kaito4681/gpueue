@@ -50,6 +50,17 @@
   default and grant `contents: write` only to the job that writes (creates the release, uploads
   the APT files, pushes `stable`); checkouts use `persist-credentials: false` except where the job
   pushes with git.
+- Real-GPU checkpoint/restore against the gpueue installed on the host (no VM: GPU checkpointing
+  needs the real GPU and driver): `scripts/gpu-host-test.sh [--only a,c] [--gpu N] [--keep]`, run
+  as a normal user without root. It builds the counters in `scripts/gpu-host-test/` (`check.c`:
+  CUDA driver API with inline PTX and a dlopen of libcuda, so only `cc` and the driver are needed;
+  `cpu.c`) and runs scenarios a-e (GPU cycles, paused GPU job, CPU cycles, a GPU job kept
+  Checkpointed while another runs, `--no-checkpoint`); see "Testing checkpoint/restore on a GPU
+  host" in `docs/install.md`. It only removes the jobs it created (labels `ghtest-<run>-*`).
+- Release checklist: before tagging `v<version>`, install the release candidate on a GPU host and
+  run `scripts/gpu-host-test.sh`; every scenario must pass (this is required, since CI has no GPU
+  and cannot test GPU checkpoints). Then push the tag (see the CI notes above), check the draft release
+  and publish it.
 - Other test scripts: `scripts/service-install-test.sh` (`gpueue service install` / `status` /
   `uninstall` and `doctor`), `scripts/helper-systemd-test.sh` (the helper alone under systemd),
   `scripts/measure-checkpoint.sh` (times each checkpoint step; not a pass/fail test).
