@@ -1035,7 +1035,9 @@ pub fn run_criu_wrap(root: PathBuf, argv: Vec<String>) -> i32 {
 mod tests {
     use super::*;
 
-    /// Prints the SigBlk and SigIgn lines of the shell's own status.
+    /// Prints the SigBlk and SigIgn lines of the shell's own status with
+    /// builtins only: no fork, and no external tool (the NixOS test VM has
+    /// no `grep` in `PATH`).
     const SHELL_SIGNALS: &str = "while read -r k v; do case $k in SigBlk:|SigIgn:) echo $k $v;; esac; done </proc/self/status";
 
     /// The SigBlk and SigIgn masks a job's program reports.
@@ -1043,7 +1045,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let log = File::create(tmp.path().join("log")).unwrap();
         let argv = ["sh", "-c", script].map(String::from);
-        let envs = BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]);
+        // The test's own PATH first, so that `sh` is found wherever it lives.
+        let path = format!(
+            "{}:/usr/bin:/bin",
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let envs = BTreeMap::from([("PATH".to_owned(), path)]);
         let pid = spawn_job(&argv, &envs, &log).unwrap();
         assert_eq!(
             waitpid(pid, None).unwrap(),
@@ -1086,11 +1093,12 @@ mod tests {
             // change them; systemd starts the units with neither ignored.
             let reserved = (1u64 << 31) | (1 << 32);
             for script in [
-                "exec grep -E 'SigBlk|SigIgn' /proc/self/status",
-                // The shell itself (no fork: `read` is a builtin).
-                SHELL_SIGNALS,
+                // A program that the shell execs: the shell again.
+                format!("exec sh -c '{SHELL_SIGNALS}'"),
+                // The shell itself.
+                SHELL_SIGNALS.to_owned(),
             ] {
-                let (blocked, ignored) = job_signal_masks(script);
+                let (blocked, ignored) = job_signal_masks(&script);
                 assert_eq!(blocked, 0, "{script}: blocked {blocked:#x}");
                 assert_eq!(ignored & !reserved, 0, "{script}: ignored {ignored:#x}");
             }
