@@ -75,7 +75,8 @@
   host" in `docs/install.md`. It only removes the jobs it created (labels `ghtest-<run>-*`).
 - Release checklist: before tagging `v<version>`, install the release candidate on a GPU host and
   run `scripts/gpu-host-test.sh`; every scenario must pass (this is required, since CI has no GPU
-  and cannot test GPU checkpoints). Then push the tag (see the CI notes above), check the draft release
+  and cannot test GPU checkpoints). Then push the tag (see the CI notes above): the draft is only
+  created once `vm-test` (the quick VM test) passes on the tagged commit. Check the draft release
   and publish it.
 - Other test scripts: `scripts/service-install-test.sh` (`gpueue service install` / `status` /
   `uninstall` and `doctor`), `scripts/helper-systemd-test.sh` (the helper alone under systemd),

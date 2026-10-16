@@ -470,8 +470,8 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   的挂载）和家目录中；测试运行中和已暂停作业的检查点与恢复、一个在私有 `/tmp` 中保存状态的作业，以及带着已检查点、
   运行中和已暂停作业的重启。从上一个发布版本的 `.deb`（从 GitHub 下载，并像 `install.sh` 那样校验）升级，
   期间有已检查点和运行中的作业。`all` 集合还加入 Ubuntu 24.04、Debian 12 和 13（其 CRIU 缺失或过旧：只测试
-  安装和不做检查点的作业）以及使用 `.rpm` 的 Fedora 44；在 Fedora 44 上目前会失败：在 SELinux（enforcing）
-  下 systemd 不能执行 `/var/lib/gpueue/lib` 中 helper 的副本，因此任何作业都无法启动。CI 在涉及 helper、
+  安装和不做检查点的作业）以及使用 `.rpm` 的 Fedora 44。（已知问题，修复之前有效：在 Fedora 44 上测试会失败，
+  因为在 SELinux（enforcing）下 systemd 不能执行 `/var/lib/gpueue/lib` 中 helper 的副本，任何作业都无法启动。）CI 在涉及 helper、
   守护进程、检查点或打包的拉取请求上以及每次推送到 `main` 时运行快速集合（Ubuntu 26.04）；除非它在该发布版本
   自己的 `.deb` 上通过，否则不会创建发布版本，连草稿也不会。
 
