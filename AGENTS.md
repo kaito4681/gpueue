@@ -58,7 +58,8 @@
   `.github/workflows/release.yml`, which builds and signs the tarballs, `.deb` and `.rpm`
   packages and attaches them, with `install.sh` and `RPM-GPG-KEY-gpueue`, to a draft GitHub
   release. The `release` job needs `vm-test`, the quick VM test with the release's own `.deb` on
-  the tagged commit: without it passing, not even the draft is created. Publishing the release as a stable one (`release: released`, not the tag push) triggers
+  the tagged commit: without it passing, not even the draft is created. Publishing the release
+  as a stable one (`release: released`, not the tag push) triggers
   `release-apt.yml` (APT repository), `release-aur.yml` (AUR) and `release-nix.yml` (moves the
   `stable` branch); each can also be run by hand (`workflow_dispatch`), which is needed when the
   release was published with a workflow's `GITHUB_TOKEN`. Release workflows are read-only by

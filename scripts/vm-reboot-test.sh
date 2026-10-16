@@ -58,6 +58,7 @@
 #   GPUEUE_VM_REPO           the GitHub repository of the releases
 #                            (default kaito4681/gpueue); GH_TOKEN or
 #                            GITHUB_TOKEN, when set, is used for its API
+#                            (else an authenticated `gh`, else none)
 #   GPUEUE_VM_CACHE          cache volume, or an absolute directory
 #                            (default gpueue-vm-cache)
 #   GPUEUE_VM_KEEP=1         on a failure, keep the VM running for debugging
@@ -159,9 +160,15 @@ if [ -n "$need_upgrade" ]; then
         auth=()
         token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
         [ -z "$token" ] || auth=(-H "Authorization: Bearer $token")
-        old_version="$(curl -fsSL --retry 3 "${auth[@]}" -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/$repo/releases?per_page=100" |
-            python3 -c '
+        # Anonymous API requests are rate limited: without a token, an
+        # authenticated gh is used when there is one.
+        if [ -z "$token" ] && command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+            releases="$(gh api "repos/$repo/releases?per_page=100")"
+        else
+            releases="$(curl -fsSL --retry 3 "${auth[@]}" -H 'Accept: application/vnd.github+json' \
+                "https://api.github.com/repos/$repo/releases?per_page=100")"
+        fi || { echo "cannot list the releases of $repo (set GH_TOKEN, or GPUEUE_VM_UPGRADE_FROM)" >&2; exit 1; }
+        old_version="$(python3 -c '
 import json, re, sys
 tree = sys.argv[1]
 def key(v):
@@ -172,7 +179,7 @@ found = [r["tag_name"][1:] for r in json.load(sys.stdin)
          if not r["draft"] and not r["prerelease"] and re.fullmatch(r"v\d+\.\d+\.\d+", r["tag_name"])]
 older = sorted((v for v in found if key(v) < key(tree)), key=key)
 print(older[-1] if older else "")
-' "$version")"
+' "$version" <<<"$releases")"
         [ -n "$old_version" ] || { echo "no release of $repo is older than $version (set GPUEUE_VM_UPGRADE_FROM)" >&2; exit 1; }
     fi
     echo "upgrade scenario: from the release v$old_version to the tree ($version)"
