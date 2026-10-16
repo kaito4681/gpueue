@@ -121,7 +121,7 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    `/var/lib/gpueue/checkpoints/<id>/` 下的镜像目录对命名空间的 init 执行 `criu dump`。
    在插件模式下，它只运行 `criu dump`，使用 CRIU 的默认插件目录，由 CRIU 的 `cuda_plugin.so` 调用 cuda-checkpoint
    （在插件模式下，如果插件缺失，CUDA 作业会被拒绝）。在转储之前，它写入恢复除 CRIU 镜像之外所需的内容
-   （所有者记录、作业的挂载和文件、一份 `meta.json` 草稿）；转储成功后立即写入 `DUMPED` 标记，然后是 CRIU
+   （所有者记录、作业的挂载和文件、一份 `meta.json` 草稿）；转储成功后立即把镜像刷写到磁盘（CRIU 不会 fsync，而进程已不存在）并写入 `DUMPED` 标记，然后是 CRIU
    日志中的外部挂载、最终的 `meta.json`（包含模式），最后写入 `COMPLETE` 标记。转储成功后进程停止，因此从那时起
    镜像永远不会被删除：如果收尾失败，helper 会重试、保留镜像，并报告该检查点尚未完成（守护进程把作业视为已创建
    检查点）；它会在恢复该镜像之前或再次启动时完成该镜像，在转储与标记之间崩溃的情况也是如此，即使 systemd 仍报告被转储的单元处于活动状态。如果转储失败，CRIU 会让进程继续运行，随后由守护进程将其终止。带有守护进程不认识的错误码（来自更新版本的 helper）的转储失败按被拒绝处理：作业继续运行。helper 会把 CRIU 的

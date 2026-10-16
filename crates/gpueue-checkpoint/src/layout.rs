@@ -14,7 +14,8 @@
 //!     <job id>-<unix ms>.log   dump.log of a failed dump (newest kept)
 //! ```
 //!
-//! Both `meta.json` and `COMPLETE` are written via write-to-temp + fsync +
+//! The images are fsynced before `DUMPED` and `COMPLETE` are written. Both
+//! `meta.json` and `COMPLETE` are written via write-to-temp + fsync +
 //! rename + directory fsync, so a crash at any point leaves either a complete
 //! directory or one without the marker, which is incomplete. An incomplete
 //! directory whose dump succeeded ([`CheckpointDir::is_unfinalized_dump`])
@@ -259,8 +260,11 @@ impl CheckpointDir {
     }
 
     /// Record that `criu dump` succeeded (before anything else is written
-    /// after it).
+    /// after it). CRIU does not fsync its images, and the dumped processes
+    /// are gone, so the images are flushed to disk first: a marker must
+    /// never outlive, after a power failure, the data it vouches for.
     pub fn mark_dumped(&self) -> io::Result<()> {
+        sync_tree(&self.root)?;
         write_atomic(&self.dumped_marker_path(), b"criu dump succeeded\n")
     }
 
@@ -349,6 +353,9 @@ impl CheckpointDir {
         }
         // A stale marker must never vouch for new contents.
         remove_if_exists(&self.marker_path())?;
+        // Nor may a marker vouch for images still in the page cache (see
+        // `mark_dumped`; also for a dump marked by an older helper).
+        sync_tree(&self.root)?;
         meta.size_bytes = self.size_bytes()?;
         let json = serde_json::to_vec_pretty(&meta)?;
         write_atomic(&self.meta_path(), &json)?;
@@ -450,6 +457,21 @@ pub fn dir_size(path: &Path) -> io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// fsync every regular file and directory under `path` (symlinks are not
+/// followed), files before the directory that holds them.
+pub fn sync_tree(path: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            sync_tree(&entry.path())?;
+        } else if ft.is_file() {
+            File::open(entry.path())?.sync_all()?;
+        }
+    }
+    fsync_dir(path)
 }
 
 /// Move the dump log of a failed dump of `dir` to
@@ -853,6 +875,20 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path().join("a"), tmp.path().join("link")).unwrap();
         assert_eq!(dir_size(tmp.path()).unwrap(), 15);
         assert_eq!(dir_size(&tmp.path().join("a")).unwrap(), 10);
+    }
+
+    #[test]
+    fn sync_tree_walks_without_following_symlinks() {
+        let tmp = TempDir::new();
+        fs::write(tmp.path().join("a"), b"x").unwrap();
+        fs::create_dir_all(tmp.path().join("sub/deeper")).unwrap();
+        fs::write(tmp.path().join("sub/deeper/b"), b"y").unwrap();
+        // A dangling symlink and one to a directory outside: neither is
+        // opened.
+        std::os::unix::fs::symlink("/nonexistent", tmp.path().join("dangling")).unwrap();
+        std::os::unix::fs::symlink("/proc", tmp.path().join("sub/proc")).unwrap();
+        sync_tree(tmp.path()).unwrap();
+        assert!(sync_tree(&tmp.path().join("missing")).is_err());
     }
 
     #[test]
