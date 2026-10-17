@@ -53,7 +53,7 @@ docs/<lang>/ go up two levels (../../packaging/...). Code blocks are copied unch
 | NVIDIA ドライバー（GPU ジョブ） | `cuda-checkpoint` が `--action lock/checkpoint/restore/unlock` と `--timeout` に対応したドライバー：r570 以降（cuda-checkpoint 自体は r550 に対応していますが、`--toggle` のみで、gpueue はこれを使いません） | 595 |
 | cuda-checkpoint（GPU ジョブ） | NVIDIA のバイナリ。メジャーバージョンがドライバーと同じもの | 595 |
 | nvidia-smi（GPU ジョブ） | ヘルパーが CUDA プロセスと GPU メモリを調べるのに使います | ドライバー付属 |
-| Rust（ビルド時のみ） | 1.88 以降と、ヘルパーの fork ガードライブラリ用の C コンパイラー（`cc`） | 1.98.1 |
+| Rust（ビルド時のみ） | 1.89 以降と、ヘルパーの fork ガードライブラリ用の C コンパイラー（`cc`） | 1.98.1 |
 
 NVIDIA ドライバーがなくても、gpueue は CPU のみのジョブを実行でき、それらのチェックポイントも取れます。
 
