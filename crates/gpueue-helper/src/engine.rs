@@ -2383,17 +2383,20 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
     /// CRIU let it go). `Err` if one still is not after a moment to settle
     /// (then job code has run), or if this cannot be checked.
     async fn confirm_stopped(&self, init: u32) -> Result<(), String> {
-        let mut running = Vec::new();
-        for _ in 0..100 {
-            running = self
+        let until = tokio::time::Instant::now() + self.cfg.stop_settle_time;
+        let running = loop {
+            let running = self
                 .host
                 .unstopped_threads(init)
                 .map_err(|e| format!("checking that the restored job is stopped failed: {e}"))?;
             if running.is_empty() {
                 return Ok(());
             }
+            if tokio::time::Instant::now() >= until {
+                break running;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        };
         Err(format!(
             "threads {running:?} of the restored job did not stop although it was paused"
         ))

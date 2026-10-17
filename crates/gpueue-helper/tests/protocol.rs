@@ -154,6 +154,9 @@ fn config(root: &Path, daemon_uid: u32) -> HelperConfig {
         // Tests that make these fail need not wait the production pauses.
         finalize_retry_delay: Duration::from_millis(10),
         remove_retry_delay: Duration::from_millis(10),
+        // A test's restored job that is to stay paused is either stopped at
+        // once or never.
+        stop_settle_time: Duration::from_millis(100),
         ..HelperConfig::default()
     }
 }

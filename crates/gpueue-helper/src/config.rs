@@ -72,6 +72,9 @@ pub struct HelperConfig {
     /// The pause between attempts to remove the image a job was restored
     /// from.
     pub remove_retry_delay: Duration,
+    /// How long a job restored to stay paused may take until each of its
+    /// threads is seen stopped.
+    pub stop_settle_time: Duration,
     /// `TimeoutStopSec` of job units: SIGTERM → SIGKILL grace when systemd
     /// stops a job (e.g. a `no_checkpoint` job at shutdown).
     pub job_stop_timeout: Duration,
@@ -128,6 +131,7 @@ impl Default for HelperConfig {
             spawn_timeout: Duration::from_secs(30),
             finalize_retry_delay: Duration::from_secs(1),
             remove_retry_delay: Duration::from_millis(500),
+            stop_settle_time: Duration::from_secs(2),
             job_stop_timeout: Duration::from_secs(30),
             helper_exe: PathBuf::from("/usr/bin/gpueue-helper"),
             gc_roots: crate::gcroots::GcRoots::disabled(),
