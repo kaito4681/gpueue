@@ -2347,6 +2347,11 @@ warned on their next command. Refusals:
   gives the job its credentials back, so a restored `SO_REUSEPORT` socket would belong to root and
   could join a root service's group on the same port (and receive part of its connections). Turn
   `SO_REUSEPORT` off in the program, or run the job with `--no-checkpoint`.
+- `reading the job's open files: inspecting socket N of process P (for SO_REUSEPORT): Operation
+  not permitted`: the helper looks at the job's sockets through `pidfd_getfd`, and something
+  denied it (a seccomp filter on `gpueue-helper.service`, Yama's `kernel.yama.ptrace_scope` 3,
+  which CRIU cannot work under either, or a kernel older than 5.6). The helper refuses the
+  checkpoint rather than miss such a socket; let the helper use `pidfd_getfd`.
 - `the job holds deleted files that still have other hard links (...)`, `... files deleted on NFS
   while open (...)`: CRIU could only checkpoint such files by linking them back into their
   directories as root (`--link-remap`, which gpueue never uses). Close the files before the

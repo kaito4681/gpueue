@@ -2332,6 +2332,11 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
   ソケットを作り直すので、リストアされた `SO_REUSEPORT` のソケットは root のものになり、同じポートの root の
   サービスのグループに加わって（その接続の一部を受け取って）しまう可能性があります。プログラムで
   `SO_REUSEPORT` を無効にするか、ジョブを `--no-checkpoint` で実行してください。
+- `reading the job's open files: inspecting socket N of process P (for SO_REUSEPORT): Operation
+  not permitted`：ヘルパーはジョブのソケットを `pidfd_getfd` で調べますが、それが拒否されました
+  （`gpueue-helper.service` の seccomp フィルター、Yama の `kernel.yama.ptrace_scope` 3（CRIU もこの設定では
+  動きません）、または 5.6 より古いカーネル）。ヘルパーはそのようなソケットを見逃すよりもチェックポイントを
+  拒否します。ヘルパーが `pidfd_getfd` を使えるようにしてください。
 - `the job holds deleted files that still have other hard links (...)`、`... files deleted on NFS
   while open (...)`：CRIU がそうしたファイルをチェックポイントできるのは、root としてディレクトリに
   リンクし直す場合（`--link-remap`。gpueue は決して使いません）だけです。チェックポイントの前にファイルを

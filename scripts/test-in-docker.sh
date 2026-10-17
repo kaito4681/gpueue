@@ -19,7 +19,14 @@ fi
 docker run --rm -v gpueue-cargo-home:/cargo "$image" \
     sh -c "chown $(id -u):$(id -g) /cargo" >/dev/null
 
+# CAP_SYS_PTRACE makes Docker's default seccomp profile allow pidfd_getfd
+# (and ptrace, process_vm_readv, ...), which the helper's dump hazard scan
+# uses to inspect a job's sockets; without it the scan fails closed and the
+# helper's tests fail. The tests run as an unprivileged user, so the
+# capability itself is not in their effective set: only the seccomp profile
+# changes, not what the processes may do.
 exec docker run --rm \
+    --cap-add SYS_PTRACE \
     --user "$(id -u):$(id -g)" \
     -e CARGO_HOME=/cargo \
     -e CARGO_TARGET_DIR=/work/target/docker \

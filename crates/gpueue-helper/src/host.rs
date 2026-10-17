@@ -1100,7 +1100,7 @@ pub fn scan_dump_hazards(
     }
     out.held_files = held_files(proc_root, host_pids, private);
     for (pid, fd) in socket_fds {
-        if let Some(addr) = reuseport_inet_socket(pid, fd)
+        if let Some(addr) = reuseport_inet_socket(pid, fd)?
             && !out.reuseport_sockets.contains(&addr)
         {
             out.reuseport_sockets.push(addr);
@@ -1750,28 +1750,58 @@ const OPEN_FILES_TIMEOUT: Duration = Duration::from_secs(10);
 /// The local address of socket `fd` of process `pid` if it is an internet
 /// socket with `SO_REUSEPORT` (looked at through a duplicate taken with
 /// `pidfd_getfd`, which leaves the job's socket alone). A process or
-/// descriptor that is gone counts as none.
-fn reuseport_inet_socket(pid: u32, fd: i32) -> Option<String> {
+/// descriptor that is gone, or a descriptor that is no longer a socket,
+/// counts as none.
+///
+/// Any other failure is an error, so that the dump is refused: e.g. a
+/// seccomp filter that denies `pidfd_getfd` (Docker's default profile does,
+/// without `CAP_SYS_PTRACE`), Yama's `ptrace_scope` 3, or a kernel older
+/// than 5.6 would otherwise hide every such socket.
+fn reuseport_inet_socket(pid: u32, fd: i32) -> io::Result<Option<String>> {
+    use rustix::io::Errno;
     use rustix::net::{AddressFamily, sockopt};
-    let pidfd = rustix::process::pidfd_open(
-        rustix::process::Pid::from_raw(i32::try_from(pid).ok()?)?,
-        rustix::process::PidfdFlags::empty(),
-    )
-    .ok()?;
+    let gone = |e: Errno| -> io::Result<Option<String>> {
+        if e == Errno::SRCH || e == Errno::BADF || e == Errno::NOTSOCK {
+            Ok(None)
+        } else {
+            Err(io::Error::other(format!(
+                "inspecting socket {fd} of process {pid} (for SO_REUSEPORT): {}",
+                io::Error::from(e)
+            )))
+        }
+    };
+    let Some(target) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return Ok(None);
+    };
+    let pidfd = match rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()) {
+        Ok(p) => p,
+        Err(e) => return gone(e),
+    };
     let sock =
-        rustix::process::pidfd_getfd(&pidfd, fd, rustix::process::PidfdGetfdFlags::empty()).ok()?;
-    let family = sockopt::socket_domain(&sock).ok()?;
+        match rustix::process::pidfd_getfd(&pidfd, fd, rustix::process::PidfdGetfdFlags::empty()) {
+            Ok(s) => s,
+            Err(e) => return gone(e),
+        };
+    let family = match sockopt::socket_domain(&sock) {
+        Ok(f) => f,
+        Err(e) => return gone(e),
+    };
     if family != AddressFamily::INET && family != AddressFamily::INET6 {
-        return None;
+        return Ok(None);
     }
-    if !sockopt::socket_reuseport(&sock).ok()? {
-        return None;
+    match sockopt::socket_reuseport(&sock) {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(e) => return gone(e),
     }
     let addr = rustix::net::getsockname(&sock)
         .ok()
         .and_then(|a| std::net::SocketAddr::try_from(a).ok())
         .map_or_else(|| "an unknown address".to_owned(), |a| a.to_string());
-    Some(addr)
+    Ok(Some(addr))
 }
 
 /// `(inode, path)` of each bound socket in `/proc/net/unix`.
@@ -2085,7 +2115,12 @@ mod tests {
         let f = f.to_str().unwrap();
         let sock = tmp.path().join("sock").to_str().unwrap().to_owned();
 
-        let h = scan_dump_hazards(proc_root, &[pid], &["/tmp-private".into()]).unwrap();
+        // The scan fails (rather than missing the SO_REUSEPORT socket) where
+        // pidfd_getfd is denied: e.g. Docker's default seccomp profile
+        // without CAP_SYS_PTRACE (scripts/test-in-docker.sh adds it), or
+        // Yama's ptrace_scope 3.
+        let h = scan_dump_hazards(proc_root, &[pid], &["/tmp-private".into()])
+            .unwrap_or_else(|e| panic!("scanning the fixture: {e}"));
         // Both files: another deleted file that had the same path is
         // another file. Nothing else of the fixture is deleted.
         let mut deleted: Vec<(&str, u64, u32, u64, bool, bool)> = h
@@ -2116,12 +2151,7 @@ mod tests {
             "{h:?}"
         );
         assert_eq!(h.bound_sockets, [sock], "{h:?}");
-        // pidfd_getfd needs ptrace access to the fixture, which a sandbox
-        // may deny; then nothing is found.
-        assert!(
-            h.reuseport_sockets.is_empty() || h.reuseport_sockets == [reuse_addr.to_owned()],
-            "{h:?}"
-        );
+        assert_eq!(h.reuseport_sockets, [reuse_addr.to_owned()], "{h:?}");
         assert!(h.notify_fds.is_empty(), "{h:?}");
         assert!(h.abstract_listeners.is_empty(), "{h:?}");
         assert!(h.silly_renamed.is_empty(), "{h:?}");
@@ -2142,6 +2172,95 @@ mod tests {
         let host = SystemHost::new("nvidia-smi".into(), Default::default(), "x".into());
         let groups = host.process_groups(&[pid]).unwrap().unwrap();
         assert!(groups.contains(&nix::unistd::getegid().as_raw()));
+    }
+
+    /// Makes the calling thread's `pidfd_getfd` calls fail with `EPERM`, as
+    /// a seccomp policy that denies it does (Docker's default profile
+    /// without `CAP_SYS_PTRACE`). Seccomp filters apply to the thread that
+    /// installs them (and threads it starts), so the other tests are not
+    /// affected.
+    ///
+    /// The only `unsafe` in the workspace, in a test: neither rustix nor nix
+    /// installs seccomp filters.
+    #[allow(unsafe_code)]
+    fn deny_pidfd_getfd_in_this_thread() {
+        use nix::libc;
+        const fn stmt(code: u32, k: u32) -> libc::sock_filter {
+            libc::sock_filter {
+                code: code as u16,
+                jt: 0,
+                jf: 0,
+                k,
+            }
+        }
+        let nr_offset = std::mem::offset_of!(libc::seccomp_data, nr) as u32;
+        let mut filter = [
+            stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, nr_offset),
+            libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_pidfd_getfd as u32,
+            },
+            stmt(
+                libc::BPF_RET | libc::BPF_K,
+                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            ),
+            stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW),
+        ];
+        let prog = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        // SAFETY: plain system calls; `prog` points to a valid filter for
+        // their duration.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::syscall(
+                    libc::SYS_seccomp,
+                    libc::SECCOMP_SET_MODE_FILTER,
+                    0,
+                    &raw const prog
+                ),
+                0,
+                "installing a seccomp filter: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+
+    /// A helper whose `pidfd_getfd` is denied (a seccomp policy, Yama's
+    /// `ptrace_scope` 3) cannot tell whether the job's internet sockets
+    /// have `SO_REUSEPORT`: the scan fails, so the dump is refused, rather
+    /// than reporting none.
+    #[test]
+    fn a_denied_socket_inspection_fails_the_scan() {
+        use crate::testing::{FixtureChild, fixture_dir, fixture_ready};
+        if fixture_dir().is_some() {
+            let _l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            fixture_ready("");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = FixtureChild::spawn(
+            "host::tests::a_denied_socket_inspection_fails_the_scan",
+            tmp.path(),
+        );
+        let pid = fixture.pid();
+        let scan = std::thread::spawn(move || {
+            deny_pidfd_getfd_in_this_thread();
+            scan_dump_hazards(Path::new("/proc"), &[pid], &[])
+        })
+        .join()
+        .unwrap();
+        let err = scan.expect_err("the scan must fail when pidfd_getfd is denied");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("of process {pid} (for SO_REUSEPORT)"))
+                && msg.contains(&io::Error::from_raw_os_error(nix::libc::EPERM).to_string()),
+            "{msg}"
+        );
     }
 
     /// Regression (audit V2, S1-2/S2-1): the kernel keeps a socket's name

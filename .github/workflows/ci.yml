@@ -72,7 +72,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     # Keep in sync with the image of release.yml's build job.
-    container: rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    # CAP_SYS_PTRACE lets pidfd_getfd through Docker's default seccomp profile
+    # (see scripts/test-in-docker.sh); the tests run as an unprivileged user.
+    container:
+      image: rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      options: --cap-add SYS_PTRACE
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
