@@ -40,7 +40,7 @@
 | NVIDIA 驱动（GPU 作业） | 其 `cuda-checkpoint` 支持 `--action lock/checkpoint/restore/unlock` 和 `--timeout` 的驱动：r570 或更高版本（cuda-checkpoint 本身支持 r550，但仅支持 `--toggle`，而 gpueue 不使用它） | 595 |
 | cuda-checkpoint（GPU 作业） | NVIDIA 提供的二进制文件，主版本号须与驱动相同 | 595 |
 | nvidia-smi（GPU 作业） | helper 用它查找 CUDA 进程和 GPU 显存 | 随驱动提供 |
-| Rust（仅构建时） | 1.88 或更高版本，另需一个 C 编译器（`cc`）用于构建 helper 的 fork guard 库 | 1.98.1 |
+| Rust（仅构建时） | 1.89 或更高版本，另需一个 C 编译器（`cc`）用于构建 helper 的 fork guard 库 | 1.98.1 |
 
 没有 NVIDIA 驱动时，gpueue 仍然可以运行仅使用 CPU 的作业，并同样可以为它们创建检查点。
 
@@ -2078,7 +2078,10 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
   抽象名称。相对名称会被视为主机路径，因为无法得知它是在哪个目录中绑定的；名称中含有 `.`、`..` 或 `//` 的、位于 `/proc` 之下的，或其 `/tmp` 下的
   目录要经过符号链接或另一个挂载才能到达的，也同样如此。
 - `the job has Unix sockets listening on the abstract names [...]`：CRIU 会以 root 身份建立该监听套接字，
-  因此检查谁在监听的客户端（`SO_PEERCRED`）会看到 root。请改为监听 `/tmp` 之下的路径。
+  因此检查谁在监听的客户端（`SO_PEERCRED`）会看到 root。请改为监听 `/tmp` 之下的路径。libcuda 在每个初始化了
+  CUDA 的进程中监听的 `@cuda-uvmfd-<PID 命名空间的 inode>-<PID>@` 不会被拒绝，前提是名称中是该进程在其 PID 命名空间
+  中的 PID，并且该进程映射了 libcuda（它的客户端只有作业中其他进程里的 libcuda，从不询问谁在监听）；
+  仅仅名称相似的套接字照样会被拒绝。
 - `the job has inotify or fanotify descriptors (...)`：CRIU 会以 root 身份按路径重新添加这些监视。请在创建
   检查点之前关闭文件监视器，或用 `--no-checkpoint` 运行该作业。
 - 检查点失败，且 CRIU 日志中出现 `Post dump script passed with 1` 和 `descriptors in flight in Unix socket

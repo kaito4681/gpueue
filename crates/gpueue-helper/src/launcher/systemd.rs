@@ -42,8 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpueue_protocol::helper::{ExitStatus, HelperErrorCode, signal};
-use zbus::Connection;
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::{Connection, DBusError, OwnedObjectPath, OwnedVariant, Variant};
 
 use super::{
     LaunchError, LaunchResult, LaunchSpec, Launcher, RestoreSpec, UnitState, parse_unit_name,
@@ -111,7 +110,7 @@ pub struct SystemdLauncher {
     stopping: Arc<AtomicBool>,
 }
 
-type Props<'a> = Vec<(&'a str, Value<'a>)>;
+type Props<'a> = Vec<(&'a str, Variant<'a>)>;
 
 impl SystemdLauncher {
     /// Connect to the system bus.
@@ -132,8 +131,8 @@ impl SystemdLauncher {
 
     async fn manager_call<B, R>(&self, method: &str, body: &B) -> zbus::Result<R>
     where
-        B: serde::Serialize + zbus::zvariant::DynamicType,
-        R: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
+        B: serde::Serialize + zbus::DynamicType,
+        R: for<'d> zbus::wire::DynamicDeserialize<'d>,
     {
         let reply = self
             .conn
@@ -142,7 +141,7 @@ impl SystemdLauncher {
         reply.body().deserialize()
     }
 
-    async fn property(&self, path: &str, iface: &str, name: &str) -> zbus::Result<OwnedValue> {
+    async fn property(&self, path: &str, iface: &str, name: &str) -> zbus::Result<OwnedVariant> {
         let reply = self
             .conn
             .call_method(Some(DEST), path, Some(PROPS_IFACE), "Get", &(iface, name))
@@ -171,7 +170,7 @@ impl SystemdLauncher {
             .property(path.as_str(), iface, name)
             .await
             .map_err(dbus)?;
-        String::try_from(v).map_err(|e| dbus(e.into()))
+        String::try_from(v).map_err(dbus)
     }
 
     async fn int_prop(&self, path: &OwnedObjectPath, name: &str) -> LaunchResult<i32> {
@@ -179,7 +178,7 @@ impl SystemdLauncher {
             .property(path.as_str(), SERVICE_IFACE, name)
             .await
             .map_err(dbus)?;
-        i32::try_from(v).map_err(|e| dbus(e.into()))
+        i32::try_from(v).map_err(dbus)
     }
 
     async fn main_pid(&self, unit: &str) -> LaunchResult<Option<u32>> {
@@ -190,7 +189,7 @@ impl SystemdLauncher {
             .property(path.as_str(), SERVICE_IFACE, "MainPID")
             .await
             .map_err(dbus)?;
-        let pid = u32::try_from(v).map_err(|e| dbus(e.into()))?;
+        let pid = u32::try_from(v).map_err(dbus)?;
         Ok((pid != 0).then_some(pid))
     }
 
@@ -236,7 +235,7 @@ impl SystemdLauncher {
         loop {
             match self.property(job.as_str(), JOB_IFACE, "State").await {
                 Ok(v) => {
-                    if String::try_from(v).map_err(|e| dbus(e.into()))? == "running" {
+                    if String::try_from(v).map_err(dbus)? == "running" {
                         return Ok(());
                     }
                 }
@@ -352,16 +351,16 @@ impl Launcher for SystemdLauncher {
         let mut props = self.common_props(format!("gpueue job {} of uid {}", spec.job.0, spec.uid));
         props.extend(device_props(spec.devices.as_deref()));
         props.extend([
-            ("Type", Value::from("exec")),
+            ("Type", Variant::from("exec")),
             (
                 "ExecStart",
-                Value::from(vec![(
+                Variant::from(vec![(
                     exe.clone(),
                     vec![exe, "shim".to_owned(), dir],
                     false,
                 )]),
             ),
-            ("CapabilityBoundingSet", Value::from(SHIM_CAPS)),
+            ("CapabilityBoundingSet", Variant::from(SHIM_CAPS)),
         ]);
         self.start_transient(&spec.unit, props).await?;
         match self.wait_for_start(spec).await {
@@ -397,16 +396,19 @@ impl Launcher for SystemdLauncher {
         let mut props = self.common_props(format!("gpueue job {} (restored)", spec.job.0));
         props.extend(device_props(spec.devices.as_deref()));
         props.extend([
-            ("Type", Value::from("forking")),
+            ("Type", Variant::from("forking")),
             (
                 "ExecStart",
-                Value::from(vec![(argv[0].clone(), argv, false)]),
+                Variant::from(vec![(argv[0].clone(), argv, false)]),
             ),
             (
                 "PIDFile",
-                Value::from(spec.pidfile.to_string_lossy().into_owned()),
+                Variant::from(spec.pidfile.to_string_lossy().into_owned()),
             ),
-            ("TimeoutStartUSec", Value::from(duration_usec(spec.timeout))),
+            (
+                "TimeoutStartUSec",
+                Variant::from(duration_usec(spec.timeout)),
+            ),
         ]);
         self.start_transient(&spec.unit, props).await?;
 
@@ -553,7 +555,7 @@ impl Launcher for SystemdLauncher {
             .property(MANAGER_PATH, MANAGER, "SystemState")
             .await
             .map_err(dbus)?;
-        let state = String::try_from(v).map_err(|e| dbus(e.into()))?;
+        let state = String::try_from(v).map_err(dbus)?;
         Ok(state == "stopping")
     }
 
@@ -570,26 +572,26 @@ impl Launcher for SystemdLauncher {
 /// network goes down, so a job that saves its state there on SIGTERM can.
 pub fn common_props(description: String, job_stop_timeout: Duration) -> Props<'static> {
     vec![
-        ("Description", Value::from(description)),
-        ("Before", Value::from(vec![HELPER_UNIT.to_owned()])),
+        ("Description", Variant::from(description)),
+        ("Before", Variant::from(vec![HELPER_UNIT.to_owned()])),
         (
             "After",
-            Value::from(
+            Variant::from(
                 JOB_UNIT_AFTER
                     .iter()
                     .map(|u| (*u).to_owned())
                     .collect::<Vec<_>>(),
             ),
         ),
-        ("RemainAfterExit", Value::from(true)),
-        ("KillMode", Value::from("mixed")),
-        ("NoNewPrivileges", Value::from(true)),
-        ("StandardInput", Value::from("null")),
-        ("StandardOutput", Value::from("journal")),
-        ("StandardError", Value::from("journal")),
+        ("RemainAfterExit", Variant::from(true)),
+        ("KillMode", Variant::from("mixed")),
+        ("NoNewPrivileges", Variant::from(true)),
+        ("StandardInput", Variant::from("null")),
+        ("StandardOutput", Variant::from("journal")),
+        ("StandardError", Variant::from("journal")),
         (
             "TimeoutStopUSec",
-            Value::from(duration_usec(job_stop_timeout)),
+            Variant::from(duration_usec(job_stop_timeout)),
         ),
     ]
 }
@@ -601,8 +603,8 @@ pub fn device_props(devices: Option<&[DeviceRule]>) -> Props<'static> {
         return Vec::new();
     };
     vec![
-        ("DevicePolicy", Value::from("closed")),
-        ("DeviceAllow", Value::from(devices.to_vec())),
+        ("DevicePolicy", Variant::from("closed")),
+        ("DeviceAllow", Variant::from(devices.to_vec())),
     ]
 }
 
@@ -617,12 +619,24 @@ pub fn signal_target(sig: i32) -> &'static str {
     }
 }
 
+/// Whether `e` is a D-Bus error reply named one of `names`. zbus reports
+/// the names it defines in `fdo::Error` (`org.freedesktop.DBus.Error.*`) as
+/// [`zbus::Error::FDO`] and every other name as
+/// [`zbus::Error::MethodError`].
+fn is_error_reply(e: &zbus::Error, names: &[&str]) -> bool {
+    match e {
+        zbus::Error::MethodError(name, _, _) => names.contains(&name.as_str()),
+        zbus::Error::FDO(e) => names.contains(&e.name().as_str()),
+        _ => false,
+    }
+}
+
 fn is_no_such_unit(e: &zbus::Error) -> bool {
-    matches!(e, zbus::Error::MethodError(name, _, _) if name.as_str() == NO_SUCH_UNIT)
+    is_error_reply(e, &[NO_SUCH_UNIT])
 }
 
 fn is_job_gone(e: &zbus::Error) -> bool {
-    matches!(e, zbus::Error::MethodError(name, _, _) if JOB_GONE_ERRORS.contains(&name.as_str()))
+    is_error_reply(e, JOB_GONE_ERRORS)
 }
 
 fn dbus(e: zbus::Error) -> LaunchError {
@@ -659,6 +673,42 @@ mod tests {
         assert_eq!(exit_status_from_systemd(0, 0), None);
     }
 
+    /// The `zbus::Error` a reply to a systemd call named `name` turns into.
+    fn error_reply(name: &str) -> zbus::Error {
+        let call = zbus::Message::method_call(MANAGER_PATH, "GetUnit")
+            .build(&("x.service",))
+            .unwrap();
+        zbus::Message::error(&call.header(), name)
+            .build(&("detail",))
+            .unwrap()
+            .into()
+    }
+
+    #[test]
+    fn classifies_error_replies() {
+        // systemd's own names and the D-Bus ones that zbus maps to
+        // `fdo::Error` both have to be recognized.
+        assert!(is_no_such_unit(&error_reply(NO_SUCH_UNIT)));
+        for name in JOB_GONE_ERRORS {
+            let e = error_reply(name);
+            assert!(is_job_gone(&e), "{name}: {e:?}");
+            assert!(!is_no_such_unit(&e), "{name}");
+        }
+        assert!(matches!(
+            error_reply("org.freedesktop.DBus.Error.UnknownObject"),
+            zbus::Error::FDO(_)
+        ));
+        for name in [
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "org.freedesktop.systemd1.UnitMasked",
+        ] {
+            let e = error_reply(name);
+            assert!(!is_job_gone(&e), "{name}");
+            assert!(!is_no_such_unit(&e), "{name}");
+        }
+        assert!(!is_job_gone(&zbus::Error::InvalidReply));
+    }
+
     #[test]
     fn routes_signals() {
         assert_eq!(signal_target(signal::SIGTERM), "main");
@@ -690,7 +740,7 @@ mod tests {
         };
         assert_eq!(
             get("After"),
-            Value::from(vec![
+            Variant::from(vec![
                 "remote-fs.target".to_owned(),
                 "network.target".to_owned()
             ])
@@ -698,13 +748,13 @@ mod tests {
         assert_eq!(get("After").value_signature().to_string(), "as");
         assert_eq!(
             get("Before"),
-            Value::from(vec!["gpueue-helper.service".to_owned()])
+            Variant::from(vec!["gpueue-helper.service".to_owned()])
         );
         // Ordering only: nothing is pulled in.
         for dep in ["Requires", "Wants", "BindsTo", "Requisite"] {
             assert!(props.iter().all(|(n, _)| *n != dep), "{dep} is set");
         }
-        assert_eq!(get("TimeoutStopUSec"), Value::from(5_000_000u64));
+        assert_eq!(get("TimeoutStopUSec"), Variant::from(5_000_000u64));
     }
 
     #[test]
@@ -716,13 +766,13 @@ mod tests {
         ];
         let props = device_props(Some(&rules));
         assert_eq!(props.len(), 2);
-        assert_eq!(props[0], ("DevicePolicy", Value::from("closed")));
+        assert_eq!(props[0], ("DevicePolicy", Variant::from("closed")));
         assert_eq!(props[1].0, "DeviceAllow");
         assert_eq!(props[1].1.value_signature().to_string(), "a(ss)");
-        assert_eq!(props[1].1, Value::from(rules));
+        assert_eq!(props[1].1, Variant::from(rules));
         // A CPU job: closed, nothing allowed beyond systemd's pseudo devices.
         let props = device_props(Some(&[]));
-        assert_eq!(props[0], ("DevicePolicy", Value::from("closed")));
+        assert_eq!(props[0], ("DevicePolicy", Variant::from("closed")));
         assert_eq!(props[1].1.value_signature().to_string(), "a(ss)");
     }
 }

@@ -1875,11 +1875,31 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 paths.notify_fds
             ));
         }
-        if !paths.abstract_listeners.is_empty() {
+        // libcuda's listeners are fine (see `crate::host::parse_cuda_uvmfd_name`)
+        // if their pid is one of the job's processes and the job has libcuda
+        // mapped; the dump checked the rest (the pid namespace, which
+        // process maps libcuda), which the images do not tell.
+        let mut listeners = paths.abstract_listeners.clone();
+        if !paths.cuda_uvmfd_listeners.is_empty() {
+            let pids = crate::images::read_pids(&dir.images_dir()).map_err(|e| {
+                error(
+                    HelperErrorCode::InvalidRequest,
+                    format!("reading the checkpoint's images: {e}"),
+                )
+            })?;
+            let libcuda = paths.files.iter().any(|f| crate::host::is_libcuda_path(f));
+            listeners.extend(
+                paths
+                    .cuda_uvmfd_listeners
+                    .iter()
+                    .filter(|(_, pid)| !libcuda || !pids.contains(pid))
+                    .map(|(name, _)| name.clone()),
+            );
+        }
+        if !listeners.is_empty() {
             return refuse(format!(
-                "Unix sockets listening on the abstract names {:?}, which CRIU would set up \
-                 as root",
-                paths.abstract_listeners
+                "Unix sockets listening on the abstract names {listeners:?}, which CRIU would \
+                 set up as root"
             ));
         }
         match crate::images::read_in_flight_fds(&dir.images_dir()) {

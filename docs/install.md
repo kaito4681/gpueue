@@ -39,7 +39,7 @@ command on their `PATH`.
 | NVIDIA driver (GPU jobs) | a driver whose `cuda-checkpoint` supports `--action lock/checkpoint/restore/unlock` and `--timeout`: r570 or newer (cuda-checkpoint itself supports r550, but only with `--toggle`, which gpueue does not use) | 595 |
 | cuda-checkpoint (GPU jobs) | the binary from NVIDIA, with the same major version as the driver | 595 |
 | nvidia-smi (GPU jobs) | the helper uses it to find CUDA processes and GPU memory | from the driver |
-| Rust (building only) | 1.88 or newer, plus a C compiler (`cc`) for the helper's fork guard library | 1.98.1 |
+| Rust (building only) | 1.89 or newer, plus a C compiler (`cc`) for the helper's fork guard library | 1.98.1 |
 
 Without an NVIDIA driver gpueue still runs CPU-only jobs, and checkpoints them as well.
 
@@ -2336,7 +2336,11 @@ warned on their next command. Refusals:
   another mount.
 - `the job has Unix sockets listening on the abstract names [...]`: CRIU would set the listener
   up as root, so clients checking who listens (`SO_PEERCRED`) would see root. Listen on a path
-  below `/tmp` instead.
+  below `/tmp` instead. The socket libcuda listens on in every process that initialises CUDA,
+  `@cuda-uvmfd-<pid namespace inode>-<pid>@`, is not refused when the name has the process's
+  pid in its pid namespace and the process has libcuda mapped (its only
+  clients are libcuda in the job's other processes, which never ask who listens); a name that
+  only looks like it is refused like any other.
 - `the job has inotify or fanotify descriptors (...)`: CRIU would re-add the watches as root, by
   path. Close file watchers before the checkpoint, or run the job with `--no-checkpoint`.
 - A checkpoint that fails with `Post dump script passed with 1` and `descriptors in flight in

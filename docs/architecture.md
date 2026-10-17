@@ -255,6 +255,23 @@ hold a root file opened with the dump-time mode. The helper therefore:
   (`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV)`). It also refuses a job
   with Unix sockets listening on abstract names (CRIU sets them up as root, so a client asking
   who listens, with `SO_PEERCRED`, would be told root; non-listening abstract sockets are fine),
+  except libcuda's: every process that initialises CUDA listens on
+  `\0cuda-uvmfd-<inode of its pid namespace>-<its pid there>\0` (`SOCK_SEQPACKET`; libcuda in
+  another process of the same pid namespace connects to it by that name, sends its credentials
+  with `SCM_CREDENTIALS` and gets the listener's `/dev/nvidia-uvm` descriptor; libcuda never calls
+  `getsockopt`, so `SO_PEERCRED` misleads nobody), and cuda-checkpoint keeps it while it closes
+  the `/dev/nvidia*` descriptors. Such a listener passes if one process holding it has libcuda
+  mapped and the name has exactly that process's pid in its pid namespace (both the scan before
+  the dump and the post-dump hook's). The inode is not compared: a restored process keeps the
+  listener named after the pid namespace of its first run, and is in a new one. A job could
+  name a socket of its own like that, but
+  only a libcuda client of that pid namespace would ever connect to it, and those do not look
+  at the listener's credentials. The restored name keeps the dump-time inode, which the kernel
+  may give to another pid namespace later: while the restored job runs, a process there with
+  the same pid cannot bind its own listener, and libcuda's `cuInit` then fails with
+  `CUDA_ERROR_OPERATING_SYSTEM` (and a restore fails if such a process holds the name). Anyone
+  on the host can take such a name already (abstract names have no permissions, and jobs share
+  the host's network namespace), and gpueue 0.1.3 restored these listeners the same way,
   a job with inotify or fanotify descriptors (CRIU re-adds their watches as root, by paths that
   it follows symlinks in), and, in the post-dump hook, a dump with descriptors in flight in
   Unix socket messages (`SCM_RIGHTS` in `sk-queues.img`; CRIU re-opens them as root and hands
@@ -278,7 +295,8 @@ hold a root file opened with the dump-time mode. The helper therefore:
   refused with every reason found) if the job has opened such a descriptor meanwhile;
 - **before the restore** refuses it if the owner left one of those groups, if the image has a
   socket bound on a host filesystem (by the same rules for its name), a listening socket with
-  an abstract name, inotify or fanotify descriptors, descriptors in flight (`sk-queues.img`),
+  an abstract name (but libcuda's, if `pstree.img` has the pid in its name and the image has
+  libcuda mapped), inotify or fanotify descriptors, descriptors in flight (`sk-queues.img`),
   or an internet socket bound to a port that another socket on the host has too (any address
   and family, same protocol; read from `/proc/net/{tcp,udp,udplite}{,6}`): CRIU 4.2 sets
   `SO_REUSEADDR` and `SO_REUSEPORT` on every internet socket it restores, as root, before it

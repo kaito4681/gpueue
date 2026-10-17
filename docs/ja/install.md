@@ -53,7 +53,7 @@ docs/<lang>/ go up two levels (../../packaging/...). Code blocks are copied unch
 | NVIDIA ドライバー（GPU ジョブ） | `cuda-checkpoint` が `--action lock/checkpoint/restore/unlock` と `--timeout` に対応したドライバー：r570 以降（cuda-checkpoint 自体は r550 に対応していますが、`--toggle` のみで、gpueue はこれを使いません） | 595 |
 | cuda-checkpoint（GPU ジョブ） | NVIDIA のバイナリ。メジャーバージョンがドライバーと同じもの | 595 |
 | nvidia-smi（GPU ジョブ） | ヘルパーが CUDA プロセスと GPU メモリを調べるのに使います | ドライバー付属 |
-| Rust（ビルド時のみ） | 1.88 以降と、ヘルパーの fork ガードライブラリ用の C コンパイラー（`cc`） | 1.98.1 |
+| Rust（ビルド時のみ） | 1.89 以降と、ヘルパーの fork ガードライブラリ用の C コンパイラー（`cc`） | 1.98.1 |
 
 NVIDIA ドライバーがなくても、gpueue は CPU のみのジョブを実行でき、それらのチェックポイントも取れます。
 
@@ -2321,7 +2321,10 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
   シンボリックリンクや別のマウントを経由して到達するものも同様です。
 - `the job has Unix sockets listening on the abstract names [...]`：CRIU はリスナーを root としてセット
   アップするので、誰が待ち受けているかを確認するクライアント（`SO_PEERCRED`）には root と見えてしまいます。
-  代わりに `/tmp` 以下のパスで待ち受けてください。
+  代わりに `/tmp` 以下のパスで待ち受けてください。CUDA を初期化したすべてのプロセスで libcuda が待ち受ける
+  `@cuda-uvmfd-<PID 名前空間の inode>-<PID>@` は、名前がそのプロセスの PID 名前空間での PID を持ち、
+  プロセスが libcuda をマップしていれば拒否されません（そのクライアントはジョブのほかのプロセスの libcuda
+  だけで、誰が待ち受けているかを尋ねません）。名前が似ているだけのものはほかと同様に拒否されます。
 - `the job has inotify or fanotify descriptors (...)`：CRIU は監視を root として、パスで再登録することになり
   ます。チェックポイントの前にファイル監視を閉じるか、ジョブを `--no-checkpoint` で実行してください。
 - `Post dump script passed with 1` と、CRIU のログにある `descriptors in flight in Unix socket messages

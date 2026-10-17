@@ -463,7 +463,8 @@ Details are in [docs/install.md](docs/install.md).
   checkpointed; the checkpoint is refused and the job keeps running. Bind sockets to an absolute
   path below `/tmp` (without `..` or symlinks on the way), or use an abstract name for sockets
   that do not listen. A socket *listening* on an abstract name cannot be checkpointed (CRIU
-  would set it up as root, and its clients would see root as the listener).
+  would set it up as root, and its clients would see root as the listener), except the one
+  libcuda listens on in every CUDA process (`@cuda-uvmfd-<pid namespace inode>-<pid>@`).
 - **inotify, fanotify and descriptors in flight:** a job with an inotify or fanotify descriptor
   (file watchers), or one that is passing descriptors over a Unix socket (`SCM_RIGHTS`) at the
   moment of the checkpoint, cannot be checkpointed (CRIU would recreate those as root).
