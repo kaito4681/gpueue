@@ -257,6 +257,13 @@ impl Daemon {
         self.core.helper_ready()
     }
 
+    /// Whether a spawn or restore request for `id` has not returned yet.
+    /// For tests.
+    #[doc(hidden)]
+    pub fn launch_in_flight(&self, id: gpueue_core::model::JobId) -> bool {
+        self.core.launch_in_flight(id)
+    }
+
     pub fn set_launch_check_hook(&self, hook: Option<LaunchCheckHook>) {
         self.core.set_launch_check_hook(hook);
     }

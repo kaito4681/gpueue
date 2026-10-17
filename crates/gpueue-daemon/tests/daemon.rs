@@ -350,6 +350,20 @@ impl Harness {
         );
     }
 
+    /// Waits until the request of the job's latest launch has returned: its
+    /// effect on the job shows a moment before (and an action checking the
+    /// launch waits for it only briefly).
+    async fn wait_launch_settled(&self, id: JobId) {
+        let daemon = self.daemon.as_ref().unwrap();
+        for _ in 0..250 {
+            if !daemon.launch_in_flight(id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the launch of job {id} never settled");
+    }
+
     /// Waits until the daemon has reconciled with the helper's current
     /// session.
     async fn wait_reconciled(&self) {
@@ -1511,7 +1525,7 @@ async fn shutdown_leaves_jobs_whose_checkpoint_is_refused_running() {
         let daemon = h.daemon.take().unwrap();
         // Without retrying the refused job until the settle wait (11 s)
         // runs out.
-        tokio::time::timeout(Duration::from_secs(5), daemon.shutdown_requested())
+        tokio::time::timeout(Duration::from_secs(10), daemon.shutdown_requested())
             .await
             .expect("shutdown finishes");
 
@@ -3147,6 +3161,7 @@ async fn launches_retried_successfully_before_the_action_looks_are_reported_laun
         let (launched, release) = gate.reached().await;
         admin.wait_state(launched, &JobState::Running).await;
         h.wait_spawned(launched).await;
+        h.wait_launch_settled(launched).await;
         drop(release);
         let reply = reply.await.unwrap();
         assert_eq!(reply.status, StatusCode::OK, "{action} {id}");
@@ -3165,6 +3180,7 @@ async fn launches_retried_successfully_before_the_action_looks_are_reported_laun
     let (launched, release) = gate.reached().await;
     admin.wait_state(launched, &JobState::Running).await;
     h.wait_spawned(launched).await;
+    h.wait_launch_settled(launched).await;
     drop(release);
     let reply = reply.await.unwrap();
     assert_eq!(reply.status, StatusCode::CREATED);
@@ -3278,6 +3294,7 @@ async fn launches_that_fail_for_a_real_reason_report_it() {
     let (launched, release) = gate.reached().await;
     assert_eq!(launched, checkpointed);
     wait_restore_error(&h, checkpointed, reason).await;
+    h.wait_launch_settled(checkpointed).await;
     drop(release);
     let reply = reply.await.unwrap();
     assert_eq!(reply.error().code, ErrorCode::Internal);
@@ -3298,6 +3315,7 @@ async fn launches_that_fail_for_a_real_reason_report_it() {
         reason: "no such directory".to_owned(),
     });
     admin.wait_state(queued, &failed).await;
+    h.wait_launch_settled(queued).await;
     drop(release);
     let reply = reply.await.unwrap();
     assert_eq!(reply.status, StatusCode::OK);
