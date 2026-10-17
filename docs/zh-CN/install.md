@@ -2079,8 +2079,8 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
   目录要经过符号链接或另一个挂载才能到达的，也同样如此。
 - `the job has Unix sockets listening on the abstract names [...]`：CRIU 会以 root 身份建立该监听套接字，
   因此检查谁在监听的客户端（`SO_PEERCRED`）会看到 root。请改为监听 `/tmp` 之下的路径。libcuda 在每个初始化了
-  CUDA 的进程中监听的 `@cuda-uvmfd-<PID 命名空间的 inode>-<PID>@` 不会被拒绝，前提是名称中是该进程所在 PID 命名空间
-  的 inode 和它在其中的 PID，并且该进程映射了 libcuda（它的客户端只有作业中其他进程里的 libcuda，从不询问谁在监听）；
+  CUDA 的进程中监听的 `@cuda-uvmfd-<PID 命名空间的 inode>-<PID>@` 不会被拒绝，前提是名称中是该进程在其 PID 命名空间
+  中的 PID，并且该进程映射了 libcuda（它的客户端只有作业中其他进程里的 libcuda，从不询问谁在监听）；
   仅仅名称相似的套接字照样会被拒绝。
 - `the job has inotify or fanotify descriptors (...)`：CRIU 会以 root 身份按路径重新添加这些监视。请在创建
   检查点之前关闭文件监视器，或用 `--no-checkpoint` 运行该作业。

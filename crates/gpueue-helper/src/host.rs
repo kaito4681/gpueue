@@ -1846,8 +1846,7 @@ pub fn is_libcuda_path(path: &str) -> bool {
 /// Whether the listening socket with the abstract name `name` (as
 /// `/proc/net/unix` shows it, NULs as `@`) is libcuda's own (see
 /// [`parse_cuda_uvmfd_name`]): one of the processes `holders` that hold it
-/// has libcuda mapped, and the name has the inode of that process's pid
-/// namespace and its pid there.
+/// has libcuda mapped and has the pid of the name in its own pid namespace.
 ///
 /// Such a listener is exempt from the refusal of abstract listeners (see
 /// [`DumpHazards::abstract_listeners`]): its only clients are libcuda in
@@ -1856,8 +1855,16 @@ pub fn is_libcuda_path(path: &str) -> bool {
 /// `SO_PEERCRED` saying root after a restore misleads nobody), and
 /// cuda-checkpoint leaves it in place (unlike the process's `/dev/nvidia*`
 /// descriptors, which it closes, so they cannot be what is checked).
+///
+/// The pid namespace inode in the name is not compared with the process's:
+/// a restored process keeps the listener of its first run, named after the
+/// pid namespace it had then, and is in a new one, so the next checkpoint
+/// would be refused. A name with another inode is one only libcuda in a pid
+/// namespace with that inode would connect to, which anyone on the host can
+/// bind anyway (abstract names have no permissions), and libcuda ignores
+/// the listener's credentials.
 fn is_cuda_uvmfd_listener(proc_root: &Path, name: &str, holders: &[u32]) -> bool {
-    let Some((ns, pid)) = name
+    let Some((_, pid)) = name
         .strip_prefix('@')
         .and_then(|n| n.strip_suffix('@'))
         .and_then(parse_cuda_uvmfd_name)
@@ -1866,13 +1873,6 @@ fn is_cuda_uvmfd_listener(proc_root: &Path, name: &str, holders: &[u32]) -> bool
     };
     holders.iter().any(|holder| {
         let dir = proc_root.join(holder.to_string());
-        let pid_ns = fs::read_link(dir.join("ns/pid")).ok().and_then(|l| {
-            l.to_str()?
-                .strip_prefix("pid:[")?
-                .strip_suffix(']')?
-                .parse::<u64>()
-                .ok()
-        });
         // The last NSpid is the pid in the process's own pid namespace.
         let ns_pid = fs::read_to_string(dir.join("status")).ok().and_then(|s| {
             s.lines()
@@ -1882,8 +1882,7 @@ fn is_cuda_uvmfd_listener(proc_root: &Path, name: &str, holders: &[u32]) -> bool
                 .parse::<u32>()
                 .ok()
         });
-        pid_ns == Some(ns)
-            && ns_pid == Some(pid)
+        ns_pid == Some(pid)
             && fs::read_to_string(dir.join("maps")).is_ok_and(|maps| {
                 maps.lines()
                     .filter_map(|l| l.split_whitespace().nth(5))
@@ -2485,8 +2484,10 @@ mod tests {
     /// A process of its own (see `FixtureChild`) listening on libcuda's
     /// name for it (`cuda-uvmfd-<pid ns inode>-<pid>`, NUL-terminated) and
     /// on near misses of it; with a file named `libcuda.so.1` mapped when
-    /// its directory has one. Only the exact name of a process with
-    /// libcuda mapped is left out of `abstract_listeners`.
+    /// its directory has one. Only names with the process's own pid (with
+    /// any pid namespace inode: a restored process keeps the name of its
+    /// first pid namespace) of a process with libcuda mapped are left out
+    /// of `abstract_listeners`.
     #[test]
     fn exempts_only_libcudas_own_listener() {
         use crate::testing::{FixtureChild, fixture_dir, fixture_ready};
@@ -2557,17 +2558,17 @@ mod tests {
                 format!("@cuda-uvmfd-{ns}-0{pid}@"),
                 format!("@cuda-uvmfd-{ns}-{pid}"),
                 format!("@cuda-uvmfd-{ns}-{}@", pid + 1),
-                format!("@cuda-uvmfd-{}-{pid}@", ns + 1),
             ]
         };
         let (ns, pid, got) = scan(true);
         let mut want = others(ns, pid);
         want.sort();
         assert_eq!(got, want);
-        // Without libcuda, its own name is refused too.
+        // Without libcuda, its own names are refused too.
         let (ns, pid, got) = scan(false);
         let mut want = others(ns, pid);
         want.push(format!("@cuda-uvmfd-{ns}-{pid}@"));
+        want.push(format!("@cuda-uvmfd-{}-{pid}@", ns + 1));
         want.sort();
         assert_eq!(got, want);
     }

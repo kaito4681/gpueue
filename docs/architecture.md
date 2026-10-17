@@ -261,8 +261,10 @@ hold a root file opened with the dump-time mode. The helper therefore:
   with `SCM_CREDENTIALS` and gets the listener's `/dev/nvidia-uvm` descriptor; libcuda never calls
   `getsockopt`, so `SO_PEERCRED` misleads nobody), and cuda-checkpoint keeps it while it closes
   the `/dev/nvidia*` descriptors. Such a listener passes if one process holding it has libcuda
-  mapped and the name has exactly that process's pid namespace inode and pid (both the scan
-  before the dump and the post-dump hook's). A job could name a socket of its own like that, but
+  mapped and the name has exactly that process's pid in its pid namespace (both the scan before
+  the dump and the post-dump hook's). The inode is not compared: a restored process keeps the
+  listener named after the pid namespace of its first run, and is in a new one. A job could
+  name a socket of its own like that, but
   only a libcuda client of that pid namespace would ever connect to it, and those do not look
   at the listener's credentials. The restored name keeps the dump-time inode, which the kernel
   may give to another pid namespace later: while the restored job runs, a process there with

@@ -182,8 +182,9 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   libcuda 的除外：每个初始化了 CUDA 的进程都在 `\0cuda-uvmfd-<其 PID 命名空间的 inode>-<它在其中的 PID>\0`
   （`SOCK_SEQPACKET`）上监听，同一 PID 命名空间中其他进程里的 libcuda 按这个名称连接，用 `SCM_CREDENTIALS` 发送凭据，
   并取得监听方的 `/dev/nvidia-uvm` 描述符；libcuda 从不调用 `getsockopt`，所以 `SO_PEERCRED` 误导不了谁；
-  cuda-checkpoint 关闭 `/dev/nvidia*` 描述符时会保留这个套接字。持有它的某个进程映射了 libcuda，且名称恰好是该进程
-  的 PID 命名空间 inode 和 PID 时放行（dump 之前的扫描和 post-dump 钩子都如此）。作业也可以这样命名自己的套接字，
+  cuda-checkpoint 关闭 `/dev/nvidia*` 描述符时会保留这个套接字。持有它的某个进程映射了 libcuda，且名称中恰好是该进程
+  在其 PID 命名空间中的 PID 时放行（dump 之前的扫描和 post-dump 钩子都如此）。不比较 inode：恢复后的进程保留以
+  首次运行时的 PID 命名空间命名的监听套接字，而它已处于新的命名空间中。作业也可以这样命名自己的套接字，
   但只有该 PID 命名空间中的 libcuda 会连接它，而它们不看监听方的凭据。恢复后的名称保留 dump 时的 inode，内核以后
   可能把它分给另一个 PID 命名空间：在恢复的作业运行期间，那里 PID 相同的进程无法绑定自己的监听套接字，libcuda 的
   `cuInit` 会以 `CUDA_ERROR_OPERATING_SYSTEM` 失败（反过来，若这样的进程占着该名称，恢复会失败）。主机上任何人本来

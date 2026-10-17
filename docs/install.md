@@ -2337,8 +2337,8 @@ warned on their next command. Refusals:
 - `the job has Unix sockets listening on the abstract names [...]`: CRIU would set the listener
   up as root, so clients checking who listens (`SO_PEERCRED`) would see root. Listen on a path
   below `/tmp` instead. The socket libcuda listens on in every process that initialises CUDA,
-  `@cuda-uvmfd-<pid namespace inode>-<pid>@`, is not refused when the name has the inode of the
-  process's pid namespace and its pid there and the process has libcuda mapped (its only
+  `@cuda-uvmfd-<pid namespace inode>-<pid>@`, is not refused when the name has the process's
+  pid in its pid namespace and the process has libcuda mapped (its only
   clients are libcuda in the job's other processes, which never ask who listens); a name that
   only looks like it is refused like any other.
 - `the job has inotify or fanotify descriptors (...)`: CRIU would re-add the watches as root, by
