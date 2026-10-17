@@ -9,19 +9,38 @@ on:
 permissions:
   contents: read
 
+# Superseded pull request runs are cancelled. Every other run (a push to
+# main, a manual run) has a group of its own: with a shared group, GitHub
+# drops a queued run when a newer one queues behind the running one, which
+# left merge commits on main without any CI.
 concurrency:
-  group: ci-${{ github.ref }}
-  # Superseded pull request runs are cancelled; runs on main all finish.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
+  # Base images of the distribution tests, pinned by digest (the multi-arch
+  # index) so that a moved tag cannot break CI unrelated to a change, and
+  # Docker Hub resolves them without a tag lookup. The jobs pick theirs with
+  # fromJSON(env.BASE_IMAGES)[<name>]. To bump one:
+  #   docker buildx imagetools inspect <name>   # the top-level "Digest:"
+  # and update the value here (fedora: also move the pinned release).
+  BASE_IMAGES: >-
+    {
+    "ubuntu:26.04": "ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944",
+    "ubuntu:24.04": "ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac",
+    "ubuntu:22.04": "ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956",
+    "debian:12": "debian:12@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858",
+    "rockylinux/rockylinux:9": "rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f",
+    "fedora:44": "fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80"
+    }
   # Same toolchain as docker/test.Dockerfile (scripts/test-in-docker.sh).
   RUST_TOOLCHAIN: "1.98.1"
 
 jobs:
   lint:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -35,6 +54,7 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -45,8 +65,23 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --locked
 
+  # The tests in the environment release.yml runs them in: root in the
+  # rust:bookworm container, then an unprivileged user via runuser. No other
+  # job runs there, so a failure specific to it would only show on a tag.
+  release-env:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Keep in sync with the image of release.yml's build job.
+    container: rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/dist/test-unprivileged.sh
+
   msrv:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,6 +95,7 @@ jobs:
 
   shellcheck:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -73,6 +109,7 @@ jobs:
   # versions (a warning), by a pinned, checksummed cargo-deny (deny.toml).
   deny:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -85,6 +122,7 @@ jobs:
   # actionlint image.
   actionlint:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -105,6 +143,7 @@ jobs:
   # unlike a workflow-level paths filter, which would leave it pending.
   changes:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       nix: ${{ steps.filter.outputs.nix }}
       vm: ${{ steps.filter.outputs.vm }}
@@ -200,7 +239,16 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
-          extra_nix_config: ${{ matrix.kvm && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
+          # cache.nixos.org drops connections now and then (HTTP/2 framing
+          # errors, a 416 on a resumed download): fall back to building,
+          # time out stalled transfers and retry them, without HTTP/2.
+          extra_nix_config: |
+            fallback = true
+            connect-timeout = 15
+            stalled-download-timeout = 60
+            download-attempts = 8
+            http2 = false
+            ${{ matrix.kvm && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
       - if: matrix.flake-check
         run: nix flake check -L
       - if: matrix.eval
@@ -227,7 +275,6 @@ jobs:
   # under systemd in a privileged container.
   service-install:
     runs-on: ubuntu-24.04
-    needs: [test]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -239,7 +286,6 @@ jobs:
   # distribution tests below.
   dist-build:
     runs-on: ubuntu-24.04
-    needs: [test]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -272,7 +318,7 @@ jobs:
           path: target/dist-releases
       - run: scripts/dist-test.sh
         env:
-          GPUEUE_DIST_BASE: ${{ matrix.base }}
+          GPUEUE_DIST_BASE: ${{ fromJSON(env.BASE_IMAGES)[matrix.base] }}
           GPUEUE_DIST_SKIP_BUILD: "1"
 
   # The .deb of each architecture (built like release.yml does, but from a
@@ -295,9 +341,12 @@ jobs:
       - run: scripts/test-in-docker.sh build --locked -p gpueue -p gpueue-helper
       - run: scripts/dist/build-package.sh target/docker/debug target/deb
       - run: |
-          for base in debian:12 ubuntu:24.04; do
+          for base in "$DEBIAN_12" "$UBUNTU_2404"; do
             GPUEUE_DEB_BASE="$base" scripts/deb-test.sh target/deb/gpueue_*.deb
           done
+        env:
+          DEBIAN_12: ${{ fromJSON(env.BASE_IMAGES)['debian:12'] }}
+          UBUNTU_2404: ${{ fromJSON(env.BASE_IMAGES)['ubuntu:24.04'] }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: deb-${{ matrix.runner }}
@@ -331,7 +380,7 @@ jobs:
           path: target/deb
       - run: scripts/apt-repo-test.sh target/deb/gpueue_*.deb
         env:
-          GPUEUE_APT_BASES: ${{ matrix.base }}
+          GPUEUE_APT_BASES: ${{ fromJSON(env.BASE_IMAGES)[matrix.base] }}
 
   # The .rpm of each architecture (built like release.yml does, but from a
   # debug build), installed, upgraded from an older pre-release package and
@@ -356,9 +405,12 @@ jobs:
           GPUEUE_PKG_VERSION="$version-rc.1" scripts/dist/build-package.sh target/docker/debug target/rpm-old rpm
           scripts/dist/build-package.sh target/docker/debug target/rpm rpm
       - run: |
-          for base in rockylinux/rockylinux:9 fedora:latest; do
+          for base in "$ROCKY_9" "$FEDORA"; do
             GPUEUE_RPM_BASE="$base" scripts/rpm-test.sh target/rpm-old/gpueue-*.rpm target/rpm/gpueue-*.rpm
           done
+        env:
+          ROCKY_9: ${{ fromJSON(env.BASE_IMAGES)['rockylinux/rockylinux:9'] }}
+          FEDORA: ${{ fromJSON(env.BASE_IMAGES)['fedora:44'] }}
       # GPG-signing the .rpm as release.yml's sign-rpm job does.
       - run: scripts/rpm-sign-test.sh target/rpm/gpueue-*.rpm
 
@@ -367,7 +419,6 @@ jobs:
   # systemd (scripts/dist/aur-test.sh).
   aur:
     runs-on: ubuntu-24.04
-    needs: [test]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -390,7 +441,6 @@ jobs:
   # a simulated reboot (CPU-only; the GPU scenarios need an NVIDIA GPU).
   e2e:
     runs-on: ubuntu-24.04
-    needs: [test]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
