@@ -129,6 +129,19 @@ pub(crate) fn open_parent_in(
     trusted: impl Fn(u32) -> bool,
     who: &str,
 ) -> Result<(OwnedFd, String), String> {
+    walk(top, path, &trusted, who, false)
+}
+
+/// [`open_parent_in`]; with `reject_remote`, a directory on the way must
+/// not be on a FUSE or network filesystem either (see
+/// [`crate::deadmounts::is_remote_fstype`]).
+fn walk(
+    top: &str,
+    path: &str,
+    trusted: &impl Fn(u32) -> bool,
+    who: &str,
+    reject_remote: bool,
+) -> Result<(OwnedFd, String), String> {
     let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
     let Some((last, dirs)) = comps.split_last() else {
         return Err(format!("{path:?} has no parent"));
@@ -141,14 +154,14 @@ pub(crate) fn open_parent_in(
     }
     let mut fd = rustix::fs::open(top, PATH_FLAGS, Mode::empty())
         .map_err(|e| format!("opening {top}: {e}"))?;
-    check(&fd, top, &trusted, who)?;
+    check(&fd, top, trusted, who, reject_remote)?;
     let mut walked = String::new();
     for c in dirs {
         walked.push('/');
         walked.push_str(c);
         fd = rustix::fs::openat2(&fd, *c, PATH_FLAGS, Mode::empty(), RESOLVE)
             .map_err(|e| format!("opening {walked} without following symlinks: {e}"))?;
-        check(&fd, &walked, &trusted, who)?;
+        check(&fd, &walked, trusted, who, reject_remote)?;
     }
     Ok((fd, (*last).to_owned()))
 }
@@ -158,6 +171,7 @@ fn check(
     what: &str,
     trusted: &impl Fn(u32) -> bool,
     who: &str,
+    reject_remote: bool,
 ) -> Result<(), String> {
     let st = rustix::fs::fstat(fd).map_err(|e| format!("{what}: {e}"))?;
     if !controlled_by(trusted(st.st_uid), st.st_mode) {
@@ -171,7 +185,35 @@ fn check(
             "{what} is on a FUSE filesystem, whose daemon decides what is there"
         ));
     }
+    if reject_remote {
+        let id = mnt_id(fd).map_err(|e| format!("{what}: {e}"))?;
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+            .map_err(|e| format!("reading mountinfo: {e}"))?;
+        if let Some(e) = remote_problem(what, id, &mountinfo) {
+            return Err(e);
+        }
+    }
     Ok(())
+}
+
+/// Why the directory `what`, on the mount `id`, must not be on the way to
+/// a host path that CRIU binds, according to `mountinfo` (the helper's):
+/// it is on a FUSE or network filesystem, whose daemon or server (and
+/// whoever controls another client of it) decides what a lookup there
+/// returns, whatever owner and mode it reports here. A mount that is not
+/// in `mountinfo` (mounted after the walk opened it) counts as one.
+fn remote_problem(what: &str, id: u64, mountinfo: &str) -> Option<String> {
+    let entries = crate::mounts::parse_mountinfo(mountinfo);
+    match entries.iter().find(|m| m.id == id) {
+        Some(m) if !crate::deadmounts::is_remote_fstype(&m.fstype) => None,
+        Some(m) => Some(format!(
+            "{what} is on a {} filesystem, whose server decides what is there",
+            m.fstype
+        )),
+        None => Some(format!(
+            "{what} is on mount {id}, which mountinfo does not list"
+        )),
+    }
 }
 
 /// `name` in `dir`, without following symlinks: the root of whatever is
@@ -272,16 +314,88 @@ pub fn ensure_root_dir(dir: &str) -> Result<Option<(OwnedFd, String)>, String> {
 
 /// Why `criu restore` must not bind the host path `path` (an external
 /// mount source, which CRIU looks up by its name, as root, following
-/// symlinks on the way), if it must not: a directory on the way is one
-/// that someone `trust` does not trust can change (see [`OwnerTrust`]),
-/// or is on a FUSE filesystem, so whoever controls it could make the
-/// lookup end somewhere else, such as in another user's directory, between
-/// the checks and the restore. `/` itself is always fine.
+/// symlinks, the last component included), if it must not: a directory
+/// on the way is one that someone `trust` does not trust can change (see
+/// [`OwnerTrust`]), or is on a FUSE or network filesystem, or the last
+/// component is a symlink, or it is in a sticky directory (like `/tmp`)
+/// and its owner is not trusted (or it is missing there), so whoever
+/// controls it could make the lookup end somewhere else, such as in
+/// another user's directory, between the checks and the restore. `/`
+/// itself is always fine.
+///
+/// The trust in system accounts (uids below `job_min_uid`, see
+/// [`OwnerTrust::system`]) assumes that no job's owner can act as one:
+/// gpueue never runs a job as such an account, but a job's owner who can
+/// otherwise run code as one (a `sudo` rule, a setuid program, a service
+/// they control) could redirect a path through its directories.
 pub fn bind_source_problem(path: &str, trust: OwnerTrust) -> Option<String> {
     if path.split('/').all(|c| c.is_empty()) {
         return None;
     }
-    open_parent_trusting(path, trust).err()
+    bind_source_problem_in("/", path, |uid| trust.trusts(uid), trust.who())
+}
+
+/// [`bind_source_problem`] with the walk starting at `top` and the
+/// owners that `trusted` accepts (see [`open_parent_in`]).
+pub(crate) fn bind_source_problem_in(
+    top: &str,
+    path: &str,
+    trusted: impl Fn(u32) -> bool,
+    who: &str,
+) -> Option<String> {
+    let (dir, name) = match walk(top, path, &trusted, who, true) {
+        Ok(v) => v,
+        Err(e) => return Some(e),
+    };
+    leaf_problem(&dir, &name, path, &trusted, who)
+}
+
+/// Why the last component `name` (in `dir`, which the walk accepted) of
+/// the bind source `path` could be redirected: it is a symlink (CRIU
+/// follows it), or `dir` is sticky and writable by others, where the
+/// owner of an entry may replace it (so it must be one that `trusted`
+/// accepts) and anyone may create a missing one. Elsewhere only the
+/// directory's (trusted) owner can change its entries.
+fn leaf_problem(
+    dir: &OwnedFd,
+    name: &str,
+    path: &str,
+    trusted: &impl Fn(u32) -> bool,
+    who: &str,
+) -> Option<String> {
+    let st = match rustix::fs::fstat(dir) {
+        Ok(st) => st,
+        Err(e) => return Some(format!("{path}: {e}")),
+    };
+    // The walk accepted `dir`: if others may write to it, it is sticky.
+    let sticky = st.st_mode & 0o022 != 0;
+    // Without `O_NOFOLLOW`, `RESOLVE_NO_SYMLINKS` refuses a symlink as the
+    // last component with `ELOOP`. `O_PATH` without `O_DIRECTORY` does not
+    // trigger an automount point.
+    let flags = OFlags::PATH.union(OFlags::CLOEXEC);
+    let fd = match rustix::fs::openat2(dir, name, flags, Mode::empty(), RESOLVE) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) if !sticky => return None,
+        Err(rustix::io::Errno::NOENT) => {
+            return Some(format!(
+                "{path} does not exist, and anyone may create it in a sticky directory"
+            ));
+        }
+        Err(rustix::io::Errno::LOOP) => return Some(format!("{path} is a symlink")),
+        Err(e) => return Some(format!("opening {path} without following symlinks: {e}")),
+    };
+    if !sticky {
+        return None;
+    }
+    match rustix::fs::fstat(&fd) {
+        Ok(st) if trusted(st.st_uid) => None,
+        Ok(_) => Some(format!(
+            "{path} is in a sticky directory and owned by someone other than {}, who could \
+             replace it",
+            who.trim_start_matches("only ")
+        )),
+        Err(e) => Some(format!("{path}: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +463,71 @@ mod tests {
         assert!(open_parent("/usr/../etc/x").is_err());
         assert!(open_parent("usr/bin").is_err());
         assert_eq!(bind_source_problem("/", OwnerTrust::ROOT_ONLY), None);
+    }
+
+    /// The last component of a bind source: CRIU follows a symlink there,
+    /// and in a sticky directory its owner may replace it.
+    #[test]
+    fn bind_sources_check_the_last_component() {
+        use std::os::unix::fs::PermissionsExt;
+        let me = nix::unistd::geteuid().as_raw();
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().to_str().unwrap();
+        let mode = |rel: &str, mode: u32| {
+            std::fs::set_permissions(tmp.path().join(rel), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        mode("", 0o755);
+        for d in ["srv", "srv/data", "tmp", "tmp/d"] {
+            std::fs::create_dir(tmp.path().join(d)).unwrap();
+            mode(d, 0o755);
+        }
+        mode("tmp", 0o1777);
+        std::os::unix::fs::symlink("data", tmp.path().join("srv/link")).unwrap();
+        std::os::unix::fs::symlink("d", tmp.path().join("tmp/link")).unwrap();
+
+        let mine = |uid: u32| uid == me;
+        let others = |uid: u32| uid != me;
+        let who = "only root";
+        assert_eq!(bind_source_problem_in(top, "/srv/data", mine, who), None);
+        // Missing below a directory only a trusted owner can change.
+        assert_eq!(bind_source_problem_in(top, "/srv/none", mine, who), None);
+        let e = bind_source_problem_in(top, "/srv/link", mine, who).unwrap();
+        assert!(e.contains("/srv/link is a symlink"), "{e}");
+        let e = bind_source_problem_in(top, "/tmp/link", mine, who).unwrap();
+        assert!(e.contains("symlink"), "{e}");
+        // In a sticky directory: an entry of a trusted owner passes, a
+        // missing one does not (anyone could create it).
+        assert_eq!(bind_source_problem_in(top, "/tmp/d", mine, who), None);
+        let e = bind_source_problem_in(top, "/tmp/none", mine, who).unwrap();
+        assert!(e.contains("anyone may create it"), "{e}");
+        // An entry of someone the trust does not accept (the test cannot
+        // create another user's file, so the entry is checked with a
+        // trust that refuses ourselves).
+        let dir = walk(top, "/tmp/d", &mine, who, true).unwrap();
+        let e = leaf_problem(&dir.0, &dir.1, "/tmp/d", &others, who).unwrap();
+        assert!(
+            e.contains("/tmp/d is in a sticky directory and owned by someone other than root"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn bind_sources_are_not_below_remote_filesystems() {
+        let mi = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 0:50 / /net rw - nfs4 h:/e rw
+3 1 0:51 / /home/alice/fs rw - fuse.sshfs alice@h: rw
+4 1 0:52 / /run rw - tmpfs tmpfs rw
+";
+        assert_eq!(remote_problem("/", 1, mi), None);
+        assert_eq!(remote_problem("/run/x", 4, mi), None);
+        let e = remote_problem("/net/a", 2, mi).unwrap();
+        assert!(e.contains("/net/a is on a nfs4 filesystem"), "{e}");
+        let e = remote_problem("/home/alice/fs/x", 3, mi).unwrap();
+        assert!(e.contains("fuse.sshfs"), "{e}");
+        let e = remote_problem("/x", 9, mi).unwrap();
+        assert!(e.contains("does not list"), "{e}");
     }
 
     /// Bind sources below a directory of a system account (such as

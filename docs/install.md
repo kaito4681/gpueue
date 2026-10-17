@@ -1471,6 +1471,8 @@ restore:
   (such as `systemd-resolve`'s `/run/systemd/resolve`), but not below one of a user who may run
   jobs, nor one of the daemon's user (see
   [Network and FUSE filesystems that stop answering](#network-and-fuse-filesystems-that-stop-answering)).
+  This assumes users cannot act as those accounts by other means (a `sudo` rule, a service they
+  control): set `job_min_uid` above every account that users can run code as.
 - `job_max_uid`: users with a larger uid are refused. Unset by default, because directory
   services (LDAP, AD through sssd ID mapping) commonly give regular users uids far above 60000,
   and systemd-homed users have 60001-60513. Set it only if you want a bound.
@@ -2367,12 +2369,16 @@ warned on their next command. Refusals:
   point> (<type>) could only be restored by binding a host path ...`: the job uses a mount whose
   host path lies below a directory that a job's owner could change (a user's `allow_other` FUSE
   mount in their home; directories of root and of system accounts below `job_min_uid` other
-  than the daemon's user are fine unless they are group- or world-writable). Mount the
-  filesystem on a directory whose parents only root can change (such as below `/mnt`) for jobs
-  that must be checkpointed.
+  than the daemon's user are fine unless they are group- or world-writable), on a FUSE or
+  network filesystem, or that is itself a symlink or another user's entry in a sticky directory
+  such as `/tmp` (a bind of `/tmp/<their dir>`). Mount the filesystem on a directory whose
+  parents only root can change (such as below `/mnt`) for jobs that must be checkpointed.
 - `the job has processes in a PID or user namespace of their own (...)`: the job runs
   `unshare`, `bwrap` or a rootless container runtime, and CRIU cannot dump nested PID and user
   namespaces. Run the job with `--no-checkpoint`, or without the nested namespace.
+- `reading the job's mounts: the job has a mount whose root or mount point contains control
+  characters ...` (or `is not UTF-8`): a mount of the host copied into the job's namespace has a
+  path that CRIU cannot read back from mountinfo. Unmount or rename it and start the job again.
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`: the job's
   mount namespace depends on a mount that is hidden under another one, so it could never be
   restored. Run the job again (`gpueue restart`). New jobs get a cleaned-up namespace.

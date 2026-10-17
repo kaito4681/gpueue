@@ -40,11 +40,19 @@ pub struct MountEntry {
     pub fstype: String,
 }
 
+/// The fields of a mountinfo line. The kernel separates them with single
+/// spaces and escapes space, tab, newline and backslash in paths as
+/// `\ooo`, but leaves every other character as it is, so the line is split
+/// on ASCII spaces only: a path may contain other (Unicode) whitespace.
+fn fields(line: &str) -> impl Iterator<Item = &str> {
+    line.split(' ').filter(|f| !f.is_empty())
+}
+
 /// Parse mountinfo, skipping malformed lines.
 pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
     text.lines()
         .filter_map(|l| {
-            let mut f = l.split_whitespace();
+            let mut f = fields(l);
             let mut e = MountEntry {
                 id: f.next()?.parse().ok()?,
                 parent: f.next()?.parse().ok()?,
@@ -62,15 +70,68 @@ pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
         .collect()
 }
 
+/// The (unescaped) mount point of one mountinfo line.
+pub fn mount_point_field(line: &str) -> Option<String> {
+    fields(line).nth(4).map(unescape_octal)
+}
+
+/// The mount points of the mountinfo `bytes` (as read from
+/// `/proc/<pid>/mountinfo`), in order; `Err` if CRIU could not parse a
+/// line the way the kernel wrote it: a mount's root or mount point is not
+/// UTF-8 or contains a control character.
+///
+/// CRIU (4.2) reads mountinfo with `sscanf("%ms")`, which stops at any
+/// ASCII whitespace (also `\r`, `\v` and `\f`, which the kernel does not
+/// escape), and unescapes only `\040`, `\011` and `\134`, not the `\012`
+/// of a newline. Such a path would make it dump (and restore) a mount at a
+/// different path than the job's. Tabs are refused too, like every other
+/// control character, as they are unlikely in a real mount point and
+/// other tools (CRIU's `--external mnt[...]` option, logs) treat them
+/// differently.
+pub fn checked_mount_points(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        let Ok(line) = std::str::from_utf8(line) else {
+            let line = String::from_utf8_lossy(line);
+            let path = fields(&line).nth(4).unwrap_or_default().to_owned();
+            return Err(format!(
+                "the job has a mount whose root or mount point is not UTF-8 ({path:?}), which \
+                 CRIU cannot be relied on to handle; unmount it or end the job"
+            ));
+        };
+        let mut f = fields(line).skip(3);
+        let (Some(root), Some(mount_point)) = (f.next(), f.next()) else {
+            continue;
+        };
+        let (root, mount_point) = (unescape_octal(root), unescape_octal(mount_point));
+        if root
+            .chars()
+            .chain(mount_point.chars())
+            .any(char::is_control)
+        {
+            return Err(format!(
+                "the job has a mount whose root or mount point contains control characters \
+                 ({mount_point:?}, root {root:?}), which CRIU cannot parse in mountinfo; \
+                 unmount it or end the job"
+            ));
+        }
+        out.push(mount_point);
+    }
+    Ok(out)
+}
+
 /// Undo mountinfo's `\ooo` escapes (space, tab, newline, backslash).
 pub fn unescape_octal(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // Exactly three octal digits (bytes, so that a backslash before
+        // a multi-byte character cannot split it).
         if b[i] == b'\\'
-            && i + 4 <= b.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 4], 8)
+            && let Some(d) = b.get(i + 1..i + 4)
+            && d.iter().all(|c| (b'0'..=b'7').contains(c))
+            && let Ok(v) = u8::try_from(d.iter().fold(0u32, |v, c| v * 8 + u32::from(c - b'0')))
         {
             out.push(v);
             i += 4;
@@ -475,6 +536,60 @@ mod tests {
         assert_eq!(e[8].root, "/hm stage");
         assert_eq!(unescape_octal("a\\134b\\040"), "a\\b ");
         assert_eq!(unescape_octal("trailing\\04"), "trailing\\04");
+    }
+
+    /// Fields are separated by ASCII spaces only: other whitespace is part
+    /// of a path (the kernel escapes only space, tab, newline, backslash).
+    #[test]
+    fn splits_fields_on_spaces_only() {
+        let mi = "1 0 8:1 / / rw - ext4 a rw\n\
+                  2 1 0:5 /x\u{2003}y /a\u{a0}b\u{85}c rw shared:1 - tmpfs t rw\n\
+                  3 1 0:6 / /v\x0bw rw - tmpfs t rw\n";
+        let e = parse_mountinfo(mi);
+        assert_eq!(e[1].root, "/x\u{2003}y");
+        assert_eq!(e[1].mount_point, "/a\u{a0}b\u{85}c");
+        assert_eq!(e[1].fstype, "tmpfs");
+        assert_eq!(e[2].mount_point, "/v\x0bw");
+        assert_eq!(e[2].fstype, "tmpfs");
+        assert_eq!(
+            mount_point_field("2 1 0:5 / /a\u{2003}b rw - tmpfs t rw").as_deref(),
+            Some("/a\u{2003}b")
+        );
+        assert_eq!(
+            mount_point_field("2 1 0:5 / /a\\040b rw").as_deref(),
+            Some("/a b")
+        );
+    }
+
+    /// Paths that CRIU would split or not unescape are refused.
+    #[test]
+    fn checked_mount_points_refuse_what_criu_misreads() {
+        let tab = b"1 0 8:1 / / rw - ext4 a rw\n2 1 0:5 / /a\\040b\\011c rw - tmpfs t rw\n";
+        assert!(checked_mount_points(tab).is_err(), "a tab is refused too");
+        let ok = "1 0 8:1 / / rw - ext4 a rw\n2 1 0:5 / /a\\040b\u{2003}\\134 rw - tmpfs t rw\n";
+        assert_eq!(
+            checked_mount_points(ok.as_bytes()).unwrap(),
+            ["/", "/a b\u{2003}\\"]
+        );
+        for bad in [
+            "2 1 0:5 / /a\\012b rw - tmpfs t rw\n",
+            "2 1 0:5 / /a\rb rw - tmpfs t rw\n",
+            "2 1 0:5 / /a\x0bb rw - tmpfs t rw\n",
+            "2 1 0:5 / /a\x0cb rw - tmpfs t rw\n",
+            "2 1 0:5 /r\x0b / rw - tmpfs t rw\n",
+            "2 1 0:5 / /a\u{85}b rw - tmpfs t rw\n",
+        ] {
+            let e = checked_mount_points(bad.as_bytes()).unwrap_err();
+            assert!(e.contains("control characters"), "{bad:?}: {e}");
+        }
+        let e = checked_mount_points(b"1 0 8:1 / / rw - ext4 a rw\n2 1 0:5 / /a\xffb rw\n")
+            .unwrap_err();
+        assert!(e.contains("not UTF-8"), "{e}");
+        // A backslash before a multi-byte character, and not three octal
+        // digits: left as it is.
+        assert_eq!(unescape_octal("/a\\\u{e9}xy"), "/a\\\u{e9}xy");
+        assert_eq!(unescape_octal("/a\\+12"), "/a\\+12");
+        assert_eq!(unescape_octal("/a\\400"), "/a\\400");
     }
 
     #[test]

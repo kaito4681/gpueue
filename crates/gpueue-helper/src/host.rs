@@ -72,7 +72,9 @@ pub trait HostProbe: Send + Sync + 'static {
     /// Which of `host_pids` use CUDA: every process that answers
     /// `cuda-checkpoint --get-state` (the job must not be stopped).
     fn cuda_pids(&self, host_pids: &[u32]) -> io::Result<Vec<u32>>;
-    /// Mount points in the mount namespace of `pid`.
+    /// Mount points in the mount namespace of `pid`; an `InvalidData`
+    /// error if CRIU could not parse one (see
+    /// [`crate::mounts::checked_mount_points`]).
     fn mount_points(&self, pid: u32) -> io::Result<Vec<String>>;
     /// Mounts of the namespace of `pid` that CRIU could only restore from a
     /// path that is hidden in the helper's own namespace (see
@@ -1407,12 +1409,9 @@ impl HostProbe for SystemHost {
     }
 
     fn mount_points(&self, pid: u32) -> io::Result<Vec<String>> {
-        let mi = fs::read_to_string(self.proc_root.join(pid.to_string()).join("mountinfo"))?;
-        Ok(mi
-            .lines()
-            .filter_map(|l| l.split_whitespace().nth(4))
-            .map(crate::mounts::unescape_octal)
-            .collect())
+        let mi = fs::read(self.proc_root.join(pid.to_string()).join("mountinfo"))?;
+        crate::mounts::checked_mount_points(&mi)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     fn unreachable_mounts(&self, pid: u32) -> io::Result<Vec<String>> {
@@ -1802,8 +1801,8 @@ pub fn is_mount_point(mountinfo: &str, path: &Path) -> bool {
     let want = path.to_string_lossy();
     mountinfo
         .lines()
-        .filter_map(|l| l.split_whitespace().nth(4))
-        .any(|mp| crate::mounts::unescape_octal(mp) == want)
+        .filter_map(crate::mounts::mount_point_field)
+        .any(|mp| mp == want)
 }
 
 /// Parse the two `nvidia-smi --format=csv,noheader,nounits` queries (memory
