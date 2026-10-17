@@ -1672,38 +1672,44 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        let mut kids = Vec::new();
-        for _ in 0..200 {
-            kids = procfs::descendants(Path::new("/proc"), pid).unwrap();
+        // Deadlines only matter when something is wrong: a loaded machine
+        // may take a while to schedule the processes.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let kids = loop {
+            let kids = procfs::descendants(Path::new("/proc"), pid).unwrap();
             if !kids.is_empty() {
-                break;
+                break kids;
             }
+            assert!(Instant::now() < deadline, "the shell started no child");
             thread::sleep(Duration::from_millis(10));
-        }
-        for p in std::iter::once(pid).chain(kids.iter().copied()) {
+        };
+        let tree: Vec<u32> = std::iter::once(pid).chain(kids.iter().copied()).collect();
+        for &p in &tree {
             signal(p, rustix::process::Signal::STOP);
         }
-        let mut stopped = false;
-        for _ in 0..200 {
-            if ex
-                .execute(&Step::EnsureRunnable { pids: vec![pid] })
-                .is_err()
-            {
-                stopped = true;
-                break;
-            }
+        // A SIGSTOP takes effect when its task next runs: until then, the
+        // thaw would find nothing to continue in it, and it would stop
+        // afterwards.
+        let state = |p: u32| {
+            std::fs::read_to_string(format!("/proc/{p}/stat"))
+                .ok()
+                .and_then(|s| procfs::parse_stat_state(&s))
+        };
+        while !tree.iter().all(|&p| state(p) == Some('T')) {
+            assert!(Instant::now() < deadline, "the tree did not stop");
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(stopped);
+        assert!(
+            ex.execute(&Step::EnsureRunnable { pids: vec![pid] })
+                .is_err()
+        );
         let out = ex.execute(&Step::Thaw { root_pid: pid }).unwrap();
         assert!(
             out.stdout.contains(&format!("SIGCONT {pid}")),
             "{}",
             out.stdout
         );
-        let ok = ex.execute(&Step::EnsureRunnable {
-            pids: std::iter::once(pid).chain(kids.iter().copied()).collect(),
-        });
+        let ok = ex.execute(&Step::EnsureRunnable { pids: tree.clone() });
         for p in &kids {
             signal(*p, rustix::process::Signal::KILL);
         }
