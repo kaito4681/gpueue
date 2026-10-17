@@ -176,7 +176,10 @@ impl HostProbe for FakeHost {
             VerifyRequest::Restored(_) => &self.restored_problems,
             VerifyRequest::Probe(c) => return Ok(vec![String::new(); c.paths.len()]),
             VerifyRequest::BindSources(c) => return Ok(vec![String::new(); c.paths.len()]),
-            VerifyRequest::HeldAttrs(_) => return Err("not a check with a list of problems".into()),
+            VerifyRequest::HeldAttrs(_) | VerifyRequest::DumpHazards(_) => {
+                return Err("not a check with a list of problems".into());
+            }
+            VerifyRequest::OpenFiles(_) => return Ok(Vec::new()),
             VerifyRequest::Exist(c) => {
                 return Ok(c
                     .paths
@@ -330,6 +333,9 @@ pub struct FakeExecState {
     /// What the `post-dump` hook of each successful `criu dump`
     /// (`--action-script`, see [`crate::access::run_dump_hook`]) reports.
     pub dump_hook_held: Option<Vec<crate::access::HeldFile>>,
+    /// Makes the `post-dump` hook of the next `criu dump` refuse with this
+    /// reason: CRIU then fails (and resumes the job).
+    pub dump_hook_refusal: Option<String>,
     /// The arguments of every `criu dump` run.
     pub dump_args: Vec<Vec<String>>,
 }
@@ -397,20 +403,33 @@ impl Executor for FakeExecutor {
             command,
             ..
         } = step
+            && let Some(script) = command.value_of("--action-script")
+            && let Some(why) = st.dump_hook_refusal.take()
+        {
+            let request = dump_hook_request(&fs::read_to_string(script)?)?;
+            fs::write(crate::access::hook_refusal_path(&request), why)?;
+            return Err(StepError::Failed {
+                code: Some(1),
+                output: StepOutput {
+                    stdout: String::new(),
+                    stderr: "post-dump script failed".into(),
+                },
+            });
+        }
+        if let Step::Run {
+            action: Action::CriuDump { .. },
+            command,
+            ..
+        } = step
             && let Some(dir) = command.value_of("-D")
         {
             fs::write(Path::new(dir).join(layout::CRIU_INVENTORY), b"inv")?;
             if let (Some(held), Some(script)) =
                 (&st.dump_hook_held, command.value_of("--action-script"))
             {
-                let script = fs::read_to_string(script)?;
-                let request = script
-                    .trim_end()
-                    .rsplit_once(" dump-hook ")
-                    .map(|(_, r)| r.trim_matches('\''))
-                    .ok_or_else(|| io::Error::other(format!("unknown action script {script}")))?;
+                let request = dump_hook_request(&fs::read_to_string(script)?)?;
                 fs::write(
-                    crate::access::hook_result_path(Path::new(request)),
+                    crate::access::hook_result_path(&request),
                     serde_json::to_vec(held).map_err(io::Error::other)?,
                 )?;
             }
@@ -420,4 +439,13 @@ impl Executor for FakeExecutor {
         }
         Ok(StepOutput::default())
     }
+}
+
+/// The request file of the `dump-hook` action script `script`.
+fn dump_hook_request(script: &str) -> io::Result<std::path::PathBuf> {
+    script
+        .trim_end()
+        .rsplit_once(" dump-hook ")
+        .map(|(_, r)| r.trim_matches('\'').into())
+        .ok_or_else(|| io::Error::other(format!("unknown action script {script}")))
 }

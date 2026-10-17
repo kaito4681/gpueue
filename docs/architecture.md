@@ -158,10 +158,16 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    A job with processes in a PID or user namespace of their own (`unshare`, `bwrap`, a rootless
    container runtime), found among the descendants of the namespace's init, is refused: CRIU
    cannot dump nested PID and user namespaces.
-   If a check fails, it refuses the
+   Every lookup of the job's files in these checks runs in a child process with a deadline, and
+   the checks of a `checkpoint` request give up after 45 s (a stopping helper waits for them no
+   longer). If a check fails, it refuses the
    dump before touching the job, which keeps running, and the `checkpoint` request fails with the
    reason (a refusal found only when the dump is due is reported with the outcome instead, and the
-   daemon warns the owner). In manual mode it then runs
+   daemon warns the owner). CRIU's `post-dump` action script (`gpueue-helper dump-hook`) runs the
+   same checks of the job's files again while CRIU still has the dumped tasks stopped; if they find
+   something to refuse (the job opened it after the first checks), or do not finish in time, the
+   script fails, CRIU abandons the dump and resumes the job, and the checkpoint is reported as
+   refused with the reason. In manual mode it then runs
    `cuda-checkpoint --action lock` and `checkpoint` on each CUDA process, followed by
    `criu dump` of the namespace's init with `--tcp-close` and the image directory under
    `/var/lib/gpueue/checkpoints/<id>/`. In plugin mode it runs only `criu dump`, with CRIU's
@@ -250,9 +256,19 @@ hold a root file opened with the dump-time mode. The helper therefore:
   keeps running). It refuses a job with internet sockets that have `SO_REUSEPORT`
   (CRIU creates sockets as root before it restores the job's credentials, so the restored socket
   would be root's and could join the `SO_REUSEPORT` group of a root service on the same port;
-  confirmed with CRIU 4.2), saves deleted files on the host's filesystems in the image instead of linking them
-  back with `--link-remap` (which CRIU does as root, by path, while the dump runs), and records
-  the groups the job runs with;
+  confirmed with CRIU 4.2), never passes `--link-remap` (with it CRIU links open files that have
+  no name of their own back into their directories, as root, by path, while the dump runs):
+  deleted files are saved in the image instead, and a job holding a deleted file that still has
+  another hard link, or a file the NFS client renamed to `.nfs<hex>` because it was deleted while
+  open, is refused, since CRIU could only link those back. A restore re-creates a deleted file as
+  root with the owner and mode it had, so a job holding a deleted file with the setuid or setgid
+  bit or file capabilities (a `security.capability` attribute) is refused too: it would get a
+  privileged program back. Other deleted files, the owner's or not (a shared library replaced by
+  a package upgrade while the job runs, say), are saved: their contents are what the job could
+  already read. It records the groups the job runs with. All these checks of the job's
+  descriptors are made before the dump and again by the `post-dump` script while CRIU has the
+  job stopped, which vetoes the dump (CRIU resumes the job, and the checkpoint is reported as
+  refused with every reason found) if the job has opened such a descriptor meanwhile;
 - **before the restore** refuses it if the owner left one of those groups, if the image has a
   socket bound on a host filesystem (by the same rules for its name), a listening socket with
   an abstract name, inotify or fanotify descriptors, descriptors in flight (`sk-queues.img`),
@@ -317,7 +333,8 @@ hold a root file opened with the dump-time mode. The helper therefore:
 The last check looks at the objects CRIU opened, so racing it by changing paths does not help.
 What remains is the short window in which CRIU itself works on paths as root before that
 check: re-creating a deleted file that was saved in the image (a file named
-`<name>.cr.<id>.ghost` that exists only for a moment, owned by the job's owner) or creating the
+`<name>.cr.<id>.ghost` that exists only for a moment, with the owner and mode the deleted file
+had; the dump made sure it has no setuid or setgid bit) or creating the
 missing directories on its way. An owner who swaps a directory between the pre-check and that
 moment can make such a transient file appear in another directory.
 

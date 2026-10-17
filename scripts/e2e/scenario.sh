@@ -1909,6 +1909,74 @@ s27_job_signals() {
     kill_runs_handler "$id" done/success
 }
 
+# s28: deleted files at a checkpoint. CRIU never links a file back into its
+# directory (no --link-remap; it would do so as root, by path): files
+# deleted for good, as a multiprocessing semaphore, a large temporary file on
+# the job's own /tmp, a file in its owner's directory and a root-owned file
+# (as a library replaced by a package upgrade), are saved in the image and
+# come back with their contents. A deleted file that still has another hard
+# link, or a deleted setuid program, is refused before the dump, with the
+# reason, and the job keeps running.
+# held_root_file <id>: a process of job <id>'s live unit has the deleted
+# e2e-root-file open on fd 3, with its contents.
+held_root_file() {
+    local unit cg p
+    unit=$(systemctl list-units --no-legend --plain --state=active \
+        "gpueue-job-$1.service" "gpueue-job-$1-r*.service" | awk '{print $1}' | tail -n1)
+    [ -n "$unit" ] || return 1
+    cg=$(systemctl show -p ControlGroup --value "$unit")
+    while read -r p; do
+        if [[ "$(readlink "/proc/$p/fd/3" 2>/dev/null)" == *"e2e-root-file (deleted)" ]] \
+            && grep -qx 'root data' "/proc/$p/fd/3"; then
+            return 0
+        fi
+    done < <(find "/sys/fs/cgroup$cg" -name cgroup.procs -exec cat {} + 2>/dev/null)
+    return 1
+}
+s28_deleted_files() {
+    local a b c d err before root_file=/home/alice/e2e-root-file suid_file=/home/alice/e2e-suid-file
+    free_group
+    a=$(add alice -g free -- "python3 /e2e/deleted_files.py")
+    b=$(add alice -g free -- 'f=e2e-linked-$$; echo x >$f; ln $f $f.keep; exec 3<$f; rm $f; sleep 1000')
+    printf 'root data\n' >"$root_file"
+    chown root:root "$root_file"
+    chmod 0644 "$root_file"
+    install -o root -g root -m 4755 /bin/true "$suid_file"
+    c=$(add alice -g free -- "exec 3<$root_file; $COUNTER")
+    d=$(add alice -g free -- "exec 3<$suid_file; sleep 1000")
+    for j in "$a" "$b" "$c" "$d"; do wait_state "$j" running; done
+    for j in "$a" "$b" "$c" "$d"; do wait_unit "$j"; done
+    sleep 2
+    rm -f "$root_file" "$suid_file"
+
+    for j in "$a" "$c"; do
+        pz alice checkpoint "$j" || fail "checkpoint $j"
+        wait_state "$j" checkpointed 120
+        before=$(last_line 1000 "$j")
+        pz alice restore "$j" || fail "restore $j"
+        wait_state "$j" running 120
+        sleep 2
+        [ "$(last_line 1000 "$j")" -gt "$before" ] || fail "job $j did not continue after the restore"
+        expect_state "$j" running
+        check_counter_log 1000 "$j"
+    done
+    # The restored job c still holds the deleted root file, with its contents.
+    held_root_file "$c" || fail "job $c lost its deleted root file"
+
+    err=$(pz alice checkpoint "$b" 2>&1) && fail "the checkpoint of job $b was not refused"
+    echo "checkpoint of job $b: $err"
+    grep -q "other hard links" <<<"$err" || fail "the refusal does not say why: $err"
+    err=$(pz alice checkpoint "$d" 2>&1) && fail "the checkpoint of job $d was not refused"
+    echo "checkpoint of job $d: $err"
+    grep -q "setuid" <<<"$err" || fail "the refusal does not say why: $err"
+    sleep 1
+    expect_state "$b" running
+    expect_state "$d" running
+    pz alice kill "$a" "$b" "$c" "$d" >/dev/null
+    for j in "$a" "$b" "$c" "$d"; do wait_state "$j" 'done/*'; done
+    rm -f /home/alice/e2e-linked-* /home/alice/e2e-deleted-*
+}
+
 case "${1:-main}" in
 main)
     run "1 add/status/log/follow/wait" s1_lifecycle
@@ -1928,6 +1996,7 @@ main)
     run "25 resolved's files in a system account's directory" s25_resolved_binds
     run "26 other containers' mounts" s26_container_mounts
     run "27 signals of a job" s27_job_signals
+    run "28 deleted files at a checkpoint" s28_deleted_files
     if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers

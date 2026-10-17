@@ -174,6 +174,18 @@ pub struct HeldAttrsCheck {
 /// The reply to a [`HeldAttrsCheck`]: one entry per file.
 pub type HeldAttrsReply = Result<Vec<Option<FileAttrs>>, String>;
 
+/// A scan of the files that the processes `pids` hold, as root (see
+/// [`crate::host::scan_dump_hazards`] and [`crate::host::scan_open_files`]).
+/// In the child only so that a filesystem that does not answer cannot hold
+/// up the helper: the parent kills the child at its deadline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanCheck {
+    pub proc_root: std::path::PathBuf,
+    pub pids: Vec<u32>,
+    /// Mount points of the job's own tmpfs mounts.
+    pub private: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "check", rename_all = "snake_case")]
 pub enum VerifyRequest {
@@ -191,6 +203,11 @@ pub enum VerifyRequest {
     BindSources(BindSourceCheck),
     /// The reply is a [`HeldAttrsReply`].
     HeldAttrs(HeldAttrsCheck),
+    /// The reply is `Result<DumpHazards, String>` (see
+    /// [`crate::host::scan_dump_hazards`]).
+    DumpHazards(ScanCheck),
+    /// The reply lists the paths of [`crate::host::scan_open_files`].
+    OpenFiles(ScanCheck),
 }
 
 /// The problems found (empty: all is well), or why the check could not be
@@ -221,6 +238,10 @@ pub fn run_verify_access() -> i32 {
                 attrs.into_iter().map(Option::flatten).collect(),
             ))
         }
+        Ok(VerifyRequest::DumpHazards(c)) => serde_json::to_vec(
+            &crate::host::scan_dump_hazards(&c.proc_root, &c.pids, &c.private)
+                .map_err(|e| e.to_string()),
+        ),
         req => serde_json::to_vec(&verify(req)),
     };
     match out {
@@ -290,7 +311,10 @@ fn verify(req: Result<VerifyRequest, String>) -> VerifyReply {
                 .collect(),
             )
         }
-        VerifyRequest::HeldAttrs(_) => Err("not a check with a list of problems".into()),
+        VerifyRequest::OpenFiles(c) => Ok(crate::host::scan_open_files(&c.proc_root, &c.pids)),
+        VerifyRequest::HeldAttrs(_) | VerifyRequest::DumpHazards(_) => {
+            Err("not a check with a list of problems".into())
+        }
     })
 }
 
@@ -447,23 +471,26 @@ pub struct DumpHookRequest {
 ///
 /// At `post-dump` CRIU has dumped the job but not killed it yet: its tasks
 /// are stopped under CRIU's control, holding exactly the files the image
-/// has. The hook reads the [`DumpHookRequest`] from `<request>` and writes
-/// the job's [`HeldFile`]s ([`crate::host::held_files`]) next to it
-/// ([`hook_result_path`]). The list the helper made before the dump misses
-/// files the job opened after it (e.g. a file it creates every few
-/// moments). The hook never fails the dump (CRIU would resume the job):
-/// without its result, the helper's earlier list is used.
+/// has. The hook reads the [`DumpHookRequest`] from `<request>` and scans
+/// the job again ([`crate::host::scan_dump_hazards`], in a `verify-access`
+/// child with a deadline): the helper's checks before the dump saw the job
+/// while it ran, and it may have opened other files since.
+///
+/// - If the job now has something [`crate::host::DumpHazards::refusal`]
+///   refuses, the image has descriptors in flight in socket messages
+///   (`in_flight_fds_refusal`), or the scan fails, the hook writes the
+///   reason to [`hook_refusal_path`] and fails. CRIU 4.x then abandons the
+///   dump and resumes the job, and the helper reports the checkpoint as
+///   refused.
+/// - Otherwise it writes the job's [`HeldFile`]s next to the request
+///   ([`hook_result_path`]): the list made before the dump misses files
+///   the job opened after it (e.g. a file it creates every few moments).
+///   If that fails, the helper's earlier list is used.
 pub fn run_dump_hook(request: &Path) -> i32 {
     if std::env::var("CRTOOLS_SCRIPT_ACTION").as_deref() != Ok("post-dump") {
         return 0;
     }
-    // Descriptors in flight in socket messages are only seen in the image;
-    // failing the hook fails the dump, and the job goes on.
-    if let Some(reason) = in_flight_fds_refusal() {
-        eprintln!("gpueue-helper: {reason}");
-        return 1;
-    }
-    let result = (|| -> Result<(), String> {
+    let scan = (|| -> Result<crate::host::DumpHazards, String> {
         let req: DumpHookRequest = serde_json::from_slice(
             &fs::read(request).map_err(|e| format!("reading {}: {e}", request.display()))?,
         )
@@ -471,17 +498,48 @@ pub fn run_dump_hook(request: &Path) -> i32 {
         let proc_root = Path::new("/proc");
         let pids = crate::host::ns_processes(proc_root, req.init_pid)
             .map_err(|e| format!("listing the job's processes: {e}"))?;
-        let held = crate::host::held_files(proc_root, &pids, &req.private);
-        let out = hook_result_path(request);
-        let tmp = out.with_extension("tmp");
-        serde_json::to_vec(&held)
-            .map_err(io::Error::other)
-            .and_then(|b| fs::write(&tmp, b))
-            .and_then(|()| fs::rename(&tmp, &out))
-            .map_err(|e| format!("writing {}: {e}", out.display()))
+        let exe = std::env::current_exe().map_err(|e| format!("locating myself: {e}"))?;
+        let check = VerifyRequest::DumpHazards(ScanCheck {
+            proc_root: proc_root.to_owned(),
+            pids,
+            private: req.private.clone(),
+        });
+        let hazards = run_child(&exe, &check, crate::host::DUMP_SCAN_TIMEOUT)
+            .map_err(|e| format!("scanning the job's files: {e}"))?;
+        Ok(hazards)
     })();
-    if let Err(e) = result {
-        eprintln!("gpueue-helper: listing the files of the dumped job: {e}");
+    let hazards = match scan {
+        // Descriptors in flight in socket messages are only seen in the
+        // image (see `in_flight_fds_refusal`).
+        Ok(hazards) => match hazards.refusal().or_else(in_flight_fds_refusal) {
+            None => Ok(hazards),
+            Some(why) => Err(why),
+        },
+        Err(e) => Err(format!(
+            "the job could not be checked again after CRIU stopped it: {e}"
+        )),
+    };
+    let hazards = match hazards {
+        Ok(h) => h,
+        Err(why) => {
+            eprintln!("gpueue-helper: abandoning the dump: {why}");
+            if let Err(e) = fs::write(hook_refusal_path(request), why.as_bytes()) {
+                eprintln!("gpueue-helper: writing the dump refusal: {e}");
+            }
+            return 1;
+        }
+    };
+    let out = hook_result_path(request);
+    let tmp = out.with_extension("tmp");
+    if let Err(e) = serde_json::to_vec(&hazards.held_files)
+        .map_err(io::Error::other)
+        .and_then(|b| fs::write(&tmp, b))
+        .and_then(|()| fs::rename(&tmp, &out))
+    {
+        eprintln!(
+            "gpueue-helper: listing the files of the dumped job: writing {}: {e}",
+            out.display()
+        );
     }
     0
 }
@@ -566,10 +624,18 @@ pub fn signal_ns_member(
     }
 }
 
-/// Where [`run_restore_hook`] writes its result for `request`.
+/// Where [`run_restore_hook`] and [`run_dump_hook`] write their result
+/// for `request`.
 pub fn hook_result_path(request: &Path) -> std::path::PathBuf {
     let mut name = request.as_os_str().to_owned();
     name.push(".result");
+    name.into()
+}
+
+/// Where [`run_dump_hook`] writes why it made CRIU abandon the dump.
+pub fn hook_refusal_path(request: &Path) -> std::path::PathBuf {
+    let mut name = request.as_os_str().to_owned();
+    name.push(".refused");
     name.into()
 }
 

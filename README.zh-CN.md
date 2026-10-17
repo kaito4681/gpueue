@@ -427,6 +427,10 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - **`SO_REUSEPORT`：** 如果作业有设置了 `SO_REUSEPORT` 的 TCP 或 UDP 套接字，同样无法为它创建检查点
   （CRIU 会把该套接字恢复为属于 root 的套接字，它随后可能与某个 root 服务共享端口）。有些服务器默认会设置它；
   请将其关闭，或使用 `--no-checkpoint`。
+- **已删除的文件：** 作业在仍打开时删除的文件（临时文件、multiprocessing 信号量）会保存到镜像中。如果作业持有
+  仍有其他硬链接的已删除文件、在打开时于 NFS 上被删除的文件（`.nfs<十六进制>`），或带有 setuid / setgid
+  位或文件能力的已删除程序，就无法为它创建检查点；检查点会被拒绝，作业继续运行。作业运行期间被软件包升级
+  替换的库没有问题。
 - **Python 和 PyTorch：**
   - Python 3.14 及更新版本在 Linux 上默认使用 `forkserver` 启动方式，因此 DataLoader worker
     不是 fork 出来的，也不依赖 fork guard。Python 3.12 和 3.13（或显式指定

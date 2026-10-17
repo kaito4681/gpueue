@@ -2345,6 +2345,17 @@ warned on their next command. Refusals:
   gives the job its credentials back, so a restored `SO_REUSEPORT` socket would belong to root and
   could join a root service's group on the same port (and receive part of its connections). Turn
   `SO_REUSEPORT` off in the program, or run the job with `--no-checkpoint`.
+- `the job holds deleted files that still have other hard links (...)`, `... files deleted on NFS
+  while open (...)`: CRIU could only checkpoint such files by linking them back into their
+  directories as root (`--link-remap`, which gpueue never uses). Close the files before the
+  checkpoint, or run the job with `--no-checkpoint`.
+- `the job holds deleted files with the setuid or setgid bit or file capabilities (...)`: a
+  restore would re-create them as root with that owner and mode, as privileged programs. Close
+  them before the checkpoint, or restart the job. (Other deleted files, such as libraries that a
+  package upgrade replaced while the job ran, are saved in the image and are fine.)
+- `... (found while CRIU had the job stopped for the dump); the job was resumed`: the job opened
+  such a file after the checks before the dump; CRIU's `post-dump` check found it and CRIU
+  abandoned the dump.
 - `the job depends on a filesystem that is gone, does not answer or root cannot access: <mount
   point> (<type>) ...; the job uses it: ...`: a FUSE or network filesystem that the job uses is no
   longer mounted on the host, does not answer, or is a FUSE mount without `allow_other`. Mount it
