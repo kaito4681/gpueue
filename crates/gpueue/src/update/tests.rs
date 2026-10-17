@@ -5,7 +5,7 @@ use gpueue_protocol::api::{HelperStatus, VersionResponse};
 
 use super::*;
 use crate::service::MARKER;
-use crate::system::fake::FakeSystem;
+use crate::system::fake::{FakeSystem, create_dirs};
 use crate::system::{CmdOutput, HttpError};
 
 // A throwaway key pair (its secret key was not kept), another key, and data signed with the first.
@@ -271,6 +271,10 @@ fn extraction_accepts_files_and_directories_below_the_top_directory() {
     // The setuid bit is dropped.
     let mode = std::fs::metadata(top.join("gpueue")).unwrap().mode() & 0o7777;
     assert_eq!(mode, 0o755);
+    // Directories are 0755 whatever the umask is.
+    for dir in [&top, &top.join("docs")] {
+        assert_eq!(std::fs::metadata(dir).unwrap().mode() & 0o7777, 0o755);
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let top = extract(TARBALL, dir.path(), NAME).unwrap();
@@ -1007,7 +1011,7 @@ fn bare_system() -> FakeSystem {
 
 fn symlink(sys: &FakeSystem, target: &str, link: &str) {
     let local = sys.path(Path::new(link));
-    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    create_dirs(sys.root(), local.parent().unwrap());
     std::os::unix::fs::symlink(target, local).unwrap();
 }
 

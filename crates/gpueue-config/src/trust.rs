@@ -478,8 +478,16 @@ mod tests {
         assert!(err.to_string().contains("is a symlink"), "{err}");
     }
 
+    /// Creates `path` with `mode` and any missing parents with 0755, whatever the umask is.
     fn mkdir(path: &Path, mode: u32) {
-        std::fs::create_dir_all(path).unwrap();
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            mkdir(parent, 0o755);
+        }
+        if !path.exists() {
+            std::fs::create_dir(path).unwrap();
+        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 

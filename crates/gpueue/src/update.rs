@@ -18,7 +18,7 @@
 //! `GPUEUE_RELEASE_API_URL` (a fake API) and `GPUEUE_UPDATE_PUBKEY_FILE` (another public key).
 
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -407,6 +407,18 @@ pub fn verify_sha256(data: &[u8], sums: &[u8], name: &str) -> Result<()> {
 /// Extracts the gzipped tarball `data` into the local directory `dest`. Only regular files and
 /// directories below the single top directory `top` are accepted: no absolute paths, no `..`, no
 /// links or devices. File modes keep only the permission bits up to 0755. Returns `dest/top`.
+/// Creates `dir` and its missing parents with mode 0755, whatever the umask is.
+fn create_dirs(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent() {
+        create_dirs(parent)?;
+    }
+    std::fs::create_dir(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+}
+
 pub fn extract(data: &[u8], dest: &Path, top: &str) -> Result<PathBuf> {
     let bad = |what: String| format!("refusing the release tarball: {what}");
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(data));
@@ -429,20 +441,18 @@ pub fn extract(data: &[u8], dest: &Path, top: &str) -> Result<PathBuf> {
         let kind = entry.header().entry_type();
         let target = dest.join(&path);
         if kind.is_dir() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o755)
-                .create(&target)
-                .map_err(|err| format!("creating {}: {err}", target.display()))?;
+            create_dirs(&target).map_err(|err| format!("creating {}: {err}", target.display()))?;
         } else if kind.is_file() {
             if let Some(parent) = target.parent() {
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o755)
-                    .create(parent)
+                create_dirs(parent)
                     .map_err(|err| format!("creating {}: {err}", parent.display()))?;
             }
-            let mode = entry.header().mode().unwrap_or(0o644) & 0o755;
+            // Executables are 0755 and everything else 0644, whatever the umask is.
+            let mode = if entry.header().mode().unwrap_or(0o644) & 0o111 != 0 {
+                0o755
+            } else {
+                0o644
+            };
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -450,6 +460,9 @@ pub fn extract(data: &[u8], dest: &Path, top: &str) -> Result<PathBuf> {
                 .custom_flags(nix::libc::O_NOFOLLOW)
                 .open(&target)
                 .map_err(|err| format!("creating {}: {err}", target.display()))?;
+            // `mode` above is filtered by the umask; set it exactly.
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(|err| format!("setting the mode of {}: {err}", target.display()))?;
             io::copy(&mut entry, &mut file)
                 .map_err(|err| format!("writing {}: {err}", target.display()))?;
         } else {

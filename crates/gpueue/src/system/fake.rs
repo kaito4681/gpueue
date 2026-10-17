@@ -47,10 +47,39 @@ pub struct FakeSystem {
     pub http_log: RefCell<Vec<(String, Headers)>>,
 }
 
+/// Creates `dir` and its missing parents below `root` with mode 0755, whatever the umask is.
+pub fn create_dirs(root: &Path, dir: &Path) {
+    if dir == root || dir.is_dir() {
+        return;
+    }
+    create_dirs(root, dir.parent().unwrap());
+    std::fs::create_dir(dir).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Writes `contents` to `path` with exactly `mode`, whatever the umask is.
+pub fn write_file(path: &Path, contents: impl AsRef<[u8]>, mode: u32) {
+    std::fs::write(path, contents).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
 impl FakeSystem {
     pub fn new() -> Self {
+        // Tests bind Unix sockets below the root, whose paths are limited to 107 bytes: keep the
+        // root short even when `$TMPDIR` is long.
+        let base = std::env::temp_dir();
+        let base = if base.as_os_str().len() <= 40 {
+            base
+        } else {
+            PathBuf::from("/tmp")
+        };
+        let dir = tempfile::Builder::new()
+            .prefix("gq")
+            .tempdir_in(base)
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         Self {
-            dir: tempfile::tempdir().unwrap(),
+            dir,
             euid: 0,
             exe: PathBuf::from("/usr/bin/gpueue"),
             groups: RefCell::default(),
@@ -129,8 +158,8 @@ impl FakeSystem {
     /// Writes a file at a system path, creating parent directories.
     pub fn write(&self, path: &str, contents: &str) {
         let path = self.path(Path::new(path));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, contents).unwrap();
+        create_dirs(self.dir.path(), path.parent().unwrap());
+        write_file(&path, contents, 0o644);
     }
 
     pub fn write_exe(&self, path: &str, contents: &str) {
@@ -140,7 +169,7 @@ impl FakeSystem {
     }
 
     pub fn mkdir(&self, path: &str) {
-        std::fs::create_dir_all(self.path(Path::new(path))).unwrap();
+        create_dirs(self.dir.path(), &self.path(Path::new(path)));
     }
 
     pub fn read(&self, path: &str) -> Option<String> {
