@@ -1939,8 +1939,9 @@ or an sshfs mount on which every file shows as root's; this includes files it op
 before the dump), as long as it is that very file:
 
 - on the same mounted filesystem (no reboot or remount in between): the same device and inode, or
-- after the filesystem was mounted again: the same owner, group, mode, size, modification time
-  and change time as right after the dump. Device numbers change with a new mount, and inode
+- after the filesystem was mounted again (another device number), or on a FUSE or network
+  filesystem: the same owner, group, mode, size, modification time and change time (and birth
+  time, where the filesystem reports one) as right after the dump. Device numbers change with a new mount, and inode
   numbers are not stable on every filesystem: FUSE filesystems such as sshfs number inodes in the
   order they are looked up, so after a reboot the job's files usually have other numbers (and
   another file may have the old one). The change time is set by the kernel (or, on sshfs, by the

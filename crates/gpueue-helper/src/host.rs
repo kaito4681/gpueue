@@ -598,7 +598,7 @@ pub fn nested_namespace_processes(proc_root: &Path, init_pid: u32) -> io::Result
             };
             if p != pid_ns || u != user_ns {
                 let comm = fs::read_to_string(proc_root.join(child.to_string()).join("comm"))
-                    .map(|c| c.trim().to_owned())
+                    .map(|c| printable(c.trim_end_matches('\n')))
                     .unwrap_or_default();
                 out.push(format!("{child} ({comm})"));
             }
@@ -606,6 +606,20 @@ pub fn nested_namespace_processes(proc_root: &Path, init_pid: u32) -> io::Result
     }
     out.sort();
     Ok(out)
+}
+
+/// `name` (a process name, which its process chooses) for a message:
+/// control characters escaped, at most 64 characters.
+pub fn printable(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars().take(64) {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn ns_process_infos(proc_root: &Path, init_pid: u32) -> io::Result<Vec<ProcInfo>> {
@@ -757,6 +771,9 @@ impl HostProbe for SystemHost {
     ) -> Result<(), String> {
         let mut threads = Vec::with_capacity(cuda_pids.len());
         for &pid in cuda_pids {
+            // The PIDs come from a scan: right before root's cuda-checkpoint
+            // acts on one, it must still be a process of the job.
+            crate::traced::check_process(init_pid, pid)?;
             let what = format!("cuda-checkpoint --get-restore-tid of process {pid}");
             let spec = cuda_get_restore_tid(&self.cuda_checkpoint, pid);
             let out = run_with_timeout(&spec, self.get_state_timeout, Duration::from_millis(20))
@@ -1012,6 +1029,8 @@ impl HostProbe for SystemHost {
         let mut out = DumpHazards::default();
         let mut sockets = std::collections::HashSet::new();
         let mut socket_fds: Vec<(u32, i32)> = Vec::new();
+        // By inode: two deleted files may have had the same path.
+        let mut deleted = std::collections::HashSet::new();
         for pid in host_pids {
             let dir = self.proc_root.join(pid.to_string());
             let links = ["fd", "map_files"].iter().flat_map(|sub| {
@@ -1045,9 +1064,12 @@ impl HostProbe for SystemHost {
                 if !path.starts_with('/') || is_private_path(path, private) {
                     continue;
                 }
-                let size = fs::metadata(&link).map_or(0, |m| m.len());
-                if !out.deleted_files.iter().any(|(p, _)| p == path) {
-                    out.deleted_files.push((path.to_owned(), size));
+                let Ok(meta) = fs::metadata(&link) else {
+                    continue; // closed or exited meanwhile
+                };
+                use std::os::unix::fs::MetadataExt;
+                if deleted.insert((meta.dev(), meta.ino())) {
+                    out.deleted_files.push((path.to_owned(), meta.len()));
                 }
             }
         }
@@ -1506,6 +1528,13 @@ mod tests {
         assert!(!is_private_path("/home/a/f", &private));
     }
 
+    #[test]
+    fn process_names_are_printable() {
+        assert_eq!(printable("python3"), "python3");
+        assert_eq!(printable("a\nb\x1b[2J"), "a\\nb\\u{1b}[2J");
+        assert_eq!(printable(&"x".repeat(100)).len(), 64);
+    }
+
     /// Our own process: a deleted file it holds and a socket it bound.
     #[test]
     fn finds_dump_hazards() {
@@ -1519,8 +1548,29 @@ mod tests {
         let h = host
             .dump_hazards(&[std::process::id()], &["/tmp-private".into()])
             .unwrap();
+        assert!(
+            h.deleted_files
+                .iter()
+                .any(|(p, _)| p == f.to_str().unwrap()),
+            "{h:?}"
+        );
+        // Another deleted file that had the same path is another file.
+        fs::write(&f, b"0123456789").unwrap();
+        let held2 = fs::File::open(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        let h = host
+            .dump_hazards(&[std::process::id()], &["/tmp-private".into()])
+            .unwrap();
+        let mut sizes: Vec<u64> = h
+            .deleted_files
+            .iter()
+            .filter(|(p, _)| p == f.to_str().unwrap())
+            .map(|(_, s)| *s)
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, [0, 10], "{h:?}");
+        drop(held2);
         let f = f.to_str().unwrap();
-        assert!(h.deleted_files.iter().any(|(p, _)| p == f), "{h:?}");
         assert!(
             h.bound_sockets.contains(&sock.to_str().unwrap().to_owned()),
             "{h:?}"

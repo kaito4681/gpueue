@@ -656,6 +656,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             unit: record.unit.clone(),
             exe: self.cfg.job_exe().to_owned(),
             files: files.clone(),
+            uid: creds.uid.0,
             argv,
             envs,
             devices,
@@ -1615,6 +1616,17 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             ));
         }
         if let Some(exe) = &record.shim_exe
+            && let Err(e) = crate::helperbin::verify(exe, self.cfg.helper_copy_dir.as_deref())
+        {
+            return Err(error(
+                HelperErrorCode::InvalidRequest,
+                format!(
+                    "the checkpointed job runs the helper binary {e}; the job cannot be \
+                     restored"
+                ),
+            ));
+        }
+        if let Some(exe) = &record.shim_exe
             && let Some(dir) = &self.cfg.helper_copy_dir
             && crate::helperbin::is_copy(dir, exe)
         {
@@ -2182,6 +2194,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 let map = device_map(&*host, &saved, &gpus)?;
                 let run = |steps| {
                     let mut exec = factory();
+                    exec.confine_to(pid);
                     run_plan_until(&mut *exec, steps, Some(&deadline))
                         .map(|_| ())
                         .map_err(|f| format!("CUDA restore failed: {f}"))
@@ -2820,6 +2833,7 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     }
     let deadline = Deadline::after(budget);
     on_deadline(deadline.at + ck.timeouts.rollback_budget(cuda_pids.len()) + OP_SLACK);
+    exec.confine_to(init_pid);
     if let Err(failure) = run_dump_with_rollback(exec, ck, steps, &cuda_pids, Some(&deadline)) {
         let mut reason = failure.to_string();
         if matches!(failure.error, StepError::DeadlineExceeded { .. }) {

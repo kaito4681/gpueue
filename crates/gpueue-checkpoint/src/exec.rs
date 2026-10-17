@@ -68,6 +68,11 @@ pub enum StepError {
     },
     #[error("process {pid} cannot be touched: {reason:?}")]
     Unrunnable { pid: u32, reason: Unrunnable },
+    /// The step's process is no longer one of the job's (it exited, and
+    /// its PID may have been reused): it was not touched (see
+    /// [`Executor::confine_to`]).
+    #[error("process {pid} is no longer a process of the job; not touched")]
+    NotInJob { pid: u32 },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -97,7 +102,9 @@ impl StepError {
     pub fn ran(&self) -> bool {
         !matches!(
             self,
-            StepError::Spawn { .. } | StepError::DeadlineExceeded { ran: false, .. }
+            StepError::Spawn { .. }
+                | StepError::NotInJob { .. }
+                | StepError::DeadlineExceeded { ran: false, .. }
         )
     }
 
@@ -142,6 +149,14 @@ impl Deadline {
 /// Runs single steps. The helper uses [`SystemExecutor`]; tests use fakes.
 pub trait Executor {
     fn execute(&mut self, step: &Step) -> Result<StepOutput, StepError>;
+
+    /// Confines the steps that act on a process by its PID (CUDA calls,
+    /// `criu dump --tree`, SIGCONT) to the processes in the PID namespace
+    /// of the job whose namespace init is `init_pid`: the PIDs of a plan
+    /// come from a scan of `/proc`, and a process of the job may exit and
+    /// its PID be reused before a step runs. A step whose process is not
+    /// (any longer) in that namespace is not run ([`StepError::NotInJob`]).
+    fn confine_to(&mut self, _init_pid: u32) {}
 }
 
 /// A step together with its result.
@@ -381,6 +396,10 @@ pub struct SystemExecutor {
     pub cgroup_root: PathBuf,
     /// How often a running child is polled for exit.
     pub poll_interval: Duration,
+    /// The PID namespace (the `/proc/<pid>/ns/pid` link) of the job that
+    /// the steps are confined to (see [`Executor::confine_to`]); empty when
+    /// it could not be read, which no process matches.
+    pub job_pid_ns: Option<PathBuf>,
 }
 
 impl Default for SystemExecutor {
@@ -389,15 +408,33 @@ impl Default for SystemExecutor {
             proc_root: PathBuf::from("/proc"),
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             poll_interval: Duration::from_millis(20),
+            job_pid_ns: None,
         }
     }
 }
 
+/// The process a step acts on by its PID.
+fn action_pid(action: &Action) -> Option<u32> {
+    match *action {
+        Action::CudaLock { pid }
+        | Action::CudaCheckpoint { pid }
+        | Action::CudaRestore { pid }
+        | Action::CudaUnlock { pid } => Some(pid),
+        Action::CriuDump { root_pid } => Some(root_pid),
+        Action::CriuRestore => None,
+    }
+}
+
 impl Executor for SystemExecutor {
+    fn confine_to(&mut self, init_pid: u32) {
+        self.job_pid_ns = Some(procfs::pid_ns(&self.proc_root, init_pid).unwrap_or_default());
+    }
+
     fn execute(&mut self, step: &Step) -> Result<StepOutput, StepError> {
         match step {
             Step::EnsureRunnable { pids } => {
                 for &pid in pids {
+                    self.ensure_in_job(pid)?;
                     if let Some(reason) =
                         procfs::check_runnable(&self.proc_root, &self.cgroup_root, pid)?
                     {
@@ -407,7 +444,13 @@ impl Executor for SystemExecutor {
                 Ok(StepOutput::default())
             }
             Step::IfRunnable { pid, then } => {
-                match procfs::check_runnable(&self.proc_root, &self.cgroup_root, *pid) {
+                // A PID that is no longer the job's: its process is gone.
+                let runnable = if self.in_job(*pid) {
+                    procfs::check_runnable(&self.proc_root, &self.cgroup_root, *pid)
+                } else {
+                    Err(io::Error::from(io::ErrorKind::NotFound))
+                };
+                match runnable {
                     Ok(None) => self.execute(then),
                     Ok(Some(reason)) => Err(StepError::Unrunnable { pid: *pid, reason }),
                     // Gone (or exited): there is nothing left to undo.
@@ -420,14 +463,22 @@ impl Executor for SystemExecutor {
             }
             Step::Thaw { root_pid } => self.thaw(*root_pid),
             Step::Run {
-                command, timeout, ..
-            } => run_with_timeout(command, *timeout, self.poll_interval),
+                action,
+                command,
+                timeout,
+            } => {
+                if let Some(pid) = action_pid(action) {
+                    self.ensure_in_job(pid)?;
+                }
+                run_with_timeout(command, *timeout, self.poll_interval)
+            }
             Step::IfCudaState {
                 pid,
                 get_state,
                 when,
                 then,
             } => {
+                self.ensure_in_job(*pid)?;
                 let out =
                     run_with_timeout(get_state, plan::CUDA_GET_STATE_TIMEOUT, self.poll_interval)?;
                 match parse_cuda_state(&out.stdout) {
@@ -458,6 +509,44 @@ impl Executor for SystemExecutor {
 }
 
 impl SystemExecutor {
+    /// Whether `pid` is in the job's PID namespace (always, unconfined).
+    fn in_job(&self, pid: u32) -> bool {
+        match &self.job_pid_ns {
+            None => true,
+            Some(ns) => procfs::pid_ns(&self.proc_root, pid).is_ok_and(|p| p == *ns),
+        }
+    }
+
+    fn ensure_in_job(&self, pid: u32) -> Result<(), StepError> {
+        if self.in_job(pid) {
+            Ok(())
+        } else {
+            Err(StepError::NotInJob { pid })
+        }
+    }
+
+    /// SIGCONT to `pid` if it is still a stopped process in the PID
+    /// namespace `ns` (that of the tree's root) and of the job. Through a
+    /// pidfd opened before the checks: if the PID was reused meanwhile, the
+    /// pidfd names the process that exited, and the signal goes nowhere.
+    fn continue_task(&self, pid: u32, ns: &Path) -> bool {
+        use rustix::process::{PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+        let Some(raw) = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        else {
+            return false;
+        };
+        let Ok(fd) = pidfd_open(raw, PidfdFlags::empty()) else {
+            return false;
+        };
+        let member = procfs::pid_ns(&self.proc_root, pid).is_ok_and(|p| p == ns)
+            && self.in_job(pid)
+            && procfs::inspect(&self.proc_root, &self.cgroup_root, pid)
+                .is_ok_and(|st| st.stopped == Some('T'));
+        member && pidfd_send_signal(&fd, Signal::CONT).is_ok()
+    }
+
     /// [`Step::Thaw`]: SIGCONT the stopped tasks and thaw the frozen
     /// cgroups of the tree (up to the cgroup of `root`, see
     /// [`procfs::ThawPlan`]), until (briefly) none is stopped or frozen.
@@ -489,9 +578,19 @@ impl SystemExecutor {
                 std::fs::write(dir.join("cgroup.freeze"), "0")?;
                 note(format!("thawed {}", dir.display()));
             }
-            for &pid in &left.stopped {
-                signal(pid, rustix::process::Signal::CONT);
-                note(format!("SIGCONT {pid}"));
+            if !left.stopped.is_empty() {
+                // The tree's processes are those in the PID namespace of
+                // its root (a namespace init) or, for a root in the host's,
+                // processes there.
+                let ns = procfs::pid_ns(&self.proc_root, root)?;
+                if self.job_pid_ns.as_ref().is_some_and(|j| *j != ns) {
+                    return Err(StepError::NotInJob { pid: root });
+                }
+                for &pid in &left.stopped {
+                    if self.continue_task(pid, &ns) {
+                        note(format!("SIGCONT {pid}"));
+                    }
+                }
             }
             thread::sleep(self.poll_interval);
         }
@@ -1393,6 +1492,55 @@ mod tests {
 
     const POLL: Duration = Duration::from_millis(5);
 
+    /// Once confined to a job, steps on a PID outside the job's PID
+    /// namespace (a reused PID) are not run.
+    #[test]
+    fn confined_steps_skip_processes_outside_the_job() {
+        let tmp = crate::test_util::TempDir::new();
+        let proc_root = tmp.path().join("proc");
+        for (pid, ns) in [(10, "pid:[1]"), (11, "pid:[1]"), (20, "pid:[2]")] {
+            let dir = proc_root.join(pid.to_string()).join("ns");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::os::unix::fs::symlink(ns, dir.join("pid")).unwrap();
+        }
+        let marker = tmp.path().join("ran");
+        let run = |pid: u32| Step::Run {
+            action: Action::CudaLock { pid },
+            command: sh(&format!("echo {pid} >> {}", marker.display())),
+            timeout: Duration::from_secs(10),
+        };
+        let mut ex = SystemExecutor {
+            proc_root,
+            ..SystemExecutor::default()
+        };
+        // Unconfined: anything goes.
+        ex.execute(&run(20)).unwrap();
+        ex.confine_to(10);
+        ex.execute(&run(11)).unwrap();
+        let e = ex.execute(&run(20)).unwrap_err();
+        assert!(matches!(e, StepError::NotInJob { pid: 20 }), "{e:?}");
+        assert!(!e.ran());
+        let e = ex.execute(&run(30)).unwrap_err();
+        assert!(matches!(e, StepError::NotInJob { pid: 30 }), "{e:?}");
+        let e = ex
+            .execute(&Step::Run {
+                action: Action::CriuDump { root_pid: 20 },
+                command: sh("true"),
+                timeout: Duration::from_secs(10),
+            })
+            .unwrap_err();
+        assert!(matches!(e, StepError::NotInJob { pid: 20 }), "{e:?}");
+        // A rollback guard takes it as gone.
+        let out = ex
+            .execute(&Step::IfRunnable {
+                pid: 20,
+                then: Box::new(run(20)),
+            })
+            .unwrap();
+        assert!(out.stdout.contains("gone"), "{out:?}");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "20\n11\n");
+    }
+
     #[test]
     fn system_run_success_captures_output() {
         let out =
@@ -1627,6 +1775,7 @@ mod tests {
             proc_root,
             cgroup_root: cg.clone(),
             poll_interval: POLL,
+            ..SystemExecutor::default()
         };
         let res = ex.execute(&Step::Thaw { root_pid: 10 });
         kernel.join().unwrap();

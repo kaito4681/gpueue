@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::sys::ptrace;
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
@@ -65,6 +65,10 @@ struct Tracee {
     gone: bool,
     /// Detached already (or given up on).
     detached: bool,
+    /// A pidfd of the process, opened while the thread is traced (its PID
+    /// cannot be reused then): signals sent to the process after the
+    /// detach never reach a process that took over its PID.
+    pidfd: Option<std::os::fd::OwnedFd>,
 }
 
 impl Tracee {
@@ -78,12 +82,21 @@ impl Tracee {
             in_stop: false,
             gone: false,
             detached: false,
+            pidfd: None,
         };
         ptrace::seize(t.tid, ptrace::Options::empty())
             .map_err(|e| format!("attaching to thread {tid} of process {pid}: {e}"))?;
         // From here on `t` is dropped (and detached) on every early return.
         // Checked once seized: a traced thread's id cannot be reused.
         check_member(init, pid, tid)?;
+        t.pidfd = Some(
+            rustix::process::pidfd_open(
+                rustix::process::Pid::from_raw(t.pid.as_raw())
+                    .ok_or_else(|| format!("invalid process id {pid}"))?,
+                rustix::process::PidfdFlags::empty(),
+            )
+            .map_err(|e| format!("opening a pidfd of process {pid}: {e}"))?,
+        );
         // A thread in a group stop traps as soon as it is seized.
         let until = Instant::now() + SETTLE;
         while !t.in_stop && !t.gone {
@@ -221,6 +234,15 @@ impl Tracee {
         }
     }
 
+    /// Sends `sig` to the process through its pidfd.
+    fn signal_process(&self, sig: Signal) {
+        if let Some(fd) = &self.pidfd
+            && let Some(sig) = rustix::process::Signal::from_named_raw(sig as i32)
+        {
+            let _ = rustix::process::pidfd_send_signal(fd, sig);
+        }
+    }
+
     fn alive(&self) -> bool {
         Path::new(&format!("/proc/{}/task/{}", self.pid, self.tid)).exists()
     }
@@ -237,6 +259,12 @@ impl Drop for Tracee {
 
 fn to_raw(id: u32) -> Result<i32, String> {
     i32::try_from(id).map_err(|_| format!("invalid thread id {id}"))
+}
+
+/// `pid` is a process in the same cgroup as `init` (the job's), right
+/// before a root action on it by its PID.
+pub fn check_process(init: u32, pid: u32) -> Result<(), String> {
+    check_member(init, pid, pid)
 }
 
 /// `tid` is a thread of `pid`, in the same cgroup as `init`.
@@ -355,7 +383,7 @@ fn trace<R: Send>(
         // Running job code would be worse than losing the job (whose image
         // is kept): kill the processes whose threads are out of control.
         for t in &tracees {
-            let _ = kill(t.pid, Signal::SIGKILL);
+            t.signal_process(Signal::SIGKILL);
         }
         let until = Instant::now() + STOP_GRACE;
         for t in &mut tracees {
@@ -368,7 +396,7 @@ fn trace<R: Send>(
     } else {
         for t in &tracees {
             for &sig in &t.held {
-                let _ = kill(t.pid, sig);
+                t.signal_process(sig);
             }
         }
     }
@@ -379,6 +407,8 @@ fn trace<R: Send>(
 #[cfg(test)]
 mod tests {
     use std::process::{Child, Command};
+
+    use nix::sys::signal::kill;
 
     use super::*;
 

@@ -241,6 +241,9 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     for path in cfg.paths_to_check() {
         gpueue_helper::validate::check_root_owned_path(path)?;
     }
+    // Job units, restores and the access checks run this binary as root.
+    gpueue_helper::validate::check_root_owned_path(&cfg.helper_exe)
+        .map_err(|e| format!("the helper binary {}: {e}", cfg.helper_exe.display()))?;
     if let Some(dir) = &cfg.fork_guard_dir {
         // Without it jobs still run; only forked children of CUDA
         // processes keep their dumps from succeeding.

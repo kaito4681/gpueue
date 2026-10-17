@@ -483,26 +483,64 @@ pub fn run_dump_hook(request: &Path) -> i32 {
 /// SIGSTOP to `init` and every process in its PID namespace (signals from
 /// the host's namespace reach a namespace init too).
 fn stop_tree(init: u32) -> Result<(), String> {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
+    let ns = gpueue_checkpoint::procfs::pid_ns(Path::new("/proc"), init)
+        .map_err(|e| format!("reading the PID namespace of the job: {e}"))?;
     let pids = crate::host::ns_processes(Path::new("/proc"), init)
         .map_err(|e| format!("listing the job's processes: {e}"))?;
-    for pid in [init].into_iter().chain(pids) {
-        let raw = i32::try_from(pid).map_err(|_| format!("invalid pid {pid}"))?;
-        kill(Pid::from_raw(raw), Signal::SIGSTOP).map_err(|e| format!("process {pid}: {e}"))?;
+    for pid in [init]
+        .into_iter()
+        .chain(pids.into_iter().filter(|p| *p != init))
+    {
+        match signal_ns_member(&ns, pid, rustix::process::Signal::STOP) {
+            Ok(_) => {}
+            Err(e) => return Err(format!("process {pid}: {e}")),
+        }
     }
     Ok(())
 }
 
 /// SIGKILL to every process in the PID namespace of `init`, and to `init`.
 fn kill_tree(init: u32) {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
+    let Ok(ns) = gpueue_checkpoint::procfs::pid_ns(Path::new("/proc"), init) else {
+        return;
+    };
     let pids = crate::host::ns_processes(Path::new("/proc"), init).unwrap_or_default();
     for pid in pids.into_iter().chain([init]) {
-        if let Ok(pid) = i32::try_from(pid) {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-        }
+        let _ = signal_ns_member(&ns, pid, rustix::process::Signal::KILL);
+    }
+}
+
+/// Sends `sig` to `pid` if it is a process in the PID namespace `ns`.
+/// Through a pidfd opened before the check, so a PID reused after the
+/// `/proc` scan is never signalled (the pidfd then names the process that
+/// exited). Returns whether it was signalled; a process that is gone is
+/// not an error.
+pub fn signal_ns_member(
+    ns: &Path,
+    pid: u32,
+    sig: rustix::process::Signal,
+) -> Result<bool, rustix::io::Errno> {
+    use rustix::process::{Pid, PidfdFlags, pidfd_open, pidfd_send_signal};
+    let raw = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or(rustix::io::Errno::INVAL)?;
+    let fd = match pidfd_open(raw, PidfdFlags::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::SRCH) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if gpueue_checkpoint::procfs::pid_ns(Path::new("/proc"), pid)
+        .ok()
+        .as_deref()
+        != Some(ns)
+    {
+        return Ok(false);
+    }
+    match pidfd_send_signal(&fd, sig) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::SRCH) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -537,6 +575,10 @@ pub fn become_owner(owner: &Owner) -> Result<(), String> {
     })()
     .map_err(|e| format!("switching to uid {}: {e}", owner.uid))?;
     rustix::thread::set_no_new_privs(true).map_err(|e| format!("no_new_privs: {e}"))?;
+    // Not left to `fs.suid_dumpable`: the owner must not ptrace a process
+    // that holds what root pinned.
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .map_err(|e| format!("making the process non-dumpable: {e}"))?;
     if nix::unistd::geteuid().is_root() || nix::unistd::getuid().is_root() {
         return Err("still root".into());
     }
@@ -618,8 +660,11 @@ pub struct Pinned {
 ///
 /// - its device and inode are those of the dump (the same mounted
 ///   filesystem, e.g. no reboot in between), or
-/// - its owner, group, mode, size, modification and change times are those
-///   of the dump, to the nanosecond. Device numbers change when a
+/// - its device is not that of the dump, or its filesystem does not keep
+///   inode numbers stable (FUSE, network filesystems), and its owner,
+///   group, mode, size, modification and change times (and its birth time,
+///   if the filesystem reported one at the dump) are those of the dump, to
+///   the nanosecond. Device numbers change when a
 ///   filesystem is mounted again, and inode numbers are not stable on every
 ///   filesystem: FUSE filesystems such as sshfs number inodes in the order
 ///   they are looked up, so after a reboot another file may have the old
@@ -645,10 +690,19 @@ pub struct FileAttrs {
     pub size: i64,
     pub mtime: (i64, i64),
     pub ctime: (i64, i64),
+    /// The birth time, where the filesystem reports one (not recorded by
+    /// gpueue 0.1.3 and earlier).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btime: Option<(i64, i64)>,
 }
 
 impl FileAttrs {
-    pub fn of(st: &rustix::fs::Stat) -> Self {
+    /// The attributes of `st` (of the file open as `fd`).
+    pub fn of(fd: impl std::os::fd::AsFd, st: &rustix::fs::Stat) -> Self {
+        let btime = rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::BTIME)
+            .ok()
+            .filter(|x| x.stx_mask & StatxFlags::BTIME.bits() != 0)
+            .map(|x| (x.stx_btime.tv_sec, i64::from(x.stx_btime.tv_nsec)));
         #[allow(clippy::unnecessary_cast)]
         Self {
             uid: st.st_uid,
@@ -657,8 +711,44 @@ impl FileAttrs {
             size: st.st_size as i64,
             mtime: (st.st_mtime as i64, st.st_mtime_nsec as i64),
             ctime: (st.st_ctime as i64, st.st_ctime_nsec as i64),
+            btime,
         }
     }
+
+    /// Whether `now` are these attributes (a birth time recorded at the
+    /// dump must be there and the same).
+    pub fn matches(&self, now: &FileAttrs) -> bool {
+        self.btime.is_none_or(|b| now.btime == Some(b))
+            && FileAttrs {
+                btime: None,
+                ..*self
+            } == FileAttrs {
+                btime: None,
+                ..*now
+            }
+    }
+}
+
+/// Filesystems whose inode numbers may change while a file stays the same
+/// (e.g. FUSE filesystems such as sshfs number inodes in lookup order, and
+/// network filesystems are mounted again after a reboot).
+const RENUMBERING_FS: &[i64] = &[
+    0x6573_5546,           // FUSE
+    0x6969,                // NFS
+    0x517b,                // SMB
+    0xfe53_4d42u32 as i64, // SMB2
+    0xff53_4d42u32 as i64, // CIFS
+    0x0102_1997,           // 9P
+    0x00c3_6400,           // Ceph
+    0x5346_414f,           // AFS
+    0x6b41_4653,           // kAFS
+    0x7375_7245,           // Coda
+];
+
+/// Whether the filesystem of `fd` is one of [`RENUMBERING_FS`].
+fn renumbers_inodes(fd: impl std::os::fd::AsFd) -> bool {
+    #[allow(clippy::unnecessary_cast)]
+    rustix::fs::fstatfs(fd).is_ok_and(|s| RENUMBERING_FS.contains(&(s.f_type as i64)))
 }
 
 /// After a successful dump (nothing of the job runs any more): records the
@@ -681,18 +771,27 @@ pub fn complete_held_files(files: &mut [HeldFile]) {
 /// if it is the same device and inode as at the dump (see
 /// [`complete_held_files`]). May block.
 pub fn held_file_attrs(f: &HeldFile) -> Option<FileAttrs> {
-    open_no_symlinks(&f.path)
-        .and_then(|fd| rustix::fs::fstat(&fd))
-        .ok()
-        .filter(|st| (st.st_dev, st.st_ino) == (f.dev, f.ino))
-        .map(|st| FileAttrs::of(&st))
+    let fd = open_no_symlinks(&f.path).ok()?;
+    let st = rustix::fs::fstat(&fd).ok()?;
+    ((st.st_dev, st.st_ino) == (f.dev, f.ino)).then(|| FileAttrs::of(&fd, &st))
 }
 
 impl HeldFile {
-    /// Whether `st`, found at this path, is this file (see [`HeldFile`]).
-    pub fn is(&self, st: &rustix::fs::Stat) -> bool {
-        (st.st_dev, st.st_ino) == (self.dev, self.ino)
-            || self.attrs.is_some_and(|a| a == FileAttrs::of(st))
+    /// Whether `st`, the file open as `fd` and found at this path, is this
+    /// file (see [`HeldFile`]).
+    pub fn is(&self, fd: impl std::os::fd::AsFd, st: &rustix::fs::Stat) -> bool {
+        if (st.st_dev, st.st_ino) == (self.dev, self.ino) {
+            return true;
+        }
+        let Some(attrs) = &self.attrs else {
+            return false;
+        };
+        // On the same mounted filesystem, one that keeps its inode
+        // numbers, another inode is another file.
+        if st.st_dev == self.dev && !renumbers_inodes(&fd) {
+            return false;
+        }
+        attrs.matches(&FileAttrs::of(&fd, st))
     }
 }
 
@@ -754,6 +853,11 @@ pub struct ProcCreds {
     pub groups: Vec<u32>,
     /// `CapPrm`, `CapEff`, `CapAmb` all zero.
     pub no_caps: bool,
+    /// `CapBnd` zero: the capability bounding set is empty (the shim drops
+    /// it before it becomes the owner).
+    pub no_bounding_caps: bool,
+    /// `NoNewPrivs` set (the shim sets it).
+    pub no_new_privs: bool,
 }
 
 pub fn parse_creds(status: &str) -> Option<ProcCreds> {
@@ -764,14 +868,15 @@ pub fn parse_creds(status: &str) -> Option<ProcCreds> {
     };
     let nums =
         |s: &str| -> Option<Vec<u32>> { s.split_whitespace().map(|n| n.parse().ok()).collect() };
-    let no_caps = ["CapPrm", "CapEff", "CapAmb"]
-        .iter()
-        .all(|c| field(c).is_some_and(|v| u64::from_str_radix(v, 16) == Ok(0)));
+    let zero = |c: &str| field(c).is_some_and(|v| u64::from_str_radix(v, 16) == Ok(0));
+    let no_caps = ["CapPrm", "CapEff", "CapAmb"].iter().all(|c| zero(c));
     Some(ProcCreds {
         uids: nums(field("Uid")?)?,
         gids: nums(field("Gid")?)?,
         groups: nums(field("Groups").unwrap_or(""))?,
         no_caps,
+        no_bounding_caps: zero("CapBnd"),
+        no_new_privs: field("NoNewPrivs") == Some("1"),
     })
 }
 
@@ -852,11 +957,40 @@ fn pin(link: &Path) -> io::Result<OwnedFd> {
 fn check_restored(c: &RestoredCheck) -> VerifyReply {
     let procs = crate::host::ns_processes(Path::new("/proc"), c.init_pid)
         .map_err(|e| format!("listing the restored processes: {e}"))?;
-    check_restored_procs(c, &procs)
+    check_restored_procs(c, &procs, true)
 }
 
-/// [`check_restored`] for the processes `procs` of the job.
-fn check_restored_procs(c: &RestoredCheck, procs: &[u32]) -> VerifyReply {
+/// The threads of process `pid` (by their `status`), without those that
+/// have exited. At least the process itself (its main thread).
+fn thread_statuses(proc_root: &Path, pid: u32) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    if let Ok(tasks) = fs::read_dir(proc_root.join(format!("{pid}/task"))) {
+        for t in tasks.flatten() {
+            let tid = t.file_name().to_string_lossy().into_owned();
+            // Exited meanwhile: the tasks are stopped, but a thread may
+            // have been a zombie already.
+            let Ok(status) = fs::read_to_string(t.path().join("status")) else {
+                continue;
+            };
+            if !is_dead(&status) {
+                out.push((tid, status));
+            }
+        }
+    }
+    if out.is_empty() {
+        let status = fs::read_to_string(proc_root.join(format!("{pid}/status")))
+            .map_err(|e| format!("reading process {pid}: {e}"))?;
+        out.push((pid.to_string(), status));
+    }
+    Ok(out)
+}
+
+/// [`check_restored`] for the processes `procs` of the job. `hardened`
+/// also requires what the shim sets up and an unprivileged test process
+/// cannot: an empty capability bounding set and `no_new_privs` in every
+/// thread. (Whether the namespace init is dumpable is not checked: CRIU
+/// restores it dumpable, whatever it was at the dump.)
+fn check_restored_procs(c: &RestoredCheck, procs: &[u32], hardened: bool) -> VerifyReply {
     let proc_root = Path::new("/proc");
     raise_nofile_limit();
     // CRIU restores a job's zombies (e.g. a `sleep` its shell had not
@@ -888,50 +1022,61 @@ fn check_restored_procs(c: &RestoredCheck, procs: &[u32]) -> VerifyReply {
     // capabilities, the same in every process.
     let mut owner: Option<Owner> = None;
     for &pid in procs {
-        let status = fs::read_to_string(proc_root.join(format!("{pid}/status")))
-            .map_err(|e| format!("reading process {pid}: {e}"))?;
-        let creds = parse_creds(&status).ok_or(format!("process {pid}: unreadable status"))?;
-        if creds.uids.iter().any(|u| *u != c.owner_uid) {
-            problems.push(format!(
-                "process {pid} runs as uids {:?}, not as the owner {}",
-                creds.uids, c.owner_uid
-            ));
-        }
-        let foreign: Vec<u32> = creds
-            .gids
-            .iter()
-            .chain(&creds.groups)
-            .copied()
-            .filter(|g| !c.allowed_gids.contains(g))
-            .collect();
-        if !foreign.is_empty() {
-            problems.push(format!(
-                "process {pid} has groups {foreign:?} that its owner is no longer in"
-            ));
-        }
-        if !creds.no_caps {
-            problems.push(format!("process {pid} has capabilities"));
-        }
         if ns_of(pid).ok().as_ref() != Some(&init_ns) {
             problems.push(format!(
                 "process {pid} is in a mount namespace of its own (not supported)"
             ));
         }
-        let mut groups = creds.groups.clone();
-        groups.sort_unstable();
-        let this = Owner {
-            uid: c.owner_uid,
-            gid: creds.gids.get(1).copied().unwrap_or(u32::MAX),
-            groups,
-        };
-        match &owner {
-            None => owner = Some(this),
-            Some(o) if *o != this => {
+        for (tid, status) in thread_statuses(proc_root, pid)? {
+            let who = if tid == pid.to_string() {
+                format!("process {pid}")
+            } else {
+                format!("thread {tid} of process {pid}")
+            };
+            let creds = parse_creds(&status).ok_or(format!("{who}: unreadable status"))?;
+            if creds.uids.iter().any(|u| *u != c.owner_uid) {
                 problems.push(format!(
-                    "process {pid} has other credentials than the job's init"
+                    "{who} runs as uids {:?}, not as the owner {}",
+                    creds.uids, c.owner_uid
                 ));
             }
-            Some(_) => {}
+            let foreign: Vec<u32> = creds
+                .gids
+                .iter()
+                .chain(&creds.groups)
+                .copied()
+                .filter(|g| !c.allowed_gids.contains(g))
+                .collect();
+            if !foreign.is_empty() {
+                problems.push(format!(
+                    "{who} has groups {foreign:?} that its owner is no longer in"
+                ));
+            }
+            if !creds.no_caps {
+                problems.push(format!("{who} has capabilities"));
+            }
+            if hardened && !creds.no_bounding_caps {
+                problems.push(format!("{who} has a capability bounding set"));
+            }
+            if hardened && !creds.no_new_privs {
+                problems.push(format!(
+                    "{who} may gain privileges (no_new_privs is not set)"
+                ));
+            }
+            let mut groups = creds.groups.clone();
+            groups.sort_unstable();
+            let this = Owner {
+                uid: c.owner_uid,
+                gid: creds.gids.get(1).copied().unwrap_or(u32::MAX),
+                groups,
+            };
+            match &owner {
+                None => owner = Some(this),
+                Some(o) if *o != this => {
+                    problems.push(format!("{who} has other credentials than the job's init"));
+                }
+                Some(_) => {}
+            }
         }
     }
     if !problems.is_empty() {
@@ -992,7 +1137,7 @@ fn check_restored_procs(c: &RestoredCheck, procs: &[u32]) -> VerifyReply {
         if !seen.insert((st.st_dev, st.st_ino, want, deleted, path.clone())) {
             return;
         }
-        let held = !deleted && c.held.iter().any(|h| h.path == path && h.is(&st));
+        let held = !deleted && c.held.iter().any(|h| h.path == path && h.is(&fd, &st));
         objects.push(Pinned {
             what,
             path,
@@ -1088,6 +1233,7 @@ fn raise_nofile_limit() {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
     use std::process::Stdio;
 
     /// Polls `cond` until it holds. The deadline only matters when it never
@@ -1173,10 +1319,42 @@ mod tests {
             held: vec![],
             stop: false,
         };
-        assert_eq!(check_restored_procs(&req, &[parent, zombie]), Ok(vec![]));
+        assert_eq!(
+            check_restored_procs(&req, &[parent, zombie], false),
+            Ok(vec![])
+        );
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(exited.wait().unwrap().success());
+    }
+
+    /// Root's signals to a job's processes go only to processes still in
+    /// the job's PID namespace.
+    #[test]
+    fn signals_only_members_of_the_namespace() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let other = Path::new("pid:[1]");
+        assert_eq!(
+            signal_ns_member(other, pid, rustix::process::Signal::KILL),
+            Ok(false)
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        let ns = gpueue_checkpoint::procfs::pid_ns(Path::new("/proc"), pid).unwrap();
+        assert_eq!(
+            signal_ns_member(&ns, pid, rustix::process::Signal::KILL),
+            Ok(true)
+        );
+        assert!(child.wait().unwrap().signal().is_some());
+        // Gone: not an error.
+        assert_eq!(
+            signal_ns_member(&ns, pid, rustix::process::Signal::KILL),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -1193,6 +1371,17 @@ mod tests {
                 .unwrap();
         assert!(!c.no_caps);
         assert_eq!(parse_creds("Uid:\t1\n"), None);
+        assert!(!c.no_bounding_caps && !c.no_new_privs);
+        let c = parse_creds(&format!(
+            "{status}CapBnd:\t0000000000000000\nNoNewPrivs:\t1\n"
+        ))
+        .unwrap();
+        assert!(c.no_bounding_caps && c.no_new_privs);
+        let c = parse_creds(&format!(
+            "{status}CapBnd:\t000001ffffffffff\nNoNewPrivs:\t0\n"
+        ))
+        .unwrap();
+        assert!(!c.no_bounding_caps && !c.no_new_privs);
 
         assert_eq!(want_of_fd_flags(0o100002, false), Want::ReadWrite);
         assert_eq!(want_of_fd_flags(0o2001, false), Want::Write);
@@ -1359,8 +1548,23 @@ VmFlags: rd ex mr mw me
         };
         // `ns_processes` lists the PID namespace of the init: in a test that
         // is the host's, so restrict it to the child.
-        let check = |req: &RestoredCheck| check_restored_procs(req, &[req.init_pid]);
+        let check = |req: &RestoredCheck| check_restored_procs(req, &[req.init_pid], false);
         assert_eq!(check(&req), Ok(vec![]));
+        // A process the shim did not set up (as a test's child is not): a
+        // bounding set, no `no_new_privs`.
+        // (What the test runner has, its child inherits.)
+        let mine = parse_creds(&fs::read_to_string("/proc/self/status").unwrap()).unwrap();
+        let p = check_restored_procs(&req, &[req.init_pid], true).unwrap();
+        for (what, expected) in [
+            ("bounding set", !mine.no_bounding_caps),
+            ("no_new_privs", !mine.no_new_privs),
+        ] {
+            assert_eq!(
+                p.iter().any(|p| p.contains(what)),
+                expected,
+                "{what}: {p:?}"
+            );
+        }
         // The directory is swapped for a symlink to where it went.
         fs::rename(&dir, tmp.path().join("y")).unwrap();
         std::os::unix::fs::symlink(tmp.path().join("y"), &dir).unwrap();
@@ -1393,6 +1597,18 @@ VmFlags: rd ex mr mw me
         held.held[0].dev += 1;
         held.held[0].ino += 1000;
         assert_eq!(check(&held), Ok(vec![]));
+        // Not on the same device, though, when the filesystem keeps its
+        // inode numbers: another inode there is another file.
+        let mut same_dev = held.clone();
+        same_dev.held[0].dev -= 1;
+        let local = !renumbers_inodes(fs::File::open(&data).unwrap());
+        assert_eq!(!check(&same_dev).unwrap().is_empty(), local);
+        // A birth time recorded at the dump must be the same.
+        if held.held[0].attrs.unwrap().btime.is_some() {
+            let mut born = held.clone();
+            born.held[0].attrs.as_mut().unwrap().btime = Some((1, 0));
+            assert!(!check(&born).unwrap().is_empty());
+        }
         // Another file at that path is not that file, even with the same
         // owner, mode, size and times (renaming it there changed its
         // change time).

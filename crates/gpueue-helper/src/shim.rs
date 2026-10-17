@@ -294,6 +294,15 @@ fn outer(files: &JobFiles) -> Result<i32, Failure> {
         .spawn()
         .map_err(|e| Failure::other(format!("starting the namespace init: {e}")))?;
     let init = Pid::from_raw(init.id() as i32);
+    // All the outer shim does from here on is forward signals to the init
+    // (which runs as the owner by then: CAP_KILL) and write `init-status`
+    // (opened now).
+    let mut init_status = OpenOptions::new().write(true).open(files.init_status());
+    if let Err(e) = keep_only_kill() {
+        // The job runs on regardless; the outer shim is still bounded by
+        // the unit's capability bounding set.
+        eprintln!("gpueue shim: dropping capabilities: {e}");
+    }
 
     let status = loop {
         let Ok(Some(info)) = sfd.read_signal() else {
@@ -313,10 +322,41 @@ fn outer(files: &JobFiles) -> Result<i32, Failure> {
             let _ = kill(init, sig);
         }
     };
-    if let Ok(mut f) = OpenOptions::new().write(true).open(files.init_status()) {
-        let _ = write_status_to(&mut f, &status);
+    if let Ok(f) = init_status.as_mut() {
+        let _ = write_status_to(f, &status);
     }
     Ok(exit_code(status))
+}
+
+/// Drops every capability but `CAP_KILL` (bounding, ambient, inheritable,
+/// permitted and effective sets) and makes the process non-dumpable.
+fn keep_only_kill() -> io::Result<()> {
+    use rustix::thread::{
+        CapabilitySet, CapabilitySets, capabilities, clear_ambient_capability_set,
+        remove_capability_from_bounding_set, set_capabilities,
+    };
+    clear_ambient_capability_set()?;
+    for cap in CapabilitySet::all().iter() {
+        if cap == CapabilitySet::KILL {
+            continue;
+        }
+        match remove_capability_from_bounding_set(cap) {
+            // EINVAL: unknown to this kernel.
+            Ok(()) | Err(rustix::io::Errno::INVAL) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let keep = capabilities(None)?.permitted & CapabilitySet::KILL;
+    set_capabilities(
+        None,
+        CapabilitySets {
+            effective: keep,
+            permitted: keep,
+            inheritable: CapabilitySet::empty(),
+        },
+    )?;
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -952,6 +992,10 @@ fn drop_privileges(spec: &ShimSpec, groups: &[Gid]) -> io::Result<()> {
     // effective capability sets.
     nix::unistd::setresuid(uid, uid, uid)?;
     set_no_new_privs(true)?;
+    // The init keeps files it opened as root (`exit-status`): its owner
+    // must not be able to ptrace it, whatever `fs.suid_dumpable` says.
+    // The job itself is dumpable again once it execs.
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)?;
     if nix::unistd::getuid().is_root() || nix::unistd::geteuid().is_root() {
         return Err(io::Error::other("still root after dropping privileges"));
     }
@@ -959,14 +1003,17 @@ fn drop_privileges(spec: &ShimSpec, groups: &[Gid]) -> io::Result<()> {
 }
 
 /// Open (creating) the log for appending, as the owner, refusing symlinks
-/// and anything that is not a regular file owned by the owner.
+/// and anything that is not a regular file owned by the owner. Opened
+/// without blocking (a FIFO would block the open) and without becoming a
+/// controlling terminal; the job gets it blocking again.
 fn open_log(path: &Path, mode: u32) -> Result<File, Failure> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
     let denied = |e: io::Error| Failure::denied(format!("cannot open log {}: {e}", path.display()));
     let f = OpenOptions::new()
         .append(true)
         .create(true)
         .mode(mode & 0o660)
-        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_NOCTTY).bits())
         .open(path)
         .map_err(denied)?;
     let meta = f.metadata().map_err(denied)?;
@@ -976,6 +1023,12 @@ fn open_log(path: &Path, mode: u32) -> Result<File, Failure> {
             "not a regular file owned by the job's owner",
         )));
     }
+    let flags = fcntl(&f, FcntlArg::F_GETFL).map_err(|e| denied(e.into()))?;
+    fcntl(
+        &f,
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) - OFlag::O_NONBLOCK),
+    )
+    .map_err(|e| denied(e.into()))?;
     // The unit's umask would strip group write; set the mode explicitly.
     use std::os::unix::fs::PermissionsExt;
     f.set_permissions(std::fs::Permissions::from_mode(mode & 0o660))
@@ -1034,6 +1087,23 @@ pub fn run_criu_wrap(root: PathBuf, argv: Vec<String>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FIFO in place of the log does not block the open, and the log the
+    /// job gets is blocking.
+    #[test]
+    fn log_is_a_blocking_regular_file() {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        // Without a reader the open fails at once (ENXIO); with one, the
+        // check refuses it.
+        assert!(open_log(&fifo, 0o640).is_err());
+        let log = open_log(&tmp.path().join("log"), 0o640).unwrap();
+        let flags = OFlag::from_bits_truncate(fcntl(&log, FcntlArg::F_GETFL).unwrap());
+        assert!(!flags.contains(OFlag::O_NONBLOCK), "{flags:?}");
+        assert!(flags.contains(OFlag::O_APPEND), "{flags:?}");
+    }
 
     /// Prints the SigBlk and SigIgn lines of the shell's own status with
     /// builtins only: no fork, and no external tool (the NixOS test VM has
