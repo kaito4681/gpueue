@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -42,6 +42,7 @@ use gpueue_protocol::helper::{
 use tokio::sync::{Notify, Semaphore, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::clock::Clock;
 use crate::config::Config;
 use crate::error::{ApiResult, Failure};
 use crate::gpu::DetectedGpu;
@@ -51,14 +52,6 @@ use crate::limits::{MAX_STREAMS_PER_UID, UidLimiter};
 use crate::logfile;
 use crate::usage::SizeWarnings;
 use crate::users::UserDb;
-
-/// Current time in Unix epoch milliseconds.
-pub fn now_ms() -> Timestamp {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as Timestamp)
-        .unwrap_or(0)
-}
 
 /// The reason recorded for a dump the helper refused before touching the
 /// job (`code: checkpoint_refused`).
@@ -568,9 +561,15 @@ pub struct Core {
     launches_paused_until: Mutex<Option<tokio::time::Instant>>,
     /// Checkpoint size warnings (see [`crate::usage`]).
     pub(crate) size_warnings: Mutex<SizeWarnings>,
+    /// Where state changes, billing and reminders take the time from.
+    pub(crate) clock: Arc<dyn Clock>,
+    /// Failed attempts of [`Core::retry_storage`] so far.
+    #[cfg(test)]
+    storage_failures: AtomicU64,
 }
 
 impl Core {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         store: Store,
@@ -579,6 +578,7 @@ impl Core {
         detected_gpus: HashMap<GpuIndex, DetectedGpu>,
         gpu_detection: GpuDetectionStatus,
         trust_uid_header: bool,
+        clock: Arc<dyn Clock>,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         let (changes, _) = watch::channel(0);
@@ -616,7 +616,15 @@ impl Core {
             launch_check_hook: Mutex::new(None),
             launches_paused_until: Mutex::new(None),
             size_warnings: Mutex::default(),
+            clock,
+            #[cfg(test)]
+            storage_failures: AtomicU64::new(0),
         })
+    }
+
+    /// The current time in Unix epoch milliseconds (see [`Clock`]).
+    pub fn now_ms(&self) -> Timestamp {
+        self.clock.now_ms()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
@@ -1407,7 +1415,7 @@ impl Core {
         launched: JobState,
     ) -> ApiResult<bool> {
         let core = self.clone();
-        let now = now_ms();
+        let now = self.now_ms();
         self.write(move |tx, ch| {
             let Some(mut job) = tx.get_job(id)? else {
                 return Ok(false);
@@ -1676,7 +1684,7 @@ impl Core {
         reason: String,
     ) -> ApiResult<Option<Job>> {
         let core = self.clone();
-        let now = now_ms();
+        let now = self.now_ms();
         self.write(move |tx, ch| {
             let Some(mut job) = tx.get_job(id)? else {
                 return Ok(None);
@@ -1967,7 +1975,7 @@ impl Core {
         P: FnOnce(&dyn StoreOps, &Job) -> Result<(), StorageError> + Send + 'static,
     {
         let core = self.clone();
-        let now = now_ms();
+        let now = self.now_ms();
         let result = self
             .write(move |tx, ch| {
                 let Some(mut job) = tx.get_job(id)? else {
@@ -2038,7 +2046,7 @@ impl Core {
                 self.try_handle_event(job, None, move |_| event, mark).await
             }
             hp::Event::CheckpointFinished { job, outcome } => {
-                let now = now_ms();
+                let now = self.now_ms();
                 let succeeded = matches!(outcome, CheckpointOutcome::Success { .. });
                 // `late`: how the outcome applies to a job whose checkpoint
                 // request was taken for lost (see `abandoned_checkpoints`).
@@ -2398,6 +2406,8 @@ impl Core {
             match attempt().await {
                 Ok(value) => return Some(value),
                 Err(e) => {
+                    #[cfg(test)]
+                    self.storage_failures.fetch_add(1, Ordering::SeqCst);
                     tracing::error!("cannot {what} (trying again in {delay:?}): {}", e.0.message)
                 }
             }
@@ -2671,7 +2681,7 @@ impl Core {
 
     pub async fn schedule_once(self: &Arc<Self>) -> ApiResult<()> {
         let launch = !self.is_shutting_down() && self.helper_ready() && !self.launches_paused();
-        let now = now_ms();
+        let now = self.now_ms();
         let core = self.clone();
         let launched = self
             .write(move |tx, ch| {
@@ -2832,7 +2842,7 @@ impl Core {
     pub async fn stop_launches(self: &Arc<Self>, wait: Duration) {
         self.launches_stopped.cancel();
         let core = self.clone();
-        let now = now_ms();
+        let now = self.now_ms();
         let result = self
             .write(move |tx, ch| {
                 // Under the database lock: a scheduling pass has either
@@ -2909,7 +2919,7 @@ impl Core {
             return;
         };
         let core = self.clone();
-        let now = now_ms();
+        let now = self.now_ms();
         let result = self
             .write(move |tx, ch| {
                 let Some(mut job) = tx.get_job(id)? else {
@@ -3081,7 +3091,7 @@ impl Core {
 
     async fn checkpoint_for_shutdown(self: &Arc<Self>, id: JobId) -> ApiResult<()> {
         let core = self.clone();
-        let now = now_ms();
+        let now = self.now_ms();
         let done = self
             .write(move |tx, ch| {
                 let Some(mut job) = tx.get_job(id)? else {
@@ -3134,6 +3144,7 @@ mod tests {
                 gpus: Vec::new(),
             },
             false,
+            Arc::new(crate::clock::SystemClock),
         )
     }
 
