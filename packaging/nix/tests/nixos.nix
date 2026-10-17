@@ -71,7 +71,13 @@ pkgs.testers.runNixOSTest {
         s = next(j for j in jobs if j["id"] == int(job_id))["state"]
         return "/".join([s["state"]] + ([s["result"]] if "result" in s else []))
 
-    def wait_state(job_id, prefix, timeout=60):
+    # Upper bounds, in seconds, for retry(); they only matter when something
+    # is wrong (a poll returns as soon as its condition holds), so they are
+    # generous for a loaded CI runner. Checkpoint and restore take longer.
+    WAIT = 300
+    WAIT_CRIU = 600
+
+    def wait_state(job_id, prefix, timeout=WAIT):
         def check(_):
             s = state(job_id)
             machine.log(f"job {job_id}: {s}")
@@ -87,7 +93,7 @@ pkgs.testers.runNixOSTest {
         return int(lines[-1]) if lines else -1
 
     def wait_counting(job_id, after):
-        retry(lambda _: last_count(job_id) > after, 60)
+        retry(lambda _: last_count(job_id) > after, WAIT)
 
     base = machine.succeed("readlink -f /run/current-system").strip()
 
@@ -128,10 +134,10 @@ pkgs.testers.runNixOSTest {
         wait_state(job, "running")
         wait_counting(job, 5)
         pz("alice", f"checkpoint {job}")
-        wait_state(job, "checkpointed", 120)
+        wait_state(job, "checkpointed", WAIT_CRIU)
         before = last_count(job)
         pz("alice", f"restore {job}")
-        wait_state(job, "running", 120)
+        wait_state(job, "running", WAIT_CRIU)
         wait_counting(job, before)
         pz("alice", f"kill {job}")
         wait_state(job, "done")
@@ -143,7 +149,7 @@ pkgs.testers.runNixOSTest {
             machine.succeed("systemctl daemon-reload")
             machine.succeed("systemctl restart gpueue-helper.service")
             machine.wait_for_unit("gpueue-helper.service")
-            retry(lambda _: "helper: connected" in machine.succeed("gpueue doctor 2>&1 || true"), 60)
+            retry(lambda _: "helper: connected" in machine.succeed("gpueue doctor 2>&1 || true"), WAIT)
 
         machine.succeed(f"mkdir -p {dropin}")
         machine.succeed(
@@ -157,7 +163,7 @@ pkgs.testers.runNixOSTest {
         root = f"/nix/var/nix/gcroots/gpueue/job-{job}"
         assert machine.succeed(f"readlink {root}").strip() == "${gpueueOld}"
         pz("alice", f"checkpoint {job}")
-        wait_state(job, "checkpointed", 120)
+        wait_state(job, "checkpointed", WAIT_CRIU)
         before = last_count(job)
         # Back to the system's helper, then collect everything unrooted.
         machine.succeed(f"rm -r {dropin}")
@@ -165,7 +171,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("nix-collect-garbage -d")
         machine.succeed("test -x ${gpueueOld}/bin/gpueue-helper")
         pz("alice", f"restore {job}")
-        wait_state(job, "running", 120)
+        wait_state(job, "running", WAIT_CRIU)
         wait_counting(job, before)
         pz("alice", f"kill {job}")
         wait_state(job, "done")

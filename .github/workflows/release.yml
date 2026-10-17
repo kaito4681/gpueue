@@ -22,6 +22,7 @@ jobs:
   # the .deb would ship the test APT archive key (scripts/dist/gen-apt-key.sh).
   check-signing:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
       HAVE_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY != '' }}
@@ -69,6 +70,7 @@ jobs:
   # Native builds per architecture (the helper embeds C code, so no cross
   # compiling): the tarball, the .deb and the .rpm, with their checksums.
   build:
+    timeout-minutes: 60
     strategy:
       matrix:
         include:
@@ -98,12 +100,7 @@ jobs:
       # The job runs as root in the container; the helper's tests refuse
       # root, so they run as an unprivileged user.
       - name: Test
-        run: |
-          useradd -m builder
-          chown -R builder: .
-          runuser -u builder -- env PATH="$PATH" RUSTUP_HOME="$RUSTUP_HOME" \
-            CARGO_HOME=/home/builder/.cargo CARGO_TARGET_DIR=/home/builder/target \
-            cargo test --workspace --locked
+        run: scripts/dist/test-unprivileged.sh
       - run: cargo build --release --locked -p gpueue -p gpueue-helper
       - name: Package
         run: |
@@ -143,6 +140,7 @@ jobs:
   sign-rpm:
     needs: [check-signing, build]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
@@ -224,6 +222,7 @@ jobs:
   release:
     needs: [check-signing, build, sign-rpm, vm-test]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     # gh release create/upload (with GH_TOKEN; the checkout keeps no token).
     permissions:
       contents: write
