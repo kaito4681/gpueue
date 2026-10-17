@@ -24,6 +24,7 @@ fn core_with(helper: FakeHelper, config: Config, store: Store) -> Arc<Core> {
             gpus: Vec::new(),
         },
         false,
+        Arc::new(crate::clock::SystemClock),
     )
 }
 
@@ -114,11 +115,10 @@ async fn an_event_that_cannot_be_recorded_is_retried_not_acknowledged() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gpueue.db");
     let helper = FakeHelper::new();
-    let core = core_with(
-        helper.clone(),
-        Config::default(),
-        Store::open(&path).unwrap(),
-    );
+    let store = Store::open(&path).unwrap();
+    // Attempts fail soon rather than after the default 5 s.
+    store.set_busy_timeout(Duration::from_millis(100)).unwrap();
+    let core = core_with(helper.clone(), Config::default(), store);
     let job = live_job(&core, &helper, JobState::Running).await;
     start(&core).await;
 
@@ -137,13 +137,17 @@ async fn an_event_that_cannot_be_recorded_is_retried_not_acknowledged() {
     });
     is_locked.recv().unwrap();
     helper.exit(job.id, 0);
-    // The first attempt fails after the busy timeout (5 s).
-    tokio::time::sleep(Duration::from_millis(6000)).await;
+    // Attempts fail after the busy timeout, and are repeated.
+    eventually("recording the event failed twice", || async {
+        core.storage_failures.load(Ordering::SeqCst) >= 2
+    })
+    .await;
     assert_eq!(
         helper.unacked().len(),
         1,
         "not acknowledged while unrecorded"
     );
+    assert_eq!(job_state(&core, job.id).await, JobState::Running);
     release.send(()).unwrap();
     blocker.join().unwrap();
 
@@ -211,7 +215,7 @@ async fn a_dump_outcome_after_the_request_was_taken_for_lost_is_applied() {
                 let core = core.clone();
                 move |tx, ch| {
                     let mut job = tx.get_job(id)?.unwrap();
-                    core.apply_in_tx(tx, &mut job, &t, now_ms(), ch)?;
+                    core.apply_in_tx(tx, &mut job, &t, core.now_ms(), ch)?;
                     Ok(job)
                 }
             })
@@ -455,7 +459,11 @@ async fn a_pass_that_waited_for_the_database_respects_a_new_launch_pause() {
 /// Finding: the SIGKILL that `kill` sends after the grace period found its
 /// run by `started_at` alone, which a restore keeps, so it could kill the
 /// job's next run. It is now tied to the launch of the process too.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// On paused tokio time: the test's sleep ends only once the kill timer has
+/// fired and done its work (time does not move on while the timer's
+/// database read runs on the blocking pool).
+#[tokio::test(start_paused = true)]
 async fn the_kill_timer_spares_the_next_run_after_a_restore() {
     for restored in [false, true] {
         let helper = FakeHelper::new();
@@ -472,7 +480,8 @@ async fn the_kill_timer_spares_the_next_run_after_a_restore() {
                 .settle_on_drop(job.id)
                 .finish(LaunchOutcome::Done);
         }
-        tokio::time::sleep(Duration::from_millis(1600)).await;
+        // Past the 1 s grace period.
+        tokio::time::sleep(Duration::from_secs(2)).await;
         let killed = helper.signals().contains(&(job.id, signal::SIGKILL));
         assert_eq!(killed, !restored, "restored: {restored}");
         core.cancel.cancel();

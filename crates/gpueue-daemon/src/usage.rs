@@ -169,11 +169,12 @@ impl Core {
 
     fn reminded_recently(&self, uid: Uid) -> bool {
         let interval = Duration::from_secs(self.config.checkpoint_size_warning_interval_secs);
+        let now = self.clock.instant();
         let state = self.size_warnings.lock().unwrap_or_else(|e| e.into_inner());
         state
             .reminded
             .get(&uid)
-            .is_some_and(|at| at.elapsed() < interval)
+            .is_some_and(|at| now.saturating_duration_since(*at) < interval)
     }
 
     /// Records that the size warnings among `delivered` reached `uid`.
@@ -187,8 +188,9 @@ impl Core {
         if !delivered.iter().any(is_size_warning) {
             return;
         }
+        let now = self.clock.instant();
         let mut state = self.size_warnings.lock().unwrap_or_else(|e| e.into_inner());
-        state.reminded.insert(uid, Instant::now());
+        state.reminded.insert(uid, now);
         if let Some(pending) = state.owners.get_mut(&uid) {
             pending.retain(|w| !delivered.contains(w));
             if pending.is_empty() {

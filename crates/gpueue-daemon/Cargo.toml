@@ -44,6 +44,8 @@ tower-service.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
+# Paused time in the unit tests (`start_paused`).
+tokio = { workspace = true, features = ["test-util"] }
 # Enables the test-only feature for this crate's own tests.
 gpueue-daemon = { path = ".", features = ["test-uid-header"] }
 tempfile.workspace = true

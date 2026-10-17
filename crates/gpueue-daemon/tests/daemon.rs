@@ -11,8 +11,8 @@ use gpueue_core::model::{GpuIndex, JobId, JobResult, JobSpec, JobState, Uid};
 use gpueue_daemon::api::TEST_UID_HEADER;
 use gpueue_daemon::helper::FakeOutcome;
 use gpueue_daemon::{
-    Config, Daemon, DaemonOptions, DetectedGpu, FakeHelper, FallbackGpuDetector, GpuDetector,
-    LaunchCheckHook, StaticGpuDetector, StaticUserDb,
+    Clock, Config, Daemon, DaemonOptions, DetectedGpu, FakeHelper, FallbackGpuDetector,
+    GpuDetector, LaunchCheckHook, ManualClock, StaticGpuDetector, StaticUserDb, SystemClock,
 };
 use gpueue_protocol::BINARY_VERSION;
 use gpueue_protocol::api::{
@@ -31,7 +31,16 @@ use tokio::sync::{mpsc, oneshot};
 
 const ALICE: u32 = 1000;
 const BOB: u32 = 1001;
-const ADMIN: u32 = 500;
+
+/// The administrator: 500, unless that is the uid running the tests (see
+/// [`me`]), who must not be an administrator.
+fn admin() -> u32 {
+    if nix::unistd::getuid().as_raw() == 500 {
+        501
+    } else {
+        500
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test client
@@ -206,6 +215,8 @@ fn done(result: JobResult) -> JobState {
 struct Harness {
     dir: tempfile::TempDir,
     helper: FakeHelper,
+    /// The daemon's clock, kept across restarts.
+    clock: Arc<dyn Clock>,
     daemon: Option<Daemon>,
     /// `checkpoint_size_limit_bytes` and
     /// `checkpoint_size_warning_interval_secs` of the next start.
@@ -225,11 +236,24 @@ impl Harness {
     }
 
     async fn with_gpus(detector: impl GpuDetector) -> Self {
+        Self::with_clock(detector, Arc::new(SystemClock)).await
+    }
+
+    /// A daemon without GPUs whose clock stands still until advanced, so
+    /// that billed run time is exact.
+    async fn with_manual_clock() -> (Self, ManualClock) {
+        let clock = ManualClock::new();
+        let h = Self::with_clock(StaticGpuDetector::anonymous(0), Arc::new(clock.clone())).await;
+        (h, clock)
+    }
+
+    async fn with_clock(detector: impl GpuDetector, clock: Arc<dyn Clock>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let helper = FakeHelper::new();
         let mut harness = Self {
             dir,
             helper,
+            clock,
             daemon: None,
             checkpoint_limit: None,
             warning_interval_secs: Config::default().checkpoint_size_warning_interval_secs,
@@ -263,8 +287,9 @@ impl Harness {
         let daemon = Daemon::start(DaemonOptions {
             config: self.config(),
             helper: Arc::new(self.helper.clone()),
-            users: Arc::new(StaticUserDb::with_admins([ADMIN])),
+            users: Arc::new(StaticUserDb::with_admins([admin()])),
             gpus: Arc::new(detector),
+            clock: self.clock.clone(),
             trust_uid_header: true,
         })
         .await
@@ -325,6 +350,31 @@ impl Harness {
         );
     }
 
+    /// Waits until the daemon has reconciled with the helper's current
+    /// session.
+    async fn wait_reconciled(&self) {
+        let daemon = self.daemon.as_ref().unwrap();
+        for _ in 0..250 {
+            if daemon.helper_ready() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the daemon never reconciled with the helper");
+    }
+
+    /// Waits until the daemon has applied and acknowledged every event the
+    /// fake helper emitted.
+    async fn wait_events_acknowledged(&self) {
+        for _ in 0..250 {
+            if self.helper.unacked().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("unacknowledged events: {:?}", self.helper.unacked());
+    }
+
     /// The job's process exits with `code` (once it has been spawned).
     async fn exit(&self, id: JobId, code: i32) {
         self.wait_spawned(id).await;
@@ -333,7 +383,7 @@ impl Harness {
 
     async fn set_default_parallel(&self, parallel: u32) {
         let reply = self
-            .client(ADMIN)
+            .client(admin())
             .call(
                 Method::PUT,
                 "/v1/groups/default/parallel",
@@ -398,7 +448,7 @@ async fn add_start_exit_status_and_log() {
         "{raw}"
     );
     let secret = BTreeMap::from([("SECRET".to_owned(), "hunter2".to_owned())]);
-    for caller in [ALICE, ADMIN] {
+    for caller in [ALICE, admin()] {
         let view = h.client(caller).job(id).await;
         assert_eq!(view.details.unwrap().envs.as_ref(), Some(&secret));
     }
@@ -428,12 +478,23 @@ async fn add_start_exit_status_and_log() {
     h.stop().await;
 }
 
-/// The uid running the tests: the daemon only reads logs owned by the
-/// job's owner, so jobs whose logs the tests write belong to it.
+/// The owner of the jobs whose logs the tests write (see [`write_log`]):
+/// the daemon only reads logs owned by the job's owner. The uid running the
+/// tests, or, since jobs cannot run as root, [`ALICE`] when that is root.
 fn me() -> u32 {
-    let uid = nix::unistd::getuid().as_raw();
-    assert!(uid != 0 && uid != ADMIN, "run the tests as a regular user");
-    uid
+    match nix::unistd::getuid().as_raw() {
+        0 => ALICE,
+        uid => uid,
+    }
+}
+
+/// Writes the log of a job of [`me`] at `path`, owned by [`me`].
+fn write_log(path: &Path, content: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+    if nix::unistd::getuid().is_root() {
+        std::os::unix::fs::chown(path, Some(me()), None).unwrap();
+    }
 }
 
 /// Someone who is neither [`me`] nor an administrator.
@@ -450,8 +511,7 @@ async fn finished_job_with_log(h: &Harness, content: &str) -> (JobId, PathBuf) {
     h.exit(id, 0).await;
     owner.wait_state(id, &done(JobResult::Success)).await;
     let log = h.dir.path().join(format!("logs/{}/{id}.log", me()));
-    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-    std::fs::write(&log, content).unwrap();
+    write_log(&log, content);
     (id, log)
 }
 
@@ -475,7 +535,7 @@ async fn logs_are_raw_bytes_for_the_owner_only() {
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert_eq!(reply.error().code, ErrorCode::PermissionDenied);
     let reply = h
-        .client(ADMIN)
+        .client(admin())
         .get(&format!("/v1/jobs/{id}/log?tail=1"))
         .await;
     assert_eq!(&reply.body[..], b"three\n");
@@ -525,8 +585,7 @@ async fn log_follow_streams_appended_output() {
     let id = alice.add(&job_request("train", &[])).await;
     alice.wait_state(id, &JobState::Running).await;
     let log = h.dir.path().join(format!("logs/{}/{id}.log", me()));
-    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-    std::fs::write(&log, "start\n").unwrap();
+    write_log(&log, "start\n");
 
     let response = alice
         .open(Method::GET, &format!("/v1/jobs/{id}/log?follow=true"), None)
@@ -601,7 +660,7 @@ async fn gpu_slots_are_shared_across_users() {
         .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     let reply = h
-        .client(ADMIN)
+        .client(admin())
         .call(
             Method::PUT,
             "/v1/gpus/parallel",
@@ -622,7 +681,7 @@ async fn other_users_see_redacted_jobs_and_cannot_touch_them() {
     let mut h = Harness::new(1).await;
     let alice = h.client(ALICE);
     let bob = h.client(BOB);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
 
     // Bob watches the event stream, and so does alice.
     let response = bob.open(Method::GET, "/v1/events", None).await;
@@ -803,6 +862,8 @@ async fn failed_checkpoint_terminates_the_job_while_holding_its_gpu() {
     h.helper
         .set_checkpoint_outcome(FakeOutcome::Fail("criu: tcp connection".to_owned()));
     h.helper.set_ignore_sigterm(true);
+    // The job stays terminating until the SIGKILL is let through.
+    h.helper.hold_kills();
 
     let id = alice.add(&job_request("train", &[0])).await;
     alice.wait_state(id, &JobState::Running).await;
@@ -836,6 +897,18 @@ async fn failed_checkpoint_terminates_the_job_while_holding_its_gpu() {
     );
 
     // SIGTERM is ignored; SIGKILL follows after the 1 s grace period.
+    h.helper.wait_held_kills(1).await;
+    assert_eq!(
+        alice.job(id).await.state,
+        JobState::Terminating {
+            result: reason.clone()
+        }
+    );
+    assert!(matches!(
+        alice.job(waiting).await.state,
+        JobState::Queued { .. }
+    ));
+    h.helper.release_kills();
     let job = alice.wait_state(id, &done(reason)).await;
     assert_eq!(
         job.details.unwrap().last_error.as_deref(),
@@ -910,7 +983,7 @@ async fn a_checkpoint_a_stopping_helper_refuses_can_be_retried() {
 async fn refused_checkpoint_fails_the_command_and_leaves_the_job_running() {
     let mut h = Harness::new(1).await;
     let alice = h.client(ALICE);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let id = alice.add(&job_request("train", &[0])).await;
     admin.wait_state(id, &JobState::Running).await;
     h.wait_spawned(id).await;
@@ -1419,7 +1492,10 @@ async fn shutdown_leaves_jobs_whose_checkpoint_is_refused_running() {
                 .set_checkpoint_outcome(FakeOutcome::Refuse("hidden mount /run/x".to_owned()));
         }
 
-        let reply = h.client(ADMIN).post("/v1/daemon/shutdown", json!({})).await;
+        let reply = h
+            .client(admin())
+            .post("/v1/daemon/shutdown", json!({}))
+            .await;
         assert_eq!(reply.status, StatusCode::ACCEPTED);
         let daemon = h.daemon.take().unwrap();
         // Without retrying the refused job until the settle wait (11 s)
@@ -1495,7 +1571,7 @@ async fn failed_os_shutdown_dumps_end_as_checkpoint_failed_after_the_reboot() {
     h.start(0).await;
     let alice = h.client(ALICE);
     // Polled as the admin: the owner's requests would take the warnings.
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     for (id, reason) in [
         (failed, "criu: tcp connection (CRIU log: /x.log)"),
         (refused, "checkpoint refused: hidden mount /run/x"),
@@ -1541,7 +1617,10 @@ async fn shutdown_checkpoints_running_jobs_then_stops() {
     stashed.stashed = true;
     let untouched = alice.add(&stashed).await;
 
-    let reply = h.client(ADMIN).post("/v1/daemon/shutdown", json!({})).await;
+    let reply = h
+        .client(admin())
+        .post("/v1/daemon/shutdown", json!({}))
+        .await;
     assert_eq!(reply.status, StatusCode::ACCEPTED);
     let daemon = h.daemon.take().unwrap();
     tokio::time::timeout(Duration::from_secs(10), daemon.shutdown_requested())
@@ -1659,7 +1738,7 @@ async fn dependencies_are_own_jobs_and_recorded_once() {
     let bobs = bob.add(&stashed).await;
     request.spec.dependencies = vec![bobs];
     request.stashed = true;
-    h.client(ADMIN).add(&request).await;
+    h.client(admin()).add(&request).await;
 
     let alices = alice.add(&stashed).await;
     request.spec.dependencies = vec![alices, alices, bobs, alices];
@@ -1677,7 +1756,7 @@ async fn dependencies_are_own_jobs_and_recorded_once() {
 async fn validation_versions_groups_and_bulk_operations() {
     let mut h = Harness::new(1).await;
     let alice = h.client(ALICE);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
 
     // Unknown dependency, GPU, group; relative cwd; root.
     let mut request = job_request("x", &[]);
@@ -1854,7 +1933,7 @@ async fn undetected_gpus_are_kept_but_start_nothing() {
     let mut h = Harness::with_gpus(StaticGpuDetector(vec![a100(0), a100(1)])).await;
     h.set_default_parallel(4).await;
     let alice = h.client(ALICE);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
 
     let listed = gpus(&alice).await.gpus;
     assert_eq!(listed.len(), 2);
@@ -1945,7 +2024,7 @@ async fn version_reports_how_gpus_were_detected() {
     assert_eq!(version.gpu_detection.unwrap().nvml_error, None);
     assert_eq!(version.orphan_jobs, None);
     assert!(version.helper.programs.is_empty());
-    let version: VersionResponse = h.client(ADMIN).get("/v1/version").await.json();
+    let version: VersionResponse = h.client(admin()).get("/v1/version").await.json();
     assert!(version.orphan_jobs.is_some());
     let detection = version.gpu_detection.expect("reported");
     assert_eq!(detection.source, GpuSource::Config);
@@ -2003,7 +2082,7 @@ async fn owner_is_warned_once_about_a_failed_checkpoint() {
     let mut h = Harness::new(1).await;
     let alice = h.client(ALICE);
     let bob = h.client(BOB);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     h.helper
         .set_checkpoint_outcome(FakeOutcome::Fail("criu: tcp connection".to_owned()));
 
@@ -2062,8 +2141,15 @@ const CAROL: u32 = 1002;
 impl Harness {
     /// A daemon with a checkpoint size limit of [`LIMIT`].
     async fn with_limit(warning_interval_secs: u64) -> Self {
+        Self::with_limit_and_clock(warning_interval_secs, Arc::new(SystemClock)).await
+    }
+
+    /// [`Harness::with_limit`] with the daemon taking the time from
+    /// `clock`.
+    async fn with_limit_and_clock(warning_interval_secs: u64, clock: Arc<dyn Clock>) -> Self {
         let mut h = Harness::new(1).await;
         h.stop().await;
+        h.clock = clock;
         h.checkpoint_limit = Some(LIMIT);
         h.warning_interval_secs = warning_interval_secs;
         h.start(1).await;
@@ -2118,7 +2204,7 @@ async fn checkpoints_over_the_size_limit_warn_owners_and_admins() {
     let mut h = Harness::with_limit(3600).await;
     let alice = h.client(ALICE);
     let bob = h.client(BOB);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
 
     // Under the limit: nobody is warned.
     let first = h.checkpoint_as(ALICE).await;
@@ -2166,25 +2252,32 @@ async fn checkpoints_over_the_size_limit_warn_owners_and_admins() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admins_are_reminded_once_per_interval() {
-    let mut h = Harness::with_limit(1).await;
-    let admin = h.client(ADMIN);
+    // The reminders' clock stands still but where the test advances it.
+    let clock = ManualClock::new();
+    let mut h = Harness::with_limit_and_clock(1, Arc::new(clock.clone())).await;
+    let admin = h.client(admin());
 
     h.checkpoint_as(ALICE).await;
     h.checkpoint_as(ALICE).await;
     assert_eq!(next_warnings(&admin).await, [usage(8192)]);
     assert!(admin.get("/v1/jobs").await.warnings().is_empty());
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    clock.advance(Duration::from_millis(999));
+    assert!(admin.get("/v1/jobs").await.warnings().is_empty());
+    clock.advance(Duration::from_millis(1));
     assert_eq!(admin.get("/v1/jobs").await.warnings(), [usage(8192)]);
     assert!(admin.get("/v1/jobs").await.warnings().is_empty());
 
     // An administrator's own checkpoint: the owner warning carries the same
-    // numbers, so no separate reminder comes with it.
-    let own = h.checkpoint_as(ADMIN).await;
-    // The admin's own requests above may have taken a reminder; wait until
-    // another one would be due (which also lets the daemon queue the owner
-    // warning after recording the image).
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert_eq!(next_warnings(&admin).await, [over_limit(own, 12288)]);
+    // numbers, so no separate reminder comes with it, although one is due.
+    let own = h.checkpoint_as(admin.uid).await;
+    // The daemon queues the owner warning while it applies the dump's
+    // outcome, which it acknowledges to the helper afterwards.
+    h.wait_events_acknowledged().await;
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(
+        admin.get("/v1/jobs").await.warnings(),
+        [over_limit(own, 12288)]
+    );
     assert!(admin.get("/v1/jobs").await.warnings().is_empty());
 
     h.stop().await;
@@ -2194,7 +2287,7 @@ async fn admins_are_reminded_once_per_interval() {
 async fn no_size_warnings_without_a_limit() {
     let mut h = Harness::new(1).await;
     h.set_default_parallel(8).await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     h.checkpoint_as(ALICE).await;
     h.checkpoint_as(ALICE).await;
     assert!(admin.get("/v1/jobs").await.warnings().is_empty());
@@ -2220,7 +2313,7 @@ impl Harness {
 
     /// Runs a job of alice and checkpoints it.
     async fn checkpointed_job(&self) -> JobId {
-        let admin = self.client(ADMIN);
+        let admin = self.client(admin());
         let id = self.client(ALICE).add(&job_request("train", &[])).await;
         admin.wait_state(id, &JobState::Running).await;
         admin.action(id, "checkpoint", json!(null)).await;
@@ -2236,7 +2329,7 @@ fn last_error(job: &JobView) -> Option<&str> {
 /// Waits (polling as the admin, so the owner's warning stays pending) until
 /// the job is checkpointed again with `reason`.
 async fn wait_restore_error(h: &Harness, id: JobId, reason: &str) -> JobView {
-    h.client(ADMIN)
+    h.client(admin())
         .wait_for(id, "checkpointed with the reason", |j| {
             j.state == JobState::Checkpointed && last_error(j) == Some(reason)
         })
@@ -2253,7 +2346,7 @@ async fn restore_failure_without_a_checkpoint_record_is_kept() {
     h.stop().await;
     assert!(h.store().delete_checkpoint(id).unwrap());
     h.start(0).await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
 
     let reason = "criu restore failed (unit inactive)";
     h.helper
@@ -2303,7 +2396,7 @@ async fn restore_failure_without_a_checkpoint_record_is_kept() {
 async fn restore_refused_by_the_helper_keeps_the_reason() {
     let mut h = Harness::new(0).await;
     let id = h.checkpointed_job().await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
 
     // The helper's up-front checks (GPU compatibility, missing mounts, ...)
     // refuse the request itself.
@@ -2480,7 +2573,14 @@ async fn spawns_refused_by_a_stopping_helper_are_requeued() {
         ids.push(alice.add(&job_request(&format!("j{i}"), &[])).await);
     }
     // Refused and put back in line, not failed...
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !ids
+        .iter()
+        .all(|id| h.helper.stopping_refusals().contains(id))
+    {
+        assert!(tokio::time::Instant::now() < deadline, "not all refused");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     for &id in &ids {
         let state = alice.job(id).await.state;
         assert!(
@@ -2600,50 +2700,71 @@ async fn a_spawn_refused_by_a_stopping_helper_is_queued_until_retried() {
     h.stop().await;
 }
 
+/// Two spawn requests are cut off by a helper restart: the restarted
+/// helper re-discovers the job the old one had started, and never got the
+/// other request. Their failures (`ConnectionLost`) reach the daemon
+/// before it reconciles with the new helper, or after.
+///
+/// A request cut off by a disconnect never reaches the next helper: the
+/// connection's pending requests fail for good when it breaks. (The fake
+/// helper used to let such a request through once the next session had
+/// started, which answered the re-discovered job's spawn with "already
+/// running" and failed it.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawns_cut_off_by_a_helper_restart_are_resolved_not_lost() {
-    let mut h = Harness::new(0).await;
-    h.set_default_parallel(2).await;
-    let alice = h.client(ALICE);
-    h.helper.hold_launches();
-    let started = alice.add(&job_request("started", &[])).await;
-    let never = alice.add(&job_request("never", &[])).await;
-    h.helper.wait_held(2).await;
+    for lost_before_reconnect in [true, false] {
+        let mut h = Harness::new(0).await;
+        h.set_default_parallel(2).await;
+        let alice = h.client(ALICE);
+        h.helper.hold_launches();
+        let started = alice.add(&job_request("started", &[])).await;
+        let never = alice.add(&job_request("never", &[])).await;
+        h.helper.wait_held(2).await;
 
-    // The helper restarts while both requests are in flight: the answers
-    // are lost. It had started one job (and re-discovers its unit); the
-    // other request never reached it.
-    h.helper.disconnect();
-    h.helper.lose_held_launches();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    h.helper.insert_running(started);
-    h.helper.reconnect();
+        // The helper restarts while both requests are in flight: the
+        // answers are lost. It had started one job (and re-discovers its
+        // unit); the other request never reached it.
+        h.helper.disconnect();
+        if lost_before_reconnect {
+            h.helper.lose_held_launches();
+            h.helper.wait_held(0).await;
+        }
+        h.helper.insert_running(started);
+        h.helper.reconnect();
+        if !lost_before_reconnect {
+            h.wait_reconciled().await;
+            h.helper.lose_held_launches();
+        }
 
-    // The job it never started goes back in line and is started again.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !h.helper.is_running(never) {
-        assert!(tokio::time::Instant::now() < deadline, "not respawned");
-        let state = alice.job(never).await.state;
-        assert!(
-            matches!(state, JobState::Running | JobState::Queued { .. }),
-            "{state:?}"
+        // The job it never started goes back in line and is started
+        // again.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !h.helper.is_running(never) {
+            assert!(tokio::time::Instant::now() < deadline, "not respawned");
+            let state = alice.job(never).await.state;
+            assert!(
+                matches!(state, JobState::Running | JobState::Queued { .. }),
+                "{state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let spawned = |id| h.helper.spawned().iter().filter(|r| r.job == id).count();
+        assert_eq!(
+            spawned(started),
+            0,
+            "the re-discovered job was spawned again"
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(spawned(never), 1);
+        // Both run as far as the daemon and the helper are concerned.
+        for id in [started, never] {
+            assert_eq!(alice.job(id).await.state, JobState::Running, "job {id}");
+            let reply = alice.action(id, "checkpoint", json!(null)).await;
+            assert_eq!(reply.status, StatusCode::OK, "job {id}");
+            alice.wait_state(id, &JobState::Checkpointed).await;
+            assert!(h.helper.has_image(id));
+        }
+        h.stop().await;
     }
-    assert_eq!(
-        h.helper
-            .spawned()
-            .iter()
-            .filter(|r| r.job == started)
-            .count(),
-        0,
-        "the re-discovered job was spawned again"
-    );
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-    for id in [started, never] {
-        assert_eq!(alice.job(id).await.state, JobState::Running, "job {id}");
-    }
-    h.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2727,11 +2848,17 @@ async fn a_helper_reconnect_during_a_spawn_does_not_lose_the_job() {
     // The live-job list sent on reconnect predates the spawn.
     h.helper.disconnect();
     h.helper.reconnect();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    h.wait_reconciled().await;
+    let lists = h.helper.list_requests();
     h.helper.release_launches();
     h.wait_spawned(id).await;
-    // Past the one-second re-check, the job is still running.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The daemon checks the job again once the spawn has returned, and
+    // finds it running.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while h.helper.list_requests() == lists {
+        assert!(tokio::time::Instant::now() < deadline, "not checked again");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(alice.job(id).await.state, JobState::Running);
     let reply = alice.action(id, "checkpoint", json!(null)).await;
     assert_eq!(reply.status, StatusCode::OK);
@@ -2832,7 +2959,7 @@ async fn assert_no_restore_error(h: &Harness, id: JobId) {
     use gpueue_core::storage::StoreOps;
 
     assert_eq!(h.store().get_job_error(id).unwrap(), None);
-    assert_eq!(last_error(&h.client(ADMIN).job(id).await), None);
+    assert_eq!(last_error(&h.client(admin()).job(id).await), None);
     assert!(
         h.client(ALICE)
             .get("/v1/groups")
@@ -2862,7 +2989,7 @@ async fn restores_refused_by_a_stopping_helper_are_requeued_not_failed() {
     h.set_default_parallel(2).await;
     let first = h.checkpointed_job().await;
     let second = h.checkpointed_job().await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     h.helper.set_stopping(true);
 
     // `restore --immediate`: put back in line (still regardless of slots), not
@@ -2895,7 +3022,7 @@ async fn restores_refused_by_a_stopping_helper_are_requeued_not_failed() {
 async fn restores_abandoned_by_a_stopping_helper_are_requeued_not_failed() {
     let mut h = Harness::new(0).await;
     let id = h.checkpointed_job().await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
 
     // Accepted, then abandoned before systemd started the unit; the helper
     // goes on stopping and refuses the retries.
@@ -2993,7 +3120,7 @@ fn add_immediately(client: &Client, command: &str) -> tokio::task::JoinHandle<Re
 async fn launches_retried_successfully_before_the_action_looks_are_reported_launched() {
     let mut h = Harness::new(0).await;
     let (checkpointed, queued, finished) = launch_targets(&h).await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let mut gate = h.gate_launch_checks();
 
     // A stopping helper refuses the launch; the daemon puts the job back in
@@ -3040,7 +3167,7 @@ async fn launches_retried_successfully_before_the_action_looks_are_reported_laun
 async fn launches_still_being_retried_when_the_action_looks_are_pending() {
     let mut h = Harness::new(0).await;
     let (checkpointed, queued, _) = launch_targets(&h).await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let mut gate = h.gate_launch_checks();
 
     // The retry is in flight (held by the helper) when the action looks.
@@ -3083,7 +3210,7 @@ async fn launches_still_being_retried_when_the_action_looks_are_pending() {
 async fn launches_requeued_but_not_retried_yet_when_the_action_looks_are_pending() {
     let mut h = Harness::new(0).await;
     let id = h.checkpointed_job().await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let mut gate = h.gate_launch_checks();
 
     // The helper goes away before reading the request: the job is put back
@@ -3114,7 +3241,7 @@ async fn launches_requeued_but_not_retried_yet_when_the_action_looks_are_pending
 async fn launches_that_fail_for_a_real_reason_report_it() {
     let mut h = Harness::new(0).await;
     let (checkpointed, queued, _) = launch_targets(&h).await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let mut gate = h.gate_launch_checks();
     let reason = "checkpoint is not compatible with this host";
     h.helper.set_restore_rejection(Some(reason));
@@ -3171,7 +3298,7 @@ async fn launches_that_fail_for_a_real_reason_report_it() {
 async fn a_restore_cut_off_by_a_helper_restart_is_requeued_not_failed() {
     let mut h = Harness::new(0).await;
     let id = h.checkpointed_job().await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     h.helper.hold_launches();
     let restore = send_action(&admin, id, "restore", json!({"immediate": true}));
     h.helper.wait_held(1).await;
@@ -3183,7 +3310,6 @@ async fn a_restore_cut_off_by_a_helper_restart_is_requeued_not_failed() {
     let reply = restore.await.unwrap();
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.json::<Value>()["launch_pending"], json!(true));
-    tokio::time::sleep(Duration::from_millis(100)).await;
     h.helper.reconnect();
 
     // Requeued (not marked interrupted) and restored again.
@@ -3205,7 +3331,7 @@ async fn immediate_launches_wait_for_a_disconnected_helper() {
     h.set_default_parallel(2).await;
     let alice = h.client(ALICE);
     // Only an administrator's launches are immediate.
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let checkpointed = h.checkpointed_job().await;
     let blocker = alice.add(&job_request("blocker", &[])).await;
     alice.wait_state(blocker, &JobState::Running).await;
@@ -3300,7 +3426,7 @@ async fn immediate_launches_wait_for_a_disconnected_helper() {
 async fn orphans_keep_their_gpus_and_admins_can_kill_them() {
     let mut h = Harness::new(1).await;
     let alice = h.client(ALICE);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let first = alice.add(&job_request("first", &[0])).await;
     h.exit(first, 0).await;
     alice.wait_state(first, &done(JobResult::Success)).await;
@@ -3359,7 +3485,7 @@ async fn orphans_keep_their_gpus_and_admins_can_kill_them() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn switch_swaps_the_forced_launch_mark() {
     let mut h = Harness::new(0).await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let busy = admin.add(&job_request("busy", &[])).await;
     admin.wait_state(busy, &JobState::Running).await;
     let a = admin.add(&job_request("a", &[])).await;
@@ -3465,7 +3591,7 @@ async fn connections_and_streams_are_limited_per_user() {
 async fn operations_left_by_closed_connections_count_as_connections() {
     const MAX_CONNECTIONS_PER_UID: usize = 64;
     let mut h = Harness::new(0).await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     h.helper.hold_launches();
     let mut request = job_request("held", &[]);
     request.immediate = true;
@@ -3631,7 +3757,7 @@ async fn job_ids_beyond_the_database_range_are_not_found() {
 async fn reset_jobs_that_run_again_after_a_checkpoint_or_restore_are_removed() {
     let mut h = Harness::new(0).await;
     let alice = h.client(ALICE);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let gone = |client: Client, id: JobId| async move {
         for _ in 0..250 {
             if client.get(&format!("/v1/jobs/{id}")).await.status == StatusCode::NOT_FOUND {
@@ -3703,7 +3829,7 @@ fn sigterms(h: &Harness, id: JobId) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lagging_event_subscriber_is_told_to_resync() {
     let mut h = Harness::new(0).await;
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     // Not read while the daemon publishes more events than it buffers.
     let mut events = admin
         .open(Method::GET, "/v1/events", None)
@@ -3824,7 +3950,7 @@ async fn lower_usage_user_starts_first() {
     h.stop().await;
     h.start(1).await;
     let shares: gpueue_protocol::api::SharesResponse =
-        h.client(ADMIN).get("/v1/shares").await.json();
+        h.client(admin()).get("/v1/shares").await.json();
     let b = shares.users.iter().find(|u| u.uid == Uid(BOB)).unwrap();
     assert!(b.raw_usage > 0.0, "{shares:?}");
 }
@@ -3888,7 +4014,7 @@ async fn o_priority_and_top_order_only_the_owners_jobs() {
     );
     // An administrator may move anyone's job; unknown jobs fail alone.
     let reply = h
-        .client(ADMIN)
+        .client(admin())
         .post("/v1/jobs/top", json!({ "ids": [a1.0, 999] }))
         .await;
     assert_eq!(
@@ -3914,7 +4040,7 @@ async fn top_can_be_disabled_for_users() {
         [(id.0, Some(ErrorCode::PermissionDenied))]
     );
     let reply = h
-        .client(ADMIN)
+        .client(admin())
         .post("/v1/jobs/top", json!({ "ids": [id.0] }))
         .await;
     assert_eq!(bulk_results(&reply), [(id.0, None)]);
@@ -3925,7 +4051,7 @@ async fn nice_site_shares_and_group_priority_authorization() {
     let h = Harness::new(0).await;
     let alice = h.client(ALICE);
     let bob = h.client(BOB);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let stashed = |command: &str| AddJobRequest {
         stashed: true,
         ..job_request(command, &[])
@@ -4062,7 +4188,7 @@ async fn restarted_copy_does_not_inherit_a_negative_nice() {
     let id = alice.add(&job_request("x", &[])).await;
     alice.wait_state(id, &JobState::Running).await;
     let reply = h
-        .client(ADMIN)
+        .client(admin())
         .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": -5 }))
         .await;
     assert_eq!(bulk_results(&reply), [(id.0, None)]);
@@ -4103,60 +4229,57 @@ async fn raw_usage(client: &Client, uid: u32) -> f64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_running_time_is_billed() {
-    // The default calculation period (5 min) never passes here: all usage
-    // comes from jobs leaving the running state.
-    let mut h = Harness::new(0).await;
+    // The daemon's clock stands still but where the test advances it, so
+    // every charge is exactly the time it was advanced by while the job
+    // ran (CPU-only: billing 1 per second). The default calculation period
+    // (5 min) never passes here: all usage comes from jobs leaving the
+    // running state.
+    let (mut h, clock) = Harness::with_manual_clock().await;
     let alice = h.client(ALICE);
     let bob = h.client(BOB);
     let id = alice.add(&job_request("train", &[])).await;
     alice.wait_state(id, &JobState::Running).await;
     h.wait_spawned(id).await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    clock.advance(Duration::from_millis(600));
 
-    // Pausing charges the run so far (CPU-only: billing 1 per second).
+    // Pausing charges the run so far.
     assert_eq!(
         alice.action(id, "pause", json!({})).await.status,
         StatusCode::OK
     );
     alice.wait_state(id, &JobState::Paused).await;
-    let paused = raw_usage(&alice, ALICE).await;
-    assert!((0.5..2.0).contains(&paused), "{paused}");
-    // Paused time is not billed.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(raw_usage(&alice, ALICE).await, paused);
-
-    // Resumed, then checkpointed: the second run is charged.
+    assert_usage(raw_usage(&alice, ALICE).await, 0.6);
+    // Paused time is not billed: resumed, then checkpointed, only the
+    // second run is charged.
+    clock.advance(Duration::from_millis(500));
     assert_eq!(
         alice.action(id, "start", json!(null)).await.status,
         StatusCode::OK
     );
     alice.wait_state(id, &JobState::Running).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    clock.advance(Duration::from_millis(400));
     assert_eq!(
         alice.action(id, "checkpoint", json!(null)).await.status,
         StatusCode::OK
     );
     alice.wait_state(id, &JobState::Checkpointed).await;
-    let checkpointed = raw_usage(&alice, ALICE).await;
-    assert!(
-        (0.3..1.5).contains(&(checkpointed - paused)),
-        "{paused} -> {checkpointed}"
-    );
+    assert_usage(raw_usage(&alice, ALICE).await, 1.0);
 
     // Waiting checkpointed, waiting to be restored and being removed while
     // waiting cost nothing, although the job's started_at is old.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    clock.advance(Duration::from_millis(300));
     let other = bob.add(&job_request("other", &[])).await;
     bob.wait_state(other, &JobState::Running).await;
     assert_eq!(
         alice.action(id, "restore", json!({})).await.status,
         StatusCode::OK
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Bob's job holds the only slot.
     assert!(matches!(
         alice.job(id).await.state,
         JobState::RestoreQueued { .. }
     ));
+    clock.advance(Duration::from_millis(200));
     // (Killing it is refused: it does not run; it can only be removed.)
     assert_eq!(
         alice.action(id, "kill", json!({})).await.status,
@@ -4166,58 +4289,72 @@ async fn only_running_time_is_billed() {
         .call(Method::DELETE, &format!("/v1/jobs/{id}"), None)
         .await;
     assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(raw_usage(&alice, ALICE).await, checkpointed);
+    assert_usage(raw_usage(&alice, ALICE).await, 1.0);
+    clock.advance(Duration::from_millis(250));
     h.exit(other, 0).await;
     bob.wait_state(other, &done(JobResult::Success)).await;
-    assert!(raw_usage(&bob, BOB).await > 0.0);
+    assert_usage(raw_usage(&bob, BOB).await, 0.45);
 
-    // A restored job is billed from the restore on, before any calculation.
+    // A restored job is billed from the restore on, before any calculation;
+    // the time it waited checkpointed is not.
     let id = alice.add(&job_request("again", &[])).await;
     alice.wait_state(id, &JobState::Running).await;
     alice.action(id, "checkpoint", json!(null)).await;
     alice.wait_state(id, &JobState::Checkpointed).await;
-    let before = raw_usage(&alice, ALICE).await;
+    assert_usage(raw_usage(&alice, ALICE).await, 1.0);
+    clock.advance(Duration::from_millis(700));
     alice.action(id, "restore", json!({})).await;
     alice.wait_state(id, &JobState::Running).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    clock.advance(Duration::from_millis(400));
     h.exit(id, 0).await;
     alice.wait_state(id, &done(JobResult::Success)).await;
-    let after = raw_usage(&alice, ALICE).await;
-    assert!(
-        (0.3..1.5).contains(&(after - before)),
-        "{before} -> {after}"
-    );
+    assert_usage(raw_usage(&alice, ALICE).await, 1.4);
 
-    // Usage and run records survive a restart.
+    // Usage and run records survive a restart, which decays usage by the
+    // 3.35 s since the first calculation (when the daemon first started).
     h.stop().await;
     h.start(0).await;
-    assert!(raw_usage(&h.client(ADMIN), ALICE).await >= after * 0.99);
+    let decay = gpueue_core::priority::decay_factor(
+        3350,
+        h.priority.priority_decay_half_life_secs as i64 * 1000,
+    );
+    assert!(decay < 1.0);
+    assert_usage(raw_usage(&h.client(admin()), ALICE).await, 1.4 * decay);
+    assert_usage(raw_usage(&h.client(admin()), BOB).await, 0.45 * decay);
+}
+
+/// Asserts that billed `usage` is `expected` (up to rounding).
+#[track_caller]
+fn assert_usage(usage: f64, expected: f64) {
+    assert!(
+        (usage - expected).abs() < 1e-9,
+        "usage {usage}, expected {expected}"
+    );
 }
 
 /// `priority_usage_reset_period = "now"` charges nothing from before the
 /// reset, not even the run time of jobs running since before it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reset_at_start_charges_nothing_from_before_it() {
-    let mut h = Harness::new(0).await;
+    let (mut h, clock) = Harness::with_manual_clock().await;
     let alice = h.client(ALICE);
     let id = alice.add(&job_request("train", &[])).await;
     alice.wait_state(id, &JobState::Running).await;
     h.wait_spawned(id).await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    clock.advance(Duration::from_millis(1500));
     h.stop().await;
     h.priority.priority_usage_reset_period = gpueue_daemon::config::ResetPeriod::Now;
     h.start(0).await;
     let alice = h.client(ALICE);
     assert_eq!(raw_usage(&alice, ALICE).await, 0.0);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    clock.advance(Duration::from_millis(300));
     // Pausing charges the run since the reset only.
     assert_eq!(
         alice.action(id, "pause", json!({})).await.status,
         StatusCode::OK
     );
     alice.wait_state(id, &JobState::Paused).await;
-    let usage = raw_usage(&alice, ALICE).await;
-    assert!((0.2..1.0).contains(&usage), "{usage}");
+    assert_usage(raw_usage(&alice, ALICE).await, 0.3);
     h.stop().await;
 }
 
@@ -4232,7 +4369,7 @@ async fn users_may_only_raise_nice_values() {
         })
         .await;
     let reply = h
-        .client(ADMIN)
+        .client(admin())
         .post("/v1/jobs/nice", json!({ "ids": [id.0], "nice": 10000 }))
         .await;
     assert_eq!(bulk_results(&reply), [(id.0, None)]);
@@ -4256,7 +4393,7 @@ async fn users_may_only_raise_nice_values() {
 async fn restart_in_place_drops_administrators_grants() {
     let h = Harness::new(0).await;
     let alice = h.client(ALICE);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let id = alice.add(&job_request("x", &[])).await;
     alice.wait_state(id, &JobState::Running).await;
     for (path, body) in [
@@ -4310,7 +4447,7 @@ async fn users_immediate_add_is_queued_first_among_their_jobs() {
     h.set_default_parallel(1).await;
     let alice = h.client(ALICE);
     let bob = h.client(BOB);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
 
     let busy = bob.add(&job_request("busy", &[])).await;
     bob.wait_state(busy, &JobState::Running).await;
@@ -4362,7 +4499,7 @@ async fn users_immediate_launches_keep_every_limit() {
     let mut h = Harness::new(0).await;
     h.set_default_parallel(1).await;
     let alice = h.client(ALICE);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
 
     let busy = alice.add(&job_request("busy", &[])).await;
     alice.wait_state(busy, &JobState::Running).await;
@@ -4453,7 +4590,7 @@ async fn admins_immediate_launches_start_right_away() {
     let mut h = Harness::new(1).await;
     h.set_default_parallel(1).await;
     let bob = h.client(BOB);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let busy = bob.add(&job_request("busy", &[0])).await;
     bob.wait_state(busy, &JobState::Running).await;
     let reply = add_immediate(&admin, job_request("admin's", &[0])).await;
@@ -4495,7 +4632,7 @@ async fn users_immediate_restores_are_queued() {
     h.set_default_parallel(0).await;
     let alice = h.client(ALICE);
     let bob = h.client(BOB);
-    let admin = h.client(ADMIN);
+    let admin = h.client(admin());
     let id = alice.add(&job_request("train", &[0])).await;
     alice.wait_state(id, &JobState::Running).await;
     admin.action(id, "checkpoint", json!(null)).await;
