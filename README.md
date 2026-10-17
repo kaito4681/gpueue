@@ -326,7 +326,8 @@ columns, and `Checkpointed` jobs show the image size.
   groups, with `no_new_privs` set and all capabilities dropped. The command runs in the directory
   it was added from, with the environment of the `gpueue add` invocation.
 - The root helper refuses jobs of system accounts (uid below `job_min_uid`, by default `UID_MIN`
-  of `/etc/login.defs`), of `nobody`, systemd dynamic-user uids (61184-65519) and, if `job_max_uid` is set, uids above it, of users missing from `job_allowed_users` when it is set, and of users
+  of `/etc/login.defs`), of `nobody`, systemd dynamic-user uids (61184-65519) and, if `job_max_uid`
+  is set, uids above it, of users missing from `job_allowed_users` when it is set, and of users
   whose primary group is root-equivalent (`job_denied_groups`: `docker`, `lxd`, `incus-admin`,
   `libvirt`, `libvirtd`, `disk`, `sudo`, `wheel`, `admin` by default). Those groups are left out of every
   job's supplementary groups, so a job cannot use Docker or sudo even if its owner can (the

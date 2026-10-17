@@ -192,6 +192,11 @@ curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.
 | `--purge` | `--uninstall` と一緒に使い、`/etc/gpueue` と `/var/lib/gpueue`（と `config.toml` が設定したデータディレクトリ）も削除します |
 | `-y`、`--yes` | purge の前に確認しません |
 
+`--version` を付けないと、`install.sh` はインストール済みの gpueue をより古いリリースで置き換えることを
+拒否します（確認するのは、root だけが置き換えられるインストール済みの `gpueue`、つまりユニットが実行する
+ものか `/usr/local/bin` または `/usr/bin` にあるものだけで、`PATH` で見つかったものは対象外です）。
+リリースのタグは `v<major>.<minor>.<patch>` の形でなければならず、それ以外は拒否されます。
+
 トークンが保存されるのは `--save-token` を付けたときだけです。そうしておけば、期限切れや失効したトークンが、
 どのトークンが使われたのか気づかないうちに以降の実行を失敗させることはありません。
 
@@ -209,10 +214,10 @@ curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.
    その `.sha256` と `.minisig` ファイルを一時ディレクトリに（リダイレクト先も含めて HTTPS だけで）ダウンロードし、
    `.sha256` ファイルがその tarball の名前でのチェックサムであることを確かめてから、チェックサムを確認します。
 3. スクリプトに組み込まれたリリース鍵（`packaging/minisign.pub`）で `.minisig` の署名を確認します。
-   `PATH` にある `minisign` を使い、なければ GitHub から minisign 0.12 の静的バイナリのリリースを一時
-   ディレクトリにダウンロードし、スクリプトに組み込まれた SHA-256 チェックサム（`scripts/dist/get-minisign.sh`
-   と同じもの）で確認してから使います。このダウンロードに失敗すると、ディストリビューションから `minisign` を
-   インストールして（例: `sudo apt install minisign`）再実行するよう伝えて止まります。署名の確認を省くことは
+   `PATH` にある `minisign` は（スクリプトは root で動くので）使いません。GitHub から minisign 0.12 の
+   静的バイナリのリリースを一時ディレクトリにダウンロードし、スクリプトに組み込まれた SHA-256 チェックサム
+   （`scripts/dist/get-minisign.sh` と同じもの）で確認してから使います。このダウンロードに失敗すると止まり
+   ます。署名の確認を省くことは
    ありません。署名の trusted comment は、要求したリリースと tarball の `gpueue <tag> <file>` でなければ
    なりません。これにより、古いリリースの（正しく署名された）tarball を新しい名前で配っても拒否されます。
 4. tarball を展開し（リンクや tarball の外を指すパスは拒否します）、新しい `gpueue service install` を実行し
@@ -290,6 +295,32 @@ git commit packaging/minisign.pub scripts/install.sh
 apt でパッケージをインストールし、チェックポイント済み・実行中・一時停止中のジョブを抱えたまま再起動し、
 前のリリースからアップグレードして、ジョブをリストアします。失敗したときは何も作成されません。原因を直して
 新しいバージョンのタグを付けるか、失敗がリリースのせいでなければ失敗したジョブを再実行してください。
+
+`release.yml` は、コミットがデフォルトブランチの祖先でないタグも拒否します（ジョブ `check-signing`。手動
+実行でも同じです）。また `apt-repo.sh` と `update-aur.sh` はデフォルトブランチの `packaging/minisign.pub` で
+検証し、タグが別の鍵を持っていると失敗します。そのため、鍵をローテーションしたあと、古いタグを APT
+リポジトリや AUR に再公開することはできません。
+
+<a id="recommended-repository-settings-maintainers"></a>
+#### 推奨するリポジトリ設定（メンテナー向け）
+
+これらの設定はリポジトリには含まれないので、メンテナーが `gh api` で適用します（オーナー、リポジトリ、
+ブランチの名前は読み替えてください）。
+
+- リリースラインを保護する：デフォルトブランチ（と安定版ブランチ）に、プルリクエストと CI チェックを必須に
+  し、force push と削除を禁止するブランチルールセットを設定し、`v*` に、作成・更新・削除をメンテナーに
+  限るタグルールセットを設定します。
+- アクションの固定を必須にする：Actions の権限（`PUT /repos/{owner}/{repo}/actions/permissions`）で
+  `sha_pinning_required` を設定します。完全なコミット SHA に固定されていないアクションがあるとワークフロー
+  が失敗するようになります（`.github/dependabot.yml` が固定を最新に保ちます）。
+- シークレットスキャンとプッシュ保護（`security_and_analysis`）、および Dependabot アラートを有効にします。
+- チャネルごとに別の鍵を使う：minisign の鍵はリリースのアセットに署名し、APT と RPM の署名はそれぞれ別の
+  GPG 鍵（`APT_GPG_PRIVATE_KEY`）を使います。RPM チャネルには APT アーカイブ鍵ではなく専用の鍵を用意して、
+  1 つの漏えいが両方に及ばないようにします。
+- 署名用のシークレットは保護された environment に置きます（別途追跡中です）。
+
+依存関係は CI で `cargo-deny`（`deny.toml`：アドバイザリ、crates.io をソースとして唯一認めること、バージョン
+の重複は警告）によって検査され、Dependabot が cargo と GitHub Actions の更新を毎週提案します。
 
 <a id="installing-the-debianubuntu-package"></a>
 ## Debian/Ubuntu パッケージのインストール
@@ -422,7 +453,8 @@ sudo apt purge gpueue     # also delete /etc/gpueue and the APT repository entry
 `InRelease`、`Release.gpg`、公開鍵 `gpueue.gpg`、`gpueue.sources` です。リリースが**安定版リリースとして
 公開されたとき**（`released` イベント：安定版リリースの公開、またはプレリリースの安定版への変更）、
 `.github/workflows/release-apt.yml` が `scripts/dist/apt-repo.sh github <tag>` でリポジトリを更新します。
-リリースの `.deb` ファイルを（チェックサムと、タグのコミットの公開鍵による minisign の署名を確認したあとで）
+リリースの `.deb` ファイルを（チェックサムと、デフォルトブランチの公開鍵による minisign の署名を確認したあとで。タグにある同じ
+ファイルが同じ鍵でなければジョブは失敗します）
 追加し、リポジトリにすでにあるパッケージを署名済みのインデックスと照合し（`InRelease` が
 `packaging/apt/gpueue-archive-keyring.gpg` で検証でき、各 `.deb` が署名済みの `Packages` にある SHA256 と
 一致すること。一致しなければジョブは何も変えずに失敗します。中断した実行が残した、インデックスにない `.deb` は
@@ -867,10 +899,13 @@ gpueue doctor
 PKGBUILD は `packaging/aur/gpueue-bin` にあります。リリースが安定版リリースとして公開されると（APT
 リポジトリと同じ `released` イベント。ドラフトやプレリリースでは動きません）、
 `.github/workflows/release-aur.yml` が `scripts/dist/update-aur.sh <version>` を実行します。これは
-リリースの tarball とその `.minisig` ファイルをダウンロードし、タグの `packaging/minisign.pub` で（`install.sh`
-と同様に trusted comment `gpueue v<version> <file>` も）確認し、確認した tarball と、タグのソースアーカイブ
-（署名付きのアセットには含まれないユニットと断片用）から PKGBUILD のチェックサムを計算し、Arch Linux の
-コンテナで `.SRCINFO` を再生成します。そして `PKGBUILD`、`.SRCINFO`、
+リリースの tarball とその `.minisig` ファイルをダウンロードし、デフォルトブランチの
+`packaging/minisign.pub` で（タグにある同じファイルが同じ鍵でなければスクリプトは失敗します。`install.sh`
+と同様に trusted comment `gpueue v<version> <file>` も）確認し、確認した tarball から PKGBUILD の
+チェックサムを計算し、Arch Linux のコンテナで `.SRCINFO` を再生成します。ユニット、`sysusers.d` と
+`tmpfiles.d` の断片、デフォルトの設定は署名付きの tarball の中（`packaging/` 以下）にあり、PKGBUILD は
+そこからインストールします（それらが追加されたリリースより前のリリースは、この PKGBUILD ではパッケージ化
+できません）。そして `PKGBUILD`、`.SRCINFO`、
 `gpueue-bin.install` を `ssh://aur@aur.archlinux.org/gpueue-bin.git` に push します。リリースには x86_64 と
 aarch64 の両方の tarball が必要です。新しいリリースなしでパッケージングを変更するには、PKGBUILD の
 `pkgrel` を上げてワークフローを手動で実行します（`gh workflow run release-aur.yml -f version=<X.Y.Z>`）。
@@ -922,7 +957,9 @@ scripts/test-in-docker.sh build --release -p gpueue -p gpueue-helper
 
 ```sh
 sha256sum -c gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar xzf gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+# Unpack as root in a directory only root can write to (e.g. below /root): the helper is
+# run as root, so `service install` refuses one that others could have replaced.
+sudo tar --no-same-owner -xzf gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
 sudo gpueue-v0.1.0-x86_64-unknown-linux-gnu/gpueue service install
 ```
 
@@ -933,7 +970,13 @@ sudo gpueue-v0.1.0-x86_64-unknown-linux-gnu/gpueue service install
 sudo target/release/gpueue service install
 ```
 
-`gpueue-helper` は `gpueue` の隣に置く必要があります。ユニットは次の場所のバイナリを実行します。
+`gpueue-helper` は `gpueue` の隣に置く必要があります。`service install` がそれをコピーするとき、ヘルパーと
+その上のすべてのディレクトリは root の所有で、グループやその他から書き込めない必要があります（ヘルパーは
+root として動くので、コピーの前にそれを差し替えられる人は root を得られてしまいます）。そうでなければ
+install は拒否し、その旨を伝えます。リリースのビルドや展開は root だけが書き込めるディレクトリ（たとえば
+`/root` 以下で、`sudo tar` を使って）で行うか、先に両方のバイナリを `/usr/local/bin` に置いてください。
+`gpueue` 自体は、そのパスからではなく実行中のプロセスからコピーされます。ユニットは次の場所のバイナリを
+実行します。
 
 1. 再インストールや更新のときは、現在の `service install` によるインストール先のディレクトリ
 2. そうでなければ、`gpueue` バイナリのあるディレクトリが `/usr/bin` か `/usr/local/bin` ならそのディレクトリ
@@ -1012,7 +1055,7 @@ NixOS 以外で Nix でビルドした場合（`nix build` のあと `sudo ./res
    | `/var/lib/gpueue/daemon` | 0700 gpueue | デーモンのデータベース `state.sqlite` |
    | `/var/lib/gpueue/helper` | 0711 root | ヘルパーのジョブの記録とイベントキュー |
    | `/var/lib/gpueue/checkpoints` | 0700 root | チェックポイントのイメージ、ジョブごとに `<id>/` |
-   | `/var/lib/gpueue/logs` | 0755 root | ジョブの出力、`<uid>/<id>.log`（ヘルパーが `<uid>/` をモード 2770、ユーザーの所有、グループ `gpueue` で作成） |
+   | `/var/lib/gpueue/logs` | 0755 root | ジョブの出力、`<uid>/<id>.log`（ヘルパーが `<uid>/` をモード 2770、ユーザーの所有、グループ `gpueue` で作成。[ログディレクトリの権限](#log-directory-permissions) を参照） |
    | `/var/lib/gpueue/lib` | 0755 root | fork ガードのライブラリ（`gpueue-forkguard-<hash>.so`）と、ジョブのユニットが実行するヘルパーのコピー（`gpueue-helper-<hash>`。[アップグレード](#upgrading)を参照） |
    | `/var/lib/gpueue/criu-no-plugins` | 0755 root | manual モード用の空の CRIU プラグインディレクトリ |
    | `/run/gpueue` | 0755 gpueue | `gpueue.sock`（デーモン、モード 0666）と `helper.sock`（ヘルパー、`gpueue` の所有、モード 0600） |
@@ -1088,6 +1131,12 @@ gpueue は、`gpueue.service` と `gpueue-helper.service` それぞれのユニ�
 | NixOS 上の Nix | `nix flake update && sudo nixos-rebuild switch` | `services.gpueue.enable = false` のあと `sudo nixos-rebuild switch` |
 | それ以外の Nix | ユニットを作成した Nix の設定 | 同じ |
 | `gpueue service install` | `sudo gpueue update` | `sudo gpueue uninstall` |
+
+ヘルパーのユニット（`gpueue-helper.service`）は意図的にサンドボックス化されていません。ヘルパーは root で動き、
+ホストのマウントとデバイスを見られる必要があり、`criu restore --root` のために `/` を bind マウントし、CRIU
+と cuda-checkpoint が操作するプロセスを起動します。サンドボックスのディレクティブ（デバイスの許可リスト、
+seccomp フィルター）はそれらのプロセスにも影響してしまいます。ヘルパーの防御は、小さいこと、root 所有の設定
+だけを読むこと、他人が置き換えられるものを拒否することです。
 
 デーモンは `ProtectSystem=strict` で動くので、書き込めるのはユニットの
 `ReadWritePaths=/var/lib/gpueue/daemon /var/lib/gpueue/logs /run/gpueue` 以下だけです。`config.toml` で
@@ -1257,7 +1306,8 @@ gpueue service status   # both units, and whether the daemon is reachable and co
   `cuda_checkpoint_path = "cuda-checkpoint-r570"`）。CRIU と、NVIDIA ドライバーがあるホストでの
   cuda-checkpoint は FAIL です。ヘルパーが拒否するプログラム（再起動するとヘルパーが止まります）も FAIL で、
   再起動ではなく所有者の修正を案内します。それ以外は警告です。
-- ヘルパーが実行しているのにデーモンが把握していないジョブ（`orphaned jobs`、ある場合のみ）
+- ヘルパーが実行しているのにデーモンが把握していないジョブ（`orphaned jobs`、ある場合のみ。デーモンはそれについて、ヘルパーのプログラムのパスと NVML が失敗した理由を
+  管理者にしか伝えないので、見るには管理者として `doctor` を実行してください）
 - チェックポイントのディレクトリ（存在するか、tmpfs でないか、空き容量）とチェックポイントの合計サイズ
   （`checkpoint dir`、`checkpoint usage`）
 - あなたが管理者かどうか（`admin`）
@@ -1319,7 +1369,8 @@ scripts/gpu-host-test.sh --keep          # keep the jobs and files for debugging
 <a id="configuration"></a>
 ## 設定
 
-デーモンとヘルパーは `/etc/gpueue/config.toml` を読みます。キーはすべて任意です。未知のキーは無視されます。
+デーモンとヘルパーは `/etc/gpueue/config.toml` を読み、どちらも、シンボリックリンクであるファイル（やその上の
+ディレクトリ）や、root 以外が変更できるファイルでは起動を拒否します。キーはすべて任意です。未知のキーは無視されます。
 ファイルがなければすべてデフォルトになります。インストールされるファイル
 （[packaging/config.toml](../../packaging/config.toml)）にはすべてのキーがコメント付きで並んでいます。
 コメントアウトされた `# key = value` の行はデフォルトを示し、`# Example:` の下でインデントされた行は、
@@ -1364,7 +1415,7 @@ sudo systemctl restart gpueue-helper.service gpueue.service
 | `grace_secs` | `30` | 両方 | ジョブを停止するときの SIGTERM から SIGKILL までの秒数 |
 | `shell` | `["sh", "-c"]` | デーモン | ジョブのコマンドラインを後ろに付け加えるコマンドの接頭辞 |
 | `max_unfinished_jobs_per_user` | `10000` | デーモン | 1 ユーザーが持てる、終了していないジョブ（待機中、stash 中、実行中、一時停止中、チェックポイント済みなど）の数。超えると `add` と、ジョブを再び動かす `restart` は `too_many_requests` で拒否されます |
-| `max_job_spec_bytes` | `262144`（256 KiB） | デーモン | 1 つのジョブのコマンド、作業ディレクトリ、ラベル、環境変数（`gpueue add` は呼び出し元の環境変数をすべて送ります）の合計バイト数の上限。超えるジョブは `bad_request` で拒否されます |
+| `max_job_spec_bytes` | `262144`（256 KiB） | デーモン | 1 つのジョブのコマンド、作業ディレクトリ、ラベル、環境変数（`gpueue add` は呼び出し元の環境変数をすべて送ります）の合計バイト数の上限（依存関係は 1 つにつき 8 バイトと数えます。1 つのジョブが依存できるのは最大 1000 ジョブです）。超えるジョブは `bad_request` で拒否されます |
 | `checkpoint_size_limit_bytes` | 未設定（制限なし） | デーモン | 全イメージの合計がこのサイズを超えたら警告します（イメージが自動で削除されることはありません） |
 | `checkpoint_size_warning_interval_secs` | `3600` | デーモン | 上限を超えている間、各管理者に通知する間隔 |
 | `checkpoint_tcp_close` | `true` | 両方 | チェックポイント時に TCP 接続を閉じます（`criu --tcp-close`） |
@@ -1381,6 +1432,7 @@ sudo systemctl restart gpueue-helper.service gpueue.service
 | `job_system_dbus` | `false` | ヘルパー | `true` にするとジョブがシステムの D-Bus（systemd、polkit）に接続できます。デフォルトではジョブから `/run/dbus` を隠します（[ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)を参照） |
 | `job_systemd_varlink` | `false` | ヘルパー | `true` にするとジョブが `/run/systemd` の下にある systemd の Varlink サービスに接続できます。デフォルトでは journald のログのソケット、resolved の名前解決のソケットと `resolv.conf` のファイル、`userdb/` 以外のこのディレクトリをジョブから隠します（[ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)を参照） |
 | `job_min_uid` | `/etc/login.defs` の `UID_MIN`、なければ `1000` | ヘルパー | uid がこれより小さいユーザーのジョブを拒否します（[ジョブを実行できるユーザー](#who-jobs-may-run-as)を参照） |
+| `job_max_uid` | 未設定（上限なし） | ヘルパー | uid がこれより大きいユーザーのジョブを拒否します。65534、65535、4294967295、61184-65519（systemd の `DynamicUser=`）は常に拒否されます（[ジョブを実行できるユーザー](#who-jobs-may-run-as)を参照） |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]` | ヘルパー | root 相当のグループ。ジョブの補助グループから外し、プライマリグループがこれらのいずれかであるジョブは拒否します |
 | `job_hidden_socket_dirs` | `["/run/libvirt", "/run/cups"]` | ヘルパー | 空の root 所有の tmpfs でジョブから隠すディレクトリ（なければ先に作ります）。呼び出し元のグループをユーザーデータベースで確かめるデーモンのソケットのもので、グループを外しても防げません。2 階層以上の絶対パスで指定し、経路上の既存のディレクトリ（とシンボリックリンク）は root のもので、グループや他人が書き込めないものでなければなりません（ヘルパーの起動時に確認します）（[ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)を参照） |
 | `job_allowed_users` | `[]`（全員） | ヘルパー | 空でなければ、ここに（名前で）挙げたユーザーだけがジョブを実行できます |
@@ -1413,9 +1465,10 @@ sudo usermod -aG gpueue-admin alice
 <a id="who-jobs-may-run-as"></a>
 ## ジョブを実行できるユーザー
 
-root ヘルパーがすべてのジョブをその所有者として起動するので、誰のジョブを実行するかはヘルパーが決めます。
-デーモンにはそれを変えられません。ジョブを root（uid 0 や gid 0）や所有者が属していないグループで実行しない
-ことに加えて、ヘルパーはすべての起動とリストアに 3 つの設定を適用します。
+root ヘルパーがすべてのジョブをその所有者として起動するので、誰のジョブを実行するかのポリシーはヘルパーが
+適用します。デーモンにはそのポリシーを変えられません。ジョブを root（uid 0 や gid 0）、uid 65534（`nobody`）、
+65535、4294967295、systemd の `DynamicUser=` の範囲 61184-65519 の uid、あるいは所有者が属していないグループで
+実行しないことに加えて、ヘルパーはすべての起動とリストアに 4 つの設定を適用します。
 
 - `job_min_uid`：uid がこれより小さいユーザーは拒否されます。未設定のときは `/etc/login.defs` の `UID_MIN`
   （ほとんどのディストリビューションで 1000）、ファイルに有効な `UID_MIN` がなければ 1000 です。これにより
@@ -1424,6 +1477,12 @@ root ヘルパーがすべてのジョブをその所有者として起動する
   したジョブにバインドするホストのパスは、uid がこれより小さいアカウントのディレクトリ（`systemd-resolve` の
   `/run/systemd/resolve` など）の下にあってもかまいませんが、ジョブを実行できるユーザーのディレクトリや
   デーモンのユーザーのディレクトリの下にあってはいけません（[応答しなくなったネットワークと FUSE のファイルシステム](#network-and-fuse-filesystems-that-stop-answering)を参照）。
+  これは、ユーザーが他の手段（`sudo` のルール、自分で制御できるサービス）でそれらのアカウントとして振る舞え
+  ないことを前提にしています。ユーザーがコードを実行できるすべてのアカウントより上に `job_min_uid` を設定して
+  ください。
+- `job_max_uid`：uid がこれより大きいユーザーは拒否されます。ディレクトリサービス（LDAP、sssd の ID マッピング
+  による AD）では一般ユーザーに 60000 をはるかに超える uid が割り当てられることが多く、systemd-homed の
+  ユーザーは 60001-60513 なので、デフォルトでは未設定です。上限が欲しいときだけ設定してください。
 - `job_denied_groups`：メンバーがパスワードなしで root として振る舞えるグループです。これらはジョブの補助
   グループから外されるので、`docker` に属するユーザーのジョブは `docker` なしで実行されます。どのグループを
   外したかはヘルパーのジャーナルに記録されます（ジョブの出力には何も加えません）。プライマリグループがこれらの
@@ -1446,6 +1505,16 @@ root ヘルパーがすべてのジョブをその所有者として起動する
   Docker を使えるようになります）。
 - `job_allowed_users`：空でなければ、（名前で）挙げたユーザーだけがジョブを実行できます。
 
+これが何を防ぎ、何を防がないか：ヘルパーが確認するのはリクエストが指名するユーザーであり、誰がそれを求めた
+かではありません。起動の uid、作業ディレクトリ、コマンド、環境変数はデーモンから届き、デーモンはソケットの
+資格情報で投入したクライアントを識別します。したがって、乗っ取られたデーモン（権限のない `gpueue` ユーザー）
+は、root やポリシーが拒否するユーザーとして何かを実行することはできませんが、ポリシーが許可する任意の
+ユーザーとして任意のコマンドを起動できます。`gpueue` ユーザーは、ジョブの実行を許可されたすべてのユーザー
+として振る舞えるものとして扱ってください。`gpueue-admin` のメンバーは全ユーザーのジョブの環境変数
+（`gpueue status --json`、`gpueue log` のヘッダー、`gpueue status` が表示する環境変数）も読めるので、すべての
+管理者を信頼できないマシンでは、ジョブの環境変数に秘密を渡さないでください。デーモンのデータベースにも
+それらは保存されています（`0700 gpueue`）。ヘルパー側での投入者の確認は issue #107 で追跡しています。
+
 拒否されたジョブは、`gpueue refuses to run jobs as <user>:` で始まり、たとえば `uid 999 is below job_min_uid
 1000 (UID_MIN in /etc/login.defs)`、`primary group docker is in job_denied_groups`、`not in
 job_allowed_users` が続く理由で起動に失敗します。`gpueue status` には `Failed to spawn` と表示され、
@@ -1453,6 +1522,19 @@ job_allowed_users` が続く理由で起動に失敗します。`gpueue status` 
 （[リストアの失敗](#restore-failures)を参照）、ジョブはチェックポイント済みのままです。`gpueue doctor` は有効な
 ポリシー（最小 uid とその出どころ、拒否するグループとそのうちホストに存在するもの、許可するユーザー）を表示し、
 ヘルパーも起動時にログに記録します。これらのキーを変えたらヘルパーを再起動してください。
+
+<a id="log-directory-permissions"></a>
+## ログディレクトリの権限
+
+`/var/lib/gpueue/logs/<uid>/` は、ジョブのユーザーの所有、グループ `gpueue`、モード 2770 です。setgid ビット
+により、shim がそこに作るログはグループ `gpueue` のものになり（ユーザーはそのメンバーではありません）、
+グループの書き込み権限により、権限のないデーモンがヘルパーを経由せずにそれらを切り詰めたり削除したりできます。
+これには、ディレクトリの setgid ビットを尊重するローカルのファイルシステム（サポートされるどのカーネルでも
+ext4、xfs、btrfs、tmpfs など）が必要です。代わりにデフォルト ACL も検討しましたが、ファイルシステムとマウント
+で `acl` のサポートが必要になるため採用しませんでした。安全性は setgid ビットに頼っていません。shim はすべての
+ログをモード 0660 で作成して明示的に設定し（setuid、setgid、スティッキーのビットはなし）、デーモンは、通常
+ファイルでない、ジョブの所有者の所有でない、またはそれらのビットのいずれかがあるログの読み取りと切り詰めを
+拒否します。
 
 <a id="what-a-job-can-and-cannot-do"></a>
 ## ジョブにできること・できないこと
@@ -1573,8 +1655,10 @@ gpueue はこれを、ユーザーの待機中のジョブのうち今すぐ起�
 加わります。そのため、一時停止中のグループに置かれた古いジョブが、そのユーザーの最新のジョブを他の
 ユーザーのジョブより前に押し上げることはありません。それでも並ぶ場合は、ユーザーの順序、次に id で決まります。**これは pueue からの変更点です。** pueue では
 `-o` の優先度が高いジョブが他のすべてのジョブより先になります。`priority_type = "basic"` で pueue の順序
-（全ジョブについて `-o` の優先度が高いもの、次に id が小さいもの。nice、サイトファクター、`top`、
-フェアシェアは無視されます）に戻ります。
+（`-o` の優先度が高いもの、次に id が小さいもの。nice、サイトファクター、`top`、フェアシェアは無視されます）
+に戻ります。ただし、ユーザーの `-o` はそのユーザー自身のジョブの順序にしか影響しません。各ユーザーのジョブは
+`-o` で並べ替えられ、その順にそのユーザーのキュー位置（その id）を受け取るので、他のユーザーの先に出した
+ジョブより前に自分のジョブを割り込ませることは誰にもできません。
 
 **即時起動。** pueue では、キュー中または stash されたジョブの `start <id>`、`add -i`、`restart -i`、
 `restore -i` はジョブをすぐに起動します。gpueue でそうなるのは管理者の場合だけで、グループの `parallel`
@@ -1869,8 +1953,9 @@ automount ポイントをトリガーしながら）確認し、なければ分�
 であれば通ります。
 
 - 同じマウント済みのファイルシステム上（間に再起動や再マウントがない）：同じデバイスと inode であること。または
-- ファイルシステムが再びマウントされたあと：ダンプ直後と同じ所有者、グループ、モード、サイズ、更新時刻、
-  変更時刻であること。デバイス番号は新しいマウントで変わり、inode 番号はすべてのファイルシステムで安定している
+- ファイルシステムが再びマウントされたあと（別のデバイス番号）、または FUSE やネットワークのファイルシステム
+  上：ダンプ直後と同じ所有者、グループ、モード、サイズ、更新時刻、変更時刻（ファイルシステムが報告する場合は
+  作成時刻も）であること。デバイス番号は新しいマウントで変わり、inode 番号はすべてのファイルシステムで安定している
   わけではありません。sshfs のような FUSE ファイルシステムは inode を検索された順に番号付けするので、再起動後は
   ジョブのファイルは通常別の番号になります（そして別のファイルが古い番号を持つこともあります）。変更時刻は
   カーネル（sshfs ではサーバー）が設定するもので、ジョブの所有者は自分のものでないファイルにそれを設定でき
@@ -2037,8 +2122,7 @@ sudo gpueue update --version 0.2.0 --yes
    エラーで止まり、片方だけなら止まってもう一度実行するよう伝え（再実行で組が修復されます）、両方なっていれば
    （最後の確認だけが失敗した場合）警告して続けます。
 
-`install.sh`（必要なら `--version` を付けて再実行）でも同じことができます。署名は `PATH` にある `minisign`、
-なければダウンロードした固定版の minisign で確認します（[インストーラーの実行](#running-the-installer)
+`install.sh`（必要なら `--version` を付けて再実行）でも同じことができます。署名はダウンロードした固定版の minisign で確認します（[インストーラーの実行](#running-the-installer)
 を参照）。
 
 `service install`（したがって上記のどちらの方法も）は、バイナリとユニットを置き換え、何か変わっていれば両方の
@@ -2230,11 +2314,35 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
 - `the job has Unix sockets bound to [...] on the host's filesystems (or to relative names ...)`：
   リストアの際に CRIU が root としてそれらのパスを作成、unlink、chown することになります。ソケットは `/tmp`
   以下の絶対パスか抽象名にバインドしてください。相対名は、バインドされたディレクトリがわからないので、
-  ホストのパスとして扱われます。
+  ホストのパスとして扱われます。`.`、`..`、`//` を含む名前、`/proc` 以下の名前、`/tmp` 以下のディレクトリが
+  シンボリックリンクや別のマウントを経由して到達するものも同様です。
+- `the job has Unix sockets listening on the abstract names [...]`：CRIU はリスナーを root としてセット
+  アップするので、誰が待ち受けているかを確認するクライアント（`SO_PEERCRED`）には root と見えてしまいます。
+  代わりに `/tmp` 以下のパスで待ち受けてください。
+- `the job has inotify or fanotify descriptors (...)`：CRIU は監視を root として、パスで再登録することになり
+  ます。チェックポイントの前にファイル監視を閉じるか、ジョブを `--no-checkpoint` で実行してください。
+- `Post dump script passed with 1` と、CRIU のログにある `descriptors in flight in Unix socket messages
+  (SCM_RIGHTS)` でチェックポイントが失敗する場合：ジョブがちょうどそのとき Unix ソケットでディスクリプタを
+  渡していました。ジョブは動き続けます。しばらくしてからもう一度チェックポイントしてください。
+- `internet sockets bound to TCP port N, which another socket on this host is bound to as well` でリストアが
+  拒否される場合：CRIU は復元したソケットを root として `SO_REUSEPORT` 付きでバインドするので、今そのポートを
+  持っている相手とポートを共有してしまう可能性があります。ポートを空けて（または空くのを待って）もう一度
+  リストアしてください。
 - `the job has internet sockets with SO_REUSEPORT (...)`：CRIU はジョブに資格情報を戻す前に root として
   ソケットを作り直すので、リストアされた `SO_REUSEPORT` のソケットは root のものになり、同じポートの root の
   サービスのグループに加わって（その接続の一部を受け取って）しまう可能性があります。プログラムで
   `SO_REUSEPORT` を無効にするか、ジョブを `--no-checkpoint` で実行してください。
+- `the job holds deleted files that still have other hard links (...)`、`... files deleted on NFS
+  while open (...)`：CRIU がそうしたファイルをチェックポイントできるのは、root としてディレクトリに
+  リンクし直す場合（`--link-remap`。gpueue は決して使いません）だけです。チェックポイントの前にファイルを
+  閉じるか、ジョブを `--no-checkpoint` で実行してください。
+- `the job holds deleted files with the setuid or setgid bit or file capabilities (...)`：リストアはそれらを
+  root として、その所有者とモードのまま、特権プログラムとして再作成してしまいます。チェックポイントの前に
+  閉じるか、ジョブを再起動してください。（それ以外の削除されたファイル、たとえばジョブの実行中にパッケージの
+  アップグレードで置き換えられたライブラリは、イメージに保存されるので問題ありません。）
+- `... (found while CRIU had the job stopped for the dump); the job was resumed`：ジョブがダンプ前の
+  チェックのあとでそうしたファイルを開きました。CRIU の `post-dump` のチェックがそれを見つけ、CRIU は
+  ダンプを中止しました。
 - `the job depends on a filesystem that is gone, does not answer or root cannot access: <mount point>
   (<type>) ...; the job uses it: ...`：ジョブが使っている FUSE やネットワークのファイルシステムが、ホストに
   もうマウントされていないか、応答しないか、`allow_other` なしの FUSE マウントです。再びマウントして（sshfs を
@@ -2244,12 +2352,17 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
   could only restore by binding a host path that someone other than root can redirect: <mount
   point> (<type>) could only be restored by binding a host path ...`：ジョブが、ホストのパスがジョブの
   所有者の変更できるディレクトリの下にあるマウント（ユーザーが自分のホームに作った `allow_other` の FUSE
-  マウント）を使っています。root と、デーモンのユーザー以外の `job_min_uid` 未満のシステムアカウントの
+  マウント）、FUSE やネットワークのファイルシステム、あるいはそれ自体がシンボリックリンクであるものや、
+  `/tmp` のようなスティッキーなディレクトリにある他のユーザーのエントリ（`/tmp/<そのユーザーのディレクトリ>`
+  の bind）を使っています。root と、デーモンのユーザー以外の `job_min_uid` 未満のシステムアカウントの
   ディレクトリは、グループやその他のユーザーが書き込めない限り問題ありません。チェックポイントする必要のあるジョブには、`/mnt` の下など、親ディレクトリを root しか変更
   できない場所にファイルシステムをマウントしてください。
 - `the job has processes in a PID or user namespace of their own (...)`：ジョブが `unshare`、`bwrap`、
   rootless のコンテナランタイムを実行しており、CRIU は入れ子の PID 名前空間とユーザー名前空間をダンプできません。
   ジョブを `--no-checkpoint` で実行するか、入れ子の名前空間なしで実行してください。
+- `reading the job's mounts: the job has a mount whose root or mount point contains control
+  characters ...`（または `is not UTF-8`）：ジョブの名前空間にコピーされたホストのマウントに、CRIU が
+  mountinfo から読み戻せないパスがあります。アンマウントするか名前を変えて、ジョブを起動し直してください。
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`：ジョブのマウント
   名前空間が別のマウントの下に隠れたマウントに依存しているので、決してリストアできません。ジョブを実行し直して
   ください（`gpueue restart`）。新しいジョブには整理された名前空間が与えられます。

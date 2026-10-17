@@ -168,6 +168,10 @@ curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.
 | `--purge` | 与 `--uninstall` 一起使用时，同时删除 `/etc/gpueue` 和 `/var/lib/gpueue`（以及 `config.toml` 设置的数据目录） |
 | `-y`, `--yes` | 清除（purge）前不再询问 |
 
+不带 `--version` 时，`install.sh` 会拒绝用更旧的发布版本替换已安装的 gpueue（它只检查只有 root 才能替换的
+已安装 `gpueue`：单元所运行的那个，或位于 `/usr/local/bin` 或 `/usr/bin` 中的那个，绝不检查通过 `PATH`
+找到的）。发布版本的标签必须形如 `v<major>.<minor>.<patch>`；其他任何形式都会被拒绝。
+
 只有指定 `--save-token` 时才会保存令牌。这样，过期或被吊销的令牌就不会在你不知道用了哪个令牌的情况下
 导致之后的运行失败。
 
@@ -182,10 +186,10 @@ aarch64 且 glibc 为 2.34 或更高版本，以及 gpueue 是否并非由包管
 2. 将 `gpueue-v<X>-<target>.tar.gz`（`x86_64-unknown-linux-gnu` 或 `aarch64-unknown-linux-gnu`）
    及其 `.sha256` 和 `.minisig` 文件下载到临时目录（只用 HTTPS，重定向也是如此），确认 `.sha256` 文件是按名称给出的该
    tarball 的校验和，并校验校验和，
-3. 用内置于脚本中的发布密钥（`packaging/minisign.pub`）校验 `.minisig` 签名。它使用 `PATH` 中的
-   `minisign`；如果没有，就从 GitHub 将 minisign 0.12 的静态二进制发布包下载到临时目录，用内置于脚本中的
-   SHA-256 校验和（与 `scripts/dist/get-minisign.sh` 相同）校验后使用。如果下载失败，它会停止，并提示你
-   从发行版安装 `minisign`（例如 `sudo apt install minisign`）后重新运行；签名校验绝不会被跳过。
+3. 用内置于脚本中的发布密钥（`packaging/minisign.pub`）校验 `.minisig` 签名。它从不使用 `PATH` 中的
+   `minisign`（脚本以 root 身份运行）：它从 GitHub 将 minisign 0.12 的静态二进制发布包下载到临时目录，用
+   内置于脚本中的 SHA-256 校验和（与 `scripts/dist/get-minisign.sh` 相同）校验后使用。如果下载失败，它会
+   停止；签名校验绝不会被跳过。
    签名的 trusted comment 必须是所请求的发布版本和 tarball 的 `gpueue <tag> <file>`，因此以较新名称提供的
    旧发布版本的（签名有效的）tarball 会被拒绝，
 4. 解压 tarball（拒绝链接以及指向其外部的路径），运行新的 `gpueue service install`
@@ -255,6 +259,29 @@ git commit packaging/minisign.pub scripts/install.sh
 `.deb` 通过时，才会创建草稿：它在 Ubuntu 26.04 虚拟机中用 apt 安装软件包，在有已检查点、运行中和已暂停作业的
 情况下重启，从上一个发布版本升级，并恢复这些作业。如果失败，则不会创建任何内容：修复原因后为新版本打标签；
 如果失败并非由该发布版本引起，则重新运行失败的作业。
+
+`release.yml` 还会拒绝其提交不是默认分支祖先的标签（作业 `check-signing`，手动运行时也是如此），并且
+`apt-repo.sh` 和 `update-aur.sh` 用默认分支的 `packaging/minisign.pub` 进行校验，标签中带有不同密钥时会
+失败。因此，密钥轮换之后，较旧的标签无法再重新发布到 APT 仓库或 AUR。
+
+<a id="recommended-repository-settings-maintainers"></a>
+#### 推荐的仓库设置（维护者）
+
+这些设置不在仓库中，因此由维护者用 `gh api` 应用（请按实际情况调整所有者、仓库和分支名称）：
+
+- 保护发布线：在默认分支（以及任何稳定分支）上设置分支规则集，要求拉取请求和 CI 检查，禁止强制推送和
+  删除；并在 `v*` 上设置标签规则集，把创建、更新和删除限制为维护者。
+- 要求固定 action：在 Actions 权限（`PUT /repos/{owner}/{repo}/actions/permissions`）中设置
+  `sha_pinning_required`，这会使工作流在遇到未固定到完整提交 SHA 的 action 时失败
+  （`.github/dependabot.yml` 会让固定的版本保持最新）。
+- 启用 secret scanning 和 push protection（`security_and_analysis`），以及 Dependabot 警报。
+- 各渠道使用不同的密钥：minisign 密钥为发布资源文件签名，APT 和 RPM 的签名使用它们自己的 GPG 密钥
+  （`APT_GPG_PRIVATE_KEY`）；请为 RPM 渠道单独准备一个密钥，而不是使用 APT 归档密钥，这样一次泄露就不会
+  同时影响两者。
+- 把签名用的 secrets 放在受保护的 environment 中（另行跟踪）。
+
+依赖项由 CI 中的 `cargo-deny` 检查（`deny.toml`：安全公告、crates.io 为唯一来源、重复版本仅警告），
+Dependabot 每周提出 cargo 和 GitHub Actions 的更新。
 
 <a id="installing-the-debianubuntu-package"></a>
 ## 安装 Debian/Ubuntu 软件包
@@ -378,8 +405,8 @@ sudo apt purge gpueue     # also delete /etc/gpueue and the APT repository entry
 `gpueue update` 所跟随的“latest”发布版本）：`.deb` 文件、`Packages`、`Packages.gz`、`Release`、`InRelease`
 和 `Release.gpg`、公钥 `gpueue.gpg` 以及 `gpueue.sources`。当某个发布版本**作为稳定版本发布**时
 （`released` 事件：发布一个稳定版本，或将预发布版本转为稳定版本），`.github/workflows/release-apt.yml` 会通过
-`scripts/dist/apt-repo.sh github <tag>` 更新它：添加该发布版本的 `.deb` 文件（先用该标签所在提交中的公钥
-校验其校验和与 minisign 签名），将仓库中已有的软件包与已签名的索引核对（`InRelease` 必须能用
+`scripts/dist/apt-repo.sh github <tag>` 更新它：添加该发布版本的 `.deb` 文件（先用默认分支的公钥
+校验其校验和与 minisign 签名；该标签中的同一文件必须是同一个密钥，否则作业失败），将仓库中已有的软件包与已签名的索引核对（`InRelease` 必须能用
 `packaging/apt/gpueue-archive-keyring.gpg` 验证，且每个 `.deb` 的 SHA256 必须与已签名的 `Packages` 中列出的
 一致；不一致时作业失败且不做任何更改；被中断的运行留下的、索引中未列出的 `.deb` 会被丢弃），
 按架构只保留最新的五个版本（按 Debian 版本顺序）并删除其余版本，
@@ -781,9 +808,11 @@ cuda-checkpoint（参见 [cuda-checkpoint](#cuda-checkpoint)）。两者都是�
 PKGBUILD 位于 `packaging/aur/gpueue-bin`。当一个发布版本作为稳定版本发布时（与 APT 仓库相同的 `released`
 事件；草稿和预发布版本不会触发），
 `.github/workflows/release-aur.yml` 会运行 `scripts/dist/update-aur.sh <version>`，它下载发布版本的 tarball
-及其 `.minisig` 文件，用该标签的 `packaging/minisign.pub` 校验它们（并像 `install.sh` 一样校验 trusted comment
-`gpueue v<version> <file>`），根据校验过的 tarball 和该标签的源码归档（用于单元和片段，签名的资源文件中不包含它们）
-计算 PKGBUILD 的校验和，并在 Arch Linux 容器中重新生成 `.SRCINFO`。然后它将 `PKGBUILD`、`.SRCINFO` 和 `gpueue-bin.install` 推送到
+及其 `.minisig` 文件，用默认分支的 `packaging/minisign.pub` 校验它们（该标签中的同一文件必须是同一个密钥，否则脚本失败；
+它还像 `install.sh` 一样校验 trusted comment `gpueue v<version> <file>`），根据校验过的 tarball
+计算 PKGBUILD 的校验和，并在 Arch Linux 容器中重新生成 `.SRCINFO`。单元、`sysusers.d` 和 `tmpfiles.d`
+片段以及默认配置都在已签名的 tarball 中（位于 `packaging/` 之下），PKGBUILD 从那里安装它们（在加入这些
+文件的版本之前的发布版本无法用此 PKGBUILD 打包）。然后它将 `PKGBUILD`、`.SRCINFO` 和 `gpueue-bin.install` 推送到
 `ssh://aur@aur.archlinux.org/gpueue-bin.git`。发布版本必须同时包含 x86_64 和 aarch64 的 tarball。
 要在不发布新版本的情况下修改打包，请在 PKGBUILD 中递增 `pkgrel`，并手动运行工作流
 （`gh workflow run release-aur.yml -f version=<X.Y.Z>`）。
@@ -833,7 +862,9 @@ scripts/test-in-docker.sh build --release -p gpueue -p gpueue-helper
 
 ```sh
 sha256sum -c gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar xzf gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+# Unpack as root in a directory only root can write to (e.g. below /root): the helper is
+# run as root, so `service install` refuses one that others could have replaced.
+sudo tar --no-same-owner -xzf gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
 sudo gpueue-v0.1.0-x86_64-unknown-linux-gnu/gpueue service install
 ```
 
@@ -844,7 +875,11 @@ sudo gpueue-v0.1.0-x86_64-unknown-linux-gnu/gpueue service install
 sudo target/release/gpueue service install
 ```
 
-`gpueue-helper` 必须与 `gpueue` 位于同一目录。单元从以下位置运行二进制文件：
+`gpueue-helper` 必须与 `gpueue` 位于同一目录。`service install` 复制它时，helper 及其上方的每一级目录都必须
+属于 root，且不能被组或其他用户写入（它以 root 身份运行，因此任何能在复制之前把它换掉的人都能获得 root）；
+否则安装会拒绝并说明原因。请在只有 root 能写入的目录中构建或解压发布版本（例如 `/root` 之下，并使用
+`sudo tar`），或先把两个二进制文件都放到 `/usr/local/bin`。`gpueue` 本身是从正在运行的进程复制的，而不是
+从它的路径复制的。单元从以下位置运行二进制文件：
 
 1. 重新安装或更新时，使用当前 `service install` 安装所在的目录；
 2. 否则，如果 `gpueue` 二进制文件所在目录是 `/usr/bin` 或 `/usr/local/bin`，则使用该目录
@@ -914,7 +949,7 @@ store 路径注册为垃圾回收根 `/nix/var/nix/gcroots/gpueue`（通过 `nix
    | `/var/lib/gpueue/daemon` | 0700 gpueue | `state.sqlite`，守护进程的数据库 |
    | `/var/lib/gpueue/helper` | 0711 root | helper 的作业记录和事件队列 |
    | `/var/lib/gpueue/checkpoints` | 0700 root | 检查点镜像，每个作业一个 `<id>/` |
-   | `/var/lib/gpueue/logs` | 0755 root | 作业输出，`<uid>/<id>.log`（helper 以 2770 权限创建 `<uid>/`，所有者为该用户，组为 `gpueue`） |
+   | `/var/lib/gpueue/logs` | 0755 root | 作业输出，`<uid>/<id>.log`（helper 以 2770 权限创建 `<uid>/`，所有者为该用户，组为 `gpueue`；见[日志目录权限](#log-directory-permissions)） |
    | `/var/lib/gpueue/lib` | 0755 root | fork guard 库（`gpueue-forkguard-<hash>.so`），以及作业单元运行的 helper 副本（`gpueue-helper-<hash>`；见[升级](#upgrading)） |
    | `/var/lib/gpueue/criu-no-plugins` | 0755 root | 手动模式使用的空 CRIU 插件目录 |
    | `/run/gpueue` | 0755 gpueue | `gpueue.sock`（守护进程，权限 0666）和 `helper.sock`（helper，所有者 `gpueue`，权限 0600） |
@@ -989,6 +1024,11 @@ store 路径注册为垃圾回收根 `/nix/var/nix/gcroots/gpueue`（通过 `nix
 | NixOS 上的 Nix | `nix flake update && sudo nixos-rebuild switch` | `services.gpueue.enable = false`，然后 `sudo nixos-rebuild switch` |
 | 其他系统上的 Nix | 创建该单元的 Nix 配置 | 同左 |
 | `gpueue service install` | `sudo gpueue update` | `sudo gpueue uninstall` |
+
+helper 单元（`gpueue-helper.service`）有意不做沙箱隔离：它以 root 身份运行，必须能看到主机的挂载和设备，
+为 `criu restore --root` 绑定挂载 `/`，并启动供 CRIU 和 cuda-checkpoint 操作的进程，而沙箱指令（设备允许
+列表、seccomp 过滤器）也会影响这些进程。它的保护在于：体积小、只读取属于 root 的配置、拒绝他人可能替换过的
+内容。
 
 守护进程以 `ProtectSystem=strict` 运行：它只能写入单元的
 `ReadWritePaths=/var/lib/gpueue/daemon /var/lib/gpueue/logs /run/gpueue` 之下。如果在 `config.toml`
@@ -1140,7 +1180,8 @@ gpueue service status   # both units, and whether the daemon is reachable and co
   （例如 `cuda_checkpoint_path = "cuda-checkpoint-r570"`）。CRIU，以及有 NVIDIA 驱动的主机上的
   cuda-checkpoint 为 FAIL；helper 会拒绝的程序（重启会使 helper 停止）也为 FAIL，提示修正所有权而不是
   重启。其他情况为警告。
-- helper 正在运行但守护进程未记录的作业（`orphaned jobs`，仅在存在时显示）
+- helper 正在运行但守护进程未记录的作业（`orphaned jobs`，仅在存在时显示；守护进程只把它们、helper 的程序路径以及 NVML 失败的原因告诉管理员，
+  因此请以管理员身份运行 `doctor` 来查看）
 - 检查点目录（是否存在、是否为 tmpfs、可用空间）以及检查点总大小（`checkpoint dir`、`checkpoint usage`）
 - 你是否为管理员（`admin`）
 - 除非 `update_check = false`，是否有更新的发布版本（`update`）。这项检查最多为 INFO，无法访问 GitHub 时
@@ -1194,7 +1235,8 @@ scripts/gpu-host-test.sh --keep          # keep the jobs and files for debugging
 <a id="configuration"></a>
 ## 配置
 
-守护进程和 helper 读取 `/etc/gpueue/config.toml`。所有键都是可选的。未知的键会被忽略。文件
+守护进程和 helper 读取 `/etc/gpueue/config.toml`，并且遇到是符号链接（或其上方目录是符号链接）、或除 root 外
+任何人都能修改的文件时，两者都会拒绝启动。所有键都是可选的。未知的键会被忽略。文件
 不存在则全部使用默认值。安装的文件（[packaging/config.toml](../../packaging/config.toml)）以注释
 列出了所有键：注释行 `# key = value` 表示默认值，`# Example:` 下方缩进的行是默认未设置的键
 （例如 `checkpoint_size_limit_bytes`）和 `[[gpus]]` 的示例。修改后，请重启使用该键的服务。
@@ -1235,7 +1277,7 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/gpue
 | `grace_secs` | `30` | 两者 | 停止作业时 SIGTERM 与 SIGKILL 之间的秒数 |
 | `shell` | `["sh", "-c"]` | 守护进程 | 命令前缀，作业的命令行追加在其后 |
 | `max_unfinished_jobs_per_user` | `10000` | 守护进程 | 每个用户最多可以拥有的未结束作业（排队、stash、运行、暂停、已检查点等）数量；超出后 `add` 以及让作业重新运行的 `restart` 会以 `too_many_requests` 被拒绝 |
-| `max_job_spec_bytes` | `262144`（256 KiB） | 守护进程 | 一个作业的命令、工作目录、标签和环境变量（`gpueue add` 会发送调用者的全部环境变量）合计的字节数上限；更大的作业会以 `bad_request` 被拒绝 |
+| `max_job_spec_bytes` | `262144`（256 KiB） | 守护进程 | 一个作业的命令、工作目录、标签和环境变量（`gpueue add` 会发送调用者的全部环境变量）合计的字节数上限（每个依赖项计 8 字节；一个作业最多也只能依赖 1000 个作业）；更大的作业会以 `bad_request` 被拒绝 |
 | `checkpoint_size_limit_bytes` | 未设置（无上限） | 守护进程 | 所有镜像的总大小超过该值时发出警告（镜像永远不会被自动删除） |
 | `checkpoint_size_warning_interval_secs` | `3600` | 守护进程 | 超出上限期间，每位管理员收到提醒的间隔 |
 | `checkpoint_tcp_close` | `true` | 两者 | 创建检查点时关闭 TCP 连接（`criu --tcp-close`） |
@@ -1252,6 +1294,7 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/gpue
 | `job_system_dbus` | `false` | helper | `true` 允许作业访问系统 D-Bus（systemd、polkit）；默认情况下对作业隐藏 `/run/dbus`（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
 | `job_systemd_varlink` | `false` | helper | `true` 允许作业访问 `/run/systemd` 下的 systemd Varlink 服务；默认情况下该目录对作业隐藏，只保留 journald 的日志套接字、resolved 的名称解析套接字和 `resolv.conf` 文件以及 `userdb/`（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
 | `job_min_uid` | `/etc/login.defs` 的 `UID_MIN`，没有则为 `1000` | helper | 拒绝 uid 小于此值的用户的作业（见 [谁可以运行作业](#who-jobs-may-run-as)） |
+| `job_max_uid` | 未设置（无上限） | helper | 拒绝 uid 大于此值的用户的作业；65534、65535、4294967295 和 61184-65519（systemd 的 `DynamicUser=`）总是被拒绝（见 [谁可以运行作业](#who-jobs-may-run-as)） |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]` | helper | 等同 root 的组：从作业的附加组中去掉；主组为其中之一的作业会被拒绝 |
 | `job_hidden_socket_dirs` | `["/run/libvirt", "/run/cups"]` | helper | 用空的、属于 root 的 tmpfs 对作业隐藏的目录（不存在时先创建）：这些守护进程套接字在用户数据库中检查调用者的组，去掉组无法阻止；须为至少两级深的绝对路径，途中已存在的目录（和符号链接）须属于 root 且不可被组或其他人写入（helper 启动时检查）（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
 | `job_allowed_users` | `[]`（所有人） | helper | 非空时，只有列出的用户（按名称）可以运行作业 |
@@ -1282,8 +1325,9 @@ sudo usermod -aG gpueue-admin alice
 <a id="who-jobs-may-run-as"></a>
 ## 谁可以运行作业
 
-root helper 以所有者身份启动每个作业，因此由它决定运行谁的作业；守护进程无法改变这一点。除了从不以 root
-（uid 0 或 gid 0）或所有者不属于的组运行作业之外，helper 对每次启动和每次恢复应用三项设置：
+root helper 以所有者身份启动每个作业，因此由它来执行“运行谁的作业”的策略；守护进程无法改变这一策略。除了
+从不以 root（uid 0 或 gid 0）、uid 65534（`nobody`）、65535、4294967295 或 systemd 的 `DynamicUser=` 范围
+61184-65519 内的 uid，或所有者不属于的组运行作业之外，helper 对每次启动和每次恢复应用四项设置：
 
 - `job_min_uid`：uid 小于此值的用户会被拒绝。未设置时为 `/etc/login.defs` 的 `UID_MIN`（大多数发行版为
   1000），文件中没有有效的 `UID_MIN` 时为 1000。这样系统账户（`www-data`、`postgres`、守护进程自己的
@@ -1291,6 +1335,11 @@ root helper 以所有者身份启动每个作业，因此由它决定运行谁�
   恢复的作业中的主机路径可以位于 uid 小于此值的账户的目录之下（例如 `systemd-resolve` 的
   `/run/systemd/resolve`），但不能位于可以运行作业的用户的目录之下，也不能位于守护进程用户的目录之下（见
   [不再响应的网络和 FUSE 文件系统](#network-and-fuse-filesystems-that-stop-answering)）。
+  这假定用户无法通过其他方式（`sudo` 规则、由他们控制的服务）以这些账户的身份行事：请把 `job_min_uid`
+  设置得高于用户能以其身份运行代码的所有账户。
+- `job_max_uid`：uid 大于此值的用户会被拒绝。默认未设置，因为目录服务（LDAP、通过 sssd ID 映射的 AD）
+  通常会给普通用户远高于 60000 的 uid，而 systemd-homed 用户的 uid 为 60001-60513。只有在你想要上限时才
+  设置它。
 - `job_denied_groups`：其成员无需密码即可以 root 身份行事的组。它们会从作业的附加组中去掉，因此属于
   `docker` 的用户的作业在没有 `docker` 的情况下运行；去掉了哪些组会记录在 helper 的日志中
   （不会改动作业的输出）。主组为其中之一的作业会被拒绝，进程带有其中之一的检查点也会被拒绝恢复（CRIU 会恢复该组）。
@@ -1311,12 +1360,30 @@ root helper 以所有者身份启动每个作业，因此由它决定运行谁�
   "wheel", "admin"]` 让作业可以使用 Docker）。
 - `job_allowed_users`：非空时，只有列出的用户（按名称）可以运行作业。
 
+这能防护什么、不能防护什么：helper 检查的是请求所指名的用户，而不是谁发出了请求。启动所用的 uid、工作目录、
+命令和环境变量来自守护进程，守护进程通过套接字凭据识别提交的客户端。因此，被攻陷的守护进程（非特权的
+`gpueue` 用户）无法以 root 或策略拒绝的用户身份运行任何东西，但可以以策略允许的任何用户身份启动任意命令。
+请把 `gpueue` 用户视为能以每一个获准运行作业的用户的身份行事。`gpueue-admin` 的成员还可以读取每个用户的
+作业环境变量（`gpueue status --json`、`gpueue log` 的头部以及 `gpueue status` 显示的环境变量），因此在你不
+信任每一位管理员的机器上，不要通过作业的环境变量传递机密；守护进程的数据库中也保存着它们（`0700
+gpueue`）。在 helper 一侧检查提交者的工作在 issue #107 中跟踪。
+
 被拒绝的作业启动失败，原因以 `gpueue refuses to run jobs as <user>:` 开头，后面是例如 `uid 999 is below
 job_min_uid 1000 (UID_MIN in /etc/login.defs)`、`primary group docker is in job_denied_groups` 或 `not in
 job_allowed_users`。`gpueue status` 将其显示为 `Failed to spawn`，`gpueue log <id>` 和
 `gpueue status --json` 会显示原因。被拒绝的恢复按恢复失败处理（见 [恢复失败](#restore-failures)），作业保持
 已检查点状态。`gpueue doctor` 会显示生效的策略（最小 uid 及其来源、拒绝的组以及其中哪些在主机上存在、允许
 的用户），helper 启动时也会将其写入日志。更改这些键后请重启 helper。
+
+<a id="log-directory-permissions"></a>
+## 日志目录权限
+
+`/var/lib/gpueue/logs/<uid>/` 属于作业的用户，组为 `gpueue`，权限为 2770。setgid 位使 shim 在其中创建的
+日志属于组 `gpueue`（用户不是该组成员），而组写权限使非特权的守护进程无需经过 helper 就能截断和删除它们。
+这要求本地文件系统遵循目录上的 setgid 位（在任何受支持的内核上，ext4、xfs、btrfs、tmpfs 等都可以）。
+我们考虑过改用默认 ACL，但没有采用，因为它需要文件系统和挂载支持 `acl`。安全性并不依赖 setgid 位：shim
+以 0660 权限创建每个日志并显式设置（不带 setuid、setgid 或 sticky 位），而守护进程会拒绝读取或截断不是
+普通文件、不属于作业所有者、或带有这些位中任何一个的日志。
 
 <a id="what-a-job-can-and-cannot-do"></a>
 ## 作业能做什么、不能做什么
@@ -1413,8 +1480,9 @@ priority = site factor
 其他作业：它保留自己的等待时间（等待依赖的作业的等待时间为 0，从依赖完成时开始计算），能够启动时再加入
 汇总，因此停放在已暂停组中的旧作业无法把该用户最新的作业抬到其他用户的作业前面。剩余的
 平局先按该用户的顺序、再按 id 决定。**这是与 pueue 的不同之处，**在 pueue 中，`-o` 优先级较高的作业胜过所有
-其他作业。`priority_type = "basic"` 可恢复 pueue 的顺序（对所有作业先按 `-o` 优先级从高到低、再按 id 从小到大；
-此时 nice、site 因子、`top` 和 fair share 都被忽略）。
+其他作业。`priority_type = "basic"` 可恢复 pueue 的顺序（先按 `-o` 优先级从高到低、再按 id 从小到大；此时 nice、
+site 因子、`top` 和 fair share 都被忽略），不过用户的 `-o` 仍然只决定该用户自己的作业的顺序：每个用户的作业按
+`-o` 排序后，依次占用该用户的队列位置（即其 id），因此没有人能把自己的作业插到其他用户更早提交的作业前面。
 
 **立即启动。** 在 pueue 中，对排队中或暂存的作业执行 `start <id>`，以及 `add -i`、`restart -i` 和
 `restore -i`，都会立即启动作业。在 gpueue 中只有管理者的这些操作会这样：其作业会立即启动，忽略组的
@@ -1680,8 +1748,8 @@ helper 会记录这些路径各自的文件系统类型和挂载点，以及作�
 检查也会通过：
 
 - 在同一个已挂载的文件系统上（期间没有重启或重新挂载）：设备和 inode 相同；或
-- 文件系统重新挂载之后：所有者、组、权限、大小、修改时间和变更时间（ctime）与转储刚结束时
-  相同。设备号会随新挂载而改变，而 inode 号并非在所有文件系统上都稳定：sshfs 等 FUSE 文件系统
+- 文件系统重新挂载之后（设备号不同），或在 FUSE 或网络文件系统上：所有者、组、权限、大小、修改时间和变更
+  时间（ctime）（以及文件系统报告的创建时间，如果有的话）与转储刚结束时相同。设备号会随新挂载而改变，而 inode 号并非在所有文件系统上都稳定：sshfs 等 FUSE 文件系统
   按查找顺序为 inode 编号，因此重启后作业的文件通常会有其他编号（另一个文件可能拿到旧编号）。
   变更时间由内核（在 sshfs 上由服务器）设置，作业的所有者无法在不属于自己的文件上设置它。
 
@@ -1829,8 +1897,7 @@ sudo gpueue update --version 0.2.0 --yes
    文件，就以该错误停止；若只有一个是，就停止并提示再运行一次（再次运行会修复这对二进制文件）；
    若两者都是（只有最后的检查失败），就发出警告并继续。
 
-`install.sh`（再次运行，可选 `--version`）同样可用，效果相同；它用 `PATH` 中的 `minisign` 验证签名，
-或者下载一个固定版本的 minisign（参见[运行安装程序](#running-the-installer)）。
+`install.sh`（再次运行，可选 `--version`）同样可用，效果相同；它用自己下载的固定版本的 minisign 验证签名（参见[运行安装程序](#running-the-installer)）。
 
 `service install`（因此上述两种方式都是）会替换二进制文件和单元，并在有任何变化时重启两个
 服务。它先写入两个二进制文件，再从 helper 开始依次放到位；如果其中一个无法放到位，另一个会被
@@ -2005,10 +2072,29 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
   `gpueue doctor`），而 CRIU 也无法转储其设备映射。
 - `the job has Unix sockets bound to [...] on the host's filesystems (or to relative names ...)`：
   恢复会让 CRIU 以 root 身份创建、unlink 和 chown 这些路径。请把套接字绑定到 `/tmp` 下的绝对路径或
-  抽象名称。相对名称会被视为主机路径，因为无法得知它是在哪个目录中绑定的。
+  抽象名称。相对名称会被视为主机路径，因为无法得知它是在哪个目录中绑定的；名称中含有 `.`、`..` 或 `//` 的、位于 `/proc` 之下的，或其 `/tmp` 下的
+  目录要经过符号链接或另一个挂载才能到达的，也同样如此。
+- `the job has Unix sockets listening on the abstract names [...]`：CRIU 会以 root 身份建立该监听套接字，
+  因此检查谁在监听的客户端（`SO_PEERCRED`）会看到 root。请改为监听 `/tmp` 之下的路径。
+- `the job has inotify or fanotify descriptors (...)`：CRIU 会以 root 身份按路径重新添加这些监视。请在创建
+  检查点之前关闭文件监视器，或用 `--no-checkpoint` 运行该作业。
+- 检查点失败，且 CRIU 日志中出现 `Post dump script passed with 1` 和 `descriptors in flight in Unix socket
+  messages (SCM_RIGHTS)`：作业当时正在通过 Unix 套接字传递描述符。作业会继续运行；请稍后再次为它创建
+  检查点。
+- 恢复被拒绝，提示 `internet sockets bound to TCP port N, which another socket on this host is bound to as
+  well`：CRIU 以 root 身份并带 `SO_REUSEPORT` 绑定恢复的套接字，这可能与当前占用该端口的一方共享端口。请释放
+  该端口（或等它被释放），然后再次恢复。
 - `the job has internet sockets with SO_REUSEPORT (...)`：CRIU 在把凭据交还给作业之前以 root 身份重建
   套接字，因此恢复后的 `SO_REUSEPORT` 套接字将属于 root，并可能加入同一端口上某个 root 服务的组（并接收其
   部分连接）。请在程序中关闭 `SO_REUSEPORT`，或用 `--no-checkpoint` 运行该作业。
+- `the job holds deleted files that still have other hard links (...)`、`... files deleted on NFS
+  while open (...)`：CRIU 只能通过以 root 身份把这类文件重新链接回它们的目录（`--link-remap`，gpueue 从不
+  使用）来为它们创建检查点。请在创建检查点之前关闭这些文件，或用 `--no-checkpoint` 运行该作业。
+- `the job holds deleted files with the setuid or setgid bit or file capabilities (...)`：恢复会以 root 身份、
+  带着该所有者和权限把它们重新创建出来，成为特权程序。请在创建检查点之前关闭它们，或重启该作业。（其他已删除
+  的文件，例如作业运行期间被软件包升级替换掉的库，会保存在镜像中，没有问题。）
+- `... (found while CRIU had the job stopped for the dump); the job was resumed`：作业在转储前的检查之后
+  打开了这样的文件；CRIU 的 `post-dump` 检查发现了它，CRIU 放弃了转储。
 - `the job depends on a filesystem that is gone, does not answer or root cannot access: <mount
   point> (<type>) ...; the job uses it: ...`：作业使用的 FUSE 或网络文件系统已不再挂载在主机上、不响应，
   或者是未使用 `allow_other` 的 FUSE 挂载。请重新挂载它（重启 sshfs、恢复 NFS 服务器；用户的 FUSE 文件系统
@@ -2018,11 +2104,15 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
   could only restore by binding a host path that someone other than root can redirect: <mount
   point> (<type>) could only be restored by binding a host path ...`：作业使用的挂载，其主机路径位于作业所有者
   可以修改的目录之下（用户在自己主目录中的 `allow_other` FUSE 挂载；root 以及除守护进程用户以外低于
-  `job_min_uid` 的系统账户的目录，只要不可被组或其他用户写入，就没有问题）。对需要做检查点的作业，请把文件系统
+  `job_min_uid` 的系统账户的目录，只要不可被组或其他用户写入，就没有问题）、FUSE 或网络文件系统，或者其本身是
+  符号链接，或是 `/tmp` 这类 sticky 目录中他人的条目（对 `/tmp/<其目录>` 的绑定）。对需要做检查点的作业，请把文件系统
   挂载在父目录只有 root 能修改的目录上（例如 `/mnt` 之下）。
 - `the job has processes in a PID or user namespace of their own (...)`：作业运行了 `unshare`、`bwrap` 或
   rootless 容器运行时，而 CRIU 无法转储嵌套的 PID 和用户命名空间。请用 `--no-checkpoint` 运行该作业，或不使用
   嵌套的命名空间。
+- `reading the job's mounts: the job has a mount whose root or mount point contains control
+  characters ...`（或 `is not UTF-8`）：复制到作业命名空间中的某个主机挂载，其路径是 CRIU 无法从 mountinfo
+  读回的。请卸载或重命名它，然后重新启动该作业。
 - `the job's mounts [...] are only reachable through mounts hidden under other mounts`：作业的
   挂载命名空间依赖一个被另一个挂载遮盖的挂载，因此永远无法恢复。请重新运行该作业
   （`gpueue restart`）。新作业会得到清理过的命名空间。
