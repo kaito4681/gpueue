@@ -39,7 +39,7 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    4 MiB 内查找行首（如果这一范围内的行数不够，就从那里开始输出），并且同时只运行少量这样的扫描。单个用户能保存的
    内容也有限制：未结束的作业最多 `max_unfinished_jobs_per_user` 个（超出后 `add` 以及让作业重新运行的 `restart`
    会以 `too_many_requests` 被拒绝），一个作业的命令、工作目录、标签和环境变量合计最多 `max_job_spec_bytes`
-   （超出会以 `bad_request` 被拒绝）。落后太多的 `/v1/events` 订阅者会收到一个 `resync` 事件来代替它错过的事件；
+   （超出会以 `bad_request` 被拒绝；每个依赖按 8 字节计算，一个作业最多可依赖 1000 个作业）。落后太多的 `/v1/events` 订阅者会收到一个 `resync` 事件来代替它错过的事件；
    `gpueue wait` 随后会重新读取作业列表。
 2. **调度。** 当排队作业的组有空闲槽位，且其申请的每块 GPU 都有空闲槽位时，该作业启动。
    候选作业按优先级顺序考虑（参见[优先级与公平共享](#priority-and-fair-share)）。每一轮调度读取未结束的作业时不读取
@@ -70,7 +70,10 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    会对其发出警告，管理员可以用 `gpueue kill <id>` 停止它。
 4. **helper → systemd。** helper 通过 D-Bus 启动一个临时服务，其主进程为
    `gpueue-helper shim`，从 helper 二进制文件的内容寻址副本（`<data_dir>/lib/gpueue-helper-<hash>`，见
-   [helper 二进制副本](#helper-binary-copies)）运行。该单元设置了 `Before=gpueue-helper.service`、
+   [helper 二进制副本](#helper-binary-copies)）运行。该单元的描述只写明作业 id 和所有者的 uid（不含命令行，因为单元描述任何本地用户都能读取，并且会写入日志）。
+   它的 capability 边界集只限于 shim 在放弃特权之前所需的那些（`CAP_SYS_ADMIN`、`CAP_SETUID`、`CAP_SETGID`、
+   `CAP_SETPCAP`、`CAP_DAC_OVERRIDE`、`CAP_DAC_READ_SEARCH`、`CAP_KILL`）；命名空间 init 启动之后，外层 shim 只保留
+   `CAP_KILL`（用于把信号转发给 init，init 随后以所有者身份运行）。该单元设置了 `Before=gpueue-helper.service`、
    `After=remote-fs.target network.target`（仅排序）和 `KillMode=mixed`，stdin 为
    `/dev/null`，停止超时为 `grace_secs`。每个作业都位于自己的 cgroup 中，独立于守护进程、helper 和用户会话，
    因此在守护进程和 helper 重启以及用户注销后仍能继续存在。在 `gpu_device_isolation`（默认开启）时，该单元还设置了
@@ -82,7 +85,8 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    并在 `/tmp` 和 `/dev/shm` 上挂载私有 tmpfs（在此之前先卸下挂载在那里及其下方的东西，例如主机的 tmpfs
    `/tmp` 以及其上的 AppImage FUSE 挂载，否则它们会隐藏在命名空间中保留下来）。因位于 root 以外的人可以修改的
    目录之下而无法这样够到的挂载（`/tmp` 是普通目录时，用户在 `/tmp/<自己的目录>/` 中的 FUSE 挂载），会在挂载
-   私有 tmpfs 之后，像其他被隐藏的挂载一样先把它移到一旁再移除。除非 `job_system_dbus = true`，它会用一个空的 tmpfs 隐藏 `/run/dbus`，并且除非
+   私有 tmpfs 之后，像其他被隐藏的挂载一样先把它移到一旁再移除。如果某个被隐藏的挂载其上层的挂载无法用这种方式移到一旁，它会保留
+   （该作业随后无法创建检查点）；其他被隐藏的挂载仍会被移除。除非 `job_system_dbus = true`，它会用一个空的 tmpfs 隐藏 `/run/dbus`，并且除非
    `job_systemd_varlink = true`，用只保留 journald 日志套接字、resolved 名称解析套接字和 `resolv.conf` 文件以及 `userdb/`
    的 tmpfs 隐藏 `/run/systemd`，因此即使之后出现新的套接字，作业也无法通过 D-Bus 或 Varlink 向 systemd 或 polkit
    请求任何操作。它同样用空的 tmpfs 隐藏 `job_hidden_socket_dirs` 中的目录（默认为 `/run/libvirt` 和
@@ -114,9 +118,12 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    一起记录在 `helper-mounts.json` 中，这样一个已死的文件系统不会让所有作业都无法做检查点（见
    [不再响应的网络和 FUSE 文件系统](install.md#network-and-fuse-filesystems-that-stop-answering)）。
    如果命名空间 init 的后代中有进程位于自己的 PID 或用户命名空间（`unshare`、`bwrap`、rootless 容器运行时），
-   作业会被拒绝：CRIU 无法转储嵌套的 PID 和用户命名空间。如果检查失败，它会在触碰作业之前拒绝转储，作业继续运行，
-   `checkpoint` 请求会失败并给出原因（只有在应当转储时才发现的拒绝，会改为随结果一起报告，并由守护进程警告所有者）。
-   在手动模式下，它随后对每个 CUDA 进程运行
+   作业会被拒绝：CRIU 无法转储嵌套的 PID 和用户命名空间。这些检查中对作业文件的每一次查找都在带期限的子进程中进行，
+   `checkpoint` 请求的检查在 45 秒后放弃（正在停止的 helper 不再等待它们）。如果检查失败，它会在触碰作业之前拒绝转储，
+   作业继续运行，`checkpoint` 请求会失败并给出原因（只有在应当转储时才发现的拒绝，会改为随结果一起报告，并由守护进程警告所有者）。
+   CRIU 的 `post-dump` 动作脚本（`gpueue-helper dump-hook`）会在 CRIU 仍停住被转储的任务时，对作业的文件再做一遍相同的检查；
+   如果发现应当拒绝的内容（作业在第一轮检查之后打开了它），或没有及时完成，脚本就会失败，CRIU 放弃转储并让作业继续运行，
+   检查点会连同原因一起报告为被拒绝。在手动模式下，它随后对每个 CUDA 进程运行
    `cuda-checkpoint --action lock` 和 `checkpoint`，接着以 `--tcp-close` 和
    `/var/lib/gpueue/checkpoints/<id>/` 下的镜像目录对命名空间的 init 执行 `criu dump`。
    在插件模式下，它只运行 `criu dump`，使用 CRIU 的默认插件目录，由 CRIU 的 `cuda_plugin.so` 调用 cuda-checkpoint
@@ -162,27 +169,47 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 所有者可以改变这样的路径所指向的对象，例如把自己的某个目录替换为指向 `/etc` 的符号链接；如果不加防范，
 恢复后的作业就会以转储时的模式持有一个 root 的文件。因此 helper 会：
 
-- **在转储时**拒绝在主机文件系统上绑定了 Unix 套接字的作业（CRIU 在恢复时会以 root 身份对这些路径执行绑定、
-  unlink 和 chown；作业自己的 `/tmp` 下的套接字没有问题，而绑定到相对名称的套接字会被视为绑定在主机上，因为
-  `/proc` 无法说明它在哪个目录中），拒绝带有设置了 `SO_REUSEPORT` 的网络套接字的作业（CRIU 在恢复作业的凭据之前
+- **在转储时**拒绝其命名空间中有挂载根或挂载点不是 UTF-8、或包含控制字符的挂载的作业（内核在 mountinfo 中只转义
+  空格、制表符、换行和反斜杠，而 CRIU 4.2 在任何 ASCII 空白处拆分其字段，并且只反转义空格、制表符和反斜杠，
+  因此会在另一个路径上转储这样的挂载），拒绝在主机文件系统上绑定了 Unix 套接字的作业（CRIU 在恢复时会以 root
+  身份对这些路径执行绑定、unlink 和 chown；作业自己的 `/tmp` 下的套接字没有问题，而绑定到相对名称的套接字会被
+  视为绑定在主机上，因为 `/proc` 无法说明它在哪个目录中）。内核保存的套接字名称与作业传给 `bind(2)` 的完全一致，
+  CRIU 也正是绑定这个名称，因此名称只有同时满足以下条件才算作业自己的：它是绝对且已规范化的路径（没有 `.`、`..`
+  或空的组成部分），不在 `/proc` 之下，位于某个私有 tmpfs 挂载之下，并且它所在的目录能从该挂载出发、通过从作业根
+  目录起的描述符、不经过符号链接、也不跨入其他挂载地到达
+  （`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV)`）。它还拒绝有 Unix 套接字在抽象名称上监听的作业
+  （CRIU 会以 root 身份设置它们，因此通过 `SO_PEERCRED` 询问谁在监听的客户端会被告知是 root；不监听的抽象套接字没有问题）、
+  有 inotify 或 fanotify 描述符的作业（CRIU 会以 root 身份通过跟随符号链接的路径重新添加它们的监视），并且在 post-dump
+  钩子中，拒绝带有 Unix 套接字消息中传输中的描述符（`sk-queues.img` 中的 `SCM_RIGHTS`；CRIU 会以 root 身份重新打开
+  它们并交给作业，恢复钩子看不到这一过程，因此该钩子会使转储失败，作业继续运行）的转储。它拒绝带有设置了
+  `SO_REUSEPORT` 的网络套接字的作业（CRIU 在恢复作业的凭据之前
   以 root 身份创建套接字，因此恢复后的套接字将属于 root，并可能加入同一端口上某个 root 服务的 `SO_REUSEPORT`
   组；已在 CRIU 4.2 上确认），从不使用 `--link-remap`（CRIU 会在转储期间以 root 身份按路径把没有自己名字的打开文件
   链接回其目录）：已删除的文件改为保存到镜像中；持有仍有其他硬链接的已删除文件、或持有在打开时被删除而被 NFS
   客户端重命名为 `.nfs<十六进制>` 的文件的作业会被拒绝，因为 CRIU 只能把它们链接回去。恢复时会以 root 身份按原所有者和
   模式重新创建已删除文件，因此持有带 setuid / setgid 位或文件能力（`security.capability` 属性）的已删除文件的作业
   也会被拒绝（否则它会取回一个有特权的程序）。其他已删除文件，无论是否属于所有者（例如作业运行期间被软件包升级
-  替换的共享库），都会被保存：其内容是作业本来就能读取的。它还记录作业运行时所属的组。这些检查在转储
-  之前进行，并在 CRIU 仍停住作业时由 `post-dump` 脚本再次进行；如果作业在此期间打开了这样的文件，脚本会否决转储
-  （CRIU 恢复作业运行）；
-- **在恢复之前**，如果所有者已离开其中某个组、镜像中有绑定在主机文件系统上的套接字，或者镜像中的某个路径
+  替换的共享库），都会被保存：其内容是作业本来就能读取的。它还记录作业运行时所属的组。对作业描述符的所有这些检查
+  在转储之前进行，并在 CRIU 仍停住作业时由 `post-dump` 脚本再次进行；如果作业在此期间打开了这样的描述符，脚本会否决转储
+  （CRIU 恢复作业运行，检查点会连同找到的所有原因一起报告为被拒绝）；
+- **在恢复之前**，如果所有者已离开其中某个组、镜像中有绑定在主机文件系统上的套接字（按同样的规则判断其名称）、
+  在抽象名称上监听的套接字、inotify 或 fanotify 描述符、传输中的描述符（`sk-queues.img`），或者有绑定到某个端口的
+  网络套接字而主机上另一个套接字也占用该端口（任何地址和协议族，相同协议；从 `/proc/net/{tcp,udp,udplite}{,6}`
+  读取），就拒绝恢复：CRIU 4.2 会在绑定之前以 root 身份对它恢复的每个网络套接字设置 `SO_REUSEADDR` 和
+  `SO_REUSEPORT`，因此它可能加入转储之后占用该端口的某个 root 服务的组。恢复钩子会在 CRIU 绑定套接字之后、作业运行之前
+  再检查一次（别人的套接字占用了作业某个套接字的端口，会导致恢复的作业被终止）。镜像中的某个路径
   （`files.img`）已无法由所有者在途中不经过符号链接而到达（以所有者身份通过
   `openat2(RESOLVE_NO_SYMLINKS)` 检查），则拒绝恢复；
 - **对 CRIU 从主机绑定的挂载**（作业命名空间的外部挂载，以及代替转储时略去的挂载的主机文件系统）：CRIU 以
   root 身份按路径查找每个来源，并跟随途中的符号链接（`open_tree(AT_SYMLINK_NOFOLLOW)` 只保护最后一个组成部分），
   而恢复钩子只检查任务持有的文件，不检查它们的挂载。因此到这样的来源途中的每个目录都必须是任何作业的所有者都
   无法修改的目录（属于 root 或除守护进程用户以外低于 `job_min_uid` 的系统账户，除非带 sticky 位否则不可被组或
-  其他人写入，且不在 FUSE 文件系统上），并且不跟随符号链接地检查；这样在 CRIU 绑定之前作业的所有者就无法改变它。
-  没有作业以这样的系统账户运行，因此其目录与 root 的目录一样安全：shim 从中把 resolved 的套接字和 `resolv.conf`
+  其他人写入，且不在 FUSE 或网络文件系统上，因为在那里查找返回什么由服务器或其他客户端决定），并且不跟随符号链接地
+  检查，来源本身也不能是符号链接（CRIU 会跟随它），在 `/tmp` 这样的 sticky 目录中，它也不能是别人的条目（其所有者可以
+  在那里重命名它）或不存在（任何人都可以在那里创建它）；这样在 CRIU 绑定之前作业的所有者就无法改变它。这假定没有作业的所有者
+  能在 gpueue 之外以低于 `job_min_uid` 的（守护进程用户以外的）系统账户身份行事（gpueue 从不以这样的账户运行作业）：
+  能通过其他手段（`sudo` 规则、自己控制的服务）以这样的账户身份运行代码的所有者可以修改它的目录，因此请让
+  `job_min_uid` 高于用户能够冒用的所有账户。没有作业以这样的系统账户运行，因此其目录与 root 的目录一样安全：shim 从中把 resolved 的套接字和 `resolv.conf`
   文件绑定到每个作业的 systemd-resolved 的 `/run/systemd/resolve`（属于 `systemd-resolve`）可以通过（gpueue 0.1.2
   只接受 root 的目录，在每次转储时略去这些绑定，随后拒绝每一次恢复）。否则，例如在自己的主目录中有 `allow_other` FUSE 挂载的所有者，可以在
   检查之后重命名途中的某个目录并在原处放一个符号链接，恢复的作业就会被绑定上另一个主机目录，例如它本来无法到达
@@ -195,14 +222,17 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   （`gpueue-helper verify-access`）通过 `/proc` 固定（pin）任务的每个打开的文件、工作目录和根目录、
   可执行文件以及文件映射，进入作业的挂载命名空间，切换到所有者身份，并要求所有者能够以它被打开的方式访问其中每一项
   （对固定的文件执行 `faccessat2`），并且能够按其路径、不经过符号链接到达它，且是同一个 inode。
-  它还要求每个任务都以所有者身份运行，所属的组是所有者仍在其中的组，并且没有 capability。
+  它还要求每个任务的每个线程都以所有者身份运行，所属的组是所有者仍在其中的组，没有 capability，capability 边界集为空，
+  并设置了 `no_new_privs`，而且命名空间 init 不可转储（dumpable）（它持有 shim 以 root 身份打开的文件，因此其所有者不能
+  对它执行 ptrace；CRIU 会恢复转储时的该标志）。
   位于作业自身挂载上的文件（`/proc`、私有 tmpfs）来自镜像，会被跳过。对于作业在转储时就已持有的文件，
   只需要其路径通向那个文件本身：作业持有文件的方式可能是其所有者无法再次打开的方式（以只读方式创建，
   或位于把文件显示为 root 所有的 sshfs 挂载上），而取回同一个文件并不会给它带来任何新的权限。
   所持有的文件在转储前列出一次，之后由 CRIU 的 `post-dump` 动作脚本 `gpueue-helper dump-hook`
   在被转储的任务仍处于 CRIU 控制下停止时再列出一次（因此作业在 CRIU 停止它之前刚刚打开的文件也算在内）。
-  判断是否为同一文件的依据是：它具有转储时记录的设备号和 inode，或者（重新挂载后，设备号会变化，
-  sshfs 等 FUSE 文件系统会重新编号其 inode）具有转储后立即记录的所有者、组、模式、大小、修改时间和变更时间；
+  判断是否为同一文件的依据是：它具有转储时记录的设备号和 inode，或者（仅在重新挂载使设备号变化后，或在 inode 编号不稳定
+  的 FUSE 或网络文件系统上；sshfs 会重新编号 inode）具有转储后立即记录的所有者、组、模式、大小、修改时间和变更时间，
+  以及文件系统报告的创建时间；
   变更时间无法由用户设置，而在该位置重命名或链接另一个文件会改变它（参见
   [文件系统与挂载](install.md#filesystems-and-mounts)）。helper 在带期限的子进程中查询这些属性，
   因此无响应的文件系统不会让 helper 卡住（未能在期限内查询到的文件不记录属性，只按设备号和 inode
@@ -223,8 +253,14 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 <a id="other-privilege-boundaries"></a>
 ## 其他权限边界
 
-- <a id="job-credentials"></a>运行谁的作业由 helper 而不是守护进程决定，因此被攻破的守护进程也无法绕过。
-  每次启动和恢复时，helper 通过 NSS 查找所有者，并以代码为 `policy_denied` 的错误拒绝 uid 0、gid 0、所有者
+- <a id="job-credentials"></a>谁可以运行作业的策略由 helper 而不是守护进程执行，因此被攻破的守护进程也无法绕过该策略：
+  它无法让 helper 以 root 身份运行任何东西、加入所有者不属于的组、以策略拒绝的用户身份运行，或以普通用户范围之外的
+  uid 运行。helper 无法检查的是谁提交了作业：它从守护进程获取 uid、工作目录、命令和环境变量，因此被攻破的守护进程可以
+  以任何通过策略的用户身份启动任何命令（并通过信号、检查点和恢复请求操作这些用户的作业）。客户端的授权（谁可以添加、
+  查看或更改哪个作业）由守护进程负责，守护进程保存的作业环境变量也是如此：`gpueue-admin` 的成员可以通过 CLI 读取每个
+  用户的作业环境变量（包括其中传入的机密）。由 helper 自己验证提交者的设计尚未实现（issue #107）。每次启动和恢复时，
+  helper 通过 NSS 查找所有者，并以代码为 `policy_denied` 的错误拒绝 uid 0、gid 0、高于 `job_max_uid`（若已设置）的 uid、
+  65534、65535、4294967295 和 systemd 动态用户范围 61184-65519、所有者
   不属于的组、低于 `job_min_uid`（默认为 `/etc/login.defs` 的 `UID_MIN`）的用户、不在非空的
   `job_allowed_users` 中的用户，以及属于 `job_denied_groups`（`docker`、`disk`、`sudo` 等等同 root 的组，在
   `/etc/group` 中查找）的作业组；其消息（`gpueue refuses to run jobs as <user>: <reason>`）会成为作业的启动
@@ -264,7 +300,8 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
 因此 helper 在启动时把自身复制到 `<data_dir>/lib/gpueue-helper-<内容的 FNV-1a 哈希>`（模式 0755，先写入
 临时文件再 rename 到位，然后像其他归 root 所有的路径一样检查），作业单元运行这个副本。作业记录以及随镜像
 保存的记录（`helper-job.json`）会指明它（`shim_exe`），因此恢复会让进程树回到转储时的二进制文件上，副本
-缺失时拒绝恢复并说明原因。helper 每次启动时都会删除既不是它自己的、也没有被作业记录或镜像记录指明、也没有
+缺失时拒绝恢复并说明原因。恢复之前，helper 还会检查该二进制文件是归 root 所有、且其他人不可写的普通文件，以及副本的内容
+与其名称所示一致；启动时，它会像检查其他归 root 所有的路径一样检查自身的二进制文件及其上层目录。helper 每次启动时都会删除既不是它自己的、也没有被作业记录或镜像记录指明、也没有
 被镜像（`files.img`）映射的副本；如果有检查点无法读取，则不删除任何副本。在 NixOS 上 helper 从路径不变的
 Nix store 运行，不创建副本，而由 Nix GC root（`/nix/var/nix/gcroots/gpueue/job-<id>`）保留旧的 store 路径。
 如果无法创建副本，helper 会记录警告，作业单元则运行已安装的二进制文件。在 SELinux 下，在 `/var/lib` 中创建的
@@ -316,7 +353,7 @@ helper，所以可以执行它）复制到 rename 之前的临时文件上，每
   分配用户现在就能启动（组存在且未暂停、GPU 已检测到、依赖已完成）的作业汇总起来的等待时间来实现）、经典的 fair-share 因子 `2^(-U/S)`、衰减、作业的计费以及重置周期的边界
   （根据守护进程传入的本地 UTC 偏移计算）。`scheduler::plan_prioritized` 用它对候选作业排序，然后原样应用
   通常的槽位、暂停和依赖规则，因此放不下的高优先级作业永远不会阻塞排在它后面的作业。`plan`/`plan_with`
-  保持 pueue 的顺序（也用于 `priority_type = "basic"`）。`scheduler::pending_priorities`（`gpueue prio`
+  保持 pueue 的顺序（也用于 `priority_type = "basic"`，此时 `priority::basic_order` 让用户的 `-o` 只重排该用户自己的作业）。`scheduler::pending_priorities`（`gpueue prio`
   背后的实现）使用相同的候选选择，因此它列出的正是调度计划所考虑的作业。
 - 存储中保存 `jobs.nice`、`jobs.site_factor`、`jobs.top_seq`、`jobs.run_since`、`groups.priority`、
   `user_shares` 和 `user_usage` 表，并在 `meta` 中保存上次计算和重置用量的时间（schema 版本 6），以及上次重置所针对的

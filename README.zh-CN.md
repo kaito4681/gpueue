@@ -233,7 +233,7 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | 用语 | "task" | "job"。为了兼容，保留了 `--print-task-id` 等选项名。 |
 | `--json` | pueue 的内部状态 | gpueue 自己的格式，见下文 |
 | `edit`、`env`、`restart --edit` | 支持 | 接受但尚未实现 |
-| `add -o/--priority`、`switch` | 对守护进程的所有任务排序 | 只对你自己的作业排序；哪个用户的作业先启动由带 fair share 的 Slurm 风格多因子优先级决定（参见[作业优先级](#job-priority)）。`priority_type = "basic"` 可恢复 pueue 的顺序。 |
+| `add -o/--priority`、`switch` | 对守护进程的所有任务排序 | 只对你自己的作业排序；哪个用户的作业先启动由带 fair share 的 Slurm 风格多因子优先级决定（参见[作业优先级](#job-priority)）。`priority_type = "basic"` 可恢复 pueue 的顺序，但 `-o` 仍然只对你自己的作业排序。 |
 | 回调、别名、`pueue.yml` | 支持 | 不可用 |
 
 额外的命令和选项：
@@ -309,7 +309,7 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - 每个作业属于添加它的用户。它以该用户的 uid、gid 和附加组运行，设置了 `no_new_privs`，并丢弃全部 capability。
   命令在添加作业时所在的目录中运行，使用 `gpueue add` 调用时的环境变量。
 - root helper 拒绝以下用户的作业：系统账户（uid 小于 `job_min_uid`，默认为 `/etc/login.defs` 的
-  `UID_MIN`）、设置了 `job_allowed_users` 时不在其中的用户，以及主组为等同 root 的组的用户
+  `UID_MIN`）、`nobody`、systemd 动态用户的 uid（61184-65519）、设置了 `job_max_uid` 时高于它的 uid、设置了 `job_allowed_users` 时不在其中的用户，以及主组为等同 root 的组的用户
   （`job_denied_groups`，默认为 `docker`、`lxd`、`incus-admin`、`libvirt`、`libvirtd`、`disk`、`sudo`、`wheel`、
   `admin`）。这些组会从每个作业的附加组中去掉，因此即使所有者能使用 Docker 或 sudo，作业也不能
   （helper 的日志会记录去掉了哪些组）。被拒绝的作业以 `gpueue refuses to run jobs as <user>: <reason>` 为原因启动失败。
@@ -423,7 +423,13 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   [恢复与路径](docs/zh-CN/architecture.md#restores-and-paths)）。
 - **Unix 套接字：** 如果作业的 Unix 套接字绑定在其自己的 `/tmp` 和
   `/dev/shm` 之外的路径上（例如你的主目录中），或绑定到 `ctl.sock` 这样的相对名称，就无法为它创建检查点；
-  检查点会被拒绝，作业继续运行。请把套接字绑定到 `/tmp` 下的绝对路径，或使用抽象名称。
+  检查点会被拒绝，作业继续运行。请把套接字绑定到 `/tmp` 下的绝对路径（途中不含 `..` 或符号链接），或对不监听的
+  套接字使用抽象名称。在抽象名称上*监听*的套接字无法创建检查点（CRIU 会以 root 身份设置它，其客户端会看到
+  root 是监听者）。
+- **inotify、fanotify 和传输中的描述符：** 如果作业有 inotify 或 fanotify 描述符（文件监视器），或在创建检查点的
+  那一刻正通过 Unix 套接字传递描述符（`SCM_RIGHTS`），就无法为它创建检查点（CRIU 会以 root 身份重新创建它们）。
+- **监听端口：** 如果作业的 TCP 或 UDP 套接字绑定了某个端口，仍可为它创建检查点（Jupyter、TensorBoard），但只有在
+  主机上没有其他套接字占用该端口时才会恢复；否则恢复会被拒绝，待端口空闲后可以重试。
 - **`SO_REUSEPORT`：** 如果作业有设置了 `SO_REUSEPORT` 的 TCP 或 UDP 套接字，同样无法为它创建检查点
   （CRIU 会把该套接字恢复为属于 root 的套接字，它随后可能与某个 root 服务共享端口）。有些服务器默认会设置它；
   请将其关闭，或使用 `--no-checkpoint`。
