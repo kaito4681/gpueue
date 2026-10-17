@@ -537,7 +537,8 @@ pub struct Core {
     /// lost or timed out), with the state that launch put them in
     /// (`Running` or `Restoring`) and the launch (see
     /// [`Launches::latest`]); see [`Core::spawn_lost_check`]. Removed once
-    /// the helper lists the job.
+    /// the helper lists the job, and not added for a launch it listed the
+    /// job during (see [`Core::note_unconfirmed_launch`]).
     unconfirmed_launches: Mutex<HashMap<JobId, (JobState, Option<u64>)>>,
     /// Jobs whose checkpoint request was taken for lost and which were put
     /// back to running or paused (see [`Core::abandon_lost_checkpoint`]),
@@ -1270,7 +1271,8 @@ impl Core {
         match effect {
             Effect::Spawn => {
                 let settle = self.launches.settle_on_drop(job.id);
-                settle_launch(settle, self.spawn_job(job).await)
+                let seq = settle.seq();
+                settle_launch(settle, self.spawn_job(job, seq).await)
             }
             Effect::SignalStop => self.signal(job, signal::SIGSTOP).await,
             Effect::SignalContinue => self.signal(job, signal::SIGCONT).await,
@@ -1282,7 +1284,8 @@ impl Core {
             }
             Effect::Restore => {
                 let settle = self.launches.settle_on_drop(job.id);
-                settle_launch(settle, self.start_restore(job).await)
+                let seq = settle.seq();
+                settle_launch(settle, self.start_restore(job, seq).await)
             }
             // After a successful restore the helper has already removed the
             // image, or removes it when the job exits or is checkpointed
@@ -1313,7 +1316,8 @@ impl Core {
         }
     }
 
-    async fn spawn_job(self: &Arc<Self>, job: &Job) -> Result<(), LaunchFailure> {
+    /// Sends the spawn request of launch `seq` (see [`Launches::latest`]).
+    async fn spawn_job(self: &Arc<Self>, job: &Job, seq: Option<u64>) -> Result<(), LaunchFailure> {
         let users = self.users.clone();
         let owner = job.owner;
         let gid = tokio::task::spawn_blocking(move || users.primary_gid(owner))
@@ -1390,16 +1394,38 @@ impl Core {
             // check below tells: a job the helper does not know was never
             // started and goes back in line, see `Core::spawn_lost_check`.
             Err(e) => {
-                self.unconfirmed_launches
-                    .lock()
-                    .unwrap()
-                    .insert(job.id, (JobState::Running, self.launches.latest(job.id)));
+                self.note_unconfirmed_launch(job.id, JobState::Running, seq);
                 if matches!(e, HelperError::Timeout) {
                     self.spawn_lost_check(job.id, job.started_at);
                 }
                 Err(LaunchFailure::new(e.into(), LaunchOutcome::Unconfirmed))
             }
         }
+    }
+
+    /// Records that the request of launch `seq` of `id`, which put the job
+    /// in `launched`, went unanswered (see [`Core::spawn_lost_check`]):
+    /// unless the helper has listed the job since the launch began, as
+    /// when the request's failure arrives only after the reconciliation
+    /// with a restarted helper that re-discovered the job. Taken for
+    /// unconfirmed then, the job would be requeued and run a second time
+    /// should its process disappear later.
+    fn note_unconfirmed_launch(&self, id: JobId, launched: JobState, seq: Option<u64>) {
+        // Under the lock under which the helper's lists confirm launches.
+        let mut unconfirmed = self.unconfirmed_launches.lock().unwrap();
+        if self.launches.confirmed(id, seq) {
+            tracing::debug!(job = %id, "the helper listed the job since; its launch is confirmed");
+            return;
+        }
+        unconfirmed.insert(id, (launched, seq));
+    }
+
+    /// The helper lists `id`: its launches were not lost, whatever becomes
+    /// of their requests. Called with `unconfirmed`, the locked
+    /// `unconfirmed_launches`.
+    fn confirm_launch(&self, unconfirmed: &mut HashMap<JobId, (JobState, Option<u64>)>, id: JobId) {
+        unconfirmed.remove(&id);
+        self.launches.confirm(id);
     }
 
     /// Puts a job whose spawn or restore request did not start it back in
@@ -1545,7 +1571,7 @@ impl Core {
             // job's exit, has been received by now.
             let received = core.helper.events_delivered();
             if running.iter().any(|r| r.job == id) {
-                core.unconfirmed_launches.lock().unwrap().remove(&id);
+                core.confirm_launch(&mut core.unconfirmed_launches.lock().unwrap(), id);
                 return;
             }
             // Its exit (or restore outcome) may have been received but not
@@ -1817,7 +1843,12 @@ impl Core {
         });
     }
 
-    async fn start_restore(self: &Arc<Self>, job: &Job) -> Result<(), LaunchFailure> {
+    /// Sends the restore request of launch `seq` (see [`Launches::latest`]).
+    async fn start_restore(
+        self: &Arc<Self>,
+        job: &Job,
+        seq: Option<u64>,
+    ) -> Result<(), LaunchFailure> {
         self.warn_if_gpus_changed(job).await;
         // A job paused when it was dumped is restored stopped: it does not
         // run before its owner resumes it (see `lifecycle::keep_paused`,
@@ -1880,10 +1911,7 @@ impl Core {
             // `Core::spawn_job`): its outcome event arrives if it did, and a
             // restore it neither reports nor runs is requeued.
             Err(e) => {
-                self.unconfirmed_launches
-                    .lock()
-                    .unwrap()
-                    .insert(job.id, (JobState::Restoring, self.launches.latest(job.id)));
+                self.note_unconfirmed_launch(job.id, JobState::Restoring, seq);
                 if matches!(e, HelperError::Timeout) {
                     self.spawn_lost_check(job.id, job.started_at);
                 }
@@ -2238,10 +2266,13 @@ impl Core {
             return;
         };
         // The helper knows these jobs: their launches were not lost,
-        // whatever became of their requests.
+        // whatever became of their requests (also those still in flight,
+        // whose failure may arrive later).
         {
             let mut unconfirmed = self.unconfirmed_launches.lock().unwrap();
-            unconfirmed.retain(|id, _| !live.contains_key(id));
+            for &id in live.keys() {
+                self.confirm_launch(&mut unconfirmed, id);
+            }
         }
         let jobs: Vec<Job> = jobs
             .into_iter()

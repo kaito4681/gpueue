@@ -80,6 +80,9 @@ struct Record {
     /// (e.g. it exited before its spawn request returned): its settling is
     /// of no interest to the next reconciliation.
     released: bool,
+    /// The helper listed the job while this launch was in flight (see
+    /// [`Launches::confirm`]).
+    confirmed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -126,8 +129,32 @@ impl Launches {
                 in_flight: true,
                 outcome: None,
                 released: false,
+                confirmed: false,
             },
         );
+    }
+
+    /// Records that the helper runs `id` while its latest launch is in
+    /// flight: whatever becomes of that launch's request (its answer may be
+    /// lost on the way), the job was started. No-op when no launch is in
+    /// flight.
+    pub fn confirm(&self, id: JobId) {
+        if let Some(record) = self.state.lock().unwrap().jobs.get_mut(&id)
+            && record.in_flight
+        {
+            record.confirmed = true;
+        }
+    }
+
+    /// Whether launch `seq` of `id` was confirmed (see
+    /// [`Launches::confirm`]).
+    pub fn confirmed(&self, id: JobId, seq: Option<u64>) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&id)
+            .is_some_and(|r| Some(r.seq) == seq && r.confirmed)
     }
 
     /// The sequence number of the latest launch of `id`.
@@ -275,6 +302,11 @@ pub struct SettleGuard<'a> {
 }
 
 impl SettleGuard<'_> {
+    /// The launch this guard settles (`None`: none was in flight).
+    pub fn seq(&self) -> Option<u64> {
+        self.seq
+    }
+
     /// Settles the launch with `outcome`.
     pub fn finish(mut self, outcome: LaunchOutcome) {
         self.outcome = Some(outcome);
@@ -405,6 +437,29 @@ mod tests {
         drop(launches.settle_on_drop(id));
         launches.forget(id);
         assert_eq!(launches.latest(id), None);
+    }
+
+    #[test]
+    fn only_a_launch_in_flight_is_confirmed() {
+        let launches = Launches::default();
+        let id = JobId(1);
+        launches.confirm(id);
+        assert!(!launches.confirmed(id, None));
+        launches.begin(id);
+        let first = launches.latest(id);
+        launches.confirm(id);
+        assert!(launches.confirmed(id, first));
+        drop(launches.settle_on_drop(id));
+        assert!(launches.confirmed(id, first), "still known once settled");
+        // A settled launch is not confirmed afterwards, and a new launch
+        // starts unconfirmed.
+        launches.begin(id);
+        let second = launches.latest(id);
+        assert!(!launches.confirmed(id, second));
+        assert!(!launches.confirmed(id, first));
+        drop(launches.settle_on_drop(id));
+        launches.confirm(id);
+        assert!(!launches.confirmed(id, second));
     }
 
     #[test]
