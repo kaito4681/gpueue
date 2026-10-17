@@ -431,7 +431,7 @@ and `sudo apt install gpueue` brings gpueue back. Both keep `/var/lib/gpueue` (s
 
 ### The APT repository (maintainers)
 
-The repository is the set of assets of the release `apt` (a pre-release, so it never becomes the
+The repository is the set of assets of the release `apt` (a normal release marked "not latest", so it never becomes the
 "latest" release that `install.sh` and `gpueue update` follow): the `.deb` files, `Packages`,
 `Packages.gz`, `Release`, `InRelease` and `Release.gpg`, the public key `gpueue.gpg` and
 `gpueue.sources`. `.github/workflows/release-apt.yml` updates it with

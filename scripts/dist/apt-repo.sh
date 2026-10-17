@@ -433,7 +433,7 @@ cmd_github() {
 
     if ! gh release view "$apt_release" -R "$repo" >/dev/null 2>&1; then
         log "creating the release $apt_release"
-        gh release create "$apt_release" -R "$repo" --prerelease --latest=false \
+        gh release create "$apt_release" -R "$repo" --latest=false \
             --title "APT repository" \
             --notes "The gpueue APT repository (a flat repository; its files are the assets of this release). It is updated by .github/workflows/release-apt.yml; see docs/install.md." >/dev/null
     fi

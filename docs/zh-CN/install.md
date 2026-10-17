@@ -404,7 +404,7 @@ sudo apt purge gpueue     # also delete /etc/gpueue and the APT repository entry
 <a id="the-apt-repository-maintainers"></a>
 ### APT 仓库（维护者）
 
-该仓库就是发布版本 `apt` 的资源文件集合（它是一个预发布版本，因此永远不会成为 `install.sh` 和
+该仓库就是发布版本 `apt` 的资源文件集合（它是一个不标记为 latest 的普通发布版本，因此永远不会成为 `install.sh` 和
 `gpueue update` 所跟随的“latest”发布版本）：`.deb` 文件、`Packages`、`Packages.gz`、`Release`、`InRelease`
 和 `Release.gpg`、公钥 `gpueue.gpg` 以及 `gpueue.sources`。当某个发布版本**作为稳定版本发布**时
 （`released` 事件：发布一个稳定版本，或将预发布版本转为稳定版本），`.github/workflows/release-apt.yml` 会通过
