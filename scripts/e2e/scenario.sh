@@ -1975,6 +1975,74 @@ s28_deleted_files() {
     pz alice kill "$a" "$b" "$c" "$d" >/dev/null
     for j in "$a" "$b" "$c" "$d"; do wait_state "$j" 'done/*'; done
     rm -f /home/alice/e2e-linked-* /home/alice/e2e-deleted-*
+# s29: mounts of the host that a job's namespace copies and that need care:
+# - Two mounts hidden under later mounts, the first below a directory that
+#   others can change (the shim cannot set its cover aside safely) and the
+#   second below root's: the shim still removes the second.
+# - A mount point with a vertical tab, which the kernel does not escape in
+#   mountinfo and CRIU would split there: the dump is refused.
+# - A bind of a directory of alice's in the sticky /tmp: CRIU would bind it
+#   again by that path, and she could replace it with a symlink before a
+#   restore, so the dump of a job working in it is refused.
+s29_mount_edge_cases() {
+    local base=/srv/e2e29 odd id pid err
+    odd=$(printf '%s/odd\vname' "$base")
+    # Remove what this scenario made whatever happens (also via `fail`).
+    # shellcheck disable=SC2064 # expanded now, on purpose
+    trap "umount -l '$base' 2>/dev/null || true; rm -rf '$base' /tmp/alice29" EXIT
+    free_group
+
+    mkdir -p "$base"
+    mount -t tmpfs -o mode=0755 e2e29 "$base"
+    mkdir -p "$base/u/a/b" "$base/r/a/b"
+    chmod 0777 "$base/u"
+    mount -t tmpfs e2e29-hidden "$base/u/a/b"
+    mount -t tmpfs e2e29-cover "$base/u/a"
+    mount -t tmpfs e2e29-hidden "$base/r/a/b"
+    mount -t tmpfs e2e29-cover "$base/r/a"
+    id=$(add alice -g free -- "$COUNTER")
+    wait_state "$id" running
+    pid=$(live_pid "$id")
+    grep -F " $base/" "/proc/$pid/mountinfo" || true
+    ! grep -qF " $base/r/a/b " "/proc/$pid/mountinfo" ||
+        fail "the shim did not remove $base/r/a/b after failing on $base/u/a/b"
+    grep -qF " $base/u/a/b " "/proc/$pid/mountinfo" ||
+        fail "the job does not have $base/u/a/b (the scenario did not test anything)"
+    pz alice kill "$id" >/dev/null || fail "kill $id"
+    wait_state "$id" 'done/*'
+    umount -l "$base"
+
+    mount -t tmpfs -o mode=0755 e2e29 "$base"
+    mkdir "$odd"
+    mount -t tmpfs e2e29-odd "$odd"
+    id=$(add alice -g free -- "$COUNTER")
+    wait_state "$id" running
+    wait_unit "$id"
+    sleep 1.5
+    err=$(pz alice checkpoint "$id" 2>&1) && fail "the checkpoint of job $id was not refused"
+    echo "checkpoint of job $id: $err"
+    grep -q "control characters" <<<"$err" || fail "the refusal does not say why: $err"
+    expect_state "$id" running
+    pz alice kill "$id" >/dev/null || fail "kill $id"
+    wait_state "$id" 'done/*'
+    umount -l "$base"
+
+    install -d -o alice -g alice -m 0755 /tmp/alice29
+    mkdir -p "$base/b"
+    mount --bind /tmp/alice29 "$base/b"
+    rm -f /home/alice/m29.txt
+    id=$(cjob "$base/b" /home/alice/m29.txt)
+    wait_state "$id" running
+    wait_unit "$id"
+    sleep 1.5
+    err=$(pz alice checkpoint "$id" 2>&1) && fail "the checkpoint of job $id was not refused"
+    echo "checkpoint of job $id: $err"
+    grep -q "/tmp/alice29 is in a sticky directory and owned by someone other than root" <<<"$err" ||
+        fail "the refusal does not name /tmp/alice29: $err"
+    expect_state "$id" running
+    pz alice kill "$id" >/dev/null || fail "kill $id"
+    wait_state "$id" 'done/*'
+    rm -f /home/alice/m29.txt
 }
 
 case "${1:-main}" in
@@ -1997,6 +2065,7 @@ main)
     run "26 other containers' mounts" s26_container_mounts
     run "27 signals of a job" s27_job_signals
     run "28 deleted files at a checkpoint" s28_deleted_files
+    run "29 hidden, oddly named and redirectable mounts" s29_mount_edge_cases
     if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers
