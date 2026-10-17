@@ -25,7 +25,7 @@ clap_complete = "4.5"
 clap_complete_nushell = "4.5"
 chrono = "0.4"
 interim = { version = "0.2", features = ["chrono_0_4"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
 rustix = { version = "1", features = ["fs"] }
 # Async stack: no features here; each crate enables exactly what it uses so the
