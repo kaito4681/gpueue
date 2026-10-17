@@ -278,7 +278,10 @@ git commit packaging/minisign.pub scripts/install.sh
 - 各渠道使用不同的密钥：minisign 密钥为发布资源文件签名，APT 和 RPM 的签名使用它们自己的 GPG 密钥
   （`APT_GPG_PRIVATE_KEY`）；请为 RPM 渠道单独准备一个密钥，而不是使用 APT 归档密钥，这样一次泄露就不会
   同时影响两者。
-- 把签名用的 secrets 放在受保护的 environment 中（另行跟踪）。
+- 把签名用的 secrets 放在只有发布工作流才能使用的受保护 GitHub environment 中，而不是普通的仓库 secrets
+  （计划见 [#51](https://github.com/kaito4681/gpueue/issues/51)；上述仓库设置在
+  [#126](https://github.com/kaito4681/gpueue/issues/126) 中跟踪）。`v*` 的标签规则集已经就位；在该
+  environment 建立之前，这些 secrets 仍是仓库 secrets。
 
 依赖项由 CI 中的 `cargo-deny` 检查（`deny.toml`：安全公告、crates.io 为唯一来源、重复版本仅警告），
 Dependabot 每周提出 cargo 和 GitHub Actions 的更新。

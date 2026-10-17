@@ -296,7 +296,11 @@ These settings are not in the repository, so they are applied by a maintainer wi
 - Use separate keys per channel: the minisign key signs release assets, and the APT and RPM
   signatures use their own GPG key (`APT_GPG_PRIVATE_KEY`); give the RPM channel a key of its own
   instead of the APT archive key, so that one leak does not cover both.
-- Keep the signing secrets in a protected environment (tracked separately).
+- Keep the signing secrets in a protected GitHub environment that only the release workflows can
+  use, instead of plain repository secrets (planned in
+  [#51](https://github.com/kaito4681/gpueue/issues/51); the repository settings above are
+  tracked in [#126](https://github.com/kaito4681/gpueue/issues/126)). The tag ruleset on `v*` is
+  already in place; until the environment exists, the secrets are repository secrets.
 
 Dependencies are checked in CI by `cargo-deny` (`deny.toml`: advisories, crates.io as the only
 source, duplicate versions as warnings), and Dependabot proposes cargo and GitHub Actions updates
@@ -442,8 +446,8 @@ five versions per architecture (in Debian version order), regenerates and signs 
 copies `gpueue.gpg` and `gpueue.sources` out of the newest package it keeps), and uploads the
 packages first and the index last, `InRelease` at the very end; old `.deb` files are deleted after
 that. Each upload is tried three times; when the index still cannot be uploaded, the previous
-index files are put back and the job fails, saying to run it again. It creates the `apt` release when it is missing. `apt-repo.sh` decides what is published:
-drafts, pre-releases and tags other than `v*` are skipped with a notice. The index has no
+index files are put back and the job fails, saying to run it again. It creates the `apt` release
+when it is missing. `apt-repo.sh` decides what is published: drafts, pre-releases and tags other than `v*` are skipped with a notice. The index has no
 `by-hash` files (they need a subdirectory, and release asset names cannot contain `/`), hence the
 short window described above.
 
