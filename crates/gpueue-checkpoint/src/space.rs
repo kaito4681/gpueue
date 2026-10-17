@@ -120,13 +120,19 @@ mod tests {
         assert!(available_bytes(Path::new("/definitely/not/here")).is_err());
         assert_eq!(tmpfs_used_bytes(Path::new("/proc")).unwrap(), None);
         // /dev/shm is a tmpfs on most systems (and in the test container).
-        if is_tmpfs(Path::new("/dev/shm")).unwrap_or(false) {
-            let before = tmpfs_used_bytes(Path::new("/dev/shm")).unwrap().unwrap();
-            let f = Path::new("/dev/shm").join(format!("gpueue-space-{}", std::process::id()));
+        // Other processes use it too, and may free what they hold at any
+        // time: only what this test holds there is known to be in use.
+        let shm = Path::new("/dev/shm");
+        if is_tmpfs(shm).unwrap_or(false) {
+            let f = shm.join(format!("gpueue-space-{}", std::process::id()));
             std::fs::write(&f, vec![1u8; 1 << 20]).unwrap();
-            let after = tmpfs_used_bytes(Path::new("/dev/shm")).unwrap().unwrap();
+            let used = tmpfs_used_bytes(shm).unwrap().unwrap();
+            let st = rustix::fs::statfs(shm).unwrap();
             std::fs::remove_file(&f).unwrap();
-            assert!(after >= before + (1 << 20) - 4096, "{before} -> {after}");
+            #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+            let size = u64::try_from(st.f_blocks).unwrap() * u64::try_from(st.f_bsize).unwrap();
+            assert!(used >= 1 << 20, "{used}");
+            assert!(used <= size, "{used} of {size}");
         }
     }
 }

@@ -400,6 +400,8 @@ pub struct SystemExecutor {
     /// the steps are confined to (see [`Executor::confine_to`]); empty when
     /// it could not be read, which no process matches.
     pub job_pid_ns: Option<PathBuf>,
+    /// How long [`Step::Thaw`] waits for the tree to run again.
+    pub thaw_settle_timeout: Duration,
 }
 
 impl Default for SystemExecutor {
@@ -409,6 +411,7 @@ impl Default for SystemExecutor {
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             poll_interval: Duration::from_millis(20),
             job_pid_ns: None,
+            thaw_settle_timeout: THAW_SETTLE_TIMEOUT,
         }
     }
 }
@@ -560,7 +563,7 @@ impl SystemExecutor {
                 done.push(line);
             }
         };
-        let until = Instant::now() + THAW_SETTLE_TIMEOUT;
+        let until = Instant::now() + self.thaw_settle_timeout;
         loop {
             let left = procfs::plan_thaw(&self.proc_root, &self.cgroup_root, root)?;
             if left.is_empty() {
@@ -601,7 +604,7 @@ impl SystemExecutor {
     }
 }
 
-/// How long [`Step::Thaw`] waits for the tree to run again.
+/// How long [`Step::Thaw`] waits for the tree to run again (by default).
 const THAW_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to wait for output pipes to close after the child exited (a
@@ -616,6 +619,21 @@ pub fn run_with_timeout(
     spec: &CommandSpec,
     timeout: Duration,
     poll_interval: Duration,
+) -> Result<StepOutput, StepError> {
+    run_until(spec, timeout, poll_interval, |deadline| {
+        Instant::now() >= deadline
+    })
+}
+
+/// [`run_with_timeout`], which kills the child once `expired` says so,
+/// given the deadline (`timeout` after the spawn). Tests also wait there
+/// for the child to be set up, which a loaded machine may take longer for
+/// than the timeout under test.
+fn run_until(
+    spec: &CommandSpec,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut expired: impl FnMut(Instant) -> bool,
 ) -> Result<StepOutput, StepError> {
     let mut child = spec
         .to_command()
@@ -638,7 +656,7 @@ pub fn run_with_timeout(
         if let Some(status) = child.try_wait()? {
             break Some(status);
         }
-        if Instant::now() >= deadline {
+        if expired(deadline) {
             let status = kill_tree(&mut child)?;
             // It may have exited on its own between `try_wait` and the
             // kill: then it was not killed by us, and how it ended counts
@@ -648,7 +666,14 @@ pub fn run_with_timeout(
             }
             break Some(status);
         }
-        thread::sleep(poll_interval.min(deadline.saturating_duration_since(Instant::now())));
+        let left = deadline.saturating_duration_since(Instant::now());
+        // Past the deadline but not expired (a test waits for its child):
+        // no busy loop.
+        thread::sleep(if left.is_zero() {
+            poll_interval
+        } else {
+            poll_interval.min(left)
+        });
     };
     let drain_deadline = Instant::now() + PIPE_DRAIN_TIMEOUT;
     let output = StepOutput {
@@ -1569,14 +1594,22 @@ mod tests {
 
     #[test]
     fn system_run_timeout_kills() {
+        let tmp = crate::test_util::TempDir::new();
+        let ready = tmp.path().join("ready");
         let start = Instant::now();
-        let e = run_with_timeout(
-            &sh("echo started; exec sleep 30"),
+        // Killed at the timeout, but not before it has written its output.
+        let e = run_until(
+            &sh(&format!(
+                "echo started; : > {}; exec sleep 30",
+                ready.display()
+            )),
             Duration::from_millis(200),
             POLL,
+            |deadline| ready.exists() && Instant::now() >= deadline,
         )
         .unwrap_err();
-        assert!(start.elapsed() < Duration::from_secs(10));
+        // Not after the 30 seconds of `sleep`.
+        assert!(start.elapsed() < Duration::from_secs(25));
         match e {
             StepError::TimedOut { after, output } => {
                 assert_eq!(after, Duration::from_millis(200));
@@ -1603,23 +1636,31 @@ mod tests {
             "sleep 60 & echo $! > {p}.a; setsid sleep 60 & echo $! > {p}.b; wait",
             p = pids.display()
         );
-        let e = run_with_timeout(&sh(&script), Duration::from_millis(500), POLL).unwrap_err();
-        assert!(matches!(e, StepError::TimedOut { .. }));
-        for suffix in ["a", "b"] {
-            let pid: u32 = std::fs::read_to_string(pids.with_extension(suffix))
-                .unwrap()
+        let pid = |suffix| -> Option<u32> {
+            std::fs::read_to_string(pids.with_extension(suffix))
+                .ok()?
                 .trim()
                 .parse()
-                .unwrap();
-            let mut gone = false;
-            for _ in 0..200 {
-                if !alive(pid) {
-                    gone = true;
-                    break;
-                }
+                .ok()
+        };
+        // Killed at the timeout once both grandchildren were started.
+        let e = run_until(&sh(&script), Duration::from_millis(500), POLL, |deadline| {
+            pid("a").is_some() && pid("b").is_some() && Instant::now() >= deadline
+        })
+        .unwrap_err();
+        assert!(matches!(e, StepError::TimedOut { .. }), "{e:?}");
+        for suffix in ["a", "b"] {
+            let pid = pid(suffix).unwrap();
+            // SIGKILL takes effect when the process is next scheduled: on
+            // a loaded machine, that may take a while.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while alive(pid) {
+                assert!(
+                    Instant::now() < deadline,
+                    "grandchild {suffix} ({pid}) survived"
+                );
                 thread::sleep(Duration::from_millis(10));
             }
-            assert!(gone, "grandchild {suffix} ({pid}) survived");
         }
     }
 
@@ -1747,34 +1788,41 @@ mod tests {
         std::fs::create_dir_all(cg.join("job")).unwrap();
         let freeze = cg.join("job/cgroup.freeze");
         let events = cg.join("job/cgroup.events");
-        std::fs::write(&freeze, "1\n").unwrap();
-        std::fs::write(&events, "populated 1\nfrozen 1\n").unwrap();
+        // As the kernel's files, these are never seen half-written.
+        let write = |path: &Path, text: &str| {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, text).unwrap();
+            std::fs::rename(&tmp, path).unwrap();
+        };
+        write(&freeze, "1\n");
+        write(&events, "populated 1\nfrozen 1\n");
+        // Far more than either side takes, even on a loaded machine: only
+        // a broken thaw runs into it.
+        let settle = Duration::from_secs(60);
         let kernel = {
             let (freeze, events) = (freeze.clone(), events.clone());
             thread::spawn(move || {
                 let wait_thawed = || {
-                    for _ in 0..2000 {
-                        if std::fs::read_to_string(&freeze).unwrap().trim() == "0" {
-                            return true;
-                        }
+                    let deadline = Instant::now() + settle;
+                    // The thaw's write may be seen half done (empty).
+                    while std::fs::read_to_string(&freeze).unwrap().trim() != "0" {
+                        assert!(Instant::now() < deadline, "never thawed");
                         thread::sleep(Duration::from_millis(1));
                     }
-                    false
                 };
                 // The first thaw is undone (frozen again)...
-                if wait_thawed() {
-                    std::fs::write(&freeze, "1\n").unwrap();
-                }
+                wait_thawed();
+                write(&freeze, "1\n");
                 // ...the second one takes.
-                if wait_thawed() {
-                    std::fs::write(&events, "populated 1\nfrozen 0\n").unwrap();
-                }
+                wait_thawed();
+                write(&events, "populated 1\nfrozen 0\n");
             })
         };
         let mut ex = SystemExecutor {
             proc_root,
             cgroup_root: cg.clone(),
             poll_interval: POLL,
+            thaw_settle_timeout: settle,
             ..SystemExecutor::default()
         };
         let res = ex.execute(&Step::Thaw { root_pid: 10 });
