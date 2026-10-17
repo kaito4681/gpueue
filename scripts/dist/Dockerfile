@@ -10,6 +10,7 @@ RUN set -e; \
     if [ -f /etc/ssl/certs/ca-certificates.crt ]; then \
         sed -i 's|http://|https://|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true; \
     fi; \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' >/etc/apt/apt.conf.d/80-gpueue-retries; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         systemd systemd-sysv dbus python3 procps curl ca-certificates sudo; \

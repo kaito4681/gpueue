@@ -130,17 +130,42 @@ prepare() {
     pz carol status
 }
 
+# criu_running: a `criu` process exists (the dump of a checkpoint).
+criu_running() { pgrep -x criu >/dev/null; }
+
 trigger() {
     local s=$1 action=$2 big
     big=$(cat "$STATE/$s/big" 2>/dev/null || true)
-    if [ -n "$big" ]; then
-        pz alice checkpoint "$big" || fail "checkpoint"
-        wait_state "$big" checkpointing 10
-        echo "checkpoint of job $big in flight: $(find "$CKPT/$big" -mindepth 1 2>/dev/null | wc -l) files, COMPLETE: $([ -e "$CKPT/$big/COMPLETE" ] && echo yes || echo no)"
+    if [ -z "$big" ]; then
+        sync
+        echo "systemctl $action"
+        systemctl "$action"
+        return
     fi
+    # The dump must still run when the shutdown starts, whatever the speed of
+    # the disk: criu is stopped (SIGSTOP) as soon as it exists, the shutdown
+    # begins, and criu continues once systemd is stopping the daemon. A
+    # transient unit does that (the ssh session may be gone by then, and a unit
+    # without default dependencies is not stopped by the shutdown), and the
+    # journal check of `verify` finds the dump ending during the shutdown.
+    pz alice checkpoint "$big" || fail "checkpoint"
+    local end=$((SECONDS + 60))
+    until criu_running; do
+        [ "$SECONDS" -lt "$end" ] || fail "no criu process: the dump of job $big ended, or never started"
+        sleep 0.02
+    done
+    pkill -STOP -x criu || fail "cannot stop criu"
+    [ ! -e "$CKPT/$big/COMPLETE" ] || fail "the checkpoint of job $big was complete before the shutdown"
+    echo "checkpoint of job $big held in flight: $(find "$CKPT/$big" -mindepth 1 2>/dev/null | wc -l) files, COMPLETE: no"
     sync
-    echo "systemctl $action"
-    systemctl "$action"
+    systemd-run --quiet --collect --unit e2e-criu-cont -p DefaultDependencies=no bash -c '
+        for _ in $(seq 600); do
+            [ "$(systemctl is-active gpueue.service)" = active ] || break
+            sleep 0.1
+        done
+        pkill -CONT -x criu' || fail "cannot start the unit that continues criu"
+    echo "systemctl --no-block $action"
+    systemctl --no-block "$action"
 }
 
 # check_journal <scenario>: the stop order in the previous boot's journal,

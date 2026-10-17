@@ -9,6 +9,7 @@ FROM ${BASE}
 RUN set -e; \
     if ! command -v criu >/dev/null || ! command -v systemctl >/dev/null \
        || ! command -v python3 >/dev/null; then \
+        printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' >/etc/apt/apt.conf.d/80-gpueue-retries; \
         apt-get update; \
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             systemd systemd-sysv dbus python3 procps criu; \
@@ -26,13 +27,17 @@ RUN set -e; \
     getent passwd 1001 >/dev/null || useradd -m -u 1001 -s /bin/sh bob
 # Optional: sshfs and an SSH server for the FUSE mount scenario of
 # scripts/e2e/scenario.sh (it prints a SKIP line when they are missing, e.g.
-# where apt is offline, or fails with GPUEUE_E2E_REQUIRE_SSHFS=1).
+# where apt is offline). With REQUIRE_SSHFS=1 (GPUEUE_E2E_REQUIRE_SSHFS=1 of
+# scripts/e2e-test.sh) a failed install fails the image build instead.
+ARG REQUIRE_SSHFS=
 RUN if ! command -v sshfs >/dev/null || ! command -v sshd >/dev/null; then \
+        printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' >/etc/apt/apt.conf.d/80-gpueue-retries; \
         (apt-get update \
          && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             sshfs openssh-server openssh-client \
          && rm -rf /var/lib/apt/lists/*) \
-        || echo "sshfs/openssh-server not installed; the FUSE scenario will be skipped"; \
+        || { [ -z "$REQUIRE_SSHFS" ] || { echo "sshfs/openssh-server install failed" >&2; exit 1; }; \
+             echo "WARNING: sshfs/openssh-server not installed; the FUSE scenario will be skipped" >&2; }; \
     fi
 # Optional: sudo and polkit (pkexec), so that scenario 19 of
 # scripts/e2e/scenario.sh can show that jobs cannot use them even when the

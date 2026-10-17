@@ -28,12 +28,13 @@ trap cleanup EXIT
 cp "$rpm" "$work/test.rpm"
 
 mounts=()
-setup=""
+# Retry transient mirror failures (every apt-get of the containers).
+setup='printf "Acquire::Retries \"5\";\nAcquire::http::Timeout \"30\";\nAcquire::https::Timeout \"30\";\n" >/etc/apt/apt.conf.d/80-gpueue-retries'
 if [ "${GPUEUE_DEB_HTTPS:-}" = 1 ]; then
     ca=/etc/ssl/certs/ca-certificates.crt
     [ -f "$ca" ] || { echo "GPUEUE_DEB_HTTPS=1 needs $ca" >&2; exit 1; }
     mounts+=(-v "$ca:/usr/local/share/host-ca.crt:ro")
-    setup='sed -i "s|http://|https://|g" /etc/apt/sources.list.d/ubuntu.sources
+    setup+=$'\n''sed -i "s|http://|https://|g" /etc/apt/sources.list.d/ubuntu.sources
 echo "Acquire::https::CaInfo \"/usr/local/share/host-ca.crt\";" >/etc/apt/apt.conf.d/99host-ca'
 fi
 
@@ -72,8 +73,9 @@ echo "=== sign-rpm.sh (ubuntu:24.04)"
 docker run --rm -i "${mounts[@]}" -v "$root:/src:ro" -v "$work:/out" ubuntu:24.04 bash -euo pipefail <<EOF
 $setup
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q >/dev/null
-apt-get install -y -q --no-install-recommends rpm gnupg >/dev/null 2>&1
+apt-get update -q >/tmp/update.out 2>&1 || { cat /tmp/update.out >&2; exit 1; }
+if grep -E '^(E|Err):' /tmp/update.out >&2; then echo "apt-get update failed" >&2; exit 1; fi
+apt-get install -y -q --no-install-recommends rpm gnupg >/dev/null
 bash -euo pipefail /out/sign.sh
 EOF
 

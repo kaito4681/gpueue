@@ -136,11 +136,16 @@ docker run -d --name "$name" --privileged --cgroupns=private \
     -v "$stage":/dist:ro \
     "$image" >/dev/null
 state=
-for _ in $(seq 100); do
+for _ in $(seq 150); do
     state="$(docker exec "$name" systemctl is-system-running 2>/dev/null || true)"
     case "$state" in running | degraded) break ;; esac
     sleep 0.2
 done
+case "${state:-}" in running | degraded) ;; *)
+    echo "systemd in $name did not come up (state: ${state:-unknown})" >&2
+    exit 1
+    ;;
+esac
 echo "$base: systemd ${state:-unknown}"
 
 status=0

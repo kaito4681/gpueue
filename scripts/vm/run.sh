@@ -157,24 +157,24 @@ download_image() {
     case "$DISTRO_SUMS_KIND" in
     sha256 | sha512)
         name=${DISTRO_IMG_URL##*/}
-        curl -fsSL --retry 3 -o "$dir/SUMS" "$DISTRO_SUMS_URL"
+        curl -fsSL --retry 5 --retry-all-errors -o "$dir/SUMS" "$DISTRO_SUMS_URL"
         # "<hash> *<name>" (Ubuntu) or "<hash>  <name>" (Debian).
         line=$(grep -E "^[0-9a-f]+ [ *]$name\$" "$dir/SUMS") || die "$name is not in $DISTRO_SUMS_URL"
         log "downloading $DISTRO_IMG_URL"
-        curl -fsSL --retry 3 -o "$dir/image" "$DISTRO_IMG_URL"
+        curl -fsSL --retry 5 --retry-all-errors -o "$dir/image" "$DISTRO_IMG_URL"
         (cd "$dir" && echo "${line%% *}  image" | "${DISTRO_SUMS_KIND}sum" -c -) || die "checksum mismatch"
         ;;
     fedora)
         # The directory listing names the CHECKSUM file of the build, whose
         # lines are "SHA256 (<image>) = <hash>".
-        sums=$(curl -fsSL --retry 3 "$DISTRO_IMG_URL" | grep -oE 'Fedora-Cloud-[0-9][^"]*-x86_64-CHECKSUM' | head -n1) \
+        sums=$(curl -fsSL --retry 5 --retry-all-errors "$DISTRO_IMG_URL" | grep -oE 'Fedora-Cloud-[0-9][^"]*-x86_64-CHECKSUM' | head -n1) \
             || die "no CHECKSUM file in $DISTRO_IMG_URL"
-        curl -fsSL --retry 3 -o "$dir/SUMS" "$DISTRO_IMG_URL$sums"
+        curl -fsSL --retry 5 --retry-all-errors -o "$dir/SUMS" "$DISTRO_IMG_URL$sums"
         line=$(grep -E '^SHA256 \(Fedora-Cloud-Base-Generic-[^)]*\.x86_64\.qcow2\) = [0-9a-f]{64}$' "$dir/SUMS") \
             || die "no Generic qcow2 image in $sums"
         name=$(sed -E 's/^SHA256 \(([^)]*)\).*/\1/' <<<"$line")
         log "downloading $DISTRO_IMG_URL$name"
-        curl -fsSL --retry 3 -o "$dir/image" "$DISTRO_IMG_URL$name"
+        curl -fsSL --retry 5 --retry-all-errors -o "$dir/image" "$DISTRO_IMG_URL$name"
         (cd "$dir" && echo "${line##* }  image" | sha256sum -c -) || die "checksum mismatch"
         ;;
     esac
