@@ -3,21 +3,23 @@
 # (and pkgrel=1 when the version changes), downloads the release's tarballs with their
 # .minisig files and checks them like install.sh does (the release key, and the trusted
 # comment "gpueue v<VERSION> <file>"), computes the PKGBUILD's checksums from the verified
-# tarballs and from the tag's source archive, and regenerates .SRCINFO with
+# tarballs, and regenerates .SRCINFO with
 # `makepkg --printsrcinfo` (run directly when makepkg is installed, else in an Arch Linux
 # container).
 #
-# The release key is packaging/minisign.pub of the tag (from its source archive), as
-# apt-repo.sh takes it: a run for an older tag may come from a newer default branch. No
-# signed release asset carries the systemd units, the sysusers.d and tmpfiles.d snippets
-# and the default configuration, so the PKGBUILD takes them from the same source archive
-# (GitHub generates it from the tag, and keeps it byte-stable).
+# The release key is the default branch's packaging/minisign.pub (GPUEUE_TRUSTED_KEY_URL),
+# never one read from the tag alone; the tag's own copy (from its source archive) must be
+# the same key, or the script fails (so does an older tag, after a key rotation). The
+# systemd units, the sysusers.d and tmpfiles.d snippets and the default configuration are
+# in the signed release tarballs (packaging/), which the PKGBUILD uses from there.
 #
 # Usage: scripts/dist/update-aur.sh VERSION      (e.g. 0.2.0; prereleases are not packaged)
 # Environment:
 #   GPUEUE_RELEASE_BASE_URL  repository URL the PKGBUILD downloads from
 #                           (default https://github.com/kaito4681/gpueue; file:// works,
 #                           for tests)
+#   GPUEUE_TRUSTED_KEY_URL   where the trusted minisign.pub is fetched from (default: the
+#                           default branch on raw.githubusercontent.com; file:// works, for tests)
 #   GPUEUE_AUR_DIR           package directory (default packaging/aur/gpueue-bin)
 #   GPUEUE_ARCH_IMAGE        container image with makepkg
 #   MINISIGN                the minisign binary (default: scripts/dist/get-minisign.sh)
@@ -28,6 +30,7 @@ version="${1:-}"
 version="${version#v}"
 base="${GPUEUE_RELEASE_BASE_URL:-https://github.com/kaito4681/gpueue}"
 base="${base%/}"
+trusted_url="${GPUEUE_TRUSTED_KEY_URL:-https://raw.githubusercontent.com/kaito4681/gpueue/HEAD/packaging/minisign.pub}"
 dir="${GPUEUE_AUR_DIR:-$root/packaging/aur/gpueue-bin}"
 image="${GPUEUE_ARCH_IMAGE:-archlinux:base-devel-20260927.0.600689}"
 targets=(x86_64:x86_64-unknown-linux-gnu aarch64:aarch64-unknown-linux-gnu)
@@ -44,14 +47,14 @@ trap 'rm -rf "$work"' EXIT
 fetch() { curl -fsSL --retry 3 -o "$2" "$1" || die "cannot download $1"; }
 is_sha256() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
 
-# The source archive has no published checksum; GitHub keeps tag archives byte-stable.
+# The trusted key comes from the default branch; the tag's copy only has to match it.
+fetch "$trusted_url" "$work/minisign.pub"
+[ -n "$(sed -n 2p "$work/minisign.pub")" ] || die "the trusted minisign.pub is empty"
 fetch "$base/archive/refs/tags/v$version.tar.gz" "$work/src.tar.gz"
-tar -tzf "$work/src.tar.gz" "gpueue-$version/packaging/config.toml" >/dev/null 2>&1 ||
-    die "the source archive of v$version has no gpueue-$version/packaging/config.toml"
-tar -xzOf "$work/src.tar.gz" "gpueue-$version/packaging/minisign.pub" >"$work/minisign.pub" 2>/dev/null ||
+tar -xzOf "$work/src.tar.gz" "gpueue-$version/packaging/minisign.pub" >"$work/tag-minisign.pub" 2>/dev/null ||
     die "the source archive of v$version has no gpueue-$version/packaging/minisign.pub"
-src_sum="$(sha256sum "$work/src.tar.gz" | cut -d' ' -f1)"
-is_sha256 "$src_sum" || die "cannot compute the checksum of the source archive"
+[ "$(sed -n 2p "$work/minisign.pub")" = "$(sed -n 2p "$work/tag-minisign.pub")" ] ||
+    die "packaging/minisign.pub of v$version differs from the default branch's; refusing to package it"
 
 minisign="${MINISIGN:-}"
 [ -n "$minisign" ] || minisign="$("$root/scripts/dist/get-minisign.sh" "$work/minisign")"
@@ -82,7 +85,6 @@ set_line() {
 }
 set_line pkgver "$version"
 [ "$old_version" = "$version" ] || set_line pkgrel 1
-set_line sha256sums "('$src_sum')"
 for arch in "${!sums[@]}"; do
     set_line "sha256sums_$arch" "('${sums[$arch]}')"
 done

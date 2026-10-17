@@ -1,0 +1,29 @@
+# cargo-deny configuration, checked by the `deny` job of .github/workflows/ci.yml:
+#   scripts/dist/get-cargo-deny.sh DIR   (a pinned binary)
+#   DIR/cargo-deny --locked check advisories bans sources
+# Licenses are not checked here (the workspace is MIT and has no license policy yet).
+
+[graph]
+all-features = true
+
+[advisories]
+# Vulnerabilities, unmaintained and unsound crates, and yanked releases all fail the check.
+yanked = "deny"
+ignore = [
+    # Add "RUSTSEC-YYYY-NNNN" entries here only with a comment saying why the advisory does
+    # not apply and when to drop the entry.
+]
+
+[bans]
+# Duplicate versions of a crate only warn (they cost build time and binary size).
+multiple-versions = "warn"
+# The workspace's own path dependencies carry no version, which cargo-deny counts as
+# wildcards; every external dependency is a version requirement from crates.io (see [sources]).
+wildcards = "allow"
+
+[sources]
+# crates.io only: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

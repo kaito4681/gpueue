@@ -69,6 +69,18 @@ jobs:
           docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:v0.10.0 \
             -S warning "${files[@]}"
 
+  # Advisories (RUSTSEC), crates.io as the only source and duplicate
+  # versions (a warning), by a pinned, checksummed cargo-deny (deny.toml).
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: |
+          deny="$(scripts/dist/get-cargo-deny.sh "$RUNNER_TEMP/cargo-deny")"
+          "$deny" --locked check advisories bans sources
+
   # The workflows (with shellcheck on their run: scripts), by a pinned
   # actionlint image.
   actionlint:
@@ -124,7 +136,7 @@ jobs:
                 # Read by the package (keep in sync with the source fileset
                 # in packaging/nix/package.nix), or this workflow.
                 scripts/install.sh | scripts/dist/deb-check.sh | scripts/dist/get-minisign.sh | .github/workflows/ci.yml) ;;
-                .agents/* | skills/* | AGENTS.md | README.ja.md | README.zh-CN.md | .gitignore | docker/* | scripts/* | .github/*)
+                .agents/* | skills/* | AGENTS.md | README.ja.md | README.zh-CN.md | .gitignore | deny.toml | docker/* | scripts/* | .github/*)
                   continue ;;
               esac
               echo "Running the Nix jobs, for $file"
@@ -369,6 +381,8 @@ jobs:
           mkdir -p "target/aur/$name"
           install -m 0755 target/docker/debug/gpueue target/docker/debug/gpueue-helper "target/aur/$name/"
           cp -r README.md LICENSE docs "target/aur/$name/"
+          mkdir "target/aur/$name/packaging"
+          cp -r packaging/systemd packaging/sysusers.d packaging/tmpfiles.d packaging/config.toml "target/aur/$name/packaging/"
           tar -C target/aur -czf "target/aur/$name.tar.gz" "$name"
       - run: scripts/dist/aur-test.sh target/aur/gpueue-v*.tar.gz
 

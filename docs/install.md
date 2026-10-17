@@ -271,6 +271,32 @@ Ubuntu 26.04 VM, reboots it with checkpointed, running and paused jobs, upgrades
 release and restores the jobs. If it fails, nothing is created: fix the cause and tag a new
 version, or rerun the failed jobs when the failure was not the release's.
 
+`release.yml` also refuses a tag whose commit is not an ancestor of the default branch (the job
+`check-signing`, also for a run by hand), and `apt-repo.sh` and `update-aur.sh` verify with the
+default branch's `packaging/minisign.pub` and fail when the tag carries a different key. After a key
+rotation, older tags therefore cannot be republished to the APT repository or the AUR.
+
+#### Recommended repository settings (maintainers)
+
+These settings are not in the repository, so they are applied by a maintainer with `gh api`
+(adjust the owner, repository and branch names):
+
+- Protect the release line: a branch ruleset on the default branch (and on any stable branch) that
+  requires pull requests and the CI checks, blocks force pushes and deletions, and a tag ruleset on
+  `v*` that restricts creation, update and deletion to the maintainers.
+- Require pinned actions: set `sha_pinning_required` in the Actions permissions
+  (`PUT /repos/{owner}/{repo}/actions/permissions`), which makes workflows fail on an action that is
+  not pinned to a full commit SHA (`.github/dependabot.yml` keeps the pins current).
+- Enable secret scanning and push protection (`security_and_analysis`), and Dependabot alerts.
+- Use separate keys per channel: the minisign key signs release assets, and the APT and RPM
+  signatures use their own GPG key (`APT_GPG_PRIVATE_KEY`); give the RPM channel a key of its own
+  instead of the APT archive key, so that one leak does not cover both.
+- Keep the signing secrets in a protected environment (tracked separately).
+
+Dependencies are checked in CI by `cargo-deny` (`deny.toml`: advisories, crates.io as the only
+source, duplicate versions as warnings), and Dependabot proposes cargo and GitHub Actions updates
+weekly.
+
 ## Installing the Debian/Ubuntu package
 
 Each release has a `.deb` for amd64 and arm64, for Debian 12 and Ubuntu 22.04, 24.04 and 26.04.
@@ -403,7 +429,7 @@ The repository is the set of assets of the release `apt` (a pre-release, so it n
 `scripts/dist/apt-repo.sh github <tag>` when a release is **published as a stable release** (the
 `released` event: publishing a stable release, or turning a pre-release into one): it adds the release's
 `.deb` files (after checking their checksums and their minisign signatures, with the public key
-of the tag's commit), checks the packages already in the repository against its signed index
+of the default branch; the tag's copy must be the same key, or the job fails), checks the packages already in the repository against its signed index
 (`InRelease` must verify with `packaging/apt/gpueue-archive-keyring.gpg`, and each `.deb` must
 have the SHA256 the signed `Packages` lists; on a mismatch the job fails and changes nothing, and a
 `.deb` the index does not list, left by an interrupted run, is dropped), deletes all but the newest
@@ -847,11 +873,13 @@ Checkpoints need CRIU 4.2 or newer, which is in the official repositories
 The PKGBUILD lives in `packaging/aur/gpueue-bin`. When a release is published as a stable release
 (the `released` event, like the APT repository; never for a draft or a pre-release),
 `.github/workflows/release-aur.yml` runs `scripts/dist/update-aur.sh <version>`, which downloads
-the release's tarballs and their `.minisig` files, checks them with the tag's
-`packaging/minisign.pub` (and the trusted comment `gpueue v<version> <file>`, as `install.sh` does),
-computes the PKGBUILD's checksums from the verified tarballs and from the tag's source archive (for
-the units and snippets, which no signed asset carries), and regenerates `.SRCINFO` in an Arch
-Linux container.
+the release's tarballs and their `.minisig` files, checks them with the default branch's
+`packaging/minisign.pub` (the tag's copy must be the same key, or the script fails; it also checks the
+trusted comment `gpueue v<version> <file>`, as `install.sh` does),
+computes the PKGBUILD's checksums from the verified tarballs, and regenerates `.SRCINFO` in an Arch
+Linux container. The units, the `sysusers.d` and `tmpfiles.d` snippets and the default configuration
+are in the signed tarballs (under `packaging/`), and the PKGBUILD installs them from there (releases
+before the one that added them cannot be packaged with this PKGBUILD).
 It then pushes `PKGBUILD`, `.SRCINFO` and `gpueue-bin.install` to
 `ssh://aur@aur.archlinux.org/gpueue-bin.git`. The release must have both the x86_64 and the aarch64
 tarball. To change the packaging without a new release, bump `pkgrel` in the PKGBUILD and run the

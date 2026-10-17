@@ -43,6 +43,9 @@ else
     install -m 0755 "$root/target/docker/release/gpueue" "$root/target/docker/release/gpueue-helper" \
         "$stage/build/$name/"
     cp -r "$root/README.md" "$root/LICENSE" "$root/docs" "$stage/build/$name/"
+    mkdir "$stage/build/$name/packaging"
+    cp -r "$root/packaging/systemd" "$root/packaging/sysusers.d" "$root/packaging/tmpfiles.d" \
+        "$root/packaging/config.toml" "$stage/build/$name/packaging/"
     tar -C "$stage/build" -czf "$release/$name.tar.gz" "$name"
 fi
 (cd "$release" && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
@@ -62,17 +65,19 @@ sign "$name.tar.gz" release "gpueue v$version $name.tar.gz"
 sign "$aarch64" release "gpueue v$version $aarch64"
 
 # The source archive: tracked and new (not ignored) files of the working tree, as GitHub
-# would archive the tag, with the throwaway key as packaging/minisign.pub.
+# would archive the tag, with the throwaway key as packaging/minisign.pub (the trusted key
+# of the default branch is a copy of it).
 mkdir -p "$stage/src/gpueue-$version"
 (cd "$root" && git ls-files -z --cached --others --exclude-standard |
     tar --null --ignore-failed-read -T - -cf - 2>/dev/null) | tar -C "$stage/src/gpueue-$version" -xf -
 cp "$stage/keys/release.pub" "$stage/src/gpueue-$version/packaging/minisign.pub"
+cp "$stage/keys/release.pub" "$stage/trusted.pub"
 tar -C "$stage/src" -czf "$stage/repo/archive/refs/tags/v$version.tar.gz" "gpueue-$version"
 rm -rf "$stage/src"
 
 cp -r "$root/packaging/aur/gpueue-bin" "$stage/pkg"
 update_aur() {
-    GPUEUE_RELEASE_BASE_URL="file://$stage/repo" GPUEUE_AUR_DIR="$stage/pkg" MINISIGN="$minisign" \
+    GPUEUE_RELEASE_BASE_URL="file://$stage/repo" GPUEUE_TRUSTED_KEY_URL="file://$stage/trusted.pub" GPUEUE_AUR_DIR="$stage/pkg" MINISIGN="$minisign" \
         "$root/scripts/dist/update-aur.sh" "$version"
 }
 # expect_refused PATTERN: update-aur.sh fails, says PATTERN and leaves the PKGBUILD alone.
@@ -87,6 +92,11 @@ expect_refused() {
     cmp -s "$root/packaging/aur/gpueue-bin/PKGBUILD" "$stage/pkg/PKGBUILD" ||
         { echo "FAIL: a refused release changed the PKGBUILD" >&2; exit 1; }
 }
+# The tag carries another key than the default branch (a tag made to ship its own key).
+cp "$stage/keys/release.pub" "$stage/trusted.pub.good"
+cp "$stage/keys/other.pub" "$stage/trusted.pub"
+expect_refused "differs from the default branch's"
+cp "$stage/trusted.pub.good" "$stage/trusted.pub"
 cp "$release/$aarch64.minisig" "$stage/aarch64.minisig"
 # Signed with another key.
 sign "$aarch64" other "gpueue v$version $aarch64"

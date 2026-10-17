@@ -19,18 +19,16 @@ conflicts=('gpueue')
 backup=('etc/gpueue/config.toml')
 install=gpueue-bin.install
 options=('!strip' '!debug')
-# The release tarball holds the binaries. The systemd units, the sysusers.d and tmpfiles.d
-# snippets and the default configuration come from the tag's source archive.
-source=("gpueue-${pkgver}-src.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+# The release tarballs (minisign-signed, verified by update-aur.sh) hold the binaries, the
+# systemd units, the sysusers.d and tmpfiles.d snippets and the default configuration.
 source_x86_64=("${url}/releases/download/v${pkgver}/gpueue-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
 source_aarch64=("${url}/releases/download/v${pkgver}/gpueue-v${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 sha256sums_x86_64=('0000000000000000000000000000000000000000000000000000000000000000')
 sha256sums_aarch64=('0000000000000000000000000000000000000000000000000000000000000000')
 
 package() {
   local bin="${srcdir}/gpueue-v${pkgver}-${CARCH}-unknown-linux-gnu"
-  local src="${srcdir}/gpueue-${pkgver}"
+  local src="${bin}"
 
   install -Dm0755 -t "${pkgdir}/usr/bin" "${bin}/gpueue" "${bin}/gpueue-helper"
 

@@ -75,6 +75,9 @@ for arg in "$@"; do
     mkdir -p "$stage"
     install -m 0755 "$root/target/dist-build/$dir/gpueue" "$root/target/dist-build/$dir/gpueue-helper" "$stage/"
     cp -r "$src/README.md" "$src/LICENSE" "$src/docs" "$stage/"
+    mkdir "$stage/packaging"
+    cp -r "$src/packaging/systemd" "$src/packaging/sysusers.d" "$src/packaging/tmpfiles.d" \
+        "$src/packaging/config.toml" "$stage/packaging/"
     mkdir -p "$out/$tag"
     tar -C "$work" -czf "$out/$tag/$name.tar.gz" "$name"
     (cd "$out/$tag" && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
