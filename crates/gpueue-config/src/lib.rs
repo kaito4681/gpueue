@@ -60,6 +60,7 @@
 //! criu_restore_timeout_secs = 3600   # default: only the deadline applies
 //! nvml_library = "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1"
 //! job_min_uid = 1000                 # default: UID_MIN of /etc/login.defs, else 1000
+//! job_max_uid = 60000                # default: no upper bound
 //!
 //! # Job priority (Slurm's priority/multifactor); see [`PriorityConfig`].
 //! [priority]
@@ -213,6 +214,11 @@ pub struct Config {
     /// (helper only). Unset: `UID_MIN` of `/etc/login.defs`, else 1000 (see
     /// [`job_policy::effective_min_uid`]). uid 0 is always refused.
     pub job_min_uid: Option<u32>,
+    /// Jobs (spawns and restores) of users with a larger uid are refused
+    /// (helper only). Unset: no upper bound. 65534, 65535, 4294967295 and
+    /// systemd's `DynamicUser=` range 61184-65519 are always refused (see
+    /// [`job_policy::is_reserved_uid`]).
+    pub job_max_uid: Option<u32>,
     /// Groups that grant root-equivalent power (helper only; see
     /// [`job_policy::DEFAULT_JOB_DENIED_GROUPS`]). A job whose group is one
     /// of them is refused; they are dropped from a job's supplementary
@@ -440,6 +446,7 @@ impl Default for Config {
             criu_restore_timeout_secs: None,
             fork_guard: true,
             job_min_uid: None,
+            job_max_uid: None,
             job_denied_groups: job_policy::default_denied_groups(),
             job_allowed_users: Vec::new(),
             job_hidden_socket_dirs: job_policy::default_hidden_socket_dirs(),
@@ -710,6 +717,7 @@ mod tests {
         assert!(!config.job_system_dbus);
         assert!(!config.job_systemd_varlink);
         assert_eq!(config.job_min_uid, None);
+        assert_eq!(config.job_max_uid, None);
         assert_eq!(
             config.job_denied_groups,
             job_policy::DEFAULT_JOB_DENIED_GROUPS
@@ -933,8 +941,10 @@ mod tests {
         assert_eq!(config.criu_dump_timeout_secs, Some(3600));
         assert_eq!(config.criu_restore_timeout_secs, Some(3600));
         assert_eq!(config.job_min_uid, Some(1000));
+        assert_eq!(config.job_max_uid, Some(60000));
         // Everything else is the default.
         config.job_min_uid = None;
+        config.job_max_uid = None;
         config.checkpoint_size_limit_bytes = None;
         config.nvml_library = None;
         config.criu_dump_timeout_secs = None;

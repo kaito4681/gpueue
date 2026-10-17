@@ -314,8 +314,8 @@ failed and keeps the image as well.
   environment, which the daemon stores: members of `gpueue-admin` can read every user's job
   environment (including secrets passed in it) through the CLI. A design in which the helper
   verifies the submitter itself is not implemented yet (issue #107). For every spawn and restore it looks the owner up
-  through NSS and refuses uid 0, gid 0, uids above `UID_MAX` of `/etc/login.defs` (default 60000)
-  and 65534, 65535 and 4294967295, groups the owner is not in, users below `job_min_uid`
+  through NSS and refuses uid 0, gid 0, uids above `job_max_uid` (when set), 65534, 65535,
+  4294967295 and systemd's dynamic-user range 61184-65519, groups the owner is not in, users below `job_min_uid`
   (default `UID_MIN` of `/etc/login.defs`), users missing from a non-empty `job_allowed_users`,
   and a job group listed in `job_denied_groups` (root-equivalent groups such as `docker`, `disk`
   or `sudo`, looked up in `/etc/group`), with an error of code `policy_denied` whose message

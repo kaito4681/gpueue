@@ -1376,7 +1376,8 @@ Every `*_secs` key is at most one year (31536000).
 | `gpu_device_isolation` | `true` | helper | each job unit may open only its assigned GPUs' device nodes (`DevicePolicy=closed`); `false` turns this off (see [GPU isolation](#gpu-isolation)) |
 | `job_system_dbus` | `false` | helper | `true` lets jobs reach the system D-Bus (systemd, polkit); by default `/run/dbus` is hidden from jobs (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_systemd_varlink` | `false` | helper | `true` lets jobs reach systemd's Varlink services under `/run/systemd`; by default the directory is hidden from jobs except journald's log sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/` (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
-| `job_min_uid` | `UID_MIN` of `/etc/login.defs`, else `1000` | helper | jobs of users with a smaller uid are refused (uids above `UID_MAX`, 65534, 65535 and 4294967295 always are) (see [Who jobs may run as](#who-jobs-may-run-as)) |
+| `job_min_uid` | `UID_MIN` of `/etc/login.defs`, else `1000` | helper | jobs of users with a smaller uid are refused (see [Who jobs may run as](#who-jobs-may-run-as)) |
+| `job_max_uid` | unset (no upper bound) | helper | jobs of users with a larger uid are refused; 65534, 65535, 4294967295 and 61184-65519 (systemd `DynamicUser=`) are always refused (see [Who jobs may run as](#who-jobs-may-run-as)) |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]` | helper | root-equivalent groups: dropped from jobs' supplementary groups; a job whose primary group is one of them is refused |
 | `job_hidden_socket_dirs` | `["/run/libvirt", "/run/cups"]` | helper | directories hidden from jobs behind an empty root-owned tmpfs (created first if missing): those of daemon sockets that check the caller's groups in the user database, which dropping groups does not defeat; absolute paths at least two levels deep, whose existing directories (and symlinks) on the way are root's and not group- or world-writable (checked when the helper starts) (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_allowed_users` | `[]` (everyone) | helper | if not empty, only these users (by name) may run jobs |
@@ -1410,9 +1411,9 @@ without logging in again.
 
 The root helper starts every job as its owner, so it applies the policy on whose jobs it runs;
 the daemon cannot change that policy. Besides never running a job as root (uid 0 or gid 0), as a
-uid above `UID_MAX` of `/etc/login.defs` (60000 when unset) or as 65534 (`nobody`), 65535 or
-4294967295, or with a group its owner is not in, the helper applies three settings to every
-spawn and every restore:
+uid of 65534 (`nobody`), 65535, 4294967295 or systemd's `DynamicUser=` range 61184-65519, or
+with a group its owner is not in, the helper applies four settings to every spawn and every
+restore:
 
 - `job_min_uid`: users with a smaller uid are refused. Unset, it is `UID_MIN` of
   `/etc/login.defs` (1000 on most distributions), or 1000 when the file has no valid `UID_MIN`.
@@ -1422,6 +1423,9 @@ spawn and every restore:
   (such as `systemd-resolve`'s `/run/systemd/resolve`), but not below one of a user who may run
   jobs, nor one of the daemon's user (see
   [Network and FUSE filesystems that stop answering](#network-and-fuse-filesystems-that-stop-answering)).
+- `job_max_uid`: users with a larger uid are refused. Unset by default, because directory
+  services (LDAP, AD through sssd ID mapping) commonly give regular users uids far above 60000,
+  and systemd-homed users have 60001-60513. Set it only if you want a bound.
 - `job_denied_groups`: groups whose members can act as root without a password. They are
   removed from a job's supplementary groups, so a job of a user in `docker` runs without
   `docker` (the helper's journal records which groups it left out; the job's output is not

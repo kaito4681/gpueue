@@ -93,10 +93,9 @@ impl Credentials {
 pub struct JobPolicy {
     pub min_uid: u32,
     pub min_uid_source: MinUidSource,
-    /// The last uid of regular users (`UID_MAX` of `login.defs`, default
-    /// 60000); jobs of larger uids are refused, as are
-    /// [`job_policy::RESERVED_UIDS`].
-    pub max_uid: u32,
+    /// `job_max_uid`: jobs of larger uids are refused. `None`: no bound.
+    /// [`job_policy::is_reserved_uid`] uids are refused either way.
+    pub max_uid: Option<u32>,
     /// Group names; looked up in `group_file` at each check, so groups
     /// created later are covered.
     pub denied_groups: Vec<String>,
@@ -113,7 +112,7 @@ impl JobPolicy {
         Self {
             min_uid,
             min_uid_source,
-            max_uid: job_policy::effective_max_uid(login_defs),
+            max_uid: file.job_max_uid,
             denied_groups: file.job_denied_groups.clone(),
             allowed_users: file.job_allowed_users.clone(),
             group_file: group_file.to_owned(),
@@ -126,7 +125,7 @@ impl JobPolicy {
         Self {
             min_uid: 1,
             min_uid_source: MinUidSource::Config,
-            max_uid: job_policy::FALLBACK_JOB_MAX_UID,
+            max_uid: None,
             denied_groups: Vec::new(),
             allowed_users: Vec::new(),
             group_file: PathBuf::from(job_policy::GROUP_FILE_PATH),
@@ -150,10 +149,11 @@ impl JobPolicy {
     /// One line for the helper's log.
     pub fn describe(&self) -> String {
         format!(
-            "job_min_uid {} ({}), max uid {}, job_denied_groups {:?}, job_allowed_users {}",
+            "job_min_uid {} ({}), job_max_uid {}, job_denied_groups {:?}, job_allowed_users {}",
             self.min_uid,
             self.min_uid_source.describe(),
-            self.max_uid,
+            self.max_uid
+                .map_or_else(|| "(none)".to_owned(), |m| m.to_string()),
             self.denied_groups,
             if self.allowed_users.is_empty() {
                 "(everyone)".to_owned()
@@ -212,14 +212,22 @@ pub fn check_credentials<H: HostProbe + ?Sized>(
             ),
         ));
     }
-    if uid.0 > policy.max_uid || job_policy::RESERVED_UIDS.contains(&uid.0) {
+    if job_policy::is_reserved_uid(uid.0) {
         return Err(Rejection::policy(
             &user.name,
             format!(
-                "uid {} is outside the range of regular users (UID_MAX {}, and never 65534, \
-                 65535 or 4294967295)",
-                uid.0, policy.max_uid
+                "uid {} is reserved (nobody, 65535, 4294967295 and systemd's dynamic users \
+                 61184-65519 never run jobs)",
+                uid.0
             ),
+        ));
+    }
+    if let Some(max) = policy.max_uid
+        && uid.0 > max
+    {
+        return Err(Rejection::policy(
+            &user.name,
+            format!("uid {} is above job_max_uid {max}", uid.0),
         ));
     }
     if !policy.allowed_users.is_empty() && !policy.allowed_users.contains(&user.name) {
@@ -429,27 +437,51 @@ mod tests {
     }
 
     #[test]
-    fn refuses_uids_beyond_uid_max_and_nobody() {
+    fn refuses_reserved_uids_and_honors_job_max_uid() {
         let (p, _dir) = policy("");
-        assert_eq!(p.max_uid, 60000);
+        assert_eq!(p.max_uid, None);
         let h = FakeHost::default();
-        for uid in [60000u32, 60001, 65534, 65535, u32::MAX] {
+        let uids = [
+            60000u32,
+            60513,
+            61183,
+            61184,
+            65000,
+            65519,
+            65520,
+            65534,
+            65535,
+            100_000,
+            u32::MAX,
+        ];
+        for uid in uids {
             h.add_user(uid, "u", uid, &[uid]);
         }
-        let go_with = |p: &JobPolicy, uid: u32| check_credentials(&h, p, Uid(uid), Gid(uid), None);
-        let go = |uid: u32| go_with(&p, uid);
-        assert!(go(60000).is_ok());
-        for uid in [60001u32, 65534, 65535, u32::MAX] {
+        let go = |p: &JobPolicy, uid: u32| check_credentials(&h, p, Uid(uid), Gid(uid), None);
+        // No upper bound: sssd-sized and systemd-homed uids are fine.
+        for uid in [60000u32, 60513, 61183, 65520, 100_000] {
+            assert!(go(&p, uid).is_ok(), "{uid}");
+        }
+        for uid in [61184u32, 65000, 65519, 65534, 65535, u32::MAX] {
             assert_eq!(
-                go(uid).unwrap_err().code,
+                go(&p, uid).unwrap_err().code,
                 HelperErrorCode::PolicyDenied,
                 "{uid}"
             );
         }
-        // Reserved uids stay refused even when UID_MAX is raised above them.
-        let mut wide = p.clone();
-        wide.max_uid = u32::MAX;
-        assert!(go_with(&wide, 65534).is_err());
+        let (p, _dir) = policy("job_max_uid = 60513");
+        assert_eq!(p.max_uid, Some(60513));
+        assert!(go(&p, 60513).is_ok());
+        let e = go(&p, 100_000).unwrap_err();
+        assert_eq!(e.code, HelperErrorCode::PolicyDenied);
+        assert!(
+            e.message.contains("above job_max_uid 60513"),
+            "{}",
+            e.message
+        );
+        // Reserved uids stay refused even when the bound is raised above them.
+        let (p, _dir) = policy("job_max_uid = 4294967295");
+        assert!(go(&p, 65534).is_err());
     }
 
     const LOGIN_DEFS: &str = "# UID_MIN 10\nUID_MIN\t\t 1000\nUID_MAX 60000\n";
