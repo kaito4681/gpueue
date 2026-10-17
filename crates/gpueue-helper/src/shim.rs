@@ -440,6 +440,11 @@ fn init(files: &JobFiles, start: &mut Option<File>) -> Result<i32, Failure> {
         let Ok(Some(info)) = sfd.read_signal() else {
             continue;
         };
+        // CRIU restores the init non-dumpable (as it was dumped; the
+        // restore hook refuses it otherwise), but whatever changed it
+        // meanwhile is undone at every wake-up.
+        let _ =
+            rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
         let signo = info.ssi_signo as i32;
         if signo != Signal::SIGCHLD as i32 {
             if status.is_none()

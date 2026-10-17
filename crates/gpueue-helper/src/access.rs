@@ -1073,11 +1073,29 @@ fn thread_statuses(proc_root: &Path, pid: u32) -> Result<Vec<(String, String)>, 
     Ok(out)
 }
 
+/// Whether process `pid` is dumpable. The kernel gives the files in
+/// `/proc/<pid>/` of a process that is not dumpable to root (the directory
+/// itself keeps the process's effective uid); `status` is one of them.
+pub fn is_dumpable(proc_root: &Path, pid: u32) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    let status = fs::metadata(proc_root.join(format!("{pid}/status")))
+        .map_err(|e| format!("reading process {pid}: {e}"))?;
+    let euid = fs::read_to_string(proc_root.join(format!("{pid}/status")))
+        .ok()
+        .and_then(|s| parse_creds(&s))
+        .and_then(|c| c.uids.get(1).copied())
+        .ok_or_else(|| format!("process {pid}: unreadable status"))?;
+    // A process running as root shows root's files either way.
+    Ok(euid != 0 && status.uid() == euid)
+}
+
 /// [`check_restored`] for the processes `procs` of the job. `hardened`
 /// also requires what the shim sets up and an unprivileged test process
 /// cannot: an empty capability bounding set and `no_new_privs` in every
-/// thread. (Whether the namespace init is dumpable is not checked: CRIU
-/// restores it dumpable, whatever it was at the dump.)
+/// thread, and a namespace init that is not dumpable. The init holds files
+/// the shim opened as root (`exit-status`), so its owner must not be able
+/// to ptrace it; CRIU restores the flag of the dump, and the check runs
+/// before any restored task runs.
 fn check_restored_procs(c: &RestoredCheck, procs: &[u32], hardened: bool) -> VerifyReply {
     let proc_root = Path::new("/proc");
     raise_nofile_limit();
@@ -1106,6 +1124,12 @@ fn check_restored_procs(c: &RestoredCheck, procs: &[u32], hardened: bool) -> Ver
     let mut problems = Vec::new();
     let ns_of = |pid: u32| fs::read_link(proc_root.join(format!("{pid}/ns/mnt")));
     let init_ns = ns_of(c.init_pid).map_err(|e| format!("reading the job's namespace: {e}"))?;
+    if hardened && is_dumpable(proc_root, c.init_pid)? {
+        problems.push(format!(
+            "the job's init (process {}) is dumpable",
+            c.init_pid
+        ));
+    }
     // Credentials: the owner's, groups the owner is still in, no
     // capabilities, the same in every process.
     let mut owner: Option<Owner> = None;
@@ -1450,6 +1474,54 @@ mod tests {
         );
     }
 
+    /// A process that made itself non-dumpable (as the shim's init does)
+    /// shows as such; one that exec'd a program does not.
+    #[test]
+    fn tells_dumpable_processes() {
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipped: needs an unprivileged user");
+            return;
+        }
+        let proc_root = Path::new("/proc");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert_eq!(is_dumpable(proc_root, child.id()), Ok(true));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // A process that makes itself non-dumpable and does not exec
+        // after that (python3 where there is one; `unsafe` is not allowed
+        // here for a fork).
+        let Ok(mut child) = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import ctypes, sys, time\n\
+                 ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)\n\
+                 print('ready', flush=True)\n\
+                 time.sleep(30)",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("skipped the non-dumpable part: no python3");
+            return;
+        };
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        assert_eq!(line.trim(), "ready");
+        let dumpable = is_dumpable(proc_root, child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(dumpable, Ok(false));
+    }
+
     #[test]
     fn parses_proc_files() {
         let status = "Name:\tx\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n\
@@ -1644,13 +1716,14 @@ VmFlags: rd ex mr mw me
         let check = |req: &RestoredCheck| check_restored_procs(req, &[req.init_pid], false);
         assert_eq!(check(&req), Ok(vec![]));
         // A process the shim did not set up (as a test's child is not): a
-        // bounding set, no `no_new_privs`.
+        // bounding set, no `no_new_privs`, a dumpable init.
         // (What the test runner has, its child inherits.)
         let mine = parse_creds(&fs::read_to_string("/proc/self/status").unwrap()).unwrap();
         let p = check_restored_procs(&req, &[req.init_pid], true).unwrap();
         for (what, expected) in [
             ("bounding set", !mine.no_bounding_caps),
             ("no_new_privs", !mine.no_new_privs),
+            ("is dumpable", true),
         ] {
             assert_eq!(
                 p.iter().any(|p| p.contains(what)),

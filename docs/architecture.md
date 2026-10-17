@@ -321,7 +321,9 @@ hold a root file opened with the dump-time mode. The helper therefore:
   way it is open (`faccessat2` on the pinned file) and reaches it by its path, without
   symlinks, as the same inode. It also requires that every thread of every task runs as the
   owner, with groups the owner is still in, without capabilities, with an empty capability
-  bounding set and with `no_new_privs`. Files on the job's own mounts (`/proc`, the
+  bounding set and with `no_new_privs`, and that the namespace init is not dumpable (it holds
+  files the shim opened as root, so its owner must not be able to ptrace it; CRIU restores the
+  flag it had at the dump). Files on the job's own mounts (`/proc`, the
   private tmpfs) come from the image and are skipped. A file the job held at the dump only
   needs its path to lead to that very file: a job may hold a file in a way its owner could not
   open it again (created read-only, or on an sshfs mount that shows files as root's), and
