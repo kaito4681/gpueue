@@ -51,7 +51,7 @@ cc = "1"
 # signatures, checksums and tarballs.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 minisign-verify = "0.3"
-sha2 = "0.10"
+sha2 = "0.11"
 semver = "1"
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
