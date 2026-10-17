@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::system::CmdOutput;
-use crate::system::fake::FakeSystem;
+use crate::system::fake::{FakeSystem, create_dirs};
 
 const ETC: &str = "/etc/systemd/system";
 const LIB: &str = "/usr/lib/systemd/system";
@@ -49,7 +49,7 @@ fn write_dpkg_package(sys: &FakeSystem) {
 
 fn symlink(sys: &FakeSystem, target: &str, link: &str) {
     let local = sys.path(Path::new(link));
-    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    create_dirs(sys.root(), local.parent().unwrap());
     std::os::unix::fs::symlink(target, local).unwrap();
 }
 

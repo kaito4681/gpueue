@@ -5,7 +5,7 @@ use gpueue_daemon::config::Config;
 
 use super::*;
 use crate::system::CmdOutput;
-use crate::system::fake::FakeSystem;
+use crate::system::fake::{FakeSystem, create_dirs, write_file};
 
 fn opts() -> InstallOptions {
     InstallOptions {
@@ -326,9 +326,8 @@ const NIX_LOADER: &str = "/nix/store/xyz-glibc-2.40/lib/ld-linux-x86-64.so.2";
 
 fn write_bytes(sys: &FakeSystem, path: &str, bytes: &[u8]) {
     let local = sys.path(Path::new(path));
-    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
-    std::fs::write(&local, bytes).unwrap();
-    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o755)).unwrap();
+    create_dirs(sys.root(), local.parent().unwrap());
+    write_file(&local, bytes, 0o755);
 }
 
 fn read_bytes(sys: &FakeSystem, path: &str) -> Vec<u8> {
@@ -1479,7 +1478,7 @@ fn purge_keeps_a_user_directory_that_fills_up_again_and_goes_on() {
     let raced = std::cell::Cell::new(false);
     let remove = |parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr| {
         if name == "1000" && !raced.replace(true) {
-            std::fs::write(&racing, "new log").unwrap();
+            write_file(&racing, "new log", 0o644);
         }
         remove_dir(parent, name)
     };
@@ -1522,26 +1521,29 @@ fn purge_keeps_a_user_directory_that_fills_up_again_and_goes_on() {
 }
 
 #[test]
-fn purge_keeps_what_it_may_not_open_and_goes_on() {
+fn purge_keeps_what_it_may_not_remove_and_goes_on() {
     let sys = system();
     run_install(&sys, &opts()).unwrap();
     sys.write("/var/lib/gpueue/logs/1000/7.log", "log");
     sys.write("/var/lib/gpueue/logs/1001/8.log", "log");
-    let locked = sys.path(Path::new("/var/lib/gpueue/logs/1000"));
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
     let mut out = Vec::new();
     let dirs = PurgePlan::new(&sys).unwrap().dirs;
-    let result = purge(&sys, &dirs, &remove_dir, &mut out);
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-    result.unwrap();
+    // The kernel refuses to remove the directory of user 1000 (as for a directory that is not
+    // writable by us), which does not depend on who runs the tests, unlike a real mode 000.
+    let denying = |parent: &std::os::fd::OwnedFd, name: &std::ffi::OsStr| {
+        if name == "1000" {
+            Err(nix::errno::Errno::EACCES)
+        } else {
+            remove_dir(parent, name)
+        }
+    };
+    purge(&sys, &dirs, &denying, &mut out).unwrap();
     let out = String::from_utf8(out).unwrap();
-    // (Running the tests as root, which can open it, would not exercise this.)
-    if sys.exists("/var/lib/gpueue/logs/1000/7.log") {
-        assert!(
-            out.contains("kept /var/lib/gpueue/logs/1000 (not accessible"),
-            "{out}"
-        );
-    }
+    assert!(
+        out.contains("kept /var/lib/gpueue/logs/1000 (not accessible"),
+        "{out}"
+    );
+    assert!(sys.exists("/var/lib/gpueue/logs/1000"));
     assert!(!sys.exists("/var/lib/gpueue/logs/1001"));
     assert!(out.contains("removed /etc/gpueue\n"), "{out}");
 }
@@ -2316,7 +2318,7 @@ fn install_refuses_a_masked_or_overridden_package_even_with_force() {
         install_package(&sys);
         if masked {
             let local = sys.path(Path::new("/etc/systemd/system/gpueue.service"));
-            std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+            create_dirs(sys.root(), local.parent().unwrap());
             std::os::unix::fs::symlink("/dev/null", local).unwrap();
         } else {
             sys.write(
@@ -2342,7 +2344,7 @@ fn install_refuses_units_from_the_nix_store() {
     let sys = system();
     for unit in ["gpueue.service", "gpueue-helper.service"] {
         let local = sys.path(Path::new(UNIT_DIR).join(unit).as_path());
-        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        create_dirs(sys.root(), local.parent().unwrap());
         std::os::unix::fs::symlink(format!("/nix/store/abc-{unit}"), local).unwrap();
     }
     for force in [false, true] {
@@ -2407,7 +2409,7 @@ fn status_reports_the_install_method() {
 
 fn symlink(sys: &FakeSystem, target: &str, link: &str) {
     let local = sys.path(Path::new(link));
-    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    create_dirs(sys.root(), local.parent().unwrap());
     std::os::unix::fs::symlink(target, local).unwrap();
 }
 

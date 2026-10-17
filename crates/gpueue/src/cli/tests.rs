@@ -1,14 +1,22 @@
 use std::path::PathBuf;
 
 use chrono::{Local, TimeDelta, TimeZone};
-use clap::{CommandFactory, Parser, error::ErrorKind};
+use clap::{CommandFactory, FromArgMatches, Parser, error::ErrorKind};
 
 use super::*;
 
-fn parse(args: &[&str]) -> Cli {
+/// Parses `args` like the real parser, but without reading `GPUEUE_SOCKET` from the process
+/// environment, so the tests give the same results wherever they run.
+fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
     let mut argv = vec!["gpueue"];
     argv.extend_from_slice(args);
-    match Cli::try_parse_from(&argv) {
+    let command = Cli::command().mut_arg("socket", |arg| arg.env(None::<&str>));
+    let mut matches = command.try_get_matches_from(argv)?;
+    Cli::from_arg_matches_mut(&mut matches)
+}
+
+fn parse(args: &[&str]) -> Cli {
+    match try_parse(args) {
         Ok(cli) => cli,
         Err(err) => panic!("failed to parse {args:?}: {err}"),
     }
@@ -19,9 +27,7 @@ fn cmd(args: &[&str]) -> SubCommand {
 }
 
 fn parse_err(args: &[&str]) -> ErrorKind {
-    let mut argv = vec!["gpueue"];
-    argv.extend_from_slice(args);
-    match Cli::try_parse_from(&argv) {
+    match try_parse(args) {
         Ok(cli) => panic!("{args:?} unexpectedly parsed as {cli:?}"),
         Err(err) => err.kind(),
     }
@@ -65,10 +71,7 @@ fn global_options() {
 
 #[test]
 fn socket_default() {
-    // GPUEUE_SOCKET may be set in the environment running the tests; only check when it isn't.
-    if std::env::var_os("GPUEUE_SOCKET").is_none() {
-        assert_eq!(parse(&[]).socket, PathBuf::from(DEFAULT_SOCKET));
-    }
+    assert_eq!(parse(&[]).socket, PathBuf::from(DEFAULT_SOCKET));
 }
 
 #[test]

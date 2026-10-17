@@ -240,6 +240,21 @@ async fn route(
     }
 }
 
+/// A temporary directory with a short path: a socket path must fit `sun_path` (108 bytes),
+/// which a long `$TMPDIR` would exceed.
+fn socket_dir() -> tempfile::TempDir {
+    let base = std::env::temp_dir();
+    let base = if base.as_os_str().len() <= 40 {
+        base
+    } else {
+        PathBuf::from("/tmp")
+    };
+    tempfile::Builder::new()
+        .prefix("gq")
+        .tempdir_in(base)
+        .unwrap()
+}
+
 struct FakeDaemon {
     _dir: tempfile::TempDir,
     socket: PathBuf,
@@ -251,7 +266,7 @@ struct FakeDaemon {
 impl FakeDaemon {
     fn start(mode: Mode) -> Self {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let socket = dir.path().join("gpueue.sock");
         let log = Arc::new(Mutex::new(Vec::new()));
         let listener = {
@@ -495,7 +510,7 @@ fn wait_returns_when_the_job_finishes() {
 
 #[test]
 fn missing_daemon_gets_a_friendly_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = socket_dir();
     let output = gpueue(&dir.path().join("missing.sock"), &["status"]);
     assert_eq!(output.status.code(), Some(1));
     let text = stderr(&output);
