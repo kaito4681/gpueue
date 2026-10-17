@@ -7,7 +7,9 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use comfy_table::presets::{NOTHING, UTF8_HORIZONTAL_ONLY};
-use comfy_table::{Cell, CellAlignment, ContentArrangement, Row, Table};
+use comfy_table::{
+    Cell, CellAlignment, ContentArrangement, ContentLineStyle, LineStyle, Row, Table, TableStyle,
+};
 use gpueue_core::authz::REDACTED;
 use gpueue_core::model::{DEFAULT_GROUP, Group, JobId, JobResult, JobState};
 use gpueue_core::priority::PriorityType;
@@ -314,7 +316,7 @@ fn job_table(jobs: &[JobView], selected: &[Column], ctx: &RenderCtx) -> String {
     let columns = Columns::for_jobs(selected, jobs);
     let mut table = ctx.table();
     table
-        .load_preset(UTF8_HORIZONTAL_ONLY)
+        .load_style(UTF8_HORIZONTAL_ONLY)
         .set_header(columns.header())
         .add_rows(jobs.iter().map(|job| job_row(job, &columns, ctx)));
     table.to_string()
@@ -391,7 +393,7 @@ pub fn gpus(gpus: &[GpuView], ctx: &RenderCtx) -> String {
     }
     let mut table = ctx.table();
     table
-        .load_preset(UTF8_HORIZONTAL_ONLY)
+        .load_style(UTF8_HORIZONTAL_ONLY)
         .set_header(vec!["GPU", "Name", "Memory", "Slots", "Jobs"]);
     for gpu in gpus {
         let limit = if gpu.parallel == 0 {
@@ -484,7 +486,7 @@ pub fn priorities(response: &PriorityResponse, ctx: &RenderCtx) -> String {
         return format!("{headline}\nNo pending jobs.");
     }
     let mut table = ctx.table();
-    table.load_preset(UTF8_HORIZONTAL_ONLY);
+    table.load_style(UTF8_HORIZONTAL_ONLY);
     if basic {
         table.set_header(vec!["Id", "Owner", "Group", "Prio"]);
     } else {
@@ -549,7 +551,7 @@ pub fn shares(response: &SharesResponse, ctx: &RenderCtx) -> String {
         return format!("No users with jobs or usage.\n{footer}");
     }
     let mut table = ctx.table();
-    table.load_preset(UTF8_HORIZONTAL_ONLY).set_header(vec![
+    table.load_style(UTF8_HORIZONTAL_ONLY).set_header(vec![
         "User",
         "RawShares",
         "NormShares",
@@ -744,19 +746,26 @@ fn log_state_text(job: &JobView) -> (String, Color) {
     }
 }
 
+/// The box around the title of [`log_header`]: a frame without inner lines.
+const LOG_TITLE_STYLE: TableStyle = TableStyle::new()
+    .top_border(LineStyle::new('┌', '─', '─', '┐'))
+    .header_lines(ContentLineStyle::none().left('│').right('│'))
+    .header_separator(LineStyle::new('└', '─', '─', '┘'))
+    .content_lines(ContentLineStyle::none().left('│').right('│'));
+
 /// The box with the job id and state plus the details table shown above a
 /// job's log (pueue's `print_task_info`).
 pub fn log_header(job: &JobView, ctx: &RenderCtx) -> String {
     let (state, color) = log_state_text(job);
     let mut title = ctx.table();
-    title.load_preset("││─ └──┘     ─ ┌┐  ");
+    title.load_style(LOG_TITLE_STYLE);
     title.set_header(vec![
         ctx.style.cell(format!("Job {}: ", job.id), None, true),
         ctx.style.cell(&state, Some(color), false),
     ]);
 
     let mut info = ctx.table();
-    info.load_preset(NOTHING);
+    info.load_style(NOTHING);
     let mut add = |key: &str, value: String| {
         info.add_row(vec![ctx.style.cell(key, None, true), Cell::new(value)]);
     };
