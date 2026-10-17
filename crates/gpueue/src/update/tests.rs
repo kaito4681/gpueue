@@ -204,6 +204,28 @@ fn checksums_are_checked() {
 }
 
 #[test]
+fn checksums_match_known_sha256_values() {
+    // FIPS 180-2 test vectors, written out rather than computed with the sha2 crate that
+    // verify_sha256 uses, so that a wrong digest implementation cannot pass on its own.
+    let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    verify_sha256(b"abc", format!("{abc}  a.tar.gz\n").as_bytes(), "a.tar.gz").unwrap();
+    verify_sha256(b"", format!("{empty}  a.tar.gz\n").as_bytes(), "a.tar.gz").unwrap();
+    // sha256sum prints lowercase; uppercase hex is accepted too.
+    let upper = abc.to_ascii_uppercase();
+    verify_sha256(
+        b"abc",
+        format!("{upper}  a.tar.gz\n").as_bytes(),
+        "a.tar.gz",
+    )
+    .unwrap();
+    // The last digit changed.
+    let wrong = format!("{}c  a.tar.gz\n", &abc[..63]);
+    let err = verify_sha256(b"abc", wrong.as_bytes(), "a.tar.gz").unwrap_err();
+    assert!(err.contains("mismatch"), "{err}");
+}
+
+#[test]
 fn versions_parse_with_or_without_v() {
     assert_eq!(parse_version("v0.2.0").unwrap(), Version::new(0, 2, 0));
     assert_eq!(parse_version("0.2.0").unwrap(), Version::new(0, 2, 0));
