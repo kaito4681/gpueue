@@ -24,7 +24,7 @@
 #     becomes the "latest" release that install.sh and `gpueue update`
 #     follow), downloads its .deb files and index files and TAG's .deb files
 #     (checked against their .sha256 and their minisign signatures, with the
-#     public key of TAG's commit), runs `update` on them (which verifies the
+#     public key of the default branch, which TAG's commit must carry too), runs `update` on them (which verifies the
 #     existing packages), then uploads the new .deb files first, the index
 #     files after them (InRelease last), and only then deletes the .deb files
 #     that fell out of the index. Each upload is tried 3 times; when the index
@@ -402,14 +402,22 @@ cmd_github() {
     temp_dirs+=("$work")
     mkdir -p "$work/new" "$work/repo"
 
-    # The release's packages, checked like a user would check them, with the
-    # minisign key of the tag's commit (a re-run for an older tag may come
-    # from a newer default branch). Only the versioned gpueue_<version>_<arch>.deb
-    # files: the version-less copies gpueue_<arch>.deb (for
-    # releases/latest/download) are the same packages.
+    # The release's packages, checked like a user would check them. The
+    # minisign key is the default branch's, never one read from the tag alone
+    # (whoever can push a tag could otherwise ship their own key); the tag's
+    # packaging/minisign.pub must be the same key, which also refuses a tag
+    # made before a key rotation (re-run it after reviewing that). Only the
+    # versioned gpueue_<version>_<arch>.deb files: the version-less copies
+    # gpueue_<arch>.deb (for releases/latest/download) are the same packages.
     gh api -H "Accept: application/vnd.github.raw" \
-        "repos/$repo/contents/packaging/minisign.pub?ref=$tag" >"$work/minisign.pub" ||
+        "repos/$repo/contents/packaging/minisign.pub" >"$work/minisign.pub" ||
+        die "cannot read packaging/minisign.pub of the default branch"
+    gh api -H "Accept: application/vnd.github.raw" \
+        "repos/$repo/contents/packaging/minisign.pub?ref=$tag" >"$work/tag-minisign.pub" ||
         die "cannot read packaging/minisign.pub at $tag"
+    [ -n "$(sed -n 2p "$work/minisign.pub")" ] || die "the default branch's packaging/minisign.pub is empty"
+    [ "$(sed -n 2p "$work/minisign.pub")" = "$(sed -n 2p "$work/tag-minisign.pub")" ] ||
+        die "packaging/minisign.pub at $tag differs from the default branch's; refusing to publish"
     gh release download "$tag" -R "$repo" -D "$work/new" \
         -p 'gpueue_*_*.deb' -p 'gpueue_*_*.deb.sha256' -p 'gpueue_*_*.deb.minisig'
     local minisign="${MINISIGN:-}" deb new=()
