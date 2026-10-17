@@ -17,6 +17,10 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    # One pull request for all action updates, majors included: they are
+    # mostly runtime (Node.js) bumps of actions that work together, such as
+    # cache and cache/restore (which share the VM image cache) or
+    # upload-artifact and download-artifact.
     groups:
       actions:
-        update-types: [minor, patch]
+        patterns: ["*"]
