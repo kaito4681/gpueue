@@ -63,14 +63,6 @@ UMask=0077
 # them; it re-discovers them on start.
 # No mount sandboxing (ProtectSystem=, PrivateTmp=, ...): the helper
 # bind-mounts / for `criu restore --root` and must see the host's mounts.
-# Only what CRIU and cuda-checkpoint do not need is switched off: kernel
-# logs, changing the clock, and real-time scheduling for the processes it
-# runs. Not ProtectHostname= (a restored job would get a private copy of the
-# UTS namespace), nor ProtectKernelModules=, ProtectProc=, PrivateUsers= or a
-# SystemCallFilter= (CRIU uses far too many system calls).
-ProtectKernelLogs=yes
-ProtectClock=yes
-RestrictRealtime=yes
 
 [Install]
 WantedBy=multi-user.target

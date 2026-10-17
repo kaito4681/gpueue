@@ -1121,6 +1121,12 @@ The refusals name the way to update or remove gpueue that fits the install metho
 | Nix elsewhere | the Nix configuration that created the unit | the same |
 | `gpueue service install` | `sudo gpueue update` | `sudo gpueue uninstall` |
 
+The helper unit (`gpueue-helper.service`) is intentionally not sandboxed: it runs as root and has
+to see the host's mounts and devices, bind-mount `/` for `criu restore --root`, and start processes
+that CRIU and cuda-checkpoint operate on, and sandboxing directives (device allow-lists, seccomp
+filters) would also affect those processes. Its protection is that it is small, only reads
+root-owned configuration, and refuses what others could have replaced.
+
 The daemon runs with `ProtectSystem=strict`: it can only write below the unit's
 `ReadWritePaths=/var/lib/gpueue/daemon /var/lib/gpueue/logs /run/gpueue`. If you move `data_dir`,
 `state_db`, `logs_dir` or `api_socket` elsewhere in `config.toml`, add the new directories in a
