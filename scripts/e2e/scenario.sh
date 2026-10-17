@@ -3,7 +3,7 @@
 # scripts/e2e-test.sh). Users act through the real CLI with runuser:
 # alice (1000) and bob (1001) are regular users, carol (1002) is in
 # gpueue-admin; scenario 17 adds dave (1003), a user without usage, and
-# scenario 18 svcacct (990, a system account) and dockeruser (1004, primary
+# scenario 18 svcacct (a system account, uid allocated by useradd -r) and dockeruser (1004, primary
 # group docker).
 #
 # Usage: scenario.sh main | reboot-prepare | reboot-verify | lib
@@ -59,6 +59,20 @@ expect_state() {
     # shellcheck disable=SC2053
     [[ "$got" == $2 ]] || fail "job $1 is $got, expected $2"
 }
+# Jobs that must outlive a step of the test wait for a file instead of
+# sleeping for a fixed time: the test decides when they end.
+# hold_file <user> <tag>: a fresh path in <user>'s home that the job can see.
+hold_file() {
+    local f=/home/$1/.e2e-hold-$2
+    rm -f "$f"
+    echo "$f"
+}
+# hold_cmd <file> <command>: a job command that waits for `release <file>`,
+# then runs <command>.
+hold_cmd() { echo "while [ ! -e '$1' ]; do sleep 0.1; done; $2"; }
+release() { touch "$@"; }
+# unit_inactive <id>: the unit of job <id> is not running (any more).
+unit_inactive() { ! systemctl is-active --quiet "gpueue-job-$1.service"; }
 last_line() { tail -n1 "$LOGS/$1/$2.log"; }
 # The counter's log must be 0, 1, 2, ... without gaps or repeats.
 check_counter_log() {
@@ -266,7 +280,7 @@ s2_authz() {
 }
 
 s3_limits() {
-    local a b c ids=() i running max=0 out
+    local a b c ids=() i out
     ! pz alice group add lim -p 2 2>/dev/null || fail "a regular user can add groups"
     pz carol group add lim -p 2 || fail "group add"
     pz carol group add free -p 0 || fail "group add"
@@ -275,15 +289,31 @@ s3_limits() {
     pz carol gpu parallel 1 || fail "gpu parallel"
 
     # Group limit: 4 jobs, at most 2 at a time, started in order.
-    for i in 1 2 3 4; do ids+=("$(add alice -g lim -- 'sleep 1.5')"); done
-    local end=$((SECONDS + 40))
-    while [ "$(q carol "len([i for i in $(echo "[${ids[*]}]" | tr ' ' ,) if not st(i).startswith('done')])")" != 0 ]; do
-        running=$(q carol "len([i for i in $(echo "[${ids[*]}]" | tr ' ' ,) if st(i) == 'running'])")
-        if [ "$running" -gt "$max" ]; then max=$running; fi
-        [ "$SECONDS" -lt "$end" ] || fail "group jobs did not finish"
-        sleep 0.2
+    # The jobs run until released, so the number running at each step is
+    # exact, not a sample of a polling loop.
+    local holds=()
+    for i in 1 2 3 4; do
+        holds+=("$(hold_file alice "lim$i")")
+        ids+=("$(add alice -g lim -- "$(hold_cmd "${holds[$((i - 1))]}" true)")")
     done
-    [ "$max" = 2 ] || fail "group lim ran $max jobs at once (limit 2)"
+    local idlist
+    idlist=$(echo "[${ids[*]}]" | tr ' ' ,)
+    count_running() { q carol "len([i for i in $idlist if st(i) == 'running'])"; }
+    wait_state "${ids[0]}" running
+    wait_state "${ids[1]}" running
+    expect_state "${ids[2]}" queued
+    expect_state "${ids[3]}" queued
+    [ "$(count_running)" = 2 ] || fail "group lim runs $(count_running) jobs (limit 2)"
+    release "${holds[0]}"
+    wait_state "${ids[0]}" 'done/*'
+    wait_state "${ids[2]}" running
+    expect_state "${ids[3]}" queued
+    [ "$(count_running)" = 2 ] || fail "group lim runs $(count_running) jobs (limit 2)"
+    release "${holds[1]}"
+    wait_state "${ids[3]}" running
+    release "${holds[2]}" "${holds[3]}"
+    for i in "${ids[@]}"; do wait_state "$i" 'done/*' 30; done
+    rm -f "${holds[@]}"
     for i in 0 1 2; do
         [ "$(started_at "${ids[$i]}")" -le "$(started_at "${ids[$((i + 1))]}")" ] || fail "jobs started out of order"
     done
@@ -293,20 +323,25 @@ s3_limits() {
         || fail "the third job started before a slot was free"
 
     # GPU limit (1 job per GPU) in an unlimited group.
-    a=$(add alice -g free --gpu 0 -- 'echo CVD=$CUDA_VISIBLE_DEVICES; sleep 2')
+    local ha hc
+    ha=$(hold_file alice gpu-a)
+    hc=$(hold_file alice gpu-c)
+    a=$(add alice -g free --gpu 0 -- "$(hold_cmd "$ha" 'echo CVD=$CUDA_VISIBLE_DEVICES')")
     b=$(add bob -g free --gpu 0 -- 'echo CVD=$CUDA_VISIBLE_DEVICES; sleep 0.5')
-    c=$(add alice -g free --gpu 1 -- 'echo CVD=$CUDA_VISIBLE_DEVICES; sleep 1')
+    c=$(add alice -g free --gpu 1 -- "$(hold_cmd "$hc" 'echo CVD=$CUDA_VISIBLE_DEVICES')")
     wait_state "$a" running
     # GPU isolation (gpu_device_isolation = true, the default): every job
     # unit is DevicePolicy=closed.
     [ "$(systemctl show -p DevicePolicy --value "gpueue-job-$a.service")" = closed ] \
         || fail "job $a's unit is not DevicePolicy=closed"
     wait_state "$c" running
+    # Job a holds GPU 0 until released, so b has to wait for it.
     expect_state "$b" queued
+    release "$ha"
     wait_state "$b" 'done/*' 30
-    # Not just expect_state: launches are serialized, so on a loaded host
-    # job c may start late enough to still run when b is done.
+    release "$hc"
     for i in "$a" "$b" "$c"; do wait_state "$i" 'done/*' 30 && expect_state "$i" done/success; done
+    rm -f "$ha" "$hc"
     [ "$(started_at "$b")" -ge "$(finished_at "$a")" ] || fail "job $b shared GPU 0 with job $a"
     grep -qx 'CVD=0' "$LOGS/1000/$a.log" || fail "CUDA_VISIBLE_DEVICES of job $a"
     grep -qx 'CVD=0' "$LOGS/1001/$b.log" || fail "CUDA_VISIBLE_DEVICES of job $b"
@@ -314,16 +349,23 @@ s3_limits() {
 
     # Immediate launches: a regular user's job is only queued first among
     # their jobs and waits for the GPU slot; an administrator's ignores it.
-    a=$(add alice -g free --gpu 0 -- 'sleep 3')
+    ha=$(hold_file alice imm-a)
+    hc=$(hold_file carol imm-c)
+    a=$(add alice -g free --gpu 0 -- "$(hold_cmd "$ha" true)")
     wait_state "$a" running
     mkdir -p "$STATE"
     b=$(add bob -i -g free --gpu 0 -- 'sleep 0.5' 2>"$STATE/immediate-note")
     expect_state "$b" queued
     grep -q "was queued first among your jobs" "$STATE/immediate-note" \
         || fail "job $b's add -i does not say it was queued: $(cat "$STATE/immediate-note")"
-    c=$(add carol -i -g free --gpu 0 -- 'sleep 0.5')
-    expect_state "$c" '@(running|done/*)'
+    c=$(add carol -i -g free --gpu 0 -- "$(hold_cmd "$hc" true)")
+    # The administrator's job starts although job a holds the GPU slot, and
+    # job a is still running (held) when it does.
+    wait_state "$c" running
+    expect_state "$a" running
+    release "$ha" "$hc"
     for i in "$a" "$b" "$c"; do wait_state "$i" 'done/*' 30 && expect_state "$i" done/success; done
+    rm -f "$ha" "$hc"
     [ "$(started_at "$b")" -ge "$(finished_at "$a")" ] || fail "the immediate job $b shared GPU 0 with job $a"
     [ "$(started_at "$c")" -lt "$(finished_at "$a")" ] || fail "the administrator's immediate job $c waited"
 }
@@ -354,14 +396,17 @@ s4_checkpoint_restore() {
 
 # s5/s6: stop <unit>, let one job exit while it is down, start it again.
 restart_while_running() {
-    local unit=$1 a b
+    local unit=$1 a b ha hb
+    ha=$(hold_file alice restart-a)
+    hb=$(hold_file bob restart-b)
     # Leave $unit running whatever happens, or every later scenario fails
     # as well. Runs when the scenario's subshell exits (also via `fail`).
-    # shellcheck disable=SC2064 # $unit is expanded now, on purpose
-    trap "systemctl start $unit || true" EXIT
+    # shellcheck disable=SC2064 # $unit and the files are expanded now, on purpose
+    trap "systemctl start $unit || true; rm -f '$ha' '$hb'" EXIT
     free_group
-    a=$(add alice -g free -- 'sleep 3; exit 5')
-    b=$(add bob -g free -- 'sleep 9; echo finished')
+    # Both jobs end when the test releases them, not after a fixed time.
+    a=$(add alice -g free -- "$(hold_cmd "$ha" 'exit 5')")
+    b=$(add bob -g free -- "$(hold_cmd "$hb" 'echo finished')")
     # The daemon shows a job as running as soon as it asks the helper to
     # start it; wait for the units, so that the restart below finds both
     # jobs started rather than racing their spawns (scenario 10 restarts
@@ -371,21 +416,22 @@ restart_while_running() {
     wait_unit "$a"
     wait_unit "$b"
     systemctl restart "$unit"
-    wait_socket
-    sleep 1
+    wait_helper
     expect_state "$a" running
     expect_state "$b" running
     for id in "$a" "$b"; do
         systemctl is-active --quiet "gpueue-job-$id.service" || fail "job $id died with the restart of $unit"
     done
     systemctl stop "$unit"
-    sleep 4 # job a exits while $unit is down
+    release "$ha" # job a exits while $unit is down
+    wait_for 30 "job $a's unit to exit" unit_inactive "$a"
     systemctl is-active --quiet "gpueue-job-$b.service" || fail "job $b died with $unit"
     systemctl start "$unit"
-    wait_socket
-    wait_state "$a" done/failed/5 15
+    wait_helper
+    wait_state "$a" done/failed/5 30
     expect_state "$b" running
-    wait_state "$b" done/success 20
+    release "$hb"
+    wait_state "$b" done/success 30
     grep -qx finished "$LOGS/1001/$b.log" || fail "job $b's output is missing"
 }
 s5_daemon_restart() { restart_while_running gpueue.service; }
@@ -1318,17 +1364,18 @@ s23_nested_namespaces() {
 # the scheduler, so the helper gets concurrent spawns; then again while the
 # helper restarts. No job may fail to spawn or get lost.
 s10_burst() {
-    local ids=() i id u
+    local ids=() i id u k rc
     burst() { # burst <tag> <count> <command>: add jobs in parallel, ids in $STATE/burst-<tag>
         local tag=$1 n=$2 cmd=$3 k
         mkdir -p "$STATE"
         rm -f "$STATE"/burst-"$tag"-*
+        rm -f "$STATE"/burst-rc-"$tag"-*
         for k in $(seq "$n"); do
             if [ $((k % 2)) -eq 0 ]; then u=alice; else u=bob; fi
             if [ $((k % 3)) -eq 0 ]; then
-                add "$u" -g free -- "$cmd" >"$STATE/burst-$tag-$k" &
+                { add "$u" -g free -- "$cmd" >"$STATE/burst-$tag-$k"; echo $? >"$STATE/burst-rc-$tag-$k"; } &
             else
-                add "$u" -g free -i -- "$cmd" >"$STATE/burst-$tag-$k" &
+                { add "$u" -g free -i -- "$cmd" >"$STATE/burst-$tag-$k"; echo $? >"$STATE/burst-rc-$tag-$k"; } &
             fi
         done
         wait
@@ -1343,14 +1390,26 @@ s10_burst() {
 
     # Again, with a helper restart while the spawns are in flight. An
     # `add --immediate` that finds the helper away is refused (no job).
+    # The restart waits for the first add of the burst to have finished
+    # (some job exists, its spawn is in flight); the other adds run on while
+    # the helper goes away and comes back.
+    mkdir -p "$STATE"
+    rm -f "$STATE"/burst-b-* "$STATE"/burst-rc-b-*
     burst b 16 'echo ok; sleep 3' >/dev/null 2>&1 &
-    sleep 0.15
+    wait_for 30 "the first job of the burst" bash -c 'cat "$1"/burst-b-* 2>/dev/null | grep -q .' _ "$STATE"
     systemctl restart gpueue-helper.service
     wait
     mapfile -t ids < <(cat "$STATE"/burst-b-*)
     echo "${#ids[@]} of 16 jobs added around the helper restart"
-    [ "${#ids[@]}" -ge 8 ] || fail "only ${#ids[@]} of 16 jobs were added"
-    wait_socket
+    # Only an `add --immediate` may be refused (it needs the helper);
+    # every other add (k divisible by 3) must have produced a job.
+    for k in $(seq 16); do
+        rc=$(cat "$STATE/burst-rc-b-$k")
+        if [ "$rc" != 0 ] && [ $((k % 3)) -eq 0 ]; then fail "add $k (not immediate) failed with $rc"; fi
+        if [ "$rc" = 0 ] && ! grep -q . "$STATE/burst-b-$k"; then fail "add $k succeeded without an id"; fi
+        if [ "$rc" != 0 ] && grep -q . "$STATE/burst-b-$k"; then fail "add $k failed but printed an id"; fi
+    done
+    wait_helper
     for id in "${ids[@]}"; do wait_state "$id" 'done/*' 90; done
     for id in "${ids[@]}"; do expect_state "$id" done/success; done
     for id in "${ids[@]}"; do
@@ -1374,7 +1433,10 @@ s17_priority() {
     free_group
     # dave has never used the machine; bob uses GPU 0 for a while.
     getent passwd 1003 >/dev/null || useradd -m -u 1003 -s /bin/sh dave
-    run=$(add bob -g free --gpu 0 -- 'sleep 4')
+    local hrun hblock
+    hrun=$(hold_file bob prio-run)
+    hblock=$(hold_file alice prio-block)
+    run=$(add bob -g free --gpu 0 -- "$(hold_cmd "$hrun" true)")
     wait_state "$run" running
     bobs=$(add bob -g free --gpu 0 -- 'echo bob')
     sleep 0.3
@@ -1388,13 +1450,14 @@ s17_priority() {
     echo "$out"
     ! grep -q 'echo bob' <<<"$out" || fail "prio shows another user's command"
     [ "$(prio_ids dave)" = "$daves $bobs" ] || fail "dave's job is not first: $(prio_ids dave)"
+    release "$hrun"
     wait_state "$bobs" 'done/*' 60
     expect_state "$daves" done/success
     [ "$(started_at "$daves")" -le "$(started_at "$bobs")" ] \
         || fail "bob's older job started before the job of dave, who used less"
 
     # top: alice's newest job goes first among her own jobs.
-    blocker=$(add alice -g free --gpu 1 -- 'sleep 3')
+    blocker=$(add alice -g free --gpu 1 -- "$(hold_cmd "$hblock" true)")
     wait_state "$blocker" running
     x1=$(add alice -g free --gpu 1 -- 'true')
     x2=$(add alice -g free --gpu 1 -- 'true')
@@ -1407,21 +1470,27 @@ s17_priority() {
     [ "$(prio_ids alice)" = "$x3 $x2 $x1" ] || fail "order after top and nice: $(prio_ids alice)"
     pz carol share set bob 2 || fail "share set"
     pz carol group priority free 1 || fail "group priority"
+    release "$hblock"
     for id in "$x1" "$x2" "$x3"; do wait_state "$id" 'done/*' 60; done
     [ "$(started_at "$x3")" -le "$(started_at "$x2")" ] || fail "job $x3 did not start first"
     [ "$(started_at "$x2")" -le "$(started_at "$x1")" ] || fail "the niced job $x1 did not start last"
+    rm -f "$hrun" "$hblock"
 }
 
 s18_job_policy() {
-    local id log groups journal
+    local id log groups journal svc_uid min_uid
     # A system account (uid below UID_MIN of /etc/login.defs, or 1000).
-    getent passwd 990 >/dev/null || useradd -m -u 990 -s /bin/sh svcacct
+    # Its uid is allocated by useradd -r (below UID_MIN), not hardcoded.
+    getent passwd svcacct >/dev/null || useradd -r -m -s /bin/sh svcacct
+    svc_uid=$(id -u svcacct)
+    min_uid=$(awk '$1 == "UID_MIN" { print $2 }' /etc/login.defs 2>/dev/null)
+    [ "$svc_uid" -lt "${min_uid:-1000}" ] || fail "svcacct (uid $svc_uid) is not below job_min_uid"
     id=$(add svcacct -- 'echo should not run')
     wait_state "$id" done/failed_to_spawn
     # The log header (with the reason) goes to stderr.
     log=$(pz svcacct log "$id" 2>&1) || fail "log failed"
     echo "$log"
-    grep -q 'gpueue refuses to run jobs as svcacct: uid 990 is below job_min_uid' <<<"$log" \
+    grep -q "gpueue refuses to run jobs as svcacct: uid $svc_uid is below job_min_uid" <<<"$log" \
         || fail "the log does not show the refusal"
 
     # A denied supplementary group is left out (the helper's journal says so).
@@ -1473,9 +1542,9 @@ s.listen(16)
 while True:
     s.accept()[0].close()' "$sock" &
     E2E_LISTENERS="$E2E_LISTENERS $!"
-    wait_for 10 "the socket $sock" test -S "$sock"
-    runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' \
-        "$sock" || fail "eve cannot connect to $sock outside gpueue"
+    # Connecting also waits for listen(), which follows bind().
+    wait_for 10 "eve to connect to $sock outside gpueue" \
+        runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' "$sock"
 }
 # The default job_hidden_socket_dirs.
 E2E_SOCKET_DIRS="/run/libvirt /run/cups"
@@ -1575,9 +1644,8 @@ s.listen(16)
 while True:
     c, _ = s.accept()
     c.close()' "$E2E_DOCKER_SOCK" "$(getent group docker | cut -d: -f3)" &
-    wait_for 10 "the fake docker socket" test -S "$E2E_DOCKER_SOCK"
-    runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' \
-        "$E2E_DOCKER_SOCK" || fail "eve cannot connect to the docker socket outside gpueue"
+    wait_for 10 "eve to connect to the fake docker socket outside gpueue" \
+        runuser -u eve -- python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' "$E2E_DOCKER_SOCK"
     echo "control: eve can connect to the docker socket outside gpueue"
 
     # A block device of group disk.
@@ -1870,14 +1938,16 @@ signals_clear() {
         fail "job $1 has blocked or ignored signals"
 }
 # kill_runs_handler <id> <expected state>: `gpueue kill` runs the SIGTERM
-# handler of term_trap.py job <id> within 2 s, well before grace_secs.
+# handler of term_trap.py job <id>. A job whose handler cannot run is only
+# ended by SIGKILL after grace_secs, and never logs "got TERM": that is
+# checked once the job has ended, without a wall-clock bound.
 kill_runs_handler() {
     local id=$1 log=$LOGS/1000/$1.log
     wait_for 30 "job $id to install its handler" grep -qsx ready "$log"
     pz alice kill "$id" || fail "kill $id"
-    timeout 2 bash -c "until grep -qx 'got TERM' '$log'; do sleep 0.05; done" ||
-        fail "the SIGTERM handler of job $id did not run within 2 s of the kill"
-    wait_state "$id" "$2"
+    wait_state "$id" "$2" 60
+    grep -qx 'got TERM' "$log" ||
+        fail "the SIGTERM handler of job $id did not run (the job was killed after the grace period?)"
 }
 s27_job_signals() {
     local id

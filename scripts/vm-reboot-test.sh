@@ -150,13 +150,19 @@ version="$(workspace_version "$root")"
 dist_arch
 [ "$DIST_DEB_ARCH" = amd64 ] || { echo "the VM test runs x86_64 guests only" >&2; exit 1; }
 
-# The previous release, for the upgrade scenario: GPUEUE_VM_UPGRADE_FROM, or
-# the newest stable release older than the tree's version.
+# The previous release, for the upgrade scenario: GPUEUE_VM_UPGRADE_FROM
+# (pinned: it must verify, or the run fails), or the newest stable release
+# older than the tree's version whose package verifies with this tree's
+# packaging/minisign.pub (older releases may have been signed with another key;
+# each one skipped is reported, and the run fails when none verifies).
 old_version=
+candidates=()
 if [ -n "$need_upgrade" ]; then
     old_version="${GPUEUE_VM_UPGRADE_FROM:-}"
     old_version="${old_version#v}"
-    if [ -z "$old_version" ]; then
+    if [ -n "$old_version" ]; then
+        candidates=("$old_version")
+    else
         auth=()
         token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
         [ -z "$token" ] || auth=(-H "Authorization: Bearer $token")
@@ -177,12 +183,15 @@ def key(v):
     return [int(x) for x in main.split(".")], pre == "", pre
 found = [r["tag_name"][1:] for r in json.load(sys.stdin)
          if not r["draft"] and not r["prerelease"] and re.fullmatch(r"v\d+\.\d+\.\d+", r["tag_name"])]
-older = sorted((v for v in found if key(v) < key(tree)), key=key)
-print(older[-1] if older else "")
+older = sorted((v for v in found if key(v) < key(tree)), key=key, reverse=True)
+print("\n".join(older))
 ' "$version" <<<"$releases")"
-        [ -n "$old_version" ] || { echo "no release of $repo is older than $version (set GPUEUE_VM_UPGRADE_FROM)" >&2; exit 1; }
+        mapfile -t candidates <<<"$old_version"
+        [ -n "${candidates[0]}" ] || { echo "no release of $repo is older than $version (set GPUEUE_VM_UPGRADE_FROM)" >&2; exit 1; }
+        # Provisional (every candidate is older than the tree): the package
+        # versions below do not depend on which one is chosen.
+        old_version="${candidates[0]}"
     fi
-    echo "upgrade scenario: from the release v$old_version to the tree ($version)"
 fi
 
 # The tree's packages. When the upgrade starts from the tree's own version,
@@ -228,7 +237,8 @@ fetch_release_pkg() {
     dir="$stage/release-$fmt"
     mkdir -p "$dir"
     for f in "$name" "$name.sha256" "$name.minisig"; do
-        curl -fsSL --retry 3 -o "$dir/$f" "https://github.com/$repo/releases/download/$tag/$f"
+        curl -fsSL --retry 5 --retry-all-errors -o "$dir/$f" "https://github.com/$repo/releases/download/$tag/$f" ||
+            { echo "cannot download $f of $tag" >&2; return 1; }
     done
     sum="$(cat "$dir/$name.sha256")"
     if ! [[ "$sum" =~ ^([0-9a-f]{64})\ [\ *](.+)$ ]] || [ "${BASH_REMATCH[2]}" != "$name" ]; then
@@ -247,11 +257,31 @@ fetch_release_pkg() {
     cp "$dir/$name" "$stage/pkg/old.$fmt"
 }
 if [ -n "$need_upgrade" ]; then
+    upgrade_formats=()
     for spec in "${specs[@]}"; do
         [ "${spec#*/}" = upgrade ] || continue
         distro_info "${spec%%/*}"
-        [ -f "$stage/pkg/old.$DISTRO_PKG" ] || fetch_release_pkg "$DISTRO_PKG"
+        [[ " ${upgrade_formats[*]} " == *" $DISTRO_PKG "* ]] || upgrade_formats+=("$DISTRO_PKG")
     done
+    verified=
+    for cand in "${candidates[@]}"; do
+        old_version="$cand"
+        ok=1
+        for fmt in "${upgrade_formats[@]}"; do
+            fetch_release_pkg "$fmt" || { ok=; break; }
+        done
+        if [ -n "$ok" ]; then
+            verified=1
+            break
+        fi
+        rm -f "$stage"/pkg/old.*
+        echo "release v$cand is not usable as the upgrade base (see above)" >&2
+    done
+    [ -n "$verified" ] || {
+        echo "no release to upgrade from verifies with packaging/minisign.pub (tried: ${candidates[*]}); set GPUEUE_VM_UPGRADE_FROM to a release that does" >&2
+        exit 1
+    }
+    echo "upgrade scenario: from the release v$old_version to the tree ($version)"
 fi
 
 # --- the runner ------------------------------------------------------------------

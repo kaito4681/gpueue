@@ -24,8 +24,13 @@ VM_IMAGE_VERSION=2
 distro_info() {
     local ubuntu_apt debian_apt
     # Plain HTTP (port 80) may be blocked; the images have CA certificates.
+    # apt retries transient mirror failures.
     ubuntu_apt='apt:
   preserve_sources_list: false
+  conf: |
+    Acquire::Retries "5";
+    Acquire::http::Timeout "30";
+    Acquire::https::Timeout "30";
   primary:
     - arches: [default]
       uri: https://archive.ubuntu.com/ubuntu
@@ -36,6 +41,10 @@ package_update: true
 package_upgrade: false'
     debian_apt='apt:
   preserve_sources_list: false
+  conf: |
+    Acquire::Retries "5";
+    Acquire::http::Timeout "30";
+    Acquire::https::Timeout "30";
   primary:
     - arches: [default]
       uri: https://deb.debian.org/debian

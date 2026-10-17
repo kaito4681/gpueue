@@ -66,11 +66,16 @@ docker run -d "${gpu_args[@]}" --name "$name" --privileged --cgroupns=private \
     "$image" >/dev/null
 
 # Wait for systemd to come up.
-for _ in $(seq 50); do
+for _ in $(seq 150); do
     state="$(docker exec "$name" systemctl is-system-running 2>/dev/null || true)"
     case "$state" in running | degraded) break ;; esac
     sleep 0.2
 done
+case "${state:-}" in running | degraded) ;; *)
+    echo "systemd in $name did not come up (state: ${state:-unknown})" >&2
+    exit 1
+    ;;
+esac
 echo "container systemd: ${state:-unknown}"
 
 status=0

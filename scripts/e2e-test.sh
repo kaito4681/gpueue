@@ -117,6 +117,7 @@ if [ "${GPUEUE_E2E_SKIP_BUILD:-}" != 1 ]; then
 fi
 docker build -q -t "$image" \
     --build-arg "BASE=${GPUEUE_SYSTEMD_BASE:-ubuntu:26.04}" \
+    --build-arg "REQUIRE_SSHFS=${GPUEUE_E2E_REQUIRE_SSHFS:-}" \
     "$root/scripts/helper-systemd" >/dev/null
 
 stage="$(mktemp -d)"
@@ -145,11 +146,16 @@ boot() {
         -v "$stage":/e2e:ro -v "$volume":/var/lib/gpueue -v "$disk":/var/lib/gpueue-e2e-disk \
         "$image" >/dev/null
     local state=
-    for _ in $(seq 100); do
+    for _ in $(seq 150); do
         state="$(docker exec "$1" systemctl is-system-running 2>/dev/null || true)"
         case "$state" in running | degraded) break ;; esac
         sleep 0.2
     done
+    case "${state:-}" in running | degraded) ;; *)
+        echo "systemd in $1 did not come up (state: ${state:-unknown})" >&2
+        exit 1
+        ;;
+    esac
     echo "$1: systemd ${state:-unknown}"
     if mounts_selected; then
         docker exec "$1" bash /e2e/mounts.sh setup

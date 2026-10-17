@@ -8,6 +8,7 @@
 FROM ubuntu:26.04
 COPY ca.crt /tmp/host-ca.crt
 RUN set -e; \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' >/etc/apt/apt.conf.d/80-gpueue-retries; \
     sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|; s|http://security.ubuntu.com|https://security.ubuntu.com|' \
         /etc/apt/sources.list.d/ubuntu.sources; \
     apt-get -o Acquire::https::CAInfo=/tmp/host-ca.crt update; \

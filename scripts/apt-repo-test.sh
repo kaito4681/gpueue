@@ -67,13 +67,14 @@ cleanup() {
 trap cleanup EXIT
 
 mounts=()
-setup=""
+# Retry transient mirror failures (every apt-get of the containers).
+setup='printf "Acquire::Retries \"5\";\nAcquire::http::Timeout \"30\";\nAcquire::https::Timeout \"30\";\n" >/etc/apt/apt.conf.d/80-gpueue-retries'
 if [ "${GPUEUE_DEB_HTTPS:-}" = 1 ]; then
     ca=/etc/ssl/certs/ca-certificates.crt
     [ -f "$ca" ] || { echo "GPUEUE_DEB_HTTPS=1 needs $ca" >&2; exit 1; }
     mounts+=(-v "$ca:/usr/local/share/host-ca.crt:ro")
     # Only the distribution's sources: the test repository is plain HTTP.
-    setup='sed -i "s|http://|https://|g" /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+    setup+=$'\n''sed -i "s|http://|https://|g" /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 echo "Acquire::https::CaInfo \"/usr/local/share/host-ca.crt\";" >/etc/apt/apt.conf.d/99host-ca'
 fi
 
@@ -87,7 +88,9 @@ docker run -d --name "$server" --network "$net" --network-alias repo "${mounts[@
 docker exec -i "$server" bash -euo pipefail <<EOF
 $setup
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q >/dev/null
+# apt-get update exits 0 even when an index failed to download: fail on E:/Err:.
+apt-get update -q >/tmp/update.out 2>&1 || { cat /tmp/update.out >&2; exit 1; }
+if grep -E '^(E|Err):' /tmp/update.out >&2; then echo "apt-get update failed" >&2; exit 1; fi
 apt-get install -y -q --no-install-recommends apt-utils gnupg python3 curl >/dev/null
 EOF
 
@@ -391,6 +394,8 @@ echo "apt-repo.sh github: ok"
 mkdir serve && cp state/* serve/
 EOF
 docker exec -d "$server" sh -c 'cd /w/serve && exec python3 -m http.server 8000 >/w/http.log 2>&1'
+docker exec "$server" curl -sf --retry 30 --retry-delay 1 --retry-connrefused -o /dev/null http://127.0.0.1:8000/gpueue.sources ||
+    { echo "the test repository's HTTP server did not come up" >&2; docker exec "$server" cat /w/http.log >&2 || true; exit 1; }
 
 publish_v2() {
     docker exec -i "$server" bash -euo pipefail <<'EOF'
@@ -412,7 +417,8 @@ for base in "${bases[@]}"; do
     docker exec -i "$client" bash -euo pipefail <<EOF
 $setup
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q >/dev/null
+apt-get update -q >/tmp/update.out 2>&1 || { cat /tmp/update.out >&2; exit 1; }
+if grep -E '^(E|Err):' /tmp/update.out >&2; then echo "apt-get update failed" >&2; exit 1; fi
 EOF
     docker exec -i "$client" bash -euo pipefail <<'EOF'
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -426,7 +432,9 @@ status() { dpkg-query -W -f='${Status} ${Version}' gpueue 2>/dev/null || true; }
 in_madison() { local out; out="$(apt-cache madison gpueue)"; grep -q "$1" <<<"$out"; }
 clean_update() {
     apt-get update -q 2>&1 | tee /tmp/update.out
-    if grep -E '^(W|E|Err):' /tmp/update.out; then fail "apt-get update reported a problem"; fi
+    # Only the test repository is judged: warnings about the distribution's
+    # mirrors say nothing about it (the mirrors were checked before).
+    if grep -E '^(W|E|Err):.*repo:8000' /tmp/update.out; then fail "apt-get update reported a problem with the test repository"; fi
     grep -q 'http://repo:8000 ./ InRelease' /tmp/update.out || fail "InRelease was not fetched"
 }
 sources=/etc/apt/sources.list.d/gpueue.sources
@@ -469,7 +477,9 @@ status() { dpkg-query -W -f='${Status} ${Version}' gpueue 2>/dev/null || true; }
 in_madison() { local out; out="$(apt-cache madison gpueue)"; grep -q "$1" <<<"$out"; }
 clean_update() {
     apt-get update -q 2>&1 | tee /tmp/update.out
-    if grep -E '^(W|E|Err):' /tmp/update.out; then fail "apt-get update reported a problem"; fi
+    # Only the test repository is judged: warnings about the distribution's
+    # mirrors say nothing about it (the mirrors were checked before).
+    if grep -E '^(W|E|Err):.*repo:8000' /tmp/update.out; then fail "apt-get update reported a problem with the test repository"; fi
     grep -q 'http://repo:8000 ./ InRelease' /tmp/update.out || fail "InRelease was not fetched"
 }
 no_conffile_prompt() {

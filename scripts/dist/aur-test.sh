@@ -123,10 +123,15 @@ docker run -d --name "$container" --privileged --cgroupns=private \
     -v "$stage":/stage \
     "$image" /usr/lib/systemd/systemd >/dev/null
 state=
-for _ in $(seq 100); do
+for _ in $(seq 150); do
     state="$(docker exec "$container" systemctl is-system-running 2>/dev/null || true)"
     case "$state" in running | degraded) break ;; esac
     sleep 0.2
 done
+case "${state:-}" in running | degraded) ;; *)
+    echo "systemd in $container did not come up (state: ${state:-unknown})" >&2
+    exit 1
+    ;;
+esac
 echo "aur-test: systemd ${state:-unknown}"
 docker exec "$container" bash /stage/aur-scenario.sh
