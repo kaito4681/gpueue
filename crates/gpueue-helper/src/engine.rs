@@ -1834,10 +1834,83 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
             })?
             .unwrap_or_default();
         let private = &self.cfg.mounts.tmpfs;
+        let refuse = |what: String| {
+            Err(error(
+                HelperErrorCode::PermissionDenied,
+                format!("the checkpointed job has {what}; it cannot be restored"),
+            ))
+        };
+        if paths.notify_fds > 0 {
+            return refuse(format!(
+                "{} inotify or fanotify descriptors, whose watches CRIU would re-add as root, \
+                 by paths",
+                paths.notify_fds
+            ));
+        }
+        if !paths.abstract_listeners.is_empty() {
+            return refuse(format!(
+                "Unix sockets listening on the abstract names {:?}, which CRIU would set up \
+                 as root",
+                paths.abstract_listeners
+            ));
+        }
+        match crate::images::read_in_flight_fds(&dir.images_dir()) {
+            Ok(false) => {}
+            Ok(true) => {
+                return refuse(
+                    "descriptors in flight in Unix socket messages (SCM_RIGHTS), which CRIU \
+                     would re-open as root"
+                        .into(),
+                );
+            }
+            Err(e) => {
+                return Err(error(
+                    HelperErrorCode::InvalidRequest,
+                    format!("reading the checkpoint's images: {e}"),
+                ));
+            }
+        }
+        // CRIU binds internet sockets as root with SO_REUSEPORT: none may
+        // share its port with a socket on the host (a root service's, say).
+        // The restore hook checks again once they are bound.
+        if !paths.inet_ports.is_empty() {
+            let unknown: Vec<String> = paths
+                .inet_ports
+                .iter()
+                .filter(|p| crate::host::inet_proto_name(p.proto).is_none())
+                .map(ToString::to_string)
+                .collect();
+            if !unknown.is_empty() {
+                return refuse(format!(
+                    "internet sockets bound to {}, which gpueue cannot check",
+                    unknown.join(", ")
+                ));
+            }
+            let in_use = self.host.inet_ports_in_use().map_err(|e| {
+                error(
+                    HelperErrorCode::Internal,
+                    format!("reading the host's internet sockets: {e}"),
+                )
+            })?;
+            let taken: Vec<String> = paths
+                .inet_ports
+                .iter()
+                .filter(|p| in_use.contains(p))
+                .map(ToString::to_string)
+                .collect();
+            if !taken.is_empty() {
+                return refuse(format!(
+                    "internet sockets bound to {}, which another socket on this host is bound \
+                     to as well; CRIU would bind them as root with SO_REUSEPORT, sharing the \
+                     port (restore it once the port is free)",
+                    taken.join(", ")
+                ));
+            }
+        }
         let sockets: Vec<&String> = paths
             .unix_sockets
             .iter()
-            .filter(|p| !crate::host::is_private_path(p, private))
+            .filter(|p| crate::host::is_host_socket_name(p, private))
             .collect();
         if !sockets.is_empty() {
             return Err(error(
@@ -2585,6 +2658,22 @@ pub fn precheck_dump<H: HostProbe + ?Sized>(
              its connections, so such a job cannot be checkpointed (do not set SO_REUSEPORT, \
              or run the job with --no-checkpoint)",
             hazards.reuseport_sockets.join(", ")
+        ));
+    }
+    if !hazards.notify_fds.is_empty() {
+        return Err(format!(
+            "the job has inotify or fanotify descriptors ({}); CRIU would re-add their watches \
+             as root, by paths, so such a job cannot be checkpointed (close them before the \
+             checkpoint, or run the job with --no-checkpoint)",
+            hazards.notify_fds.join(", ")
+        ));
+    }
+    if !hazards.abstract_listeners.is_empty() {
+        return Err(format!(
+            "the job has Unix sockets listening on the abstract names {:?}; CRIU would set them \
+             up as root, so their clients would be told that root listens there, and such a \
+             job cannot be checkpointed (listen on a path below /tmp instead)",
+            hazards.abstract_listeners
         ));
     }
     // Deleted files are saved in the image (see `dump_job`), and so are the
