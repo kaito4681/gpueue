@@ -485,8 +485,7 @@ fn init(files: &JobFiles, start: &mut Option<File>) -> Result<i32, Failure> {
 pub fn mounts_to_prune(mountinfo: &str, plan: &MountPlan) -> Vec<String> {
     mountinfo
         .lines()
-        .filter_map(|l| l.split_whitespace().nth(4))
-        .map(unescape_octal)
+        .filter_map(crate::mounts::mount_point_field)
         .filter(|m| plan.prunes(m))
         .collect()
 }
@@ -515,18 +514,22 @@ fn read_mount_tree() -> Result<MountTree, String> {
 /// [`mountfd`]): `C`'s mount point is reached once, through root-owned
 /// directories only, and each mount is checked by its id before it is
 /// detached. A covering mount below a directory that someone else can
-/// change is left alone (the job then cannot be checkpointed).
+/// change is left alone (the job then cannot be checkpointed), and the
+/// mounts hidden under other covering mounts are still removed.
 fn remove_hidden_mounts() -> Result<(), String> {
     use rustix::mount::{MoveMountFlags, OpenTreeFlags, move_mount, open_tree};
 
     let not_restorable = |what: &str, e: String| {
         eprintln!("gpueue shim: cannot remove {what}: {e}; the job will not be restorable");
     };
+    // Covering mounts that cannot be set aside: the mounts they hide stay,
+    // and the others are still removed.
+    let mut skipped: Vec<u64> = Vec::new();
     for _ in 0..16 {
         let tree = read_mount_tree()?;
         let hidden = tree.hidden();
-        let Some(first) = hidden.first() else {
-            return Ok(());
+        let Some(first) = hidden.iter().find(|h| !skipped.contains(&h.covered_by)) else {
+            break;
         };
         let cover = first.covered_by_path.clone();
         if cover == "/" {
@@ -535,7 +538,8 @@ fn remove_hidden_mounts() -> Result<(), String> {
                  the job will not be restorable",
                 first.mount_point
             );
-            return Ok(());
+            skipped.push(first.covered_by);
+            continue;
         }
         let ids: Vec<u64> = hidden
             .iter()
@@ -547,7 +551,8 @@ fn remove_hidden_mounts() -> Result<(), String> {
             Ok(v) => v,
             Err(e) => {
                 not_restorable(&what, e);
-                return Ok(());
+                skipped.push(first.covered_by);
+                continue;
             }
         };
         let cover_root = match mountfd::open_at(&parent, &name).and_then(|fd| {
@@ -564,7 +569,8 @@ fn remove_hidden_mounts() -> Result<(), String> {
             Ok(fd) => fd,
             Err(e) => {
                 not_restorable(&what, e);
-                return Ok(());
+                skipped.push(first.covered_by);
+                continue;
             }
         };
         let copy = match open_tree(
@@ -579,11 +585,15 @@ fn remove_hidden_mounts() -> Result<(), String> {
             Err(e) => {
                 // Old kernel (< 5.2): keep going, the dump will refuse.
                 not_restorable(&what, format!("copying {cover}: {e}"));
-                return Ok(());
+                skipped.push(first.covered_by);
+                continue;
             }
         };
-        mountfd::detach(&cover_root)
-            .map_err(|e| format!("detaching {cover} to uncover hidden mounts: {e}"))?;
+        if let Err(e) = mountfd::detach(&cover_root) {
+            not_restorable(&what, format!("detaching {cover}: {e}"));
+            skipped.push(first.covered_by);
+            continue;
+        }
         drop(cover_root);
         // Unmount what is reachable now; anything still covered (several
         // layers) is handled in the next round. Each by descriptor, after
@@ -612,7 +622,12 @@ fn remove_hidden_mounts() -> Result<(), String> {
         .map_err(|e| format!("re-attaching {cover}: {e}"))?;
         res?;
     }
-    let left = read_mount_tree()?.hidden();
+    // Those under a skipped covering mount were reported already.
+    let left: Vec<_> = read_mount_tree()?
+        .hidden()
+        .into_iter()
+        .filter(|h| !skipped.contains(&h.covered_by))
+        .collect();
     if !left.is_empty() {
         eprintln!("gpueue shim: hidden mounts left: {left:?}; the job will not be restorable");
     }

@@ -111,7 +111,9 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    AppImage's FUSE mount, which would otherwise stay hidden in the namespace). A mount it cannot
    reach that way, because it lies below a directory someone other than root can change (a
    user's FUSE mount in `/tmp/<their dir>/` when `/tmp` is a plain directory), is removed after
-   the private tmpfs is mounted, by setting that aside as for other hidden mounts. Unless
+   the private tmpfs is mounted, by setting that aside as for other hidden mounts. A hidden mount
+   whose covering mount it cannot set aside that way stays (the job then cannot be checkpointed);
+   the other hidden mounts are still removed. Unless
    `job_system_dbus = true`, it hides `/run/dbus` behind an empty tmpfs and, unless
    `job_systemd_varlink = true`, hides `/run/systemd` behind a tmpfs that holds only journald's log
    sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/`, so the job cannot
@@ -238,7 +240,11 @@ path. After the dump the owner can change what such a path leads to, for example
 directory of theirs with a symlink to `/etc`; without precautions the restored job would then
 hold a root file opened with the dump-time mode. The helper therefore:
 
-- **at the dump** refuses a job with Unix sockets bound on the host's filesystems (CRIU binds,
+- **at the dump** refuses a job whose namespace has a mount whose root or mount point is not
+  UTF-8 or contains a control character (the kernel escapes only space, tab, newline and
+  backslash in mountinfo, and CRIU 4.2 splits its fields at any ASCII whitespace and unescapes
+  only space, tab and backslash, so it would dump such a mount at another path), refuses a job
+  with Unix sockets bound on the host's filesystems (CRIU binds,
   unlinks and chowns those paths as root on restore; sockets below the job's own `/tmp` are
   fine, and a socket bound to a relative name counts as bound on the host, since `/proc` does
   not tell in which directory). The kernel keeps a socket's name as the job gave it to
@@ -286,8 +292,15 @@ hold a root file opened with the dump-time mode. The helper therefore:
   protects the last component), and the restore hook checks only the files the tasks hold, not
   their mounts. So every directory on the way to such a source must be one that no job's owner
   can change (owned by root or by a system account below `job_min_uid` other than the daemon's
-  user, not group- or world-writable unless sticky, not on a FUSE filesystem), walked without
-  following symlinks; no job's owner can then redirect it before CRIU binds it. No job runs as
+  user, not group- or world-writable unless sticky, not on a FUSE or network filesystem, whose
+  server or another client decides what a lookup there returns), walked without following
+  symlinks, and the source itself must not be a symlink (CRIU follows it) nor, in a sticky
+  directory such as `/tmp`, an entry of anyone else (who may rename it there) or missing (anyone
+  may create it there); no job's owner can then redirect it before CRIU binds it. This assumes
+  that no job's owner can act as a system account below `job_min_uid` other than through gpueue
+  (which never runs a job as one): an owner who can run code as such an account by other means
+  (a `sudo` rule, a service they control) could change its directories, so keep `job_min_uid`
+  above every account that users can act as. No job runs as
   such a system account, so its directories are as safe as root's: systemd-resolved's
   `/run/systemd/resolve` (owned by `systemd-resolve`), from which the shim binds resolved's
   socket and `resolv.conf` files into every job, passes. (gpueue 0.1.2 accepted only root's

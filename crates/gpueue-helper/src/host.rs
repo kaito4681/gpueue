@@ -72,7 +72,9 @@ pub trait HostProbe: Send + Sync + 'static {
     /// Which of `host_pids` use CUDA: every process that answers
     /// `cuda-checkpoint --get-state` (the job must not be stopped).
     fn cuda_pids(&self, host_pids: &[u32]) -> io::Result<Vec<u32>>;
-    /// Mount points in the mount namespace of `pid`.
+    /// Mount points in the mount namespace of `pid`; an `InvalidData`
+    /// error if CRIU could not parse one (see
+    /// [`crate::mounts::checked_mount_points`]).
     fn mount_points(&self, pid: u32) -> io::Result<Vec<String>>;
     /// Mounts of the namespace of `pid` that CRIU could only restore from a
     /// path that is hidden in the helper's own namespace (see
@@ -1407,12 +1409,9 @@ impl HostProbe for SystemHost {
     }
 
     fn mount_points(&self, pid: u32) -> io::Result<Vec<String>> {
-        let mi = fs::read_to_string(self.proc_root.join(pid.to_string()).join("mountinfo"))?;
-        Ok(mi
-            .lines()
-            .filter_map(|l| l.split_whitespace().nth(4))
-            .map(crate::mounts::unescape_octal)
-            .collect())
+        let mi = fs::read(self.proc_root.join(pid.to_string()).join("mountinfo"))?;
+        crate::mounts::checked_mount_points(&mi)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     fn unreachable_mounts(&self, pid: u32) -> io::Result<Vec<String>> {
@@ -1802,8 +1801,8 @@ pub fn is_mount_point(mountinfo: &str, path: &Path) -> bool {
     let want = path.to_string_lossy();
     mountinfo
         .lines()
-        .filter_map(|l| l.split_whitespace().nth(4))
-        .any(|mp| crate::mounts::unescape_octal(mp) == want)
+        .filter_map(crate::mounts::mount_point_field)
+        .any(|mp| mp == want)
 }
 
 /// Parse the two `nvidia-smi --format=csv,noheader,nounits` queries (memory
@@ -2052,72 +2051,96 @@ mod tests {
         assert_eq!(printable(&"x".repeat(100)).len(), 64);
     }
 
-    /// Our own process: a deleted file it holds and a socket it bound.
+    /// A process of its own (see `FixtureChild`): two deleted files that
+    /// had the same path, a socket it bound, and an internet socket with
+    /// `SO_REUSEPORT` (and one without).
     #[test]
     fn finds_dump_hazards() {
+        use crate::testing::{FixtureChild, fixture_dir, fixture_ready};
+        use rustix::net::{AddressFamily, SocketType, sockopt};
+        if let Some(dir) = fixture_dir() {
+            let f = dir.join("gone");
+            let _held = fs::File::create(&f).unwrap();
+            fs::remove_file(&f).unwrap();
+            fs::write(&f, b"0123456789").unwrap();
+            let _held2 = fs::File::open(&f).unwrap();
+            fs::remove_file(&f).unwrap();
+            let _l = std::os::unix::net::UnixListener::bind(dir.join("sock")).unwrap();
+            let plain = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let reuse = rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
+            sockopt::set_socket_reuseport(&reuse, true).unwrap();
+            rustix::net::bind(&reuse, &std::net::SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+            rustix::net::listen(&reuse, 1).unwrap();
+            let reuse_addr =
+                std::net::SocketAddr::try_from(rustix::net::getsockname(&reuse).unwrap()).unwrap();
+            fixture_ready(&format!("{} {reuse_addr}", plain.local_addr().unwrap()));
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
-        let f = tmp.path().join("gone");
-        let held = fs::File::create(&f).unwrap();
-        fs::remove_file(&f).unwrap();
-        let sock = tmp.path().join("sock");
-        let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let host = SystemHost::new("nvidia-smi".into(), Default::default(), "x".into());
+        let fixture = FixtureChild::spawn("host::tests::finds_dump_hazards", tmp.path());
+        let (_plain, reuse_addr) = fixture.payload.split_once(' ').unwrap();
+        let pid = fixture.pid();
         let proc_root = Path::new("/proc");
-        let me = std::process::id();
-        let h = scan_dump_hazards(proc_root, &[me], &["/tmp-private".into()]).unwrap();
+        let f = tmp.path().join("gone");
         let f = f.to_str().unwrap();
-        let found = h.deleted_files.iter().find(|d| d.path == f);
-        let found = found.unwrap_or_else(|| panic!("{h:?}"));
-        assert_eq!(found.uid, nix::unistd::geteuid().as_raw(), "{h:?}");
-        assert_eq!((found.nlink, found.private), (0, false), "{h:?}");
-        // Only this file (other tests of this process may hold others).
-        let only_deleted = DumpHazards {
-            deleted_files: vec![found.clone()],
-            ..Default::default()
-        };
-        assert_eq!(only_deleted.refusal(), None, "{h:?}");
-        // Another deleted file that had the same path is another file.
-        fs::write(f, b"0123456789").unwrap();
-        let held2 = fs::File::open(f).unwrap();
-        fs::remove_file(f).unwrap();
-        let h2 = scan_dump_hazards(proc_root, &[me], &["/tmp-private".into()]).unwrap();
-        let mut sizes: Vec<u64> = h2
+        let sock = tmp.path().join("sock").to_str().unwrap().to_owned();
+
+        let h = scan_dump_hazards(proc_root, &[pid], &["/tmp-private".into()]).unwrap();
+        // Both files: another deleted file that had the same path is
+        // another file. Nothing else of the fixture is deleted.
+        let mut deleted: Vec<(&str, u64, u32, u64, bool, bool)> = h
             .deleted_files
             .iter()
-            .filter(|d| d.path == f)
-            .map(|d| d.size)
+            .map(|d| {
+                (
+                    d.path.as_str(),
+                    d.size,
+                    d.uid,
+                    d.nlink,
+                    d.private,
+                    d.file_caps,
+                )
+            })
             .collect();
-        sizes.sort_unstable();
-        assert_eq!(sizes, [0, 10], "{h2:?}");
-        drop(held2);
-        assert!(
-            h.bound_sockets.contains(&sock.to_str().unwrap().to_owned()),
+        deleted.sort_unstable();
+        let me = nix::unistd::geteuid().as_raw();
+        assert_eq!(
+            deleted,
+            [(f, 0, me, 0, false, false), (f, 10, me, 0, false, false)],
             "{h:?}"
         );
-        let tmp_root = tmp.path().parent().unwrap().to_str().unwrap().to_owned();
-        let h = scan_dump_hazards(proc_root, &[me], &[tmp_root]).unwrap();
-        let found = h.deleted_files.iter().find(|d| d.path == f);
-        assert!(found.is_some_and(|d| d.private), "{h:?}");
+        assert!(
+            h.deleted_files
+                .iter()
+                .all(|d| d.mode & 0o170000 == 0o100000 && !d.grants_privileges()),
+            "{h:?}"
+        );
+        assert_eq!(h.bound_sockets, [sock], "{h:?}");
+        // pidfd_getfd needs ptrace access to the fixture, which a sandbox
+        // may deny; then nothing is found.
+        assert!(
+            h.reuseport_sockets.is_empty() || h.reuseport_sockets == [reuse_addr.to_owned()],
+            "{h:?}"
+        );
+        assert!(h.notify_fds.is_empty(), "{h:?}");
+        assert!(h.abstract_listeners.is_empty(), "{h:?}");
+        assert!(h.silly_renamed.is_empty(), "{h:?}");
+        // Without the sockets, the deleted files alone are fine.
+        let deleted_only = DumpHazards {
+            deleted_files: h.deleted_files.clone(),
+            ..Default::default()
+        };
+        assert_eq!(deleted_only.refusal(), None, "{h:?}");
+
+        // In a private tmpfs, the files and the socket are the job's own.
+        let private = vec![tmp.path().to_str().unwrap().to_owned()];
+        let h = scan_dump_hazards(proc_root, &[pid], &private).unwrap();
+        assert_eq!(h.deleted_files.len(), 2, "{h:?}");
+        assert!(h.deleted_files.iter().all(|d| d.private), "{h:?}");
         assert!(h.bound_sockets.is_empty(), "{h:?}");
-        drop(held);
-        let groups = host.process_groups(&[std::process::id()]).unwrap().unwrap();
-        // An internet socket with SO_REUSEPORT (and one without).
-        use rustix::net::{AddressFamily, SocketType, sockopt};
-        let plain = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let reuse = rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
-        sockopt::set_socket_reuseport(&reuse, true).unwrap();
-        rustix::net::bind(&reuse, &std::net::SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        rustix::net::listen(&reuse, 1).unwrap();
-        let port = std::net::SocketAddr::try_from(rustix::net::getsockname(&reuse).unwrap())
-            .unwrap()
-            .port();
-        let h = scan_dump_hazards(proc_root, &[me], &["/tmp-private".into()]).unwrap();
-        // pidfd_getfd needs ptrace access to ourselves, which a sandbox may
-        // deny; then nothing is found.
-        if !h.reuseport_sockets.is_empty() {
-            assert_eq!(h.reuseport_sockets, [format!("127.0.0.1:{port}")], "{h:?}");
-        }
-        drop((plain, reuse));
+
+        let host = SystemHost::new("nvidia-smi".into(), Default::default(), "x".into());
+        let groups = host.process_groups(&[pid]).unwrap().unwrap();
         assert!(groups.contains(&nix::unistd::getegid().as_raw()));
     }
 
@@ -2149,25 +2172,38 @@ mod tests {
     /// filesystem, and the dump must report it.
     #[test]
     fn sockets_bound_out_of_a_private_dir_are_hazards() {
+        use crate::testing::{FixtureChild, fixture_dir, fixture_ready};
+        if let Some(dir) = fixture_dir() {
+            let private_dir = dir.join("private");
+            let _a =
+                std::os::unix::net::UnixListener::bind(private_dir.join("../host/a.sock")).unwrap();
+            let _b =
+                std::os::unix::net::UnixListener::bind(private_dir.join("link/b.sock")).unwrap();
+            fixture_ready("");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let private_dir = tmp.path().join("private");
         let host_dir = tmp.path().join("host");
         fs::create_dir(&private_dir).unwrap();
         fs::create_dir(&host_dir).unwrap();
         std::os::unix::fs::symlink(&host_dir, private_dir.join("link")).unwrap();
-        let via_dotdot = private_dir.join("../host/a.sock");
-        let via_link = private_dir.join("link/b.sock");
-        let _a = std::os::unix::net::UnixListener::bind(&via_dotdot).unwrap();
-        let _b = std::os::unix::net::UnixListener::bind(&via_link).unwrap();
+        let fixture = FixtureChild::spawn(
+            "host::tests::sockets_bound_out_of_a_private_dir_are_hazards",
+            tmp.path(),
+        );
         assert!(host_dir.join("a.sock").exists() && host_dir.join("b.sock").exists());
         let private = [private_dir.to_str().unwrap().to_owned()];
-        let h = scan_dump_hazards(Path::new("/proc"), &[std::process::id()], &private).unwrap();
-        for name in [&via_dotdot, &via_link] {
-            assert!(
-                h.bound_sockets.iter().any(|s| s == name.to_str().unwrap()),
-                "{name:?} not reported: {h:?}"
-            );
-        }
+        let h = scan_dump_hazards(Path::new("/proc"), &[fixture.pid()], &private).unwrap();
+        let mut bound = h.bound_sockets.clone();
+        bound.sort();
+        let mut want = [
+            private_dir.join("../host/a.sock"),
+            private_dir.join("link/b.sock"),
+        ]
+        .map(|p| p.to_str().unwrap().to_owned());
+        want.sort();
+        assert_eq!(bound, want, "{h:?}");
     }
 
     #[test]
@@ -2203,45 +2239,67 @@ mod tests {
         );
     }
 
-    /// Our own process: an inotify descriptor, a listening socket with an
-    /// abstract name, and an internet socket sharing its port.
+    /// A process of its own (see `FixtureChild`): an inotify descriptor, a
+    /// listening socket with an abstract name, and two internet sockets on
+    /// one port, which another process then shares.
     #[test]
     fn finds_notify_fds_abstract_listeners_and_port_conflicts() {
-        use std::os::linux::net::SocketAddrExt;
-        let _ify = rustix::fs::inotify::init(rustix::fs::inotify::CreateFlags::CLOEXEC).unwrap();
-        let name = format!("gpueue-test-{}", std::process::id());
-        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&name).unwrap();
-        let _l = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
-        let host = SystemHost::new("nvidia-smi".into(), Default::default(), "x".into());
-        let h =
-            scan_dump_hazards(Path::new("/proc"), &[std::process::id()], &["/tmp".into()]).unwrap();
-        assert_eq!(
-            h.notify_fds,
-            [format!("inotify of process {}", std::process::id())]
-        );
-        assert_eq!(h.abstract_listeners, [format!("@{name}")]);
-
-        // Two sockets of ours on one UDP port: no conflict while both are
-        // the job's, one when only one of them is.
+        use crate::testing::{FixtureChild, fixture_dir, fixture_ready};
         use rustix::net::{AddressFamily, SocketType, sockopt};
-        let a = rustix::net::socket(AddressFamily::INET, SocketType::DGRAM, None).unwrap();
-        sockopt::set_socket_reuseport(&a, true).unwrap();
-        rustix::net::bind(&a, &std::net::SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        let port = std::net::SocketAddr::try_from(rustix::net::getsockname(&a).unwrap())
-            .unwrap()
-            .port();
-        let b = rustix::net::socket(AddressFamily::INET, SocketType::DGRAM, None).unwrap();
-        sockopt::set_socket_reuseport(&b, true).unwrap();
-        rustix::net::bind(&b, &std::net::SocketAddr::from(([127, 0, 0, 1], port))).unwrap();
+        use std::os::linux::net::SocketAddrExt;
+        let udp = |port: u16| {
+            let s = rustix::net::socket(AddressFamily::INET, SocketType::DGRAM, None).unwrap();
+            sockopt::set_socket_reuseport(&s, true).unwrap();
+            rustix::net::bind(&s, &std::net::SocketAddr::from(([127, 0, 0, 1], port))).unwrap();
+            let port = std::net::SocketAddr::try_from(rustix::net::getsockname(&s).unwrap())
+                .unwrap()
+                .port();
+            (s, port)
+        };
+        if fixture_dir().is_some() {
+            let _ify =
+                rustix::fs::inotify::init(rustix::fs::inotify::CreateFlags::CLOEXEC).unwrap();
+            let name = format!("gpueue-test-{}", std::process::id());
+            let addr = std::os::unix::net::SocketAddr::from_abstract_name(&name).unwrap();
+            let _l = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+            // Two sockets of the fixture on one UDP port.
+            let (_a, port) = udp(0);
+            let (_b, _) = udp(port);
+            fixture_ready(&format!("{name} {port}"));
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = FixtureChild::spawn(
+            "host::tests::finds_notify_fds_abstract_listeners_and_port_conflicts",
+            tmp.path(),
+        );
+        let (name, port) = fixture.payload.split_once(' ').unwrap();
+        let port: u16 = port.parse().unwrap();
+        let pid = fixture.pid();
+        let h = scan_dump_hazards(Path::new("/proc"), &[pid], &["/tmp".into()]).unwrap();
+        assert_eq!(h.notify_fds, [format!("inotify of process {pid}")], "{h:?}");
+        assert_eq!(h.abstract_listeners, [format!("@{name}")], "{h:?}");
+        assert!(h.bound_sockets.is_empty(), "{h:?}");
+
+        // The host's ports (any process's) include the fixture's.
+        let host = SystemHost::new("nvidia-smi".into(), Default::default(), "x".into());
         let in_use = host.inet_ports_in_use().unwrap();
         assert!(in_use.contains(&crate::images::InetPort { proto: 17, port }));
-        let me = std::process::id();
-        assert!(
-            inet_port_conflicts(Path::new("/proc"), me, &[me])
-                .unwrap()
-                .is_empty()
+        // No conflict while both sockets on the port are the job's, one
+        // once another process shares it.
+        let proc_root = Path::new("/proc");
+        assert_eq!(
+            inet_port_conflicts(proc_root, pid, &[pid]).unwrap(),
+            Vec::<String>::new()
         );
-        drop((a, b));
+        let (other, _) = udp(port);
+        assert_eq!(
+            inet_port_conflicts(proc_root, pid, &[pid]).unwrap(),
+            [format!(
+                "the job's socket on UDP port {port} shares the port with another socket"
+            )]
+        );
+        drop(other);
         let p = |proto, port| crate::images::InetPort { proto, port };
         let sockets = [(p(6, 80), 1), (p(6, 80), 2), (p(17, 80), 3), (p(6, 81), 4)];
         let own = std::collections::HashSet::from([1, 3]);
@@ -2257,35 +2315,43 @@ mod tests {
     /// renamed: CRIU could only link them back, so both are refused.
     #[test]
     fn finds_deleted_files_with_links_and_nfs_silly_names() {
+        use crate::testing::{FixtureChild, fixture_dir, fixture_ready};
+        if let Some(dir) = fixture_dir() {
+            let f = dir.join("f");
+            let _linked = fs::File::open(&f).unwrap();
+            fs::remove_file(&f).unwrap();
+            let _silly = fs::File::open(dir.join(".nfs000000000012340000000a")).unwrap();
+            fixture_ready("");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("f");
         fs::write(&f, b"x").unwrap();
         fs::hard_link(&f, tmp.path().join("keep")).unwrap();
-        let linked = fs::File::open(&f).unwrap();
-        fs::remove_file(&f).unwrap();
         let silly = tmp.path().join(".nfs000000000012340000000a");
         fs::write(&silly, b"y").unwrap();
-        let silly_held = fs::File::open(&silly).unwrap();
-        let me = std::process::id();
-        let h = scan_dump_hazards(Path::new("/proc"), &[me], &[]).unwrap();
+        let fixture = FixtureChild::spawn(
+            "host::tests::finds_deleted_files_with_links_and_nfs_silly_names",
+            tmp.path(),
+        );
+        let h = scan_dump_hazards(Path::new("/proc"), &[fixture.pid()], &[]).unwrap();
         let f = f.to_str().unwrap();
-        let found = h.deleted_files.iter().find(|d| d.path == f);
-        assert!(found.is_some_and(|d| d.nlink == 1), "{h:?}");
-        assert!(
-            h.silly_renamed
-                .contains(&silly.to_str().unwrap().to_owned()),
+        assert_eq!(
+            h.deleted_files
+                .iter()
+                .map(|d| (d.path.as_str(), d.nlink))
+                .collect::<Vec<_>>(),
+            [(f, 1)],
             "{h:?}"
         );
-        // Only these (other tests of this process may hold other hazards).
-        let h = DumpHazards {
-            deleted_files: h.deleted_files,
-            silly_renamed: h.silly_renamed,
-            ..Default::default()
-        };
+        assert_eq!(
+            h.silly_renamed,
+            [silly.to_str().unwrap().to_owned()],
+            "{h:?}"
+        );
         let why = h.refusal().unwrap();
         assert!(why.contains("other hard links") && why.contains(f), "{why}");
         assert!(why.contains("deleted on NFS"), "{why}");
-        drop((linked, silly_held));
     }
 
     #[test]
@@ -2347,13 +2413,23 @@ mod tests {
 
     #[test]
     fn finds_own_children() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("5")
-            .spawn()
-            .unwrap();
-        let kids = children_of(Path::new("/proc"), std::process::id()).unwrap();
-        assert!(kids.contains(&child.id()));
-        child.kill().unwrap();
-        child.wait().unwrap();
+        use crate::testing::{FixtureChild, fixture_dir, fixture_ready};
+        if fixture_dir().is_some() {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            fixture_ready(&child.id().to_string());
+            child.kill().unwrap();
+            child.wait().unwrap();
+            return;
+        }
+        // The children of a process of its own: those of the test process
+        // come and go with other tests.
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = FixtureChild::spawn("host::tests::finds_own_children", tmp.path());
+        let sleep: u32 = fixture.payload.parse().unwrap();
+        let kids = children_of(Path::new("/proc"), fixture.pid()).unwrap();
+        assert_eq!(kids, [sleep]);
     }
 }

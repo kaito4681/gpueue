@@ -36,7 +36,7 @@ hyper-util = { version = "0.1", default-features = false }
 http-body-util = "0.1"
 tower-service = "0.3"
 comfy-table = "7"
-nix = { version = "0.30", features = ["user", "sched", "mount", "signal", "process", "fs", "ptrace"] }
+nix = { version = "0.31", features = ["user", "sched", "mount", "signal", "process", "fs", "ptrace"] }
 axum = "0.8"
 futures = "0.3"
 tokio-util = "0.7"
@@ -50,7 +50,7 @@ cc = "1"
 # `gpueue update` only (never the helper): HTTPS with rustls, release
 # signatures, checksums and tarballs.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
-minisign-verify = "0.2"
+minisign-verify = "0.3"
 sha2 = "0.10"
 semver = "1"
 tar = { version = "0.4", default-features = false }
