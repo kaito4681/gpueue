@@ -1365,6 +1365,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 let op_ends = self.op_ends.clone();
                 let private = self.cfg.mounts.tmpfs.clone();
                 let helper_exe = self.cfg.helper_exe.clone();
+                let finalize_retry_delay = self.cfg.finalize_retry_delay;
                 tokio::task::spawn_blocking(move || {
                     let mut exec = factory();
                     dump_job(
@@ -1377,6 +1378,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                         &private,
                         Some(&helper_exe),
                         cap,
+                        finalize_retry_delay,
                         &|end| op_ends.set(job, end),
                     )
                 })
@@ -2371,7 +2373,7 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                 job.0
             );
             attempt += 1;
-            tokio::time::sleep(REMOVE_RETRY_DELAY).await;
+            tokio::time::sleep(self.cfg.remove_retry_delay).await;
         }
         RestoreOutcome::Success { pid, stopped }
     }
@@ -2753,6 +2755,9 @@ fn gib(bytes: u64) -> String {
 /// With `hook_exe` (this binary), `criu dump` runs
 /// [`crate::access::run_dump_hook`] once it has dumped the job, to record
 /// the files the job held at that moment (see [`finish_dump`]).
+///
+/// Finalizing a successful dump is tried [`FINALIZE_ATTEMPTS`] times,
+/// `finalize_retry_delay` apart.
 #[allow(clippy::too_many_arguments)]
 pub fn dump_job<H: HostProbe + ?Sized>(
     host: &H,
@@ -2764,6 +2769,7 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     private: &[String],
     hook_exe: Option<&Path>,
     cap: Option<Duration>,
+    finalize_retry_delay: Duration,
     on_deadline: &dyn Fn(Instant),
 ) -> Result<CheckpointMeta, DumpError> {
     // The pre-checks' lookups have deadlines of their own (see
@@ -2875,6 +2881,7 @@ pub fn dump_job<H: HostProbe + ?Sized>(
         let hook = crate::access::DumpHookRequest {
             init_pid,
             private: private.to_vec(),
+            pids: None,
         };
         let script = serde_json::to_vec(&hook)
             .map_err(|e| e.to_string())
@@ -2981,7 +2988,7 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     let mut last = String::new();
     for attempt in 0..FINALIZE_ATTEMPTS {
         if attempt > 0 {
-            std::thread::sleep(FINALIZE_RETRY_DELAY);
+            std::thread::sleep(finalize_retry_delay);
         }
         match finish_dump(host, &dir, Some(meta.clone())) {
             Ok(meta) => return Ok(meta),
@@ -3000,11 +3007,9 @@ pub fn dump_job<H: HostProbe + ?Sized>(
 
 /// How often a restore tries to remove the image it restored from.
 const REMOVE_ATTEMPTS: u32 = 3;
-const REMOVE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// How often [`dump_job`] tries to finalize a successful dump.
 const FINALIZE_ATTEMPTS: u32 = 3;
-const FINALIZE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// The reason reported for a dump that succeeded but could not be finalized.
 fn unfinalized_reason(dir: &CheckpointDir, error: &str) -> String {

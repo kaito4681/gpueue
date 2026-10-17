@@ -42,14 +42,51 @@ struct Inner {
     after_restore: Option<fn(&RestoreSpec)>,
 }
 
-/// Whether `release` calls are held, and how many are waiting (see
-/// [`FakeLauncher::hold_releases`]).
+/// Whether calls that pass it are held, and how many are waiting (see
+/// [`FakeLauncher::hold_releases`] and [`FakeLauncher::hold_launches`]).
 #[derive(Debug)]
-struct ReleaseGate(watch::Sender<(bool, usize)>);
+struct Gate(watch::Sender<(bool, usize)>);
 
-impl Default for ReleaseGate {
+impl Default for Gate {
     fn default() -> Self {
         Self(watch::channel((false, 0)).0)
+    }
+}
+
+impl Gate {
+    fn hold(&self) {
+        self.0.send_modify(|g| g.0 = true);
+    }
+
+    fn let_go(&self) {
+        self.0.send_modify(|g| g.0 = false);
+    }
+
+    /// Resolves once `count` calls (or more) are being held.
+    async fn wait_held(&self, count: usize) {
+        let mut rx = self.0.subscribe();
+        loop {
+            let held = rx.borrow_and_update().1;
+            if held >= count || rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Waits while the gate is held.
+    async fn pass(&self) {
+        let mut rx = self.0.subscribe();
+        if !rx.borrow_and_update().0 {
+            return;
+        }
+        self.0.send_modify(|g| g.1 += 1);
+        loop {
+            let hold = rx.borrow_and_update().0;
+            if !hold || rx.changed().await.is_err() {
+                break;
+            }
+        }
+        self.0.send_modify(|g| g.1 -= 1);
     }
 }
 
@@ -57,7 +94,8 @@ impl Default for ReleaseGate {
 #[derive(Debug, Default)]
 pub struct FakeLauncher {
     inner: Mutex<Inner>,
-    releases: ReleaseGate,
+    releases: Gate,
+    launches: Gate,
 }
 
 impl FakeLauncher {
@@ -137,6 +175,9 @@ impl FakeLauncher {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+        if result.is_ok() {
+            self.launches.pass().await;
+        }
         self.lock().active -= 1;
         result
     }
@@ -144,37 +185,32 @@ impl FakeLauncher {
     /// Makes `release` wait (as a slow StopUnit does) until
     /// [`Self::let_releases_go`].
     pub fn hold_releases(&self) {
-        self.releases.0.send_modify(|g| g.0 = true);
+        self.releases.hold();
     }
 
     pub fn let_releases_go(&self) {
-        self.releases.0.send_modify(|g| g.0 = false);
+        self.releases.let_go();
     }
 
     /// Resolves once `count` `release` calls (or more) are being held.
     pub async fn wait_held_releases(&self, count: usize) {
-        let mut rx = self.releases.0.subscribe();
-        loop {
-            let held = rx.borrow_and_update().1;
-            if held >= count || rx.changed().await.is_err() {
-                return;
-            }
-        }
+        self.releases.wait_held(count).await;
     }
 
-    async fn release_gate(&self) {
-        let mut rx = self.releases.0.subscribe();
-        if !rx.borrow_and_update().0 {
-            return;
-        }
-        self.releases.0.send_modify(|g| g.1 += 1);
-        loop {
-            let hold = rx.borrow_and_update().0;
-            if !hold || rx.changed().await.is_err() {
-                break;
-            }
-        }
-        self.releases.0.send_modify(|g| g.1 -= 1);
+    /// Makes `spawn` and `restore` wait (after their delay, as a unit that
+    /// is slow to start) until [`Self::let_launches_go`], also when the
+    /// helper stops waiting for launches.
+    pub fn hold_launches(&self) {
+        self.launches.hold();
+    }
+
+    pub fn let_launches_go(&self) {
+        self.launches.let_go();
+    }
+
+    /// Resolves once `count` launches (or more) are being held.
+    pub async fn wait_held_launches(&self, count: usize) {
+        self.launches.wait_held(count).await;
     }
 
     /// The most spawns and restores that were in progress at once.
@@ -290,7 +326,7 @@ impl Launcher for FakeLauncher {
     }
 
     async fn release(&self, unit: &str) -> LaunchResult<()> {
-        self.release_gate().await;
+        self.releases.pass().await;
         self.lock().units.remove(unit);
         Ok(())
     }

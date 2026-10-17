@@ -66,6 +66,12 @@ pub struct HelperConfig {
     pub poll_interval: Duration,
     /// How long a spawn may take until the job's shim reports back.
     pub spawn_timeout: Duration,
+    /// The pause between attempts to finalize a successful dump (see
+    /// [`crate::engine::dump_job`]).
+    pub finalize_retry_delay: Duration,
+    /// The pause between attempts to remove the image a job was restored
+    /// from.
+    pub remove_retry_delay: Duration,
     /// `TimeoutStopSec` of job units: SIGTERM → SIGKILL grace when systemd
     /// stops a job (e.g. a `no_checkpoint` job at shutdown).
     pub job_stop_timeout: Duration,
@@ -120,6 +126,8 @@ impl Default for HelperConfig {
             mounts: MountPlan::default(),
             poll_interval: Duration::from_secs(1),
             spawn_timeout: Duration::from_secs(30),
+            finalize_retry_delay: Duration::from_secs(1),
+            remove_retry_delay: Duration::from_millis(500),
             job_stop_timeout: Duration::from_secs(30),
             helper_exe: PathBuf::from("/usr/bin/gpueue-helper"),
             gc_roots: crate::gcroots::GcRoots::disabled(),
