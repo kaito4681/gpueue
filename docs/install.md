@@ -1000,7 +1000,7 @@ following:
    | `/var/lib/gpueue/daemon` | 0700 gpueue | `state.sqlite`, the daemon's database |
    | `/var/lib/gpueue/helper` | 0711 root | the helper's job records and event queue |
    | `/var/lib/gpueue/checkpoints` | 0700 root | checkpoint images, `<id>/` per job |
-   | `/var/lib/gpueue/logs` | 0755 root | job output, `<uid>/<id>.log` (the helper creates `<uid>/` with mode 2770, owned by the user, group `gpueue`) |
+   | `/var/lib/gpueue/logs` | 0755 root | job output, `<uid>/<id>.log` (the helper creates `<uid>/` with mode 2770, owned by the user, group `gpueue`; see [Log directory permissions](#log-directory-permissions)) |
    | `/var/lib/gpueue/lib` | 0755 root | the fork guard library (`gpueue-forkguard-<hash>.so`) and the copies of the helper that job units run (`gpueue-helper-<hash>`; see [Upgrading](#upgrading)) |
    | `/var/lib/gpueue/criu-no-plugins` | 0755 root | empty CRIU plugin directory for manual mode |
    | `/run/gpueue` | 0755 gpueue | `gpueue.sock` (daemon, mode 0666) and `helper.sock` (helper, owned by `gpueue`, mode 0600) |
@@ -1376,7 +1376,7 @@ Every `*_secs` key is at most one year (31536000).
 | `gpu_device_isolation` | `true` | helper | each job unit may open only its assigned GPUs' device nodes (`DevicePolicy=closed`); `false` turns this off (see [GPU isolation](#gpu-isolation)) |
 | `job_system_dbus` | `false` | helper | `true` lets jobs reach the system D-Bus (systemd, polkit); by default `/run/dbus` is hidden from jobs (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_systemd_varlink` | `false` | helper | `true` lets jobs reach systemd's Varlink services under `/run/systemd`; by default the directory is hidden from jobs except journald's log sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/` (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
-| `job_min_uid` | `UID_MIN` of `/etc/login.defs`, else `1000` | helper | jobs of users with a smaller uid are refused (see [Who jobs may run as](#who-jobs-may-run-as)) |
+| `job_min_uid` | `UID_MIN` of `/etc/login.defs`, else `1000` | helper | jobs of users with a smaller uid are refused (uids above `UID_MAX`, 65534, 65535 and 4294967295 always are) (see [Who jobs may run as](#who-jobs-may-run-as)) |
 | `job_denied_groups` | `["docker", "lxd", "incus-admin", "libvirt", "libvirtd", "disk", "sudo", "wheel", "admin"]` | helper | root-equivalent groups: dropped from jobs' supplementary groups; a job whose primary group is one of them is refused |
 | `job_hidden_socket_dirs` | `["/run/libvirt", "/run/cups"]` | helper | directories hidden from jobs behind an empty root-owned tmpfs (created first if missing): those of daemon sockets that check the caller's groups in the user database, which dropping groups does not defeat; absolute paths at least two levels deep, whose existing directories (and symlinks) on the way are root's and not group- or world-writable (checked when the helper starts) (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_allowed_users` | `[]` (everyone) | helper | if not empty, only these users (by name) may run jobs |
@@ -1408,9 +1408,11 @@ without logging in again.
 
 ## Who jobs may run as
 
-The root helper starts every job as its owner, so it decides whose jobs it runs; the daemon cannot
-change that. Besides never running a job as root (uid 0 or gid 0) or with a group its owner is not
-in, the helper applies three settings to every spawn and every restore:
+The root helper starts every job as its owner, so it applies the policy on whose jobs it runs;
+the daemon cannot change that policy. Besides never running a job as root (uid 0 or gid 0), as a
+uid above `UID_MAX` of `/etc/login.defs` (60000 when unset) or as 65534 (`nobody`), 65535 or
+4294967295, or with a group its owner is not in, the helper applies three settings to every
+spawn and every restore:
 
 - `job_min_uid`: users with a smaller uid are refused. Unset, it is `UID_MIN` of
   `/etc/login.defs` (1000 on most distributions), or 1000 when the file has no valid `UID_MIN`.
@@ -1443,6 +1445,17 @@ in, the helper applies three settings to every spawn and every restore:
   "wheel", "admin"]` lets jobs use Docker).
 - `job_allowed_users`: if not empty, only the users listed (by name) may run jobs.
 
+What this does and does not protect against: the helper checks the user a request names, not who
+asked for it. The uid, working directory, command and environment of a spawn come from the
+daemon, which identifies the submitting client by its socket credentials. A compromised daemon
+(the unprivileged `gpueue` user) therefore cannot run anything as root or as a user the policy
+refuses, but it can start arbitrary commands as any user the policy allows. Treat the `gpueue`
+user as able to act as every user permitted to run jobs. Members of `gpueue-admin` can also read
+every user's job environment (`gpueue status --json`, `gpueue log`'s header and the
+environment shown by `gpueue status`), so do not pass secrets in the environment of jobs on a
+machine where you do not trust every admin; the daemon's database holds them too (`0700
+gpueue`). A helper-side check of the submitter is tracked in issue #107.
+
 A refused job fails to spawn with a reason that starts with `gpueue refuses to run jobs as
 <user>:`, followed by e.g. `uid 999 is below job_min_uid 1000 (UID_MIN in /etc/login.defs)`,
 `primary group docker is in job_denied_groups` or `not in job_allowed_users`. `gpueue status`
@@ -1451,6 +1464,18 @@ refused restore is a restore failure (see [Restore failures](#restore-failures))
 checkpointed. `gpueue doctor` prints the effective policy (the minimum uid
 and where it comes from, the denied groups and which of them exist on the host, the allowed
 users), and the helper logs it when it starts. Restart the helper after changing these keys.
+
+## Log directory permissions
+
+`/var/lib/gpueue/logs/<uid>/` is owned by the job's user with group `gpueue` and mode 2770. The
+setgid bit makes the logs the shim creates there belong to group `gpueue` (the user is not a
+member), and group write lets the unprivileged daemon truncate and delete them without a helper
+round trip. This needs a local filesystem that honors the setgid bit on directories (ext4, xfs,
+btrfs, tmpfs, ... on any supported kernel). Default ACLs were considered instead and not used, as
+they need `acl` support on the filesystem and mount. The setgid bit is not relied on for safety:
+the shim creates every log with mode 0660 and sets it explicitly (no setuid, setgid or sticky
+bit), and the daemon refuses to read or truncate a log that is not a regular file owned by the
+job's owner or that has any of those bits.
 
 ## What a job can and cannot do
 

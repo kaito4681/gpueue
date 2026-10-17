@@ -156,11 +156,15 @@ impl MinUidSource {
 /// The value of `UID_MIN` in the contents of a `login.defs` file. Comments
 /// (`#`) and malformed lines are ignored; the last valid setting wins.
 pub fn parse_uid_min(login_defs: &str) -> Option<u32> {
+    parse_login_defs_number(login_defs, "UID_MIN")
+}
+
+fn parse_login_defs_number(login_defs: &str, key: &str) -> Option<u32> {
     let mut found = None;
     for line in login_defs.lines() {
         let line = line.split('#').next().unwrap_or("");
         let mut words = line.split_whitespace();
-        if words.next() != Some("UID_MIN") {
+        if words.next() != Some(key) {
             continue;
         }
         if let (Some(value), None) = (words.next(), words.next())
@@ -187,6 +191,33 @@ pub fn effective_min_uid(configured: Option<u32>, login_defs: &Path) -> (u32, Mi
         Some(uid) => (uid, MinUidSource::LoginDefs),
         None => (FALLBACK_JOB_MIN_UID, MinUidSource::Fallback),
     }
+}
+
+/// `UID_MAX` when `/etc/login.defs` has no usable one (the value most
+/// distributions use).
+pub const FALLBACK_JOB_MAX_UID: u32 = 60000;
+
+/// Uids that never run jobs, whatever `UID_MAX` says: `nobody` and
+/// `nogroup` (65534), the 16-bit "invalid" uid (65535) and the 32-bit one
+/// (`(uid_t)-1`, 4294967295).
+pub const RESERVED_UIDS: &[u32] = &[65534, 65535, u32::MAX];
+
+/// The value of `UID_MAX` in the contents of a `login.defs` file (same
+/// rules as [`parse_uid_min`]).
+pub fn parse_uid_max(login_defs: &str) -> Option<u32> {
+    parse_login_defs_number(login_defs, "UID_MAX")
+}
+
+/// The first uid above the range of regular users: `UID_MAX` of the
+/// `login.defs` file at `login_defs`, else [`FALLBACK_JOB_MAX_UID`]. A job
+/// may run as a uid up to and including it (`UID_MAX` is the last regular
+/// uid), never above, and never as one of [`RESERVED_UIDS`].
+pub fn effective_max_uid(login_defs: &Path) -> u32 {
+    std::fs::read_to_string(login_defs)
+        .ok()
+        .as_deref()
+        .and_then(parse_uid_max)
+        .unwrap_or(FALLBACK_JOB_MAX_UID)
 }
 
 /// The `(name, gid)` of each of `names` that the group file contents
@@ -218,6 +249,20 @@ SYS_UID_MIN               100
         assert_eq!(parse_uid_min("UID_MIN 1 2\n"), None);
         assert_eq!(parse_uid_min("#UID_MIN 500\nSYS_UID_MIN 100\n"), None);
         assert_eq!(parse_uid_min(""), None);
+    }
+
+    #[test]
+    fn max_uid_comes_from_login_defs_or_the_fallback() {
+        assert_eq!(parse_uid_max(LOGIN_DEFS), Some(60000));
+        assert_eq!(parse_uid_max("UID_MAX x\n"), None);
+        let dir = tempfile::tempdir().unwrap();
+        let defs = dir.path().join("login.defs");
+        std::fs::write(&defs, "UID_MAX 29999\n").unwrap();
+        assert_eq!(effective_max_uid(&defs), 29999);
+        assert_eq!(
+            effective_max_uid(&dir.path().join("missing")),
+            FALLBACK_JOB_MAX_UID
+        );
     }
 
     #[test]

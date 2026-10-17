@@ -82,6 +82,12 @@ pub fn open(logs_dir: &Path, owner: Uid, id: JobId, access: Access) -> io::Resul
     if meta.uid() != owner.0 {
         return Err(refuse(&path, "not owned by the job's owner"));
     }
+    // The shim creates logs 0660 and the directory is group-writable for
+    // the daemon, so a log never has these bits legitimately; do not touch
+    // a file that does.
+    if meta.mode() & 0o7000 != 0 {
+        return Err(refuse(&path, "it has setuid, setgid or sticky bits"));
+    }
     // Regular files ignore O_NONBLOCK; clear it all the same.
     nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_SETFL(OFlag::empty()))
         .map_err(io::Error::from)?;
@@ -168,6 +174,20 @@ mod tests {
         symlink(&elsewhere, logs.join(other.0.to_string())).unwrap();
         let err = read(&logs, other).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    #[test]
+    fn refuses_logs_with_setuid_or_setgid_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, logs, log) = setup();
+        std::fs::write(&log, "x").unwrap();
+        for bits in [0o2660, 0o4660, 0o1660] {
+            std::fs::set_permissions(&log, std::fs::Permissions::from_mode(bits)).unwrap();
+            let err = read(&logs, me()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        }
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o660)).unwrap();
+        assert_eq!(read(&logs, me()).unwrap(), "x");
     }
 
     #[test]

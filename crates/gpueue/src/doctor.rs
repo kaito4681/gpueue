@@ -528,6 +528,7 @@ fn check_job_policy(sys: &dyn System, config: &Config) -> Check {
         config.job_min_uid,
         &sys.path(Path::new(job_policy::LOGIN_DEFS_PATH)),
     );
+    let max_uid = job_policy::effective_max_uid(&sys.path(Path::new(job_policy::LOGIN_DEFS_PATH)));
     let groups = std::fs::read_to_string(sys.path(Path::new(job_policy::GROUP_FILE_PATH)))
         .unwrap_or_default();
     let present = job_policy::resolve_group_names(&groups, &config.job_denied_groups);
@@ -545,14 +546,14 @@ fn check_job_policy(sys: &dyn System, config: &Config) -> Check {
             .join(", ")
     };
     let allowed = if config.job_allowed_users.is_empty() {
-        format!("every user with uid >= {min_uid}")
+        format!("every user with uid {min_uid} to {max_uid}")
     } else {
         config.job_allowed_users.join(", ")
     };
     Check::info(
         NAME,
         format!(
-            "jobs run as uid >= {min_uid} ({}); denied groups: {denied}; allowed users: {allowed}",
+            "jobs run as uid >= {min_uid} ({}) and <= {max_uid} (UID_MAX; never 65534, 65535 or 4294967295); denied groups: {denied}; allowed users: {allowed}",
             source.describe()
         ),
     )

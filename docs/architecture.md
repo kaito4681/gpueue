@@ -303,9 +303,19 @@ failed and keeps the image as well.
 
 ## Other privilege boundaries
 
-- <a id="job-credentials"></a>The helper, not the daemon, decides whose jobs run, so a
-  compromised daemon cannot get around it. For every spawn and restore it looks the owner up
-  through NSS and refuses uid 0, gid 0, groups the owner is not in, users below `job_min_uid`
+- <a id="job-credentials"></a>The helper, not the daemon, applies the policy on who may run
+  jobs, so a compromised daemon cannot get around the policy: it cannot make the helper run
+  anything as root, join a group the owner is not in, run as a user the policy refuses, or run
+  as a uid outside the range of regular users. What the helper cannot check is who submitted a
+  job: it takes the uid, working directory, command and environment from the daemon, so a
+  compromised daemon can start any command as any user that passes the policy (and, through the
+  signal, checkpoint and restore requests, act on those users' jobs). The authorization of
+  clients (who may add, see or change which job) is the daemon's, and so is the job
+  environment, which the daemon stores: members of `gpueue-admin` can read every user's job
+  environment (including secrets passed in it) through the CLI. A design in which the helper
+  verifies the submitter itself is not implemented yet (issue #107). For every spawn and restore it looks the owner up
+  through NSS and refuses uid 0, gid 0, uids above `UID_MAX` of `/etc/login.defs` (default 60000)
+  and 65534, 65535 and 4294967295, groups the owner is not in, users below `job_min_uid`
   (default `UID_MIN` of `/etc/login.defs`), users missing from a non-empty `job_allowed_users`,
   and a job group listed in `job_denied_groups` (root-equivalent groups such as `docker`, `disk`
   or `sudo`, looked up in `/etc/group`), with an error of code `policy_denied` whose message

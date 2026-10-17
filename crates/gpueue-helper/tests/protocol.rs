@@ -1481,6 +1481,7 @@ async fn job_policy_refuses_spawns_and_restores() {
     let policy = |min_uid: u32| gpueue_helper::validate::JobPolicy {
         min_uid,
         min_uid_source: gpueue_config::job_policy::MinUidSource::Config,
+        max_uid: gpueue_config::job_policy::FALLBACK_JOB_MAX_UID,
         denied_groups: vec!["docker".into()],
         allowed_users: vec![],
         group_file: group_file.clone(),

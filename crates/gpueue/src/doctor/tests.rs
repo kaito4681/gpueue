@@ -806,7 +806,8 @@ fn job_policy_shows_the_minimum_uid_source_and_denied_groups() {
     let shown = message(&run(&sys, None), "job policy").to_owned();
     assert_eq!(
         shown,
-        "jobs run as uid >= 1500 (job_min_uid in the configuration); denied groups: none; \
+        "jobs run as uid >= 1500 (job_min_uid in the configuration) and <= 60000 (UID_MAX; \
+         never 65534, 65535 or 4294967295); denied groups: none; \
          allowed users: alice"
     );
 }

@@ -79,7 +79,11 @@ pub fn decode_line<T: DeserializeOwned>(line: &[u8]) -> Result<T, FrameError> {
 #[derive(Debug, Default)]
 pub struct LineBuffer {
     buf: Vec<u8>,
-    /// How far `buf` has been searched for a newline already.
+    /// Start of the first line not yet returned. Consumed bytes are only
+    /// removed from the front once per [`LineBuffer::push`], so that many
+    /// small lines in one read cost linear, not quadratic, time.
+    start: usize,
+    /// How far `buf` has been searched for a newline already (absolute).
     scanned: usize,
 }
 
@@ -89,6 +93,11 @@ impl LineBuffer {
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
+        if self.start > 0 {
+            self.buf.drain(..self.start);
+            self.scanned -= self.start;
+            self.start = 0;
+        }
         self.buf.extend_from_slice(bytes);
     }
 
@@ -96,12 +105,13 @@ impl LineBuffer {
     /// complete line is buffered yet, or an error once the pending line is
     /// longer than [`MAX_LINE_LEN`] (the connection should then be dropped).
     pub fn next_line(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
-        match self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
+        let from = self.scanned.max(self.start);
+        match self.buf[from..].iter().position(|&b| b == b'\n') {
             Some(pos) => {
-                let end = self.scanned + pos;
-                let mut line: Vec<u8> = self.buf.drain(..=end).collect();
-                self.scanned = 0;
-                line.pop();
+                let end = from + pos;
+                let line = self.buf[self.start..end].to_vec();
+                self.start = end + 1;
+                self.scanned = self.start;
                 if line.len() > MAX_LINE_LEN {
                     return Err(FrameError::TooLong { len: line.len() });
                 }
@@ -109,9 +119,9 @@ impl LineBuffer {
             }
             None => {
                 self.scanned = self.buf.len();
-                if self.buf.len() > MAX_LINE_LEN {
+                if self.pending() > MAX_LINE_LEN {
                     return Err(FrameError::TooLong {
-                        len: self.buf.len(),
+                        len: self.pending(),
                     });
                 }
                 Ok(None)
@@ -121,6 +131,39 @@ impl LineBuffer {
 
     /// Bytes buffered after the last complete line.
     pub fn pending(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.start
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_many_small_lines_and_partial_ones() {
+        let mut buf = LineBuffer::new();
+        let mut input = Vec::new();
+        for i in 0..1000 {
+            input.extend_from_slice(format!("{i}\n").as_bytes());
+        }
+        input.extend_from_slice(b"par");
+        buf.push(&input);
+        for i in 0..1000 {
+            assert_eq!(buf.next_line().unwrap(), Some(i.to_string().into_bytes()));
+        }
+        assert_eq!(buf.next_line().unwrap(), None);
+        assert_eq!(buf.pending(), 3);
+        buf.push(b"tial\n\nnext");
+        assert_eq!(buf.next_line().unwrap(), Some(b"partial".to_vec()));
+        assert_eq!(buf.next_line().unwrap(), Some(Vec::new()));
+        assert_eq!(buf.next_line().unwrap(), None);
+        assert_eq!(buf.pending(), 4);
+    }
+
+    #[test]
+    fn refuses_an_endless_line() {
+        let mut buf = LineBuffer::new();
+        buf.push(&vec![b'x'; MAX_LINE_LEN + 1]);
+        assert!(matches!(buf.next_line(), Err(FrameError::TooLong { .. })));
     }
 }
