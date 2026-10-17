@@ -82,7 +82,11 @@ jobs:
     # Build on Debian bookworm, as scripts/test-in-docker.sh does, so the
     # binaries need only glibc 2.34 (see docs/install.md). The image is
     # multi-arch, so the arm64 runner gets the arm64 toolchain.
-    container: rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    # CAP_SYS_PTRACE lets pidfd_getfd through Docker's default seccomp profile
+    # (see scripts/test-in-docker.sh); the tests run as an unprivileged user.
+    container:
+      image: rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      options: --cap-add SYS_PTRACE
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
       TARGET: ${{ matrix.target }}

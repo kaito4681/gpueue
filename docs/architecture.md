@@ -262,7 +262,8 @@ hold a root file opened with the dump-time mode. The helper therefore:
   keeps running). It refuses a job with internet sockets that have `SO_REUSEPORT`
   (CRIU creates sockets as root before it restores the job's credentials, so the restored socket
   would be root's and could join the `SO_REUSEPORT` group of a root service on the same port;
-  confirmed with CRIU 4.2), never passes `--link-remap` (with it CRIU links open files that have
+  confirmed with CRIU 4.2; the helper looks at the sockets through `pidfd_getfd`, and refuses
+  the dump if it cannot), never passes `--link-remap` (with it CRIU links open files that have
   no name of their own back into their directories, as root, by path, while the dump runs):
   deleted files are saved in the image instead, and a job holding a deleted file that still has
   another hard link, or a file the NFS client renamed to `.nfs<hex>` because it was deleted while

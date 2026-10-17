@@ -3,7 +3,12 @@
 - Code, comments, docs and commit messages are written in English.
 - Run tests inside Docker: `scripts/test-in-docker.sh` (defaults to `cargo test --workspace`;
   pass other cargo arguments, e.g. `clippy --workspace --all-targets` or `fmt --all`;
-  the toolchain image is built from `docker/test.Dockerfile`).
+  the toolchain image is built from `docker/test.Dockerfile`). The container gets
+  `--cap-add SYS_PTRACE` so that Docker's seccomp profile allows `pidfd_getfd`, which the
+  helper's dump hazard scan needs (without it those tests fail, as the helper refuses the dump).
+  Tests that need unprivileged user namespaces (blocked in Docker and on GitHub's Ubuntu
+  runners) print `skipped: ` there and run in the NixOS VM check
+  (`nix build .#checks.x86_64-linux.helper-tests`), which fails on that marker.
 - Full-stack e2e (daemon + helper + CLI under systemd in a privileged container, incl. a
   simulated reboot): `scripts/e2e-test.sh` (`GPUEUE_SYSTEMD_BASE=gpueue-poc/systemd259:0.1`
   where apt is offline; `GPUEUE_E2E_GPU=1` with a CUDA base image adds a GPU scenario).

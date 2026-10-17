@@ -19,7 +19,13 @@ pkgs.testers.runNixOSTest {
   nodes.machine = {
     users.users.alice.isNormalUser = true;
     # forkguard's test runs a Python script (and skips itself without it).
-    environment.systemPackages = [ pkgs.python3 ];
+    # tests/dump_hook.rs runs a job in a user and PID namespace of its own
+    # with unshare (and skips itself where unprivileged user namespaces are
+    # not available, unlike here).
+    environment.systemPackages = [
+      pkgs.python3
+      pkgs.util-linux
+    ];
     virtualisation.memorySize = 2048;
     virtualisation.cores = 4;
   };

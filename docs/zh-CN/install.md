@@ -2090,6 +2090,10 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
 - `the job has internet sockets with SO_REUSEPORT (...)`：CRIU 在把凭据交还给作业之前以 root 身份重建
   套接字，因此恢复后的 `SO_REUSEPORT` 套接字将属于 root，并可能加入同一端口上某个 root 服务的组（并接收其
   部分连接）。请在程序中关闭 `SO_REUSEPORT`，或用 `--no-checkpoint` 运行该作业。
+- `reading the job's open files: inspecting socket N of process P (for SO_REUSEPORT): Operation
+  not permitted`：helper 通过 `pidfd_getfd` 检查作业的套接字，而该调用被拒绝了（`gpueue-helper.service`
+  上的 seccomp 过滤器、Yama 的 `kernel.yama.ptrace_scope` 为 3（CRIU 在此设置下也无法工作），或早于 5.6 的
+  内核）。helper 宁可拒绝检查点，也不会漏掉这样的套接字；请允许 helper 使用 `pidfd_getfd`。
 - `the job holds deleted files that still have other hard links (...)`、`... files deleted on NFS
   while open (...)`：CRIU 只能通过以 root 身份把这类文件重新链接回它们的目录（`--link-remap`，gpueue 从不
   使用）来为它们创建检查点。请在创建检查点之前关闭这些文件，或用 `--no-checkpoint` 运行该作业。

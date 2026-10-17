@@ -468,8 +468,16 @@ pub fn fixture_dir() -> Option<std::path::PathBuf> {
 /// In a fixture process: tells the parent that it is set up, with
 /// `payload` (one line, e.g. the ports it bound), and waits until the parent
 /// is done with it (closes its stdin).
+///
+/// Lets any process of the user attach to it first: what scans a fixture
+/// may not be its parent (e.g. the `dump-hook` child of the test), and
+/// under Yama's `ptrace_scope` 1 (Ubuntu's default) only a parent may take
+/// a descriptor of it with `pidfd_getfd`, as the helper's scans do (the
+/// helper runs as root with `CAP_SYS_PTRACE`, which Yama lets through).
+/// Without Yama the call fails, and nothing needs to be allowed.
 pub fn fixture_ready(payload: &str) {
     use std::io::{Read, Write};
+    let _ = rustix::process::set_ptracer(rustix::process::PTracer::Any);
     let mut out = io::stdout();
     let _ = writeln!(out, "{FIXTURE_READY}{payload}");
     let _ = out.flush();
@@ -496,10 +504,25 @@ impl FixtureChild {
     /// `host::tests::finds_dump_hazards`) in `dir` and waits until it is
     /// set up.
     pub fn spawn(name: &str, dir: &Path) -> Self {
+        Self::spawn_under(&[], name, dir)
+    }
+
+    /// [`FixtureChild::spawn`], run by the command `wrapper` (e.g.
+    /// `unshare ... --fork`, which runs the fixture as its child).
+    /// [`FixtureChild::pid`] is then the wrapper's.
+    pub fn spawn_under(wrapper: &[&str], name: &str, dir: &Path) -> Self {
         use std::io::BufRead;
         use std::process::{Command, Stdio};
         let exe = std::env::current_exe().expect("the test executable");
-        let mut child = Command::new(exe)
+        let mut cmd = match wrapper.split_first() {
+            Some((program, args)) => {
+                let mut c = Command::new(program);
+                c.args(args).arg(exe);
+                c
+            }
+            None => Command::new(exe),
+        };
+        let mut child = cmd
             .args([
                 "--exact",
                 name,
