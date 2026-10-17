@@ -1089,10 +1089,14 @@ async fn lost_checkpoint_requests_do_not_leave_jobs_checkpointing() {
     h.helper.set_checkpoint_outcome(FakeOutcome::LoseRequest);
     let lost = |j: &JobView| last_error(j).is_some_and(|e| e.contains("lost"));
 
-    // Found by the reconciliation after a reconnect.
+    // Found by the reconciliation after a reconnect. (Until then, the
+    // checks cannot list the helper's jobs, so the job is seen
+    // checkpointing however slowly the test runs.)
+    h.helper.fail_list_running(usize::MAX);
     let reply = alice.action(id, "checkpoint", json!(null)).await;
     assert_eq!(reply.error().code, ErrorCode::HelperUnavailable);
     assert_eq!(alice.job(id).await.state, JobState::Checkpointing);
+    h.helper.fail_list_running(0);
     h.helper.disconnect();
     h.helper.reconnect();
     alice
@@ -1103,12 +1107,19 @@ async fn lost_checkpoint_requests_do_not_leave_jobs_checkpointing() {
     assert!(h.helper.signals().is_empty());
 
     // Found by the check after the timeout; a paused job (resumed for the
-    // dump) is paused again.
-    alice.action(id, "pause", json!({})).await;
+    // dump) is paused again. (The periodic check may have found the job
+    // before the daemon reconciled with the helper.)
+    h.wait_reconciled().await;
+    assert_eq!(
+        alice.action(id, "pause", json!({})).await.status,
+        StatusCode::OK
+    );
     alice.wait_state(id, &JobState::Paused).await;
+    h.helper.fail_list_running(usize::MAX);
     let reply = alice.action(id, "checkpoint", json!(null)).await;
     assert_eq!(reply.error().code, ErrorCode::HelperUnavailable);
     assert_eq!(alice.job(id).await.state, JobState::Checkpointing);
+    h.helper.fail_list_running(0);
     alice
         .wait_for(id, "paused again", |j| j.state == JobState::Paused)
         .await;
@@ -1128,7 +1139,7 @@ async fn lost_checkpoint_requests_do_not_leave_jobs_checkpointing() {
     alice.action(id, "checkpoint", json!(null)).await;
     h.helper.disconnect();
     h.helper.reconnect();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    h.wait_reconciled().await;
     assert_eq!(alice.job(id).await.state, JobState::Checkpointing);
     h.helper.dump(id);
     alice.wait_state(id, &JobState::Checkpointed).await;
