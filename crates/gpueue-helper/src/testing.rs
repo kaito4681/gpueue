@@ -449,3 +449,102 @@ fn dump_hook_request(script: &str) -> io::Result<std::path::PathBuf> {
         .map(|(_, r)| r.trim_matches('\'').into())
         .ok_or_else(|| io::Error::other(format!("unknown action script {script}")))
 }
+
+/// Set in a fixture process (see [`FixtureChild`]) to the directory it
+/// works in.
+pub const FIXTURE_DIR_ENV: &str = "GPUEUE_TEST_FIXTURE_DIR";
+
+/// The line a fixture process prints once it is set up, followed by its
+/// payload.
+const FIXTURE_READY: &str = "gpueue-test-fixture-ready:";
+
+/// In a fixture process (see [`FixtureChild`]): the directory to set up in.
+/// A test checks this first and, when it is set, only sets up what the
+/// parent test looks at, calls [`fixture_ready`] and returns.
+pub fn fixture_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os(FIXTURE_DIR_ENV).map(Into::into)
+}
+
+/// In a fixture process: tells the parent that it is set up, with
+/// `payload` (one line, e.g. the ports it bound), and waits until the parent
+/// is done with it (closes its stdin).
+pub fn fixture_ready(payload: &str) {
+    use std::io::{Read, Write};
+    let mut out = io::stdout();
+    let _ = writeln!(out, "{FIXTURE_READY}{payload}");
+    let _ = out.flush();
+    let _ = io::stdin().read_to_end(&mut Vec::new());
+}
+
+/// A process of its own for what a test scans by process (open files,
+/// sockets, inotify descriptors, children): the threads of the test
+/// process run other tests at the same time, whose descriptors a scan of
+/// the test process would see too. It is the test executable itself, run
+/// for the one test `name` with [`FIXTURE_DIR_ENV`] set (see
+/// [`fixture_dir`]), in that directory. The process holds only what that
+/// test sets up there (and its standard streams), so a scan of it can be
+/// compared exactly.
+pub struct FixtureChild {
+    child: std::process::Child,
+    stdout: Option<io::BufReader<std::process::ChildStdout>>,
+    /// What the fixture passed to [`fixture_ready`].
+    pub payload: String,
+}
+
+impl FixtureChild {
+    /// Starts the fixture for the test `name` (its full path, e.g.
+    /// `host::tests::finds_dump_hazards`) in `dir` and waits until it is
+    /// set up.
+    pub fn spawn(name: &str, dir: &Path) -> Self {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let exe = std::env::current_exe().expect("the test executable");
+        let mut child = Command::new(exe)
+            .args([
+                "--exact",
+                name,
+                "--test-threads=1",
+                "--nocapture",
+                "--quiet",
+            ])
+            .env(FIXTURE_DIR_ENV, dir)
+            .current_dir(dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("starting the fixture process");
+        let mut stdout = io::BufReader::new(child.stdout.take().expect("stdout"));
+        let mut line = String::new();
+        let payload = loop {
+            line.clear();
+            if stdout.read_line(&mut line).expect("reading the fixture") == 0 {
+                let status = child.wait();
+                panic!("the fixture process for {name} ended before it was ready: {status:?}");
+            }
+            if let Some(p) = line.trim_end().strip_prefix(FIXTURE_READY) {
+                break p.to_owned();
+            }
+        };
+        Self {
+            child,
+            stdout: Some(stdout),
+            payload,
+        }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for FixtureChild {
+    fn drop(&mut self) {
+        // Closing its stdin lets the fixture end its test.
+        drop(self.child.stdin.take());
+        if let Some(mut out) = self.stdout.take() {
+            let _ = io::copy(&mut out, &mut io::sink());
+        }
+        let _ = self.child.wait();
+    }
+}

@@ -1863,26 +1863,42 @@ async fn a_dump_the_post_dump_hook_vetoes_is_refused() {
 }
 
 /// The real host scans a job's files in a `verify-access` child (a
-/// filesystem that does not answer cannot hold the helper up).
+/// filesystem that does not answer cannot hold the helper up). The job is
+/// a process of its own (see `FixtureChild`), which holds only what it set
+/// up here.
 #[test]
 fn the_real_host_scans_files_in_a_child() {
     use gpueue_helper::host::{HostProbe, SystemHost};
+    use gpueue_helper::testing::{FixtureChild, fixture_dir, fixture_ready};
+    if let Some(dir) = fixture_dir() {
+        let f = dir.join("gone");
+        let _held = std::fs::File::create(&f).unwrap();
+        std::fs::remove_file(&f).unwrap();
+        let _open = std::fs::File::create(dir.join("open")).unwrap();
+        fixture_ready("");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
-    let f = tmp.path().join("gone");
-    let held = std::fs::File::create(&f).unwrap();
-    std::fs::remove_file(&f).unwrap();
-    let open = tmp.path().join("open");
-    let open_held = std::fs::File::create(&open).unwrap();
+    let fixture = FixtureChild::spawn("the_real_host_scans_files_in_a_child", tmp.path());
     let host = SystemHost::new("nvidia-smi".into(), Default::default(), helper_exe());
-    let me = std::process::id();
-    let h = host.dump_hazards(&[me], &[]).unwrap();
-    assert!(
-        h.deleted_files.iter().any(|d| Path::new(&d.path) == f),
+    let pid = fixture.pid();
+    let h = host.dump_hazards(&[pid], &[]).unwrap();
+    let gone = tmp.path().join("gone");
+    assert_eq!(
+        h.deleted_files
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        [gone.to_str().unwrap()],
         "{h:?}"
     );
-    let files = host.open_files(&[me]).unwrap();
-    assert!(files.iter().any(|p| Path::new(p) == open), "{files:?}");
-    drop((held, open_held));
+    // The open file, and the working directory.
+    let files = host.open_files(&[pid]).unwrap();
+    assert_eq!(
+        files,
+        [tmp.path().join("open"), tmp.path().to_owned()].map(|p| p.to_str().unwrap().to_owned()),
+        "{files:?}"
+    );
 }
 
 /// The helper stopped in the middle of a restore: its next start kills
