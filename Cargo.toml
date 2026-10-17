@@ -50,7 +50,7 @@ cc = "1"
 # `gpueue update` only (never the helper): HTTPS with rustls, release
 # signatures, checksums and tarballs.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
-minisign-verify = "0.2"
+minisign-verify = "0.3"
 sha2 = "0.10"
 semver = "1"
 tar = { version = "0.4", default-features = false }
