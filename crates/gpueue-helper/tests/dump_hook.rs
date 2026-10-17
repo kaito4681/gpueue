@@ -27,12 +27,17 @@ fn helper_exe() -> std::path::PathBuf {
     exe
 }
 
-/// Runs the hook for this test process (which stands for the job: the hook
-/// scans every process in the PID namespace of `init_pid`) at `action`.
-fn run_hook(dir: &Path, action: &str) -> (bool, std::path::PathBuf) {
+/// Runs the hook at `action` for the job whose init is `init_pid`.
+///
+/// The hook scans every process in the PID namespace of `init_pid` (a job
+/// has one of its own). A test cannot give its job one: unprivileged user
+/// namespaces, which that needs, are often not available (GitHub's Ubuntu
+/// runners and Docker restrict them). So the hook sees the host's
+/// processes too, and only what the job holds is checked for.
+fn run_hook(dir: &Path, action: &str, init_pid: u32) -> (bool, std::path::PathBuf) {
     let request = dir.join("dump-hook.json");
     let req = DumpHookRequest {
-        init_pid: std::process::id(),
+        init_pid,
         // Nothing private: the tempdir stands for a host filesystem.
         private: Vec::new(),
     };
@@ -48,22 +53,31 @@ fn run_hook(dir: &Path, action: &str) -> (bool, std::path::PathBuf) {
 
 #[test]
 fn post_dump_hook_vetoes_a_deleted_host_file_with_other_links() {
+    use gpueue_helper::testing::{FixtureChild, fixture_dir, fixture_ready};
+    if let Some(dir) = fixture_dir() {
+        // The job: it holds a file deleted while another link remains,
+        // which CRIU could only link-remap instead of saving as a ghost.
+        let f = dir.join("f");
+        let _held = fs::File::open(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        fixture_ready("");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let orig = dir.path().join("f");
     fs::write(&orig, b"x").unwrap();
-    // Another link keeps nlink > 0: CRIU could only link-remap such a file
-    // instead of saving it as a ghost.
     fs::hard_link(&orig, dir.path().join("keep")).unwrap();
-    let held = fs::File::open(&orig).unwrap();
-    fs::remove_file(&orig).unwrap();
-    // The hook scans every process of the PID namespace, which here is the
-    // host's: other processes (as a CI runner's agents with sockets bound
-    // in /tmp) may have hazards of their own. They must not hide ours, so
-    // have one of them here too.
+    let job = FixtureChild::spawn(
+        "post_dump_hook_vetoes_a_deleted_host_file_with_other_links",
+        dir.path(),
+    );
+    // Another process of the namespace with a hazard of its own (as a CI
+    // runner's agents with sockets bound in /tmp): it must not hide the
+    // job's.
     let other = std::os::unix::net::UnixListener::bind(dir.path().join("agent.sock")).unwrap();
 
-    let (ok, request) = run_hook(dir.path(), "post-dump");
-    drop((held, other));
+    let (ok, request) = run_hook(dir.path(), "post-dump", job.pid());
+    drop((job, other));
     assert!(
         !ok,
         "the post-dump hook must fail the dump of a job holding a deleted host file \
@@ -85,7 +99,7 @@ fn post_dump_hook_vetoes_a_deleted_host_file_with_other_links() {
 #[test]
 fn the_dump_hook_does_nothing_at_other_stages() {
     let dir = tempfile::tempdir().unwrap();
-    let (ok, request) = run_hook(dir.path(), "pre-dump");
+    let (ok, request) = run_hook(dir.path(), "pre-dump", std::process::id());
     assert!(ok);
     assert!(!hook_refusal_path(&request).exists());
     assert!(!hook_result_path(&request).exists());
