@@ -35,6 +35,9 @@ concurrency:
 
 jobs:
   apt-repo:
+    # `apt` is a normal (non-latest) release, so publishing or editing it fires `released`: skip
+    # (not fail) every release event whose tag is not a version tag.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-24.04
     # Uploads the repository's files to the `apt` release with gh (GH_TOKEN);
     # the checkout keeps no token.

@@ -451,7 +451,7 @@ sudo apt purge gpueue     # also delete /etc/gpueue and the APT repository entry
 <a id="the-apt-repository-maintainers"></a>
 ### APT リポジトリ（メンテナー向け）
 
-リポジトリは、リリース `apt`（プレリリースなので、`install.sh` と `gpueue update` がたどる「最新」リリース
+リポジトリは、リリース `apt`（「最新にしない」設定の通常リリースなので、`install.sh` と `gpueue update` がたどる「最新」リリース
 になることはありません）のアセットの集まりです。`.deb` ファイル、`Packages`、`Packages.gz`、`Release`、
 `InRelease`、`Release.gpg`、公開鍵 `gpueue.gpg`、`gpueue.sources` です。リリースが**安定版リリースとして
 公開されたとき**（`released` イベント：安定版リリースの公開、またはプレリリースの安定版への変更）、
