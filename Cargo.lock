@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "gpueue"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "clap",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "gpueue-checkpoint"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "rustix",
  "serde",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "gpueue-config"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "gpueue-core",
  "gpueue-protocol",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "gpueue-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "rusqlite",
  "serde",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "gpueue-daemon"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "axum",
  "chrono",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "gpueue-helper"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "cc",
  "clap",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "gpueue-protocol"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "gpueue-core",
  "http-body-util",

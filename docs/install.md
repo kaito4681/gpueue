@@ -821,7 +821,7 @@ must be installed as above.
 
 ## Arch Linux (AUR)
 
-**The AUR package is not published yet.** Until it is, install gpueue on Arch Linux with
+**The AUR package is planned and not published yet** ([#159](https://github.com/kaito4681/gpueue/issues/159)); it will be available once it is published. Until it is, install gpueue on Arch Linux with
 `install.sh` (it works on Arch: glibc 2.34 or newer, systemd, x86_64 or aarch64, and it verifies
 the minisign signature). CRIU 4.2 or newer comes from the official repositories:
 

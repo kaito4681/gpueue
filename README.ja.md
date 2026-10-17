@@ -15,9 +15,6 @@
 > 行っていません。
 > [プロジェクトの状況](#project-status) を参照してください。
 
-> **リリースはまだ公開されていません。** 以下のダウンロードリンク、APT リポジトリ、`stable` ブランチは、最初の
-> リリースから使えるようになります。
-
 <a id="why"></a>
 ## なぜ gpueue か
 
@@ -132,7 +129,7 @@ sudo ./result/bin/gpueue service install
 ```
 
 Arch Linux（x86_64、aarch64）では、当面は上記のインストーラーを使ってください。AUR パッケージ `gpueue-bin`
-はまだ公開されていません。CRIU（チェックポイントには 4.2 以降）は公式リポジトリにあります。
+は公開予定で、まだ公開されていません（[#159](https://github.com/kaito4681/gpueue/issues/159)）。CRIU（チェックポイントには 4.2 以降）は公式リポジトリにあります。
 
 ```sh
 sudo pacman -S criu

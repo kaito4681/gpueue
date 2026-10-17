@@ -842,7 +842,7 @@ Nix のビルドをリリースの tarball のバイナリで置き換えます�
 <a id="arch-linux-aur"></a>
 ## Arch Linux (AUR)
 
-**AUR パッケージはまだ公開されていません。** 公開されるまでは、Arch Linux には `install.sh` で gpueue を
+**AUR パッケージは公開予定で、まだ公開されていません**（[#159](https://github.com/kaito4681/gpueue/issues/159)）。公開され次第使えるようになります。公開されるまでは、Arch Linux には `install.sh` で gpueue を
 インストールしてください（Arch でも動作します。glibc 2.34 以降、systemd、x86_64 または aarch64 で、
 minisign の署名も検証します）。CRIU 4.2 以降は公式リポジトリから入れます。
 
