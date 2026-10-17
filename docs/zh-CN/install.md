@@ -347,7 +347,7 @@ minisign -Vm "gpueue_${arch}.deb" -P RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp
 | `/etc/gpueue/config.toml` | 默认配置（conffile：升级时保留你的修改） |
 | `/etc/apt/sources.list.d/gpueue.sources`, `/etc/apt/keyrings/gpueue.gpg` | gpueue APT 仓库及其签名密钥（conffile，见下文） |
 | `/usr/share/bash-completion`, `zsh/vendor-completions`, `fish/vendor_completions.d` | shell 补全 |
-| `/usr/share/doc/gpueue` | README、本指南、架构说明、许可证 |
+| `/usr/share/doc/gpueue` | README、本指南、使用参考、架构说明、许可证 |
 
 首次安装时，它会创建用户、组和目录，然后启用并启动 `gpueue-helper.service` 和 `gpueue.service`；
 请用 `gpueue doctor` 检查结果。当 systemd 不是 PID 1 时（正在构建的容器镜像、chroot），服务只会被启用，
@@ -1292,7 +1292,7 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/gpue
 | `checkpoint_deadline_secs_per_gib` | `30` | helper | 该期限中按每 GiB RSS + VRAM（检查点）或镜像（恢复）计算的部分 |
 | `criu_dump_timeout_secs` | 未设置 | helper | 可选，单独限制 `criu dump`；未设置时只适用期限 |
 | `criu_restore_timeout_secs` | 未设置 | helper | 可选，单独限制 `criu restore`；未设置时只适用期限 |
-| `fork_guard` | `true` | helper | 向作业预加载 fork guard（见 README 的限制一节） |
+| `fork_guard` | `true` | helper | 向作业预加载 fork guard（见[限制](usage.md#limitations)） |
 | `gpu_device_isolation` | `true` | helper | 每个作业单元只能打开所分配 GPU 的设备节点（`DevicePolicy=closed`）；`false` 关闭此功能（见 [GPU 隔离](#gpu-isolation)） |
 | `job_system_dbus` | `false` | helper | `true` 允许作业访问系统 D-Bus（systemd、polkit）；默认情况下对作业隐藏 `/run/dbus`（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |
 | `job_systemd_varlink` | `false` | helper | `true` 允许作业访问 `/run/systemd` 下的 systemd Varlink 服务；默认情况下该目录对作业隐藏，只保留 journald 的日志套接字、resolved 的名称解析套接字和 `resolv.conf` 文件以及 `userdb/`（见 [作业能做什么、不能做什么](#what-a-job-can-and-cannot-do)） |

@@ -390,7 +390,7 @@ trusted comment にはリリースとバージョンなしのファイル名が�
 | `/etc/gpueue/config.toml` | デフォルトの設定（conffile：アップグレードしても編集内容は保持されます） |
 | `/etc/apt/sources.list.d/gpueue.sources`、`/etc/apt/keyrings/gpueue.gpg` | gpueue の APT リポジトリとその署名鍵（conffile、後述） |
 | `/usr/share/bash-completion`、`zsh/vendor-completions`、`fish/vendor_completions.d` | シェルの補完 |
-| `/usr/share/doc/gpueue` | README、このガイド、アーキテクチャの説明、ライセンス |
+| `/usr/share/doc/gpueue` | README、このガイド、使い方のリファレンス、アーキテクチャの説明、ライセンス |
 
 初回のインストールでは、ユーザー、グループ、ディレクトリを作成し、`gpueue-helper.service` と
 `gpueue.service` を有効化して起動します。結果は `gpueue doctor` で確認してください。systemd が PID 1 でない
@@ -1430,7 +1430,7 @@ sudo systemctl restart gpueue-helper.service gpueue.service
 | `checkpoint_deadline_secs_per_gib` | `30` | ヘルパー | その期限のうち、RSS + VRAM（チェックポイント）またはイメージ（リストア）1 GiB あたりの部分 |
 | `criu_dump_timeout_secs` | 未設定 | ヘルパー | `criu dump` 単体の任意の上限。未設定なら期限だけが適用されます |
 | `criu_restore_timeout_secs` | 未設定 | ヘルパー | `criu restore` 単体の任意の上限。未設定なら期限だけが適用されます |
-| `fork_guard` | `true` | ヘルパー | ジョブに fork ガードをプリロードします（README の制限事項を参照） |
+| `fork_guard` | `true` | ヘルパー | ジョブに fork ガードをプリロードします（[制限事項](usage.md#limitations)を参照） |
 | `gpu_device_isolation` | `true` | ヘルパー | 各ジョブのユニットが開けるデバイスノードを、割り当てた GPU のものに限ります（`DevicePolicy=closed`）。`false` で無効になります（[GPU の分離](#gpu-isolation) を参照） |
 | `job_system_dbus` | `false` | ヘルパー | `true` にするとジョブがシステムの D-Bus（systemd、polkit）に接続できます。デフォルトではジョブから `/run/dbus` を隠します（[ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)を参照） |
 | `job_systemd_varlink` | `false` | ヘルパー | `true` にするとジョブが `/run/systemd` の下にある systemd の Varlink サービスに接続できます。デフォルトでは journald のログのソケット、resolved の名前解決のソケットと `resolv.conf` のファイル、`userdb/` 以外のこのディレクトリをジョブから隠します（[ジョブにできること・できないこと](#what-a-job-can-and-cannot-do)を参照） |

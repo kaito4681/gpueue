@@ -106,6 +106,9 @@ contents:
   - src: docs/install.md
     dst: /usr/share/doc/gpueue/install.md
     file_info: { mode: 0644 }
+  - src: docs/usage.md
+    dst: /usr/share/doc/gpueue/usage.md
+    file_info: { mode: 0644 }
   - src: docs/architecture.md
     dst: /usr/share/doc/gpueue/architecture.md
     file_info: { mode: 0644 }

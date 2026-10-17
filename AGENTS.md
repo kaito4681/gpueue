@@ -39,6 +39,8 @@
   configuration keys, packaging or behaviour change. The English docs are canonical; the same PR
   must update `README.ja.md`, `README.zh-CN.md`, `docs/ja/` and `docs/zh-CN/` (commands, code,
   keys and paths untranslated, English anchor ids kept).
+- `docs/usage.md` counts as user documentation too; the README's `gpueue --help` block is real
+  output, so refresh it (in all three READMEs) when the top-level help changes.
 - Update the Agent Skill in `skills/gpueue/` when user-facing commands, flags, JSON output, error
   messages or scheduling/checkpoint behaviour change; every command it shows must exist, and the
   frontmatter `name` must equal the directory name.
