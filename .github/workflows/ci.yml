@@ -246,7 +246,7 @@ jobs:
         with:
           persist-credentials: false
       - run: scripts/dist/build-test-versions.sh target/dist-releases test.1 test.2:migration
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-releases
           path: target/dist-releases
@@ -298,7 +298,7 @@ jobs:
           for base in debian:12 ubuntu:24.04; do
             GPUEUE_DEB_BASE="$base" scripts/deb-test.sh target/deb/gpueue_*.deb
           done
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: deb-${{ matrix.runner }}
           path: target/deb/gpueue_*.deb
