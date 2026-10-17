@@ -4198,6 +4198,120 @@ fn file_entry(kind: u64, id: u64, field: u64, inner: &[u8]) -> Vec<u8> {
     fe
 }
 
+/// libcuda listens on `@cuda-uvmfd-<pid ns inode>-<pid>@` in every process
+/// that initialises CUDA, and nothing asks who listens there: a checkpoint
+/// with that listener is restored when the process tree (`pstree.img`) has
+/// the pid of its name and the job has libcuda mapped. Any other abstract
+/// listener, a near miss of the name, a pid the job does not have, or a job
+/// without libcuda is refused.
+#[tokio::test]
+async fn restore_accepts_only_libcudas_abstract_listener() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 3).await;
+    let images = CheckpointDir::for_job(&env.base(), 3).images_dir();
+    let listener = |id: u64, name: &[u8]| {
+        let mut usk = Vec::new();
+        pb_uint(1, id, &mut usk);
+        pb_uint(4, 10, &mut usk); // TCP_LISTEN
+        pb_bytes(11, name, &mut usk);
+        file_entry(5, id, 16, &usk)
+    };
+    let reg = |id: u64, path: &str| {
+        let mut reg = Vec::new();
+        pb_uint(1, id, &mut reg);
+        pb_bytes(6, path.as_bytes(), &mut reg);
+        file_entry(1, id, 3, &reg)
+    };
+    let pstree = |pids: &[u64]| {
+        let entries: Vec<Vec<u8>> = pids
+            .iter()
+            .map(|p| {
+                let mut e = Vec::new();
+                pb_uint(1, *p, &mut e);
+                e
+            })
+            .collect();
+        raw_image(&entries)
+    };
+    let libcuda = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.99.02";
+    let cuda = b"\0cuda-uvmfd-4026532358-2\0";
+    // What, the entries of `files.img`, the pids of `pstree.img`, whether
+    // the restore may go on.
+    type Case<'a> = (&'a str, Vec<Vec<u8>>, &'a [u64], bool);
+    let cases: Vec<Case> = vec![
+        (
+            "without libcuda",
+            vec![reg(1, "/usr/lib/libcudart.so.12"), listener(2, cuda)],
+            &[1, 2],
+            false,
+        ),
+        (
+            "a pid the job does not have",
+            vec![reg(1, libcuda), listener(2, cuda)],
+            &[1, 3],
+            false,
+        ),
+        (
+            "no NUL at the end",
+            vec![reg(1, libcuda), listener(2, b"\0cuda-uvmfd-4026532358-2")],
+            &[1, 2],
+            false,
+        ),
+        (
+            "another name too",
+            vec![reg(1, libcuda), listener(2, cuda), listener(3, b"\0ctl")],
+            &[1, 2],
+            false,
+        ),
+        (
+            "libcuda's",
+            vec![reg(1, libcuda), listener(2, cuda)],
+            &[1, 2],
+            true,
+        ),
+    ];
+    for (what, entries, pids, ok) in cases {
+        std::fs::write(images.join("files.img"), raw_image(&entries)).unwrap();
+        std::fs::write(images.join("pstree.img"), pstree(pids)).unwrap();
+        let r = c.request(restore_req(3, &image_dir)).await;
+        if !ok {
+            let ResponseResult::Error {
+                code: HelperErrorCode::PermissionDenied,
+                message,
+            } = &r
+            else {
+                panic!("{what}: {r:?}")
+            };
+            assert!(message.contains("abstract names"), "{what}: {message}");
+            continue;
+        }
+        assert_eq!(r, ResponseResult::Accepted, "{what}");
+        assert!(matches!(
+            c.event().await.event,
+            Event::RestoreFinished {
+                outcome: RestoreOutcome::Success { .. },
+                ..
+            }
+        ));
+        let r = c
+            .request(Request::Checkpoint {
+                job: JobId(3),
+                image_dir: image_dir.clone(),
+                options: Default::default(),
+            })
+            .await;
+        assert_eq!(r, ResponseResult::Accepted, "{what}");
+        assert!(matches!(
+            c.event().await.event,
+            Event::CheckpointFinished {
+                outcome: CheckpointOutcome::Success { .. },
+                ..
+            }
+        ));
+    }
+}
+
 /// Regression (audit V2): objects CRIU recreates as root that no check
 /// of the helper sees. Each must make the restore fail before CRIU runs.
 ///
