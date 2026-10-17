@@ -15,9 +15,6 @@ stopped. It does not start over.
 > jobs yet.
 > See [Project status](#project-status).
 
-> **No release has been published yet.** The download links, the APT repository and the `stable`
-> branch below work from the first release on.
-
 ## Why
 
 On a shared GPU workstation people usually run jobs with `nohup`, `tmux` or a per-user pueue, and
@@ -127,15 +124,15 @@ sudo ./result/bin/gpueue service install
 ```
 
 On Arch Linux (x86_64, aarch64), use the installer above for now: the AUR package `gpueue-bin` is
-not published yet. CRIU (4.2 or newer, for checkpoints) is in the official repositories:
+planned and not published yet ([#159](https://github.com/kaito4681/gpueue/issues/159)). CRIU (4.2 or newer, for checkpoints) is in the official repositories:
 
 ```sh
 sudo pacman -S criu
 curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.sh | sudo bash
 ```
 
-Update with `sudo gpueue update` and remove with `sudo gpueue uninstall`. Once the package is on
-the AUR, you can install [`gpueue-bin`](https://aur.archlinux.org/packages/gpueue-bin) with any AUR
+Update with `sudo gpueue update` and remove with `sudo gpueue uninstall`. Once the package is published on
+the AUR (planned, #159), you can install [`gpueue-bin`](https://aur.archlinux.org/packages/gpueue-bin) with any AUR
 helper instead (see [docs/install.md](docs/install.md#arch-linux-aur)).
 
 #### Dependencies that are not installed automatically

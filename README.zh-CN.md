@@ -14,8 +14,6 @@
 > 但尚**未**在物理机（裸机）上或带着 GPU 作业经历真实重启的测试。
 > 参见[项目状态](#project-status)。
 
-> **尚未发布任何版本。** 下面的下载链接、APT 仓库和 `stable` 分支将从第一个版本发布起可用。
-
 <a id="why"></a>
 ## 为什么需要 gpueue
 
@@ -118,7 +116,7 @@ nix build github:kaito4681/gpueue/stable
 sudo ./result/bin/gpueue service install
 ```
 
-在 Arch Linux（x86_64、aarch64）上，目前请使用上面的安装脚本：AUR 软件包 `gpueue-bin` 尚未发布。
+在 Arch Linux（x86_64、aarch64）上，目前请使用上面的安装脚本：AUR 软件包 `gpueue-bin` 计划发布但尚未发布（[#159](https://github.com/kaito4681/gpueue/issues/159)）。
 CRIU（4.2 或更新版本，用于检查点）位于官方仓库中：
 
 ```sh

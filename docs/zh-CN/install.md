@@ -755,7 +755,7 @@ sudo ./result/bin/gpueue service install
 <a id="arch-linux-aur"></a>
 ## Arch Linux (AUR)
 
-**AUR 软件包尚未发布。** 在此之前，请在 Arch Linux 上使用 `install.sh` 安装 gpueue（它在 Arch 上可以使用：
+**AUR 软件包计划发布，但尚未发布**（[#159](https://github.com/kaito4681/gpueue/issues/159)），发布后即可使用。在此之前，请在 Arch Linux 上使用 `install.sh` 安装 gpueue（它在 Arch 上可以使用：
 glibc 2.34 或更高版本、systemd、x86_64 或 aarch64，并且它会校验 minisign 签名）。CRIU 4.2 或更高版本可从
 官方仓库获得：
 
