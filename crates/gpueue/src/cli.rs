@@ -152,7 +152,8 @@ pub enum SubCommand {
         #[arg(verbatim_doc_comment, short, long)]
         escape: bool,
 
-        /// Start the job immediately, ignoring the group's parallel limit.
+        /// Start the job right away, ignoring the group's parallel limit (administrators only).
+        /// For other users the job is queued first among their own jobs instead.
         #[arg(short = 'i', long, conflicts_with = "stashed")]
         immediate: bool,
 
@@ -323,7 +324,8 @@ pub enum SubCommand {
         #[arg(short = 'g', long, conflicts_with = "all_failed")]
         failed_in_group: Option<String>,
 
-        /// Start the jobs right away, ignoring free slots and dependencies.
+        /// Start the new jobs right away, ignoring free slots and dependencies (administrators only).
+        /// For other users they are queued first among their own jobs instead.
         #[arg(short = 'k', long, conflicts_with = "stashed")]
         immediate: bool,
 
@@ -619,7 +621,8 @@ pub enum SubCommand {
         #[arg(short, long)]
         all: bool,
 
-        /// Resume right away without waiting for free slots.
+        /// Resume right away without waiting for free slots (administrators only).
+        /// For other users the restore is queued first among their own jobs instead.
         #[arg(short, long)]
         immediate: bool,
     },
