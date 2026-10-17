@@ -427,6 +427,55 @@ fn installed_bin_dir(detection: &Detection) -> Option<&Path> {
     })
 }
 
+/// Checks that nobody but root could have replaced the file `path` that is copied and then run
+/// as root: [`check_root_owned_chain`], except that a sticky directory owned by root (`/tmp`,
+/// where `install.sh` and `gpueue update` unpack a release in a directory only root can enter) is
+/// accepted as well, since in it only the owner of an entry can rename or delete it. The file
+/// itself and the directories below the sticky one must be root's and protected.
+fn check_copy_source(sys: &dyn System, path: &Path) -> std::result::Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let first = match check_root_owned_chain(sys, path) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    let Ok(real) = std::fs::canonicalize(sys.path(path)) else {
+        return Err(first);
+    };
+    let real_root = std::fs::canonicalize(sys.root()).unwrap_or_else(|_| sys.root().to_owned());
+    // Up to, not including, the managed system's root (as check_root_owned_chain stops there).
+    let ancestors: Vec<&Path> = real
+        .ancestors()
+        .take_while(|dir| *dir != real_root)
+        .collect();
+    // A directory of root's that nobody else can enter seals what is below it: only the
+    // directories from there up must be protected against being replaced.
+    let sealed = |dir: &Path| {
+        std::fs::metadata(dir).is_ok_and(|meta| {
+            meta.is_dir() && meta.uid() == sys.root_uid() && meta.mode() & 0o077 == 0
+        })
+    };
+    let start = ancestors.iter().position(|dir| sealed(dir));
+    for dir in ancestors.iter().skip(start.unwrap_or(0)) {
+        let Ok(meta) = std::fs::metadata(dir) else {
+            return Err(first);
+        };
+        let sticky = meta.is_dir() && meta.mode() & 0o1000 != 0;
+        let protected = meta.mode() & 0o022 == 0 || sticky;
+        if meta.uid() != sys.root_uid() || !protected {
+            return Err(first);
+        }
+    }
+    if start.is_some() {
+        return Ok(());
+    }
+    // The file itself must not be writable by others, even in a sticky directory.
+    match std::fs::metadata(&real) {
+        Ok(meta) if meta.uid() == sys.root_uid() && meta.mode() & 0o022 == 0 => Ok(()),
+        _ => Err(first),
+    }
+}
+
 /// Decides where the units run the binaries from and copies them there unless they already
 /// are: `--bin-dir` if given; else the directory of an existing `service install`
 /// installation; else the directory of this binary if it is /usr/bin or /usr/local/bin (used
@@ -509,8 +558,23 @@ fn install_binaries(
             if same_file(sys, source, &target) && root_owned_regular_file(sys, &target) {
                 continue;
             }
-            let bytes = std::fs::read(sys.path(source))
-                .map_err(io_err(format!("reading {}", source.display())))?;
+            let bytes = if source == &exe {
+                // The running binary itself, not whatever its path points to by now.
+                sys.read_current_exe()
+            } else {
+                // The helper is copied to where root runs it from: if anyone else could have
+                // replaced it (or a directory above it), it is not trusted.
+                check_copy_source(sys, source).map_err(|err| {
+                    format!(
+                        "{} is not trusted ({err}); put gpueue and gpueue-helper in a directory \
+                         only root can write to (such as {DEFAULT_BIN_DIR}) and run \
+                         `service install` from there",
+                        source.display()
+                    )
+                })?;
+                std::fs::read(sys.path(source))
+            }
+            .map_err(io_err(format!("reading {}", source.display())))?;
             if let Some(file) = stage_file(sys, &target, &bytes, 0o755)? {
                 staged.push(file);
             }
@@ -1307,6 +1371,14 @@ fn purge(
             )
             .ok();
         }
+        for skipped in &purged.kept_inaccessible {
+            writeln!(
+                out,
+                "kept {} (not accessible or nested too deeply; delete it by hand)",
+                skipped.display()
+            )
+            .ok();
+        }
         if purged.removed {
             writeln!(out, "removed {dir}").ok();
         } else if purged.is_mount {
@@ -1363,7 +1435,14 @@ struct Purged {
     /// Directories below it that were not empty any more when they were to be removed (system
     /// paths).
     kept_not_empty: Vec<PathBuf>,
+    /// Entries that could not be read or removed (permission denied, or nested deeper than
+    /// [`MAX_PURGE_DEPTH`]) and were left in place (system paths).
+    kept_inaccessible: Vec<PathBuf>,
 }
+
+/// How deep below a purge directory [`remove_entry`] descends (one open file descriptor per
+/// level); deeper directories are kept and reported.
+const MAX_PURGE_DEPTH: usize = 64;
 
 /// Deletes the system path `path` recursively without following symlinks and without entering
 /// mount points (a bind mount of `/` below /run/gpueue-helper must never be descended into).
@@ -1403,6 +1482,7 @@ fn remove_tree(
         path,
         parent_dev,
         remove_dir,
+        depth: 0,
     };
     purged.removed = remove_entry(&at, mounts, true, &mut purged)?;
     Ok(purged)
@@ -1416,6 +1496,8 @@ struct Location<'a> {
     path: &'a Path,
     parent_dev: u64,
     remove_dir: &'a RemoveDir<'a>,
+    /// 0 for the purge directory.
+    depth: usize,
 }
 
 /// Removes the entry; returns whether it is gone. `top` is the purge directory itself, which
@@ -1427,13 +1509,37 @@ fn remove_entry(
     purged: &mut Purged,
 ) -> Result<bool> {
     use nix::errno::Errno;
-    use nix::fcntl::{OFlag, openat};
-    use nix::sys::stat::Mode;
+    use nix::fcntl::{AtFlags, OFlag, openat};
+    use nix::sys::stat::{Mode, SFlag, fstatat};
     use nix::unistd::{UnlinkatFlags, unlinkat};
 
     let path = at.path;
     let removing = |err: Errno| format!("removing {}: {err}", path.display());
     let reading = |err: Errno| format!("reading {}: {err}", path.display());
+    if !top {
+        if at.depth > MAX_PURGE_DEPTH {
+            purged.kept_inaccessible.push(path.to_owned());
+            return Ok(false);
+        }
+        // Decide about mount points before opening anything: a directory on another device
+        // (or one listed in mountinfo, e.g. a bind mount) is never opened.
+        match fstatat(at.parent, at.name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                let is_dir = SFlag::from_bits_truncate(stat.st_mode & SFlag::S_IFMT.bits())
+                    == SFlag::S_IFDIR;
+                if is_dir && (stat.st_dev != at.parent_dev || mounts.contains(path)) {
+                    purged.kept_mounts.push(path.to_owned());
+                    return Ok(false);
+                }
+            }
+            Err(Errno::ENOENT) => return Ok(true),
+            Err(Errno::EACCES | Errno::EPERM) => {
+                purged.kept_inaccessible.push(path.to_owned());
+                return Ok(false);
+            }
+            Err(err) => return Err(reading(err)),
+        }
+    }
     let dir = match openat(
         at.parent,
         at.name,
@@ -1444,10 +1550,21 @@ fn remove_entry(
         // Not a directory (a symlink is never followed): unlink the entry itself. unlinkat
         // does not follow symlinks either, and fails if a directory took its place.
         Err(Errno::ENOTDIR | Errno::ELOOP) => {
-            unlinkat(at.parent, at.name, UnlinkatFlags::NoRemoveDir).map_err(removing)?;
-            return Ok(true);
+            return match unlinkat(at.parent, at.name, UnlinkatFlags::NoRemoveDir) {
+                Ok(()) => Ok(true),
+                Err(Errno::ENOENT) => Ok(true),
+                Err(Errno::EACCES | Errno::EPERM) if !top => {
+                    purged.kept_inaccessible.push(path.to_owned());
+                    Ok(false)
+                }
+                Err(err) => Err(removing(err)),
+            };
         }
         Err(Errno::ENOENT) => return Ok(true),
+        Err(Errno::EACCES | Errno::EPERM) if !top => {
+            purged.kept_inaccessible.push(path.to_owned());
+            return Ok(false);
+        }
         Err(err) => return Err(format!("opening {}: {err}", path.display())),
     };
     let dev = nix::sys::stat::fstat(&dir).map_err(reading)?.st_dev;
@@ -1481,6 +1598,7 @@ fn remove_entry(
             path: &path.join(name),
             parent_dev: dev,
             remove_dir: at.remove_dir,
+            depth: at.depth + 1,
         };
         empty &= remove_entry(&child, mounts, false, purged)?;
     }
@@ -1492,6 +1610,10 @@ fn remove_entry(
             // was listed: it is kept, like a mount point, and the purge goes on.
             Err(Errno::ENOTEMPTY | Errno::EEXIST) if !top => {
                 purged.kept_not_empty.push(path.to_owned());
+                Ok(false)
+            }
+            Err(Errno::EACCES | Errno::EPERM) if !top => {
+                purged.kept_inaccessible.push(path.to_owned());
                 Ok(false)
             }
             Err(err) => Err(removing(err)),

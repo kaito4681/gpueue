@@ -170,6 +170,11 @@ Options go after `bash -s --` when the script comes from a pipe (for example
 | `--purge` | with `--uninstall`, also delete `/etc/gpueue` and `/var/lib/gpueue` (and the data directories `config.toml` sets) |
 | `-y`, `--yes` | do not ask before purging |
 
+Without `--version`, `install.sh` refuses to replace an installed gpueue with an older release
+(it only asks an installed `gpueue` that root alone can replace: the one the unit runs, or one in
+`/usr/local/bin` or `/usr/bin`, never one found through `PATH`). The release's tag must look like
+`v<major>.<minor>.<patch>`; anything else is refused.
+
 A token is saved only with `--save-token`. Without it, an expired or revoked token cannot break
 a later run without you noticing which token was used.
 
@@ -187,11 +192,11 @@ binary decides the rest before it installs anything. It then:
    temporary directory (over HTTPS only, also for redirects), checks that the `.sha256` file is
    the checksum of that tarball by name, and checks the checksum,
 3. checks the `.minisig` signature against the release key built into the script
-   (`packaging/minisign.pub`). It uses the `minisign` in `PATH`; without one it downloads the
-   static minisign 0.12 release from GitHub into the temporary directory, checks it against the
-   SHA-256 checksum built into the script (the same pin as `scripts/dist/get-minisign.sh`), and
-   uses that. If that download fails, it stops and asks you to install `minisign` from your
-   distribution (e.g. `sudo apt install minisign`) and re-run it; the signature is never skipped.
+   (`packaging/minisign.pub`). It never uses a `minisign` found in `PATH` (the script runs as
+   root): it downloads the static minisign 0.12 release from GitHub into the temporary directory,
+   checks it against the SHA-256 checksum built into the script (the same pin as
+   `scripts/dist/get-minisign.sh`), and uses that. If that download fails, it stops; the
+   signature is never skipped.
    The signature's trusted comment must be `gpueue <tag> <file>` for the requested release and
    tarball, so an older release's (validly signed) tarball served under a newer name is refused,
 4. extracts the tarball (refusing links and paths outside it), runs the new
@@ -932,7 +937,9 @@ it. `install.sh` installs them (see above). By hand:
 
 ```sh
 sha256sum -c gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar xzf gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+# Unpack as root in a directory only root can write to (e.g. below /root): the helper is
+# run as root, so `service install` refuses one that others could have replaced.
+sudo tar --no-same-owner -xzf gpueue-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
 sudo gpueue-v0.1.0-x86_64-unknown-linux-gnu/gpueue service install
 ```
 
@@ -942,7 +949,12 @@ sudo gpueue-v0.1.0-x86_64-unknown-linux-gnu/gpueue service install
 sudo target/release/gpueue service install
 ```
 
-`gpueue-helper` must sit next to `gpueue`. The units run the binaries from:
+`gpueue-helper` must sit next to `gpueue`. When `service install` copies it, the helper and every
+directory above it must be owned by root and not group- or world-writable (it is run as root, so
+anyone who could swap it before the copy would get root); otherwise install refuses and says so.
+Build or unpack the release in a directory only root can write to (for example below `/root`,
+with `sudo tar`), or put both binaries in `/usr/local/bin` first. `gpueue` itself is copied from
+the running process, not from its path. The units run the binaries from:
 
 1. the directory of the current `service install` installation, when re-installing or updating,
 2. else the directory the `gpueue` binary is in, if that is `/usr/bin` or `/usr/local/bin`
@@ -1108,6 +1120,12 @@ The refusals name the way to update or remove gpueue that fits the install metho
 | Nix on NixOS | `nix flake update && sudo nixos-rebuild switch` | `services.gpueue.enable = false`, then `sudo nixos-rebuild switch` |
 | Nix elsewhere | the Nix configuration that created the unit | the same |
 | `gpueue service install` | `sudo gpueue update` | `sudo gpueue uninstall` |
+
+The helper unit (`gpueue-helper.service`) is intentionally not sandboxed: it runs as root and has
+to see the host's mounts and devices, bind-mount `/` for `criu restore --root`, and start processes
+that CRIU and cuda-checkpoint operate on, and sandboxing directives (device allow-lists, seccomp
+filters) would also affect those processes. Its protection is that it is small, only reads
+root-owned configuration, and refuses what others could have replaced.
 
 The daemon runs with `ProtectSystem=strict`: it can only write below the unit's
 `ReadWritePaths=/var/lib/gpueue/daemon /var/lib/gpueue/logs /run/gpueue`. If you move `data_dir`,
@@ -2112,7 +2130,7 @@ rate limit): `GH_TOKEN` or `GITHUB_TOKEN` (`sudo GH_TOKEN=... gpueue update`), o
    (which repairs the pair); if both are (only the final checks failed), it warns and goes on.
 
 `install.sh` (run again, optionally with `--version`) works too and does the same; it checks the
-signature with the `minisign` in `PATH`, or downloads a pinned one (see
+signature with a pinned minisign it downloads (see
 [Running the installer](#running-the-installer)).
 
 `service install` (and so both ways above) replaces the binaries and units and restarts both

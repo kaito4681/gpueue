@@ -169,13 +169,13 @@ scenario_17() {
     mv /tmp/os-release.saved /etc/os-release
     [ ! -e /usr/local/bin/gpueue ] || fail "a refused install left /usr/local/bin/gpueue"
 
-    step "17: without minisign installed, a downloaded one checks the signature"
+    step "17: the pinned, downloaded minisign checks the signature"
     ! command -v minisign >/dev/null || fail "minisign is installed already"
     GH_TOKEN="$TOKEN" expect_fail "bad signature" bash "$install" --version "$VERSION-test.badsig"
     # A minisign download that fails, or does not match the pinned checksum,
     # stops the installation (there is no way to skip the signature).
     GPUEUE_MINISIGN_TARBALL_URL=http://127.0.0.1:8081/missing.tar.gz GH_TOKEN="$TOKEN" \
-        expect_fail "install it (e.g." bash "$install"
+        expect_fail "downloads a pinned release" bash "$install"
     GPUEUE_MINISIGN_TARBALL_URL=http://127.0.0.1:8081/corrupt.tar.gz GH_TOKEN="$TOKEN" \
         expect_fail "does not match its SHA-256 checksum" bash "$install"
     [ ! -e /usr/local/bin/gpueue ] || fail "a refused install left /usr/local/bin/gpueue"
@@ -204,7 +204,7 @@ scenario_17() {
     id="$(start_job)"
     wait_for 20 "job $id to run" job_alive "$id"
 
-    step "17: a bad signature is refused (minisign installed now)"
+    step "17: a bad signature is refused (a minisign in PATH is ignored)"
     install -m 0755 /dist/minisign /usr/local/bin/minisign
     local before
     before="$(sha256sum /usr/local/bin/gpueue)"
@@ -220,13 +220,18 @@ scenario_17() {
     set_latest "$V2"
     GH_TOKEN="$TOKEN" bash "$install" | tee /tmp/install-v2.out
     grep -q "verified the minisign signature" /tmp/install-v2.out || fail "signature not verified"
-    grep -q "checking the signature with /usr/local/bin/minisign" /tmp/install-v2.out ||
-        fail "the installed minisign was not used"
-    if grep -q "downloading minisign" /tmp/install-v2.out; then fail "minisign downloaded again"; fi
+    # A minisign in PATH is never trusted: the pinned one is downloaded all the same.
+    grep -q "downloading minisign" /tmp/install-v2.out || fail "the pinned minisign was not downloaded"
     wait_for 30 "the v2 daemon" bash -c "gpueue service status 2>/dev/null | grep -q 'version $V2, API'"
     /usr/local/bin/gpueue --version | grep -qF "$V2" || fail "gpueue --version is not $V2"
     job_alive "$id" || fail "job $id stopped during the update"
     [ "$(job_state "$id")" = running ] || fail "job $id is $(job_state "$id") after the update"
+
+    step "17: a latest release older than the installed one is refused without --version"
+    set_latest "$V1"
+    GH_TOKEN="$TOKEN" expect_fail "not downgrading" bash "$install"
+    /usr/local/bin/gpueue --version | grep -qF "$V2" || fail "the binary is not $V2 any more"
+    set_latest "$V2"
 
     step "17: --uninstall keeps the data"
     bash "$install" --uninstall | tee /tmp/uninstall.out

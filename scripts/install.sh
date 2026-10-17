@@ -19,8 +19,9 @@ INSTALL_MARKER='# Installed by `gpueue service install`; re-running it overwrite
 # The release signing key; must match packaging/minisign.pub (checked by the
 # release workflow and a unit test).
 MINISIGN_PUBKEY="RWQhfodV2C486vD6glCl5MvvRupK9WboEzB2GUxcdmp2+NNqaL9W+UFP"
-# Without minisign in PATH, this static minisign release (x86_64 and aarch64
-# binaries in one tarball) is downloaded and checked against this SHA-256.
+# This static minisign release (x86_64 and aarch64 binaries in one tarball) is
+# always downloaded and checked against this SHA-256; a minisign in PATH is
+# never used (this script runs as root, and PATH may name a writable directory).
 # Must match scripts/dist/get-minisign.sh (checked by a unit test).
 MINISIGN_VERSION="0.12"
 MINISIGN_SHA256="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
@@ -172,6 +173,21 @@ version_ge() {
     [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | sed -n 1p)" = "$2" ]
 }
 
+# semver_ge A B: whether version A >= version B, a release ranking above its
+# pre-releases (1.0.0 > 1.0.0-rc.1).
+semver_ge() {
+    local a="$1" b="$2" core_a core_b
+    core_a="${a%%[-+]*}"
+    core_b="${b%%[-+]*}"
+    if [ "$core_a" != "$core_b" ]; then
+        version_ge "$core_a" "$core_b"
+        return
+    fi
+    [ "$a" != "$core_a" ] || return 0 # A is the release (or both are the same)
+    [ "$b" = "$core_b" ] && return 1  # B is the release, A a pre-release
+    version_ge "$a" "$b"
+}
+
 check_glibc() {
     local version
     version="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')" || true
@@ -220,18 +236,44 @@ installed_bin_dir() {
     [ -z "$exe" ] || dirname "$exe"
 }
 
-# The `gpueue` of an existing installation: the one the daemon unit runs, else
-# the one in PATH; nothing if there is none.
+# trusted_exe FILE: whether FILE is an executable regular file that only root
+# can replace: it (resolved) and every directory above it must be owned by root
+# and not writable by group or others. Run as root, so nothing else is run.
+trusted_exe() {
+    local path part owner mode
+    path="$(readlink -f "$1" 2>/dev/null)" || return 1
+    [ -f "$path" ] && [ -x "$path" ] || return 1
+    part="$path"
+    while :; do
+        read -r owner mode < <(stat -c '%u %a' "$part" 2>/dev/null) || return 1
+        [ "$owner" = 0 ] || return 1
+        # Group- or world-writable (octal digits 2, 3, 6, 7), e.g. 775, 1777.
+        case "${mode: -2:1}${mode: -1}" in
+        *[2367]*) return 1 ;;
+        esac
+        [ "$part" != / ] || break
+        part="$(dirname "$part")"
+    done
+}
+
+# The `gpueue` of an existing installation that only root can replace: the one
+# the daemon unit runs, else the one in /usr/local/bin or /usr/bin (never one
+# found through PATH); nothing if there is none.
 installed_gpueue() {
     local unit exe
     for unit in /etc/systemd/system/gpueue.service /usr/lib/systemd/system/gpueue.service /lib/systemd/system/gpueue.service; do
         exe="$(unit_gpueue "$unit")"
-        if [ -n "$exe" ] && [ -x "$exe" ]; then
+        if [ -n "$exe" ] && trusted_exe "$exe"; then
             echo "$exe"
             return
         fi
     done
-    command -v gpueue 2>/dev/null || true
+    for exe in /usr/local/bin/gpueue /usr/bin/gpueue; do
+        if trusted_exe "$exe"; then
+            echo "$exe"
+            return
+        fi
+    done
 }
 
 # Whether /etc/systemd/system/gpueue.service was written by `gpueue service install`.
@@ -501,6 +543,26 @@ fetch_release() {
     api_get "$path" "$WORK/release.json" application/vnd.github+json
     TAG="$(json_tag "$WORK/release.json")"
     [ -n "$TAG" ] || die "cannot read the release's tag from $API_URL$path"
+    # The tag becomes part of file names and paths: only a version tag is used.
+    [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$ ]] ||
+        die "the release's tag \"$TAG\" is not a version tag like v0.2.0; not installing it"
+    if [ -n "$VERSION" ] && [ "$TAG" != "v$VERSION" ]; then
+        die "asked for v$VERSION but the release is tagged $TAG; not installing it"
+    fi
+}
+
+# refuse_downgrade VERSION: without --version, stops instead of replacing an
+# installed gpueue with an older release (e.g. a stale or replayed "latest").
+refuse_downgrade() {
+    local gpueue installed
+    [ -z "$VERSION" ] || return 0
+    gpueue="$(installed_gpueue)"
+    [ -n "$gpueue" ] || return 0
+    installed="$("$gpueue" --version 2>/dev/null | sed -n 's/.*[^0-9.]\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\(-[0-9A-Za-z.-]*\)\{0,1\}\).*/\1/p;q')" || true
+    [ -n "$installed" ] || return 0
+    if ! semver_ge "$1" "$installed"; then
+        die "the latest release ($1) is older than the installed gpueue ($installed); not downgrading. Pass --version $1 to install it anyway"
+    fi
 }
 
 verify() {
@@ -534,18 +596,14 @@ verify() {
 
 # minisign_unavailable REASON: stops. The signature is never skipped.
 minisign_unavailable() {
-    die "$1. minisign is needed to check the release signature: install it (e.g. \`sudo apt install minisign\`, \`sudo dnf install minisign\` or \`sudo pacman -S minisign\`) and re-run this script"
+    die "$1. minisign is needed to check the release signature; this script downloads a pinned release of it, so check the network (and that the temporary directory is not mounted noexec) and re-run it"
 }
 
-# Sets MINISIGN: the one in PATH, else the pinned static release, downloaded
-# into $WORK and checked against MINISIGN_SHA256. Only this machine's binary
-# is taken from the tarball, written (by tar -O) into a new regular file.
+# Sets MINISIGN: the pinned static release, downloaded into $WORK and checked
+# against MINISIGN_SHA256 (a minisign found elsewhere is never used). Only this
+# machine's binary is taken from the tarball, written (by tar -O) into a new
+# regular file.
 find_minisign() {
-    MINISIGN="$(command -v minisign 2>/dev/null)" || MINISIGN=""
-    if [ -n "$MINISIGN" ]; then
-        info "checking the signature with $MINISIGN"
-        return
-    fi
     local url="$MINISIGN_URL" proto='=https' arch archive="$WORK/minisign.tar.gz" sum
     # Test-only: another download URL (ignored without GPUEUE_TEST_HOOKS=1).
     # The checksum below is checked all the same.
@@ -558,7 +616,7 @@ find_minisign() {
     aarch64-*) arch=aarch64 ;;
     *) die "no minisign binary for $TARGET" ;;
     esac
-    info "minisign is not installed: downloading minisign $MINISIGN_VERSION to check the signature"
+    info "downloading minisign $MINISIGN_VERSION to check the signature"
     # A public download: no GitHub token is sent.
     curl --proto "$proto" --proto-redir "$proto" -fsSL --retry 3 -o "$archive" "$url" ||
         minisign_unavailable "cannot download minisign from $url"
@@ -674,6 +732,7 @@ do_install() {
     local version="${TAG#v}"
     local name="gpueue-$TAG-$TARGET"
     local tarball="$name.tar.gz"
+    refuse_downgrade "$version"
     info "installing gpueue $version from $REPO"
     download_asset "$WORK/release.json" "$tarball"
     download_asset "$WORK/release.json" "$tarball.sha256"
@@ -726,6 +785,7 @@ do_uninstall() {
     [ -n "$bin_dir" ] || bin_dir="${BIN_DIR:-$DEFAULT_BIN_DIR}"
     gpueue="$bin_dir/gpueue"
     [ -x "$gpueue" ] || die "$gpueue not found"
+    trusted_exe "$gpueue" || die "$gpueue (or a directory above it) can be replaced by someone other than root; not running it as root"
     # `gpueue uninstall` also removes the binaries `service install` copied. A
     # gpueue from before it has only `service uninstall`, which keeps them.
     local args=(uninstall) legacy=0
