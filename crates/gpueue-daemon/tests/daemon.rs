@@ -3249,10 +3249,8 @@ async fn launches_requeued_but_not_retried_yet_when_the_action_looks_are_pending
     h.helper.release_launches();
     let (launched, release) = gate.reached().await;
     assert_eq!(launched, id);
-    assert!(matches!(
-        admin.job(id).await.state,
-        JobState::RestoreQueued { .. }
-    ));
+    let state = admin.job(id).await.state;
+    assert!(matches!(state, JobState::RestoreQueued { .. }), "{state:?}");
     drop(release);
     let reply = reply.await.unwrap();
     assert_eq!(reply.status, StatusCode::OK);
