@@ -772,6 +772,7 @@ dependencies = [
  "futures",
  "gpueue-config",
  "gpueue-core",
+ "gpueue-daemon",
  "gpueue-protocol",
  "http-body-util",
  "hyper",

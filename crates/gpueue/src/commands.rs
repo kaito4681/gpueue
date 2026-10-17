@@ -803,7 +803,10 @@ impl App {
                             eprintln!(
                                 "{}",
                                 self.ctx.style.paint(
-                                    format!("Job {id}: {err}"),
+                                    format!(
+                                        "Job {id}: {}",
+                                        render::escape_controls(&err.to_string())
+                                    ),
                                     Some(Color::Red),
                                     false
                                 )

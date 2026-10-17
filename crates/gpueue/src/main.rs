@@ -133,7 +133,10 @@ fn run_remote(cli: &Cli, command: SubCommand) -> ExitCode {
         };
         // Warnings the daemon keeps for this user (e.g. a failed checkpoint).
         for warning in app.client.take_warnings() {
-            eprintln!("{BIN_NAME}: warning: {warning}");
+            eprintln!(
+                "{BIN_NAME}: warning: {}",
+                render::escape_controls(&warning.to_string())
+            );
         }
         code
     })
@@ -199,7 +202,9 @@ struct DaemonArgs {
 
 /// `gpueue daemon`: run the daemon in the foreground until it is stopped.
 fn run_daemon(args: DaemonArgs) -> ExitCode {
-    let mut config = match gpueue_daemon::Config::load(&args.config) {
+    // The same trust check as the helper's: the file can name a library the daemon loads
+    // (`nvml_library`) and programs, so one that anyone but root could have changed is refused.
+    let mut config = match gpueue_daemon::Config::load_trusted(&args.config) {
         Ok(config) => config,
         Err(err) => return fail(&format!("{}: {err}", args.config.display())),
     };
@@ -227,7 +232,7 @@ fn run_daemon(args: DaemonArgs) -> ExitCode {
 }
 
 fn fail(message: &str) -> ExitCode {
-    eprintln!("{BIN_NAME}: error: {message}");
+    eprintln!("{BIN_NAME}: error: {}", render::escape_controls(message));
     ExitCode::FAILURE
 }
 

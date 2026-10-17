@@ -247,7 +247,7 @@ and does not read pueue's files. These are the differences:
 | Wording | "task" | "job". Option names such as `--print-task-id` are kept for compatibility. |
 | `--json` | pueue's internal state | gpueue's own schema, described below |
 | `edit`, `env`, `restart --edit` | supported | accepted but not implemented yet |
-| `add -o/--priority`, `switch` | order all tasks of the daemon | order only your own jobs; which user's job starts first is decided by a Slurm-style multifactor priority with fair share (see [Job priority](#job-priority)). `priority_type = "basic"` restores pueue's order. |
+| `add -o/--priority`, `switch` | order all tasks of the daemon | order only your own jobs; which user's job starts first is decided by a Slurm-style multifactor priority with fair share (see [Job priority](#job-priority)). `priority_type = "basic"` restores pueue's order, except that `-o` still only orders your own jobs. |
 | Callbacks, aliases, `pueue.yml` | supported | not available |
 
 Extra commands and options:

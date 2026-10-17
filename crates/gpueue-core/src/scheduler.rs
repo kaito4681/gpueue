@@ -389,12 +389,7 @@ fn plan_inner(
             let by_id: HashMap<JobId, &Job> = candidates.iter().map(|j| (j.id, *j)).collect();
             candidates = ordered.iter().map(|p| by_id[&p.id]).collect();
         }
-        None => candidates.sort_by(|a, b| {
-            b.spec
-                .priority
-                .cmp(&a.spec.priority)
-                .then_with(|| a.id.cmp(&b.id))
-        }),
+        None => candidates = crate::priority::basic_order(&candidates),
     }
 
     let has_room = |parallel: u32, used: u32| parallel == 0 || used < parallel;

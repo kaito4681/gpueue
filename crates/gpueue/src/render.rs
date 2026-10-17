@@ -3,6 +3,7 @@
 //! Everything here is pure (data in, `String` out) so it can be tested
 //! without a terminal or a daemon.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use comfy_table::presets::{NOTHING, UTF8_HORIZONTAL_ONLY};
@@ -42,6 +43,31 @@ impl RenderCtx {
         }
         table
     }
+}
+
+/// Makes text that came from the daemon (or from a job: labels, commands,
+/// directories, error reasons) safe to print on a terminal: C0 and C1 control
+/// characters, including ESC, are shown as `\xNN` / `\u{..}` escapes, and a
+/// newline as the visible marker `⏎`. Only job logs (`log`, `follow`) are
+/// written raw, as pueue does.
+pub fn escape_controls(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '\n' => out.push('⏎'),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() && (c as u32) < 0x100 => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +168,7 @@ pub fn has_log(state: &JobState) -> bool {
 
 /// `Group "name" (N parallel): running`, as pueue's group headline.
 pub fn group_headline(name: &str, group: Option<&Group>, style: &Style) -> String {
-    let title = style.bold(format!("Group \"{name}\""));
+    let title = style.bold(format!("Group \"{}\"", escape_controls(name)));
     let Some(group) = group else {
         return title;
     };
@@ -251,7 +277,7 @@ fn job_row(job: &JobView, columns: &Columns, ctx: &RenderCtx) -> Row {
                 _ => Cell::new(""),
             },
             Column::Dependencies => Cell::new(join_ids(&job.dependencies)),
-            Column::Label => Cell::new(job.label.as_deref().unwrap_or_default()),
+            Column::Label => Cell::new(escape_controls(job.label.as_deref().unwrap_or_default())),
             Column::Owner => Cell::new(ctx.users.name(job.owner)),
             Column::Gpu => Cell::new(
                 job.gpus
@@ -261,11 +287,11 @@ fn job_row(job: &JobView, columns: &Columns, ctx: &RenderCtx) -> Row {
                     .join(","),
             ),
             Column::Command => match &job.details {
-                Some(details) => Cell::new(&details.command),
+                Some(details) => Cell::new(escape_controls(&details.command)),
                 None => Cell::new(REDACTED),
             },
             Column::Path => match &job.details {
-                Some(details) => Cell::new(details.cwd.to_string_lossy()),
+                Some(details) => Cell::new(escape_controls(&details.cwd.to_string_lossy())),
                 None => Cell::new(REDACTED),
             },
             Column::Start => Cell::new(
@@ -387,10 +413,10 @@ pub fn gpus(gpus: &[GpuView], ctx: &RenderCtx) -> String {
         table.add_row(vec![
             Cell::new(gpu.index),
             if gpu.available {
-                Cell::new(&gpu.name)
+                Cell::new(escape_controls(&gpu.name))
             } else {
                 ctx.style.cell(
-                    format!("{} (not detected)", gpu.name),
+                    format!("{} (not detected)", escape_controls(&gpu.name)),
                     Some(Color::Red),
                     false,
                 )
@@ -480,7 +506,7 @@ pub fn priorities(response: &PriorityResponse, ctx: &RenderCtx) -> String {
         let mut row = vec![
             Cell::new(job.id),
             Cell::new(ctx.users.name(job.owner)),
-            Cell::new(&job.group),
+            Cell::new(escape_controls(&job.group)),
             Cell::new(whole(job.priority)),
         ];
         if !basic {
@@ -664,7 +690,7 @@ pub fn action_report(
         if let ActionOutcome::Error { error } = &result.outcome {
             report.ok = false;
             report.stderr.push(style.paint(
-                format!("Job {}: {}", result.id, error.message),
+                format!("Job {}: {}", result.id, escape_controls(&error.message)),
                 Some(Color::Red),
                 false,
             ));
@@ -697,13 +723,17 @@ fn log_state_text(job: &JobView) -> (String, Color) {
             JobResult::Failed { exit_code } => {
                 (format!("failed with exit code {exit_code}"), Color::Red)
             }
-            JobResult::FailedToSpawn { reason } => {
-                (format!("failed to spawn: {reason}"), Color::Red)
-            }
+            JobResult::FailedToSpawn { reason } => (
+                format!("failed to spawn: {}", escape_controls(reason)),
+                Color::Red,
+            ),
             JobResult::Killed => ("killed by system or user".into(), Color::Red),
             JobResult::DependencyFailed => ("dependency failed".into(), Color::Red),
             JobResult::CheckpointFailed { reason } => (
-                format!("terminated after a failed checkpoint: {reason}"),
+                format!(
+                    "terminated after a failed checkpoint: {}",
+                    escape_controls(reason)
+                ),
                 Color::Red,
             ),
             JobResult::Lost => (
@@ -731,11 +761,14 @@ pub fn log_header(job: &JobView, ctx: &RenderCtx) -> String {
         info.add_row(vec![ctx.style.cell(key, None, true), Cell::new(value)]);
     };
     if let Some(details) = &job.details {
-        add("Command:", details.command.clone());
-        add("Path:", details.cwd.to_string_lossy().into_owned());
+        add("Command:", escape_controls(&details.command).into_owned());
+        add(
+            "Path:",
+            escape_controls(&details.cwd.to_string_lossy()).into_owned(),
+        );
     }
     if let Some(label) = &job.label {
-        add("Label:", label.clone());
+        add("Label:", escape_controls(label).into_owned());
     }
     add("Owner:", ctx.users.name(job.owner));
     if !job.gpus.is_empty() {
@@ -749,7 +782,7 @@ pub fn log_header(job: &JobView, ctx: &RenderCtx) -> String {
     }
     // Unless the title already says it (a failed spawn or dump).
     if let Some(error) = last_error(job)
-        && !state.contains(error)
+        && !state.contains(&*escape_controls(error))
     {
         let label = match job.state {
             JobState::Checkpointed | JobState::RestoreQueued { .. } | JobState::Restoring => {
@@ -757,7 +790,7 @@ pub fn log_header(job: &JobView, ctx: &RenderCtx) -> String {
             }
             _ => "Last error:",
         };
-        add(label, error.to_owned());
+        add(label, escape_controls(error).into_owned());
     }
     if let Some(column) = info.column_mut(0) {
         column.set_cell_alignment(CellAlignment::Right);

@@ -493,11 +493,19 @@ fn basic_mode_is_pueues_order() {
     b.spec.nice = 1000;
     let mut c = job(2, 2);
     c.top_seq = Some(9);
-    // -o priority first, then id; nice, top and fair share are ignored.
+    // Nice, top and fair share are ignored, and another user's -o priority
+    // does not jump the queue: user 1's single job keeps its place (3).
     let p = env.run(&[a, b, c]);
-    assert_eq!(p.iter().map(|p| p.id.0).collect::<Vec<_>>(), [3, 1, 2]);
-    assert!(close(p[0].priority, 5.0));
+    assert_eq!(p.iter().map(|p| p.id.0).collect::<Vec<_>>(), [1, 2, 3]);
+    assert!(close(p[2].priority, 5.0));
     assert_eq!(p[0].factors, Factors::default());
+
+    // A user's -o orders that user's own jobs: the higher-priority job takes
+    // the place of the user's earliest job.
+    let mut late = job(3, 1);
+    late.spec.priority = 5;
+    let p = env.run(&[job(1, 1), job(2, 2), late]);
+    assert_eq!(p.iter().map(|p| p.id.0).collect::<Vec<_>>(), [3, 2, 1]);
 }
 
 // ---------------------------------------------------------------------------

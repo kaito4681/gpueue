@@ -15,7 +15,8 @@ use crate::error::{ApiResult, Failure};
 use crate::limits::ConnectionPermit;
 
 /// Testing only: overrides the peer uid when the daemon was started with
-/// `trust_uid_header` (never configurable from the config file).
+/// `trust_uid_header` (never configurable from the config file) and the
+/// `test-uid-header` cargo feature is compiled in.
 pub const TEST_UID_HEADER: &str = "x-gpueue-test-uid";
 
 /// Per-connection info: the peer's uid from `SO_PEERCRED`, attached to
@@ -57,6 +58,27 @@ impl FromRequestParts<AppState> for Auth {
     }
 }
 
+/// Whether the caller is an administrator; `false` (never an error) when the
+/// caller cannot be identified. For routes that must stay open to everyone
+/// but show administrators more, like `/v1/version`.
+#[derive(Debug, Clone, Copy)]
+pub struct IsAdmin(pub bool);
+
+impl FromRequestParts<AppState> for IsAdmin {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, std::convert::Infallible> {
+        Ok(IsAdmin(
+            Auth::from_request_parts(parts, state)
+                .await
+                .is_ok_and(|auth| auth.0.is_admin),
+        ))
+    }
+}
+
 /// The caller's uid: `SO_PEERCRED`, or the test header when trusted.
 pub fn peer_uid(
     headers: &HeaderMap,
@@ -72,7 +94,10 @@ pub fn peer_uid(
             "cannot determine who is connecting",
         )
     })?;
-    if trust_uid_header && let Some(value) = headers.get(TEST_UID_HEADER) {
+    if cfg!(feature = "test-uid-header")
+        && trust_uid_header
+        && let Some(value) = headers.get(TEST_UID_HEADER)
+    {
         uid = value
             .to_str()
             .ok()

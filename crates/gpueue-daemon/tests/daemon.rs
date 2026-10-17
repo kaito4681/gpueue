@@ -1940,7 +1940,13 @@ async fn version_reports_how_gpus_were_detected() {
         fallback: StaticGpuDetector(vec![a100(0), a100(1)]),
     })
     .await;
+    // Ordinary users get the source but not the NVML error text.
     let version: VersionResponse = h.client(ALICE).get("/v1/version").await.json();
+    assert_eq!(version.gpu_detection.unwrap().nvml_error, None);
+    assert_eq!(version.orphan_jobs, None);
+    assert!(version.helper.programs.is_empty());
+    let version: VersionResponse = h.client(ADMIN).get("/v1/version").await.json();
+    assert!(version.orphan_jobs.is_some());
     let detection = version.gpu_detection.expect("reported");
     assert_eq!(detection.source, GpuSource::Config);
     assert!(
@@ -3569,6 +3575,19 @@ async fn jobs_per_user_and_job_size_are_limited() {
         "{:?}",
         reply.error()
     );
+
+    // The number of dependencies is capped too.
+    let mut many = job_request("f", &[]);
+    many.spec.dependencies = (1..=1001).map(JobId).collect();
+    let reply = bob
+        .post("/v1/jobs", serde_json::to_value(&many).unwrap())
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(
+        reply.error().message.contains("dependencies"),
+        "{:?}",
+        reply.error()
+    );
     h.stop().await;
 }
 
@@ -3811,7 +3830,7 @@ async fn lower_usage_user_starts_first() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn basic_priority_keeps_pueues_order() {
+async fn basic_priority_orders_only_the_owners_jobs() {
     let h = harness_with_priority(0, |p| {
         p.priority_type = gpueue_daemon::config::PriorityType::Basic;
     })
@@ -3824,8 +3843,15 @@ async fn basic_priority_keeps_pueues_order() {
     let mut request = job_request("b", &[]);
     request.spec.priority = 5;
     let b = bob.add(&request).await;
-    // Bob's -o 5 wins across users, as in pueue.
-    assert_eq!(priority_order(&alice).await, [b.0, a.0]);
+    // Bob's -o 5 does not put his job ahead of other users' jobs.
+    assert_eq!(priority_order(&alice).await, [a.0, b.0]);
+    // It does order his own jobs.
+    let b2 = bob.add(&job_request("b2", &[])).await;
+    assert_eq!(priority_order(&alice).await, [a.0, b.0, b2.0]);
+    let mut request = job_request("b3", &[]);
+    request.spec.priority = 9;
+    let b3 = bob.add(&request).await;
+    assert_eq!(priority_order(&alice).await, [a.0, b3.0, b.0, b2.0]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
