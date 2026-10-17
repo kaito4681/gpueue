@@ -135,9 +135,13 @@
 
 # [helper] Who jobs may run as (checked for every spawn and restore; uid 0 is
 # always refused). Jobs of users below job_min_uid are refused. Unset by
-# default: UID_MIN of /etc/login.defs, or 1000 when it has none.
+# default: UID_MIN of /etc/login.defs, or 1000 when it has none. Jobs of
+# users above job_max_uid are refused; unset by default (no upper bound).
+# 65534, 65535, 4294967295 and 61184-65519 (systemd DynamicUser=) are
+# always refused.
 # Example:
 #   job_min_uid = 1000
+#   job_max_uid = 60000
 
 # [helper] Groups that give root-equivalent power. They are dropped from a
 # job's supplementary groups (the helper's journal records it), and a job whose primary

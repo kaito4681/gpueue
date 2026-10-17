@@ -156,11 +156,15 @@ impl MinUidSource {
 /// The value of `UID_MIN` in the contents of a `login.defs` file. Comments
 /// (`#`) and malformed lines are ignored; the last valid setting wins.
 pub fn parse_uid_min(login_defs: &str) -> Option<u32> {
+    parse_login_defs_number(login_defs, "UID_MIN")
+}
+
+fn parse_login_defs_number(login_defs: &str, key: &str) -> Option<u32> {
     let mut found = None;
     for line in login_defs.lines() {
         let line = line.split('#').next().unwrap_or("");
         let mut words = line.split_whitespace();
-        if words.next() != Some("UID_MIN") {
+        if words.next() != Some(key) {
             continue;
         }
         if let (Some(value), None) = (words.next(), words.next())
@@ -187,6 +191,21 @@ pub fn effective_min_uid(configured: Option<u32>, login_defs: &Path) -> (u32, Mi
         Some(uid) => (uid, MinUidSource::LoginDefs),
         None => (FALLBACK_JOB_MIN_UID, MinUidSource::Fallback),
     }
+}
+
+/// Uids that never run jobs, whatever `job_max_uid` says: `nobody` and
+/// `nogroup` (65534), the 16-bit "invalid" uid (65535) and the 32-bit one
+/// (`(uid_t)-1`, 4294967295).
+pub const RESERVED_UIDS: &[u32] = &[65534, 65535, u32::MAX];
+
+/// systemd's `DynamicUser=` range (`61184..=65519`): transient service
+/// accounts, never users.
+pub const DYNAMIC_USER_UIDS: std::ops::RangeInclusive<u32> = 61184..=65519;
+
+/// Whether no job may ever run as `uid` ([`RESERVED_UIDS`] and
+/// [`DYNAMIC_USER_UIDS`]).
+pub fn is_reserved_uid(uid: u32) -> bool {
+    RESERVED_UIDS.contains(&uid) || DYNAMIC_USER_UIDS.contains(&uid)
 }
 
 /// The `(name, gid)` of each of `names` that the group file contents
@@ -218,6 +237,17 @@ SYS_UID_MIN               100
         assert_eq!(parse_uid_min("UID_MIN 1 2\n"), None);
         assert_eq!(parse_uid_min("#UID_MIN 500\nSYS_UID_MIN 100\n"), None);
         assert_eq!(parse_uid_min(""), None);
+    }
+
+    #[test]
+    fn reserved_uids() {
+        for uid in [65534, 65535, u32::MAX, 61184, 65000, 65519] {
+            assert!(is_reserved_uid(uid), "{uid}");
+        }
+        // systemd-homed users and LDAP/sssd ranges are regular users.
+        for uid in [1000, 60513, 61183, 65520, 100_000, 200_000_000] {
+            assert!(!is_reserved_uid(uid), "{uid}");
+        }
     }
 
     #[test]

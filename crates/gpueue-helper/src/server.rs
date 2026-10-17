@@ -60,9 +60,17 @@ pub fn bind(path: &Path, daemon_uid: u32) -> io::Result<UnixListener> {
     let parent_fd = rustix::fs::open(parent, dirflags, Mode::empty())?;
     // A fresh name: whatever the daemon left at an older one is not
     // touched.
+    // The name is random, so that the daemon (which can list the directory)
+    // cannot predict it and plant something there first.
     let mut attempt = 0u32;
     let private = loop {
-        let candidate = format!(".helper-sock.{}.{attempt}", std::process::id());
+        let mut random = [0u8; 8];
+        rustix::rand::getrandom(&mut random, rustix::rand::GetRandomFlags::empty())?;
+        let candidate = format!(
+            ".helper-sock.{}.{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(random)
+        );
         match rustix::fs::mkdirat(&parent_fd, candidate.as_str(), Mode::RWXU) {
             Ok(()) => break candidate,
             Err(rustix::io::Errno::EXIST) if attempt < 1000 => attempt += 1,
@@ -211,6 +219,9 @@ async fn read_line(
             return Ok(None);
         }
         buf.push(&chunk[..n]);
+        // A peer that keeps the socket full must not starve the other tasks
+        // of this runtime while its lines are parsed.
+        tokio::task::yield_now().await;
     }
 }
 

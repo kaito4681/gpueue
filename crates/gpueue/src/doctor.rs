@@ -545,15 +545,21 @@ fn check_job_policy(sys: &dyn System, config: &Config) -> Check {
             .join(", ")
     };
     let allowed = if config.job_allowed_users.is_empty() {
-        format!("every user with uid >= {min_uid}")
+        match config.job_max_uid {
+            Some(max) => format!("every user with uid {min_uid} to {max}"),
+            None => format!("every user with uid >= {min_uid}"),
+        }
     } else {
         config.job_allowed_users.join(", ")
     };
     Check::info(
         NAME,
         format!(
-            "jobs run as uid >= {min_uid} ({}); denied groups: {denied}; allowed users: {allowed}",
-            source.describe()
+            "jobs run as uid >= {min_uid} ({}){max}; denied groups: {denied}; allowed users: {allowed}",
+            source.describe(),
+            max = config
+                .job_max_uid
+                .map_or_else(String::new, |m| format!(" and <= {m} (job_max_uid)"))
         ),
     )
 }

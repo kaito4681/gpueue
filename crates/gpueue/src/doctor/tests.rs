@@ -800,13 +800,14 @@ fn job_policy_shows_the_minimum_uid_source_and_denied_groups() {
     sys.write(
         "/etc/gpueue/config.toml",
         &format!(
-            "job_min_uid = 1500\njob_denied_groups = []\njob_allowed_users = [\"alice\"]\n{CONFIG}"
+            "job_min_uid = 1500\njob_max_uid = 70000\njob_denied_groups = []\njob_allowed_users = [\"alice\"]\n{CONFIG}"
         ),
     );
     let shown = message(&run(&sys, None), "job policy").to_owned();
     assert_eq!(
         shown,
-        "jobs run as uid >= 1500 (job_min_uid in the configuration); denied groups: none; \
+        "jobs run as uid >= 1500 (job_min_uid in the configuration) and <= 70000 (job_max_uid); \
+         denied groups: none; \
          allowed users: alice"
     );
 }

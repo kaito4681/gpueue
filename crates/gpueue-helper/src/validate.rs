@@ -93,6 +93,9 @@ impl Credentials {
 pub struct JobPolicy {
     pub min_uid: u32,
     pub min_uid_source: MinUidSource,
+    /// `job_max_uid`: jobs of larger uids are refused. `None`: no bound.
+    /// [`job_policy::is_reserved_uid`] uids are refused either way.
+    pub max_uid: Option<u32>,
     /// Group names; looked up in `group_file` at each check, so groups
     /// created later are covered.
     pub denied_groups: Vec<String>,
@@ -109,6 +112,7 @@ impl JobPolicy {
         Self {
             min_uid,
             min_uid_source,
+            max_uid: file.job_max_uid,
             denied_groups: file.job_denied_groups.clone(),
             allowed_users: file.job_allowed_users.clone(),
             group_file: group_file.to_owned(),
@@ -121,6 +125,7 @@ impl JobPolicy {
         Self {
             min_uid: 1,
             min_uid_source: MinUidSource::Config,
+            max_uid: None,
             denied_groups: Vec::new(),
             allowed_users: Vec::new(),
             group_file: PathBuf::from(job_policy::GROUP_FILE_PATH),
@@ -144,9 +149,11 @@ impl JobPolicy {
     /// One line for the helper's log.
     pub fn describe(&self) -> String {
         format!(
-            "job_min_uid {} ({}), job_denied_groups {:?}, job_allowed_users {}",
+            "job_min_uid {} ({}), job_max_uid {}, job_denied_groups {:?}, job_allowed_users {}",
             self.min_uid,
             self.min_uid_source.describe(),
+            self.max_uid
+                .map_or_else(|| "(none)".to_owned(), |m| m.to_string()),
             self.denied_groups,
             if self.allowed_users.is_empty() {
                 "(everyone)".to_owned()
@@ -203,6 +210,24 @@ pub fn check_credentials<H: HostProbe + ?Sized>(
                 policy.min_uid,
                 policy.min_uid_source.describe()
             ),
+        ));
+    }
+    if job_policy::is_reserved_uid(uid.0) {
+        return Err(Rejection::policy(
+            &user.name,
+            format!(
+                "uid {} is reserved (nobody, 65535, 4294967295 and systemd's dynamic users \
+                 61184-65519 never run jobs)",
+                uid.0
+            ),
+        ));
+    }
+    if let Some(max) = policy.max_uid
+        && uid.0 > max
+    {
+        return Err(Rejection::policy(
+            &user.name,
+            format!("uid {} is above job_max_uid {max}", uid.0),
         ));
     }
     if !policy.allowed_users.is_empty() && !policy.allowed_users.contains(&user.name) {
@@ -273,6 +298,44 @@ pub fn check_credentials<H: HostProbe + ?Sized>(
     Ok(creds)
 }
 
+/// Longest accepted command line (the `command` string and each shell
+/// word), cwd or log path, in bytes. Linux caps one argument at 128 KiB
+/// (`MAX_ARG_STRLEN`) and a path at 4 KiB.
+pub const MAX_COMMAND_LEN: usize = 128 * 1024;
+pub const MAX_PATH_LEN: usize = 4096;
+/// Most environment variables and most bytes in all of them (names and
+/// values) of one job. The kernel limits `execve` to roughly 2 MiB of
+/// arguments and environment together; the daemon's request body is capped
+/// at 2 MiB.
+pub const MAX_ENV_VARS: usize = 16 * 1024;
+pub const MAX_ENV_BYTES: usize = 2 * 1024 * 1024;
+/// Most words of the shell prefix.
+pub const MAX_SHELL_WORDS: usize = 64;
+
+fn check_spawn_sizes(req: &SpawnRequest) -> Result<(), Rejection> {
+    let too_big = |what: &str| Err(Rejection::invalid(format!("{what} is too large")));
+    if req.command.len() > MAX_COMMAND_LEN {
+        return too_big("command");
+    }
+    if req.shell.len() > MAX_SHELL_WORDS || req.shell.iter().any(|w| w.len() > MAX_COMMAND_LEN) {
+        return too_big("shell");
+    }
+    if req.cwd.as_os_str().len() > MAX_PATH_LEN || req.log_path.as_os_str().len() > MAX_PATH_LEN {
+        return too_big("cwd or log path");
+    }
+    if req.envs.len() > MAX_ENV_VARS
+        || req
+            .envs
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 2)
+            .sum::<usize>()
+            > MAX_ENV_BYTES
+    {
+        return too_big("environment");
+    }
+    Ok(())
+}
+
 /// Validate a spawn request.
 pub fn check_spawn<H: HostProbe + ?Sized>(
     host: &H,
@@ -285,6 +348,7 @@ pub fn check_spawn<H: HostProbe + ?Sized>(
     if req.shell.is_empty() || req.shell[0].is_empty() {
         return Err(Rejection::invalid("shell must not be empty"));
     }
+    check_spawn_sizes(req)?;
     let nul = |s: &str| s.contains('\0');
     if req.shell.iter().any(|s| nul(s)) || nul(&req.command) {
         return Err(Rejection::invalid("command contains a NUL byte"));
@@ -357,6 +421,67 @@ mod tests {
         let mut r = req();
         r.groups = Some(vec![Gid(27)]);
         assert!(check_spawn(&host(), &JobPolicy::permissive(), &r).is_ok());
+    }
+
+    #[test]
+    fn refuses_oversized_spawn_requests() {
+        let mut r = req();
+        r.command = "x".repeat(MAX_COMMAND_LEN + 1);
+        assert!(check_spawn(&host(), &JobPolicy::permissive(), &r).is_err());
+        let mut r = req();
+        r.envs.insert("BIG".into(), "x".repeat(MAX_ENV_BYTES));
+        assert!(check_spawn(&host(), &JobPolicy::permissive(), &r).is_err());
+        let mut r = req();
+        r.cwd = format!("/{}", "a".repeat(MAX_PATH_LEN)).into();
+        assert!(check_spawn(&host(), &JobPolicy::permissive(), &r).is_err());
+    }
+
+    #[test]
+    fn refuses_reserved_uids_and_honors_job_max_uid() {
+        let (p, _dir) = policy("");
+        assert_eq!(p.max_uid, None);
+        let h = FakeHost::default();
+        let uids = [
+            60000u32,
+            60513,
+            61183,
+            61184,
+            65000,
+            65519,
+            65520,
+            65534,
+            65535,
+            100_000,
+            u32::MAX,
+        ];
+        for uid in uids {
+            h.add_user(uid, "u", uid, &[uid]);
+        }
+        let go = |p: &JobPolicy, uid: u32| check_credentials(&h, p, Uid(uid), Gid(uid), None);
+        // No upper bound: sssd-sized and systemd-homed uids are fine.
+        for uid in [60000u32, 60513, 61183, 65520, 100_000] {
+            assert!(go(&p, uid).is_ok(), "{uid}");
+        }
+        for uid in [61184u32, 65000, 65519, 65534, 65535, u32::MAX] {
+            assert_eq!(
+                go(&p, uid).unwrap_err().code,
+                HelperErrorCode::PolicyDenied,
+                "{uid}"
+            );
+        }
+        let (p, _dir) = policy("job_max_uid = 60513");
+        assert_eq!(p.max_uid, Some(60513));
+        assert!(go(&p, 60513).is_ok());
+        let e = go(&p, 100_000).unwrap_err();
+        assert_eq!(e.code, HelperErrorCode::PolicyDenied);
+        assert!(
+            e.message.contains("above job_max_uid 60513"),
+            "{}",
+            e.message
+        );
+        // Reserved uids stay refused even when the bound is raised above them.
+        let (p, _dir) = policy("job_max_uid = 4294967295");
+        assert!(go(&p, 65534).is_err());
     }
 
     const LOGIN_DEFS: &str = "# UID_MIN 10\nUID_MIN\t\t 1000\nUID_MAX 60000\n";
