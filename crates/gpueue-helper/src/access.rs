@@ -221,6 +221,7 @@ const MAX_PROBLEMS: usize = 20;
 /// writes the [`VerifyReply`] to stdout. Single-threaded (`setns` of a mount
 /// namespace requires it).
 pub fn run_verify_access() -> i32 {
+    raise_nofile_limit();
     let mut input = Vec::new();
     let req = io::stdin()
         .read_to_end(&mut input)
@@ -464,6 +465,14 @@ pub struct DumpHookRequest {
     pub init_pid: u32,
     /// Mount points of the namespace's own tmpfs mounts.
     pub private: Vec<String>,
+    /// The processes to scan, instead of every process in the PID
+    /// namespace of `init_pid` (the helper leaves this unset: a job has a
+    /// PID namespace of its own). For tests, whose job cannot have one
+    /// (that needs a user namespace, which CI runners and Docker often
+    /// refuse): the host's namespace has processes with hazards of their
+    /// own, which would make the outcome depend on what else runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<Vec<u32>>,
 }
 
 /// The CRIU action script of a dump: `gpueue-helper dump-hook <request>`,
@@ -496,8 +505,11 @@ pub fn run_dump_hook(request: &Path) -> i32 {
         )
         .map_err(|e| format!("decoding {}: {e}", request.display()))?;
         let proc_root = Path::new("/proc");
-        let pids = crate::host::ns_processes(proc_root, req.init_pid)
-            .map_err(|e| format!("listing the job's processes: {e}"))?;
+        let pids = match req.pids {
+            Some(pids) => pids,
+            None => crate::host::ns_processes(proc_root, req.init_pid)
+                .map_err(|e| format!("listing the job's processes: {e}"))?,
+        };
         let exe = std::env::current_exe().map_err(|e| format!("locating myself: {e}"))?;
         let check = VerifyRequest::DumpHazards(ScanCheck {
             proc_root: proc_root.to_owned(),
@@ -1098,7 +1110,6 @@ pub fn is_dumpable(proc_root: &Path, pid: u32) -> Result<bool, String> {
 /// before any restored task runs.
 fn check_restored_procs(c: &RestoredCheck, procs: &[u32], hardened: bool) -> VerifyReply {
     let proc_root = Path::new("/proc");
-    raise_nofile_limit();
     // CRIU restores a job's zombies (e.g. a `sleep` its shell had not
     // reaped yet at the dump) as tasks that exit again during the restore:
     // at pre-resume they are zombies with the credentials CRIU forked them
@@ -1336,7 +1347,10 @@ fn check_restored_procs(c: &RestoredCheck, procs: &[u32], hardened: bool) -> Ver
         .collect())
 }
 
-/// A job may have many files open; the check pins each one.
+/// A job may have many files open; the check of a restored job pins each
+/// one. Raised in the `verify-access` child (see [`run_verify_access`]),
+/// which exits after its one check, not by the check itself: a library
+/// call must not change the limit of the process that makes it.
 fn raise_nofile_limit() {
     use rustix::process::{Resource, getrlimit, setrlimit};
     let mut lim = getrlimit(Resource::Nofile);
@@ -1366,6 +1380,51 @@ mod tests {
         }
     }
 
+    /// Waits until `pid` (a `sleep` of the test's) is asleep, then stops
+    /// it, as CRIU holds a restored job's tasks while the check runs: what
+    /// it holds no longer changes. Until it is asleep, the dynamic loader
+    /// may still be opening and mapping its libraries (`comm` changes at
+    /// the `exec`, before that), and a check of a task that runs sees such
+    /// descriptors come and go.
+    fn stop_once_asleep(pid: u32) {
+        let state = || {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| s.rsplit_once(") ")?.1.chars().next())
+        };
+        wait_until("`sleep` to sleep", || {
+            match fs::read_to_string(format!("/proc/{pid}/syscall")) {
+                // The number of the system call it is blocked in.
+                Ok(s) => s.split_whitespace().next().is_some_and(|nr| {
+                    [nix::libc::SYS_clock_nanosleep, nix::libc::SYS_nanosleep]
+                        .map(|n| n.to_string())
+                        .contains(&nr.to_owned())
+                }),
+                // Where a ptrace restriction hides it: sleeping, which the
+                // loader's file system calls rarely are for long.
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => state() == Some('S'),
+                Err(_) => false,
+            }
+        });
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGSTOP,
+        )
+        .unwrap();
+        wait_until("`sleep` to stop", || state() == Some('T'));
+    }
+
+    /// Kills (and reaps) a child of the test when dropped, also when the
+    /// test fails: a stopped `sleep` would otherwise be left behind.
+    struct Killed(std::process::Child);
+
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     fn pinned(path: &Path, want: Want) -> Pinned {
         Pinned {
             what: "test".into(),
@@ -1392,8 +1451,8 @@ mod tests {
             eprintln!("skipped: needs an unprivileged user");
             return;
         }
-        // The job's init: a process that is just running. `spawn` returns
-        // once `sleep` has been exec'd. Its stdio and working directory are
+        // The job's init: a `sleep`, stopped once it sleeps (see
+        // `stop_once_asleep`). Its stdio and working directory are
         // set here, not inherited from the test runner (whose terminal may
         // be unreachable, e.g. a `/dev/pts/N` outside a Nix build sandbox).
         let tmp = tempfile::tempdir().unwrap();
@@ -1407,8 +1466,9 @@ mod tests {
                 .spawn()
                 .unwrap()
         };
-        let mut child = spawn("sleep", &["30"]);
-        let parent = child.id();
+        let child = Killed(spawn("sleep", &["30"]));
+        let parent = child.0.id();
+        stop_once_asleep(parent);
         // The zombie: a child of the test that exits and that the test does
         // not reap until the end (`Child` only reaps in `wait`/`try_wait`).
         // Its parent does not matter to the check, which is given the
@@ -1440,8 +1500,7 @@ mod tests {
             check_restored_procs(&req, &[parent, zombie], false),
             Ok(vec![])
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
+        drop(child);
         assert!(exited.wait().unwrap().success());
     }
 
@@ -1676,25 +1735,29 @@ VmFlags: rd ex mr mw me
         let dir = tmp.path().join("x");
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("data"), b"x").unwrap();
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("exec 3<>\"$1\"; exec sleep 30")
-            .arg("sh")
-            .arg(dir.join("data"))
-            // Not the test runner's stdio and working directory (see
-            // `zombies_are_not_checked`).
-            .current_dir(tmp.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let child = Killed(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("exec 3<>\"$1\"; exec sleep 30")
+                .arg("sh")
+                .arg(dir.join("data"))
+                // Not the test runner's stdio and working directory (see
+                // `zombies_are_not_checked`).
+                .current_dir(tmp.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
         // By its name: `exe` may be a multicall binary (`coreutils` in Nix).
         wait_until("the shell to exec `sleep` with fd 3 open", || {
-            fs::read_link(format!("/proc/{}/fd/3", child.id())).is_ok()
-                && fs::read_to_string(format!("/proc/{}/comm", child.id()))
+            fs::read_link(format!("/proc/{pid}/fd/3")).is_ok()
+                && fs::read_to_string(format!("/proc/{pid}/comm"))
                     .is_ok_and(|c| c.trim_end() == "sleep")
         });
+        stop_once_asleep(pid);
         let gid = nix::unistd::getegid().as_raw();
         let groups: Vec<u32> = nix::unistd::getgroups()
             .unwrap()
@@ -1703,7 +1766,7 @@ VmFlags: rd ex mr mw me
             .chain([gid])
             .collect();
         let req = RestoredCheck {
-            init_pid: child.id(),
+            init_pid: pid,
             owner_uid: me,
             allowed_gids: groups,
             private_tmpfs: vec![],
@@ -1714,12 +1777,19 @@ VmFlags: rd ex mr mw me
         // `ns_processes` lists the PID namespace of the init: in a test that
         // is the host's, so restrict it to the child.
         let check = |req: &RestoredCheck| check_restored_procs(req, &[req.init_pid], false);
+        // Whether the check finds problems (failing the test if it cannot
+        // be done).
+        let refused = |req: &RestoredCheck| {
+            let r = check(req);
+            !r.as_ref().unwrap_or_else(|e| panic!("{e}")).is_empty()
+        };
         assert_eq!(check(&req), Ok(vec![]));
         // A process the shim did not set up (as a test's child is not): a
         // bounding set, no `no_new_privs`, a dumpable init.
         // (What the test runner has, its child inherits.)
         let mine = parse_creds(&fs::read_to_string("/proc/self/status").unwrap()).unwrap();
-        let p = check_restored_procs(&req, &[req.init_pid], true).unwrap();
+        let p = check_restored_procs(&req, &[req.init_pid], true);
+        let p = p.unwrap_or_else(|e| panic!("{e}"));
         for (what, expected) in [
             ("bounding set", !mine.no_bounding_caps),
             ("no_new_privs", !mine.no_new_privs),
@@ -1741,9 +1811,10 @@ VmFlags: rd ex mr mw me
         // refused, unless it is the very file the job held at the dump.
         let data = tmp.path().join("y/data");
         fs::set_permissions(&data, fs::Permissions::from_mode(0o444)).unwrap();
-        let p = check(&req).unwrap();
+        let p = check(&req);
         assert!(
-            p.iter().any(|p| p.contains("may not read and write")),
+            p.as_ref()
+                .is_ok_and(|p| p.iter().any(|p| p.contains("may not read and write"))),
             "{p:?}"
         );
         let st = fs::metadata(&data).unwrap();
@@ -1759,7 +1830,7 @@ VmFlags: rd ex mr mw me
         // numbers inodes in lookup order): the attributes recorded after
         // the dump identify the file then.
         complete_held_files(&mut held.held);
-        assert!(held.held[0].attrs.is_some());
+        assert!(held.held[0].attrs.is_some(), "{:?}", held.held);
         held.held[0].dev += 1;
         held.held[0].ino += 1000;
         assert_eq!(check(&held), Ok(vec![]));
@@ -1768,16 +1839,27 @@ VmFlags: rd ex mr mw me
         let mut same_dev = held.clone();
         same_dev.held[0].dev -= 1;
         let local = !renumbers_inodes(fs::File::open(&data).unwrap());
-        assert_eq!(!check(&same_dev).unwrap().is_empty(), local);
+        assert_eq!(refused(&same_dev), local, "{:?}", check(&same_dev));
         // A birth time recorded at the dump must be the same.
         if held.held[0].attrs.unwrap().btime.is_some() {
             let mut born = held.clone();
             born.held[0].attrs.as_mut().unwrap().btime = Some((1, 0));
-            assert!(!check(&born).unwrap().is_empty());
+            assert!(refused(&born), "{:?}", check(&born));
         }
         // Another file at that path is not that file, even with the same
         // owner, mode, size and times (renaming it there changed its
-        // change time).
+        // change time). File times are taken from a clock that may advance
+        // only once per tick: first wait until a change gets a later one
+        // than recorded, else the swap could not be told apart.
+        let recorded = held.held[0].attrs.unwrap().ctime;
+        let tick = tmp.path().join("tick");
+        fs::write(&tick, b"").unwrap();
+        wait_until("the file clock to advance", || {
+            use std::os::unix::fs::MetadataExt;
+            fs::set_permissions(&tick, fs::Permissions::from_mode(0o644)).unwrap();
+            let m = fs::metadata(&tick).unwrap();
+            (m.ctime(), m.ctime_nsec()) > recorded
+        });
         let other = tmp.path().join("y/other");
         fs::write(&other, vec![b'x'; usize::try_from(st.len()).unwrap()]).unwrap();
         let mtime = fs::metadata(&data).unwrap().modified().unwrap();
@@ -1791,15 +1873,18 @@ VmFlags: rd ex mr mw me
         assert_eq!(fs::metadata(&other).unwrap().modified().unwrap(), mtime);
         fs::rename(&data, tmp.path().join("y/data.old")).unwrap();
         fs::rename(&other, &data).unwrap();
-        assert!(!check(&held).unwrap().is_empty());
+        assert!(refused(&held), "{:?}", check(&held));
         // Nor is it with the device and inode of the dump unrecorded.
         held.held[0].attrs = None;
-        assert!(!check(&held).unwrap().is_empty());
+        assert!(refused(&held), "{:?}", check(&held));
         let mut req2 = req.clone();
         req2.allowed_gids = vec![];
-        let p = check(&req2).unwrap();
-        assert!(p.iter().any(|p| p.contains("no longer in")), "{p:?}");
-        child.kill().unwrap();
-        child.wait().unwrap();
+        let p = check(&req2);
+        assert!(
+            p.as_ref()
+                .is_ok_and(|p| p.iter().any(|p| p.contains("no longer in"))),
+            "{p:?}"
+        );
+        drop(child);
     }
 }

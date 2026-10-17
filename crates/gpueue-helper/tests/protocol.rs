@@ -151,6 +151,12 @@ fn config(root: &Path, daemon_uid: u32) -> HelperConfig {
         log_base: root.join("logs"),
         criu_root: None,
         poll_interval: Duration::from_millis(20),
+        // Tests that make these fail need not wait the production pauses.
+        finalize_retry_delay: Duration::from_millis(10),
+        remove_retry_delay: Duration::from_millis(10),
+        // A test's restored job that is to stay paused is either stopped at
+        // once or never.
+        stop_settle_time: Duration::from_millis(100),
         ..HelperConfig::default()
     }
 }
@@ -207,6 +213,14 @@ const WAIT: Duration = Duration::from_secs(5);
 
 impl Client {
     async fn connect(path: &Path, hello: Hello) -> Self {
+        Self::try_connect(path, hello)
+            .await
+            .expect("the helper closed the connection instead of its hello")
+    }
+
+    /// [`Self::connect`], `None` if the helper closes the connection
+    /// instead of answering the hello.
+    async fn try_connect(path: &Path, hello: Hello) -> Option<Self> {
         let (rd, wr) = UnixStream::connect(path).await.unwrap().into_split();
         let mut c = Self {
             rd: BufReader::new(rd),
@@ -215,8 +229,12 @@ impl Client {
             events: Vec::new(),
             responses: BTreeMap::new(),
         };
-        c.send(&DaemonMessage::Hello(hello)).await;
+        // Fails if the helper closed it already.
+        c.wr.write_all(&encode_line(&DaemonMessage::Hello(hello)).unwrap())
+            .await
+            .ok()?;
         match c.read().await {
+            None => return None,
             Some(HelperMessage::Hello(h)) => {
                 assert_eq!(h.protocol_version, PROTOCOL_VERSION);
                 // The epoch of its event numbering, for the daemon.
@@ -224,7 +242,7 @@ impl Client {
             }
             other => panic!("expected hello, got {other:?}"),
         }
-        c
+        Some(c)
     }
 
     async fn send(&mut self, msg: &DaemonMessage) {
@@ -404,8 +422,8 @@ async fn connections_without_a_hello_are_capped() {
     for _ in 0..server::MAX_HANDSHAKES {
         idle.push(UnixStream::connect(env.socket()).await.unwrap());
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    // One more is closed at once.
+    // One more (accepted after them, they are accepted in order) is closed
+    // at once.
     let extra = UnixStream::connect(env.socket()).await.unwrap();
     let (rd, _wr) = extra.into_split();
     let mut line = String::new();
@@ -414,10 +432,19 @@ async fn connections_without_a_hello_are_capped() {
         .expect("the extra connection was kept")
         .unwrap_or(0);
     assert_eq!(n, 0);
-    // Once they are gone, the daemon gets in again.
+    // Once they are gone, the daemon gets in again: as soon as the helper
+    // has seen one of them close (until then, it is closed at once too).
     drop(idle);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut c = env.client().await;
+    let mut c = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(c) = Client::try_connect(&env.socket(), Hello::current()).await {
+                break c;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a handshake slot to be free again");
     assert_eq!(c.running().await, vec![]);
 }
 
@@ -2928,15 +2955,24 @@ async fn a_checkpoint_asked_for_during_a_shutdown_is_refused_and_the_job_dumped(
         c.request(Request::Spawn(env.spawn_req(1))).await,
         ResponseResult::Spawned { .. }
     ));
-    // A spawn in flight holds the shutdown up.
-    env.launcher.set_delay(Some(Duration::from_millis(500)));
+    // A spawn in flight (held until the checkpoint was refused) holds the
+    // shutdown up.
+    env.launcher.hold_launches();
     let spawn = c.send_request(Request::Spawn(env.spawn_req(2))).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(WAIT, env.launcher.wait_held_launches(1))
+        .await
+        .unwrap();
     let shutdown = tokio::spawn({
         let helper = env.helper.clone();
         async move { helper.shutdown(|_| {}, |_| {}).await }
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(WAIT, async {
+        while !env.helper.is_shutting_down() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the shutdown to begin");
     assert_eq!(
         err_code(
             &c.request(Request::Checkpoint {
@@ -2948,6 +2984,8 @@ async fn a_checkpoint_asked_for_during_a_shutdown_is_refused_and_the_job_dumped(
         ),
         HelperErrorCode::ShuttingDown
     );
+    assert!(!shutdown.is_finished(), "the spawn in flight holds it up");
+    env.launcher.let_launches_go();
     assert!(matches!(
         c.response(spawn).await,
         ResponseResult::Spawned { .. }

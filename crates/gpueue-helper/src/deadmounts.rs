@@ -1227,13 +1227,26 @@ mod tests {
 
     #[test]
     fn each_with_deadline_leaves_stuck_items_behind() {
+        // Item 0 is stuck until the test lets it go (after the call
+        // returned); the others finish at once.
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let stuck = std::sync::Mutex::new(stuck);
+        // Ample for two threads that return at once, even on a loaded
+        // machine.
+        let timeout = Duration::from_secs(3);
         let start = std::time::Instant::now();
-        let out = each_with_deadline(vec![1u64, 60, 2], Duration::from_millis(300), |s| {
-            std::thread::sleep(Duration::from_millis(s * 10));
+        let out = each_with_deadline(vec![1u64, 0, 2], timeout, move |s| {
+            if s == 0 {
+                let _ = stuck.lock().unwrap().recv();
+            }
             s
         });
+        let elapsed = start.elapsed();
+        drop(release);
         assert_eq!(out, [Some(1), None, Some(2)]);
-        assert!(start.elapsed() < Duration::from_secs(5));
+        // It gave up on the stuck item at the deadline (which it returned
+        // without: that item is let go only now).
+        assert!(elapsed >= timeout, "{elapsed:?}");
     }
 
     #[test]

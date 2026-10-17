@@ -27,19 +27,22 @@ fn helper_exe() -> std::path::PathBuf {
     exe
 }
 
-/// Runs the hook at `action` for the job whose init is `init_pid`.
+/// Runs the hook at `action` for the job whose processes are `pids` (the
+/// first one its init).
 ///
-/// The hook scans every process in the PID namespace of `init_pid` (a job
+/// The hook scans every process in the PID namespace of the init (a job
 /// has one of its own). A test cannot give its job one: unprivileged user
 /// namespaces, which that needs, are often not available (GitHub's Ubuntu
-/// runners and Docker restrict them). So the hook sees the host's
-/// processes too, and only what the job holds is checked for.
-fn run_hook(dir: &Path, action: &str, init_pid: u32) -> (bool, std::path::PathBuf) {
+/// runners and Docker restrict them). The host's namespace has processes
+/// with hazards of their own (and may have so many that a scan of all of
+/// them takes long), so the request names the processes to scan instead.
+fn run_hook(dir: &Path, action: &str, pids: &[u32]) -> (bool, std::path::PathBuf) {
     let request = dir.join("dump-hook.json");
     let req = DumpHookRequest {
-        init_pid,
+        init_pid: pids[0],
         // Nothing private: the tempdir stands for a host filesystem.
         private: Vec::new(),
+        pids: Some(pids.to_vec()),
     };
     fs::write(&request, serde_json::to_vec(&req).unwrap()).unwrap();
     let status = Command::new(helper_exe())
@@ -71,12 +74,11 @@ fn post_dump_hook_vetoes_a_deleted_host_file_with_other_links() {
         "post_dump_hook_vetoes_a_deleted_host_file_with_other_links",
         dir.path(),
     );
-    // Another process of the namespace with a hazard of its own (as a CI
-    // runner's agents with sockets bound in /tmp): it must not hide the
-    // job's.
+    // Another process of the job (this one) with a hazard of its own: it
+    // must not hide the first one's.
     let other = std::os::unix::net::UnixListener::bind(dir.path().join("agent.sock")).unwrap();
 
-    let (ok, request) = run_hook(dir.path(), "post-dump", job.pid());
+    let (ok, request) = run_hook(dir.path(), "post-dump", &[job.pid(), std::process::id()]);
     drop((job, other));
     assert!(
         !ok,
@@ -99,7 +101,7 @@ fn post_dump_hook_vetoes_a_deleted_host_file_with_other_links() {
 #[test]
 fn the_dump_hook_does_nothing_at_other_stages() {
     let dir = tempfile::tempdir().unwrap();
-    let (ok, request) = run_hook(dir.path(), "pre-dump", std::process::id());
+    let (ok, request) = run_hook(dir.path(), "pre-dump", &[std::process::id()]);
     assert!(ok);
     assert!(!hook_refusal_path(&request).exists());
     assert!(!hook_result_path(&request).exists());
