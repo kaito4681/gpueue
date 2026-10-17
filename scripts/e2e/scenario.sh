@@ -1975,6 +1975,8 @@ s28_deleted_files() {
     pz alice kill "$a" "$b" "$c" "$d" >/dev/null
     for j in "$a" "$b" "$c" "$d"; do wait_state "$j" 'done/*'; done
     rm -f /home/alice/e2e-linked-* /home/alice/e2e-deleted-*
+}
+
 # s29: mounts of the host that a job's namespace copies and that need care:
 # - Two mounts hidden under later mounts, the first below a directory that
 #   others can change (the shim cannot set its cover aside safely) and the
@@ -1989,7 +1991,7 @@ s29_mount_edge_cases() {
     odd=$(printf '%s/odd\vname' "$base")
     # Remove what this scenario made whatever happens (also via `fail`).
     # shellcheck disable=SC2064 # expanded now, on purpose
-    trap "umount -l '$base' 2>/dev/null || true; rm -rf '$base' /tmp/alice29" EXIT
+    trap "umount -l '$base/b' 2>/dev/null || true; umount -l '$base' 2>/dev/null || true; rm -rf '$base' /tmp/alice29" EXIT
     free_group
 
     mkdir -p "$base"
@@ -2043,6 +2045,7 @@ s29_mount_edge_cases() {
     pz alice kill "$id" >/dev/null || fail "kill $id"
     wait_state "$id" 'done/*'
     rm -f /home/alice/m29.txt
+    umount -l "$base/b"
 }
 
 case "${1:-main}" in
