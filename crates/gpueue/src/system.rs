@@ -85,6 +85,12 @@ pub trait System {
     /// Path of the running `gpueue` binary (a system path).
     fn current_exe(&self) -> io::Result<PathBuf>;
 
+    /// The contents of the running `gpueue` binary. On a real system this reads
+    /// `/proc/self/exe`, so it is the code that is running whatever its path now points to.
+    fn read_current_exe(&self) -> io::Result<Vec<u8>> {
+        std::fs::read(self.path(&self.current_exe()?))
+    }
+
     /// Whether the group exists.
     fn group_exists(&self, name: &str) -> bool;
 
@@ -167,6 +173,16 @@ pub struct HttpResponse {
 /// The largest response body [`RealSystem::http_get`] reads (a release tarball is far smaller).
 const MAX_HTTP_BODY: u64 = 1 << 30;
 
+/// The `PATH` commands run by [`RealSystem::run`] get, and where a bare program name is looked
+/// up: systemd's default for services, plus NixOS's system profile (where its `systemctl` is).
+const RUN_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin";
+
+/// Where a bare program name is in `path_env`; `None` for a path (which is run as given).
+fn resolve_program(program: &str, path_env: &str) -> Option<PathBuf> {
+    gpueue_config::trust::find_program(Path::new(program), path_env.as_ref())
+}
+
 /// The real host.
 #[derive(Debug, Default)]
 pub struct RealSystem;
@@ -177,8 +193,12 @@ impl System for RealSystem {
     }
 
     fn run(&self, program: &str, args: &[&str]) -> io::Result<CmdOutput> {
-        let output = Command::new(program)
+        // Never search the caller's PATH: `service install` and `update` run as root, possibly
+        // via `sudo -E` or with a PATH that has a user-writable directory in it.
+        let resolved = resolve_program(program, RUN_PATH);
+        let output = Command::new(resolved.as_deref().unwrap_or(Path::new(program)))
             .args(args)
+            .env("PATH", RUN_PATH)
             .env("LC_ALL", "C")
             .stdin(std::process::Stdio::null())
             .output()?;
@@ -196,6 +216,10 @@ impl System for RealSystem {
 
     fn current_exe(&self) -> io::Result<PathBuf> {
         std::env::current_exe()
+    }
+
+    fn read_current_exe(&self) -> io::Result<Vec<u8>> {
+        std::fs::read("/proc/self/exe")
     }
 
     fn group_exists(&self, name: &str) -> bool {
@@ -459,6 +483,21 @@ mod tests {
             .gid();
         sys.write("/etc/group", &format!("root:x:0:\n{}\n", group_line(gid)));
         sys
+    }
+
+    #[test]
+    fn run_path_extends_the_service_default() {
+        assert!(RUN_PATH.starts_with(gpueue_config::trust::DEFAULT_SERVICE_PATH));
+        assert!(resolve_program("sh", RUN_PATH).is_some_and(|p| p.is_absolute()));
+        assert_eq!(resolve_program("./sh", RUN_PATH), None);
+        assert_eq!(resolve_program("/bin/sh", RUN_PATH), None);
+        assert_eq!(resolve_program("gpueue-no-such-program", RUN_PATH), None);
+    }
+
+    #[test]
+    fn real_run_uses_the_fixed_path() {
+        let out = RealSystem.run("sh", &["-c", "echo $PATH"]).unwrap();
+        assert_eq!(out.stdout.trim(), RUN_PATH);
     }
 
     #[test]

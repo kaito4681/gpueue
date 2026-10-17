@@ -21,7 +21,12 @@ if [ -n "${GPUEUE_E2E_CUDA_MODE:-}" ]; then
 fi
 # Exits non-zero when its final checks warn (e.g. no GPUs); the state of
 # the services is checked below.
-/e2e/bin/gpueue service install --bin-dir /usr/local/bin || true
+# /e2e is a mount owned by the invoking user; `service install` only copies a
+# helper that nobody but root could have replaced, so install from a root-owned copy.
+install -d -m 0755 /opt/gpueue-src
+install -m 0755 /e2e/bin/gpueue /e2e/bin/gpueue-helper /opt/gpueue-src/
+/opt/gpueue-src/gpueue service install --bin-dir /usr/local/bin || true
+rm -rf /opt/gpueue-src
 
 getent passwd 1002 >/dev/null || useradd -m -u 1002 -s /bin/sh carol
 usermod -aG gpueue-admin carol

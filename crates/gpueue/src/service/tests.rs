@@ -835,6 +835,83 @@ fn bin_dir_installs_copies() {
 }
 
 #[test]
+fn a_helper_others_can_replace_is_not_copied() {
+    let mut sys = FakeSystem::new();
+    sys.exe = PathBuf::from("/home/u/target/release/gpueue");
+    sys.write_exe("/home/u/target/release/gpueue", "new gpueue");
+    sys.write_exe("/home/u/target/release/gpueue-helper", "new helper");
+    // Anyone can swap the helper (or rename the directory it is in) before it is copied.
+    std::fs::set_permissions(
+        sys.path(Path::new("/home/u/target/release")),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    let err = run_install(&sys, &opts()).unwrap_err();
+    assert!(
+        err.contains("/home/u/target/release/gpueue-helper is not trusted"),
+        "{err}"
+    );
+    assert!(!sys.exists("/usr/local/bin/gpueue-helper"));
+    assert!(!sys.exists("/usr/local/bin/gpueue"));
+}
+
+#[test]
+fn a_helper_unpacked_below_a_sticky_directory_is_copied() {
+    // What install.sh does: a release unpacked below /tmp (1777) in a directory only root enters.
+    let mut sys = FakeSystem::new();
+    sys.exe = PathBuf::from("/tmp/rel/gpueue");
+    sys.write_exe("/tmp/rel/gpueue", "new gpueue");
+    sys.write_exe("/tmp/rel/gpueue-helper", "new helper");
+    std::fs::set_permissions(
+        sys.path(Path::new("/tmp")),
+        std::fs::Permissions::from_mode(0o1777),
+    )
+    .unwrap();
+    run_install(&sys, &opts()).unwrap();
+    assert_eq!(
+        sys.read("/usr/local/bin/gpueue-helper").unwrap(),
+        "new helper"
+    );
+
+    // Files with group write below a directory only root can enter (a tarball made with
+    // umask 002) are fine.
+    let mut sys3 = FakeSystem::new();
+    sys3.exe = PathBuf::from("/tmp/rel/gpueue");
+    sys3.write_exe("/tmp/rel/gpueue", "new gpueue");
+    sys3.write_exe("/tmp/rel/gpueue-helper", "new helper");
+    for (path, mode) in [
+        ("/tmp", 0o1777),
+        ("/tmp/rel", 0o700),
+        ("/tmp/rel/gpueue-helper", 0o775),
+    ] {
+        std::fs::set_permissions(
+            sys3.path(Path::new(path)),
+            std::fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
+    }
+    run_install(&sys3, &opts()).unwrap();
+
+    // Not when the directory the files are in is open to everyone.
+    let sys2 = {
+        let mut sys = FakeSystem::new();
+        sys.exe = PathBuf::from("/tmp/rel/gpueue");
+        sys.write_exe("/tmp/rel/gpueue", "new gpueue");
+        sys.write_exe("/tmp/rel/gpueue-helper", "new helper");
+        for dir in ["/tmp", "/tmp/rel"] {
+            std::fs::set_permissions(
+                sys.path(Path::new(dir)),
+                std::fs::Permissions::from_mode(0o777),
+            )
+            .unwrap();
+        }
+        sys
+    };
+    let err = run_install(&sys2, &opts()).unwrap_err();
+    assert!(err.contains("is not trusted"), "{err}");
+}
+
+#[test]
 fn an_identical_binary_behind_a_symlink_is_replaced() {
     let mut sys = FakeSystem::new();
     sys.exe = PathBuf::from("/home/u/target/release/gpueue");
@@ -1434,6 +1511,46 @@ fn purge_keeps_a_user_directory_that_fills_up_again_and_goes_on() {
     let err = purge(&sys, &dirs, &failing, &mut Vec::new()).unwrap_err();
     assert!(err.contains("removing /var/lib/gpueue/logs/1000"), "{err}");
     assert!(sys.exists("/etc/gpueue/config.toml"));
+}
+
+#[test]
+fn purge_keeps_what_it_may_not_open_and_goes_on() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    sys.write("/var/lib/gpueue/logs/1000/7.log", "log");
+    sys.write("/var/lib/gpueue/logs/1001/8.log", "log");
+    let locked = sys.path(Path::new("/var/lib/gpueue/logs/1000"));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut out = Vec::new();
+    let dirs = PurgePlan::new(&sys).unwrap().dirs;
+    let result = purge(&sys, &dirs, &remove_dir, &mut out);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    result.unwrap();
+    let out = String::from_utf8(out).unwrap();
+    // (Running the tests as root, which can open it, would not exercise this.)
+    if sys.exists("/var/lib/gpueue/logs/1000/7.log") {
+        assert!(
+            out.contains("kept /var/lib/gpueue/logs/1000 (not accessible"),
+            "{out}"
+        );
+    }
+    assert!(!sys.exists("/var/lib/gpueue/logs/1001"));
+    assert!(out.contains("removed /etc/gpueue\n"), "{out}");
+}
+
+#[test]
+fn purge_stops_descending_at_a_bounded_depth() {
+    let sys = system();
+    run_install(&sys, &opts()).unwrap();
+    let deep = "d/".repeat(MAX_PURGE_DEPTH + 10);
+    sys.mkdir(&format!("/var/lib/gpueue/logs/{deep}"));
+    let mut out = Vec::new();
+    let dirs = PurgePlan::new(&sys).unwrap().dirs;
+    purge(&sys, &dirs, &remove_dir, &mut out).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("nested too deeply"), "{out}");
+    assert!(sys.exists("/var/lib/gpueue/logs/d"));
+    assert!(out.contains("removed /etc/gpueue\n"), "{out}");
 }
 
 #[test]

@@ -64,7 +64,10 @@ out="$(runuser -u alice -- /build/gpueue service install 2>&1)" && fail "non-roo
 grep -q "must run as root" <<<"$out" || fail "$out"
 
 step "install from a non-system directory copies the binaries to /usr/local/bin"
-/build/gpueue service install | tee /tmp/install.out || true
+# /build is a mount owned by the invoking user: install from a root-owned copy.
+install -d -m 0755 /opt/gpueue-src
+install -m 0755 /build/gpueue /build/gpueue-helper /opt/gpueue-src/
+/opt/gpueue-src/gpueue service install | tee /tmp/install.out || true
 grep -q "installing into /usr/local/bin" /tmp/install.out || fail "no note about /usr/local/bin"
 cmp /build/gpueue /usr/local/bin/gpueue
 cmp /build/gpueue-helper /usr/local/bin/gpueue-helper
