@@ -40,7 +40,7 @@
 | NVIDIA 驱动（GPU 作业） | 其 `cuda-checkpoint` 支持 `--action lock/checkpoint/restore/unlock` 和 `--timeout` 的驱动：r570 或更高版本（cuda-checkpoint 本身支持 r550，但仅支持 `--toggle`，而 gpueue 不使用它） | 595 |
 | cuda-checkpoint（GPU 作业） | NVIDIA 提供的二进制文件，主版本号须与驱动相同 | 595 |
 | nvidia-smi（GPU 作业） | helper 用它查找 CUDA 进程和 GPU 显存 | 随驱动提供 |
-| Rust（仅构建时） | 1.88 或更高版本，另需一个 C 编译器（`cc`）用于构建 helper 的 fork guard 库 | 1.98.1 |
+| Rust（仅构建时） | 1.89 或更高版本，另需一个 C 编译器（`cc`）用于构建 helper 的 fork guard 库 | 1.98.1 |
 
 没有 NVIDIA 驱动时，gpueue 仍然可以运行仅使用 CPU 的作业，并同样可以为它们创建检查点。
 

@@ -1,7 +1,7 @@
 {
   description = "gpueue: multi-user GPU job queue with checkpoint/restore";
 
-  # The latest stable branch (Rust 1.95; gpueue needs 1.88 or newer).
+  # The latest stable branch (Rust 1.95; gpueue needs 1.89 or newer).
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
   outputs =

@@ -39,7 +39,7 @@ command on their `PATH`.
 | NVIDIA driver (GPU jobs) | a driver whose `cuda-checkpoint` supports `--action lock/checkpoint/restore/unlock` and `--timeout`: r570 or newer (cuda-checkpoint itself supports r550, but only with `--toggle`, which gpueue does not use) | 595 |
 | cuda-checkpoint (GPU jobs) | the binary from NVIDIA, with the same major version as the driver | 595 |
 | nvidia-smi (GPU jobs) | the helper uses it to find CUDA processes and GPU memory | from the driver |
-| Rust (building only) | 1.88 or newer, plus a C compiler (`cc`) for the helper's fork guard library | 1.98.1 |
+| Rust (building only) | 1.89 or newer, plus a C compiler (`cc`) for the helper's fork guard library | 1.98.1 |
 
 Without an NVIDIA driver gpueue still runs CPU-only jobs, and checkpoints them as well.
 
