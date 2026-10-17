@@ -11,6 +11,22 @@ use std::process::Command;
 
 use gpueue_helper::access::{DumpHookRequest, hook_refusal_path, hook_result_path};
 
+/// The `gpueue-helper` binary: `GPUEUE_HELPER_EXE` if set (the test
+/// executables run elsewhere than where cargo built them, e.g. in the
+/// NixOS VM of packaging/nix/tests/helper-tests.nix), else the one cargo
+/// built for the tests.
+fn helper_exe() -> std::path::PathBuf {
+    let exe = std::env::var_os("GPUEUE_HELPER_EXE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_gpueue-helper").into());
+    assert!(
+        exe.is_file(),
+        "{} is missing; set GPUEUE_HELPER_EXE to the gpueue-helper binary",
+        exe.display()
+    );
+    exe
+}
+
 /// Runs the hook for this test process (which stands for the job: the hook
 /// scans every process in the PID namespace of `init_pid`) at `action`.
 fn run_hook(dir: &Path, action: &str) -> (bool, std::path::PathBuf) {
@@ -21,7 +37,7 @@ fn run_hook(dir: &Path, action: &str) -> (bool, std::path::PathBuf) {
         private: Vec::new(),
     };
     fs::write(&request, serde_json::to_vec(&req).unwrap()).unwrap();
-    let status = Command::new(env!("CARGO_BIN_EXE_gpueue-helper"))
+    let status = Command::new(helper_exe())
         .arg("dump-hook")
         .arg(&request)
         .env("CRTOOLS_SCRIPT_ACTION", action)
@@ -79,7 +95,7 @@ fn the_dump_hook_does_nothing_at_other_stages() {
 fn a_dump_hook_that_cannot_read_its_request_vetoes_the_dump() {
     let dir = tempfile::tempdir().unwrap();
     let request = dir.path().join("missing.json");
-    let status = Command::new(env!("CARGO_BIN_EXE_gpueue-helper"))
+    let status = Command::new(helper_exe())
         .arg("dump-hook")
         .arg(&request)
         .env("CRTOOLS_SCRIPT_ACTION", "post-dump")
