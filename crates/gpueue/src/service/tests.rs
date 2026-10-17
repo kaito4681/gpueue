@@ -862,11 +862,19 @@ fn a_helper_unpacked_below_a_sticky_directory_is_copied() {
     sys.exe = PathBuf::from("/tmp/rel/gpueue");
     sys.write_exe("/tmp/rel/gpueue", "new gpueue");
     sys.write_exe("/tmp/rel/gpueue-helper", "new helper");
-    std::fs::set_permissions(
-        sys.path(Path::new("/tmp")),
-        std::fs::Permissions::from_mode(0o1777),
-    )
-    .unwrap();
+    // Explicit modes: the test's umask (002 on CI runners) must not matter.
+    for (path, mode) in [
+        ("/tmp", 0o1777),
+        ("/tmp/rel", 0o755),
+        ("/tmp/rel/gpueue", 0o755),
+        ("/tmp/rel/gpueue-helper", 0o755),
+    ] {
+        std::fs::set_permissions(
+            sys.path(Path::new(path)),
+            std::fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
+    }
     run_install(&sys, &opts()).unwrap();
     assert_eq!(
         sys.read("/usr/local/bin/gpueue-helper").unwrap(),

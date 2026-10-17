@@ -149,7 +149,7 @@ test ! -e /var/lib/gpueue/install-receipt || fail "receipt left behind"
 test -x /build/gpueue || fail "the source binary was removed"
 
 step "uninstall --purge (also as service uninstall)"
-/build/gpueue service install >/dev/null || true
+/opt/gpueue-src/gpueue service install >/dev/null || true
 echo n | /usr/local/bin/gpueue uninstall --purge && fail "purge without confirmation"
 test -d /var/lib/gpueue || fail "purged although declined"
 /usr/local/bin/gpueue service uninstall --purge --yes
