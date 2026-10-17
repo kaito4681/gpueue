@@ -443,7 +443,11 @@ fn check_copy_source(sys: &dyn System, path: &Path) -> std::result::Result<(), S
         return Err(first);
     };
     let real_root = std::fs::canonicalize(sys.root()).unwrap_or_else(|_| sys.root().to_owned());
-    let ancestors: Vec<&Path> = real.ancestors().collect();
+    // Up to, not including, the managed system's root (as check_root_owned_chain stops there).
+    let ancestors: Vec<&Path> = real
+        .ancestors()
+        .take_while(|dir| *dir != real_root)
+        .collect();
     // A directory of root's that nobody else can enter seals what is below it: only the
     // directories from there up must be protected against being replaced.
     let sealed = |dir: &Path| {
@@ -460,9 +464,6 @@ fn check_copy_source(sys: &dyn System, path: &Path) -> std::result::Result<(), S
         let protected = meta.mode() & 0o022 == 0 || sticky;
         if meta.uid() != sys.root_uid() || !protected {
             return Err(first);
-        }
-        if *dir == real_root {
-            break;
         }
     }
     if start.is_some() {
