@@ -2792,6 +2792,67 @@ async fn spawns_cut_off_by_a_helper_restart_are_resolved_not_lost() {
     }
 }
 
+/// A spawn request is cut off by a helper restart after the helper had
+/// started the job; the restarted helper re-discovers it. Later the job's
+/// process disappears: the job is lost, not run a second time.
+///
+/// Finding: when the request's failure (`ConnectionLost`) reached the
+/// daemon only after it had reconciled with the new helper, which listed
+/// the job, the launch stayed recorded as unconfirmed, and the check after
+/// the process disappeared took the job for never started and requeued it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cut_off_spawn_of_a_job_the_helper_listed_is_not_run_again() {
+    // How the daemon finds out: a signal (SIGUSR1), which leaves the job
+    // running, or a pause.
+    let signal = || ("kill", json!({ "signal": 10 }));
+    let pause = || ("pause", json!({}));
+    for (lost_before_reconnect, (action, body)) in [
+        (true, signal()),
+        (false, signal()),
+        (true, pause()),
+        (false, pause()),
+    ] {
+        let case = format!("{action}, lost before reconnect: {lost_before_reconnect}");
+        let mut h = Harness::new(0).await;
+        let alice = h.client(ALICE);
+        h.helper.hold_launches();
+        let id = alice.add(&job_request("train", &[])).await;
+        h.helper.wait_held(1).await;
+
+        h.helper.disconnect();
+        if lost_before_reconnect {
+            h.helper.lose_held_launches();
+            h.wait_launch_settled(id).await;
+        }
+        h.helper.insert_running(id);
+        h.helper.reconnect();
+        h.wait_reconciled().await;
+        if !lost_before_reconnect {
+            h.helper.lose_held_launches();
+            h.wait_launch_settled(id).await;
+        }
+        assert_eq!(alice.job(id).await.state, JobState::Running);
+
+        // The process disappears; the daemon notices when it signals it.
+        h.helper.vanish(id);
+        let reply = alice.action(id, action, body).await;
+        assert_eq!(reply.error().code, ErrorCode::InvalidState, "{case}");
+        let job = alice
+            .wait_for(id, &format!("lost ({case})"), |j| {
+                assert!(
+                    !matches!(j.state, JobState::Queued { .. }),
+                    "requeued ({case})"
+                );
+                assert!(h.helper.spawned().is_empty(), "run again ({case})");
+                matches!(j.state, JobState::Done { .. })
+            })
+            .await;
+        assert_eq!(job.state, done(JobResult::Lost), "{case}");
+        assert!(h.helper.spawned().is_empty(), "run again ({case})");
+        h.stop().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_spawn_fails_the_waiting_action_cleanly() {
     let mut h = Harness::new(1).await;
