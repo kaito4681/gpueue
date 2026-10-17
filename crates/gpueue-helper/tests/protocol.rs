@@ -1675,17 +1675,37 @@ async fn dumps_are_refused_without_a_usable_criu() {
     );
 }
 
-/// Deleted files on the host's filesystems go into the image instead of
-/// being linked back by root (`--link-remap`) through a path the owner
-/// controls.
+/// Deleted files go into the image instead of being linked back by root
+/// (`--link-remap`, which is never passed) through a path the owner
+/// controls; the ghost limit covers the largest, private ones included.
 #[test]
-fn deleted_host_files_are_dumped_as_ghosts() {
-    let ck = gpueue_helper::config::default_checkpoint_config();
-    assert!(ck.criu.link_remap);
+fn deleted_files_are_dumped_as_ghosts() {
+    use gpueue_helper::host::DeletedFile;
+    let mut ck = gpueue_helper::config::default_checkpoint_config();
+    assert!(!ck.criu.link_remap);
     let none = gpueue_helper::engine::dump_options(&ck, &DumpHazards::default());
     assert_eq!(none, ck);
+    ck.criu.link_remap = true;
+    assert!(
+        !gpueue_helper::engine::dump_options(&ck, &DumpHazards::default())
+            .criu
+            .link_remap
+    );
+    let file = |path: &str, size: u64, private: bool| DeletedFile {
+        path: path.into(),
+        size,
+        uid: 1000,
+        mode: 0o100600,
+        nlink: 0,
+        private,
+        file_caps: false,
+    };
     let h = DumpHazards {
-        deleted_files: vec![("/home/a/x".into(), 5 << 20), ("/home/a/y".into(), 10)],
+        deleted_files: vec![
+            file("/home/a/x", 5 << 20, false),
+            file("/home/a/y", 10, false),
+            file("/tmp/big", 7 << 20, true),
+        ],
         ..Default::default()
     };
     let ghost = gpueue_helper::engine::dump_options(&ck, &h);
@@ -1694,9 +1714,175 @@ fn deleted_host_files_are_dumped_as_ghosts() {
         ghost.criu.extra_dump_args,
         [
             "--ghost-limit".into(),
-            ((5u64 << 20) + 1).to_string().into()
+            ((7u64 << 20) + 1).to_string().into()
         ] as [std::ffi::OsString; 2]
     );
+}
+
+/// Deleted files that CRIU could only link back as root, or would
+/// re-create as root as a privileged program (setuid, setgid, file
+/// capabilities), are refused before the job is touched.
+#[tokio::test]
+async fn dump_refuses_deleted_files_it_cannot_save_safely() {
+    use gpueue_helper::host::DeletedFile;
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(3))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    let file = |uid: u32, mode: u32, nlink: u64| DeletedFile {
+        path: "/home/alice/f".into(),
+        size: 1,
+        uid,
+        mode,
+        nlink,
+        private: false,
+        file_caps: false,
+    };
+    let mut caps = file(0, 0o100755, 0);
+    caps.file_caps = true;
+    let cases = [
+        (
+            DumpHazards {
+                deleted_files: vec![file(uid(), 0o100600, 1)],
+                ..Default::default()
+            },
+            "other hard links",
+        ),
+        (
+            DumpHazards {
+                silly_renamed: vec!["/nfs/alice/.nfs00000000001234000000001".into()],
+                ..Default::default()
+            },
+            "deleted on NFS",
+        ),
+        (
+            DumpHazards {
+                deleted_files: vec![file(0, 0o104755, 0)],
+                ..Default::default()
+            },
+            "setuid",
+        ),
+        (
+            DumpHazards {
+                deleted_files: vec![file(uid(), 0o102755, 0)],
+                ..Default::default()
+            },
+            "setgid",
+        ),
+        (
+            DumpHazards {
+                deleted_files: vec![caps],
+                ..Default::default()
+            },
+            "file capabilities",
+        ),
+    ];
+    for (hazards, why) in cases {
+        env.host.set_dump_hazards(hazards);
+        let r = c
+            .request(Request::Checkpoint {
+                job: JobId(3),
+                image_dir: env.base().join("3"),
+                options: Default::default(),
+            })
+            .await;
+        let ResponseResult::Error { code, message } = &r else {
+            panic!("{r:?}");
+        };
+        assert_eq!(*code, HelperErrorCode::CheckpointRefused, "{r:?}");
+        assert!(message.contains(why), "{message}");
+        assert_eq!(c.running().await, [(JobId(3), RunningPhase::Running)]);
+    }
+    assert!(env.exec.lock().unwrap().actions.is_empty());
+}
+
+/// Deleted files of others, such as libraries a package upgrade replaced
+/// while the job ran, are saved in the image like the job's own.
+#[tokio::test]
+async fn deleted_libraries_of_root_are_dumped() {
+    use gpueue_helper::host::DeletedFile;
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    env.host.set_dump_hazards(DumpHazards {
+        deleted_files: vec![DeletedFile {
+            path: "/usr/lib/x86_64-linux-gnu/libc.so.6".into(),
+            size: 2 << 20,
+            uid: 0,
+            mode: 0o100755,
+            nlink: 0,
+            private: false,
+            file_caps: false,
+        }],
+        ..Default::default()
+    });
+    spawn_and_dump(&env, &mut c, 3).await;
+    let args = env.exec.lock().unwrap().dump_args.clone();
+    let args = args.last().unwrap();
+    assert!(!args.iter().any(|a| a == "--link-remap"), "{args:?}");
+    assert!(args.iter().any(|a| a == "--ghost-limit"), "{args:?}");
+}
+
+/// The post-dump hook found something to refuse while CRIU had the job
+/// stopped: CRIU abandons the dump and resumes the job, and the helper
+/// reports a refusal (not a failure), with the hook's reason.
+#[tokio::test]
+async fn a_dump_the_post_dump_hook_vetoes_is_refused() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(3))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    env.exec.lock().unwrap().dump_hook_refusal = Some("the job holds something bad".into());
+    let image_dir = env.base().join("3");
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(3),
+            image_dir: image_dir.clone(),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    let Event::CheckpointFinished { job, outcome } = &ev.event else {
+        panic!("{ev:?}");
+    };
+    assert_eq!(*job, JobId(3));
+    assert!(outcome.is_refused(), "{outcome:?}");
+    let CheckpointOutcome::Failed { reason, .. } = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(
+        reason.contains("the job holds something bad") && reason.contains("resumed"),
+        "{reason}"
+    );
+    assert!(!image_dir.exists());
+    assert_eq!(c.running().await, [(JobId(3), RunningPhase::Running)]);
+}
+
+/// The real host scans a job's files in a `verify-access` child (a
+/// filesystem that does not answer cannot hold the helper up).
+#[test]
+fn the_real_host_scans_files_in_a_child() {
+    use gpueue_helper::host::{HostProbe, SystemHost};
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("gone");
+    let held = std::fs::File::create(&f).unwrap();
+    std::fs::remove_file(&f).unwrap();
+    let open = tmp.path().join("open");
+    let open_held = std::fs::File::create(&open).unwrap();
+    let host = SystemHost::new("nvidia-smi".into(), Default::default(), helper_exe());
+    let me = std::process::id();
+    let h = host.dump_hazards(&[me], &[]).unwrap();
+    assert!(
+        h.deleted_files.iter().any(|d| Path::new(&d.path) == f),
+        "{h:?}"
+    );
+    let files = host.open_files(&[me]).unwrap();
+    assert!(files.iter().any(|p| Path::new(p) == open), "{files:?}");
+    drop((held, open_held));
 }
 
 /// The helper stopped in the middle of a restore: its next start kills

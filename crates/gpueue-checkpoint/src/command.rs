@@ -121,8 +121,12 @@ pub struct CriuOptions {
     pub criu_path: PathBuf,
     /// `-v<N>` log verbosity (0-4).
     pub log_level: u8,
-    /// `--link-remap`: needed for unlinked-but-open files such as the POSIX
-    /// semaphores Python multiprocessing creates under `/dev/shm`.
+    /// `--link-remap`: lets CRIU link open files that have no name of their
+    /// own any more (deleted while another hard link remains, renamed away,
+    /// silly-renamed by NFS) back into their directory during the dump, as
+    /// root and by path. Off by default: files deleted for good (unlinked
+    /// POSIX semaphores under `/dev/shm`, deleted temporary files) are
+    /// saved in the image as ghost files without it.
     pub link_remap: bool,
     /// `--tcp-close` on dump and restore: TCP connections are closed rather
     /// than refusing to dump.
@@ -147,7 +151,7 @@ impl Default for CriuOptions {
         Self {
             criu_path: PathBuf::from("criu"),
             log_level: 4,
-            link_remap: true,
+            link_remap: false,
             tcp_close: true,
             external_mounts: true,
             plugin_dir: None,
@@ -493,10 +497,10 @@ mod tests {
                 "mnt[]",
                 "--enable-external-masters",
                 "--tcp-close",
-                "--link-remap",
             ]
         );
         assert!(!cmd.has_arg("-L"));
+        assert!(!cmd.has_arg("--link-remap"), "link-remap is off by default");
     }
 
     #[test]
@@ -525,9 +529,19 @@ mod tests {
     }
 
     #[test]
+    fn dump_link_remap_only_when_asked() {
+        assert!(!CriuOptions::default().link_remap);
+        let opts = CriuOptions {
+            link_remap: true,
+            ..Default::default()
+        };
+        let cmd = criu_dump(&opts, CudaMode::Plugin, &dump_target());
+        assert!(cmd.has_arg("--link-remap"));
+    }
+
+    #[test]
     fn dump_flags_can_be_disabled() {
         let opts = CriuOptions {
-            link_remap: false,
             tcp_close: false,
             external_mounts: false,
             log_level: 9,
@@ -537,7 +551,6 @@ mod tests {
         let mut t = dump_target();
         t.leave_running = true;
         let cmd = criu_dump(&opts, CudaMode::Plugin, &t);
-        assert!(!cmd.has_arg("--link-remap"));
         assert!(!cmd.has_arg("--tcp-close"));
         assert!(!cmd.has_arg("--external"));
         assert!(!cmd.has_arg("--enable-external-masters"));

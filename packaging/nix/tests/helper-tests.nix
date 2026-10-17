@@ -31,6 +31,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("multi-user.target")
     binaries = machine.succeed("ls ${tests}/bin").split()
     assert "protocol-test" in binaries, binaries
+    assert "dump_hook-test" in binaries, binaries
 
     totals = {"passed": 0, "failed": 0, "ignored": 0}
     for name in binaries:

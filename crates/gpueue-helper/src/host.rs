@@ -6,6 +6,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use gpueue_checkpoint::command::{CudaCheckpointOptions, cuda_get_restore_tid, cuda_get_state};
 use gpueue_checkpoint::exec::run_with_timeout;
 use gpueue_checkpoint::{CommandSpec, probe, procfs, space};
@@ -208,12 +210,18 @@ pub trait HostProbe: Send + Sync + 'static {
 }
 
 /// Things about a job that make CRIU work on host paths as root.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// The helper scans for them before a dump ([`scan_dump_hazards`], in
+/// [`crate::engine::precheck_dump`]) and again while CRIU has the job
+/// stopped after it ([`crate::access::run_dump_hook`]); both refuse what
+/// [`DumpHazards::refusal`] names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DumpHazards {
-    /// Deleted files on the host's filesystems that the job holds open or
-    /// mapped, with their sizes. `criu dump --link-remap` would link each
-    /// back into its directory, as root, by path.
-    pub deleted_files: Vec<(String, u64)>,
+    /// Deleted files that the job holds open or mapped, on the host's
+    /// filesystems and on its own tmpfs mounts. CRIU saves them in the
+    /// image (as "ghost" files), and a restore re-creates each one, as
+    /// root, with its owner and mode, next to its old path.
+    pub deleted_files: Vec<DeletedFile>,
     /// Paths on the host's filesystems that Unix sockets of the job are
     /// bound to. `criu restore` binds, unlinks and chowns them as root, by
     /// path.
@@ -231,12 +239,201 @@ pub struct DumpHazards {
     /// messages). CRIU re-adds their marks as root, through paths that
     /// follow symlinks, so a restored mark could watch a directory its
     /// owner may not read.
+    #[serde(default)]
     pub notify_fds: Vec<String>,
     /// Abstract names (`@name`) of listening Unix sockets of the job.
     /// CRIU sets them up as root, before it restores the job's
     /// credentials, so a client asking who listens (`SO_PEERCRED`) would
     /// be told root.
+    #[serde(default)]
     pub abstract_listeners: Vec<String>,
+    /// Files the job holds that the NFS client renamed to `.nfs<hex>`
+    /// because they were deleted while open. They have no name of their
+    /// own any more, and CRIU could only dump them by linking them back
+    /// (`--link-remap`, as root, by path).
+    #[serde(default)]
+    pub silly_renamed: Vec<String>,
+}
+
+/// A deleted file a job holds (see [`DumpHazards::deleted_files`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedFile {
+    pub path: String,
+    pub size: u64,
+    pub uid: u32,
+    pub mode: u32,
+    /// Hard links left. A file deleted while another link remains cannot be
+    /// saved as a ghost: CRIU could only link it back (`--link-remap`).
+    pub nlink: u64,
+    /// On one of the job's own tmpfs mounts (its `/tmp`, `/dev/shm`),
+    /// whose contents are saved in the image anyway.
+    pub private: bool,
+    /// Has file capabilities (a `security.capability` extended attribute).
+    #[serde(default)]
+    pub file_caps: bool,
+}
+
+impl DeletedFile {
+    /// Whether running the file could grant privileges: it has the setuid
+    /// or setgid bit, or file capabilities.
+    pub fn grants_privileges(&self) -> bool {
+        self.mode & 0o6000 != 0 || self.file_caps
+    }
+}
+
+/// At most this many paths are named in a refusal.
+const SHOWN_PATHS: usize = 5;
+
+/// `items` (paths the job chose) for a message, at most [`SHOWN_PATHS`] of
+/// them, with control characters escaped.
+fn list_some<T: AsRef<str>>(items: &[T]) -> String {
+    let escape = |item: &str| {
+        item.chars()
+            .flat_map(|c| {
+                let escaped: Vec<char> = if c.is_control() {
+                    c.escape_default().collect()
+                } else {
+                    vec![c]
+                };
+                escaped
+            })
+            .collect::<String>()
+    };
+    let mut list = items
+        .iter()
+        .take(SHOWN_PATHS)
+        .map(|i| escape(i.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > SHOWN_PATHS {
+        list.push_str(&format!(" and {} more", items.len() - SHOWN_PATHS));
+    }
+    list
+}
+
+impl DumpHazards {
+    /// Why a job with these hazards must not be dumped, if it must not.
+    /// Checked before the dump and again by the post-dump hook, which makes
+    /// CRIU abandon the dump and resume the job.
+    ///
+    /// Deleted files of other owners (a library a package upgrade replaced
+    /// while the job ran) are fine: a restore re-creates them, as root,
+    /// with their owner and mode and the contents the job could read
+    /// anyway. Not so a privileged program: re-created setuid, setgid or
+    /// with file capabilities, it could be executed through the restored
+    /// descriptor.
+    pub fn refusal(&self) -> Option<String> {
+        // Every reason, so that each can be dealt with at once.
+        let mut reasons = Vec::new();
+        if !self.bound_sockets.is_empty() {
+            reasons.push(format!(
+                "the job has Unix sockets bound to {:?} on the host's filesystems (or to \
+                 relative names, which lead there too); a restore would make CRIU create, \
+                 unlink and chown those paths as root (bind sockets to an absolute path below \
+                 /tmp, which is the job's own, or to an abstract name)",
+                self.bound_sockets
+            ));
+        }
+        if !self.reuseport_sockets.is_empty() {
+            reasons.push(format!(
+                "the job has internet sockets with SO_REUSEPORT ({}); CRIU would restore them \
+                 as root's, which lets them share the port with a root service and receive \
+                 part of its connections (do not set SO_REUSEPORT)",
+                self.reuseport_sockets.join(", ")
+            ));
+        }
+        if !self.notify_fds.is_empty() {
+            reasons.push(format!(
+                "the job has inotify or fanotify descriptors ({}); CRIU would re-add their \
+                 watches as root, by paths (close them before the checkpoint)",
+                self.notify_fds.join(", ")
+            ));
+        }
+        if !self.abstract_listeners.is_empty() {
+            reasons.push(format!(
+                "the job has Unix sockets listening on the abstract names {:?}; CRIU would set \
+                 them up as root, so their clients would be told that root listens there \
+                 (listen on a path below /tmp instead)",
+                self.abstract_listeners
+            ));
+        }
+        let linked: Vec<&str> = self
+            .deleted_files
+            .iter()
+            .filter(|f| f.nlink > 0)
+            .map(|f| f.path.as_str())
+            .collect();
+        if !linked.is_empty() || !self.silly_renamed.is_empty() {
+            let mut what = Vec::new();
+            if !linked.is_empty() {
+                what.push(format!(
+                    "deleted files that still have other hard links ({})",
+                    list_some(&linked)
+                ));
+            }
+            if !self.silly_renamed.is_empty() {
+                what.push(format!(
+                    "files deleted on NFS while open ({})",
+                    list_some(&self.silly_renamed)
+                ));
+            }
+            reasons.push(format!(
+                "the job holds {}; CRIU could only checkpoint them by linking them back into \
+                 their directories as root (close those files before the checkpoint)",
+                what.join(" and ")
+            ));
+        }
+        let privileged: Vec<String> = self
+            .deleted_files
+            .iter()
+            .filter(|f| f.grants_privileges())
+            .map(|f| {
+                let caps = if f.file_caps {
+                    ", file capabilities"
+                } else {
+                    ""
+                };
+                format!(
+                    "{} (uid {}, mode {:o}{caps})",
+                    f.path,
+                    f.uid,
+                    f.mode & 0o7777
+                )
+            })
+            .collect();
+        if !privileged.is_empty() {
+            reasons.push(format!(
+                "the job holds deleted files with the setuid or setgid bit or file \
+                 capabilities ({}); a restore would make CRIU re-create them as root with \
+                 that owner and mode (close those files, or restart the job)",
+                list_some(&privileged)
+            ));
+        }
+        if reasons.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{}; so the job cannot be checkpointed (or run it with --no-checkpoint)",
+            reasons.join("; ")
+        ))
+    }
+}
+
+/// Whether the file `path` leads to has a `security.capability` extended
+/// attribute. One whose attributes cannot be read has none.
+fn has_file_caps(path: &Path) -> bool {
+    let mut empty: [u8; 0] = [];
+    rustix::fs::getxattr(path, "security.capability", &mut empty[..]).is_ok_and(|n| n > 0)
+}
+
+/// Whether the last component of `path` is a name the Linux NFS client
+/// gives a file deleted while open (`.nfs` and hex digits: its file id and
+/// a counter).
+pub fn is_nfs_silly_name(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .and_then(|name| name.strip_prefix(".nfs"))
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 pub use crate::access::HeldFile;
@@ -267,6 +464,7 @@ pub fn is_private_path(path: &str, private: &[String]) -> bool {
         || path.starts_with("/memfd:")
         || path.starts_with("/SYSV")
         || path.starts_with("/dev/zero")
+        || path.starts_with("/[aio]")
 }
 
 /// The mount point in `private` that a Unix socket's name `name` lies
@@ -767,6 +965,175 @@ pub fn held_files(proc_root: &Path, host_pids: &[u32], private: &[String]) -> Ve
     out
 }
 
+/// Regular files that the processes `host_pids` have open, and their
+/// working directories, that this process reaches by the same path (see
+/// [`HostProbe::open_files`]). Stats the files, which may block on a
+/// filesystem that does not answer: the real host runs it in a
+/// `verify-access` child with a deadline.
+pub fn scan_open_files(proc_root: &Path, host_pids: &[u32]) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out: Vec<String> = Vec::new();
+    for pid in host_pids {
+        let dir = proc_root.join(pid.to_string());
+        let fds = fs::read_dir(dir.join("fd"))
+            .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for link in fds
+            .iter()
+            .map(|p| (p, false))
+            .chain([(&dir.join("cwd"), true)])
+        {
+            let (link, is_cwd) = link;
+            let (Ok(target), Ok(meta)) = (fs::read_link(link), fs::metadata(link)) else {
+                continue;
+            };
+            if !(meta.is_file() || is_cwd && meta.is_dir()) {
+                continue;
+            }
+            let Some(path) = target.to_str() else {
+                continue;
+            };
+            // Deleted files (CRIU saves them) and files of mounts the
+            // helper does not have (the job's private /tmp) are not
+            // reached by the same path.
+            let same =
+                fs::metadata(path).is_ok_and(|m| m.dev() == meta.dev() && m.ino() == meta.ino());
+            if same && !out.iter().any(|p| p == path) {
+                out.push(path.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// What a dump of the processes `host_pids` must take care of (see
+/// [`DumpHazards`]). Stats the files they hold, which may block on a
+/// filesystem that does not answer: the real host runs it in a
+/// `verify-access` child with a deadline (see [`HostProbe::dump_hazards`]
+/// and [`crate::access::run_dump_hook`]).
+pub fn scan_dump_hazards(
+    proc_root: &Path,
+    host_pids: &[u32],
+    private: &[String],
+) -> io::Result<DumpHazards> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = DumpHazards::default();
+    let mut deleted = std::collections::HashSet::new();
+    let mut sockets = std::collections::HashSet::new();
+    let mut socket_fds: Vec<(u32, i32)> = Vec::new();
+    for pid in host_pids {
+        let dir = proc_root.join(pid.to_string());
+        let links = ["fd", "map_files"].iter().flat_map(|sub| {
+            fs::read_dir(dir.join(sub))
+                .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        });
+        for link in links {
+            let Ok(target) = fs::read_link(&link) else {
+                continue;
+            };
+            let target = target.to_string_lossy();
+            if target == "anon_inode:inotify" || target == "anon_inode:[fanotify]" {
+                let what = format!(
+                    "{} of process {pid}",
+                    target
+                        .trim_start_matches("anon_inode:")
+                        .trim_matches(['[', ']'])
+                );
+                if !out.notify_fds.contains(&what) {
+                    out.notify_fds.push(what);
+                }
+                continue;
+            }
+            if let Some(ino) = target
+                .strip_prefix("socket:[")
+                .and_then(|s| s.strip_suffix(']'))
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                sockets.insert(ino);
+                if let Some(fd) = link
+                    .strip_prefix(dir.join("fd"))
+                    .ok()
+                    .and_then(|n| n.to_str()?.parse::<i32>().ok())
+                {
+                    socket_fds.push((*pid, fd));
+                }
+                continue;
+            }
+            let Some(path) = target.strip_suffix(" (deleted)") else {
+                // A held file (see `held_files`), or one the NFS client
+                // renamed because it was deleted while open.
+                if target.starts_with('/')
+                    && !is_private_path(&target, private)
+                    && is_nfs_silly_name(&target)
+                    && !out.silly_renamed.iter().any(|p| *p == target)
+                {
+                    out.silly_renamed.push(target.into_owned());
+                }
+                continue;
+            };
+            // Not files on any filesystem: /proc, memfd, SysV shared
+            // memory and the like.
+            if !path.starts_with('/') || is_private_path(path, &[]) {
+                continue;
+            }
+            // A process that exited meanwhile holds nothing.
+            let Ok(m) = fs::metadata(&link) else {
+                continue;
+            };
+            // By inode: two deleted files may have had the same path.
+            if !deleted.insert((m.dev(), m.ino())) {
+                continue;
+            }
+            out.deleted_files.push(DeletedFile {
+                path: path.to_owned(),
+                size: m.len(),
+                uid: m.uid(),
+                mode: m.mode(),
+                nlink: m.nlink(),
+                private: is_private_path(path, private),
+                file_caps: has_file_caps(&link),
+            });
+        }
+    }
+    out.held_files = held_files(proc_root, host_pids, private);
+    for (pid, fd) in socket_fds {
+        if let Some(addr) = reuseport_inet_socket(pid, fd)
+            && !out.reuseport_sockets.contains(&addr)
+        {
+            out.reuseport_sockets.push(addr);
+        }
+    }
+    if !sockets.is_empty()
+        && let Some(pid) = host_pids.first()
+    {
+        // The job shares the host's network namespace; `net/unix` lists
+        // the bound path of each socket by inode.
+        let table = fs::read_to_string(proc_root.join(pid.to_string()).join("net/unix"))?;
+        let listening = parse_net_unix_listening(&table);
+        for (ino, path) in parse_net_unix(&table) {
+            if !sockets.contains(&ino) {
+                continue;
+            }
+            if path.starts_with('@') {
+                if listening.contains(&ino) && !out.abstract_listeners.contains(&path) {
+                    out.abstract_listeners.push(path);
+                }
+                continue;
+            }
+            // A name below a private mount must lead there too.
+            let host = match private_socket_mount(&path, private) {
+                Some(mount) => !socket_dir_is_private(proc_root, *pid, &path, mount),
+                None => true,
+            };
+            if host && !out.bound_sockets.contains(&path) {
+                out.bound_sockets.push(path);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Host PIDs of the processes in the PID namespace whose init has host PID
 /// `init_pid`.
 pub fn ns_processes(proc_root: &Path, init_pid: u32) -> io::Result<Vec<u32>> {
@@ -1216,137 +1583,26 @@ impl HostProbe for SystemHost {
     }
 
     fn open_files(&self, host_pids: &[u32]) -> io::Result<Vec<String>> {
-        use std::os::unix::fs::MetadataExt;
-        let mut out: Vec<String> = Vec::new();
-        for pid in host_pids {
-            let dir = self.proc_root.join(pid.to_string());
-            let fds = fs::read_dir(dir.join("fd"))
-                .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
-                .unwrap_or_default();
-            for link in fds
-                .iter()
-                .map(|p| (p, false))
-                .chain([(&dir.join("cwd"), true)])
-            {
-                let (link, is_cwd) = link;
-                let (Ok(target), Ok(meta)) = (fs::read_link(link), fs::metadata(link)) else {
-                    continue;
-                };
-                if !(meta.is_file() || is_cwd && meta.is_dir()) {
-                    continue;
-                }
-                let Some(path) = target.to_str() else {
-                    continue;
-                };
-                // Deleted files (CRIU saves them) and files of mounts the
-                // helper does not have (the job's private /tmp) are not
-                // reached by the same path.
-                let same = fs::metadata(path)
-                    .is_ok_and(|m| m.dev() == meta.dev() && m.ino() == meta.ino());
-                if same && !out.iter().any(|p| p == path) {
-                    out.push(path.to_owned());
-                }
-            }
+        if host_pids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        let req = VerifyRequest::OpenFiles(crate::access::ScanCheck {
+            proc_root: self.proc_root.clone(),
+            pids: host_pids.to_vec(),
+            private: Vec::new(),
+        });
+        crate::access::run_child(&self.helper_exe, &req, OPEN_FILES_TIMEOUT)
+            .map_err(io::Error::other)
     }
 
     fn dump_hazards(&self, host_pids: &[u32], private: &[String]) -> io::Result<DumpHazards> {
-        let mut out = DumpHazards::default();
-        let mut sockets = std::collections::HashSet::new();
-        let mut socket_fds: Vec<(u32, i32)> = Vec::new();
-        // By inode: two deleted files may have had the same path.
-        let mut deleted = std::collections::HashSet::new();
-        for pid in host_pids {
-            let dir = self.proc_root.join(pid.to_string());
-            let links = ["fd", "map_files"].iter().flat_map(|sub| {
-                fs::read_dir(dir.join(sub))
-                    .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            });
-            for link in links {
-                let Ok(target) = fs::read_link(&link) else {
-                    continue;
-                };
-                let target = target.to_string_lossy();
-                if target == "anon_inode:inotify" || target == "anon_inode:[fanotify]" {
-                    let what = format!(
-                        "{} of process {pid}",
-                        target
-                            .trim_start_matches("anon_inode:")
-                            .trim_matches(['[', ']'])
-                    );
-                    if !out.notify_fds.contains(&what) {
-                        out.notify_fds.push(what);
-                    }
-                    continue;
-                }
-                if let Some(ino) = target
-                    .strip_prefix("socket:[")
-                    .and_then(|s| s.strip_suffix(']'))
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    sockets.insert(ino);
-                    if let Some(fd) = link
-                        .strip_prefix(dir.join("fd"))
-                        .ok()
-                        .and_then(|n| n.to_str()?.parse::<i32>().ok())
-                    {
-                        socket_fds.push((*pid, fd));
-                    }
-                    continue;
-                }
-                let Some(path) = target.strip_suffix(" (deleted)") else {
-                    continue; // a held file, see `held_files`
-                };
-                if !path.starts_with('/') || is_private_path(path, private) {
-                    continue;
-                }
-                let Ok(meta) = fs::metadata(&link) else {
-                    continue; // closed or exited meanwhile
-                };
-                use std::os::unix::fs::MetadataExt;
-                if deleted.insert((meta.dev(), meta.ino())) {
-                    out.deleted_files.push((path.to_owned(), meta.len()));
-                }
-            }
-        }
-        out.held_files = held_files(&self.proc_root, host_pids, private);
-        for (pid, fd) in socket_fds {
-            if let Some(addr) = reuseport_inet_socket(pid, fd)
-                && !out.reuseport_sockets.contains(&addr)
-            {
-                out.reuseport_sockets.push(addr);
-            }
-        }
-        if !sockets.is_empty()
-            && let Some(pid) = host_pids.first()
-        {
-            // The job shares the host's network namespace; `net/unix` lists
-            // the bound path of each socket by inode.
-            let table = fs::read_to_string(self.proc_root.join(pid.to_string()).join("net/unix"))?;
-            let listening = parse_net_unix_listening(&table);
-            for (ino, path) in parse_net_unix(&table) {
-                if !sockets.contains(&ino) {
-                    continue;
-                }
-                if path.starts_with('@') {
-                    if listening.contains(&ino) && !out.abstract_listeners.contains(&path) {
-                        out.abstract_listeners.push(path);
-                    }
-                    continue;
-                }
-                // A name below a private mount must lead there too.
-                let host = match private_socket_mount(&path, private) {
-                    Some(mount) => !socket_dir_is_private(&self.proc_root, *pid, &path, mount),
-                    None => true,
-                };
-                if host && !out.bound_sockets.contains(&path) {
-                    out.bound_sockets.push(path);
-                }
-            }
-        }
-        Ok(out)
+        let req = VerifyRequest::DumpHazards(crate::access::ScanCheck {
+            proc_root: self.proc_root.clone(),
+            pids: host_pids.to_vec(),
+            private: private.to_vec(),
+        });
+        crate::access::run_child(&self.helper_exe, &req, DUMP_SCAN_TIMEOUT)
+            .map_err(io::Error::other)
     }
 
     fn inet_ports_in_use(&self) -> io::Result<Vec<crate::images::InetPort>> {
@@ -1484,6 +1740,13 @@ const AUTOMOUNT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long [`SystemHost::held_file_attrs`] waits for the files' lookups.
 const HELD_ATTRS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a scan of a job's files ([`scan_dump_hazards`], before a dump
+/// and in the post-dump hook) may take.
+pub const DUMP_SCAN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long [`SystemHost::open_files`] waits for [`scan_open_files`].
+const OPEN_FILES_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The local address of socket `fd` of process `pid` if it is an internet
 /// socket with `SO_REUSEPORT` (looked at through a duplicate taken with
@@ -1799,41 +2062,42 @@ mod tests {
         let sock = tmp.path().join("sock");
         let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let host = SystemHost::new("nvidia-smi".into(), Default::default(), "x".into());
-        let h = host
-            .dump_hazards(&[std::process::id()], &["/tmp-private".into()])
-            .unwrap();
-        assert!(
-            h.deleted_files
-                .iter()
-                .any(|(p, _)| p == f.to_str().unwrap()),
-            "{h:?}"
-        );
+        let proc_root = Path::new("/proc");
+        let me = std::process::id();
+        let h = scan_dump_hazards(proc_root, &[me], &["/tmp-private".into()]).unwrap();
+        let f = f.to_str().unwrap();
+        let found = h.deleted_files.iter().find(|d| d.path == f);
+        let found = found.unwrap_or_else(|| panic!("{h:?}"));
+        assert_eq!(found.uid, nix::unistd::geteuid().as_raw(), "{h:?}");
+        assert_eq!((found.nlink, found.private), (0, false), "{h:?}");
+        // Only this file (other tests of this process may hold others).
+        let only_deleted = DumpHazards {
+            deleted_files: vec![found.clone()],
+            ..Default::default()
+        };
+        assert_eq!(only_deleted.refusal(), None, "{h:?}");
         // Another deleted file that had the same path is another file.
-        fs::write(&f, b"0123456789").unwrap();
-        let held2 = fs::File::open(&f).unwrap();
-        fs::remove_file(&f).unwrap();
-        let h = host
-            .dump_hazards(&[std::process::id()], &["/tmp-private".into()])
-            .unwrap();
-        let mut sizes: Vec<u64> = h
+        fs::write(f, b"0123456789").unwrap();
+        let held2 = fs::File::open(f).unwrap();
+        fs::remove_file(f).unwrap();
+        let h2 = scan_dump_hazards(proc_root, &[me], &["/tmp-private".into()]).unwrap();
+        let mut sizes: Vec<u64> = h2
             .deleted_files
             .iter()
-            .filter(|(p, _)| p == f.to_str().unwrap())
-            .map(|(_, s)| *s)
+            .filter(|d| d.path == f)
+            .map(|d| d.size)
             .collect();
         sizes.sort_unstable();
-        assert_eq!(sizes, [0, 10], "{h:?}");
+        assert_eq!(sizes, [0, 10], "{h2:?}");
         drop(held2);
-        let f = f.to_str().unwrap();
         assert!(
             h.bound_sockets.contains(&sock.to_str().unwrap().to_owned()),
             "{h:?}"
         );
         let tmp_root = tmp.path().parent().unwrap().to_str().unwrap().to_owned();
-        let h = host
-            .dump_hazards(&[std::process::id()], &[tmp_root])
-            .unwrap();
-        assert!(!h.deleted_files.iter().any(|(p, _)| p == f), "{h:?}");
+        let h = scan_dump_hazards(proc_root, &[me], &[tmp_root]).unwrap();
+        let found = h.deleted_files.iter().find(|d| d.path == f);
+        assert!(found.is_some_and(|d| d.private), "{h:?}");
         assert!(h.bound_sockets.is_empty(), "{h:?}");
         drop(held);
         let groups = host.process_groups(&[std::process::id()]).unwrap().unwrap();
@@ -1847,9 +2111,7 @@ mod tests {
         let port = std::net::SocketAddr::try_from(rustix::net::getsockname(&reuse).unwrap())
             .unwrap()
             .port();
-        let h = host
-            .dump_hazards(&[std::process::id()], &["/tmp-private".into()])
-            .unwrap();
+        let h = scan_dump_hazards(proc_root, &[me], &["/tmp-private".into()]).unwrap();
         // pidfd_getfd needs ptrace access to ourselves, which a sandbox may
         // deny; then nothing is found.
         if !h.reuseport_sockets.is_empty() {
@@ -1898,9 +2160,8 @@ mod tests {
         let _a = std::os::unix::net::UnixListener::bind(&via_dotdot).unwrap();
         let _b = std::os::unix::net::UnixListener::bind(&via_link).unwrap();
         assert!(host_dir.join("a.sock").exists() && host_dir.join("b.sock").exists());
-        let host = SystemHost::new("nvidia-smi".into(), Default::default(), "x".into());
         let private = [private_dir.to_str().unwrap().to_owned()];
-        let h = host.dump_hazards(&[std::process::id()], &private).unwrap();
+        let h = scan_dump_hazards(Path::new("/proc"), &[std::process::id()], &private).unwrap();
         for name in [&via_dotdot, &via_link] {
             assert!(
                 h.bound_sockets.iter().any(|s| s == name.to_str().unwrap()),
@@ -1952,9 +2213,8 @@ mod tests {
         let addr = std::os::unix::net::SocketAddr::from_abstract_name(&name).unwrap();
         let _l = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
         let host = SystemHost::new("nvidia-smi".into(), Default::default(), "x".into());
-        let h = host
-            .dump_hazards(&[std::process::id()], &["/tmp".into()])
-            .unwrap();
+        let h =
+            scan_dump_hazards(Path::new("/proc"), &[std::process::id()], &["/tmp".into()]).unwrap();
         assert_eq!(
             h.notify_fds,
             [format!("inotify of process {}", std::process::id())]
@@ -1991,6 +2251,98 @@ mod tests {
         );
         let own = std::collections::HashSet::from([1, 2, 3]);
         assert!(port_conflicts(&sockets, &own).is_empty());
+    }
+
+    /// A deleted file that keeps another hard link, and one the NFS client
+    /// renamed: CRIU could only link them back, so both are refused.
+    #[test]
+    fn finds_deleted_files_with_links_and_nfs_silly_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("f");
+        fs::write(&f, b"x").unwrap();
+        fs::hard_link(&f, tmp.path().join("keep")).unwrap();
+        let linked = fs::File::open(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        let silly = tmp.path().join(".nfs000000000012340000000a");
+        fs::write(&silly, b"y").unwrap();
+        let silly_held = fs::File::open(&silly).unwrap();
+        let me = std::process::id();
+        let h = scan_dump_hazards(Path::new("/proc"), &[me], &[]).unwrap();
+        let f = f.to_str().unwrap();
+        let found = h.deleted_files.iter().find(|d| d.path == f);
+        assert!(found.is_some_and(|d| d.nlink == 1), "{h:?}");
+        assert!(
+            h.silly_renamed
+                .contains(&silly.to_str().unwrap().to_owned()),
+            "{h:?}"
+        );
+        // Only these (other tests of this process may hold other hazards).
+        let h = DumpHazards {
+            deleted_files: h.deleted_files,
+            silly_renamed: h.silly_renamed,
+            ..Default::default()
+        };
+        let why = h.refusal().unwrap();
+        assert!(why.contains("other hard links") && why.contains(f), "{why}");
+        assert!(why.contains("deleted on NFS"), "{why}");
+        drop((linked, silly_held));
+    }
+
+    #[test]
+    fn paths_in_refusals_are_printable() {
+        assert_eq!(list_some(&["/tmp/a\nb", "/x"]), "/tmp/a\\nb, /x");
+    }
+
+    #[test]
+    fn nfs_silly_names() {
+        assert!(is_nfs_silly_name("/home/a/.nfs000000000012340000000a"));
+        assert!(is_nfs_silly_name(".nfsABCDEF"));
+        assert!(!is_nfs_silly_name("/home/a/.nfs"));
+        assert!(!is_nfs_silly_name("/home/a/.nfsrc"));
+        assert!(!is_nfs_silly_name("/home/a/.nfs0/x"));
+    }
+
+    #[test]
+    fn refuses_deleted_privileged_programs_only() {
+        let file = |path: &str, uid: u32, mode: u32| DeletedFile {
+            path: path.into(),
+            size: 1,
+            uid,
+            mode,
+            nlink: 0,
+            private: false,
+            file_caps: false,
+        };
+        // The job's own files, and files of others such as libraries a
+        // package upgrade replaced while the job ran.
+        let mut h = DumpHazards {
+            deleted_files: vec![
+                file("/home/a/tmp", 1000, 0o100600),
+                file("/dev/shm/sem.x", 1000, 0o100644),
+                file("/usr/lib/x86_64-linux-gnu/libc.so.6", 0, 0o100755),
+                file("/home/b/f", 1001, 0o100600),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(h.refusal(), None);
+        h.deleted_files[0].private = true;
+        assert_eq!(h.refusal(), None);
+        let mut caps = file("/usr/bin/ping", 0, 0o100755);
+        caps.file_caps = true;
+        let mut private_suid = file("/tmp/suid", 0, 0o104755);
+        private_suid.private = true;
+        for bad in [
+            file("/usr/bin/sudo", 0, 0o104755),
+            file("/home/a/sgid", 1000, 0o102755),
+            caps,
+            private_suid,
+        ] {
+            let mut h = h.clone();
+            let path = bad.path.clone();
+            h.deleted_files.push(bad);
+            let why = h.refusal().unwrap_or_else(|| panic!("{h:?}"));
+            assert!(why.contains(&path) && why.contains("setuid"), "{why}");
+        }
     }
 
     #[test]

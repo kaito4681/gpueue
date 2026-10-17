@@ -193,6 +193,13 @@ impl SavedMounts {
 /// deadline: pre-checks, writing the metadata, stopping the unit.
 const OP_SLACK: Duration = Duration::from_secs(60);
 
+/// How long the pre-checks of a checkpoint request may take (every lookup
+/// in them that could block has a deadline of its own, see
+/// [`crate::host::DUMP_SCAN_TIMEOUT`]). Below the daemon's request timeout,
+/// so that it gets the answer; a stopping helper waits for the request no
+/// longer than this.
+pub const PRECHECK_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// How often a stopping helper asks systemd for more time
 /// (`EXTEND_TIMEOUT_USEC`) while it waits for or runs dumps.
 const EXTEND_INTERVAL: Duration = Duration::from_secs(5);
@@ -1253,11 +1260,18 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
         let mode = self.cfg.checkpoint.mode;
         let record = entry.record;
         let private = self.cfg.mounts.tmpfs.clone();
-        tokio::task::spawn_blocking(move || {
+        let check = tokio::task::spawn_blocking(move || {
             precheck_dump(&*host, mode, &base, &record, init_pid, &private).map(|_| ())
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("checkpoint pre-check panicked: {e}")))
+        });
+        match tokio::time::timeout(PRECHECK_TIMEOUT, check).await {
+            Ok(res) => res.unwrap_or_else(|e| Err(format!("checkpoint pre-check panicked: {e}"))),
+            // The blocking task only reads; it is left to finish on its own.
+            Err(_) => Err(format!(
+                "the checks before the checkpoint did not finish within {}s (a filesystem the \
+                 job uses may not answer)",
+                PRECHECK_TIMEOUT.as_secs()
+            )),
+        }
     }
 
     /// Mark a job as checkpointing; returns whether it was stopped.
@@ -2655,43 +2669,20 @@ pub fn precheck_dump<H: HostProbe + ?Sized>(
     let hazards = host
         .dump_hazards(&host_pids, private)
         .map_err(|e| format!("reading the job's open files: {e}"))?;
-    if !hazards.bound_sockets.is_empty() {
-        return Err(format!(
-            "the job has Unix sockets bound to {:?} on the host's filesystems (or to relative \
-             names, which lead there too); a restore would make CRIU create, unlink and chown \
-             those paths as root, so such a job cannot be checkpointed (bind sockets to an \
-             absolute path below /tmp, which is the job's own, or to an abstract name)",
-            hazards.bound_sockets
-        ));
-    }
-    if !hazards.reuseport_sockets.is_empty() {
-        return Err(format!(
-            "the job has internet sockets with SO_REUSEPORT ({}); CRIU would restore them as \
-             root's, which lets them share the port with a root service and receive part of \
-             its connections, so such a job cannot be checkpointed (do not set SO_REUSEPORT, \
-             or run the job with --no-checkpoint)",
-            hazards.reuseport_sockets.join(", ")
-        ));
-    }
-    if !hazards.notify_fds.is_empty() {
-        return Err(format!(
-            "the job has inotify or fanotify descriptors ({}); CRIU would re-add their watches \
-             as root, by paths, so such a job cannot be checkpointed (close them before the \
-             checkpoint, or run the job with --no-checkpoint)",
-            hazards.notify_fds.join(", ")
-        ));
-    }
-    if !hazards.abstract_listeners.is_empty() {
-        return Err(format!(
-            "the job has Unix sockets listening on the abstract names {:?}; CRIU would set them \
-             up as root, so their clients would be told that root listens there, and such a \
-             job cannot be checkpointed (listen on a path below /tmp instead)",
-            hazards.abstract_listeners
-        ));
+    // The post-dump hook checks the same again, while CRIU has the job
+    // stopped (see `crate::access::run_dump_hook`).
+    if let Some(reason) = hazards.refusal() {
+        return Err(reason);
     }
     // Deleted files are saved in the image (see `dump_job`), and so are the
-    // contents of the job's own tmpfs mounts.
-    let ghosts: u64 = hazards.deleted_files.iter().map(|(_, s)| s).sum();
+    // contents of the job's own tmpfs mounts (deleted files there count
+    // towards those).
+    let ghosts: u64 = hazards
+        .deleted_files
+        .iter()
+        .filter(|f| !f.private)
+        .map(|f| f.size)
+        .sum();
     let tmpfs = host
         .private_tmpfs_bytes(init_pid, private)
         .map_err(|e| format!("measuring the job's /tmp and /dev/shm: {e}"))?;
@@ -2728,16 +2719,17 @@ pub fn precheck_dump<H: HostProbe + ?Sized>(
 /// CRIU's default `--ghost-limit` (largest deleted file saved in an image).
 const DEFAULT_GHOST_LIMIT: u64 = 1 << 20;
 
-/// The CRIU options for a dump of a job with `hazards`: deleted files on
-/// the host's filesystems are saved in the image (as "ghost" files) rather
-/// than linked back into their directory with `--link-remap`, which CRIU
-/// does as root by a path the job's owner may have redirected (to `/etc`,
-/// say) while the dump runs. The job's own tmpfs mounts keep
-/// `--link-remap` when nothing else needs it.
+/// The CRIU options for a dump of a job with `hazards`. Never
+/// `--link-remap`: CRIU would link open files that have no name of their
+/// own back into their directories, as root and by a path the job's owner
+/// may redirect (to `/etc`, say) while the dump runs. Deleted files are
+/// saved in the image (as "ghost" files) instead, so the ghost limit is
+/// raised to the largest; files that only `--link-remap` could dump are
+/// refused (see [`DumpHazards::refusal`]).
 pub fn dump_options(ck: &CheckpointConfig, hazards: &DumpHazards) -> CheckpointConfig {
     let mut ck = ck.clone();
-    if let Some(largest) = hazards.deleted_files.iter().map(|(_, s)| *s).max() {
-        ck.criu.link_remap = false;
+    ck.criu.link_remap = false;
+    if let Some(largest) = hazards.deleted_files.iter().map(|f| f.size).max() {
         let limit = (largest + 1).max(DEFAULT_GHOST_LIMIT);
         ck.criu.extra_dump_args.push("--ghost-limit".into());
         ck.criu.extra_dump_args.push(limit.to_string().into());
@@ -2774,6 +2766,9 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     cap: Option<Duration>,
     on_deadline: &dyn Fn(Instant),
 ) -> Result<CheckpointMeta, DumpError> {
+    // The pre-checks' lookups have deadlines of their own (see
+    // `PRECHECK_TIMEOUT`).
+    on_deadline(Instant::now() + PRECHECK_TIMEOUT + OP_SLACK);
     let DumpPrecheck {
         procs,
         mut meta,
@@ -2873,8 +2868,10 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     // The held files above were listed while the job ran: it may open
     // others before CRIU stops it. The hook lists them again while CRIU
     // has it stopped, after the dump.
+    let mut hook_request = None;
     if let Some(exe) = hook_exe {
         let request = dir.root().join(DUMP_HOOK_FILE);
+        let _ = fs::remove_file(crate::access::hook_refusal_path(&request));
         let hook = crate::access::DumpHookRequest {
             init_pid,
             private: private.to_vec(),
@@ -2897,6 +2894,7 @@ pub fn dump_job<H: HostProbe + ?Sized>(
             Ok(script) => {
                 ck.criu.extra_dump_args.push("--action-script".into());
                 ck.criu.extra_dump_args.push(script.into());
+                hook_request = Some(request);
             }
             Err(e) => {
                 let _ = dir.remove();
@@ -2924,6 +2922,11 @@ pub fn dump_job<H: HostProbe + ?Sized>(
     on_deadline(deadline.at + ck.timeouts.rollback_budget(cuda_pids.len()) + OP_SLACK);
     exec.confine_to(init_pid);
     if let Err(failure) = run_dump_with_rollback(exec, ck, steps, &cuda_pids, Some(&deadline)) {
+        // The post-dump hook found something to refuse while CRIU had the
+        // job stopped, and CRIU abandoned the dump.
+        let vetoed = hook_request
+            .as_ref()
+            .and_then(|r| fs::read_to_string(crate::access::hook_refusal_path(r)).ok());
         let mut reason = failure.to_string();
         if matches!(failure.error, StepError::DeadlineExceeded { .. }) {
             reason = format!(
@@ -2953,6 +2956,15 @@ pub fn dump_job<H: HostProbe + ?Sized>(
                 (_, Err(e)) => reason.push_str(&format!("; rollback incomplete: {e}")),
                 (_, Ok(_)) => unreachable!(),
             },
+        }
+        let resumed = failure.rollback.iter().all(|r| r.result.is_ok());
+        if let Some(why) = vetoed {
+            let why = format!("{why} (found while CRIU had the job stopped for the dump)");
+            if resumed {
+                let reason = discard_failed_dump(base, &dir, format!("{why}; the job was resumed"));
+                return Err(DumpError::Refused(reason));
+            }
+            reason = format!("{why}; {reason}");
         }
         if let Ok(log) = fs::read_to_string(dir.dump_log()) {
             let lines = probe::summarize_criu_log(&log, 5);

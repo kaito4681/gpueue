@@ -475,6 +475,12 @@ Details are in [docs/install.md](docs/install.md).
 - **`SO_REUSEPORT`:** a job with a TCP or UDP socket that has `SO_REUSEPORT` set cannot be
   checkpointed either (CRIU would restore the socket as root's, and it could then share its port
   with a root service). Some servers set it by default; turn it off or use `--no-checkpoint`.
+- **Deleted files:** files the job deleted while it still has them open (temporary files,
+  multiprocessing semaphores) are saved in the image. A job that holds a deleted file that still
+  has another hard link, a file deleted on NFS while open (`.nfs<hex>`), or a deleted program
+  with the setuid/setgid bit or file capabilities cannot be checkpointed; the checkpoint is
+  refused and the job keeps running. Libraries that a package upgrade replaced while the job
+  runs are fine.
 - **Python and PyTorch:**
   - Python 3.14 and newer default to the `forkserver` start method on Linux, so DataLoader workers
     are not forked and do not depend on the fork guard. Python 3.12 and 3.13 (or an explicit

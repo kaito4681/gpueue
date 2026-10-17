@@ -38,6 +38,10 @@ reason. A refused restore keeps the image so it can be retried.
   abstract name.
 - **`SO_REUSEPORT`** on a TCP/UDP socket makes the checkpoint refused; turn it off or use
   `--no-checkpoint`.
+- **Deleted files** the job still holds are saved in the image, except that a deleted file with
+  another hard link, a file deleted on NFS (`.nfs<hex>`), or a deleted setuid/setgid program
+  (or one with file capabilities) makes the checkpoint refused; restart such a job, or close the
+  file before checkpointing. Libraries replaced by a package upgrade are fine.
 - **Private `/tmp` and `/dev/shm`:** each job has its own empty tmpfs there (saved in the image).
   Exchange files through a persistent filesystem, not `/tmp`.
 - **Same files:** do not change or delete the job's virtualenv, binaries, libraries, working
