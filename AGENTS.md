@@ -1,7 +1,6 @@
 # Notes for contributors and coding agents
 
 ## Rules
-- Code, comments, docs and commit messages are in English.
 - `gpueue-helper` runs as root and must treat everything it gets from the daemon, from jobs and
   from users' files as untrusted. Do not weaken its checks to make a test or a workload pass;
   fix the cause or ask.
