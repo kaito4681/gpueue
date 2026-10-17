@@ -121,12 +121,16 @@ impl Report {
                 "{:<4}  {}: {}",
                 check.level.to_string(),
                 check.name,
-                check.message
+                crate::render::escape_controls(&check.message)
             )?;
             if let Some(hint) = &check.hint {
                 for (i, line) in hint.lines().enumerate() {
                     let label = if i == 0 { "fix:" } else { "    " };
-                    writeln!(out, "      {label} {line}")?;
+                    writeln!(
+                        out,
+                        "      {label} {}",
+                        crate::render::escape_controls(line)
+                    )?;
                 }
             }
         }
@@ -257,7 +261,9 @@ fn check_config_trust(sys: &dyn System, nixos: bool) -> Check {
     };
     Check::fail(
         "config",
-        format!("{reason}; the helper refuses to start with {DEFAULT_CONFIG_PATH}"),
+        format!(
+            "{reason}; the helper refuses to start with {DEFAULT_CONFIG_PATH}, and so does the daemon"
+        ),
     )
     .hint(rewrite_config_first(nixos, fix))
 }

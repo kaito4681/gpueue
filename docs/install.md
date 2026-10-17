@@ -1281,7 +1281,8 @@ gpueue service status   # both units, and whether the daemon is reachable and co
   would refuse (restarting it would stop the helper), with an ownership fix instead of a restart.
   Anything else is a warning.
 - jobs the helper runs that the daemon does not account for (`orphaned jobs`, only when there
-  are some)
+  are some; the daemon tells only administrators about them, the helper's program paths and why
+  NVML failed, so run `doctor` as an administrator to see them)
 - the checkpoint directory (exists, not tmpfs, free space) and the total checkpoint size
   (`checkpoint dir`, `checkpoint usage`)
 - whether you are an administrator (`admin`)
@@ -1341,7 +1342,8 @@ Maintainers run it on a GPU host, with the release candidate installed, before e
 
 ## Configuration
 
-The daemon and the helper read `/etc/gpueue/config.toml`. Every key is optional. Unknown keys are
+The daemon and the helper read `/etc/gpueue/config.toml`, and both refuse to start with a file (or a
+directory above it) that is a symlink or that anyone but root could change. Every key is optional. Unknown keys are
 ignored. A missing file means all defaults. The installed file
 ([packaging/config.toml](../packaging/config.toml)) lists every key with comments: a commented
 line `# key = value` shows the default, and lines indented below `# Example:` are examples for
@@ -1388,7 +1390,7 @@ Every `*_secs` key is at most one year (31536000).
 | `grace_secs` | `30` | both | seconds between SIGTERM and SIGKILL when a job is stopped |
 | `shell` | `["sh", "-c"]` | daemon | command prefix that the job's command line is appended to |
 | `max_unfinished_jobs_per_user` | `10000` | daemon | jobs one user may have that have not finished (queued, stashed, running, paused, checkpointed, ...); `add`, and a `restart` that brings a job back, are refused with `too_many_requests` beyond it |
-| `max_job_spec_bytes` | `262144` (256 KiB) | daemon | bytes a job's command, working directory, label and environment (`gpueue add` sends the caller's whole environment) may take together; larger jobs are refused with `bad_request` |
+| `max_job_spec_bytes` | `262144` (256 KiB) | daemon | bytes a job's command, working directory, label and environment (`gpueue add` sends the caller's whole environment) may take together (each dependency counts 8 bytes; a job may also depend on at most 1000 jobs); larger jobs are refused with `bad_request` |
 | `checkpoint_size_limit_bytes` | unset (no limit) | daemon | warn when all images together exceed this size (images are never deleted automatically) |
 | `checkpoint_size_warning_interval_secs` | `3600` | daemon | how often each administrator is reminded while the limit is exceeded |
 | `checkpoint_tcp_close` | `true` | both | close TCP connections when checkpointing (`criu --tcp-close`) |
@@ -1633,8 +1635,10 @@ dependency has an age of 0, counted from when the dependency finished) and joins
 it can launch, so an old job parked in a paused group cannot lift the user's newest job ahead of
 other users' jobs. Remaining ties go by the user's order, then by id. **This is a change from pueue,**
 where a higher `-o` priority wins over every other job. `priority_type = "basic"` restores
-pueue's order (higher `-o` priority first, then lower id, for all jobs; nice, site factors, `top`
-and fair share are then ignored).
+pueue's order (higher `-o` priority first, then lower id; nice, site factors, `top` and fair share
+are then ignored), except that a user's `-o` still only orders that user's own jobs: each user's
+jobs are sorted by `-o` and then take that user's queue positions (their ids) in that order, so
+nobody can put a job ahead of another user's earlier jobs.
 
 **Immediate launches.** In pueue, `start <id>` of a queued or stashed job, `add -i`, `restart -i`
 and `restore -i` start the job right away. In gpueue only administrators' do: their job starts at

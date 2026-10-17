@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Testing only: lets the integration tests impersonate uids with a header.
+# Never enable it in a shipped build.
+test-uid-header = []
+
 [dependencies]
 gpueue-core = { workspace = true, features = ["storage"] }
 gpueue-protocol.workspace = true
@@ -39,6 +44,8 @@ tower-service.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
+# Enables the test-only feature for this crate's own tests.
+gpueue-daemon = { path = ".", features = ["test-uid-header"] }
 tempfile.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }

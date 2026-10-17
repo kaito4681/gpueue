@@ -106,7 +106,9 @@ pub struct DaemonOptions {
     pub users: Arc<dyn UserDb>,
     pub gpus: Arc<dyn GpuDetector>,
     /// Testing only: honour the [`api::TEST_UID_HEADER`] header instead of
-    /// `SO_PEERCRED`. Must never be enabled in production.
+    /// `SO_PEERCRED`. The field exists only with the `test-uid-header`
+    /// cargo feature, so a production build cannot enable it.
+    #[cfg(feature = "test-uid-header")]
     pub trust_uid_header: bool,
 }
 
@@ -119,6 +121,7 @@ impl DaemonOptions {
             users: Arc::new(SystemUserDb),
             gpus: Arc::from(gpu::detector_for(&config)),
             config,
+            #[cfg(feature = "test-uid-header")]
             trust_uid_header: false,
         }
     }
@@ -157,8 +160,11 @@ impl Daemon {
             helper,
             users,
             gpus,
+            #[cfg(feature = "test-uid-header")]
             trust_uid_header,
         } = options;
+        #[cfg(not(feature = "test-uid-header"))]
+        let trust_uid_header = false;
 
         let db_path = config.state_db_path();
         if let Some(parent) = db_path.parent() {

@@ -37,7 +37,19 @@ impl UserDb for SystemUserDb {
             Ok(Some(group)) => group,
             _ => return false,
         };
-        user.gid == group.gid || group.mem.contains(&user.name)
+        if user.gid == group.gid {
+            return true;
+        }
+        // `getgrouplist` resolves supplementary groups through NSS the way
+        // login does, so directory-provided memberships count and a user is
+        // matched by uid rather than by the name listed in `group.mem`.
+        match std::ffi::CString::new(user.name.as_str())
+            .ok()
+            .and_then(|name| nix::unistd::getgrouplist(&name, user.gid).ok())
+        {
+            Some(groups) => groups.contains(&group.gid),
+            None => false,
+        }
     }
 
     fn primary_gid(&self, uid: Uid) -> Option<Gid> {

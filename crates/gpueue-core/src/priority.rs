@@ -96,7 +96,8 @@ pub enum PriorityType {
     /// priority/multifactor.
     #[default]
     Multifactor,
-    /// priority/basic: pueue's order (`-o` priority, then id).
+    /// priority/basic: pueue's order (`-o` priority, then id), where a user's
+    /// `-o` only orders their own jobs (see [`basic_order`]).
     Basic,
 }
 
@@ -360,6 +361,33 @@ pub fn owner_order(a: &Job, b: &Job) -> Ordering {
         .then_with(|| a.id.cmp(&b.id))
 }
 
+/// The `priority_type = "basic"` order: pueue's (higher `-o` priority first,
+/// then lower id), but a user's `-o` only reorders that user's own jobs.
+/// Each owner's jobs are sorted by priority and then take that owner's queue
+/// positions (their ids, ascending) in that order, so with equal priorities
+/// this is plain FIFO, and a high `-o` cannot put a job ahead of other
+/// users' jobs that were queued before the owner's earlier jobs.
+pub fn basic_order<'a>(jobs: &[&'a Job]) -> Vec<&'a Job> {
+    let mut by_owner: BTreeMap<Uid, Vec<&'a Job>> = BTreeMap::new();
+    for job in jobs {
+        by_owner.entry(job.owner).or_default().push(job);
+    }
+    let mut positioned: Vec<(JobId, &'a Job)> = Vec::with_capacity(jobs.len());
+    for owned in by_owner.values_mut() {
+        let mut slots: Vec<JobId> = owned.iter().map(|job| job.id).collect();
+        slots.sort();
+        owned.sort_by(|a, b| {
+            b.spec
+                .priority
+                .cmp(&a.spec.priority)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        positioned.extend(slots.into_iter().zip(owned.iter().copied()));
+    }
+    positioned.sort_by_key(|(slot, _)| *slot);
+    positioned.into_iter().map(|(_, job)| job).collect()
+}
+
 /// Distinct GPUs a job asks for.
 pub fn gpu_count(job: &Job) -> u32 {
     job.spec.gpus.iter().collect::<HashSet<_>>().len() as u32
@@ -402,14 +430,7 @@ pub fn prioritize(
 ) -> Vec<JobPriority> {
     let params = ctx.params;
     if params.kind == PriorityType::Basic {
-        let mut jobs: Vec<&Job> = candidates.to_vec();
-        jobs.sort_by(|a, b| {
-            b.spec
-                .priority
-                .cmp(&a.spec.priority)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        return jobs
+        return basic_order(candidates)
             .into_iter()
             .map(|job| JobPriority {
                 id: job.id,

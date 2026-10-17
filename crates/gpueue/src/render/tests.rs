@@ -702,3 +702,37 @@ fn share_table() {
     assert_eq!(human_secs(90), "90s");
     assert_eq!(human_secs(7200), "2h");
 }
+
+#[test]
+fn control_characters_are_escaped_in_text_from_the_daemon() {
+    assert_eq!(escape_controls("plain text ü"), "plain text ü");
+    assert_eq!(
+        escape_controls("a\x1b[2Jb\u{9b}c\x7fd\te\r"),
+        "a\\x1b[2Jb\\x9bc\\x7fd\\te\\r"
+    );
+    assert_eq!(escape_controls("one\ntwo"), "one⏎two");
+
+    let mut hostile = job(1, JobState::Running);
+    hostile.label = Some("l\x1b]0;x\x07".into());
+    let details = hostile.details.as_mut().unwrap();
+    details.command = "echo\nrm".into();
+    details.cwd = PathBuf::from("/tmp/\x1b[31m");
+    let table = status(
+        StatusInput {
+            groups: &[group("default", 1, false)],
+            jobs: vec![hostile.clone()],
+            no_jobs_at_all: false,
+            group: None,
+            columns: &[],
+        },
+        &ctx(),
+    );
+    assert!(table.is_ok());
+    let header = log_header(&hostile, &ctx());
+    for text in [table.unwrap(), header] {
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+    }
+}

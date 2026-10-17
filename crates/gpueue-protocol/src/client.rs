@@ -34,6 +34,28 @@ use crate::api::{
     SwitchRequest, TopRequest, VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
 };
 
+/// The largest JSON response (or error body) the client reads into memory;
+/// a longer one is refused instead of exhausting memory. Streams (job logs,
+/// events) are not subject to it.
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Reads a whole response body, up to [`MAX_BODY_BYTES`].
+async fn collect_body(status: u16, body: Incoming) -> Result<Bytes> {
+    match http_body_util::Limited::new(body, MAX_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(err) => match err.downcast::<hyper::Error>() {
+            Ok(err) => Err(ClientError::Http(*err)),
+            Err(_) => Err(ClientError::UnexpectedResponse {
+                status,
+                message: format!("the response is larger than {MAX_BODY_BYTES} bytes"),
+            }),
+        },
+    }
+}
+
 /// Error bodies longer than this are cut when they are not valid JSON.
 const MAX_RAW_ERROR_LEN: usize = 512;
 
@@ -330,7 +352,7 @@ impl Client {
         let body = body.map(encode_json).transpose()?;
         let response = self.send(route, query, body, CONTENT_TYPE_JSON).await?;
         let status = response.status().as_u16();
-        let bytes = response.into_body().collect().await?.to_bytes();
+        let bytes = collect_body(status, response.into_body()).await?;
         serde_json::from_slice(&bytes).map_err(|err| ClientError::UnexpectedResponse {
             status,
             message: format!("invalid JSON body: {err}"),
@@ -345,7 +367,8 @@ impl Client {
         let body = body.map(encode_json).transpose()?;
         let response = self.send(route, query, body, CONTENT_TYPE_JSON).await?;
         // Drain the body so the connection shuts down cleanly.
-        response.into_body().collect().await?;
+        let status = response.status().as_u16();
+        collect_body(status, response.into_body()).await?;
         Ok(())
     }
 
@@ -433,9 +456,9 @@ fn hyper_method(method: Method) -> hyper::Method {
 /// body when there is one.
 async fn error_from_response(response: Response<Incoming>) -> ClientError {
     let status = response.status().as_u16();
-    let bytes = match response.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => return ClientError::Http(err),
+    let bytes = match collect_body(status, response.into_body()).await {
+        Ok(bytes) => bytes,
+        Err(err) => return err,
     };
     match serde_json::from_slice::<ApiError>(&bytes) {
         Ok(error) => ClientError::Api { status, error },

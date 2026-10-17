@@ -98,14 +98,19 @@ fn job_not_found(id: JobId) -> Failure {
     gpueue_core::Error::JobNotFound(id).into()
 }
 
+/// How many jobs a single job may depend on.
+const MAX_JOB_DEPENDENCIES: usize = 1000;
+
 /// What [`Config::max_job_spec_bytes`](crate::config::Config) limits: the
-/// bytes of a job's command, working directory, label and environment.
+/// bytes of a job's command, working directory, label and environment, and
+/// 8 bytes per dependency.
 fn spec_bytes(spec: &JobSpec) -> u64 {
     let envs: usize = spec.envs.iter().map(|(k, v)| k.len() + v.len()).sum();
     (spec.command.len()
         + spec.cwd.as_os_str().len()
         + spec.label.as_ref().map_or(0, String::len)
-        + envs) as u64
+        + envs
+        + spec.dependencies.len() * std::mem::size_of::<u64>()) as u64
 }
 
 fn list_ids(ids: &[JobId]) -> String {
@@ -238,6 +243,12 @@ impl Core {
         let mut seen = HashSet::new();
         if let Some(gpu) = spec.gpus.iter().find(|g| !seen.insert(**g)) {
             return Err(Failure::bad_request(format!("GPU {gpu} is listed twice")));
+        }
+        if spec.dependencies.len() > MAX_JOB_DEPENDENCIES {
+            return Err(Failure::bad_request(format!(
+                "the job has {} dependencies, more than the {MAX_JOB_DEPENDENCIES} allowed",
+                spec.dependencies.len()
+            )));
         }
         let size = spec_bytes(&spec);
         let max_size = self.config.max_job_spec_bytes;

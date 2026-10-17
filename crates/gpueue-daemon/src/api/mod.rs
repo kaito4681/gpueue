@@ -28,7 +28,7 @@ use gpueue_protocol::api::{
 
 use crate::error::{ApiResult, Failure};
 use crate::state::{Core, PendingWarnings};
-pub use extract::{Auth, PeerCred, TEST_UID_HEADER};
+pub use extract::{Auth, IsAdmin, PeerCred, TEST_UID_HEADER};
 use extract::{JsonBody, OptionalJson, Permit};
 
 pub type AppState = Arc<Core>;
@@ -484,7 +484,10 @@ async fn shutdown(
     Ok(StatusCode::ACCEPTED)
 }
 
-async fn version(State(core): State<AppState>) -> Json<VersionResponse> {
+/// Open to every caller (clients check compatibility with it), but program
+/// paths, orphaned job ids and the GPU detection error are administrator
+/// information and left out for everyone else.
+async fn version(State(core): State<AppState>, IsAdmin(admin): IsAdmin) -> Json<VersionResponse> {
     let helper = core.helper.state();
     let checkpoints = core
         .checkpoint_storage()
@@ -497,14 +500,24 @@ async fn version(State(core): State<AppState>) -> Json<VersionResponse> {
         helper: HelperStatus {
             connected: helper.connected,
             version: helper.version,
-            missing_programs: helper.missing_programs,
-            programs: helper.programs,
+            missing_programs: if admin {
+                helper.missing_programs
+            } else {
+                Vec::new()
+            },
+            programs: if admin { helper.programs } else { Vec::new() },
         },
         checkpoints,
-        gpu_detection: Some(core.gpu_detection.clone()),
+        gpu_detection: Some({
+            let mut detection = core.gpu_detection.clone();
+            if !admin {
+                detection.nvml_error = None;
+            }
+            detection
+        }),
         // The database is at this version once the daemon has opened it.
         schema_version: Some(gpueue_core::storage::SCHEMA_VERSION),
-        orphan_jobs: Some(core.orphans().iter().map(|orphan| orphan.job).collect()),
+        orphan_jobs: admin.then(|| core.orphans().iter().map(|orphan| orphan.job).collect()),
     })
 }
 

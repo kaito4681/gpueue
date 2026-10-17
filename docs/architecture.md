@@ -43,7 +43,7 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    most `max_unfinished_jobs_per_user` jobs that have not finished (`add` and a `restart` that
    brings a job back are refused with `too_many_requests` beyond it), and at most
    `max_job_spec_bytes` for a job's command, working directory, label and environment together
-   (refused with `bad_request`). A `/v1/events` subscriber that falls too far behind gets a
+   (refused with `bad_request`; each dependency counts 8 bytes, and a job may depend on at most 1000 jobs). A `/v1/events` subscriber that falls too far behind gets a
    `resync` event instead of the events it missed; `gpueue wait` then reads the job list again.
 2. **Scheduling.** A queued job starts when its group has a free slot and every requested GPU has
    a free slot. Candidates are considered in priority order (see
@@ -441,7 +441,7 @@ scheduler:
   from the local UTC offset the daemon passes in). `scheduler::plan_prioritized` orders the
   candidates with it and then applies the usual slot, pause and dependency rules unchanged, so a
   high-priority job that does not fit never blocks jobs behind it. `plan`/`plan_with` keep pueue's
-  order (also used for `priority_type = "basic"`). `scheduler::pending_priorities` (behind
+  order (also used for `priority_type = "basic"`, where `priority::basic_order` lets a user's `-o` reorder only that user's own jobs). `scheduler::pending_priorities` (behind
   `gpueue prio`) uses the same candidate selection, so it lists what the plan considers.
 - The storage keeps `jobs.nice`, `jobs.site_factor`, `jobs.top_seq`, `jobs.run_since`, `groups.priority`, the
   `user_shares` and `user_usage` tables and, in `meta`, when usage was last calculated and reset
