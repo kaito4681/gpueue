@@ -30,11 +30,9 @@
 
 ## Releases
 - Before tagging `v<version>`: install the release candidate's `.deb` on a GPU host and run
-  `scripts/gpu-host-test.sh`; every scenario must pass. Run `scripts/vm-reboot-test.sh all` too.
-- Pushing the tag builds, signs and VM-tests the release and creates a draft (no draft unless
-  `vm-test` passes). Publishing the draft as a stable release triggers `release-apt.yml`,
-  `release-aur.yml` and `release-nix.yml` (moves the `stable` branch); each can be run by hand.
-- The release signing key is `packaging/minisign.pub`; rotation is described in `docs/install.md`.
+  `scripts/gpu-host-test.sh` (every scenario must pass) and `scripts/vm-reboot-test.sh all`.
+- When publishing, add text to the generated release notes; do not replace them (they carry the
+  install instructions).
 
 ## Documentation
 - Update `README.md`, `docs/install.md` and `docs/architecture.md` when commands, flags,
