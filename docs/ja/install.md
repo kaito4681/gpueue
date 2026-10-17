@@ -8,8 +8,8 @@ Anchor convention for translations (docs/ja/, docs/zh-CN/, README.ja.md, README.
 every heading is preceded by an explicit anchor whose id is the GitHub slug of the matching
 English heading (including the "-1" suffix GitHub adds to duplicates), e.g.
 
-  <a id="install-method"></a>
-  ### インストール方法
+  <a id="example-heading"></a>
+  ### 見出しの例
 
 Links within and between the translated pages use these English ids and point to the page of
 the same language (README.ja.md -> docs/ja/install.md#criu). Links to repository files from
@@ -317,7 +317,10 @@ apt でパッケージをインストールし、チェックポイント済み�
 - チャネルごとに別の鍵を使う：minisign の鍵はリリースのアセットに署名し、APT と RPM の署名はそれぞれ別の
   GPG 鍵（`APT_GPG_PRIVATE_KEY`）を使います。RPM チャネルには APT アーカイブ鍵ではなく専用の鍵を用意して、
   1 つの漏えいが両方に及ばないようにします。
-- 署名用のシークレットは保護された environment に置きます（別途追跡中です）。
+- 署名用のシークレットは、通常のリポジトリシークレットではなく、リリースのワークフローだけが使える保護された
+  GitHub environment に置きます（[#51](https://github.com/kaito4681/gpueue/issues/51) で計画中。上記のリポジトリ
+  設定は [#126](https://github.com/kaito4681/gpueue/issues/126) で追跡しています）。`v*` のタグルールセットは
+  すでに設定済みです。environment ができるまでは、シークレットはリポジトリシークレットです。
 
 依存関係は CI で `cargo-deny`（`deny.toml`：アドバイザリ、crates.io をソースとして唯一認めること、バージョン
 の重複は警告）によって検査され、Dependabot が cargo と GitHub Actions の更新を毎週提案します。
