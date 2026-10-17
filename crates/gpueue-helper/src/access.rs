@@ -457,6 +457,12 @@ pub fn run_dump_hook(request: &Path) -> i32 {
     if std::env::var("CRTOOLS_SCRIPT_ACTION").as_deref() != Ok("post-dump") {
         return 0;
     }
+    // Descriptors in flight in socket messages are only seen in the image;
+    // failing the hook fails the dump, and the job goes on.
+    if let Some(reason) = in_flight_fds_refusal() {
+        eprintln!("gpueue-helper: {reason}");
+        return 1;
+    }
     let result = (|| -> Result<(), String> {
         let req: DumpHookRequest = serde_json::from_slice(
             &fs::read(request).map_err(|e| format!("reading {}: {e}", request.display()))?,
@@ -478,6 +484,22 @@ pub fn run_dump_hook(request: &Path) -> i32 {
         eprintln!("gpueue-helper: listing the files of the dumped job: {e}");
     }
     0
+}
+
+/// Why the dump in `CRTOOLS_IMAGE_DIR` must not be kept: messages with
+/// descriptors in flight (see [`crate::images::read_in_flight_fds`]),
+/// which a restore would make CRIU re-open as root.
+fn in_flight_fds_refusal() -> Option<String> {
+    let dir = std::env::var_os("CRTOOLS_IMAGE_DIR")?;
+    match crate::images::read_in_flight_fds(Path::new(&dir)) {
+        Ok(false) => None,
+        Ok(true) => Some(
+            "the job has descriptors in flight in Unix socket messages (SCM_RIGHTS), which a \
+             restore would make CRIU re-open as root; it cannot be checkpointed"
+                .into(),
+        ),
+        Err(e) => Some(format!("reading the dump's images: {e}")),
+    }
 }
 
 /// SIGSTOP to `init` and every process in its PID namespace (signals from
@@ -1054,6 +1076,11 @@ fn check_restored_procs(c: &RestoredCheck, procs: &[u32]) -> VerifyReply {
             }
         }
     }
+    // CRIU bound the job's internet sockets as root, with SO_REUSEPORT.
+    problems.extend(
+        crate::host::inet_port_conflicts(proc_root, c.init_pid, procs)
+            .map_err(|e| format!("reading the job's internet sockets: {e}"))?,
+    );
     if !problems.is_empty() {
         return Ok(problems);
     }

@@ -463,7 +463,15 @@ Details are in [docs/install.md](docs/install.md).
 - **Unix sockets:** a job with a Unix socket bound to a path outside its own `/tmp` and
   `/dev/shm` (e.g. in your home directory), or to a relative name such as `ctl.sock`, cannot be
   checkpointed; the checkpoint is refused and the job keeps running. Bind sockets to an absolute
-  path below `/tmp`, or use an abstract name.
+  path below `/tmp` (without `..` or symlinks on the way), or use an abstract name for sockets
+  that do not listen. A socket *listening* on an abstract name cannot be checkpointed (CRIU
+  would set it up as root, and its clients would see root as the listener).
+- **inotify, fanotify and descriptors in flight:** a job with an inotify or fanotify descriptor
+  (file watchers), or one that is passing descriptors over a Unix socket (`SCM_RIGHTS`) at the
+  moment of the checkpoint, cannot be checkpointed (CRIU would recreate those as root).
+- **Listening ports:** a job whose TCP or UDP socket is bound to a port can be checkpointed
+  (Jupyter, TensorBoard), but it is restored only while no other socket on the host has that
+  port; otherwise the restore is refused and can be retried once the port is free.
 - **`SO_REUSEPORT`:** a job with a TCP or UDP socket that has `SO_REUSEPORT` set cannot be
   checkpointed either (CRIU would restore the socket as root's, and it could then share its port
   with a root service). Some servers set it by default; turn it off or use `--no-checkpoint`.

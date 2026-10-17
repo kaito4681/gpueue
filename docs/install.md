@@ -2245,7 +2245,22 @@ warned on their next command. Refusals:
 - `the job has Unix sockets bound to [...] on the host's filesystems (or to relative names ...)`:
   a restore would make CRIU create, unlink and chown those paths as root. Bind the socket to an
   absolute path below `/tmp` or to an abstract name. A relative name counts as a host path
-  because the directory it was bound in is not known.
+  because the directory it was bound in is not known, and so does a name with `.`, `..` or `//`
+  in it, one below `/proc`, or one whose directory below `/tmp` is reached through a symlink or
+  another mount.
+- `the job has Unix sockets listening on the abstract names [...]`: CRIU would set the listener
+  up as root, so clients checking who listens (`SO_PEERCRED`) would see root. Listen on a path
+  below `/tmp` instead.
+- `the job has inotify or fanotify descriptors (...)`: CRIU would re-add the watches as root, by
+  path. Close file watchers before the checkpoint, or run the job with `--no-checkpoint`.
+- A checkpoint that fails with `Post dump script passed with 1` and `descriptors in flight in
+  Unix socket messages (SCM_RIGHTS)` in CRIU's log: the job was
+  passing a descriptor over a Unix socket at that moment. The job keeps running; checkpoint it
+  again later.
+- Restore refused with `internet sockets bound to TCP port N, which another socket on this host
+  is bound to as well`: CRIU binds restored sockets as root with `SO_REUSEPORT`, which could
+  share the port with whoever holds it now. Free the port (or wait until it is free) and restore
+  again.
 - `the job has internet sockets with SO_REUSEPORT (...)`: CRIU recreates sockets as root before it
   gives the job its credentials back, so a restored `SO_REUSEPORT` socket would belong to root and
   could join a root service's group on the same port (and receive part of its connections). Turn

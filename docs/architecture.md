@@ -230,14 +230,33 @@ hold a root file opened with the dump-time mode. The helper therefore:
 - **at the dump** refuses a job with Unix sockets bound on the host's filesystems (CRIU binds,
   unlinks and chowns those paths as root on restore; sockets below the job's own `/tmp` are
   fine, and a socket bound to a relative name counts as bound on the host, since `/proc` does
-  not tell in which directory), refuses a job with internet sockets that have `SO_REUSEPORT`
+  not tell in which directory). The kernel keeps a socket's name as the job gave it to
+  `bind(2)` and CRIU binds that very name, so a name only counts as the job's own if it is
+  absolute and normalized (no `.`, `..` or empty components), not below `/proc`, below one of
+  the private tmpfs mounts, and if the directory it is in is reached from that mount, by
+  descriptor from the job's root, without symlinks and without crossing into another mount
+  (`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV)`). It also refuses a job
+  with Unix sockets listening on abstract names (CRIU sets them up as root, so a client asking
+  who listens, with `SO_PEERCRED`, would be told root; non-listening abstract sockets are fine),
+  a job with inotify or fanotify descriptors (CRIU re-adds their watches as root, by paths that
+  it follows symlinks in), and, in the post-dump hook, a dump with descriptors in flight in
+  Unix socket messages (`SCM_RIGHTS` in `sk-queues.img`; CRIU re-opens them as root and hands
+  them to the job, out of sight of the restore hook, so the hook fails the dump and the job
+  keeps running). It refuses a job with internet sockets that have `SO_REUSEPORT`
   (CRIU creates sockets as root before it restores the job's credentials, so the restored socket
   would be root's and could join the `SO_REUSEPORT` group of a root service on the same port;
   confirmed with CRIU 4.2), saves deleted files on the host's filesystems in the image instead of linking them
   back with `--link-remap` (which CRIU does as root, by path, while the dump runs), and records
   the groups the job runs with;
 - **before the restore** refuses it if the owner left one of those groups, if the image has a
-  socket bound on a host filesystem, or if a path in the image (`files.img`) can no longer be
+  socket bound on a host filesystem (by the same rules for its name), a listening socket with
+  an abstract name, inotify or fanotify descriptors, descriptors in flight (`sk-queues.img`),
+  or an internet socket bound to a port that another socket on the host has too (any address
+  and family, same protocol; read from `/proc/net/{tcp,udp,udplite}{,6}`): CRIU 4.2 sets
+  `SO_REUSEADDR` and `SO_REUSEPORT` on every internet socket it restores, as root, before it
+  binds it, so it could join the group of a root service that took the port since the dump.
+  The restore hook checks that again once CRIU has bound the sockets, before the job runs (a
+  socket of someone else on the port of one of the job's sockets kills the restored job). If a path in the image (`files.img`) can no longer be
   reached by the owner without a symlink on the way (checked as the owner, with
   `openat2(RESOLVE_NO_SYMLINKS)`);
 - **for the mounts CRIU binds from the host** (the external mounts of the job's namespace, and

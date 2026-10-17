@@ -1449,6 +1449,25 @@ async fn restore_checks_the_images_paths_first() {
     };
     assert!(message.contains("/home/alice/agent.sock"), "{message}");
 
+    // Regression (audit V2, S1-2/S2-1): CRIU binds the recorded name as
+    // root, unnormalized; a name that only looks private is a host name.
+    for name in [
+        "/tmp/../home/alice/agent.sock",
+        "/proc/self/root/home/alice/agent.sock",
+    ] {
+        std::fs::write(
+            images.join("files.img"),
+            files_image(&["/home/alice/x/f"], &[name]),
+        )
+        .unwrap();
+        let r = c.request(restore_req(3, &image_dir)).await;
+        assert_eq!(
+            err_code(&r),
+            HelperErrorCode::PermissionDenied,
+            "{name}: {r:?}"
+        );
+    }
+
     std::fs::write(
         images.join("files.img"),
         files_image(&["/home/alice/x/f"], &[]),
@@ -3692,6 +3711,41 @@ async fn dump_counts_private_tmpfs_and_refuses_reuseport_sockets() {
         message.contains("SO_REUSEPORT") && message.contains("0.0.0.0:8080"),
         "{message}"
     );
+    // Watches CRIU would re-add as root, and listeners it would set up as
+    // root.
+    for (hazards, expect) in [
+        (
+            DumpHazards {
+                notify_fds: vec!["inotify of process 7".into()],
+                ..Default::default()
+            },
+            "inotify of process 7",
+        ),
+        (
+            DumpHazards {
+                abstract_listeners: vec!["@ctl".into()],
+                ..Default::default()
+            },
+            "\"@ctl\"",
+        ),
+    ] {
+        env.host.set_dump_hazards(hazards);
+        let r = c
+            .request(Request::Checkpoint {
+                job: JobId(3),
+                image_dir: env.base().join("3"),
+                options: Default::default(),
+            })
+            .await;
+        let ResponseResult::Error {
+            code: HelperErrorCode::CheckpointRefused,
+            message,
+        } = r
+        else {
+            panic!("{r:?}")
+        };
+        assert!(message.contains(expect), "{message}");
+    }
     assert_eq!(c.running().await, [(JobId(3), RunningPhase::Running)]);
     assert!(env.exec.lock().unwrap().actions.is_empty());
 }
@@ -3861,4 +3915,160 @@ async fn a_failed_lookup_of_held_files_leaves_the_dump_unfinalized() {
     let saved: SavedMounts =
         serde_json::from_slice(&std::fs::read(dir.root().join(MOUNTS_FILE)).unwrap()).unwrap();
     assert!(saved.held_files()[0].attrs.is_some());
+}
+
+/// An image (`files.img`, `sk-queues.img`, ...) made of the given raw
+/// protobuf entries, after CRIU's two magic numbers.
+fn raw_image(entries: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x5456_4319u32.to_le_bytes());
+    out.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+    for e in entries {
+        out.extend_from_slice(&(e.len() as u32).to_le_bytes());
+        out.extend_from_slice(e);
+    }
+    out
+}
+
+fn pb_varint(mut v: u64, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+fn pb_uint(n: u64, v: u64, out: &mut Vec<u8>) {
+    pb_varint(n << 3, out);
+    pb_varint(v, out);
+}
+fn pb_bytes(n: u64, b: &[u8], out: &mut Vec<u8>) {
+    pb_varint((n << 3) | 2, out);
+    pb_varint(b.len() as u64, out);
+    out.extend_from_slice(b);
+}
+
+/// A `file_entry` (`images/fdinfo.proto`) of `kind` (`fd_types`) with
+/// `inner` as its field `field`.
+fn file_entry(kind: u64, id: u64, field: u64, inner: &[u8]) -> Vec<u8> {
+    let mut fe = Vec::new();
+    pb_uint(1, kind, &mut fe);
+    pb_uint(2, id, &mut fe);
+    pb_bytes(field, inner, &mut fe);
+    fe
+}
+
+/// Regression (audit V2): objects CRIU recreates as root that no check
+/// of the helper sees. Each must make the restore fail before CRIU runs.
+///
+/// - S2b-1: CRIU sets SO_REUSEADDR and SO_REUSEPORT on every inet socket
+///   it creates (as root) before binding it, so a bound inet socket can
+///   join the SO_REUSEPORT group of a root service on that port: refused
+///   while another socket on the host has the port.
+/// - S2-2: inotify/fanotify marks are re-added as root through a path
+///   hint, following symlinks, so the restored watch may sit on a
+///   directory the owner cannot read.
+/// - S1-3: files in flight in SCM_RIGHTS messages are reopened as root
+///   and never seen by the restore hook (which only pins /proc/<pid>/fd).
+#[tokio::test]
+async fn restore_refuses_objects_criu_recreates_as_root_unchecked() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    let image_dir = spawn_and_dump(&env, &mut c, 3).await;
+    let images = CheckpointDir::for_job(&env.base(), 3).images_dir();
+    let ok_files = files_image(&["/home/alice/x/f"], &[]);
+
+    // INETSK (4): a TCP socket listening on port 8080 (`inet_sk_entry`:
+    // family 3, type 4, proto 5, state 6, src_port 7).
+    let mut isk = Vec::new();
+    pb_uint(1, 9, &mut isk);
+    pb_uint(3, 2, &mut isk); // AF_INET
+    pb_uint(4, 1, &mut isk); // SOCK_STREAM
+    pb_uint(5, 6, &mut isk); // IPPROTO_TCP
+    pb_uint(6, 10, &mut isk); // TCP_LISTEN
+    pb_uint(7, 8080, &mut isk);
+    // INOTIFY (8, field ify = 13) and FANOTIFY (12, field ffy = 14).
+    let mut ify = Vec::new();
+    pb_uint(1, 10, &mut ify);
+    let mut ffy = Vec::new();
+    pb_uint(1, 11, &mut ffy);
+    let tcp_8080 = gpueue_helper::images::InetPort {
+        proto: 6,
+        port: 8080,
+    };
+    env.host.set_inet_ports_in_use(vec![tcp_8080]);
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "inet socket bound to a port in use",
+            file_entry(4, 9, 4, &isk),
+        ),
+        ("inotify", file_entry(8, 10, 13, &ify)),
+        ("fanotify", file_entry(12, 11, 14, &ffy)),
+    ];
+    for (what, entry) in cases {
+        std::fs::write(images.join("files.img"), raw_image(&[entry])).unwrap();
+        let r = c.request(restore_req(3, &image_dir)).await;
+        assert_eq!(
+            err_code(&r),
+            HelperErrorCode::PermissionDenied,
+            "{what}: {r:?}"
+        );
+    }
+
+    // The same port of UDP, or once the port is free, is fine.
+    let mut usk = isk.clone();
+    pb_uint(5, 17, &mut usk); // IPPROTO_UDP (the last value counts)
+    for (what, entry) in [
+        ("UDP", file_entry(4, 9, 4, &usk)),
+        ("free port", file_entry(4, 9, 4, &isk)),
+    ] {
+        if what == "free port" {
+            env.host.set_inet_ports_in_use(vec![]);
+        }
+        std::fs::write(images.join("files.img"), raw_image(&[entry])).unwrap();
+        assert_eq!(
+            c.request(restore_req(3, &image_dir)).await,
+            ResponseResult::Accepted,
+            "{what}"
+        );
+        assert!(matches!(
+            c.event().await.event,
+            Event::RestoreFinished {
+                outcome: RestoreOutcome::Success { .. },
+                ..
+            }
+        ));
+        let r = c
+            .request(Request::Checkpoint {
+                job: JobId(3),
+                image_dir: image_dir.clone(),
+                options: Default::default(),
+            })
+            .await;
+        assert_eq!(r, ResponseResult::Accepted, "{what}");
+        assert!(matches!(
+            c.event().await.event,
+            Event::CheckpointFinished {
+                outcome: CheckpointOutcome::Success { .. },
+                ..
+            }
+        ));
+    }
+
+    // SCM_RIGHTS in flight: `sk_packet_entry` (id_for 1, length 2, scm 4)
+    // with a `scm_entry` (type 1 = SCM_RIGHTS, rights 2).
+    std::fs::write(images.join("files.img"), &ok_files).unwrap();
+    let mut scm = Vec::new();
+    pb_uint(1, 1, &mut scm);
+    pb_uint(2, 12, &mut scm);
+    let mut pkt = Vec::new();
+    pb_uint(1, 9, &mut pkt);
+    pb_uint(2, 1, &mut pkt);
+    pb_bytes(4, &scm, &mut pkt);
+    std::fs::write(images.join("sk-queues.img"), raw_image(&[pkt])).unwrap();
+    let r = c.request(restore_req(3, &image_dir)).await;
+    assert_eq!(
+        err_code(&r),
+        HelperErrorCode::PermissionDenied,
+        "SCM_RIGHTS: {r:?}"
+    );
 }

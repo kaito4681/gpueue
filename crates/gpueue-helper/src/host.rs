@@ -135,6 +135,11 @@ pub trait HostProbe: Send + Sync + 'static {
     fn dump_hazards(&self, _host_pids: &[u32], _private: &[String]) -> io::Result<DumpHazards> {
         Ok(DumpHazards::default())
     }
+    /// The ports internet sockets on the host are bound to (see
+    /// [`inet_ports_in_use`]).
+    fn inet_ports_in_use(&self) -> io::Result<Vec<crate::images::InetPort>> {
+        Ok(Vec::new())
+    }
     /// Every group id the processes run with (`Gid:` and `Groups:` of
     /// `/proc/<pid>/status`), sorted; `None` if unknown.
     fn process_groups(&self, _host_pids: &[u32]) -> io::Result<Option<Vec<u32>>> {
@@ -222,14 +227,41 @@ pub struct DumpHazards {
     /// would join the `SO_REUSEPORT` group of a root service on the same
     /// port (and get part of its connections).
     pub reuseport_sockets: Vec<String>,
+    /// inotify and fanotify descriptors of the job (described for
+    /// messages). CRIU re-adds their marks as root, through paths that
+    /// follow symlinks, so a restored mark could watch a directory its
+    /// owner may not read.
+    pub notify_fds: Vec<String>,
+    /// Abstract names (`@name`) of listening Unix sockets of the job.
+    /// CRIU sets them up as root, before it restores the job's
+    /// credentials, so a client asking who listens (`SO_PEERCRED`) would
+    /// be told root.
+    pub abstract_listeners: Vec<String>,
 }
 
 pub use crate::access::HeldFile;
 
+/// Whether `path` is absolute and normalized: no empty, `.` or `..`
+/// components (the kernel's paths of open files are; a socket's name is
+/// kept as given to `bind(2)`).
+pub fn is_normalized_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    rest.is_empty()
+        || rest
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
 /// Whether a job's path names something the job's namespace has of its own
-/// (or no file on any filesystem), rather than a host file.
+/// (or no file on any filesystem), rather than a host file. Only an
+/// absolute, normalized path (see [`is_normalized_path`]) can.
 pub fn is_private_path(path: &str, private: &[String]) -> bool {
     use crate::mounts::path_under;
+    if !is_normalized_path(path) {
+        return false;
+    }
     path_under(path, "/proc")
         || private.iter().any(|p| path_under(path, p))
         || path.starts_with("/memfd:")
@@ -237,18 +269,209 @@ pub fn is_private_path(path: &str, private: &[String]) -> bool {
         || path.starts_with("/dev/zero")
 }
 
+/// The mount point in `private` that a Unix socket's name `name` lies
+/// below by its name alone: an absolute, normalized path below one of
+/// them. CRIU binds the name, as root, exactly as the job gave it to
+/// `bind(2)`, so a name with `..` in it, or one below `/proc` (whose
+/// `root` and `cwd` links lead anywhere), is never the job's own.
+pub fn private_socket_mount<'a>(name: &str, private: &'a [String]) -> Option<&'a str> {
+    use crate::mounts::path_under;
+    if !is_normalized_path(name) || path_under(name, "/proc") {
+        return None;
+    }
+    private
+        .iter()
+        .filter(|p| path_under(name, p))
+        .max_by_key(|p| p.len())
+        .map(String::as_str)
+}
+
 /// Whether a Unix socket name from `/proc/net/unix` may name a path on the
-/// host's filesystems: anything but an abstract name (`@...`) and an
-/// absolute path below `private`. A relative name (`bind("ctl.sock")`)
-/// counts too: it was resolved against the binding process's working
-/// directory at the time, which `/proc` does not record (the process may
-/// have changed directory since), and CRIU resolves it to a host path
-/// that a restore would bind as root.
+/// host's filesystems: anything but an abstract name (`@...`) and a name
+/// below `private` (see [`private_socket_mount`]). A relative name
+/// (`bind("ctl.sock")`) counts too: it was resolved against the binding
+/// process's working directory at the time, which `/proc` does not record
+/// (the process may have changed directory since), and CRIU resolves it to
+/// a host path that a restore would bind as root.
 pub fn is_host_socket_name(name: &str, private: &[String]) -> bool {
     if name.starts_with('@') {
         return false;
     }
-    !(name.starts_with('/') && is_private_path(name, private))
+    private_socket_mount(name, private).is_none()
+}
+
+/// Whether the socket name `name`, below the private mount `mount` by its
+/// name (see [`private_socket_mount`]), also leads there in the namespace
+/// of process `pid`: the directory the name is bound in must be reached
+/// from `mount` without symlinks and without crossing into another mount
+/// (looked at by descriptor, from the process's root). The name was
+/// resolved when the job bound it, and a symlink on the way (or a mount
+/// of a host directory below the private one) would have put it on the
+/// host's filesystems.
+pub fn socket_dir_is_private(proc_root: &Path, pid: u32, name: &str, mount: &str) -> bool {
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+    let open = || -> rustix::io::Result<bool> {
+        let dir = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let root = rustix::fs::open(proc_root.join(format!("{pid}/root")), dir, Mode::empty())?;
+        let mount_fd = rustix::fs::openat2(
+            &root,
+            mount,
+            dir,
+            Mode::empty(),
+            ResolveFlags::IN_ROOT | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )?;
+        let rest = name[mount.len()..].trim_start_matches('/');
+        let parent = match rest.rsplit_once('/') {
+            Some((parent, _)) => parent,
+            None => return Ok(true),
+        };
+        rustix::fs::openat2(
+            &mount_fd,
+            parent,
+            dir,
+            Mode::empty(),
+            ResolveFlags::BENEATH
+                | ResolveFlags::NO_SYMLINKS
+                | ResolveFlags::NO_MAGICLINKS
+                | ResolveFlags::NO_XDEV,
+        )?;
+        Ok(true)
+    };
+    open().unwrap_or(false)
+}
+
+/// `IPPROTO_TCP`, `IPPROTO_UDP` and `IPPROTO_UDPLITE`, and the tables of
+/// `/proc/net` that list their sockets.
+const INET_TABLES: [(u8, &str, [&str; 2]); 3] = [
+    (6, "TCP", ["tcp", "tcp6"]),
+    (17, "UDP", ["udp", "udp6"]),
+    (136, "UDP-Lite", ["udplite", "udplite6"]),
+];
+
+/// The name of IP protocol `proto` if it has ports gpueue knows of.
+pub fn inet_proto_name(proto: u8) -> Option<&'static str> {
+    INET_TABLES
+        .iter()
+        .find(|(p, ..)| *p == proto)
+        .map(|(_, name, _)| *name)
+}
+
+/// `(local port, inode)` of each socket in a table of `/proc/net` (`tcp`,
+/// `udp6`, ...). Sockets without an inode (in `TIME_WAIT`, or closed by
+/// their process) belong to no one any more and are left out.
+pub fn parse_net_inet(table: &str) -> Vec<(u16, u64)> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            // sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let port = u16::from_str_radix(f.get(1)?.rsplit_once(':')?.1, 16).ok()?;
+            let ino: u64 = f.get(9)?.parse().ok()?;
+            (ino != 0).then_some((port, ino))
+        })
+        .collect()
+}
+
+/// The internet sockets in `/proc/<pid>/net` (the network namespace of
+/// `pid`; `self` for the caller's): `(port, inode)` for each protocol of
+/// [`INET_TABLES`]. A table that does not exist (no IPv6, no UDP-Lite) is
+/// empty.
+fn inet_sockets(proc_root: &Path, pid: &str) -> io::Result<Vec<(crate::images::InetPort, u64)>> {
+    let mut out = Vec::new();
+    for (proto, _, tables) in INET_TABLES {
+        for table in tables {
+            let text = match fs::read_to_string(proc_root.join(pid).join("net").join(table)) {
+                Ok(t) => t,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            out.extend(
+                parse_net_inet(&text)
+                    .into_iter()
+                    .map(|(port, ino)| (crate::images::InetPort { proto, port }, ino)),
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// The ports internet sockets in the caller's network namespace are bound
+/// to (by protocol; any address, any family).
+pub fn inet_ports_in_use(proc_root: &Path) -> io::Result<Vec<crate::images::InetPort>> {
+    let mut out: Vec<crate::images::InetPort> = Vec::new();
+    for (port, _) in inet_sockets(proc_root, "self")? {
+        if !out.contains(&port) {
+            out.push(port);
+        }
+    }
+    Ok(out)
+}
+
+/// The ports of the restored job's internet sockets (held by the
+/// processes `procs`, in the network namespace of `init_pid`) that a
+/// socket of someone else is bound to as well. CRIU binds the job's
+/// sockets as root, with `SO_REUSEADDR` and `SO_REUSEPORT`, so such a
+/// socket may share a root service's port.
+pub fn inet_port_conflicts(
+    proc_root: &Path,
+    init_pid: u32,
+    procs: &[u32],
+) -> io::Result<Vec<String>> {
+    let mut own = std::collections::HashSet::new();
+    for pid in procs {
+        for e in fs::read_dir(proc_root.join(format!("{pid}/fd")))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if let Some(ino) = fs::read_link(e.path()).ok().and_then(|t| {
+                t.to_str()?
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .parse::<u64>()
+                    .ok()
+            }) {
+                own.insert(ino);
+            }
+        }
+    }
+    let sockets = inet_sockets(proc_root, &init_pid.to_string())?;
+    Ok(port_conflicts(&sockets, &own))
+}
+
+/// See [`inet_port_conflicts`]: of `sockets` (port, inode), those of the
+/// ports of the job's sockets (`own`) held by other sockets too.
+pub fn port_conflicts(
+    sockets: &[(crate::images::InetPort, u64)],
+    own: &std::collections::HashSet<u64>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (port, _) in sockets.iter().filter(|(_, ino)| own.contains(ino)) {
+        let what = format!("the job's socket on {port} shares the port with another socket");
+        if sockets
+            .iter()
+            .any(|(p, ino)| p == port && !own.contains(ino))
+            && !out.contains(&what)
+        {
+            out.push(what);
+        }
+    }
+    out
+}
+
+/// The inodes of listening sockets in `/proc/net/unix` (`__SO_ACCEPTCON`
+/// in `Flags`).
+pub fn parse_net_unix_listening(table: &str) -> std::collections::HashSet<u64> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let flags = u32::from_str_radix(f.get(3)?, 16).ok()?;
+            (flags & 0x0001_0000 != 0).then(|| f.get(6)?.parse().ok())?
+        })
+        .collect()
 }
 
 impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
@@ -314,6 +537,9 @@ impl<T: HostProbe> HostProbe for std::sync::Arc<T> {
     }
     fn dump_hazards(&self, host_pids: &[u32], private: &[String]) -> io::Result<DumpHazards> {
         (**self).dump_hazards(host_pids, private)
+    }
+    fn inet_ports_in_use(&self) -> io::Result<Vec<crate::images::InetPort>> {
+        (**self).inet_ports_in_use()
     }
     fn process_groups(&self, host_pids: &[u32]) -> io::Result<Option<Vec<u32>>> {
         (**self).process_groups(host_pids)
@@ -1024,6 +1250,18 @@ impl HostProbe for SystemHost {
                     continue;
                 };
                 let target = target.to_string_lossy();
+                if target == "anon_inode:inotify" || target == "anon_inode:[fanotify]" {
+                    let what = format!(
+                        "{} of process {pid}",
+                        target
+                            .trim_start_matches("anon_inode:")
+                            .trim_matches(['[', ']'])
+                    );
+                    if !out.notify_fds.contains(&what) {
+                        out.notify_fds.push(what);
+                    }
+                    continue;
+                }
                 if let Some(ino) = target
                     .strip_prefix("socket:[")
                     .and_then(|s| s.strip_suffix(']'))
@@ -1065,16 +1303,32 @@ impl HostProbe for SystemHost {
             // The job shares the host's network namespace; `net/unix` lists
             // the bound path of each socket by inode.
             let table = fs::read_to_string(self.proc_root.join(pid.to_string()).join("net/unix"))?;
+            let listening = parse_net_unix_listening(&table);
             for (ino, path) in parse_net_unix(&table) {
-                if sockets.contains(&ino)
-                    && is_host_socket_name(&path, private)
-                    && !out.bound_sockets.contains(&path)
-                {
+                if !sockets.contains(&ino) {
+                    continue;
+                }
+                if path.starts_with('@') {
+                    if listening.contains(&ino) && !out.abstract_listeners.contains(&path) {
+                        out.abstract_listeners.push(path);
+                    }
+                    continue;
+                }
+                // A name below a private mount must lead there too.
+                let host = match private_socket_mount(&path, private) {
+                    Some(mount) => !socket_dir_is_private(&self.proc_root, *pid, &path, mount),
+                    None => true,
+                };
+                if host && !out.bound_sockets.contains(&path) {
                     out.bound_sockets.push(path);
                 }
             }
         }
         Ok(out)
+    }
+
+    fn inet_ports_in_use(&self) -> io::Result<Vec<crate::images::InetPort>> {
+        inet_ports_in_use(&self.proc_root)
     }
 
     fn process_groups(&self, host_pids: &[u32]) -> io::Result<Option<Vec<u32>>> {
@@ -1553,6 +1807,140 @@ mod tests {
         }
         drop((plain, reuse));
         assert!(groups.contains(&nix::unistd::getegid().as_raw()));
+    }
+
+    /// Regression (audit V2, S1-2/S2-1): the kernel keeps a socket's name
+    /// as given to bind(2), unnormalized, and CRIU binds that very name as
+    /// root on restore. A name that only looks like it is below a private
+    /// mount (`..`, `.`, `//`, a magic link below `/proc`) must count as a
+    /// host name.
+    #[test]
+    fn unnormalized_socket_names_count_as_host_names() {
+        let private = ["/tmp".to_owned(), "/dev/shm".to_owned()];
+        for name in [
+            "/tmp/../home/a/s",
+            "/tmp/x/../../etc/s",
+            "/dev/shm/../../run/s",
+            "/tmp/./../home/a/s",
+            "/proc/self/root/home/a/s",
+            "/proc/1/cwd/s",
+            "/proc/thread-self/root/run/s",
+        ] {
+            assert!(is_host_socket_name(name, &private), "{name}");
+        }
+        // Names CRIU would resolve below the private tmpfs stay private.
+        assert!(!is_host_socket_name("/tmp/a/s", &private));
+    }
+
+    /// Regression (audit V2, S1-2/S2-1): a socket the job binds through
+    /// `..` or through a symlink inside its private tmpfs lies on a host
+    /// filesystem, and the dump must report it.
+    #[test]
+    fn sockets_bound_out_of_a_private_dir_are_hazards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let private_dir = tmp.path().join("private");
+        let host_dir = tmp.path().join("host");
+        fs::create_dir(&private_dir).unwrap();
+        fs::create_dir(&host_dir).unwrap();
+        std::os::unix::fs::symlink(&host_dir, private_dir.join("link")).unwrap();
+        let via_dotdot = private_dir.join("../host/a.sock");
+        let via_link = private_dir.join("link/b.sock");
+        let _a = std::os::unix::net::UnixListener::bind(&via_dotdot).unwrap();
+        let _b = std::os::unix::net::UnixListener::bind(&via_link).unwrap();
+        assert!(host_dir.join("a.sock").exists() && host_dir.join("b.sock").exists());
+        let host = SystemHost::new("nvidia-smi".into(), Default::default(), "x".into());
+        let private = [private_dir.to_str().unwrap().to_owned()];
+        let h = host.dump_hazards(&[std::process::id()], &private).unwrap();
+        for name in [&via_dotdot, &via_link] {
+            assert!(
+                h.bound_sockets.iter().any(|s| s == name.to_str().unwrap()),
+                "{name:?} not reported: {h:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_paths() {
+        for p in ["/", "/a", "/a/b.c", "/a/..b"] {
+            assert!(is_normalized_path(p), "{p}");
+        }
+        for p in ["", "a/b", "/a/", "//a", "/a//b", "/a/./b", "/a/../b", "/.."] {
+            assert!(!is_normalized_path(p), "{p}");
+        }
+        let private = ["/tmp".to_owned(), "/tmp/x".to_owned()];
+        assert!(!is_private_path("/tmp/../etc/passwd", &private));
+        assert_eq!(private_socket_mount("/tmp/x/s", &private), Some("/tmp/x"));
+        assert_eq!(private_socket_mount("/tmp/s", &private), Some("/tmp"));
+        assert_eq!(private_socket_mount("/proc/1/root/tmp/s", &private), None);
+    }
+
+    #[test]
+    fn parses_net_inet_and_listening_unix_sockets() {
+        let t = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                 0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 4242 1 0 100 0 0 10 0\n\
+                 1: 0100007F:1F91 0100007F:9C40 06 00000000:00000000 03:00000F9A 00000000     0        0 0 3 0\n";
+        assert_eq!(parse_net_inet(t), [(8080, 4242)]);
+        let t6 = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                  0: 00000000000000000000000000000000:0016 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 77 1 0 100 0 0 10 0\n";
+        assert_eq!(parse_net_inet(t6), [(22, 77)]);
+        let u = "Num       RefCount Protocol Flags    Type St Inode Path\n\
+                 0000000000000000: 00000002 00000000 00010000 0001 01 4242 @listen\n\
+                 0000000000000000: 00000002 00000000 00000000 0002 01 4243 @dgram\n";
+        assert_eq!(
+            parse_net_unix_listening(u),
+            std::collections::HashSet::from([4242])
+        );
+    }
+
+    /// Our own process: an inotify descriptor, a listening socket with an
+    /// abstract name, and an internet socket sharing its port.
+    #[test]
+    fn finds_notify_fds_abstract_listeners_and_port_conflicts() {
+        use std::os::linux::net::SocketAddrExt;
+        let _ify = rustix::fs::inotify::init(rustix::fs::inotify::CreateFlags::CLOEXEC).unwrap();
+        let name = format!("gpueue-test-{}", std::process::id());
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&name).unwrap();
+        let _l = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        let host = SystemHost::new("nvidia-smi".into(), Default::default(), "x".into());
+        let h = host
+            .dump_hazards(&[std::process::id()], &["/tmp".into()])
+            .unwrap();
+        assert_eq!(
+            h.notify_fds,
+            [format!("inotify of process {}", std::process::id())]
+        );
+        assert_eq!(h.abstract_listeners, [format!("@{name}")]);
+
+        // Two sockets of ours on one UDP port: no conflict while both are
+        // the job's, one when only one of them is.
+        use rustix::net::{AddressFamily, SocketType, sockopt};
+        let a = rustix::net::socket(AddressFamily::INET, SocketType::DGRAM, None).unwrap();
+        sockopt::set_socket_reuseport(&a, true).unwrap();
+        rustix::net::bind(&a, &std::net::SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let port = std::net::SocketAddr::try_from(rustix::net::getsockname(&a).unwrap())
+            .unwrap()
+            .port();
+        let b = rustix::net::socket(AddressFamily::INET, SocketType::DGRAM, None).unwrap();
+        sockopt::set_socket_reuseport(&b, true).unwrap();
+        rustix::net::bind(&b, &std::net::SocketAddr::from(([127, 0, 0, 1], port))).unwrap();
+        let in_use = host.inet_ports_in_use().unwrap();
+        assert!(in_use.contains(&crate::images::InetPort { proto: 17, port }));
+        let me = std::process::id();
+        assert!(
+            inet_port_conflicts(Path::new("/proc"), me, &[me])
+                .unwrap()
+                .is_empty()
+        );
+        drop((a, b));
+        let p = |proto, port| crate::images::InetPort { proto, port };
+        let sockets = [(p(6, 80), 1), (p(6, 80), 2), (p(17, 80), 3), (p(6, 81), 4)];
+        let own = std::collections::HashSet::from([1, 3]);
+        assert_eq!(
+            port_conflicts(&sockets, &own),
+            ["the job's socket on TCP port 80 shares the port with another socket"]
+        );
+        let own = std::collections::HashSet::from([1, 2, 3]);
+        assert!(port_conflicts(&sockets, &own).is_empty());
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub struct FakeHost {
     mounts: Mutex<Vec<String>>,
     unreachable: Mutex<Vec<String>>,
     hazards: Mutex<DumpHazards>,
+    /// See [`FakeHost::set_inet_ports_in_use`].
+    inet_ports: Mutex<Vec<crate::images::InetPort>>,
     groups: Mutex<Option<Vec<u32>>>,
     path_problems: Mutex<Vec<String>>,
     restored_problems: Mutex<Vec<String>>,
@@ -154,6 +156,10 @@ impl HostProbe for FakeHost {
         Ok(self.hazards.lock().unwrap().clone())
     }
 
+    fn inet_ports_in_use(&self) -> io::Result<Vec<crate::images::InetPort>> {
+        Ok(self.inet_ports.lock().unwrap().clone())
+    }
+
     fn process_groups(&self, _host_pids: &[u32]) -> io::Result<Option<Vec<u32>>> {
         Ok(self.groups.lock().unwrap().clone())
     }
@@ -241,6 +247,11 @@ impl FakeHost {
     /// What [`HostProbe::dump_hazards`] reports for every job.
     pub fn set_dump_hazards(&self, h: DumpHazards) {
         *self.hazards.lock().unwrap() = h;
+    }
+
+    /// What [`HostProbe::inet_ports_in_use`] reports.
+    pub fn set_inet_ports_in_use(&self, ports: Vec<crate::images::InetPort>) {
+        *self.inet_ports.lock().unwrap() = ports;
     }
 
     /// What [`HostProbe::dead_mounts`] reports for every job.
