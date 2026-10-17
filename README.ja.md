@@ -1,6 +1,10 @@
 <a id="gpueue"></a>
 # gpueue
 
+[![CI](https://github.com/kaito4681/gpueue/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kaito4681/gpueue/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/kaito4681/gpueue)](https://github.com/kaito4681/gpueue/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/kaito4681/gpueue)](LICENSE)
+
 [English](README.md) | 日本語 | [简体中文](README.zh-CN.md)
 
 複数のユーザーで共有する 1 台の Linux マシン向けの GPU ジョブキューです。CLI は
@@ -9,11 +13,19 @@
 による実行中ジョブの透過的なチェックポイント/リストア（CPU、メモリ、GPU の状態）です。マシンの再起動時にまだ
 動いている学習はディスクに保存され、止まったところから再開します。最初からやり直すことはありません。
 
+> [!NOTE]
 > **状態：プレリリース。** 以下の機能はすべて実装済みで、Docker 内（PID 1 の systemd、本物の CRIU、本物の
 > NVIDIA GPU）と、CPU ジョブを動かした QEMU/KVM 仮想マシンの実際の再起動と電源断をまたいでテストされています。
 > 物理マシン（ベアメタル）での実際の再起動や、GPU ジョブを動かしての実際の再起動をまたいだテストは**まだ**
 > 行っていません。
 > [プロジェクトの状況](#project-status) を参照してください。
+
+**目次：** [なぜ gpueue か](#why) · [機能](#features) · [クイックスタート](#quick-start) ·
+[pueue との互換性](#pueue-compatibility-and-differences) ·
+[マルチユーザーモデル](#multi-user-model-and-authorization) · [GPU スロット](#gpu-slots) ·
+[ジョブの優先度](#job-priority) · [要件](#requirements) · [制限事項](#limitations) ·
+[プロジェクトの状況](#project-status) · [Agent Skill](#agent-skill) ·
+[ドキュメント](#documentation) · [コントリビューション](#contributing) · [ライセンス](#license)
 
 <a id="why"></a>
 ## なぜ gpueue か
@@ -64,7 +76,18 @@ RHEL 9 以降）では、インストーラーが最新のリリースをダウ�
 
 ```sh
 curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.sh | sudo bash
+gpueue doctor    # check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage
+
+# Optional: make someone an administrator.
+sudo usermod -aG gpueue-admin alice
 ```
+
+一般ユーザーは何もインストールする必要はありません。チェックポイントには CRIU 4.2 以降（GPU ジョブには
+cuda-checkpoint も）が必要ですが、どのインストール方法もこれらはインストールしません。下の
+[自動ではインストールされない依存関係](#dependencies-that-are-not-installed-automatically)を参照してください。
+
+<details>
+<summary><b>install.sh が行うこと、更新と削除</b></summary>
 
 インストーラーは systemd ユニット、`gpueue` ユーザー、`gpueue-admin` グループ、ディレクトリ、デフォルトの
 /etc/gpueue/config.toml を用意し、サービスを起動して `gpueue doctor` のレポートを表示します。CRIU と
@@ -72,6 +95,11 @@ cuda-checkpoint はインストールしません。足りない場合はそう�
 （実行中のジョブは動き続けます）。削除は `sudo gpueue uninstall` で行い、データは残ります（`--purge` を付けると
 データも削除します）。GitHub のトークンは不要です（`GH_TOKEN` が設定されていれば使いますが、API のレート
 制限が上がるだけです）。
+
+</details>
+
+<details>
+<summary><b>Debian / Ubuntu（APT リポジトリまたは .deb）</b></summary>
 
 Debian と Ubuntu（amd64 または arm64）では、代わりに gpueue の APT リポジトリ（GitHub リリースの `apt`）
 からパッケージをインストールできます。`curl` と `ca-certificates` が必要で、最新の安定版とアーキテクチャは
@@ -97,6 +125,11 @@ sudo apt install "./gpueue_${arch}.deb"
 停止し、`sudo apt purge gpueue` は /etc/gpueue も削除します。どちらも /var/lib/gpueue と実行中のジョブは
 残します。
 
+</details>
+
+<details>
+<summary><b>Fedora / RHEL / Rocky / Alma（.rpm）</b></summary>
+
 Fedora、RHEL、Rocky、Alma Linux 9 以降（x86_64 または aarch64）では、リリースの .rpm をインストール
 します（dnf は URL をそのまま受け付けます）。
 
@@ -116,6 +149,11 @@ dnf リポジトリはまだありません（予定、issue #23）。更新す�
 なくてもジョブは実行できます）。ソースからビルドしたり、Nix flake を使ったりもできます
 （[docs/ja/install.md](docs/ja/install.md) を参照）。
 
+</details>
+
+<details>
+<summary><b>NixOS と Nix</b></summary>
+
 NixOS では、flake のモジュール（`github:kaito4681/gpueue/stable`、`nixosModules.default`）をインポートし、
 `services.gpueue.enable = true` を設定します（[NixOS](docs/ja/install.md#nixos) を参照）。home-manager の
 ユーザーは `homeManagerModules.default` で CLI の補完を追加できます。他のディストリビューション上の Nix
@@ -127,6 +165,11 @@ NixOS では、flake のモジュール（`github:kaito4681/gpueue/stable`、`ni
 nix build github:kaito4681/gpueue/stable
 sudo ./result/bin/gpueue service install
 ```
+
+</details>
+
+<details>
+<summary><b>Arch Linux（AUR は予定）</b></summary>
 
 Arch Linux（x86_64、aarch64）では、当面は上記のインストーラーを使ってください。AUR パッケージ `gpueue-bin`
 は公開予定で、まだ公開されていません（[#159](https://github.com/kaito4681/gpueue/issues/159)）。CRIU（チェックポイントには 4.2 以降）は公式リポジトリにあります。
@@ -140,8 +183,11 @@ curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.
 代わりに任意の AUR ヘルパーで [`gpueue-bin`](https://aur.archlinux.org/packages/gpueue-bin) を
 インストールできます（[docs/ja/install.md](docs/ja/install.md#arch-linux-aur) を参照）。
 
+</details>
+
 <a id="dependencies-that-are-not-installed-automatically"></a>
-#### 自動ではインストールされない依存関係
+<details>
+<summary><b>自動ではインストールされない依存関係（CRIU、NVIDIA ドライバー、cuda-checkpoint）</b></summary>
 
 どのインストール方法も NVIDIA ドライバーと cuda-checkpoint はインストールしません。パッケージは CRIU を
 推奨するだけで、多くのリリースではその CRIU は古いか存在せず、`install.sh` はどちらもインストールしません
@@ -164,17 +210,9 @@ sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux
 
 ヘルパーは cuda-checkpoint と CRIU を起動時にだけ探します。どちらかをインストールしたら
 `sudo systemctl restart gpueue-helper` でヘルパーを再起動し（[cuda-checkpoint](docs/ja/install.md#cuda-checkpoint)
-を参照）、結果を確認してください。
+を参照）、もう一度 `gpueue doctor` を実行してください。
 
-```sh
-# Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.
-gpueue doctor
-
-# Optional: make someone an administrator.
-sudo usermod -aG gpueue-admin alice
-```
-
-一般ユーザーは何もインストールする必要はありません。
+</details>
 
 <a id="run-a-gpu-job-any-user"></a>
 ### GPU ジョブを実行する（全ユーザー）
@@ -202,11 +240,16 @@ gpueue restore -i 0    # ...or put it first among your queued jobs (administrato
 リストアされたジョブは、チェックポイントされた瞬間から処理を続けます。ジョブ ID は変わらず、出力は同じログに
 追記されます。
 
+<details>
+<summary><b>一時停止中のジョブ</b></summary>
+
 一時停止中のジョブもチェックポイントできます（再起動時も同様です）。一時停止したままリストアされ、GPU
 スロットも保持したままです。`gpueue start` で再開します。CRIU と cuda-checkpoint は実行中のプロセスを
 必要とするため、ダンプの間はジョブが一瞬だけ動きます。リストアは停止したままのジョブを戻すので、
 `gpueue start` までジョブは（一瞬たりとも）何も実行しません。チェックポイントの処理中は `gpueue pause` は
 拒否されます。
+
+</details>
 
 <a id="what-happens-on-reboot"></a>
 ### 再起動時に何が起きるか
@@ -218,6 +261,9 @@ gpueue restore -i 0    # ...or put it first among your queued jobs (administrato
    通常どおり開始します。
 3. 各所有者（または管理者）が `gpueue restore <id>` か `gpueue restore -a` でジョブを再開します。リストアが
    自動で始まることはありません。
+
+<details>
+<summary><b>チェックポイントが拒否された・失敗したとき</b></summary>
 
 チェックポイントがうまくいかない場合は 2 通りあります。
 
@@ -234,12 +280,19 @@ OS のシャットダウンや再起動の間は、保存できなかったジ�
 すべて systemd によって停止されます。起動後は理由とともに `Checkpoint failed` と表示され、所有者に警告が
 出ます。電源断やカーネルのクラッシュでは何も保存されません。
 
+</details>
+
 <a id="pueue-compatibility-and-differences"></a>
 ## pueue との互換性と違い
 
 コマンド名、オプション、表のレイアウトは pueue 4.0 に合わせているので、`pueue` を `gpueue` に置き換えれば、
 pueue での習慣やスクリプトの多くはそのまま使えます。gpueue が真似ているのは CLI だけです。pueue の
-プロトコルは話さず、pueue のファイルも読みません。違いは次のとおりです。
+プロトコルは話さず、pueue のファイルも読みません。主な違いは、systemd が実行するシステム全体で 1 つの
+デーモン、`send` がないこと（ジョブの stdin は `/dev/null`）、ジョブをすぐに開始できるのは管理者だけで
+あることです。
+
+<details>
+<summary><b>pueue との違い</b></summary>
 
 | 項目 | pueue | gpueue |
 | --- | --- | --- |
@@ -256,6 +309,11 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 | `edit`、`env`、`restart --edit` | 対応 | 受け付けますが、まだ実装されていません |
 | `add -o/--priority`、`switch` | デーモンの全タスクを並べ替える | 自分のジョブだけを並べ替えます。どのユーザーのジョブを先に開始するかは、フェアシェアを含む Slurm 式のマルチファクター優先度で決まります（[ジョブの優先度](#job-priority) を参照）。`priority_type = "basic"` で pueue の順序に戻りますが、`-o` が並べ替えるのは引き続き自分のジョブだけです。 |
 | コールバック、エイリアス、`pueue.yml` | 対応 | ありません |
+
+</details>
+
+<details>
+<summary><b>追加のコマンド、オプション、ジョブの状態</b></summary>
 
 追加のコマンドとオプション：
 
@@ -281,8 +339,11 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 （チェックポイントの失敗後に停止中）。`status` の表には `Owner` と `GPU` の列があり、`Checkpointed` の
 ジョブにはイメージのサイズが表示されます。
 
+</details>
+
 <a id="json-output"></a>
-### JSON 出力
+<details>
+<summary><b>JSON 出力（<code>--json</code>）</b></summary>
 
 `gpueue status --json` は `{"groups": [...], "jobs": [...]}` を出力します。
 
@@ -324,8 +385,16 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
   "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
   "usage_reset_period", "billing_weights", "usage_calc_at"}` を出力します。
 
+</details>
+
 <a id="multi-user-model-and-authorization"></a>
 ## マルチユーザーモデルと認可
+
+ジョブはそれを追加したユーザーとして特権なしで実行され、ジョブを変更したり、そのコマンド、環境変数、ログを
+見たりできるのは所有者と管理者だけです。ジョブが存在することと、どの GPU を使っているかは全員が見られます。
+
+<details>
+<summary><b>詳細：呼び出し元の識別、ジョブを実行できるユーザー、ジョブにできること、誰が何をできるか</b></summary>
 
 - デーモンは、ソケットの接続相手についてカーネルが報告する uid（`SO_PEERCRED`）で呼び出し元を識別します。
   クライアントが他人になりすますことはできません。
@@ -375,8 +444,16 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 - 管理者は root と `gpueue-admin` グループのメンバー（プライマリまたは補助グループ）です。チェックは
   リクエストごとに行われるので、`usermod -aG gpueue-admin <user>` はすぐに反映されます。
 
+</details>
+
 <a id="gpu-slots"></a>
 ## GPU スロット
+
+`--gpu 0,1` を指定したジョブは、そのグループと指定した**すべての** GPU に空きスロットがあるときにだけ開始し
+（デフォルトは GPU ごとに 1 ジョブ）、開けるのはそれらの GPU のデバイスノードだけです。
+
+<details>
+<summary><b>詳細：スロットの上限、GPU の順序、分離、グループ、検出</b></summary>
 
 - `gpueue add --gpu 0,1 ...` は、そのグループに空きスロットがあり、かつ指定した**すべての** GPU に空き
   スロットがあるときにだけジョブを開始します。デーモンは知らない GPU 番号を拒否します。
@@ -402,8 +479,16 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
   GPU を追加・取り外ししたら `gpueue.service` を再起動してください。`gpueue doctor` はデーモンが検出したものと
   `nvidia-smi` を比較します。
 
+</details>
+
 <a id="job-priority"></a>
 ## ジョブの優先度
+
+複数のジョブが同じスロットを待っているときは、フェアシェアを含む Slurm 式のマルチファクター優先度で、
+どのユーザーのジョブを先に開始するかが決まります。`gpueue prio` と `gpueue share` で数値を確認できます。
+
+<details>
+<summary><b>詳細：要素、<code>top</code>、即時実行</b></summary>
 
 複数のジョブが同じスロットを待っているときは、収まるジョブのうち優先度が最も高いものが先に開始します。
 優先度は Slurm の multifactor プラグインに従います。デフォルトでは、フェアシェアの要素（最近マシンをあまり
@@ -417,6 +502,8 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 `enable_user_top = false`（または `priority_type = "basic"`）のときは、単にキューされます。一時停止中の
 ジョブの `start` はこれまでどおり再開です。管理者の即時実行はすべての上限を無視してすぐに開始します。`gpueue prio` はジョブがその位置にある理由を、`gpueue share` は全員の使用量を表示します。
 計算式と設定は [優先度とフェアシェア](docs/ja/install.md#priority-and-fair-share) を参照してください。
+
+</details>
 
 <a id="requirements"></a>
 ## 要件
@@ -434,6 +521,14 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 
 <a id="limitations"></a>
 ## 制限事項
+
+チェックポイント/リストアには制限があります。確立済みの TCP 接続は閉じられ、電源断では何も保存されず、
+ジョブは同じ GPU モデルとドライバーで、同じファイルとマウントのもとでリストアする必要があります。また、
+ある種のソケットやディスクリプタを持つジョブはチェックポイントできません（チェックポイントは拒否され、
+ジョブは動き続けます）。
+
+<details>
+<summary><b>すべての制限事項</b></summary>
 
 - **ネットワーク接続：** 確立済みの TCP 接続（データセットのサーバー、データベース、実験管理ツールなどへの
   接続）は、ジョブのチェックポイント時に閉じられます（`criu --tcp-close`）。リストア後、プログラムからは
@@ -506,10 +601,34 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 - まだないもの：`edit`、`env`、定期的なチェックポイント、ジョブを動かしたままのチェックポイント、完全な
   チェックポイントなしでの GPU の解放（"GPU suspend"）、Web UI や TCP API、VRAM で数えるスロット。
 
+</details>
+
 <a id="project-status"></a>
 ## プロジェクトの状況
 
-プレリリース（バージョン 0.1.0）。これまでにテストしたもの：
+プレリリース（バージョン 0.1.4）。v0.1.4 はセキュリティリリースです。v0.1.3 以前を使っているサイトは
+アップグレードしてください（[v0.1.4 のリリースノート](https://github.com/kaito4681/gpueue/releases/tag/v0.1.4)を参照）。
+
+<details>
+<summary><b>アップグレード前に確認すべき v0.1.4 の動作の変更</b></summary>
+
+- 次のジョブはチェックポイントできなくなりました（拒否のメッセージに理由が表示されます）：inotify/fanotify
+  の監視を持つジョブ、（libcuda 自身のもの以外の）抽象 Unix ソケットで listen しているジョブ、Unix ソケットの
+  キューにディスクリプタを持つジョブ、削除済みの setuid/setgid ファイルを持つジョブ。
+- ジョブがバインドしていたポートをホスト上の別のプログラムが使っている間は、リストアが拒否されます。
+  ポートが空いてから再試行できます。
+- `/etc/gpueue/config.toml`（またはその上のディレクトリ）が root の所有でないか、グループやその他のユーザーが
+  書き込める場合、`gpueue daemon` は起動を拒否します。`gpueue doctor` がこれを報告します。
+- `sudo gpueue service install` は、root 以外のユーザーが書き込めるディレクトリからの `gpueue-helper` の
+  コピーを拒否します。リリースは root として展開してください。
+- v0.1.3 で取ったチェックポイントは v0.1.4 でリストアできます。
+
+</details>
+
+<details>
+<summary><b>テストしたもの・まだテストしていないもの</b></summary>
+
+これまでにテストしたもの：
 
 - すべてのクレートのユニットテストと統合テスト（`scripts/test-in-docker.sh`）。
 - PID 1 の systemd 259、CRIU 4.2、`gpueue service install` でインストールしたバイナリを使った、特権 Docker
@@ -561,6 +680,8 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 
 お使いのハードウェアで何が動いて何が動かないか、ぜひ報告してください。
 
+</details>
+
 <a id="agent-skill"></a>
 ## コーディングエージェント向け Agent Skill
 
@@ -594,6 +715,12 @@ npx skills add kaito4681/gpueue -g -a claude-code -y
 scripts/test-in-docker.sh                                   # cargo test --workspace
 scripts/test-in-docker.sh clippy --workspace --all-targets
 scripts/test-in-docker.sh fmt --all
+```
+
+<details>
+<summary><b>エンドツーエンド、VM、GPU、Nix のテスト</b></summary>
+
+```sh
 scripts/e2e-test.sh               # full stack under systemd in a privileged container
 scripts/vm-reboot-test.sh         # real OS in QEMU/KVM VMs: install, reboots, upgrade (needs /dev/kvm; `all` for every distro)
 scripts/gpu-host-test.sh          # checkpoint/restore of real CUDA jobs on the installed gpueue (GPU host, no root)
@@ -610,6 +737,8 @@ nix build -L .#checks.x86_64-linux.helper-tests  # all gpueue-helper tests in a 
 スクリプトを参照）は、どちらの `GPUEUE_HELPER_CUDA_MODE` でも、GPU のチェックポイントを期限切れに追い込み、
 ダンプの途中で `criu` / `cuda-checkpoint` を kill します。`scripts/measure-checkpoint.sh` はチェックポイントの
 各ステップにかかる時間を測定します。どのスクリプトもホスト上で特権の必要な処理は実行しません。
+
+</details>
 
 <a id="license"></a>
 ## ライセンス

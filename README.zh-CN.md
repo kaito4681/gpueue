@@ -1,6 +1,10 @@
 <a id="gpueue"></a>
 # gpueue
 
+[![CI](https://github.com/kaito4681/gpueue/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kaito4681/gpueue/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/kaito4681/gpueue)](https://github.com/kaito4681/gpueue/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/kaito4681/gpueue)](LICENSE)
+
 [English](README.md) | [日本語](README.ja.md) | 简体中文
 
 面向多用户共享的单台 Linux 机器的 GPU 作业队列。其 CLI 的用法与
@@ -9,10 +13,18 @@
 对运行中的作业（CPU、内存和 GPU 状态）进行透明的检查点保存与恢复。机器重启时仍在运行的训练会被保存到磁盘，
 并从中断处继续运行，而不必从头开始。
 
+> [!NOTE]
 > **状态：预发布。** 下文所述的全部功能均已实现，并已在 Docker 中测试（systemd 作为 PID 1、
 > 真实的 CRIU、真实的 NVIDIA GPU），并在运行 CPU 作业的 QEMU/KVM 虚拟机的真实重启和关机中测试过。
 > 但尚**未**在物理机（裸机）上或带着 GPU 作业经历真实重启的测试。
 > 参见[项目状态](#project-status)。
+
+**目录：** [为什么需要 gpueue](#why) · [功能](#features) · [快速开始](#quick-start) ·
+[pueue 兼容性](#pueue-compatibility-and-differences) ·
+[多用户模型](#multi-user-model-and-authorization) · [GPU 槽位](#gpu-slots) ·
+[作业优先级](#job-priority) · [要求](#requirements) · [限制](#limitations) ·
+[项目状态](#project-status) · [Agent Skill](#agent-skill) ·
+[文档](#documentation) · [参与贡献](#contributing) · [许可证](#license)
 
 <a id="why"></a>
 ## 为什么需要 gpueue
@@ -59,13 +71,28 @@ RHEL 9+），安装脚本会下载最新的发布版本、进行校验，并将 
 
 ```sh
 curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.sh | sudo bash
+gpueue doctor    # check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage
+
+# Optional: make someone an administrator.
+sudo usermod -aG gpueue-admin alice
 ```
+
+普通用户无需安装任何东西。创建检查点需要 CRIU 4.2 或更新版本（GPU 作业还需要 cuda-checkpoint），但任何安装方式
+都不会替你安装它们；参见下面的[不会自动安装的依赖](#dependencies-that-are-not-installed-automatically)。
+
+<details>
+<summary><b>install.sh 做了什么、更新与卸载</b></summary>
 
 安装脚本会设置 systemd 单元、`gpueue` 用户、`gpueue-admin` 组、各个目录以及默认的
 /etc/gpueue/config.toml，启动服务，并打印 `gpueue doctor` 的报告。它不会安装 CRIU 或 cuda-checkpoint；
 如果它们缺失，脚本会提示你。之后用 `sudo gpueue update` 更新（运行中的作业会继续运行）。用
 `sudo gpueue uninstall` 卸载，数据会被保留（加上 `--purge` 则一并删除）。不需要 GitHub token（如果设置了
 `GH_TOKEN` 则会使用它；它只用于提高 API 速率限制）。
+
+</details>
+
+<details>
+<summary><b>Debian / Ubuntu（APT 仓库或 .deb）</b></summary>
 
 在 Debian 和 Ubuntu（amd64 或 arm64）上，也可以改为从 gpueue 的 APT 仓库（位于 GitHub Release `apt` 中）
 安装软件包；这需要 `curl` 和 `ca-certificates`，最新的稳定版本和架构由 apt 自动选择：
@@ -89,6 +116,11 @@ sudo apt install "./gpueue_${arch}.deb"
 都通过 `sudo apt update && sudo apt upgrade` 获取。`sudo apt remove gpueue` 会停止服务；`sudo apt purge gpueue`
 还会删除 /etc/gpueue。两者都会保留 /var/lib/gpueue 和运行中的作业。
 
+</details>
+
+<details>
+<summary><b>Fedora / RHEL / Rocky / Alma（.rpm）</b></summary>
+
 在 Fedora、RHEL、Rocky 和 Alma Linux 9+（x86_64 或 aarch64）上，安装发布版本中的 .rpm
 （dnf 可以直接接受 URL）：
 
@@ -105,6 +137,11 @@ sudo dnf install "https://github.com/kaito4681/gpueue/releases/latest/download/g
 Fedora 的版本足够新，而 Rocky/RHEL 9 只提供 3.19，因此在那里创建检查点需要更新的 CRIU（没有它作业也能运行）。
 你也可以从源码构建，或使用 Nix flake（参见 [docs/zh-CN/install.md](docs/zh-CN/install.md)）。
 
+</details>
+
+<details>
+<summary><b>NixOS 与 Nix</b></summary>
+
 在 NixOS 上，导入 flake 的模块（`github:kaito4681/gpueue/stable`、`nixosModules.default`）并设置
 `services.gpueue.enable = true`（参见 [NixOS](docs/zh-CN/install.md#nixos)）；home-manager 用户可以通过
 `homeManagerModules.default` 添加 CLI 的补全。在其他发行版上使用 Nix（x86_64 或 aarch64）时，构建该 flake，
@@ -115,6 +152,11 @@ Fedora 的版本足够新，而 Rocky/RHEL 9 只提供 3.19，因此在那里创
 nix build github:kaito4681/gpueue/stable
 sudo ./result/bin/gpueue service install
 ```
+
+</details>
+
+<details>
+<summary><b>Arch Linux（AUR 计划中）</b></summary>
 
 在 Arch Linux（x86_64、aarch64）上，目前请使用上面的安装脚本：AUR 软件包 `gpueue-bin` 计划发布但尚未发布（[#159](https://github.com/kaito4681/gpueue/issues/159)）。
 CRIU（4.2 或更新版本，用于检查点）位于官方仓库中：
@@ -128,8 +170,11 @@ curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.
 helper 安装 [`gpueue-bin`](https://aur.archlinux.org/packages/gpueue-bin)（参见
 [docs/zh-CN/install.md](docs/zh-CN/install.md#arch-linux-aur)）。
 
+</details>
+
 <a id="dependencies-that-are-not-installed-automatically"></a>
-#### 不会自动安装的依赖
+<details>
+<summary><b>不会自动安装的依赖（CRIU、NVIDIA 驱动、cuda-checkpoint）</b></summary>
 
 任何安装方式都不会安装 NVIDIA 驱动和 cuda-checkpoint。软件包只是推荐 CRIU，而在许多发行版版本上它过旧或
 不存在；`install.sh` 两者都不安装（会列出缺少的内容）。没有 CRIU 和 cuda-checkpoint 作业也能运行，但创建
@@ -149,17 +194,9 @@ sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux
 ```
 
 helper 只在启动时查找 cuda-checkpoint 和 CRIU：安装其中任一个后，请用 `sudo systemctl restart gpueue-helper`
-重启 helper（参见 [cuda-checkpoint](docs/zh-CN/install.md#cuda-checkpoint)），然后检查结果。
+重启 helper（参见 [cuda-checkpoint](docs/zh-CN/install.md#cuda-checkpoint)），然后再次运行 `gpueue doctor`。
 
-```sh
-# Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.
-gpueue doctor
-
-# Optional: make someone an administrator.
-sudo usermod -aG gpueue-admin alice
-```
-
-普通用户无需安装任何东西。
+</details>
 
 <a id="run-a-gpu-job-any-user"></a>
 ### 运行 GPU 作业（任意用户）
@@ -186,10 +223,15 @@ gpueue restore -i 0    # ...or put it first among your queued jobs (administrato
 
 恢复后的作业从创建检查点的那一刻继续运行。它保留原来的作业 id，其输出会追加到同一个日志中。
 
+<details>
+<summary><b>暂停的作业</b></summary>
+
 暂停的作业同样可以创建检查点，重启时也是如此。它恢复后仍处于暂停状态，并继续占用其 GPU 槽位，用
 `gpueue start` 即可让它继续运行。CRIU 和 cuda-checkpoint 需要一个正在运行的进程，因此在转储期间作业会运行片刻。
 恢复会让它保持停止状态，因此在 `gpueue start` 之前它不会执行任何代码（哪怕片刻）。检查点正在进行时，
 `gpueue pause` 会被拒绝。
+
+</details>
 
 <a id="what-happens-on-reboot"></a>
 ### 重启时会发生什么
@@ -198,6 +240,9 @@ gpueue restore -i 0    # ...or put it first among your queued jobs (administrato
    `--no-checkpoint` 作业则直接被终止。
 2. 启动后，这些作业显示为 `Checkpointed`。原本在排队的作业继续排队，并照常启动。
 3. 每个所有者（或管理员）用 `gpueue restore <id>` 或 `gpueue restore -a` 恢复自己的作业。恢复不会自动开始。
+
+<details>
+<summary><b>检查点被拒绝或失败时</b></summary>
 
 检查点可能以两种方式出错：
 
@@ -212,11 +257,17 @@ gpueue restore -i 0    # ...or put it first among your queued jobs (administrato
 在操作系统关机或重启期间，systemd 会停止所有无法保存的作业，无论其转储是被拒绝还是失败。启动后，它会显示为
 `Checkpoint failed` 及其原因，并且所有者会收到警告。断电或内核崩溃时不会保存任何内容。
 
+</details>
+
 <a id="pueue-compatibility-and-differences"></a>
 ## pueue 兼容性与差异
 
 命令名、选项和表格布局遵循 pueue 4.0，因此把 `pueue` 换成 `gpueue` 后，大多数 pueue 的使用习惯和脚本都能继续使用。
-gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的文件。差异如下：
+gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的文件。最大的差异是：整个系统只有一个由 systemd
+运行的守护进程，没有 `send`（作业的 stdin 是 `/dev/null`），并且只有管理员能立即启动作业。
+
+<details>
+<summary><b>与 pueue 的差异</b></summary>
 
 | 项目 | pueue | gpueue |
 | --- | --- | --- |
@@ -233,6 +284,11 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | `edit`、`env`、`restart --edit` | 支持 | 接受但尚未实现 |
 | `add -o/--priority`、`switch` | 对守护进程的所有任务排序 | 只对你自己的作业排序；哪个用户的作业先启动由带 fair share 的 Slurm 风格多因子优先级决定（参见[作业优先级](#job-priority)）。`priority_type = "basic"` 可恢复 pueue 的顺序，但 `-o` 仍然只对你自己的作业排序。 |
 | 回调、别名、`pueue.yml` | 支持 | 不可用 |
+
+</details>
+
+<details>
+<summary><b>额外的命令、选项和作业状态</b></summary>
 
 额外的命令和选项：
 
@@ -257,8 +313,11 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 额外的作业状态：`Checkpointing`、`Checkpointed`、`Restore queued`、`Restoring` 以及
 `Terminating`（检查点失败后正在停止）。`status` 表格包含 `Owner` 和 `GPU` 列，`Checkpointed` 作业会显示镜像大小。
 
+</details>
+
 <a id="json-output"></a>
-### JSON 输出
+<details>
+<summary><b>JSON 输出（<code>--json</code>）</b></summary>
 
 `gpueue status --json` 输出 `{"groups": [...], "jobs": [...]}`：
 
@@ -300,8 +359,16 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
   "usage_reset_period", "billing_weights", "usage_calc_at"}`。
 
+</details>
+
 <a id="multi-user-model-and-authorization"></a>
 ## 多用户模型与授权
+
+作业以添加它的用户身份、在没有特权的情况下运行，只有所有者或管理员能更改作业或查看其命令、环境变量和日志。
+所有人都能看到作业的存在以及它占用了哪些 GPU。
+
+<details>
+<summary><b>详细信息：调用者识别、谁可以运行作业、作业能做什么、谁可以做什么</b></summary>
 
 - 守护进程通过内核报告的套接字对端 uid（`SO_PEERCRED`）识别调用者。客户端无法冒充他人。
 - 每个作业属于添加它的用户。它以该用户的 uid、gid 和附加组运行，设置了 `no_new_privs`，并丢弃全部 capability。
@@ -343,8 +410,16 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - 管理员是 root 以及 `gpueue-admin` 组的成员（主组或附加组均可）。每次请求都会进行检查，因此
   `usermod -aG gpueue-admin <user>` 会立即生效。
 
+</details>
+
 <a id="gpu-slots"></a>
 ## GPU 槽位
+
+指定了 `--gpu 0,1` 的作业只有在其组和所列的**每一块** GPU 都有空闲槽位时才会启动（默认每块 GPU 1 个作业），
+并且只能打开这些 GPU 的设备节点。
+
+<details>
+<summary><b>详细信息：槽位限制、GPU 顺序、隔离、组、检测</b></summary>
 
 - `gpueue add --gpu 0,1 ...` 只有在其组有空闲槽位且所列的**每一块** GPU 都有空闲槽位时才会启动作业。
   守护进程会拒绝它不认识的 GPU 编号。
@@ -366,8 +441,16 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - GPU 在守护进程启动时通过 NVML 检测（配置中的 `[[gpus]]` 列表只是后备）。添加或移除 GPU 后请重启
   `gpueue.service`。`gpueue doctor` 会将守护进程检测到的内容与 `nvidia-smi` 进行比较。
 
+</details>
+
 <a id="job-priority"></a>
 ## 作业优先级
+
+当多个作业等待相同的槽位时，由带 fair share 的 Slurm 风格多因子优先级决定哪个用户的作业先启动；
+`gpueue prio` 和 `gpueue share` 显示具体数值。
+
+<details>
+<summary><b>详细信息：因子、<code>top</code>、即时启动</b></summary>
 
 当多个作业等待相同的槽位时，在能够放入的作业中优先级最高的那个先启动。优先级遵循 Slurm 的 multifactor
 插件：默认情况下，它是 fair-share 因子（最近使用机器较少的用户优先，用量以 7 天的半衰期衰减）与
@@ -380,6 +463,8 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 忽略所有限制立即启动。`gpueue prio` 显示作业
 为何处于当前位置，`gpueue share` 显示所有人的用量。公式和设置参见
 [优先级与公平共享](docs/zh-CN/install.md#priority-and-fair-share)。
+
+</details>
 
 <a id="requirements"></a>
 ## 要求
@@ -396,6 +481,12 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 
 <a id="limitations"></a>
 ## 限制
+
+检查点/恢复有一些限制：已建立的 TCP 连接会被关闭，断电时不会保存任何内容，作业必须在相同的 GPU 型号和驱动上、
+在相同的文件和挂载下恢复，并且持有某些套接字或描述符的作业无法创建检查点（检查点会被拒绝，作业继续运行）。
+
+<details>
+<summary><b>全部限制</b></summary>
 
 - **网络连接：** 为作业创建检查点时，已建立的 TCP 连接（连接到数据集服务器、数据库、实验跟踪服务等）
   会被关闭（`criu --tcp-close`）。恢复后程序会看到连接已断开，必须重新连接。
@@ -452,10 +543,31 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - 暂不支持：`edit`、`env`、定期检查点、在保持作业运行的同时创建检查点、不做完整检查点而释放 GPU
   （"GPU suspend"）、Web UI 或 TCP API，以及按显存计数的槽位。
 
+</details>
+
 <a id="project-status"></a>
 ## 项目状态
 
-预发布（版本 0.1.0）。目前已测试：
+预发布（版本 0.1.4）。v0.1.4 是一个安全发布版本：运行 v0.1.3 或更早版本的站点应当升级（参见
+[v0.1.4 的发布说明](https://github.com/kaito4681/gpueue/releases/tag/v0.1.4)）。
+
+<details>
+<summary><b>升级前需要确认的 v0.1.4 行为变更</b></summary>
+
+- 以下作业不能再创建检查点（拒绝消息会说明原因）：持有 inotify/fanotify 监视的作业、在抽象 Unix 套接字上监听的作业
+  （libcuda 自己的除外）、在 Unix 套接字队列中持有描述符的作业，以及持有已删除的 setuid/setgid 文件的作业。
+- 当主机上的其他程序占用了作业曾绑定的端口时，恢复会被拒绝；端口空闲后可以重试。
+- 如果 `/etc/gpueue/config.toml`（或其上层目录）不属于 root，或可被组或其他用户写入，`gpueue daemon` 会拒绝启动；
+  `gpueue doctor` 会报告这一点。
+- `sudo gpueue service install` 拒绝从非 root 用户可写的目录复制 `gpueue-helper`；请以 root 身份解压发布包。
+- v0.1.3 创建的检查点可以用 v0.1.4 恢复。
+
+</details>
+
+<details>
+<summary><b>已测试和尚未测试的内容</b></summary>
+
+目前已测试：
 
 - 每个 crate 的单元测试和集成测试（`scripts/test-in-docker.sh`）。
 - 在特权 Docker 容器中进行的全栈端到端测试：systemd 259 作为 PID 1、CRIU 4.2，
@@ -498,6 +610,8 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 
 请报告在你的硬件上哪些功能可用、哪些不可用。
 
+</details>
+
 <a id="agent-skill"></a>
 ## 面向编码智能体的 Agent Skill
 
@@ -529,6 +643,12 @@ npx skills add kaito4681/gpueue -g -a claude-code -y
 scripts/test-in-docker.sh                                   # cargo test --workspace
 scripts/test-in-docker.sh clippy --workspace --all-targets
 scripts/test-in-docker.sh fmt --all
+```
+
+<details>
+<summary><b>端到端、虚拟机、GPU 和 Nix 测试</b></summary>
+
+```sh
 scripts/e2e-test.sh               # full stack under systemd in a privileged container
 scripts/vm-reboot-test.sh         # real OS in QEMU/KVM VMs: install, reboots, upgrade (needs /dev/kvm; `all` for every distro)
 scripts/gpu-host-test.sh          # checkpoint/restore of real CUDA jobs on the installed gpueue (GPU host, no root)
@@ -545,6 +665,8 @@ nix build -L .#checks.x86_64-linux.helper-tests  # all gpueue-helper tests in a 
 scripts/helper-systemd-test.sh`（需要 CUDA 基础镜像，参见该脚本）会强制让 GPU 检查点超过其期限，并在转储中途终止
 `criu` / `cuda-checkpoint`，两种 `GPUEUE_HELPER_CUDA_MODE` 均会测试。`scripts/measure-checkpoint.sh`
 测量每个检查点步骤的耗时。这些脚本都不会在主机上执行任何特权操作。
+
+</details>
 
 <a id="license"></a>
 ## 许可证

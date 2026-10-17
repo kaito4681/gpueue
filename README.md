@@ -1,5 +1,9 @@
 # gpueue
 
+[![CI](https://github.com/kaito4681/gpueue/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kaito4681/gpueue/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/kaito4681/gpueue)](https://github.com/kaito4681/gpueue/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/kaito4681/gpueue)](LICENSE)
+
 English | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
 
 A GPU job queue for one Linux machine shared by several users. Its CLI works like
@@ -9,11 +13,19 @@ transparent checkpoint/restore of running jobs (CPU, memory and GPU state) with
 A training run that is still going when the machine reboots is saved to disk and resumes where it
 stopped. It does not start over.
 
+> [!NOTE]
 > **Status: pre-release.** Everything below is implemented and tested in Docker (systemd as PID 1,
 > real CRIU, a real NVIDIA GPU), and across real reboots and power-offs of a QEMU/KVM virtual
 > machine with CPU jobs. It has **not** been tested across a real reboot on bare metal or with GPU
 > jobs yet.
 > See [Project status](#project-status).
+
+**Contents:** [Why](#why) · [Features](#features) · [Quick start](#quick-start) ·
+[pueue compatibility](#pueue-compatibility-and-differences) ·
+[Multi-user model](#multi-user-model-and-authorization) · [GPU slots](#gpu-slots) ·
+[Job priority](#job-priority) · [Requirements](#requirements) · [Limitations](#limitations) ·
+[Project status](#project-status) · [Agent Skill](#agent-skill) ·
+[Documentation](#documentation) · [Contributing](#contributing) · [License](#license)
 
 ## Why
 
@@ -60,7 +72,19 @@ RHEL 9+), the installer downloads the latest release, checks it, and installs gp
 
 ```sh
 curl -fsSL https://github.com/kaito4681/gpueue/releases/latest/download/install.sh | sudo bash
+gpueue doctor    # check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage
+
+# Optional: make someone an administrator.
+sudo usermod -aG gpueue-admin alice
 ```
+
+Regular users do not need to install anything. Checkpoints need CRIU 4.2+ (and, for GPU jobs,
+cuda-checkpoint), which no install method installs for you; see
+[Dependencies that are not installed automatically](#dependencies-that-are-not-installed-automatically)
+below.
+
+<details>
+<summary><b>What install.sh does, updating and removing</b></summary>
 
 The installer sets up the systemd units, the `gpueue` user, the `gpueue-admin` group, the
 directories and a default /etc/gpueue/config.toml, starts the services and prints the
@@ -68,6 +92,11 @@ directories and a default /etc/gpueue/config.toml, starts the services and print
 missing. Update later with `sudo gpueue update` (running jobs keep running). Remove it with
 `sudo gpueue uninstall`, which keeps the data (`--purge` deletes it too). A GitHub token is not
 needed (`GH_TOKEN` is used when set; it only raises the API rate limit).
+
+</details>
+
+<details>
+<summary><b>Debian / Ubuntu (APT repository or .deb)</b></summary>
 
 On Debian and Ubuntu (amd64 or arm64) you can install the package from the gpueue APT repository
 (in the GitHub release `apt`) instead; this needs `curl` and `ca-certificates`, and apt picks the
@@ -93,6 +122,11 @@ Either way, later versions come with `sudo apt update && sudo apt upgrade`. `sud
 stops the services; `sudo apt purge gpueue` also deletes /etc/gpueue. Both keep /var/lib/gpueue and
 running jobs.
 
+</details>
+
+<details>
+<summary><b>Fedora / RHEL / Rocky / Alma (.rpm)</b></summary>
+
 On Fedora, RHEL, Rocky and Alma Linux 9+ (x86_64 or aarch64), install the .rpm from the release
 (dnf takes the URL directly):
 
@@ -111,6 +145,11 @@ There is no dnf repository yet (planned, issue #23): update by running the same 
 only 3.19, so checkpointing there needs a newer CRIU (jobs run without it). You can also build
 from source or use the Nix flake (see [docs/install.md](docs/install.md)).
 
+</details>
+
+<details>
+<summary><b>NixOS and Nix</b></summary>
+
 On NixOS, import the flake's module (`github:kaito4681/gpueue/stable`, `nixosModules.default`) and
 set `services.gpueue.enable = true` (see [NixOS](docs/install.md#nixos)); home-manager users can add
 the CLI's completions with `homeManagerModules.default`. With Nix on another distribution
@@ -122,6 +161,11 @@ the CLI's completions with `homeManagerModules.default`. With Nix on another dis
 nix build github:kaito4681/gpueue/stable
 sudo ./result/bin/gpueue service install
 ```
+
+</details>
+
+<details>
+<summary><b>Arch Linux (AUR planned)</b></summary>
 
 On Arch Linux (x86_64, aarch64), use the installer above for now: the AUR package `gpueue-bin` is
 planned and not published yet ([#159](https://github.com/kaito4681/gpueue/issues/159)). CRIU (4.2 or newer, for checkpoints) is in the official repositories:
@@ -135,7 +179,11 @@ Update with `sudo gpueue update` and remove with `sudo gpueue uninstall`. Once t
 the AUR (planned, #159), you can install [`gpueue-bin`](https://aur.archlinux.org/packages/gpueue-bin) with any AUR
 helper instead (see [docs/install.md](docs/install.md#arch-linux-aur)).
 
-#### Dependencies that are not installed automatically
+</details>
+
+<a id="dependencies-that-are-not-installed-automatically"></a>
+<details>
+<summary><b>Dependencies that are not installed automatically (CRIU, NVIDIA driver, cuda-checkpoint)</b></summary>
 
 No install method installs the NVIDIA driver or cuda-checkpoint. The packages only recommend
 CRIU, which is too old or missing on many releases, and `install.sh` installs neither (it lists
@@ -157,17 +205,9 @@ sudo install -o root -g root -m 0755 "/tmp/cuda-checkpoint/bin/$(uname -m)_Linux
 
 The helper looks cuda-checkpoint and CRIU up only when it starts: restart it after installing
 either with `sudo systemctl restart gpueue-helper` (see
-[cuda-checkpoint](docs/install.md#cuda-checkpoint)), then check the result.
+[cuda-checkpoint](docs/install.md#cuda-checkpoint)), then run `gpueue doctor` again.
 
-```sh
-# Check everything: criu, cuda-checkpoint, driver, kernel, systemd, services, storage.
-gpueue doctor
-
-# Optional: make someone an administrator.
-sudo usermod -aG gpueue-admin alice
-```
-
-Regular users do not need to install anything.
+</details>
 
 ### Run a GPU job (any user)
 
@@ -193,11 +233,16 @@ gpueue restore -i 0    # ...or put it first among your queued jobs (administrato
 A restored job continues from the moment it was checkpointed. It keeps its job id, and its output
 is appended to the same log.
 
+<details>
+<summary><b>Paused jobs</b></summary>
+
 A paused job can be checkpointed as well, also on a reboot. It is restored paused, still holding
 its GPU slots, and `gpueue start` resumes it. CRIU and cuda-checkpoint need a running process, so
 the job runs for a moment during the dump. The restore leaves it stopped, so it runs nothing (not
 even for a moment) until `gpueue start`. `gpueue pause` is refused while a checkpoint is in
 progress.
+
+</details>
 
 ### What happens on reboot
 
@@ -208,6 +253,9 @@ progress.
    as usual.
 3. Each owner (or an administrator) resumes their jobs with `gpueue restore <id>` or
    `gpueue restore -a`. Restores are not started automatically.
+
+<details>
+<summary><b>When a checkpoint is refused or fails</b></summary>
 
 A checkpoint can go wrong in two ways:
 
@@ -225,11 +273,17 @@ During an OS shutdown or reboot, systemd stops every job that could not be saved
 was refused or failed. After the boot it is shown as `Checkpoint failed` with the reason, and the
 owner is warned. Nothing is saved on a power loss or a kernel crash.
 
+</details>
+
 ## pueue compatibility and differences
 
 The command names, options and table layout follow pueue 4.0, so most pueue habits and scripts work
 after replacing `pueue` with `gpueue`. gpueue only copies the CLI. It does not speak pueue's protocol
-and does not read pueue's files. These are the differences:
+and does not read pueue's files. The biggest differences: one system-wide daemon run by systemd,
+no `send` (jobs' stdin is `/dev/null`), and only administrators can start a job immediately.
+
+<details>
+<summary><b>Differences from pueue</b></summary>
 
 | Topic | pueue | gpueue |
 | --- | --- | --- |
@@ -246,6 +300,11 @@ and does not read pueue's files. These are the differences:
 | `edit`, `env`, `restart --edit` | supported | accepted but not implemented yet |
 | `add -o/--priority`, `switch` | order all tasks of the daemon | order only your own jobs; which user's job starts first is decided by a Slurm-style multifactor priority with fair share (see [Job priority](#job-priority)). `priority_type = "basic"` restores pueue's order, except that `-o` still only orders your own jobs. |
 | Callbacks, aliases, `pueue.yml` | supported | not available |
+
+</details>
+
+<details>
+<summary><b>Extra commands, options and job states</b></summary>
 
 Extra commands and options:
 
@@ -271,7 +330,11 @@ Additional job states: `Checkpointing`, `Checkpointed`, `Restore queued`, `Resto
 `Terminating` (stopping after a failed checkpoint). The `status` table has `Owner` and `GPU`
 columns, and `Checkpointed` jobs show the image size.
 
-### JSON output
+</details>
+
+<a id="json-output"></a>
+<details>
+<summary><b>JSON output (<code>--json</code>)</b></summary>
 
 `gpueue status --json` prints `{"groups": [...], "jobs": [...]}`:
 
@@ -315,7 +378,16 @@ columns, and `Checkpointed` jobs show the image size.
   "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
   "usage_reset_period", "billing_weights", "usage_calc_at"}`.
 
+</details>
+
 ## Multi-user model and authorization
+
+Jobs run as the user who added them, without privileges, and only their owner or an administrator
+can change them or see their command, environment and log. Everyone can see that a job exists and
+which GPUs it holds.
+
+<details>
+<summary><b>Details: identification, who jobs may run as, what a job can do, who may do what</b></summary>
 
 - The daemon identifies callers by the kernel-reported uid of the socket peer (`SO_PEERCRED`). A
   client cannot claim to be someone else.
@@ -367,7 +439,15 @@ columns, and `Checkpointed` jobs show the image size.
 - Administrators are root and members of the `gpueue-admin` group (primary or supplementary). The
   check is made on every request, so `usermod -aG gpueue-admin <user>` takes effect immediately.
 
+</details>
+
 ## GPU slots
+
+A job given `--gpu 0,1` starts only when its group and **every** listed GPU have a free slot (1 job
+per GPU by default), and it can open only those GPUs' device nodes.
+
+<details>
+<summary><b>Details: slot limits, GPU order, isolation, groups, detection</b></summary>
 
 - `gpueue add --gpu 0,1 ...` starts the job only when its group has a free slot and **every** listed
   GPU has a free slot. The daemon rejects GPU indices it does not know.
@@ -393,7 +473,15 @@ columns, and `Checkpointed` jobs show the image size.
   only a fallback). Restart `gpueue.service` after adding or removing a GPU. `gpueue doctor`
   compares what the daemon detected with `nvidia-smi`.
 
+</details>
+
 ## Job priority
+
+When jobs wait for the same slots, a Slurm-style multifactor priority with fair share decides
+which user's job starts first; `gpueue prio` and `gpueue share` show the numbers.
+
+<details>
+<summary><b>Details: factors, <code>top</code>, immediate launches</b></summary>
 
 When jobs wait for the same slots, the one with the highest priority among those that fit starts
 first. The priority follows Slurm's multifactor plugin: by default it is the sum of a fair-share
@@ -412,6 +500,8 @@ where it is, `gpueue share` shows everyone's usage. See
 [Priority and fair share](docs/install.md#priority-and-fair-share) for the formula and the
 settings.
 
+</details>
+
 ## Requirements
 
 - Linux with systemd 240 or newer (tested: 259). Releases are built for x86_64 and aarch64; only
@@ -425,6 +515,14 @@ settings.
 Details are in [docs/install.md](docs/install.md).
 
 ## Limitations
+
+Checkpoint/restore has limits: open TCP connections are closed, nothing is saved on a power loss,
+a job must be restored on the same GPU model and driver with the same files and mounts, and some
+kinds of sockets and descriptors make a job impossible to checkpoint (the checkpoint is refused and
+the job keeps running).
+
+<details>
+<summary><b>All limitations</b></summary>
 
 - **Network connections:** established TCP connections (to a dataset server, a database, an
   experiment tracker, ...) are closed when a job is checkpointed (`criu --tcp-close`). After a
@@ -500,9 +598,33 @@ Details are in [docs/install.md](docs/install.md).
   running, freeing a GPU without a full checkpoint ("GPU suspend"), a web UI or TCP API, and slots
   counted by VRAM.
 
+</details>
+
 ## Project status
 
-Pre-release (version 0.1.0). Tested so far:
+Pre-release (version 0.1.4). v0.1.4 is a security release: sites running v0.1.3 or earlier should
+upgrade (see the [v0.1.4 release notes](https://github.com/kaito4681/gpueue/releases/tag/v0.1.4)).
+
+<details>
+<summary><b>Behaviour changes in v0.1.4 to check before upgrading</b></summary>
+
+- These jobs can no longer be checkpointed (the refusal message says why): jobs holding
+  inotify/fanotify watches, listening on an abstract Unix socket (other than libcuda's own),
+  holding a descriptor in a Unix socket queue, or holding a deleted setuid/setgid file.
+- A restore is refused while another program on the host uses a port the job had bound; it can be
+  retried once the port is free.
+- `gpueue daemon` refuses to start if `/etc/gpueue/config.toml` (or a directory above it) is not
+  root-owned or is group/world-writable; `gpueue doctor` reports this.
+- `sudo gpueue service install` refuses to copy a `gpueue-helper` from a directory a non-root user
+  can write; unpack releases as root.
+- Checkpoints taken by v0.1.3 restore with v0.1.4.
+
+</details>
+
+<details>
+<summary><b>What has been tested, and what has not</b></summary>
+
+Tested so far:
 
 - Unit and integration tests for every crate (`scripts/test-in-docker.sh`).
 - Full-stack end-to-end tests in a privileged Docker container with systemd 259 as PID 1, CRIU 4.2
@@ -555,6 +677,8 @@ Not tested yet:
 
 Please report what works and what does not on your hardware.
 
+</details>
+
 <a id="agent-skill"></a>
 ## Agent Skill for coding agents
 
@@ -587,6 +711,12 @@ commit messages are in English. Tests run inside Docker:
 scripts/test-in-docker.sh                                   # cargo test --workspace
 scripts/test-in-docker.sh clippy --workspace --all-targets
 scripts/test-in-docker.sh fmt --all
+```
+
+<details>
+<summary><b>End-to-end, VM, GPU and Nix tests</b></summary>
+
+```sh
 scripts/e2e-test.sh               # full stack under systemd in a privileged container
 scripts/vm-reboot-test.sh         # real OS in QEMU/KVM VMs: install, reboots, upgrade (needs /dev/kvm; `all` for every distro)
 scripts/gpu-host-test.sh          # checkpoint/restore of real CUDA jobs on the installed gpueue (GPU host, no root)
@@ -604,6 +734,8 @@ scripts/helper-systemd-test.sh` (with a CUDA base image, see the script) forces 
 past their deadline and kills `criu` / `cuda-checkpoint` mid-dump, in either
 `GPUEUE_HELPER_CUDA_MODE`. `scripts/measure-checkpoint.sh` measures how long each checkpoint step
 takes. None of the scripts run anything privileged on the host.
+
+</details>
 
 ## License
 
