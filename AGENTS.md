@@ -1,122 +1,50 @@
 # Notes for contributors and coding agents
 
-- Code, comments, docs and commit messages are written in English.
-- Run tests inside Docker: `scripts/test-in-docker.sh` (defaults to `cargo test --workspace`;
-  pass other cargo arguments, e.g. `clippy --workspace --all-targets` or `fmt --all`;
-  the toolchain image is built from `docker/test.Dockerfile`). The container gets
-  `--cap-add SYS_PTRACE` so that Docker's seccomp profile allows `pidfd_getfd`, which the
-  helper's dump hazard scan needs (without it those tests fail, as the helper refuses the dump).
-  Tests that need unprivileged user namespaces (blocked in Docker and on GitHub's Ubuntu
-  runners) print `skipped: ` there and run in the NixOS VM check
-  (`nix build .#checks.x86_64-linux.helper-tests`), which fails on that marker.
-- Full-stack e2e (daemon + helper + CLI under systemd in a privileged container, incl. a
-  simulated reboot): `scripts/e2e-test.sh` (`GPUEUE_SYSTEMD_BASE=gpueue-poc/systemd259:0.1`
-  where apt is offline; `GPUEUE_E2E_GPU=1` with a CUDA base image adds a GPU scenario).
-- Real OS in QEMU/KVM VMs (CPU jobs; needs /dev/kvm; the VM runs in an unprivileged Docker
-  container; prepared images cached in the `gpueue-vm-cache` volume or the directory
-  `GPUEUE_VM_CACHE`): `scripts/vm-reboot-test.sh [quick|all|[DISTRO/]SCENARIO...]`, `list` shows
-  the sets. gpueue is installed as users install it: the tree's `.deb`/`.rpm` with apt/dnf, or
-  `gpueue service install` (`service-install`). Scenarios: `basic`, `reboot`, `poweroff`,
-  `inflight` (reboot during a checkpoint), `desktop` (systemd-resolved, tmpfs `/tmp`, users' FUSE
-  mounts without allow_other, paused jobs, a reboot with checkpointed jobs), `upgrade` (the
-  previous release's package from GitHub, checked like install.sh does, to the tree's;
-  `GPUEUE_VM_UPGRADE_FROM`). Distributions (`scripts/vm/distros.sh`): ubuntu-26.04 (default),
-  ubuntu-24.04, debian-13, debian-12, fedora-44; where the distribution has no CRIU 4.2+ the
-  checkpointing scenarios print SKIP. `quick` (the default) is what CI and the release workflow
-  run; `GPUEUE_VM_DEB`/`GPUEUE_VM_RPM` test a given package instead of building one.
-- The `.deb` (nfpm, `packaging/nfpm.yaml`): `scripts/dist/build-package.sh BIN_DIR OUT_DIR` builds
-  it, `scripts/deb-test.sh [DEB]` installs/removes/purges it in a container (`GPUEUE_DEB_BASE`,
-  `GPUEUE_DEB_HTTPS=1` where plain-HTTP apt is blocked).
-- The `.rpm` (same nfpm definition): `scripts/dist/build-package.sh BIN_DIR OUT_DIR rpm` builds it,
-  `scripts/rpm-test.sh [OLD_RPM NEW_RPM]` installs/upgrades/removes it in a container
-  (`GPUEUE_RPM_BASE`, default `rockylinux/rockylinux:9`; also `fedora:latest`); `scripts/rpm-sign-test.sh RPM`
-  tests the GPG signing of the release workflow (`scripts/dist/sign-rpm.sh`).
-- The APT repository (a flat repository in the release `apt`): `scripts/dist/apt-repo.sh`
-  (`update DIR DEB...` locally, `github TAG` from `.github/workflows/release-apt.yml` when a
-  release is published); `scripts/apt-repo-test.sh [DEB]` upgrades v1 to v2 through a local copy
-  in containers (`GPUEUE_APT_BASES`, `GPUEUE_DEB_HTTPS=1`).
-- Nix flake: `flake.nix` and `packaging/nix/` (package, CRIU override, the NixOS module
-  `packaging/nix/nixos-module.nix`, the home-manager module
-  `packaging/nix/home-manager-module.nix`, and their tests in `packaging/nix/tests/`). Without
-  Nix on the host, run `nix flake check` / `nix build .#default` in a
-  pinned `nixos/nix` Docker image; the NixOS VM tests (`.#checks.x86_64-linux.nixos`, and
-  `.#checks.x86_64-linux.helper-tests`, which runs every gpueue-helper test) need `--device /dev/kvm` and
-  `--option system-features "kvm nixos-test"`. The package build
-  runs no tests (`doCheck = false`: the helper's job-spawning tests cannot pass in the Nix
-  sandbox, which refuses setgid); CI runs `nix develop -c cargo test --workspace --locked`
-  instead. Published stable releases move the `stable` branch
-  (`.github/workflows/release-nix.yml`). The module generates its units from `packaging/`.
-- CI (`.github/workflows/ci.yml`, on pull requests, pushes to `main` and `workflow_dispatch`) has
-  these jobs: `lint` (fmt, clippy), `test`, `msrv` (`rust-version`), `shellcheck`, `actionlint`
-  (the workflow files), the CPU e2e (`e2e`), `service-install`, `dist-build` and `dist` (tarball
-  and `install.sh`), `deb`, `rpm`, `apt-repo`, `aur` (builds and installs the AUR package from a
-  locally built tarball with `scripts/dist/aur-test.sh`), `vm` (`scripts/vm-reboot-test.sh quick`
-  with KVM, its prepared image in actions/cache) and `nix`. `nix` is a matrix of four
-  runners: on x86_64 the NixOS module VM test (with the home-manager check and the package/CRIU
-  smoke checks), the helper-tests VM, and `nix flake check --no-build --all-systems` plus
-  `nix develop -c cargo test`; on aarch64 `nix flake check` plus the same tests and smoke checks.
-  A `changes` job skips `nix` on pull requests whose files no flake output or test reads (keep
-  its list in sync with the source fileset in `packaging/nix/package.nix`), and `vm` on pull
-  requests that touch none of the helper, checkpoint and daemon crates, `packaging/`,
-  `scripts/vm*`, `scripts/dist/`, `scripts/e2e/`, `Cargo.lock` and `ci.yml`; pushes to `main` run
-  both. Pushing a `v<version>` tag runs
-  `.github/workflows/release.yml`, which builds and signs the tarballs, `.deb` and `.rpm`
-  packages and attaches them, with `install.sh` and `RPM-GPG-KEY-gpueue`, to a draft GitHub
-  release. The `release` job needs `vm-test`, the quick VM test with the release's own `.deb` on
-  the tagged commit: without it passing, not even the draft is created. Publishing the release
-  as a stable one (`release: released`, not the tag push) triggers
-  `release-apt.yml` (APT repository), `release-aur.yml` (AUR) and `release-nix.yml` (moves the
-  `stable` branch); each can also be run by hand (`workflow_dispatch`), which is needed when the
-  release was published with a workflow's `GITHUB_TOKEN`. Release workflows are read-only by
-  default and grant `contents: write` only to the job that writes (creates the release, uploads
-  the APT files, pushes `stable`); checkouts use `persist-credentials: false` except where the job
-  pushes with git.
-- Real-GPU checkpoint/restore against the gpueue installed on the host (no VM: GPU checkpointing
-  needs the real GPU and driver): `scripts/gpu-host-test.sh [--only a,c] [--gpu N] [--keep]`, run
-  as a normal user without root. It builds the counters in `scripts/gpu-host-test/` (`check.c`:
-  CUDA driver API with inline PTX and a dlopen of libcuda, so only `cc` and the driver are needed;
-  `cpu.c`) and runs scenarios a-e (GPU cycles, paused GPU job, CPU cycles, a GPU job kept
-  Checkpointed while another runs, `--no-checkpoint`); see "Testing checkpoint/restore on a GPU
-  host" in `docs/install.md`. It only removes the jobs it created (labels `ghtest-<run>-*`).
-- Release checklist: before tagging `v<version>`, install the release candidate on a GPU host and
-  run `scripts/gpu-host-test.sh`; every scenario must pass (this is required, since CI has no GPU
-  and cannot test GPU checkpoints). Then push the tag (see the CI notes above): the draft is only
-  created once `vm-test` (the quick VM test) passes on the tagged commit. Check the draft release
-  and publish it.
-- Other test scripts: `scripts/service-install-test.sh` (`gpueue service install` / `status` /
-  `uninstall` and `doctor`), `scripts/helper-systemd-test.sh` (the helper alone under systemd),
-  `scripts/measure-checkpoint.sh` (times each checkpoint step; not a pass/fail test).
-- Distribution test (`scripts/install.sh` against a fake GitHub API, two test versions of the
-  tree): `scripts/dist-test.sh` (`GPUEUE_DIST_BASE=ubuntu:22.04|ubuntu:24.04|debian:12`, default
-  ubuntu:26.04). The release signing key (`packaging/minisign.pub`, id EA3C2ED855877E21) is the
-  real one; to rotate it, create a new pair with `scripts/dist/gen-signing-key.sh` (see
-  `docs/install.md`).
-- AUR package (`packaging/aur/gpueue-bin`): `scripts/dist/aur-test.sh` builds and installs it in
-  an Arch Linux container with systemd; `scripts/dist/update-aur.sh <version>` points it at a
-  release (run by `.github/workflows/release-aur.yml`).
-- Workspace layout:
-  - `crates/gpueue` — the `gpueue` binary (pueue-compatible CLI, `gpueue daemon` entry point)
-  - `crates/gpueue-core` — domain model, scheduling decisions, authorization, SQLite storage
-  - `crates/gpueue-protocol` — wire types: CLI ⇄ daemon (HTTP over a Unix socket),
-    daemon ⇄ helper (newline-delimited JSON)
-  - `crates/gpueue-config` — schema of `/etc/gpueue/config.toml`, shared by the daemon, the
-    helper (which loads it with root-ownership checks) and `gpueue doctor`
-  - `crates/gpueue-daemon` — the daemon (runs as the unprivileged `gpueue` system user)
-  - `crates/gpueue-checkpoint` — CRIU and cuda-checkpoint integration
-  - `crates/gpueue-helper` — the root helper binary (spawns jobs as their owner, checkpoints)
-- User documentation: `README.md`, `docs/install.md`, `docs/architecture.md`. Update them when
-  commands, flags, configuration keys, packaging files or behavior change.
-- Agent Skill: `skills/gpueue/` (`SKILL.md` plus `references/*.md`, installed by users with
-  `npx skills add kaito4681/gpueue`) teaches coding agents to use the CLI. Update it when
-  user-facing commands, flags, JSON output, error messages or scheduling/checkpoint behavior
-  change; every command it shows must exist. Keep the frontmatter `name` equal to the directory
-  name.
-- The English documentation is canonical. It is translated into Japanese (`README.ja.md`,
-  `docs/ja/`) and Simplified Chinese (`README.zh-CN.md`, `docs/zh-CN/`). A PR that changes
-  `README.md`, `docs/install.md` or `docs/architecture.md` must update both translations in the
-  same PR. Translations keep commands, code blocks, configuration keys and paths untranslated,
-  link to pages of the same language, and keep the English anchor ids (see the HTML comment at
-  the top of `docs/ja/install.md`).
-- Shared dependencies are declared once in the root `[workspace.dependencies]`.
+## Rules
+- `gpueue-helper` runs as root and must treat everything it gets from the daemon, from jobs and
+  from users' files as untrusted. Do not weaken its checks to make a test or a workload pass;
+  fix the cause or ask.
 - Keep `gpueue-core` free of I/O other than its storage module, and keep `gpueue-helper`'s
-  dependency tree minimal (no HTTP server, no SQLite).
+  dependency tree minimal (no HTTP server, no SQLite). Shared dependencies are declared once in
+  the root `[workspace.dependencies]`.
+- Never run `gpueue clean`, `gpueue reset` or remove jobs you did not create on a host with a
+  real installation; clean up only your own jobs by id.
+
+## Testing
+- Run tests only through Docker: `scripts/test-in-docker.sh` (default `cargo test --workspace`;
+  pass other cargo arguments, e.g. `clippy --workspace --all-targets -- -D warnings`). The
+  container needs `--cap-add SYS_PTRACE` (the script adds it) so that `pidfd_getfd`, used by the
+  helper's dump hazard scan, is allowed; without it those tests fail on purpose.
+- Tests that need unprivileged user namespaces print `skipped: ` in Docker and on GitHub's
+  Ubuntu runners; they run in the NixOS VM check (`nix build .#checks.x86_64-linux.helper-tests`,
+  needs `/dev/kvm`), which fails on that marker. Without Nix on the host, use a pinned
+  `nixos/nix` Docker image.
+- Fix flaky tests at the root (synchronization, injected clocks/delays, child-process isolation,
+  explicit file modes); do not add retries or longer sleeps, and do not loosen assertions.
+- Helper, shim or CRIU changes: run the full-stack e2e, `scripts/e2e-test.sh`
+  (`GPUEUE_SYSTEMD_BASE=gpueue-poc/systemd259:0.1` where apt is offline).
+- Install, upgrade, reboot and shutdown behaviour: `scripts/vm-reboot-test.sh [quick|all|...]`
+  (QEMU/KVM in Docker; `list` shows the distributions and scenarios).
+- GPU checkpointing cannot be tested in CI or a VM. `scripts/gpu-host-test.sh` runs against the
+  gpueue installed on a GPU host, as a normal user.
+
+## Releases
+- Before tagging `v<version>`: install the release candidate's `.deb` on a GPU host and run
+  `scripts/gpu-host-test.sh` (every scenario must pass) and `scripts/vm-reboot-test.sh all`.
+- When publishing, add text to the generated release notes; do not replace them (they carry the
+  install instructions).
+
+## Documentation
+- Update `README.md`, `docs/install.md` and `docs/architecture.md` when commands, flags,
+  configuration keys, packaging or behaviour change. The English docs are canonical; the same PR
+  must update `README.ja.md`, `README.zh-CN.md`, `docs/ja/` and `docs/zh-CN/` (commands, code,
+  keys and paths untranslated, English anchor ids kept).
+- Update the Agent Skill in `skills/gpueue/` when user-facing commands, flags, JSON output, error
+  messages or scheduling/checkpoint behaviour change; every command it shows must exist, and the
+  frontmatter `name` must equal the directory name.
+
+## CI details that are easy to miss
+- The `changes` job in `ci.yml` decides when the `nix` and `vm` jobs run on pull requests; keep
+  its file list in sync with the source fileset in `packaging/nix/package.nix`.
+- The Nix package build runs no tests (the Nix sandbox refuses setgid); CI runs
+  `nix develop -c cargo test --workspace --locked` instead.
