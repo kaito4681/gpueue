@@ -323,22 +323,22 @@ OS のシャットダウンや再起動の間は、保存できなかったジ�
 これまでにテストしたもの：
 
 - すべてのクレートのユニットテストと統合テスト（`scripts/test-in-docker.sh`）。
-- PID 1 の systemd 259、CRIU 4.2、`gpueue service install` でインストールしたバイナリを使った、特権 Docker
+- PID 1 の systemd、CRIU、`gpueue service install` でインストールしたバイナリを使った、特権 Docker
   コンテナ内でのフルスタックのエンドツーエンドテスト（`scripts/e2e-test.sh`）。テストは、基本的なキュー操作、
   3 ユーザーでの認可、グループと GPU の上限、チェックポイント/リストア、デーモンとヘルパーの再起動、一度に
   大量に追加したジョブ、`gpueue shutdown`、そして擬似的な再起動をカバーしています。擬似的な再起動では、
   コンテナを systemd でシャットダウンし、新しいコンテナでジョブをリストアします。別の ext4 ファイルシステム、
   バインドマウント、`x-systemd.automount`、overlayfs、tmpfs、sshfs 上で作業するジョブで、それらが新しい
   マウントとして戻ってくる場合も含みます。
-- Docker 内の本物の GPU（ドライバー 595、manual モードの CRIU 4.2.1、Python 3.12 上の PyTorch 2.8）で：
+- Docker 内の本物の NVIDIA GPU（manual モードの CRIU、PyTorch）で：
   CUDA のカウンターと、fork された DataLoader ワーカーを使う PyTorch の学習のチェックポイント/リストア
   （結果は中断しなかった実行と同一）、およびパッケージ化されサンドボックス化された `gpueue.service` 内での
   デーモンによる NVML の GPU 検出。
 - QEMU/KVM 仮想マシン上の実際の OS（`scripts/vm-reboot-test.sh`）：各ディストリビューションのクラウド
   イメージから起動し、ユーザーと同じ方法で gpueue をインストールします。`.deb` は
   `apt install ./gpueue_<version>_amd64.deb`（Fedora では `.rpm` を `dnf` で）、または
-  `gpueue service install` を使い、`/var/lib/gpueue` は専用の ext4 ディスクに置きます。Ubuntu 26.04
-  （systemd 259、CRIU 4.2）では、`systemctl reboot`、`systemctl poweroff` の後の新規起動、そして 1 GiB の
+  `gpueue service install` を使い、`/var/lib/gpueue` は専用の ext4 ディスクに置きます。クイックセットの
+  ディストリビューションでは、`systemctl reboot`、`systemctl poweroff` の後の新規起動、そして 1 GiB の
   ジョブの `gpueue checkpoint` がまだ実行中の再起動を、2 ユーザーの CPU ジョブと `--no-checkpoint` のジョブで
   行います。起動のたびに、前回の起動のジャーナルが停止順序（最初にデーモンが停止し、ヘルパーは自身が停止する
   前にジョブをダンプし、`--no-checkpoint` のジョブのユニットはヘルパーの後にだけ停止し、最後に
@@ -349,10 +349,10 @@ OS のシャットダウンや再起動の間は、保存できなかったジ�
   ジョブのチェックポイントとリストア、プライベートな `/tmp` に状態を持つジョブ、チェックポイント済み・
   実行中・一時停止中のジョブを抱えた再起動を行います。前のリリースの `.deb`（GitHub からダウンロードし、
   `install.sh` と同じように検証）からの、チェックポイント済みと実行中のジョブを抱えたアップグレード。
-  `all` セットは Ubuntu 24.04、Debian 12 と 13（CRIU がないか古すぎるため、インストールとチェックポイント
-  なしのジョブのみ）と、`.rpm` を使う Fedora 44 を加えます。
+  `all` セットはほかの Debian と Ubuntu のリリース（CRIU がないか古すぎるため、インストールとチェックポイント
+  なしのジョブのみ）と、`.rpm` を使う Fedora を加えます。両方のセットは `scripts/vm-reboot-test.sh list` で表示されます。
   CI は、ヘルパー、デーモン、チェックポイント、パッケージングに触れるプルリクエストと
-  `main` へのすべての push でクイックセット（Ubuntu 26.04）を実行します。リリース自身の `.deb` で
+  `main` へのすべての push でクイックセットを実行します。リリース自身の `.deb` で
   これが通らない限り、リリースはドラフトとしても作成されません。
 
 まだテストしていないもの：
@@ -360,8 +360,8 @@ OS のシャットダウンや再起動の間は、保存できなかったジ�
 - 物理マシン（ベアメタル）での実際の再起動と、実際の再起動の GPU に関わる部分：GPU ジョブのチェックポイントと
   リストア、ドライバーの再読み込み、`nvidia-persistenced` に対する停止順序。
 - 実際の GitHub リリースからの `install.sh` によるインストール（偽のリリースサーバーに対しては、
-  Ubuntu 22.04/24.04/26.04 と Debian 12 のコンテナで `scripts/dist-test.sh` によりテスト済み）。
-- 動作中の systemd の下での `.deb` の再インストール、削除、purge（systemd のない素の Debian 12 と Ubuntu の
+  Debian と Ubuntu のコンテナで `scripts/dist-test.sh` によりテスト済み）。
+- 動作中の systemd の下での `.deb` の再インストール、削除、purge（systemd のない素の Debian と Ubuntu の
   コンテナで `scripts/deb-test.sh` によりテスト済み。APT リポジトリのローカルコピーを通したアップグレードも
   `scripts/apt-repo-test.sh` でテスト済み。インストールとアップグレードは上記の VM でテスト済み）、
   systemd の下での Rocky Linux 9 の `.rpm`（インストール、アップグレード、削除は素のコンテナで

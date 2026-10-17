@@ -326,22 +326,22 @@ settings.
 Tested so far:
 
 - Unit and integration tests for every crate (`scripts/test-in-docker.sh`).
-- Full-stack end-to-end tests in a privileged Docker container with systemd 259 as PID 1, CRIU 4.2
+- Full-stack end-to-end tests in a privileged Docker container with systemd as PID 1, CRIU
   and the binaries installed with `gpueue service install` (`scripts/e2e-test.sh`). The tests
   cover basic queue operations, three-user authorization, groups and GPU limits,
   checkpoint/restore, daemon and helper restarts, many jobs added at once, `gpueue shutdown`, and a
   simulated reboot: the container is shut down with systemd and the jobs are restored in a new
   container, also with jobs working on a separate ext4 filesystem, bind mounts, an
   `x-systemd.automount`, overlayfs, a tmpfs and sshfs that come back as new mounts.
-- With a real GPU in Docker (driver 595, CRIU 4.2.1 in manual mode, PyTorch 2.8 on Python 3.12):
+- With a real NVIDIA GPU in Docker (CRIU in manual mode, PyTorch):
   checkpoint/restore of a CUDA counter and of PyTorch training with forked DataLoader workers,
   with results identical to an uninterrupted run, and NVML GPU detection by the daemon inside the
   packaged, sandboxed `gpueue.service`.
 - Real operating systems in QEMU/KVM virtual machines (`scripts/vm-reboot-test.sh`), booted from
   the distributions' cloud images, with gpueue installed as users install it: the `.deb` with
   `apt install ./gpueue_<version>_amd64.deb` (the `.rpm` with `dnf` on Fedora), or
-  `gpueue service install`, and `/var/lib/gpueue` on an ext4 disk of its own. On Ubuntu 26.04
-  (systemd 259, CRIU 4.2): `systemctl reboot`, `systemctl poweroff` followed by a fresh boot, and a
+  `gpueue service install`, and `/var/lib/gpueue` on an ext4 disk of its own. On the quick set's
+  distribution: `systemctl reboot`, `systemctl poweroff` followed by a fresh boot, and a
   reboot while `gpueue checkpoint` of a 1 GiB job is still running, with CPU jobs of two users plus
   a `--no-checkpoint` job. After each boot, the previous boot's journal must show the stop order
   (the daemon stops first, the helper dumps the jobs before it stops, the `--no-checkpoint` job's
@@ -352,9 +352,9 @@ Tested so far:
   directory, checkpoints and restores of running and paused jobs, a job that keeps its state in
   its private `/tmp`, and a reboot with checkpointed, running and paused jobs. An upgrade from the
   previous release's `.deb` (downloaded from GitHub and verified like `install.sh` does) with
-  checkpointed and running jobs. The `all` set adds Ubuntu 24.04, Debian 12 and 13 (whose CRIU is
-  missing or too old: the install and jobs without checkpoints only) and Fedora 44 with the `.rpm`.
-  CI runs the quick set (Ubuntu 26.04) on pull requests
+  checkpointed and running jobs. The `all` set adds more Debian and Ubuntu releases (where CRIU is
+  missing or too old: the install and jobs without checkpoints only) and Fedora with the `.rpm`;
+  `scripts/vm-reboot-test.sh list` shows both sets. CI runs the quick set on pull requests
   that touch the helper, the daemon, checkpointing or packaging, and on every push to `main`; a
   release is not created, not even as a draft, unless it passes with the release's own `.deb`.
 
@@ -363,9 +363,9 @@ Not tested yet:
 - A real reboot on bare metal, and the GPU parts of a real reboot: GPU jobs checkpointed and
   restored across it, the driver reload, and the stop order relative to `nvidia-persistenced`.
 - Installing with `install.sh` from the real GitHub releases (tested against a fake release
-  server, `scripts/dist-test.sh`, on Ubuntu 22.04/24.04/26.04 and Debian 12 containers).
+  server, `scripts/dist-test.sh`, in Debian and Ubuntu containers).
 - The `.deb`'s reinstall, remove and purge under a running systemd (they are tested in plain
-  Debian 12 and Ubuntu containers without systemd, `scripts/deb-test.sh`, and so is an upgrade
+  Debian and Ubuntu containers without systemd, `scripts/deb-test.sh`, and so is an upgrade
   through a local copy of the APT repository, `scripts/apt-repo-test.sh`; install and upgrade are
   tested in the VMs above), the `.rpm` on Rocky Linux 9 under systemd (install, upgrade and remove
   are tested in plain containers, `scripts/rpm-test.sh`), the APT repository in the real `apt`

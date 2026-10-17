@@ -65,8 +65,8 @@ Administrators install gpueue once per machine; regular users do not need to ins
 
 ### 1. Prerequisites
 
-gpueue needs Linux with systemd 240 or newer (tested: 259) and a kernel with
-`CONFIG_CHECKPOINT_RESTORE`, 5.5 or newer recommended (tested: 7.0). Releases are built for x86_64
+gpueue needs Linux with systemd 240 or newer and a kernel with
+`CONFIG_CHECKPOINT_RESTORE`, 5.5 or newer recommended. Releases are built for x86_64
 and aarch64 and need glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+); only x86_64 has
 been tested on real hardware.
 
@@ -81,7 +81,7 @@ The NixOS module brings its own CRIU.
 | Dependency | Needed for | How to get it |
 | --- | --- | --- |
 | CRIU 4.2 or newer | every checkpoint | `sudo apt install criu` (Ubuntu 26.04), `sudo dnf install criu` (Fedora), `sudo pacman -S criu` (Arch Linux); elsewhere [build it from source](docs/install.md#criu) |
-| NVIDIA driver r570 or newer, with `nvidia-smi` (tested: 595) | GPU jobs | your distribution; its `cuda-checkpoint` must support `--action lock/checkpoint/restore/unlock` |
+| NVIDIA driver r570 or newer, with `nvidia-smi` | GPU jobs | your distribution; its `cuda-checkpoint` must support `--action lock/checkpoint/restore/unlock` |
 | NVIDIA's prebuilt cuda-checkpoint with the driver's major version, owned by root | GPU checkpoints | the commands below (on NixOS see [cuda-checkpoint on NixOS](docs/install.md#cuda-checkpoint-on-nixos)) |
 
 ```sh
@@ -301,16 +301,21 @@ then refused and the job keeps running. See [all limitations](docs/usage.md#limi
 
 ## Project status
 
-Pre-release (version 0.1.4). v0.1.4 is a security release: sites running v0.1.3 or earlier should
-upgrade (see the [v0.1.4 release notes](https://github.com/kaito4681/gpueue/releases/tag/v0.1.4)).
-It is tested by unit and integration tests, full-stack end-to-end tests under systemd in Docker
-(with a real GPU too), and real reboots of QEMU/KVM virtual machines; a real reboot on bare metal
-and the GPU parts of a real reboot are not tested yet (see
-[Test coverage](docs/usage.md#test-coverage)). Please report what works and what does not on your
-hardware.
+gpueue is pre-1.0 and under active development; the
+[releases page](https://github.com/kaito4681/gpueue/releases) has the current version and the release
+notes, which also announce security fixes. Unit, integration and full-stack end-to-end tests run
+under systemd in Docker (also with a real GPU), and real reboots, power-offs and upgrades run in
+QEMU/KVM virtual machines (`scripts/vm-reboot-test.sh list` shows the distributions). A real
+reboot on bare metal and the GPU parts of a real reboot are not tested yet; see
+[Test coverage](docs/usage.md#test-coverage) for the details. Please report what works and what
+does not on your hardware.
 
 <details>
-<summary><b>Behaviour changes in v0.1.4 to check before upgrading</b></summary>
+<summary><b>Upgrading from v0.1.3 or earlier</b></summary>
+
+v0.1.4 fixed the findings of a security review (see its
+[release notes](https://github.com/kaito4681/gpueue/releases/tag/v0.1.4)); sites running v0.1.3 or
+earlier should upgrade. Check these behaviour changes first:
 
 - These jobs can no longer be checkpointed (the refusal message says why): jobs holding
   inotify/fanotify watches, listening on an abstract Unix socket (other than libcuda's own),

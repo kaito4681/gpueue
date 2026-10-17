@@ -68,8 +68,8 @@ gpueue 由管理员在每台机器上安装一次；普通用户无需安装任�
 <a id="1-prerequisites"></a>
 ### 1. 前提条件
 
-gpueue 需要带有 systemd 240 或更新版本（已测试：259）的 Linux，以及启用了 `CONFIG_CHECKPOINT_RESTORE` 的内核
-（推荐 5.5 或更新版本，已测试：7.0）。发布版本针对 x86_64 和 aarch64 构建，需要 glibc 2.34 或更新版本
+gpueue 需要带有 systemd 240 或更新版本的 Linux，以及启用了 `CONFIG_CHECKPOINT_RESTORE` 的内核
+（推荐 5.5 或更新版本）。发布版本针对 x86_64 和 aarch64 构建，需要 glibc 2.34 或更新版本
 （Ubuntu 22.04+、Debian 12+、RHEL 9+）；只有 x86_64 在真实硬件上测试过。
 
 没有下面这些程序作业也能运行，但创建检查点需要它们，而任何安装方式都不会替你安装：软件包只是推荐 CRIU，而在许多
@@ -82,7 +82,7 @@ NixOS 模块自带 CRIU。
 | 依赖 | 用途 | 获取方式 |
 | --- | --- | --- |
 | CRIU 4.2 或更新版本 | 所有检查点 | `sudo apt install criu`（Ubuntu 26.04）、`sudo dnf install criu`（Fedora）、`sudo pacman -S criu`（Arch Linux）；其他系统请[从源码构建](docs/zh-CN/install.md#criu) |
-| NVIDIA 驱动 r570 或更新版本，含 `nvidia-smi`（已测试：595） | GPU 作业 | 来自发行版；其 `cuda-checkpoint` 必须支持 `--action lock/checkpoint/restore/unlock` |
+| NVIDIA 驱动 r570 或更新版本，含 `nvidia-smi` | GPU 作业 | 来自发行版；其 `cuda-checkpoint` 必须支持 `--action lock/checkpoint/restore/unlock` |
 | 与驱动主版本相同的 NVIDIA 预编译 cuda-checkpoint，属主为 root | GPU 检查点 | 下面的命令（NixOS 上参见 [NixOS 上的 cuda-checkpoint](docs/zh-CN/install.md#cuda-checkpoint-on-nixos)） |
 
 ```sh
@@ -307,13 +307,18 @@ GPU 型号和驱动上、在相同的文件和挂载下恢复。持有某些套�
 <a id="project-status"></a>
 ## 项目状态
 
-预发布（版本 0.1.4）。v0.1.4 是一个安全发布版本：运行 v0.1.3 或更早版本的站点应当升级（参见
-[v0.1.4 的发布说明](https://github.com/kaito4681/gpueue/releases/tag/v0.1.4)）。测试包括单元测试和集成测试、在 Docker
-中 systemd 下的全栈端到端测试（也使用真实 GPU），以及 QEMU/KVM 虚拟机的真实重启；物理机上的真实重启以及真实重启中
-与 GPU 相关的部分尚未测试（参见[测试范围](docs/zh-CN/usage.md#test-coverage)）。请报告在你的硬件上哪些功能可用、哪些不可用。
+gpueue 处于 1.0 之前、正在积极开发的阶段；当前版本和发布说明（也会公布安全修复）见
+[发布页面](https://github.com/kaito4681/gpueue/releases)。单元测试、集成测试和全栈端到端测试在 Docker 中的 systemd 下
+运行（也使用真实 GPU），真实的重启、关机和升级在 QEMU/KVM 虚拟机中运行（`scripts/vm-reboot-test.sh list` 会列出
+所用的发行版）。物理机上的真实重启以及真实重启中与 GPU 相关的部分尚未测试；详情参见
+[测试范围](docs/zh-CN/usage.md#test-coverage)。请报告在你的硬件上哪些功能可用、哪些不可用。
 
 <details>
-<summary><b>升级前需要确认的 v0.1.4 行为变更</b></summary>
+<summary><b>从 v0.1.3 或更早版本升级</b></summary>
+
+v0.1.4 修复了安全审查中发现的问题（参见其
+[发布说明](https://github.com/kaito4681/gpueue/releases/tag/v0.1.4)）；运行 v0.1.3 或更早版本的站点应当升级。
+升级前请先确认以下行为变更：
 
 - 以下作业不能再创建检查点（拒绝消息会说明原因）：持有 inotify/fanotify 监视的作业、在抽象 Unix 套接字上监听的作业
   （libcuda 自己的除外）、在 Unix 套接字队列中持有描述符的作业，以及持有已删除的 setuid/setgid 文件的作业。

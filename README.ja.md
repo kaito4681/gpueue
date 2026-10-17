@@ -70,8 +70,8 @@ gpueue は管理者がマシンごとに 1 回インストールします。一�
 <a id="1-prerequisites"></a>
 ### 1. 前提条件
 
-gpueue には、systemd 240 以降（テスト済み：259）の Linux と、`CONFIG_CHECKPOINT_RESTORE` を有効にしたカーネル
-（5.5 以降を推奨、テスト済み：7.0）が必要です。リリースは x86_64 と aarch64 向けにビルドされ、glibc 2.34 以降
+gpueue には、systemd 240 以降の Linux と、`CONFIG_CHECKPOINT_RESTORE` を有効にしたカーネル
+（5.5 以降を推奨）が必要です。リリースは x86_64 と aarch64 向けにビルドされ、glibc 2.34 以降
 （Ubuntu 22.04 以降、Debian 12 以降、RHEL 9 以降）が必要です。実機でテストしたのは x86_64 だけです。
 
 下のプログラムがなくてもジョブは実行できますが、チェックポイントには必要です。どのインストール方法もこれらは
@@ -85,7 +85,7 @@ NixOS モジュールは独自の CRIU を持ち込みます。
 | 依存関係 | 必要になる場面 | 入手方法 |
 | --- | --- | --- |
 | CRIU 4.2 以降 | すべてのチェックポイント | `sudo apt install criu`（Ubuntu 26.04）、`sudo dnf install criu`（Fedora）、`sudo pacman -S criu`（Arch Linux）。それ以外では[ソースからビルド](docs/ja/install.md#criu)します |
-| NVIDIA ドライバー r570 以降と `nvidia-smi`（テスト済み：595） | GPU ジョブ | ディストリビューションから。その `cuda-checkpoint` が `--action lock/checkpoint/restore/unlock` に対応している必要があります |
+| NVIDIA ドライバー r570 以降と `nvidia-smi` | GPU ジョブ | ディストリビューションから。その `cuda-checkpoint` が `--action lock/checkpoint/restore/unlock` に対応している必要があります |
 | ドライバーと同じメジャーバージョンの NVIDIA のビルド済み cuda-checkpoint（root の所有） | GPU のチェックポイント | 下のコマンド（NixOS では [NixOS での cuda-checkpoint](docs/ja/install.md#cuda-checkpoint-on-nixos) を参照） |
 
 ```sh
@@ -323,15 +323,20 @@ inotify、`SO_REUSEPORT` など）を持つジョブはチェックポイント�
 <a id="project-status"></a>
 ## プロジェクトの状況
 
-プレリリース（バージョン 0.1.4）。v0.1.4 はセキュリティリリースです。v0.1.3 以前を使っているサイトは
-アップグレードしてください（[v0.1.4 のリリースノート](https://github.com/kaito4681/gpueue/releases/tag/v0.1.4)を参照）。
-ユニットテストと統合テスト、Docker 内の systemd のもとでのフルスタックのエンドツーエンドテスト（本物の GPU も
-使用）、QEMU/KVM 仮想マシンの実際の再起動でテストしています。物理マシンでの実際の再起動と、実際の再起動の GPU に
-関わる部分はまだテストしていません（[テストの範囲](docs/ja/usage.md#test-coverage)を参照）。お使いのハードウェアで
-何が動いて何が動かないか、ぜひ報告してください。
+gpueue は 1.0 より前の、活発に開発中のプロジェクトです。現在のバージョンとリリースノート（セキュリティ修正の
+告知も含みます）は[リリースページ](https://github.com/kaito4681/gpueue/releases)にあります。ユニットテスト、
+統合テスト、フルスタックのエンドツーエンドテストを Docker 内の systemd のもとで（本物の GPU でも）実行し、実際の
+再起動、電源断、アップグレードを QEMU/KVM 仮想マシンで実行しています（ディストリビューションは
+`scripts/vm-reboot-test.sh list` で表示されます）。物理マシンでの実際の再起動と、実際の再起動の GPU に関わる部分は
+まだテストしていません。詳しくは[テストの範囲](docs/ja/usage.md#test-coverage)を参照してください。お使いの
+ハードウェアで何が動いて何が動かないか、ぜひ報告してください。
 
 <details>
-<summary><b>アップグレード前に確認すべき v0.1.4 の動作の変更</b></summary>
+<summary><b>v0.1.3 以前からのアップグレード</b></summary>
+
+v0.1.4 はセキュリティレビューで見つかった問題を修正しました
+（[リリースノート](https://github.com/kaito4681/gpueue/releases/tag/v0.1.4)を参照）。v0.1.3 以前を使っているサイトは
+アップグレードしてください。その前に次の動作の変更を確認してください。
 
 - 次のジョブはチェックポイントできなくなりました（拒否のメッセージに理由が表示されます）：inotify/fanotify
   の監視を持つジョブ、（libcuda 自身のもの以外の）抽象 Unix ソケットで listen しているジョブ、Unix ソケットの

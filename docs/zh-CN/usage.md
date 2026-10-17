@@ -284,18 +284,18 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 目前已测试：
 
 - 每个 crate 的单元测试和集成测试（`scripts/test-in-docker.sh`）。
-- 在特权 Docker 容器中进行的全栈端到端测试：systemd 259 作为 PID 1、CRIU 4.2，
+- 在特权 Docker 容器中进行的全栈端到端测试：systemd 作为 PID 1、CRIU，
   二进制文件通过 `gpueue service install` 安装（`scripts/e2e-test.sh`）。测试涵盖基本的队列操作、
   三个用户的授权、组和 GPU 限制、检查点/恢复、守护进程和 helper 的重启、一次性添加大量作业、
   `gpueue shutdown`，以及模拟重启：用 systemd 关闭容器，并在新容器中恢复作业，其中也包括在独立的 ext4 文件系统、
   bind 挂载、`x-systemd.automount`、overlayfs、tmpfs 和 sshfs 上工作的作业，这些挂载会作为新的挂载重新出现。
-- 在 Docker 中使用真实 GPU（驱动 595、手动模式的 CRIU 4.2.1、Python 3.12 上的 PyTorch 2.8）：
+- 在 Docker 中使用真实的 NVIDIA GPU（手动模式的 CRIU、PyTorch）：
   CUDA 计数器以及使用 fork 出的 DataLoader worker 的 PyTorch 训练的检查点/恢复，
   其结果与未中断的运行完全相同；以及守护进程在打包好的、沙箱化的 `gpueue.service` 中通过 NVML 检测 GPU。
 - QEMU/KVM 虚拟机中的真实操作系统（`scripts/vm-reboot-test.sh`）：从各发行版的云镜像启动，并以用户的方式
   安装 gpueue：用 `apt install ./gpueue_<version>_amd64.deb` 安装 `.deb`（在 Fedora 上用 `dnf` 安装
-  `.rpm`），或者用 `gpueue service install`，`/var/lib/gpueue` 位于独立的 ext4 磁盘上。在 Ubuntu 26.04
-  （systemd 259、CRIU 4.2）上，使用两个用户的 CPU 作业以及一个 `--no-checkpoint` 作业，测试
+  `.rpm`），或者用 `gpueue service install`，`/var/lib/gpueue` 位于独立的 ext4 磁盘上。在快速集合的
+  发行版上，使用两个用户的 CPU 作业以及一个 `--no-checkpoint` 作业，测试
   `systemctl reboot`、`systemctl poweroff` 后重新启动，以及在一个 1 GiB 作业的 `gpueue checkpoint` 仍在进行时
   重启。每次启动后，上一次启动的 journal 必须显示正确的停止顺序（守护进程最先停止，helper 在自身停止之前转储
   作业，`--no-checkpoint` 作业的 unit 只在 helper 之后停止，最后卸载 `/var/lib/gpueue`），且没有超时或
@@ -303,19 +303,19 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   systemd-resolved 在运行，`/tmp` 是 tmpfs，用户不带 `allow_other` 的 FUSE 挂载位于 `/tmp` 下（如 AppImage
   的挂载）和家目录中；测试运行中和已暂停作业的检查点与恢复、一个在私有 `/tmp` 中保存状态的作业，以及带着已检查点、
   运行中和已暂停作业的重启。从上一个发布版本的 `.deb`（从 GitHub 下载，并像 `install.sh` 那样校验）升级，
-  期间有已检查点和运行中的作业。`all` 集合还加入 Ubuntu 24.04、Debian 12 和 13（其 CRIU 缺失或过旧：只测试
-  安装和不做检查点的作业）以及使用 `.rpm` 的 Fedora 44。
+  期间有已检查点和运行中的作业。`all` 集合还加入其他 Debian 和 Ubuntu 版本（其 CRIU 缺失或过旧：只测试
+  安装和不做检查点的作业）以及使用 `.rpm` 的 Fedora；`scripts/vm-reboot-test.sh list` 会列出这两个集合。
   CI 在涉及 helper、
-  守护进程、检查点或打包的拉取请求上以及每次推送到 `main` 时运行快速集合（Ubuntu 26.04）；除非它在该发布版本
+  守护进程、检查点或打包的拉取请求上以及每次推送到 `main` 时运行快速集合；除非它在该发布版本
   自己的 `.deb` 上通过，否则不会创建发布版本，连草稿也不会。
 
 尚未测试：
 
 - 物理机（裸机）上的真实重启，以及真实重启中与 GPU 相关的部分：GPU 作业跨重启的检查点与恢复、驱动重新加载，
   以及相对于 `nvidia-persistenced` 的停止顺序。
-- 从真实的 GitHub Release 用 `install.sh` 安装（已在 Ubuntu 22.04/24.04/26.04 和 Debian 12 容器中针对伪造的发布服务器测试，
+- 从真实的 GitHub Release 用 `install.sh` 安装（已在 Debian 和 Ubuntu 容器中针对伪造的发布服务器测试，
   `scripts/dist-test.sh`）。
-- 在运行着 systemd 的环境中 `.deb` 的重新安装、卸载和清除（已在不带 systemd 的普通 Debian 12 和 Ubuntu 容器中测试，
+- 在运行着 systemd 的环境中 `.deb` 的重新安装、卸载和清除（已在不带 systemd 的普通 Debian 和 Ubuntu 容器中测试，
   `scripts/deb-test.sh`；通过 APT 仓库的本地副本进行升级也已测试，`scripts/apt-repo-test.sh`；安装和升级已在
   上述虚拟机中测试），在 systemd 下 Rocky Linux 9 上的 `.rpm`（安装、升级和卸载已在普通容器中测试，
   `scripts/rpm-test.sh`），真实 `apt` 发布版本中的 APT 仓库，以及真实硬件上的 arm64。
