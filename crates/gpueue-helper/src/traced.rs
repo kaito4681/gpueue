@@ -477,7 +477,7 @@ mod tests {
     /// Whether ptrace works here at all (seccomp or Yama may refuse it).
     fn ptrace_allowed(e: &str) -> bool {
         if e.contains("EPERM") {
-            eprintln!("skipping: ptrace is not permitted here ({e})");
+            eprintln!("skipped: ptrace is not permitted here ({e})");
             return false;
         }
         true
