@@ -19,7 +19,7 @@ use gpueue_protocol::api::{
 };
 
 use crate::error::{ApiResult, Failure};
-use crate::state::{Changes, Core, JobInfo, Retried, needs_helper, now_ms, targets_live_process};
+use crate::state::{Changes, Core, JobInfo, Retried, needs_helper, targets_live_process};
 
 fn lifecycle_action(action: &JobAction) -> Action {
     match action {
@@ -261,7 +261,7 @@ impl Core {
         }
         authz::require_nice_value(&caller, 0, spec.nice)?;
         let helper_ready = self.helper_ready();
-        let now = now_ms();
+        let now = self.now_ms();
         let core = self.clone();
         let (job, effects, queued) = self
             .write(move |tx, ch| {
@@ -476,7 +476,7 @@ impl Core {
         removed_together: Arc<HashSet<JobId>>,
     ) -> ApiResult<Option<(Job, Vec<Effect>, Option<(Job, Vec<Effect>)>, LaunchState)>> {
         let helper_ready = self.helper_ready();
-        let now = now_ms();
+        let now = self.now_ms();
         let core = self.clone();
         self.write(move |tx, ch| {
                 let mut job = tx.get_job(id)?.ok_or_else(|| job_not_found(id))?;
@@ -680,7 +680,7 @@ impl Core {
         self.reject_if_shutting_down()?;
         let scope = authz::selection_scope(&caller);
         let core = self.clone();
-        let now = now_ms();
+        let now = self.now_ms();
         let removed = self
             .write(move |tx, ch| {
                 if let Some(group) = &request.group
@@ -735,7 +735,7 @@ impl Core {
         self.reject_if_shutting_down()?;
         let scope = authz::reset_scope(&caller);
         let core = self.clone();
-        let now = now_ms();
+        let now = self.now_ms();
         let (removed, live) = self
             .write(move |tx, ch| {
                 if let Some(group) = &request.group

@@ -12,7 +12,7 @@
 //! helper does not know about yet. Combined with
 //! [`FakeHelper::refuse_launches`], it holds the daemon's retry of a launch
 //! a stopping helper refused. [`FakeHelper::hold_checkpoints`] does the
-//! same for checkpoint requests.
+//! same for checkpoint requests, [`FakeHelper::hold_kills`] for SIGKILLs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -91,8 +91,10 @@ struct State {
     /// When the last refusal due by `refuse_launches` was answered.
     last_refusal: Option<std::time::Instant>,
     hold_launches: bool,
-    /// Held requests fail with `ConnectionLost` when released.
-    lose_held: bool,
+    /// Requests held during this session or an earlier one fail with
+    /// `ConnectionLost` when released (see
+    /// [`FakeHelper::lose_held_launches`]).
+    lose_held_up_to: Option<u64>,
     /// Owner and GPUs of the jobs started by spawn or restore requests
     /// (or [`FakeHelper::insert_running_as`]), reported by `list_running`.
     launched: BTreeMap<JobId, (Uid, Vec<GpuIndex>)>,
@@ -103,6 +105,9 @@ struct State {
     hold_checkpoints: bool,
     /// Checkpoint requests currently held.
     held_checkpoints: usize,
+    hold_kills: bool,
+    /// SIGKILL requests currently held.
+    held_kills: usize,
     /// Connections so far (see [`HelperState::session`]).
     session: u64,
     /// How often the event numbering was reset (the epoch is one more).
@@ -111,6 +116,10 @@ struct State {
     no_event_epoch: bool,
     /// Answer `list_running` with this error, this many times.
     list_failures: usize,
+    /// `list_running` requests answered so far.
+    list_requests: usize,
+    /// The jobs of the spawn requests refused because `stopping` is set.
+    stopping_refusals: Vec<JobId>,
 }
 
 impl State {
@@ -228,9 +237,11 @@ impl FakeHelper {
     /// no effect.
     async fn launch_gate(&self) -> HelperResult<()> {
         let mut rx = self.wake.subscribe();
-        if !self.with(|s| s.hold_launches) {
+        // The session the request was sent in: a request cut off by a
+        // disconnect never reaches the helper of a later session.
+        let Some(session) = self.with(|s| s.hold_launches.then_some(s.session)) else {
             return Ok(());
-        }
+        };
         self.with(|s| s.held += 1);
         self.bump();
         let _held = Held(self, |s| &mut s.held);
@@ -239,10 +250,27 @@ impl FakeHelper {
                 return Ok(());
             }
         }
-        if self.with(|s| s.lose_held) {
+        if self.with(|s| s.lose_held_up_to.is_some_and(|up_to| session <= up_to)) {
             return Err(HelperError::ConnectionLost);
         }
         Ok(())
+    }
+
+    /// Waits while SIGKILL requests are held. A request dropped while
+    /// waiting has no effect.
+    async fn kill_gate(&self) {
+        let mut rx = self.wake.subscribe();
+        if !self.with(|s| s.hold_kills) {
+            return;
+        }
+        self.with(|s| s.held_kills += 1);
+        self.bump();
+        let _held = Held(self, |s| &mut s.held_kills);
+        while self.with(|s| s.hold_kills) {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Waits while checkpoint requests are held. A request dropped while
@@ -400,13 +428,15 @@ impl FakeHelper {
     }
 
     /// Fails the held spawn and restore requests with `ConnectionLost`, as
-    /// if the connection broke before the helper read them (until
-    /// [`reconnect`]).
+    /// if the connection broke before the helper read them: every request
+    /// sent in this session or an earlier one, also when released after a
+    /// [`reconnect`] (as the real connection's pending requests are failed
+    /// for good when it breaks).
     ///
     /// [`reconnect`]: FakeHelper::reconnect
     pub fn lose_held_launches(&self) {
         self.with(|s| {
-            s.lose_held = true;
+            s.lose_held_up_to = Some(s.session);
             s.hold_launches = false;
         });
         self.bump();
@@ -423,6 +453,31 @@ impl FakeHelper {
                 s.held < count
             }
         }) {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Holds SIGKILL requests (unanswered and without effect) until
+    /// [`release_kills`], so that a job being stopped can be observed
+    /// before it is killed.
+    ///
+    /// [`release_kills`]: FakeHelper::release_kills
+    pub fn hold_kills(&self) {
+        self.with(|s| s.hold_kills = true);
+    }
+
+    /// Lets held (and later) SIGKILL requests proceed.
+    pub fn release_kills(&self) {
+        self.with(|s| s.hold_kills = false);
+        self.bump();
+    }
+
+    /// Resolves once `count` SIGKILL requests (or more) are being held.
+    pub async fn wait_held_kills(&self, count: usize) {
+        let mut rx = self.wake.subscribe();
+        while self.with(|s| s.held_kills < count) {
             if rx.changed().await.is_err() {
                 return;
             }
@@ -528,7 +583,6 @@ impl FakeHelper {
             s.notices = Some(capture);
             let _ = s.notices.as_ref().unwrap().send(HelperNotice::Disconnected);
             s.connected = true;
-            s.lose_held = false;
             s.announce();
             s.notices = tx;
             let mut captured = Vec::new();
@@ -565,7 +619,6 @@ impl FakeHelper {
     pub fn reconnect(&self) {
         self.with(|s| {
             s.connected = true;
-            s.lose_held = false;
             s.announce();
         });
     }
@@ -592,6 +645,18 @@ impl FakeHelper {
         self.with(|s| s.signals.clone())
     }
 
+    /// The jobs of the spawn requests refused because the helper is
+    /// stopping (see [`FakeHelper::set_stopping`]), in order.
+    pub fn stopping_refusals(&self) -> Vec<JobId> {
+        self.with(|s| s.stopping_refusals.clone())
+    }
+
+    /// How many `list_running` requests were answered (not counting the
+    /// lists sent on connect).
+    pub fn list_requests(&self) -> usize {
+        self.with(|s| s.list_requests)
+    }
+
     pub fn unacked(&self) -> Vec<EventEnvelope> {
         self.with(|s| s.unacked.clone())
     }
@@ -614,6 +679,7 @@ impl FakeHelper {
                 });
             }
             if s.stopping {
+                s.stopping_refusals.push(request.job);
                 return Err(HelperError::Rejected {
                     code: HelperErrorCode::ShuttingDown,
                     message: "the helper is shutting down".to_owned(),
@@ -809,6 +875,13 @@ impl Helper for FakeHelper {
     }
 
     fn signal(&self, job: JobId, signal: i32) -> BoxFuture<'_, HelperResult<()>> {
+        if signal == signal::SIGKILL {
+            return async move {
+                self.kill_gate().await;
+                self.do_signal(job, signal)
+            }
+            .boxed();
+        }
         let result = self.do_signal(job, signal);
         async move { result }.boxed()
     }
@@ -855,6 +928,7 @@ impl Helper for FakeHelper {
                 s.list_failures -= 1;
                 return Err(HelperError::Timeout);
             }
+            s.list_requests += 1;
             Ok(s.running())
         });
         async move { result }.boxed()

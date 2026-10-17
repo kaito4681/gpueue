@@ -113,6 +113,12 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Changes how long this connection waits for a lock held by another
+    /// connection (5 s by default) before failing with `SQLITE_BUSY`.
+    pub fn set_busy_timeout(&self, timeout: Duration) -> Result<()> {
+        Ok(self.conn.busy_timeout(timeout)?)
+    }
+
     /// The schema version of the open database (always [`SCHEMA_VERSION`]
     /// after a successful open).
     pub fn schema_version(&self) -> Result<i64> {

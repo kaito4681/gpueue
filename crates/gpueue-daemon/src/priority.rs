@@ -38,7 +38,7 @@ use gpueue_protocol::api::{
 };
 
 use crate::error::{ApiResult, Failure};
-use crate::state::{Changes, Core, now_ms};
+use crate::state::{Changes, Core};
 
 /// The fair-share table from the store: shares, usage, and the owners of
 /// unfinished jobs as the active users.
@@ -137,7 +137,7 @@ impl Core {
     /// reset time, resets usage for `priority_usage_reset_period = "now"`,
     /// and runs a first calculation.
     pub async fn start_usage(self: &Arc<Self>) {
-        let now = now_ms();
+        let now = self.now_ms();
         let reset_now = self.config.priority.priority_usage_reset_period == ResetPeriod::Now;
         let result = self
             .write(move |tx, _| {
@@ -175,7 +175,7 @@ impl Core {
                 _ = self.cancel.cancelled() => return,
                 _ = tokio::time::sleep(period) => {}
             }
-            if let Err(e) = self.update_usage(now_ms()).await {
+            if let Err(e) = self.update_usage(self.now_ms()).await {
                 tracing::error!("cannot calculate usage: {}", e.0.message);
             }
         }
@@ -256,7 +256,7 @@ impl Core {
     /// `GET /v1/priority`.
     pub async fn priorities(self: &Arc<Self>) -> ApiResult<PriorityResponse> {
         let core = self.clone();
-        let now = now_ms();
+        let now = self.now_ms();
         // What the scheduler uses: the cached factors and the orphans.
         let fairshare = self.fairshare_factors();
         let reserved = self.orphan_reservations();

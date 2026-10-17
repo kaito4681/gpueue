@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use gpueue_core::model::{JobId, JobResult, JobSpec, JobState};
 use gpueue_daemon::api::TEST_UID_HEADER;
-use gpueue_daemon::{Config, Daemon, DaemonOptions, FakeHelper, StaticGpuDetector, StaticUserDb};
+use gpueue_daemon::{
+    Config, Daemon, DaemonOptions, FakeHelper, StaticGpuDetector, StaticUserDb, SystemClock,
+};
 use gpueue_protocol::BINARY_VERSION;
 use gpueue_protocol::api::{
     AddJobRequest, AddJobResponse, BulkJobResponse, JobView, ListGroupsResponse, VERSION_HEADER,
@@ -156,6 +158,7 @@ impl Harness {
             helper: Arc::new(FakeHelper::new()),
             users: Arc::new(StaticUserDb::with_admins([ADMIN])),
             gpus: Arc::new(StaticGpuDetector::anonymous(0)),
+            clock: Arc::new(SystemClock),
             trust_uid_header: true,
         })
         .await
@@ -183,6 +186,52 @@ impl Harness {
             )
             .await;
         h
+    }
+
+    /// Adds a job to a new group `probe` and waits until it runs: the
+    /// scheduling pass that started it saw every job added before it.
+    async fn probe_scheduling(&self) -> JobId {
+        let admin = self.client(ADMIN);
+        let _: Value = admin
+            .json(
+                Method::POST,
+                "/v1/groups",
+                Some(json!({"name": "probe", "parallel": 1})),
+                StatusCode::CREATED,
+            )
+            .await;
+        let probe = admin.add("probe").await;
+        admin.wait_state(probe, &JobState::Running).await;
+        probe
+    }
+
+    /// Kills and removes the job of [`Harness::probe_scheduling`] and its
+    /// group.
+    async fn remove_probe(&self, probe: JobId) {
+        let admin = self.client(ADMIN);
+        let (status, body) = admin
+            .call(
+                Method::POST,
+                &format!("/v1/jobs/{probe}/kill"),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let killed = JobState::Done {
+            result: gpueue_core::model::JobResult::Killed,
+        };
+        admin.wait_state(probe, &killed).await;
+        let (status, body) = admin
+            .call(Method::DELETE, &format!("/v1/jobs/{probe}"), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (status, body) = admin.call(Method::DELETE, "/v1/groups/probe", None).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     fn client(&self, uid: u32) -> Client {
@@ -306,13 +355,15 @@ async fn admin_pause_and_start_all_change_every_group_and_job() {
         groups(&[("default", true), ("gpu", true)])
     );
 
-    // Paused groups start nothing new.
+    // Paused groups start nothing new. A job added after it to a group
+    // that is not paused shows when a scheduling pass has seen both.
     let queued = h.client(ALICE).add("gpu").await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let probe = h.probe_scheduling().await;
     assert!(matches!(
         admin.job(queued).await.state,
         JobState::Queued { .. }
     ));
+    h.remove_probe(probe).await;
 
     let reply = admin.bulk(all(), "start", json!(null)).await;
     // Only paused jobs are resumed; the queued one starts with its group.

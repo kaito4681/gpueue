@@ -61,6 +61,7 @@
 
 mod actions;
 pub mod api;
+pub mod clock;
 /// The configuration file's schema lives in `gpueue-config`, which the root
 /// helper shares.
 pub use gpueue_config as config;
@@ -89,6 +90,7 @@ use gpueue_protocol::api::GpuSource;
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
+pub use crate::clock::{Clock, ManualClock, SystemClock};
 pub use crate::config::Config;
 pub use crate::gpu::{
     DetectedGpu, Detection, FallbackGpuDetector, GpuDetector, NvmlGpuDetector, StaticGpuDetector,
@@ -105,6 +107,8 @@ pub struct DaemonOptions {
     pub helper: Arc<dyn Helper>,
     pub users: Arc<dyn UserDb>,
     pub gpus: Arc<dyn GpuDetector>,
+    /// Where the daemon takes the time from ([`SystemClock`] but in tests).
+    pub clock: Arc<dyn Clock>,
     /// Testing only: honour the [`api::TEST_UID_HEADER`] header instead of
     /// `SO_PEERCRED`. The field exists only with the `test-uid-header`
     /// cargo feature, so a production build cannot enable it.
@@ -120,6 +124,7 @@ impl DaemonOptions {
             helper: Arc::new(HelperClient::new(&config.helper_socket)),
             users: Arc::new(SystemUserDb),
             gpus: Arc::from(gpu::detector_for(&config)),
+            clock: Arc::new(SystemClock),
             config,
             #[cfg(feature = "test-uid-header")]
             trust_uid_header: false,
@@ -160,6 +165,7 @@ impl Daemon {
             helper,
             users,
             gpus,
+            clock,
             #[cfg(feature = "test-uid-header")]
             trust_uid_header,
         } = options;
@@ -214,6 +220,7 @@ impl Daemon {
             detected,
             gpu_detection,
             trust_uid_header,
+            clock,
         );
         core.check_checkpoint_usage().await;
         core.start_usage().await;
@@ -248,6 +255,13 @@ impl Daemon {
     #[doc(hidden)]
     pub fn helper_ready(&self) -> bool {
         self.core.helper_ready()
+    }
+
+    /// Whether a spawn or restore request for `id` has not returned yet.
+    /// For tests.
+    #[doc(hidden)]
+    pub fn launch_in_flight(&self, id: gpueue_core::model::JobId) -> bool {
+        self.core.launch_in_flight(id)
     }
 
     pub fn set_launch_check_hook(&self, hook: Option<LaunchCheckHook>) {
