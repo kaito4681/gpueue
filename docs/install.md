@@ -372,7 +372,7 @@ The package contains:
 | `/etc/gpueue/config.toml` | the default configuration (a conffile: your edits are kept on upgrades) |
 | `/etc/apt/sources.list.d/gpueue.sources`, `/etc/apt/keyrings/gpueue.gpg` | the gpueue APT repository and its signing key (conffiles, see below) |
 | `/usr/share/bash-completion`, `zsh/vendor-completions`, `fish/vendor_completions.d` | shell completions |
-| `/usr/share/doc/gpueue` | README, this guide, the architecture notes, the license |
+| `/usr/share/doc/gpueue` | README, this guide, the usage reference, the architecture notes, the license |
 
 On the first installation it creates the user, the group and the directories, then enables and
 starts `gpueue-helper.service` and `gpueue.service`; check the result with `gpueue doctor`. Without
@@ -1424,7 +1424,7 @@ Every `*_secs` key is at most one year (31536000).
 | `checkpoint_deadline_secs_per_gib` | `30` | helper | part of that deadline per GiB of RSS + VRAM (checkpoint) or image (restore) |
 | `criu_dump_timeout_secs` | unset | helper | optional cap on `criu dump` alone; unset: only the deadline applies |
 | `criu_restore_timeout_secs` | unset | helper | optional cap on `criu restore` alone; unset: only the deadline applies |
-| `fork_guard` | `true` | helper | preload the fork guard into jobs (see the README's limitations) |
+| `fork_guard` | `true` | helper | preload the fork guard into jobs (see [Limitations](usage.md#limitations)) |
 | `gpu_device_isolation` | `true` | helper | each job unit may open only its assigned GPUs' device nodes (`DevicePolicy=closed`); `false` turns this off (see [GPU isolation](#gpu-isolation)) |
 | `job_system_dbus` | `false` | helper | `true` lets jobs reach the system D-Bus (systemd, polkit); by default `/run/dbus` is hidden from jobs (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |
 | `job_systemd_varlink` | `false` | helper | `true` lets jobs reach systemd's Varlink services under `/run/systemd`; by default the directory is hidden from jobs except journald's log sockets, resolved's resolution socket and `resolv.conf` files, and `userdb/` (see [What a job can and cannot do](#what-a-job-can-and-cannot-do)) |

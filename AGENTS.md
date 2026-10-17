@@ -35,10 +35,12 @@
   install instructions).
 
 ## Documentation
-- Update `README.md`, `docs/install.md` and `docs/architecture.md` when commands, flags,
+- Update `README.md`, `docs/install.md`, `docs/usage.md` and `docs/architecture.md` when commands, flags,
   configuration keys, packaging or behaviour change. The English docs are canonical; the same PR
   must update `README.ja.md`, `README.zh-CN.md`, `docs/ja/` and `docs/zh-CN/` (commands, code,
   keys and paths untranslated, English anchor ids kept).
+- The README's `gpueue --help` block is real output: when the top-level help changes, refresh it in all
+  three READMEs (`scripts/test-in-docker.sh run -q -p gpueue --bin gpueue -- --help`).
 - Update the Agent Skill in `skills/gpueue/` when user-facing commands, flags, JSON output, error
   messages or scheduling/checkpoint behaviour change; every command it shows must exist, and the
   frontmatter `name` must equal the directory name.
