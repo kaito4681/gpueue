@@ -12,6 +12,13 @@ yanked = "deny"
 ignore = [
     # Add "RUSTSEC-YYYY-NNNN" entries here only with a comment saying why the advisory does
     # not apply and when to drop the entry.
+
+    # zvariant, zbus_names and zvariant_derive were merged into zbus 6.0.0 and are no longer
+    # maintained as separate crates (informational, no vulnerability). The helper still uses
+    # zbus 5; drop these entries with the move to zbus 6 (#166).
+    "RUSTSEC-2026-0370", # zvariant
+    "RUSTSEC-2026-0371", # zbus_names
+    "RUSTSEC-2026-0372", # zvariant_derive
 ]
 
 [bans]
