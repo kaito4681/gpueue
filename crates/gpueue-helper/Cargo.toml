@@ -40,6 +40,8 @@ cc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# To map a file in a test's fixture process.
+rustix = { workspace = true, features = ["mm"] }
 
 [lints]
 workspace = true

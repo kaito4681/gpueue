@@ -246,7 +246,8 @@ pub struct DumpHazards {
     /// Abstract names (`@name`) of listening Unix sockets of the job.
     /// CRIU sets them up as root, before it restores the job's
     /// credentials, so a client asking who listens (`SO_PEERCRED`) would
-    /// be told root.
+    /// be told root. libcuda's own listeners are left out (see
+    /// [`parse_cuda_uvmfd_name`]).
     #[serde(default)]
     pub abstract_listeners: Vec<String>,
     /// Files the job holds that the NFS client renamed to `.nfs<hex>`
@@ -1023,6 +1024,8 @@ pub fn scan_dump_hazards(
     let mut deleted = std::collections::HashSet::new();
     let mut sockets = std::collections::HashSet::new();
     let mut socket_fds: Vec<(u32, i32)> = Vec::new();
+    // The processes holding each socket, by inode.
+    let mut holders: std::collections::HashMap<u64, Vec<u32>> = Default::default();
     for pid in host_pids {
         let dir = proc_root.join(pid.to_string());
         let links = ["fd", "map_files"].iter().flat_map(|sub| {
@@ -1053,6 +1056,10 @@ pub fn scan_dump_hazards(
                 .and_then(|s| s.parse::<u64>().ok())
             {
                 sockets.insert(ino);
+                let pids = holders.entry(ino).or_default();
+                if !pids.contains(pid) {
+                    pids.push(*pid);
+                }
                 if let Some(fd) = link
                     .strip_prefix(dir.join("fd"))
                     .ok()
@@ -1118,7 +1125,14 @@ pub fn scan_dump_hazards(
                 continue;
             }
             if path.starts_with('@') {
-                if listening.contains(&ino) && !out.abstract_listeners.contains(&path) {
+                if listening.contains(&ino)
+                    && !out.abstract_listeners.contains(&path)
+                    && !is_cuda_uvmfd_listener(
+                        proc_root,
+                        &path,
+                        holders.get(&ino).map_or(&[], Vec::as_slice),
+                    )
+                {
                     out.abstract_listeners.push(path);
                 }
                 continue;
@@ -1804,6 +1818,80 @@ fn reuseport_inet_socket(pid: u32, fd: i32) -> io::Result<Option<String>> {
     Ok(Some(addr))
 }
 
+/// The pid namespace inode and the pid in the name libcuda gives the
+/// socket it listens on in every process that initialises CUDA:
+/// `cuda-uvmfd-<inode of its pid namespace>-<its pid there>` (abstract,
+/// with a NUL at either end; a `SOCK_SEQPACKET` socket on which libcuda
+/// hands the process's `/dev/nvidia-uvm` descriptor to other CUDA processes
+/// of the same pid namespace that ask for it). Only the canonical decimal
+/// form counts.
+pub fn parse_cuda_uvmfd_name(body: &str) -> Option<(u64, u32)> {
+    let (ns, pid) = body.strip_prefix("cuda-uvmfd-")?.split_once('-')?;
+    let ns: u64 = ns.parse().ok()?;
+    let pid: u32 = pid.parse().ok()?;
+    (format!("cuda-uvmfd-{ns}-{pid}") == body).then_some((ns, pid))
+}
+
+/// Whether `path` names a copy of libcuda (`libcuda.so`, `libcuda.so.1`,
+/// `libcuda.so.<driver version>`).
+pub fn is_libcuda_path(path: &str) -> bool {
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    path.starts_with('/')
+        && Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "libcuda.so" || n.starts_with("libcuda.so."))
+}
+
+/// Whether the listening socket with the abstract name `name` (as
+/// `/proc/net/unix` shows it, NULs as `@`) is libcuda's own (see
+/// [`parse_cuda_uvmfd_name`]): one of the processes `holders` that hold it
+/// has libcuda mapped, and the name has the inode of that process's pid
+/// namespace and its pid there.
+///
+/// Such a listener is exempt from the refusal of abstract listeners (see
+/// [`DumpHazards::abstract_listeners`]): its only clients are libcuda in
+/// other processes of the same pid namespace, which find it by that name
+/// and never ask who listens (libcuda does not call `getsockopt`, so
+/// `SO_PEERCRED` saying root after a restore misleads nobody), and
+/// cuda-checkpoint leaves it in place (unlike the process's `/dev/nvidia*`
+/// descriptors, which it closes, so they cannot be what is checked).
+fn is_cuda_uvmfd_listener(proc_root: &Path, name: &str, holders: &[u32]) -> bool {
+    let Some((ns, pid)) = name
+        .strip_prefix('@')
+        .and_then(|n| n.strip_suffix('@'))
+        .and_then(parse_cuda_uvmfd_name)
+    else {
+        return false;
+    };
+    holders.iter().any(|holder| {
+        let dir = proc_root.join(holder.to_string());
+        let pid_ns = fs::read_link(dir.join("ns/pid")).ok().and_then(|l| {
+            l.to_str()?
+                .strip_prefix("pid:[")?
+                .strip_suffix(']')?
+                .parse::<u64>()
+                .ok()
+        });
+        // The last NSpid is the pid in the process's own pid namespace.
+        let ns_pid = fs::read_to_string(dir.join("status")).ok().and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("NSpid:"))?
+                .split_whitespace()
+                .last()?
+                .parse::<u32>()
+                .ok()
+        });
+        pid_ns == Some(ns)
+            && ns_pid == Some(pid)
+            && fs::read_to_string(dir.join("maps")).is_ok_and(|maps| {
+                maps.lines()
+                    .filter_map(|l| l.split_whitespace().nth(5))
+                    .any(is_libcuda_path)
+            })
+    })
+}
+
 /// `(inode, path)` of each bound socket in `/proc/net/unix`.
 pub fn parse_net_unix(table: &str) -> Vec<(u64, String)> {
     table
@@ -2180,8 +2268,8 @@ mod tests {
     /// installs them (and threads it starts), so the other tests are not
     /// affected.
     ///
-    /// The only `unsafe` in the workspace, in a test: neither rustix nor nix
-    /// installs seccomp filters.
+    /// One of the two `unsafe` blocks in the workspace, both in tests:
+    /// neither rustix nor nix installs seccomp filters.
     #[allow(unsafe_code)]
     fn deny_pidfd_getfd_in_this_thread() {
         use nix::libc;
@@ -2356,6 +2444,132 @@ mod tests {
             parse_net_unix_listening(u),
             std::collections::HashSet::from([4242])
         );
+    }
+
+    #[test]
+    fn parses_libcudas_socket_names_and_paths() {
+        assert_eq!(
+            parse_cuda_uvmfd_name("cuda-uvmfd-4026532358-2"),
+            Some((4026532358, 2))
+        );
+        for bad in [
+            "cuda-uvmfd-4026532358-02",
+            "cuda-uvmfd-04026532358-2",
+            "cuda-uvmfd-4026532358-+2",
+            "cuda-uvmfd-4026532358-2-3",
+            "cuda-uvmfd-4026532358-",
+            "cuda-uvmfd--2",
+            "cuda-uvmfd-4026532358-2\0",
+            "xcuda-uvmfd-4026532358-2",
+        ] {
+            assert_eq!(parse_cuda_uvmfd_name(bad), None, "{bad}");
+        }
+        for good in [
+            "/usr/lib/x86_64-linux-gnu/libcuda.so.595.99.02",
+            "/usr/lib/libcuda.so.1",
+            "/opt/libcuda.so",
+            "/usr/lib/libcuda.so.1 (deleted)",
+        ] {
+            assert!(is_libcuda_path(good), "{good}");
+        }
+        for bad in [
+            "libcuda.so.1",
+            "/usr/lib/libcudart.so.12",
+            "/usr/lib/libcuda.so1",
+            "/x/libcuda.sox",
+        ] {
+            assert!(!is_libcuda_path(bad), "{bad}");
+        }
+    }
+
+    /// A process of its own (see `FixtureChild`) listening on libcuda's
+    /// name for it (`cuda-uvmfd-<pid ns inode>-<pid>`, NUL-terminated) and
+    /// on near misses of it; with a file named `libcuda.so.1` mapped when
+    /// its directory has one. Only the exact name of a process with
+    /// libcuda mapped is left out of `abstract_listeners`.
+    #[test]
+    fn exempts_only_libcudas_own_listener() {
+        use crate::testing::{FixtureChild, fixture_dir, fixture_ready};
+        use std::os::linux::net::SocketAddrExt;
+        if let Some(dir) = fixture_dir() {
+            let lib = dir.join("libcuda.so.1");
+            #[allow(unsafe_code)]
+            let _map = lib.exists().then(|| {
+                let f = fs::File::open(&lib).unwrap();
+                // SAFETY: a new private read-only mapping, never accessed.
+                // The other `unsafe` block of the workspace is in
+                // `deny_pidfd_getfd_in_this_thread`.
+                unsafe {
+                    rustix::mm::mmap(
+                        std::ptr::null_mut(),
+                        4096,
+                        rustix::mm::ProtFlags::READ,
+                        rustix::mm::MapFlags::PRIVATE,
+                        &f,
+                        0,
+                    )
+                }
+                .unwrap()
+            });
+            let ns: u64 = fs::read_link("/proc/self/ns/pid")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .trim_start_matches("pid:[")
+                .trim_end_matches(']')
+                .parse()
+                .unwrap();
+            let pid = std::process::id();
+            let names = [
+                format!("cuda-uvmfd-{ns}-{pid}\0"),
+                format!("cuda-uvmfd-{ns}-{}\0", pid + 1),
+                format!("cuda-uvmfd-{}-{pid}\0", ns + 1),
+                format!("cuda-uvmfd-{ns}-{pid}"),
+                format!("cuda-uvmfd-{ns}-0{pid}\0"),
+            ];
+            let _listeners: Vec<_> = names
+                .iter()
+                .map(|n| {
+                    let addr =
+                        std::os::unix::net::SocketAddr::from_abstract_name(n.as_bytes()).unwrap();
+                    std::os::unix::net::UnixListener::bind_addr(&addr).unwrap()
+                })
+                .collect();
+            fixture_ready(&format!("{ns} {pid}"));
+            return;
+        }
+        let name = "host::tests::exempts_only_libcudas_own_listener";
+        let scan = |with_libcuda: bool| {
+            let tmp = tempfile::tempdir().unwrap();
+            if with_libcuda {
+                fs::write(tmp.path().join("libcuda.so.1"), vec![0u8; 4096]).unwrap();
+            }
+            let fixture = FixtureChild::spawn(name, tmp.path());
+            let (ns, pid) = fixture.payload.split_once(' ').unwrap();
+            let (ns, pid): (u64, u32) = (ns.parse().unwrap(), pid.parse().unwrap());
+            let h = scan_dump_hazards(Path::new("/proc"), &[fixture.pid()], &[]).unwrap();
+            let mut got = h.abstract_listeners;
+            got.sort();
+            (ns, pid, got)
+        };
+        let others = |ns: u64, pid: u32| {
+            vec![
+                format!("@cuda-uvmfd-{ns}-0{pid}@"),
+                format!("@cuda-uvmfd-{ns}-{pid}"),
+                format!("@cuda-uvmfd-{ns}-{}@", pid + 1),
+                format!("@cuda-uvmfd-{}-{pid}@", ns + 1),
+            ]
+        };
+        let (ns, pid, got) = scan(true);
+        let mut want = others(ns, pid);
+        want.sort();
+        assert_eq!(got, want);
+        // Without libcuda, its own name is refused too.
+        let (ns, pid, got) = scan(false);
+        let mut want = others(ns, pid);
+        want.push(format!("@cuda-uvmfd-{ns}-{pid}@"));
+        want.sort();
+        assert_eq!(got, want);
     }
 
     /// A process of its own (see `FixtureChild`): an inotify descriptor, a

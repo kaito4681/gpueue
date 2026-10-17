@@ -178,7 +178,16 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   或空的组成部分），不在 `/proc` 之下，位于某个私有 tmpfs 挂载之下，并且它所在的目录能从该挂载出发、通过从作业根
   目录起的描述符、不经过符号链接、也不跨入其他挂载地到达
   （`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV)`）。它还拒绝有 Unix 套接字在抽象名称上监听的作业
-  （CRIU 会以 root 身份设置它们，因此通过 `SO_PEERCRED` 询问谁在监听的客户端会被告知是 root；不监听的抽象套接字没有问题）、
+  （CRIU 会以 root 身份设置它们，因此通过 `SO_PEERCRED` 询问谁在监听的客户端会被告知是 root；不监听的抽象套接字没有问题。
+  libcuda 的除外：每个初始化了 CUDA 的进程都在 `\0cuda-uvmfd-<其 PID 命名空间的 inode>-<它在其中的 PID>\0`
+  （`SOCK_SEQPACKET`）上监听，同一 PID 命名空间中其他进程里的 libcuda 按这个名称连接，用 `SCM_CREDENTIALS` 发送凭据，
+  并取得监听方的 `/dev/nvidia-uvm` 描述符；libcuda 从不调用 `getsockopt`，所以 `SO_PEERCRED` 误导不了谁；
+  cuda-checkpoint 关闭 `/dev/nvidia*` 描述符时会保留这个套接字。持有它的某个进程映射了 libcuda，且名称恰好是该进程
+  的 PID 命名空间 inode 和 PID 时放行（dump 之前的扫描和 post-dump 钩子都如此）。作业也可以这样命名自己的套接字，
+  但只有该 PID 命名空间中的 libcuda 会连接它，而它们不看监听方的凭据。恢复后的名称保留 dump 时的 inode，内核以后
+  可能把它分给另一个 PID 命名空间：在恢复的作业运行期间，那里 PID 相同的进程无法绑定自己的监听套接字，libcuda 的
+  `cuInit` 会以 `CUDA_ERROR_OPERATING_SYSTEM` 失败（反过来，若这样的进程占着该名称，恢复会失败）。主机上任何人本来
+  就能占用这样的名称（抽象名称没有权限，作业共享主机的网络命名空间），gpueue 0.1.3 也是这样恢复这些监听套接字的）、
   有 inotify 或 fanotify 描述符的作业（CRIU 会以 root 身份通过跟随符号链接的路径重新添加它们的监视），并且在 post-dump
   钩子中，拒绝带有 Unix 套接字消息中传输中的描述符（`sk-queues.img` 中的 `SCM_RIGHTS`；CRIU 会以 root 身份重新打开
   它们并交给作业，恢复钩子看不到这一过程，因此该钩子会使转储失败，作业继续运行）的转储。它拒绝带有设置了
@@ -193,7 +202,7 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   在转储之前进行，并在 CRIU 仍停住作业时由 `post-dump` 脚本再次进行；如果作业在此期间打开了这样的描述符，脚本会否决转储
   （CRIU 恢复作业运行，检查点会连同找到的所有原因一起报告为被拒绝）；
 - **在恢复之前**，如果所有者已离开其中某个组、镜像中有绑定在主机文件系统上的套接字（按同样的规则判断其名称）、
-  在抽象名称上监听的套接字、inotify 或 fanotify 描述符、传输中的描述符（`sk-queues.img`），或者有绑定到某个端口的
+  在抽象名称上监听的套接字（libcuda 的除外，只要名称中的 PID 在 `pstree.img` 中且镜像中映射了 libcuda）、inotify 或 fanotify 描述符、传输中的描述符（`sk-queues.img`），或者有绑定到某个端口的
   网络套接字而主机上另一个套接字也占用该端口（任何地址和协议族，相同协议；从 `/proc/net/{tcp,udp,udplite}{,6}`
   读取），就拒绝恢复：CRIU 4.2 会在绑定之前以 root 身份对它恢复的每个网络套接字设置 `SO_REUSEADDR` 和
   `SO_REUSEPORT`，因此它可能加入转储之后占用该端口的某个 root 服务的组。恢复钩子会在 CRIU 绑定套接字之后、作业运行之前

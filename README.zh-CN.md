@@ -425,7 +425,7 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   `/dev/shm` 之外的路径上（例如你的主目录中），或绑定到 `ctl.sock` 这样的相对名称，就无法为它创建检查点；
   检查点会被拒绝，作业继续运行。请把套接字绑定到 `/tmp` 下的绝对路径（途中不含 `..` 或符号链接），或对不监听的
   套接字使用抽象名称。在抽象名称上*监听*的套接字无法创建检查点（CRIU 会以 root 身份设置它，其客户端会看到
-  root 是监听者）。
+  root 是监听者），但 libcuda 在每个 CUDA 进程中监听的套接字（`@cuda-uvmfd-<PID 命名空间的 inode>-<PID>@`）除外。
 - **inotify、fanotify 和传输中的描述符：** 如果作业有 inotify 或 fanotify 描述符（文件监视器），或在创建检查点的
   那一刻正通过 Unix 套接字传递描述符（`SCM_RIGHTS`），就无法为它创建检查点（CRIU 会以 root 身份重新创建它们）。
 - **监听端口：** 如果作业的 TCP 或 UDP 套接字绑定了某个端口，仍可为它创建检查点（Jupyter、TensorBoard），但只有在

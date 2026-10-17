@@ -2321,7 +2321,10 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
   シンボリックリンクや別のマウントを経由して到達するものも同様です。
 - `the job has Unix sockets listening on the abstract names [...]`：CRIU はリスナーを root としてセット
   アップするので、誰が待ち受けているかを確認するクライアント（`SO_PEERCRED`）には root と見えてしまいます。
-  代わりに `/tmp` 以下のパスで待ち受けてください。
+  代わりに `/tmp` 以下のパスで待ち受けてください。CUDA を初期化したすべてのプロセスで libcuda が待ち受ける
+  `@cuda-uvmfd-<PID 名前空間の inode>-<PID>@` は、名前がそのプロセスの PID 名前空間の inode とそこでの PID を
+  持ち、プロセスが libcuda をマップしていれば拒否されません（そのクライアントはジョブのほかのプロセスの libcuda
+  だけで、誰が待ち受けているかを尋ねません）。名前が似ているだけのものはほかと同様に拒否されます。
 - `the job has inotify or fanotify descriptors (...)`：CRIU は監視を root として、パスで再登録することになり
   ます。チェックポイントの前にファイル監視を閉じるか、ジョブを `--no-checkpoint` で実行してください。
 - `Post dump script passed with 1` と、CRIU のログにある `descriptors in flight in Unix socket messages

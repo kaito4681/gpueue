@@ -26,6 +26,12 @@
 //!   CRIU re-opens as root and passes to the job, out of sight of the
 //!   restore hook (see [`read_in_flight_fds`]).
 //!
+//! libcuda's own listener (`cuda-uvmfd-<pid ns inode>-<pid>`, see
+//! [`crate::host::parse_cuda_uvmfd_name`]) is told apart from other
+//! abstract listeners; the helper restores it when `pstree.img` (the
+//! `pid`, field 1, of each `pstree_entry`, `images/pstree.proto`) has a
+//! process with that pid and the job has libcuda mapped.
+//!
 //! An image file is one or two `u32` magic numbers followed by entries,
 //! each a little-endian `u32` size and a protobuf message of that size.
 //! Only the fields above are decoded; everything else is skipped by its
@@ -44,6 +50,9 @@ pub const FILES_IMAGE: &str = "files.img";
 
 /// Name of the image with the queued messages of the job's sockets.
 pub const SK_QUEUES_IMAGE: &str = "sk-queues.img";
+
+/// Name of the image with the job's process tree.
+pub const PSTREE_IMAGE: &str = "pstree.img";
 
 /// `fd_types` (`images/fdinfo.proto`).
 const REG: u64 = 1;
@@ -80,8 +89,12 @@ pub struct ImagePaths {
     pub files: Vec<String>,
     /// Paths Unix sockets were bound to (abstract names are left out).
     pub unix_sockets: Vec<String>,
-    /// Abstract names (`@name`) of listening Unix sockets.
+    /// Abstract names (`@name`, NULs shown as `@`) of listening Unix
+    /// sockets, but for libcuda's.
     pub abstract_listeners: Vec<String>,
+    /// libcuda's listening sockets (`@cuda-uvmfd-<pid ns inode>-<pid>@`),
+    /// with the pid in their name.
+    pub cuda_uvmfd_listeners: Vec<(String, u32)>,
     /// The ports internet sockets were bound to.
     pub inet_ports: Vec<InetPort>,
     /// How many inotify and fanotify descriptors there are.
@@ -146,8 +159,21 @@ pub fn parse_files_image(bytes: &[u8]) -> Result<ImagePaths, String> {
                 }
                 if name[0] == 0 {
                     if varint_field(usk, 4)? == Some(TCP_LISTEN) {
-                        let name = format!("@{}", String::from_utf8_lossy(&name[1..]));
-                        push_unique(&mut out.abstract_listeners, name);
+                        let shown =
+                            format!("@{}", String::from_utf8_lossy(&name[1..])).replace('\0', "@");
+                        // libcuda binds the name with a NUL at its end.
+                        let cuda = name[1..]
+                            .strip_suffix(b"\0")
+                            .and_then(|b| std::str::from_utf8(b).ok())
+                            .and_then(crate::host::parse_cuda_uvmfd_name);
+                        match cuda {
+                            Some((_, pid)) => {
+                                if !out.cuda_uvmfd_listeners.iter().any(|(n, _)| *n == shown) {
+                                    out.cuda_uvmfd_listeners.push((shown, pid));
+                                }
+                            }
+                            None => push_unique(&mut out.abstract_listeners, shown),
+                        }
                     }
                     continue;
                 }
@@ -164,6 +190,28 @@ pub fn parse_files_image(bytes: &[u8]) -> Result<ImagePaths, String> {
             }
             _ => {}
         }
+    }
+    Ok(out)
+}
+
+/// The pids (in the job's pid namespace) of the processes in
+/// `<images_dir>/pstree.img`; none if there is no such image.
+pub fn read_pids(images_dir: &Path) -> io::Result<Vec<u32>> {
+    match fs::read(images_dir.join(PSTREE_IMAGE)) {
+        Ok(bytes) => parse_pstree_image(&bytes).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("{PSTREE_IMAGE}: {e}"))
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The `pid` of each entry of `pstree.img`.
+pub fn parse_pstree_image(bytes: &[u8]) -> Result<Vec<u32>, String> {
+    let mut out = Vec::new();
+    for entry in entries(bytes)? {
+        let pid = varint_field(entry, 1)?.ok_or("a process without a pid")?;
+        out.push(u32::try_from(pid).map_err(|_| "invalid pid of a process")?);
     }
     Ok(out)
 }
@@ -494,6 +542,11 @@ pub(crate) mod tests {
             usk(b"\0listen", TCP_LISTEN),
             usk(b"\0dgram", 7),
             usk(b"/tmp/l.sock", TCP_LISTEN),
+            // libcuda's, and near misses.
+            usk(b"\0cuda-uvmfd-4026532358-2\0", TCP_LISTEN),
+            usk(b"\0cuda-uvmfd-4026532358-2", TCP_LISTEN),
+            usk(b"\0cuda-uvmfd-4026532358-02\0", TCP_LISTEN),
+            usk(b"\0cuda-uvmfd-4026532358-3\0", 7),
         ]);
         let p = parse_files_image(&img).unwrap();
         assert_eq!(
@@ -511,8 +564,39 @@ pub(crate) mod tests {
         );
         assert_eq!(p.inet_ports[0].to_string(), "TCP port 8888");
         assert_eq!(p.notify_fds, 2);
-        assert_eq!(p.abstract_listeners, ["@listen"]);
+        assert_eq!(
+            p.abstract_listeners,
+            [
+                "@listen",
+                "@cuda-uvmfd-4026532358-2",
+                "@cuda-uvmfd-4026532358-02@"
+            ]
+        );
+        assert_eq!(
+            p.cuda_uvmfd_listeners,
+            [("@cuda-uvmfd-4026532358-2@".to_owned(), 2)]
+        );
         assert_eq!(p.unix_sockets, ["/tmp/l.sock"]);
+    }
+
+    #[test]
+    fn reads_pids_of_the_process_tree() {
+        let entry = |pid: u64, threads: &[u64]| {
+            let mut e = Vec::new();
+            field_varint(1, pid, &mut e);
+            field_varint(2, 1, &mut e);
+            for t in threads {
+                field_varint(5, *t, &mut e);
+            }
+            e
+        };
+        let img = image(&[entry(1, &[1]), entry(2, &[2, 7]), entry(3, &[3])]);
+        assert_eq!(parse_pstree_image(&img).unwrap(), [1, 2, 3]);
+        assert!(parse_pstree_image(&image(&[vec![16, 1]])).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_pids(dir.path()).unwrap().is_empty());
+        fs::write(dir.path().join(PSTREE_IMAGE), &img).unwrap();
+        assert_eq!(read_pids(dir.path()).unwrap(), [1, 2, 3]);
     }
 
     #[test]
