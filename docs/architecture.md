@@ -89,7 +89,12 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
 4. **Helper → systemd.** Over D-Bus the helper starts a transient service whose main process is
    `gpueue-helper shim`, run from a content-addressed copy of the helper binary
    (`<data_dir>/lib/gpueue-helper-<hash>`, see [Helper binary copies](#helper-binary-copies)). The
-   unit has `Before=gpueue-helper.service`, `After=remote-fs.target network.target` (ordering
+   unit's description names the job id and the owner's uid only (not the command line, since
+   unit descriptions are readable by every local user and logged). Its capability bounding set
+   is limited to what the shim needs before it drops privileges (`CAP_SYS_ADMIN`, `CAP_SETUID`,
+   `CAP_SETGID`, `CAP_SETPCAP`, `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`, `CAP_KILL`); once the
+   namespace init is started, the outer shim keeps `CAP_KILL` alone (to forward signals to the
+   init, which then runs as the owner). The unit has `Before=gpueue-helper.service`, `After=remote-fs.target network.target` (ordering
    only) and `KillMode=mixed`, stdin is `/dev/null`, and the stop timeout is `grace_secs`. Each job lives in its own cgroup, outside the
    daemon, the helper and the user's session, so it survives restarts of the daemon and the
    helper and the user logging out. With `gpu_device_isolation` (the default) the unit also has
@@ -285,8 +290,9 @@ hold a root file opened with the dump-time mode. The helper therefore:
   directory, executable and file mapping of the tasks through `/proc`, enters the job's
   mount namespace, drops to the owner, and requires that the owner may access each of them the
   way it is open (`faccessat2` on the pinned file) and reaches it by its path, without
-  symlinks, as the same inode. It also requires that every task runs as the owner, with groups
-  the owner is still in and without capabilities. Files on the job's own mounts (`/proc`, the
+  symlinks, as the same inode. It also requires that every thread of every task runs as the
+  owner, with groups the owner is still in, without capabilities, with an empty capability
+  bounding set and with `no_new_privs`. Files on the job's own mounts (`/proc`, the
   private tmpfs) come from the image and are skipped. A file the job held at the dump only
   needs its path to lead to that very file: a job may hold a file in a way its owner could not
   open it again (created read-only, or on an sshfs mount that shows files as root's), and
@@ -294,9 +300,10 @@ hold a root file opened with the dump-time mode. The helper therefore:
   dump and again by `gpueue-helper dump-hook`, CRIU's `post-dump` action script, which runs
   while the dumped tasks are still stopped under CRIU's control (so a file the job opened
   just before CRIU stopped it counts too). It is that file if it has the device and
-  inode recorded at the dump, or (after a remount, when device numbers change and FUSE
-  filesystems such as sshfs have renumbered their inodes) the owner, group, mode, size,
-  modification and change times recorded right after the dump; the change time cannot be set by
+  inode recorded at the dump, or (only after a remount, when the device number changed, or on a
+  FUSE or network filesystem, whose inode numbers are not stable: sshfs renumbers them) the owner,
+  group, mode, size, modification and change times, and the birth time where the filesystem
+  reports one, recorded right after the dump; the change time cannot be set by
   users, and renaming or linking another file there changes it (see
   [Filesystems and mounts](install.md#filesystems-and-mounts)). The helper looks these
   attributes up in a child process with a deadline, so that a filesystem that does not answer
@@ -392,7 +399,10 @@ cannot dump a deleted executable of that size). At start-up the helper therefore
 and renamed into place, then checked like the other root-owned paths), and job units run that
 copy. The job record and the record kept with the image (`helper-job.json`) name it
 (`shim_exe`), so a restore puts the tree back on the binary it was dumped with, and a refused
-restore says so when the copy is missing. At each start the helper removes the copies that are
+restore says so when the copy is missing. Before a restore the helper also checks that the binary
+is a regular file owned by root and writable by nobody else, and that a copy still has the contents
+its name says; at start-up it checks its own binary and the directories above it like the other
+root-owned paths. At each start the helper removes the copies that are
 neither its own nor named by a job record or an image's record, nor mapped by an image
 (`files.img`); if a checkpoint cannot be read, nothing is removed. On NixOS the helper runs from
 the Nix store, whose paths do not change; it makes no copy, and the Nix GC roots

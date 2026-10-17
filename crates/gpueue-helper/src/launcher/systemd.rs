@@ -36,7 +36,7 @@
 //! `ExecStartPost=`) so it shares the executor, timeouts and error
 //! reporting of every other checkpoint step.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -74,10 +74,8 @@ pub const HELPER_UNIT: &str = "gpueue-helper.service";
 /// The units every job unit is ordered after (see [`common_props`]).
 pub const JOB_UNIT_AFTER: [&str; 2] = ["remote-fs.target", "network.target"];
 
-const CAP_CHOWN: u64 = 0;
 const CAP_DAC_OVERRIDE: u64 = 1;
 const CAP_DAC_READ_SEARCH: u64 = 2;
-const CAP_FOWNER: u64 = 3;
 const CAP_KILL: u64 = 5;
 const CAP_SETGID: u64 = 6;
 const CAP_SETUID: u64 = 7;
@@ -85,15 +83,14 @@ const CAP_SETPCAP: u64 = 8;
 const CAP_SYS_ADMIN: u64 = 21;
 /// What the root shim needs before it drops everything: namespaces and
 /// mounts, changing credentials, dropping the bounding set, and reading its
-/// root-only job files.
+/// root-only job files; the outer shim keeps `CAP_KILL` alone, to forward
+/// signals to the init once that runs as the job's owner.
 pub const SHIM_CAPS: u64 = (1 << CAP_SYS_ADMIN)
     | (1 << CAP_SETUID)
     | (1 << CAP_SETGID)
     | (1 << CAP_SETPCAP)
     | (1 << CAP_DAC_OVERRIDE)
     | (1 << CAP_DAC_READ_SEARCH)
-    | (1 << CAP_FOWNER)
-    | (1 << CAP_CHOWN)
     | (1 << CAP_KILL);
 
 const POLL: Duration = Duration::from_millis(50);
@@ -350,11 +347,9 @@ impl Launcher for SystemdLauncher {
     async fn spawn(&self, spec: &LaunchSpec) -> LaunchResult<u32> {
         let exe = spec.exe.to_string_lossy().into_owned();
         let dir = spec.files.dir().to_string_lossy().into_owned();
-        let mut props = self.common_props(format!(
-            "gpueue job {}: {}",
-            spec.job.0,
-            spec.argv.join(" ")
-        ));
+        // Not the command line: unit descriptions are readable by every
+        // local user and logged to the journal.
+        let mut props = self.common_props(format!("gpueue job {} of uid {}", spec.job.0, spec.uid));
         props.extend(device_props(spec.devices.as_deref()));
         props.extend([
             ("Type", Value::from("exec")),
@@ -379,12 +374,15 @@ impl Launcher for SystemdLauncher {
     }
 
     async fn restore(&self, spec: &RestoreSpec) -> LaunchResult<u32> {
-        let criu = resolve_program(&spec.command.program).ok_or_else(|| {
-            LaunchError::internal(format!(
-                "{} not found in PATH",
-                spec.command.program.display()
-            ))
-        })?;
+        // The helper made the programs it runs absolute at its start (see
+        // `HelperConfig::resolve_programs`); a name is not looked up here.
+        let criu = &spec.command.program;
+        if !criu.is_absolute() {
+            return Err(LaunchError::internal(format!(
+                "{} is not an absolute path",
+                criu.display()
+            )));
+        }
         let mut argv = vec![
             self.helper_exe.to_string_lossy().into_owned(),
             "criu-wrap".to_owned(),
@@ -644,21 +642,6 @@ pub fn exit_status_from_systemd(code: i32, status: i32) -> Option<ExitStatus> {
     }
 }
 
-/// Absolute path of `program`, searching `PATH` for bare names (transient
-/// units need an absolute `ExecStart`).
-pub fn resolve_program(program: &Path) -> Option<PathBuf> {
-    if program.is_absolute() {
-        return Some(program.to_owned());
-    }
-    if program.components().count() > 1 {
-        return std::env::current_dir().ok().map(|d| d.join(program));
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(program))
-        .find(|p| p.is_file())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,14 +724,5 @@ mod tests {
         let props = device_props(Some(&[]));
         assert_eq!(props[0], ("DevicePolicy", Value::from("closed")));
         assert_eq!(props[1].1.value_signature().to_string(), "a(ss)");
-    }
-
-    #[test]
-    fn resolves_programs() {
-        assert_eq!(
-            resolve_program(Path::new("/usr/sbin/criu")),
-            Some(PathBuf::from("/usr/sbin/criu"))
-        );
-        assert!(resolve_program(Path::new("sh")).is_some_and(|p| p.is_absolute()));
     }
 }

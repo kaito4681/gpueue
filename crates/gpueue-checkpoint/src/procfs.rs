@@ -58,6 +58,13 @@ pub enum Unrunnable {
     CgroupFrozen(PathBuf),
 }
 
+/// The PID namespace of `/proc/<pid>` (under `proc_root`): the target of
+/// its `ns/pid` link (`pid:[<inode>]`). Fails with `NotFound` when the
+/// process is gone (a zombie has no namespaces left).
+pub fn pid_ns(proc_root: &Path, pid: u32) -> io::Result<PathBuf> {
+    fs::read_link(proc_root.join(pid.to_string()).join("ns/pid"))
+}
+
 /// What [`inspect`] found out about a task.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskState {

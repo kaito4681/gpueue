@@ -223,6 +223,33 @@ fn relabel_copies(dir: &Path, xattr: &str, label: Option<&[u8]>) {
     }
 }
 
+/// Before a restore runs the binary `exe` that a checkpoint was dumped
+/// with: it must be a regular file (not a symlink) owned by the helper's
+/// user (root) and writable by nobody else, and a copy in `copy_dir` must
+/// still have the contents its name says.
+pub fn verify(exe: &Path, copy_dir: Option<&Path>) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let what = |e: &dyn std::fmt::Display| format!("{}: {e}", exe.display());
+    let meta = fs::symlink_metadata(exe).map_err(|e| what(&e))?;
+    if !meta.is_file() {
+        return Err(what(&"not a regular file"));
+    }
+    if meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o022 != 0 {
+        return Err(what(
+            &"may be changed by someone other than the helper's user",
+        ));
+    }
+    if let Some(dir) = copy_dir
+        && is_copy(dir, exe)
+    {
+        let contents = read_all(exe).map_err(|e| what(&e))?;
+        if exe.file_name().and_then(|n| n.to_str()) != Some(file_name(&contents).as_str()) {
+            return Err(what(&"its contents are not those it was copied with"));
+        }
+    }
+    Ok(())
+}
+
 /// Removes the copies in `dir` that are not in `keep`, and temporary files
 /// of interrupted installs. Returns what was removed. Other files (the
 /// fork guard) are left alone.
@@ -256,6 +283,27 @@ pub fn collect_garbage(dir: &Path, keep: &BTreeSet<PathBuf>) -> io::Result<Vec<P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifies_copies_before_they_are_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        let copy = install(&lib, &exe(tmp.path(), b"\x7fELF helper")).unwrap();
+        assert_eq!(verify(&copy, Some(&lib)), Ok(()));
+        // Changed in place: its name no longer matches.
+        fs::write(&copy, b"\x7fELF other").unwrap();
+        let e = verify(&copy, Some(&lib)).unwrap_err();
+        assert!(e.contains("contents"), "{e}");
+        // Not a copy: only who may change it matters.
+        assert_eq!(verify(&copy, None), Ok(()));
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o775)).unwrap();
+        let e = verify(&copy, None).unwrap_err();
+        assert!(e.contains("someone other"), "{e}");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&copy, &link).unwrap();
+        assert!(verify(&link, None).is_err());
+    }
 
     fn exe(dir: &Path, contents: &[u8]) -> PathBuf {
         let p = dir.join("gpueue-helper");

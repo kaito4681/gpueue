@@ -36,7 +36,9 @@ pub struct LaunchSpec {
     /// The job's files; `spawn.json` (credentials, command, environment)
     /// is already written.
     pub files: JobFiles,
-    /// For the unit description and tests; the shim reads `spawn.json`.
+    /// The job's owner, for the unit description.
+    pub uid: u32,
+    /// For tests; the shim reads `spawn.json`.
     pub argv: Vec<String>,
     pub envs: BTreeMap<String, String>,
     /// See [`RestoreSpec::devices`].
