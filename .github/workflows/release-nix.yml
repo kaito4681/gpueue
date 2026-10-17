@@ -29,8 +29,9 @@ jobs:
   stable-branch:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # Pushes the stable branch with the token the checkout keeps in
-    # .git/config; the job runs nothing but its own shell, git and gh.
+    # Pushes the stable branch with the token the checkout persists for git
+    # (in .git/config, or since checkout v6 in a file under $RUNNER_TEMP that
+    # .git/config includes); the job runs nothing but its own shell, git and gh.
     permissions:
       contents: write
     env:
