@@ -41,6 +41,29 @@ fn command_definition_is_valid() {
 // --- Global options -------------------------------------------------------------------------
 
 #[test]
+fn top_level_json_prints_the_job_list_or_passes_on() {
+    let cli = parse(&["--json"]);
+    assert_eq!(cli.json_unsupported_by(), None);
+    assert!(matches!(
+        cli.subcommand(),
+        SubCommand::Status { json: true, .. }
+    ));
+    assert!(matches!(
+        cmd(&["-j", "gpu"]),
+        SubCommand::Gpu { json: true, .. }
+    ));
+    assert!(matches!(
+        cmd(&["--json", "log", "3"]),
+        SubCommand::Log { json: true, .. }
+    ));
+    assert_eq!(
+        parse(&["--json", "kill", "3"]).json_unsupported_by(),
+        Some("kill")
+    );
+    assert_eq!(parse(&["kill", "3"]).json_unsupported_by(), None);
+}
+
+#[test]
 fn no_subcommand_defaults_to_status() {
     let cli = parse(&[]);
     assert_eq!(cli.cmd, None);

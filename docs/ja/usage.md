@@ -66,7 +66,9 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 <a id="json-output"></a>
 ## JSON 出力
 
-`gpueue status --json` は `{"groups": [...], "jobs": [...]}` を出力します。
+`gpueue status --json`（または `gpueue --json` だけ）は `{"groups": [...], "jobs": [...]}` を出力します。
+`--json` の出力はすべて、標準出力が端末ならインデントして表示し、それ以外（パイプ、`jq` やスクリプト）では
+1 行で出力します。
 
 ```json
 {

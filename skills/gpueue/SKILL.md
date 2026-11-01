@@ -111,7 +111,7 @@ gpueue wait 7 8 --status success -q   # exits non-zero if any of them did not su
 - Run long `wait`/`follow` calls in the background or with a timeout if the agent's tool has
   one; they are cheap (event stream, no polling).
 - For machine-readable output use `--json` on `status`, `log`, `gpu`, `group`, `prio` and
-  `share`. See [references/json.md](references/json.md) for the schema and `jq` recipes.
+  `share`; `gpueue --json` alone prints the job list like `gpueue status --json`. See [references/json.md](references/json.md) for the schema and `jq` recipes.
 
 ## 4. Control jobs
 

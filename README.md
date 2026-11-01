@@ -250,6 +250,10 @@ Options:
           [env: GPUEUE_SOCKET=]
           [default: /run/gpueue/gpueue.sock]
 
+  -j, --json
+          Print JSON: alone, the job list as `status --json` does; before a command that has
+          `--json`, the same as giving it to that command
+
   -h, --help
           Print help (see a summary with '-h')
 
