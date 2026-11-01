@@ -75,7 +75,8 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    checkpointed but the helper runs normally lost its checkpoint request and goes back to running
    (or paused) with a failed checkpoint. Should the outcome of that dump arrive after all (the
    helper resumes a job before it reports a failed dump), it is applied: a dump CRIU attempted
-   terminates the job, as after any failed dump, and a refused one leaves it alone. The daemon
+   whose rollback did not fully succeed terminates the job, as after any such failed dump, and a
+   refused or cleanly rolled-back one leaves it alone. The daemon
    launches jobs only once it has reconciled the current connection; should the helper not
    answer its request for the live jobs, it asks again. If that checkpoint request is still unanswered, or was
    answered since the previous reconnect, the list may predate it, so the daemon checks again once
@@ -184,7 +185,10 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    the job as checkpointed); it finalizes the image before restoring it or when it starts again,
    also after a crash between the dump and the marker, even if systemd still reports the dumped
    unit as active. If the dump fails, CRIU
-   leaves the process running and the daemon then terminates it. A failed dump with an error
+   leaves the process running and the helper rolls back the CUDA state. When the rollback
+   succeeds (and CRIU was not killed at the deadline), the helper reports the failure as
+   `checkpoint_rolled_back` and the job keeps running (paused again if it was paused);
+   otherwise the daemon terminates it. A failed dump with an error
    code the daemon does not know (from a newer helper) counts as refused: the job keeps running. The helper moves CRIU's
    `dump.log` to `/var/lib/gpueue/checkpoints/failed-logs/` and removes the image directory.
    A **paused** job is resumed (SIGCONT) before the dump, because cuda-checkpoint hangs on a
@@ -499,8 +503,8 @@ run unconfined (`unconfined_service_t`), which may map it.
   `Checkpoint failed` with the reason, and their owners are warned.
 - **`gpueue shutdown`** (administrators) does not rely on unit ordering. The daemon checkpoints
   running jobs one at a time (or terminates them with `--no-checkpoint`), waits for them to settle,
-  and exits. The helper keeps running. A job whose dump fails is terminated. A job whose dump the
-  helper refuses is left running, because terminating it would lose the work. The daemon logs a
+  and exits. The helper keeps running. A job whose dump fails is terminated unless the dump was rolled
+  back cleanly. A job whose dump the helper refuses is left running, because terminating it would lose the work. The daemon logs a
   warning and the owner is warned. Stop it with `gpueue kill` or `gpueue shutdown --no-checkpoint`
   if needed.
 - **`systemctl stop/restart gpueue-helper` or `gpueue`** on its own leaves jobs running. A
