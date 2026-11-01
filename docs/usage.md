@@ -140,10 +140,14 @@ A checkpoint can go wrong in two ways:
   reason. If the refusal only comes when the dump is due (for example during `gpueue shutdown`),
   the owner is warned on their next `gpueue` command. The reason is the job's last error in
   `gpueue status` and `gpueue log`.
-- **Failed:** the dump itself fails. CRIU puts the job back, but it has been frozen, so it is
-  stopped (SIGTERM, which gives it a chance to save its own checkpoint, then SIGKILL after
-  `grace_secs`) and shown as `Checkpoint failed` with the reason. The owner is warned on their next
-  `gpueue` command.
+- **Failed:** the dump itself fails (for example, a deleted file larger than CRIU's limit or a
+  file lock the job holds). CRIU puts the job back and the helper undoes what it did to the job's
+  CUDA state; when all of that succeeds, the job keeps running, and the reason (starting with
+  `checkpoint failed, the job keeps running:`) is its last error in `gpueue status` and
+  `gpueue log`. If the job cannot be put back cleanly (its CUDA state cannot be resumed, or CRIU
+  was killed mid-dump at the deadline), it is stopped (SIGTERM, which gives it a chance to save
+  its own checkpoint, then SIGKILL after `grace_secs`) and shown as `Checkpoint failed` with the
+  reason. Either way, the owner is warned on their next `gpueue` command.
 
 During an OS shutdown or reboot, systemd stops every job that could not be saved, whether its dump
 was refused or failed. After the boot it is shown as `Checkpoint failed` with the reason, and the

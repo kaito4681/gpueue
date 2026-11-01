@@ -2388,9 +2388,12 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
 チェックポイントされる一時停止中のジョブは、ダンプのために再開されます。ダンプが拒否されると、再び一時停止
 されます。
 
-試みたダンプが**失敗**すると、CRIU と cuda-checkpoint が既にジョブを凍結しているため、ジョブは停止されます
-（SIGTERM、`grace_secs` 後に SIGKILL）。ジョブは CRIU のログの要約と完全なログのパスとともに
-`Checkpoint failed` とされます。よくある理由：
+試みたダンプが**失敗**すると、ロールバックされます。CRIU がジョブの凍結を解除し、ヘルパーが CUDA の状態を
+再開します。それが成功すれば、ジョブは動き続け（一時停止中だったなら再び一時停止され）、
+`checkpoint failed, the job keeps running:` で始まる最後のエラーに CRIU のログの要約と完全なログのパスが
+入ります。ロールバックが不完全な場合や、期限で CRIU が強制終了された場合は、ジョブの状態を信頼できないため、
+ジョブは停止され（SIGTERM、`grace_secs` 後に SIGKILL）、同じ要約とともに `Checkpoint failed` とされます。
+よくある理由：
 
 - CRIU の要約に `Can't handle non-regular mapping` や `handle_device_vma plugin failed` がある：CUDA プロセスが
   `exec` せずに fork したプロセスが、まだ `/dev/nvidia*` をマップしています。通常は fork ガードがこれを防ぎ

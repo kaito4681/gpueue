@@ -292,6 +292,50 @@ async fn a_dump_failure_with_an_unknown_code_leaves_the_job_alone() {
     core.cancel.cancel();
 }
 
+/// A failed dump the helper rolled back cleanly (a deleted file over the
+/// ghost limit, a file lock) leaves the job running, paused again if it
+/// was paused, with the reason recorded for its owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rolled_back_dump_leaves_the_job_running() {
+    for paused in [false, true] {
+        let helper = FakeHelper::new();
+        let core = core(&helper);
+        let job = live_job(&core, &helper, JobState::Checkpointing).await;
+        let id = job.id;
+        let record = core.new_checkpoint_record(&job, paused, core.now_ms());
+        core.write(move |tx, _| Ok(tx.put_checkpoint(&record)?))
+            .await
+            .unwrap();
+        start(&core).await;
+        helper.emit_event(Event::CheckpointFinished {
+            job: id,
+            outcome: CheckpointOutcome::rolled_back("criu dump failed; the job was resumed"),
+        });
+        if paused {
+            wait_state(&core, id, JobState::Paused).await;
+            assert_eq!(helper.signals(), [(id, signal::SIGSTOP)]);
+        } else {
+            wait_state(&core, id, JobState::Running).await;
+            assert!(helper.signals().is_empty());
+        }
+        assert!(helper.is_running(id));
+        let record = core
+            .read(move |s| s.get_checkpoint(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, CheckpointStatus::Failed);
+        assert_eq!(
+            record.failure_reason.as_deref(),
+            Some(
+                "checkpoint failed, the job keeps running: criu dump failed; the job was \
+                 resumed"
+            )
+        );
+        core.cancel.cancel();
+    }
+}
+
 /// Finding: a launch record left from a request whose answer was lost was
 /// never cleared when the helper listed the job, so a later check could
 /// put the running job back in line (and run it twice). Reconciliation

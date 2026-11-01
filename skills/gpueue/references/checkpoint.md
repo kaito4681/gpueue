@@ -29,8 +29,9 @@ and NVIDIA cuda-checkpoint, without changes to the program.
 
 A **refused** checkpoint leaves the job running and reports why (`gpueue checkpoint` prints the
 reason; otherwise it is the job's last error in `gpueue status` / `gpueue log`). A **failed** dump
-stops the job (SIGTERM, then SIGKILL after a grace period) and shows `Checkpoint failed` with the
-reason. A refused restore keeps the image so it can be retried.
+that CRIU and the helper roll back cleanly also leaves the job running (its last error starts with
+`checkpoint failed, the job keeps running:`); one that cannot be rolled back stops the job
+(SIGTERM, then SIGKILL after a grace period) and shows `Checkpoint failed` with the reason. A refused restore keeps the image so it can be retried.
 
 - **Network:** established TCP connections are closed at checkpoint; the program must reconnect
   after restore.

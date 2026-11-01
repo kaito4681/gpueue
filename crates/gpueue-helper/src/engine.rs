@@ -1435,6 +1435,14 @@ impl<L: Launcher, H: HostProbe> Helper<L, H> {
                         );
                         CheckpointOutcome::refused(reason)
                     }
+                    DumpError::RolledBack(reason) => {
+                        eprintln!(
+                            "gpueue-helper: checkpoint of job {} failed, the job keeps \
+                             running: {reason}",
+                            job.0
+                        );
+                        CheckpointOutcome::rolled_back(reason)
+                    }
                     DumpError::Failed(reason) => {
                         eprintln!(
                             "gpueue-helper: checkpoint of job {} failed: {reason}",
@@ -2562,8 +2570,12 @@ pub enum DumpError {
     /// The pre-checks failed before anything ran against the job; it keeps
     /// running as it was.
     Refused(String),
-    /// The dump was attempted and failed (CRIU rolled back). The reason
-    /// names the preserved CRIU log, if any.
+    /// The dump was attempted and failed, and its rollback succeeded: the
+    /// job runs on. The reason names the preserved CRIU log, if any.
+    RolledBack(String),
+    /// The dump was attempted and failed, and the job's state is not to be
+    /// trusted (the rollback did not fully succeed, or criu was killed
+    /// mid-dump). The reason names the preserved CRIU log, if any.
     Failed(String),
     /// The dump succeeded (the job's processes are gone), but the
     /// checkpoint could not be finalized; the image is kept (see
@@ -3015,7 +3027,13 @@ pub fn dump_job<H: HostProbe + ?Sized>(
                 reason = format!("{reason}: {}", lines.join("; "));
             }
         }
-        return Err(DumpError::Failed(discard_failed_dump(base, &dir, reason)));
+        let reason = discard_failed_dump(base, &dir, reason);
+        // A criu killed mid-dump may have left the job broken even though
+        // the rollback went through.
+        if resumed && !failure.criu_dump_killed() {
+            return Err(DumpError::RolledBack(reason));
+        }
+        return Err(DumpError::Failed(reason));
     }
     // The dump succeeded and the job's processes are gone: from here on the
     // image is never deleted. Writing the rest of the metadata is retried;
