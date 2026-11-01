@@ -2105,6 +2105,10 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
 - `the job holds deleted files with the setuid or setgid bit or file capabilities (...)`：恢复会以 root 身份、
   带着该所有者和权限把它们重新创建出来，成为特权程序。请在创建检查点之前关闭它们，或重启该作业。（其他已删除
   的文件，例如作业运行期间被软件包升级替换掉的库，会保存在镜像中，没有问题。）
+- `the job holds file leases (...)`：恢复时，CRIU 会在把凭据还给作业之前以 root 身份重新获取作业的文件锁。
+  这对 `flock`、POSIX 和 OFD 锁无害，因此它们会被创建检查点（用 `uv run` 启动、对 uv 缓存持有锁的作业也
+  可以创建检查点），但 lease 可能是其所有者本无法获取的。请在创建检查点之前用 `fcntl(F_SETLEASE, F_UNLCK)`
+  释放 lease，或用 `--no-checkpoint` 运行该作业。
 - `... (found while CRIU had the job stopped for the dump); the job was resumed`：作业在转储前的检查之后
   打开了这样的文件；CRIU 的 `post-dump` 检查发现了它，CRIU 放弃了转储。
 - `the job depends on a filesystem that is gone, does not answer or root cannot access: <mount

@@ -257,6 +257,9 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   root 是监听者），但 libcuda 在每个 CUDA 进程中监听的套接字（`@cuda-uvmfd-<PID 命名空间的 inode>-<PID>@`）除外。
 - **inotify、fanotify 和传输中的描述符：** 如果作业有 inotify 或 fanotify 描述符（文件监视器），或在创建检查点的
   那一刻正通过 Unix 套接字传递描述符（`SCM_RIGHTS`），就无法为它创建检查点（CRIU 会以 root 身份重新创建它们）。
+- **文件锁和租约：** `flock`、POSIX（`fcntl`）和 OFD 锁会被保存，并在恢复时重新获取，因此用 `uv run`
+  （运行期间一直锁定其缓存）启动的作业也可以创建检查点。其他进程持有冲突的锁时，恢复会等待（直到其期限；之后恢复失败并保留镜像，可以重试）。持有文件租约
+  （`F_SETLEASE`）的作业无法创建检查点（CRIU 会以 root 身份重新获取它）；请先释放它。
 - **监听端口：** 如果作业的 TCP 或 UDP 套接字绑定了某个端口，仍可为它创建检查点（Jupyter、TensorBoard），但只有在
   主机上没有其他套接字占用该端口时才会恢复；否则恢复会被拒绝，待端口空闲后可以重试。
 - **`SO_REUSEPORT`：** 如果作业有设置了 `SO_REUSEPORT` 的 TCP 或 UDP 套接字，同样无法为它创建检查点

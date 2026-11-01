@@ -131,6 +131,15 @@ pub struct CriuOptions {
     /// `--tcp-close` on dump and restore: TCP connections are closed rather
     /// than refusing to dump.
     pub tcp_close: bool,
+    /// `--file-locks` on dump and restore: the job's `flock`, POSIX and OFD
+    /// locks are saved and taken again (`uv run` holds one on its cache for
+    /// as long as it runs). Without it a job holding any lock cannot be
+    /// dumped. CRIU takes them on the restored descriptors before it
+    /// restores the job's credentials, as root; that gains the job nothing
+    /// for these locks, which only depend on the descriptor's access mode,
+    /// but would for file leases, so the helper refuses jobs that hold
+    /// those. A restore waits for a lock another process holds meanwhile.
+    pub file_locks: bool,
     /// `--external mnt[] --enable-external-masters` on dump and restore, needed
     /// when the job runs in its own mount namespace.
     pub external_mounts: bool,
@@ -153,6 +162,7 @@ impl Default for CriuOptions {
             log_level: 4,
             link_remap: false,
             tcp_close: true,
+            file_locks: true,
             external_mounts: true,
             plugin_dir: None,
             empty_plugin_dir: PathBuf::from("/var/lib/gpueue/criu-no-plugins"),
@@ -178,6 +188,9 @@ impl CriuOptions {
         }
         if self.tcp_close {
             cmd.arg("--tcp-close");
+        }
+        if self.file_locks {
+            cmd.arg("--file-locks");
         }
         match mode {
             CudaMode::Plugin => {
@@ -497,6 +510,7 @@ mod tests {
                 "mnt[]",
                 "--enable-external-masters",
                 "--tcp-close",
+                "--file-locks",
             ]
         );
         assert!(!cmd.has_arg("-L"));
@@ -540,6 +554,21 @@ mod tests {
     }
 
     #[test]
+    fn file_locks_on_dump_and_restore() {
+        let opts = CriuOptions::default();
+        for mode in [CudaMode::Plugin, CudaMode::Manual] {
+            assert!(criu_dump(&opts, mode, &dump_target()).has_arg("--file-locks"));
+            assert!(criu_restore(&opts, mode, &restore_target()).has_arg("--file-locks"));
+        }
+        let opts = CriuOptions {
+            file_locks: false,
+            ..Default::default()
+        };
+        assert!(!criu_dump(&opts, CudaMode::Plugin, &dump_target()).has_arg("--file-locks"));
+        assert!(!criu_restore(&opts, CudaMode::Plugin, &restore_target()).has_arg("--file-locks"));
+    }
+
+    #[test]
     fn dump_flags_can_be_disabled() {
         let opts = CriuOptions {
             tcp_close: false,
@@ -575,6 +604,7 @@ mod tests {
                 "mnt[]",
                 "--enable-external-masters",
                 "--tcp-close",
+                "--file-locks",
                 "--restore-detached",
                 "--root",
                 "/run/gpueue/root",

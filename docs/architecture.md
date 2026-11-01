@@ -172,7 +172,7 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    script fails, CRIU abandons the dump and resumes the job, and the checkpoint is reported as
    refused with the reason. In manual mode it then runs
    `cuda-checkpoint --action lock` and `checkpoint` on each CUDA process, followed by
-   `criu dump` of the namespace's init with `--tcp-close` and the image directory under
+   `criu dump` of the namespace's init with `--tcp-close`, `--file-locks` and the image directory under
    `/var/lib/gpueue/checkpoints/<id>/`. In plugin mode it runs only `criu dump`, with CRIU's
    default plugin directory, and CRIU's `cuda_plugin.so` calls cuda-checkpoint (in plugin mode a
    CUDA job is refused when the plugin is missing). Before the dump it writes what a restore needs
@@ -280,7 +280,14 @@ hold a root file opened with the dump-time mode. The helper therefore:
   it follows symlinks in), and, in the post-dump hook, a dump with descriptors in flight in
   Unix socket messages (`SCM_RIGHTS` in `sk-queues.img`; CRIU re-opens them as root and hands
   them to the job, out of sight of the restore hook, so the hook fails the dump and the job
-  keeps running). It refuses a job with internet sockets that have `SO_REUSEPORT`
+  keeps running). Dumps and restores pass `--file-locks`: CRIU takes the job's locks again on
+  the restored descriptors before it restores the job's credentials, as root (confirmed with CRIU
+  4.2). For `flock`, POSIX and OFD locks that gains nothing, since they only depend on the
+  descriptor's access mode, and a restore waits for a conflicting lock held meanwhile. A file
+  lease depends on owning the file (or `CAP_LEASE`), and CRIU breaks a breaking lease again by
+  opening the file by path, so the helper refuses a job holding a lease, delegation or any lock
+  other than those three (read from `/proc/<pid>/fdinfo/<fd>`, as CRIU does), before the dump and
+  in the post-dump hook. It refuses a job with internet sockets that have `SO_REUSEPORT`
   (CRIU creates sockets as root before it restores the job's credentials, so the restored socket
   would be root's and could join the `SO_REUSEPORT` group of a root service on the same port;
   confirmed with CRIU 4.2; the helper looks at the sockets through `pidfd_getfd`, and refuses

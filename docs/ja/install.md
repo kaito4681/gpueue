@@ -2354,6 +2354,11 @@ CRIU や cuda-checkpoint を `/usr/local/bin` にインストールする代わ�
   root として、その所有者とモードのまま、特権プログラムとして再作成してしまいます。チェックポイントの前に
   閉じるか、ジョブを再起動してください。（それ以外の削除されたファイル、たとえばジョブの実行中にパッケージの
   アップグレードで置き換えられたライブラリは、イメージに保存されるので問題ありません。）
+- `the job holds file leases (...)`：CRIU はリストア時に、ジョブに資格情報を戻す前の root として、ジョブの
+  ファイルロックを取り直します。`flock`、POSIX、OFD のロックではそれが害にならないので、チェックポイント
+  されます（uv のキャッシュにロックをかける `uv run` で起動したジョブもチェックポイントできます）。しかし
+  lease は所有者が取れないものになり得ます。チェックポイントの前に `fcntl(F_SETLEASE, F_UNLCK)` で lease を
+  解放するか、ジョブを `--no-checkpoint` で実行してください。
 - `... (found while CRIU had the job stopped for the dump); the job was resumed`：ジョブがダンプ前の
   チェックのあとでそうしたファイルを開きました。CRIU の `post-dump` のチェックがそれを見つけ、CRIU は
   ダンプを中止しました。
