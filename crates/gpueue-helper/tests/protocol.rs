@@ -2198,7 +2198,11 @@ async fn failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first()
     assert_eq!(r, ResponseResult::Accepted);
     let ev = c.event().await;
     let Event::CheckpointFinished {
-        outcome: CheckpointOutcome::Failed { reason, code: None },
+        outcome:
+            CheckpointOutcome::Failed {
+                reason,
+                code: Some(HelperErrorCode::CheckpointRolledBack),
+            },
         ..
     } = ev.event
     else {
@@ -2245,6 +2249,41 @@ async fn failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first()
         ResponseResult::Ok
     );
     assert!(kept[0].exists());
+}
+
+/// A failed dump whose rollback fails too (here CUDA cannot be resumed)
+/// is reported without a code: the daemon terminates the job.
+#[tokio::test]
+async fn a_failed_dump_with_a_failed_rollback_has_no_code() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(5))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    env.host.set_cuda_pids(vec![10_001]);
+    {
+        let mut exec = env.exec.lock().unwrap();
+        exec.fail_on = Some(|a| matches!(a, Action::CriuDump { .. }));
+        exec.then_fail_on = Some(|a| matches!(a, Action::CudaRestore { .. }));
+    }
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(5),
+            image_dir: env.base().join("5"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    let Event::CheckpointFinished {
+        outcome: CheckpointOutcome::Failed { reason, code: None },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert!(reason.contains("rollback incomplete"), "{reason}");
 }
 
 #[tokio::test]

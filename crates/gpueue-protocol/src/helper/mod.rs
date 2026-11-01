@@ -358,6 +358,11 @@ pub enum HelperErrorCode {
     /// checkpoint. The image is kept; the helper finalizes it before a
     /// restore or at its next start, so the job counts as checkpointed.
     CheckpointUnfinalized,
+    /// In a failed [`CheckpointOutcome`]: the dump was attempted and failed,
+    /// and the rollback succeeded (CRIU thawed the job and its CUDA state
+    /// was restored), so the job runs on. An older daemon takes this
+    /// unknown code as a refusal, which leaves the job alone too.
+    CheckpointRolledBack,
     Internal,
     /// The helper's job credential policy (`job_min_uid`,
     /// `job_denied_groups`, `job_allowed_users`) refuses to run jobs as the
@@ -426,15 +431,17 @@ pub enum CheckpointOutcome {
     Success { image_size_bytes: u64 },
     /// The dump failed.
     ///
-    /// Without `code`, the dump was attempted: CRIU rolled back and the job
-    /// is still running, but it has been frozen and its CUDA state toggled,
-    /// so terminating it is up to the daemon. CRIU's log, if any, was kept
-    /// for administrators and `reason` names its path.
+    /// Without `code`, the dump was attempted and its rollback did not
+    /// fully succeed (or CRIU was killed mid-dump): the job may still run,
+    /// but its state is not to be trusted, so terminating it is up to the
+    /// daemon. CRIU's log, if any, was kept for administrators and `reason`
+    /// names its path.
     Failed {
         reason: String,
-        /// Why, when it is not an attempted dump that CRIU rolled back:
-        /// `checkpoint_refused` when the pre-checks failed before the job
-        /// was touched (it keeps running as it was), and
+        /// Why, when it is not such a dump: `checkpoint_refused` when the
+        /// pre-checks failed before the job was touched (it keeps running
+        /// as it was), `checkpoint_rolled_back` when the dump failed but
+        /// was rolled back cleanly (the job runs on), and
         /// `checkpoint_unfinalized` when the dump succeeded but the image
         /// is not finalized yet. Absent from older helpers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -456,6 +463,15 @@ impl CheckpointOutcome {
         CheckpointOutcome::Failed {
             reason: reason.into(),
             code: Some(HelperErrorCode::CheckpointRefused),
+        }
+    }
+
+    /// A dump that failed and was rolled back cleanly (see
+    /// [`HelperErrorCode::CheckpointRolledBack`]).
+    pub fn rolled_back(reason: impl Into<String>) -> Self {
+        CheckpointOutcome::Failed {
+            reason: reason.into(),
+            code: Some(HelperErrorCode::CheckpointRolledBack),
         }
     }
 
