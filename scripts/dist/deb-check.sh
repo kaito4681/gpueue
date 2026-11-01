@@ -104,6 +104,33 @@ rm -f /tmp/criu-ran
 grep -q 'is not owned by root' /tmp/criu.err || { cat /tmp/criu.err; fail "no warning about a criu root does not own"; }
 must_not_exist /tmp/criu-ran
 rm -f "$fake"
+# A root-owned CRIU on a path a user could redirect is not run either: in a
+# directory a user owns (criu_path), or behind a symlink a user owns.
+real=/usr/local/lib/gpueue-test-criu
+mkdir -p /usr/local/lib
+printf '#!/bin/sh\ntouch /tmp/criu-ran\necho "Version: 3.16"\n' >"$real"
+chmod 755 "$real"
+mkdir -p /srv/user-dir
+cp -p "$real" /srv/user-dir/criu
+chown 1000 /srv/user-dir
+cp -p /etc/gpueue/config.toml /tmp/config.toml.orig
+echo 'criu_path = "/srv/user-dir/criu"' >>/etc/gpueue/config.toml
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+grep -q 'is not owned by root' /tmp/criu.err || { cat /tmp/criu.err; fail "no warning about a criu in a directory a user owns"; }
+must_not_exist /tmp/criu-ran
+cp -p /tmp/config.toml.orig /etc/gpueue/config.toml
+ln -s "$real" "$fake"
+chown -h 1000 "$fake"
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+grep -q 'is not owned by root' /tmp/criu.err || { cat /tmp/criu.err; fail "no warning about a criu behind a symlink a user owns"; }
+must_not_exist /tmp/criu-ran
+# The same symlink owned by root is followed, and its target is what runs.
+chown -h 0 "$fake"
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+grep -q 'CRIU 4.2 or newer is needed to checkpoint (found 3.16 at /usr/local/sbin/criu)' /tmp/criu.err ||
+    { cat /tmp/criu.err; fail "no warning about CRIU 3.16 behind a root-owned symlink"; }
+must_exist /tmp/criu-ran
+rm -rf "$fake" "$real" /srv/user-dir /tmp/criu-ran
 
 step "a rolled-back removal enables the services again (prerm remove, postinst abort-remove)"
 wants=/etc/systemd/system/multi-user.target.wants

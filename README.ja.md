@@ -78,7 +78,8 @@ gpueue には、systemd 240 以降の Linux と、`CONFIG_CHECKPOINT_RESTORE` �
 インストールしません。パッケージは CRIU を推奨するだけで、多くのリリースではその CRIU は古いか存在せず、
 `install.sh` は足りないものを表示するだけです
 （[各方法が何をインストールするか](docs/ja/install.md#dependencies-that-are-not-installed-automatically)を参照）。
-NixOS モジュールは独自の CRIU を持ち込みます。
+NixOS モジュールは独自の CRIU を持ち込みます。`.deb` と `.rpm` は、CRIU がないか 4.2 より古いとインストール時に
+警告し、`gpueue doctor` がディストリビューションに合ったインストール方法を示します。
 
 <a id="dependencies-that-are-not-installed-automatically"></a>
 

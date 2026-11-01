@@ -22,16 +22,62 @@ systemd_running() {
     [ -d /run/systemd/system ]
 }
 
-# Whether $1, what it resolves to and every directory above that are owned by
-# root and not group- or world-writable, as the helper requires of a program
-# it runs as root: nothing else is run here either.
-root_owned() {
-    p=$(readlink -f -- "$1") || return 1
-    while :; do
-        [ -n "$(find "$p" -maxdepth 0 -user 0 ! -perm /022 2>/dev/null)" ] || return 1
-        [ "$p" = / ] && return 0
-        p=$(dirname -- "$p")
+# Whether the absolute path $1 can be trusted to run as root, as the helper
+# requires of a program (see `OwnershipCheck::walk` in gpueue-config): walked
+# one component at a time from /, every directory and the file must be owned
+# by root and not group- or world-writable, and every symlink owned by root;
+# a symlink is followed only once it has been checked, and its target is
+# checked the same way. Sets $resolved to the path with every symlink
+# resolved, which is what is run: nothing along it can change afterwards.
+trusted_path() {
+    resolved=
+    case "$1" in
+    /*) ;;
+    *) return 1 ;;
+    esac
+    cur=/
+    rest=${1#/}
+    hops=0
+    root_only "$cur" || return 1
+    while [ -n "$rest" ]; do
+        c=${rest%%/*}
+        case "$rest" in
+        */*) rest=${rest#*/} ;;
+        *) rest= ;;
+        esac
+        case "$c" in
+        "" | .) continue ;;
+        ..)
+            cur=$(dirname -- "$cur")
+            continue
+            ;;
+        esac
+        if [ "$cur" = / ]; then next=/$c; else next=$cur/$c; fi
+        if [ -L "$next" ]; then
+            [ "$(stat -c %u -- "$next" 2>/dev/null)" = 0 ] || return 1
+            hops=$((hops + 1))
+            [ "$hops" -le 40 ] || return 1
+            target=$(readlink -- "$next") || return 1
+            case "$target" in
+            /*)
+                cur=/
+                target=${target#/}
+                ;;
+            esac
+            rest=$target${rest:+/$rest}
+            continue
+        fi
+        root_only "$next" || return 1
+        cur=$next
     done
+    [ -f "$cur" ] && [ -x "$cur" ] || return 1
+    resolved=$cur
+}
+
+# Whether $1 (not a symlink) exists, is owned by root and is not group- or
+# world-writable.
+root_only() {
+    [ -n "$(find "$1" -maxdepth 0 -user 0 ! -perm /022 2>/dev/null)" ]
 }
 
 # Warns when the CRIU the helper would use is missing or older than 4.2: jobs
@@ -56,11 +102,11 @@ check_criu() {
     esac
     if [ -z "$criu" ]; then
         found="not found"
-    elif ! root_owned "$criu"; then
-        echo "gpueue: warning: $criu is not owned by root (or is writable by others), so the helper will not run it; see \`gpueue doctor\`" >&2
+    elif ! trusted_path "$criu"; then
+        echo "gpueue: warning: $criu (or a directory or symlink on its path) is not owned by root or is writable by others, so the helper will not run it; see \`gpueue doctor\`" >&2
         return 0
     else
-        version=$(timeout 10 "$criu" --version 2>/dev/null |
+        version=$(timeout 10 "$resolved" --version 2>/dev/null |
             sed -n 's/^Version:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' | head -n 1) || true
         # Not parsable: an unusual build, which the helper assumes is new enough.
         [ -n "$version" ] || return 0
