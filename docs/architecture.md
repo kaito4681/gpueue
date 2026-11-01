@@ -282,7 +282,9 @@ hold a root file opened with the dump-time mode. The helper therefore:
   confirmed with CRIU 4.2; the helper looks at the sockets through `pidfd_getfd`, and refuses
   the dump if it cannot), never passes `--link-remap` (with it CRIU links open files that have
   no name of their own back into their directories, as root, by path, while the dump runs):
-  deleted files are saved in the image instead, and a job holding a deleted file that still has
+  deleted files are saved in the image instead (CRIU's `--ghost-limit` is set to the free space
+  of the image base, since the job may create a larger deleted file, such as a PyTorch DataLoader
+  batch in `/dev/shm`, after the checks), and a job holding a deleted file that still has
   another hard link, or a file the NFS client renamed to `.nfs<hex>` because it was deleted while
   open, is refused, since CRIU could only link those back. A restore re-creates a deleted file as
   root with the owner and mode it had, so a job holding a deleted file with the setuid or setgid
