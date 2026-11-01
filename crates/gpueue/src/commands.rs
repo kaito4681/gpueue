@@ -1275,8 +1275,19 @@ struct LogJson {
     output: String,
 }
 
+/// `value` as JSON for stdout: indented on a terminal, on one line otherwise
+/// (for pipes, `jq` and scripts).
 fn to_json<T: Serialize>(value: &T) -> String {
-    serde_json::to_string(value).expect("output serializes")
+    json_text(value, io::stdout().is_terminal())
+}
+
+fn json_text<T: Serialize>(value: &T, pretty: bool) -> String {
+    if pretty {
+        serde_json::to_string_pretty(value)
+    } else {
+        serde_json::to_string(value)
+    }
+    .expect("output serializes")
 }
 
 fn to_u32(value: usize) -> Result<u32> {
@@ -1408,6 +1419,16 @@ mod tests {
 
     use super::*;
     use crate::render::tests::{ctx, job};
+
+    #[test]
+    fn json_is_indented_only_when_asked() {
+        let value = serde_json::json!({"jobs": [{"id": 1}]});
+        assert_eq!(json_text(&value, false), r#"{"jobs":[{"id":1}]}"#);
+        assert_eq!(
+            json_text(&value, true),
+            "{\n  \"jobs\": [\n    {\n      \"id\": 1\n    }\n  ]\n}"
+        );
+    }
 
     #[test]
     fn version_mismatch_hints_at_the_install() {

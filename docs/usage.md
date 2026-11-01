@@ -64,7 +64,9 @@ columns, and `Checkpointed` jobs show the image size.
 
 ## JSON output
 
-`gpueue status --json` (or just `gpueue --json`) prints `{"groups": [...], "jobs": [...]}`:
+`gpueue status --json` (or just `gpueue --json`) prints `{"groups": [...], "jobs": [...]}`. Every
+`--json` output is indented when stdout is a terminal and on one line otherwise (in a pipe, for
+`jq` or a script):
 
 ```json
 {
