@@ -1805,6 +1805,13 @@ async fn dump_refuses_deleted_files_it_cannot_save_safely() {
             },
             "file capabilities",
         ),
+        (
+            DumpHazards {
+                leases: vec!["LEASE on /home/alice/f (process 10001)".into()],
+                ..Default::default()
+            },
+            "file leases",
+        ),
     ];
     for (hazards, why) in cases {
         env.host.set_dump_hazards(hazards);
@@ -1849,6 +1856,8 @@ async fn deleted_libraries_of_root_are_dumped() {
     let args = args.last().unwrap();
     assert!(!args.iter().any(|a| a == "--link-remap"), "{args:?}");
     assert!(args.iter().any(|a| a == "--ghost-limit"), "{args:?}");
+    // The job's file locks are saved (and taken again on restore).
+    assert!(args.iter().any(|a| a == "--file-locks"), "{args:?}");
 }
 
 /// The post-dump hook found something to refuse while CRIU had the job

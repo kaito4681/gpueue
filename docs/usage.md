@@ -289,6 +289,12 @@ settings.
 - **inotify, fanotify and descriptors in flight:** a job with an inotify or fanotify descriptor
   (file watchers), or one that is passing descriptors over a Unix socket (`SCM_RIGHTS`) at the
   moment of the checkpoint, cannot be checkpointed (CRIU would recreate those as root).
+- **File locks and leases:** `flock`, POSIX (`fcntl`) and OFD locks are saved and taken again on
+  restore, so jobs started with `uv run` (which locks its cache while it runs) can be
+  checkpointed. A restore waits while another process holds a conflicting lock (up to its
+  deadline; it then fails and keeps the image, so it can be retried). A job holding a
+  file lease (`F_SETLEASE`) cannot be checkpointed (CRIU would take it again as root); release it
+  first.
 - **Listening ports:** a job whose TCP or UDP socket is bound to a port can be checkpointed
   (Jupyter, TensorBoard), but it is restored only while no other socket on the host has that
   port; otherwise the restore is refused and can be retried once the port is free.

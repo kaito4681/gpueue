@@ -256,6 +256,16 @@ pub struct DumpHazards {
     /// (`--link-remap`, as root, by path).
     #[serde(default)]
     pub silly_renamed: Vec<String>,
+    /// File leases, delegations and other locks that are neither `flock`,
+    /// POSIX nor OFD locks (described for messages). CRIU dumps a job's
+    /// file locks (`--file-locks`) and takes them again on the restored
+    /// descriptors before it restores the job's credentials, as root.
+    /// `flock`, POSIX and OFD locks only depend on the descriptor's access
+    /// mode, so root gains the job nothing there; a lease (`F_SETLEASE`)
+    /// depends on owning the file or `CAP_LEASE`, and CRIU breaks a
+    /// breaking lease again by opening the file, as root and by path.
+    #[serde(default)]
+    pub leases: Vec<String>,
 }
 
 /// A deleted file a job holds (see [`DumpHazards::deleted_files`]).
@@ -358,6 +368,14 @@ impl DumpHazards {
                  them up as root, so their clients would be told that root listens there \
                  (listen on a path below /tmp instead)",
                 self.abstract_listeners
+            ));
+        }
+        if !self.leases.is_empty() {
+            reasons.push(format!(
+                "the job holds file leases ({}); CRIU would take them again as root, which \
+                 may give the job leases its owner could not take (release them with \
+                 fcntl(F_SETLEASE, F_UNLCK) before the checkpoint)",
+                list_some(&self.leases)
             ));
         }
         let linked: Vec<&str> = self
@@ -1009,6 +1027,29 @@ pub fn scan_open_files(proc_root: &Path, host_pids: &[u32]) -> Vec<String> {
     out
 }
 
+/// The kinds of the locks in `/proc/<pid>/fdinfo/<fd>` contents `info`
+/// that are not `flock`, POSIX or OFD locks (see [`DumpHazards::leases`]),
+/// e.g. `LEASE` or `DELEG`. Each `lock:` line reads `<id>: <kind> ...`
+/// (`<id>: -> <kind> ...` for a request still waiting, not held).
+fn unsupported_locks(info: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in info.lines() {
+        let Some(rest) = line.strip_prefix("lock:") else {
+            continue;
+        };
+        let Some(kind) = rest.split_whitespace().nth(1) else {
+            continue;
+        };
+        if kind == "->" || matches!(kind, "FLOCK" | "POSIX" | "OFDLCK") {
+            continue;
+        }
+        if !out.iter().any(|k| k == kind) {
+            out.push(kind.to_owned());
+        }
+    }
+    out
+}
+
 /// What a dump of the processes `host_pids` must take care of (see
 /// [`DumpHazards`]). Stats the files they hold, which may block on a
 /// filesystem that does not answer: the real host runs it in a
@@ -1038,6 +1079,21 @@ pub fn scan_dump_hazards(
                 continue;
             };
             let target = target.to_string_lossy();
+            // Locks belong to open files, so only descriptors have them;
+            // `fdinfo` lists those of this open file, as CRIU reads them.
+            if let Some(fd) = link
+                .strip_prefix(dir.join("fd"))
+                .ok()
+                .and_then(|n| n.to_str())
+                && let Ok(info) = fs::read_to_string(dir.join("fdinfo").join(fd))
+            {
+                for kind in unsupported_locks(&info) {
+                    let what = format!("{kind} on {target} (process {pid})");
+                    if !out.leases.contains(&what) {
+                        out.leases.push(what);
+                    }
+                }
+            }
             if target == "anon_inode:inotify" || target == "anon_inode:[fanotify]" {
                 let what = format!(
                     "{} of process {pid}",
@@ -2242,6 +2298,7 @@ mod tests {
         assert!(h.notify_fds.is_empty(), "{h:?}");
         assert!(h.abstract_listeners.is_empty(), "{h:?}");
         assert!(h.silly_renamed.is_empty(), "{h:?}");
+        assert!(h.leases.is_empty(), "{h:?}");
         // Without the sockets, the deleted files alone are fine.
         let deleted_only = DumpHazards {
             deleted_files: h.deleted_files.clone(),
@@ -2700,6 +2757,81 @@ mod tests {
         assert!(!is_nfs_silly_name("/home/a/.nfs"));
         assert!(!is_nfs_silly_name("/home/a/.nfsrc"));
         assert!(!is_nfs_silly_name("/home/a/.nfs0/x"));
+    }
+
+    #[test]
+    fn finds_leases_among_file_locks() {
+        let info = "pos:\t0\nflags:\t0100002\nmnt_id:\t30\nino:\t1234\n\
+                    lock:\t1: FLOCK  ADVISORY  WRITE 10 103:02:1234 0 EOF\n\
+                    lock:\t2: POSIX  ADVISORY  READ 10 103:02:1234 0 99\n\
+                    lock:\t3: OFDLCK ADVISORY  READ -1 103:02:1234 0 EOF\n\
+                    lock:\t4: -> FLOCK  ADVISORY  WRITE 11 103:02:1234 0 EOF\n";
+        assert!(unsupported_locks(info).is_empty());
+        let info = "lock:\t1: LEASE  ACTIVE    READ 10 00:2f:44 0 EOF\n\
+                    lock:\t2: LEASE  BREAKING  READ 10 00:2f:44 0 EOF\n\
+                    lock:\t3: DELEG  ACTIVE    READ 10 00:2f:44 0 EOF\n";
+        assert_eq!(unsupported_locks(info), ["LEASE", "DELEG"]);
+        let h = DumpHazards {
+            leases: vec!["LEASE on /home/a/f (process 10)".into()],
+            ..Default::default()
+        };
+        let why = h.refusal().unwrap();
+        assert!(
+            why.contains("file leases (LEASE on /home/a/f (process 10))"),
+            "{why}"
+        );
+        assert!(why.contains("F_SETLEASE"), "{why}");
+    }
+
+    /// A process holding a `flock` (which CRIU saves) and a read lease
+    /// (refused). python3 where there is one: rustix cannot take a lease,
+    /// and `unsafe` is not allowed here.
+    #[test]
+    fn finds_leases_but_not_flocks() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        // Leases need a filesystem that supports them: tmpfs does.
+        let tmp = tempfile::tempdir_in("/dev/shm").unwrap();
+        let locked = tmp.path().join("locked");
+        let leased = tmp.path().join("leased");
+        fs::write(&locked, b"x").unwrap();
+        fs::write(&leased, b"x").unwrap();
+        let Ok(mut child) = Command::new("python3")
+            .args([
+                "-c",
+                // F_SETLEASE is 1024, F_RDLCK 0.
+                "import fcntl, sys, time\n\
+                 locked = open(sys.argv[1])\n\
+                 fcntl.flock(locked, fcntl.LOCK_SH)\n\
+                 leased = open(sys.argv[2])\n\
+                 fcntl.fcntl(leased, 1024, 0)\n\
+                 print('ready', flush=True)\n\
+                 time.sleep(30)",
+            ])
+            .arg(&locked)
+            .arg(&leased)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("skipped the scan of a process: no python3");
+            return;
+        };
+        let mut line = String::new();
+        io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let pid = child.id();
+        let h = scan_dump_hazards(Path::new("/proc"), &[pid], &[]);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(line.trim(), "ready");
+        let h = h.unwrap();
+        assert_eq!(
+            h.leases,
+            [format!("LEASE on {} (process {pid})", leased.display())],
+            "{h:?}"
+        );
     }
 
     #[test]

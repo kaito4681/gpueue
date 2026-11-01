@@ -158,7 +158,7 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    ジョブが開いた）場合や、時間内に終わらなかった場合は、スクリプトが失敗し、CRIU はダンプを放棄してジョブを
    再開し、チェックポイントは理由とともに拒否されたと報告されます。manual モードでは
    次に各 CUDA プロセスに対して `cuda-checkpoint --action lock` と `checkpoint` を実行し、続いて
-   `--tcp-close` と `/var/lib/gpueue/checkpoints/<id>/` 以下のイメージディレクトリを指定して、名前空間の init を
+   `--tcp-close`、`--file-locks` と `/var/lib/gpueue/checkpoints/<id>/` 以下のイメージディレクトリを指定して、名前空間の init を
    `criu dump` します。plugin モードでは CRIU のデフォルトのプラグインディレクトリで `criu dump` だけを実行し、
    CRIU の `cuda_plugin.so` が cuda-checkpoint を呼び出します（plugin モードでは、プラグインがなければ CUDA の
    ジョブは拒否されます）。ダンプの前に、CRIU のイメージ以外にリストアに必要なもの（所有者の記録、ジョブの
@@ -256,7 +256,13 @@ CRIU は root として動き、リストアするジョブのすべてをダン
   inotify や fanotify のディスクリプタを持つジョブ（CRIU はそのウォッチを root として、シンボリックリンクを
   たどるパスで再登録します）、そして post-dump フックでは、Unix ソケットのメッセージで転送中のディスクリプタ
   （`sk-queues.img` の `SCM_RIGHTS`。CRIU はそれらを root として開き直してジョブに渡し、リストアのフックからは
-  見えないので、フックがダンプを失敗させ、ジョブは動き続けます）があるダンプも拒否します。`SO_REUSEPORT` を
+  見えないので、フックがダンプを失敗させ、ジョブは動き続けます）があるダンプも拒否します。ダンプとリストアには
+  `--file-locks` を渡します。CRIU はジョブのロックを、ジョブの資格情報をリストアする前に、リストアした
+  ディスクリプタ上で root として取り直します（CRIU 4.2 で確認）。`flock`、POSIX、OFD のロックはディスクリプタの
+  アクセスモードにしか依存しないので、これで得るものはなく、その間にほかのプロセスが競合するロックを持っていれば
+  リストアは待ちます。ファイルリースはファイルの所有（または `CAP_LEASE`）に依存し、CRIU は break 中のリースを
+  パスでファイルを開いて break し直すので、ヘルパーはリース、デリゲーション、またはこの 3 種類以外のロックを持つ
+  ジョブを（CRIU と同じく `/proc/<pid>/fdinfo/<fd>` から読んで）ダンプの前と post-dump フックで拒否します。`SO_REUSEPORT` を
   設定したインターネットソケットを持つジョブを拒否し
   （CRIU はジョブの資格情報をリストアする前に root としてソケットを作るので、リストアされたソケットは root の
   ものになり、同じポートの root のサービスの `SO_REUSEPORT` グループに加わることができてしまいます。CRIU 4.2 で確認
