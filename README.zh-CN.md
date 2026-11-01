@@ -75,7 +75,8 @@ gpueue 需要带有 systemd 240 或更新版本的 Linux，以及启用了 `CONF
 没有下面这些程序作业也能运行，但创建检查点需要它们，而任何安装方式都不会替你安装：软件包只是推荐 CRIU，而在许多
 发行版版本上它过旧或不存在；`install.sh` 只会列出缺少的内容
 （参见[各安装方式会安装什么](docs/zh-CN/install.md#dependencies-that-are-not-installed-automatically)）。
-NixOS 模块自带 CRIU。
+NixOS 模块自带 CRIU。如果 CRIU 缺失或早于 4.2，`.deb` 和 `.rpm` 会在安装时发出警告，`gpueue doctor`
+会说明如何在你的发行版上安装它。
 
 <a id="dependencies-that-are-not-installed-automatically"></a>
 

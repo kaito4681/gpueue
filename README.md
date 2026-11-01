@@ -74,7 +74,8 @@ Jobs run without the programs below, but checkpoints need them, and no install m
 them for you: the packages only recommend CRIU, which is too old or missing on many releases, and
 `install.sh` only lists what is missing (see
 [what each method installs](docs/install.md#dependencies-that-are-not-installed-automatically)).
-The NixOS module brings its own CRIU.
+The NixOS module brings its own CRIU. The `.deb` and the `.rpm` warn at install time when CRIU is
+missing or older than 4.2, and `gpueue doctor` says how to install it on your distribution.
 
 <a id="dependencies-that-are-not-installed-automatically"></a>
 

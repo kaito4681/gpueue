@@ -4,7 +4,8 @@
 # `apt-get install ./gpueue_*.deb` succeeds and sets up the user, directories
 # and services, that an edited conffile survives a reinstallation, that
 # installing next to `gpueue service install` is refused, that a rolled-back
-# removal (postinst abort-remove) enables the services again, and what
+# removal (postinst abort-remove) enables the services again, that postinst
+# warns about a CRIU older than 4.2 (and runs none root does not own), and what
 # `dpkg -r` and `dpkg -P` keep and delete.
 #
 # TODO(P4b): `apt-get update` / `apt upgrade` against a real (test) APT
@@ -83,6 +84,53 @@ must_exist /etc/systemd/system/multi-user.target.wants/gpueue.service \
 # apt reads the repository from gpueue.sources (not fetched: it does not exist yet).
 apt-get indextargets --no-release-info 2>/dev/null | grep -q 'github.com/kaito4681/gpueue/releases/download/apt' ||
     fail "apt does not see the gpueue repository"
+
+step "postinst warns about a CRIU older than 4.2, and does not run one root does not own"
+# /usr/local/sbin comes first in the helper's PATH, before a distribution CRIU.
+fake=/usr/local/sbin/criu
+mkdir -p /usr/local/sbin
+printf '#!/bin/sh\ntouch /tmp/criu-ran\necho "Version: 3.16"\n' >"$fake"
+chmod 755 "$fake"
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+grep -q 'CRIU 4.2 or newer is needed to checkpoint (found 3.16 at /usr/local/sbin/criu)' /tmp/criu.err ||
+    { cat /tmp/criu.err; fail "no warning about CRIU 3.16"; }
+printf '#!/bin/sh\necho "Version: 4.2.1"\n' >"$fake"
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+! grep -q CRIU /tmp/criu.err || { cat /tmp/criu.err; fail "warned about CRIU 4.2.1"; }
+printf '#!/bin/sh\ntouch /tmp/criu-ran\necho "Version: 3.16"\n' >"$fake"
+chown 1000 "$fake"
+rm -f /tmp/criu-ran
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+grep -q 'is not owned by root' /tmp/criu.err || { cat /tmp/criu.err; fail "no warning about a criu root does not own"; }
+must_not_exist /tmp/criu-ran
+rm -f "$fake"
+# A root-owned CRIU on a path a user could redirect is not run either: in a
+# directory a user owns (criu_path), or behind a symlink a user owns.
+real=/usr/local/lib/gpueue-test-criu
+mkdir -p /usr/local/lib
+printf '#!/bin/sh\ntouch /tmp/criu-ran\necho "Version: 3.16"\n' >"$real"
+chmod 755 "$real"
+mkdir -p /srv/user-dir
+cp -p "$real" /srv/user-dir/criu
+chown 1000 /srv/user-dir
+cp -p /etc/gpueue/config.toml /tmp/config.toml.orig
+echo 'criu_path = "/srv/user-dir/criu"' >>/etc/gpueue/config.toml
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+grep -q 'is not owned by root' /tmp/criu.err || { cat /tmp/criu.err; fail "no warning about a criu in a directory a user owns"; }
+must_not_exist /tmp/criu-ran
+cp -p /tmp/config.toml.orig /etc/gpueue/config.toml
+ln -s "$real" "$fake"
+chown -h 1000 "$fake"
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+grep -q 'is not owned by root' /tmp/criu.err || { cat /tmp/criu.err; fail "no warning about a criu behind a symlink a user owns"; }
+must_not_exist /tmp/criu-ran
+# The same symlink owned by root is followed, and its target is what runs.
+chown -h 0 "$fake"
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+grep -q 'CRIU 4.2 or newer is needed to checkpoint (found 3.16 at /usr/local/sbin/criu)' /tmp/criu.err ||
+    { cat /tmp/criu.err; fail "no warning about CRIU 3.16 behind a root-owned symlink"; }
+must_exist /tmp/criu-ran
+rm -rf "$fake" "$real" /srv/user-dir /tmp/criu-ran
 
 step "a rolled-back removal enables the services again (prerm remove, postinst abort-remove)"
 wants=/etc/systemd/system/multi-user.target.wants

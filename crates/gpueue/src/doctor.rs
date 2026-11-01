@@ -923,10 +923,7 @@ fn check_criu(sys: &dyn System, configured: &Path, programs: Programs) -> Check 
             MIN_CRIU.0, MIN_CRIU.1
         )
     } else {
-        format!(
-            "install CRIU {}.{} or newer (https://criu.org/Installation), or set `criu_path` in {}",
-            MIN_CRIU.0, MIN_CRIU.1, DEFAULT_CONFIG_PATH
-        )
+        criu_install_hint(&OsRelease::read(sys))
     };
     let path = match programs.resolve(sys, NAME, "criu_path", configured) {
         Ok(Some(path)) => path,
@@ -948,6 +945,45 @@ fn check_criu(sys: &dyn System, configured: &Path, programs: Programs) -> Check 
         return Check::fail(NAME, format!("{shown} is version {version}, too old")).hint(install);
     }
     Check::ok(NAME, format!("{version} ({shown})"))
+}
+
+/// How to get CRIU on `release` (outside NixOS), after docs/install.md#criu: the
+/// distribution's own package where it is new enough, else a build from source.
+fn criu_install_hint(release: &OsRelease) -> String {
+    let (major, minor, _) = MIN_CRIU;
+    let restart = "then `sudo systemctl restart gpueue-helper`";
+    let ubuntu_major = release
+        .version_id
+        .split('.')
+        .next()
+        .and_then(|v| v.parse::<u32>().ok());
+    let package = match release.id.as_str() {
+        "ubuntu" if ubuntu_major.is_some_and(|v| v >= 26) => {
+            Some("`sudo apt install criu` (in universe)")
+        }
+        "fedora" => Some("`sudo dnf install criu`"),
+        "arch" => Some("`sudo pacman -S criu`"),
+        _ => None,
+    };
+    if let Some(package) = package {
+        return format!("install the distribution's CRIU with {package}, {restart}");
+    }
+    let build = format!(
+        "build CRIU {major}.{minor} or newer from source (https://criu.org/Installation: the \
+         release tarball, `make` and `sudo make install` into /usr/local/sbin) or set \
+         `criu_path` in {DEFAULT_CONFIG_PATH} to a root-owned build"
+    );
+    if release.id.is_empty() {
+        format!(
+            "install CRIU {major}.{minor} or newer: the distribution's package if it is new \
+             enough, else {build}; {restart}"
+        )
+    } else {
+        format!(
+            "install CRIU {major}.{minor} or newer: this distribution's package is older or \
+             missing, so {build}; {restart}"
+        )
+    }
 }
 
 /// The NVIDIA kernel module's version: from /proc/driver/nvidia/version, or nvidia-smi.
