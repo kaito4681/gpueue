@@ -2368,6 +2368,11 @@ warned on their next command. Refusals:
   restore would re-create them as root with that owner and mode, as privileged programs. Close
   them before the checkpoint, or restart the job. (Other deleted files, such as libraries that a
   package upgrade replaced while the job ran, are saved in the image and are fine.)
+- `the job holds file leases (...)`: CRIU takes a job's file locks again on restore, as root
+  before it gives the job its credentials back. That is harmless for `flock`, POSIX and OFD locks,
+  which are checkpointed (so jobs started with `uv run`, which holds a lock on uv's cache, can be
+  checkpointed), but a lease could be one its owner could not take. Release the lease with
+  `fcntl(F_SETLEASE, F_UNLCK)` before the checkpoint, or run the job with `--no-checkpoint`.
 - `... (found while CRIU had the job stopped for the dump); the job was resumed`: the job opened
   such a file after the checks before the dump; CRIU's `post-dump` check found it and CRIU
   abandoned the dump.
