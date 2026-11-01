@@ -64,7 +64,7 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 <a id="json-output"></a>
 ## JSON 输出
 
-`gpueue status --json` 输出 `{"groups": [...], "jobs": [...]}`：
+`gpueue status --json`（或只用 `gpueue --json`）输出 `{"groups": [...], "jobs": [...]}`：
 
 ```json
 {

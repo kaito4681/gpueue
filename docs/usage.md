@@ -64,7 +64,7 @@ columns, and `Checkpointed` jobs show the image size.
 
 ## JSON output
 
-`gpueue status --json` prints `{"groups": [...], "jobs": [...]}`:
+`gpueue status --json` (or just `gpueue --json`) prints `{"groups": [...], "jobs": [...]}`:
 
 ```json
 {
