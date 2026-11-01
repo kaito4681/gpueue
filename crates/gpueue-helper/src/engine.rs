@@ -2599,6 +2599,8 @@ pub struct DumpPrecheck {
     /// [`crate::deadmounts`]).
     detached: Vec<DetachedMount>,
     below_detached: Vec<String>,
+    /// Free bytes of the image base (see [`dump_options`]).
+    available: u64,
 }
 
 /// The checks before a dump, which only read the job's state: the image
@@ -2750,27 +2752,37 @@ pub fn precheck_dump<H: HostProbe + ?Sized>(
         groups,
         detached,
         below_detached,
+        available,
     })
 }
 
-/// CRIU's default `--ghost-limit` (largest deleted file saved in an image).
+/// CRIU's default `--ghost-limit` (largest deleted file saved in an
+/// image), the least passed.
 const DEFAULT_GHOST_LIMIT: u64 = 1 << 20;
 
-/// The CRIU options for a dump of a job with `hazards`. Never
-/// `--link-remap`: CRIU would link open files that have no name of their
-/// own back into their directories, as root and by a path the job's owner
-/// may redirect (to `/etc`, say) while the dump runs. Deleted files are
-/// saved in the image (as "ghost" files) instead, so the ghost limit is
-/// raised to the largest; files that only `--link-remap` could dump are
-/// refused (see [`DumpHazards::refusal`]).
-pub fn dump_options(ck: &CheckpointConfig, hazards: &DumpHazards) -> CheckpointConfig {
+/// The largest `--ghost-limit` passed: CRIU parses it with `atol`.
+const MAX_GHOST_LIMIT: u64 = i64::MAX as u64;
+
+/// The CRIU options for a dump of a job, with `available` free bytes on
+/// the image base. Never `--link-remap`: CRIU would link open files that
+/// have no name of their own back into their directories, as root and by a
+/// path the job's owner may redirect (to `/etc`, say) while the dump runs.
+/// Deleted files are saved in the image (as "ghost" files) instead; files
+/// that only `--link-remap` could dump are refused (see
+/// [`DumpHazards::refusal`]).
+///
+/// The ghost limit is the free space, not the largest deleted file the
+/// pre-checks saw: a job keeps deleting and creating files until CRIU
+/// freezes it (PyTorch's DataLoader passes each batch in a deleted file
+/// under `/dev/shm`), and CRIU compares the space a file takes, which is
+/// more than its size on a tmpfs. A file larger than the free space could
+/// not be saved anyway.
+pub fn dump_options(ck: &CheckpointConfig, available: u64) -> CheckpointConfig {
     let mut ck = ck.clone();
     ck.criu.link_remap = false;
-    if let Some(largest) = hazards.deleted_files.iter().map(|f| f.size).max() {
-        let limit = (largest + 1).max(DEFAULT_GHOST_LIMIT);
-        ck.criu.extra_dump_args.push("--ghost-limit".into());
-        ck.criu.extra_dump_args.push(limit.to_string().into());
-    }
+    let limit = available.clamp(DEFAULT_GHOST_LIMIT, MAX_GHOST_LIMIT);
+    ck.criu.extra_dump_args.push("--ghost-limit".into());
+    ck.criu.extra_dump_args.push(limit.to_string().into());
     ck
 }
 
@@ -2819,9 +2831,10 @@ pub fn dump_job<H: HostProbe + ?Sized>(
         groups,
         detached,
         below_detached,
+        available,
     } = precheck_dump(host, ck.mode, base, record, init_pid, private)
         .map_err(DumpError::Refused)?;
-    let mut ck = dump_options(ck, &hazards);
+    let mut ck = dump_options(ck, available);
     for d in &detached {
         eprintln!(
             "gpueue-helper: job {}: {} ({}) {}; the job does not use it, so it is checkpointed \
