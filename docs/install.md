@@ -1841,6 +1841,9 @@ their unit. You need to turn it off:
   The helper also writes `shutdown-manifest.json` there after the dumps at system shutdown.
 - Each job has at most one image. It is deleted when the restore succeeds, when the job is removed
   (`remove`, `clean`, `reset`), or when the dump fails. A failed restore keeps the image.
+  `reset` asks before it removes any job (non-interactive use needs `-f`) and asks again before it
+  removes checkpointed jobs: answering no, or `--keep-checkpoints`, keeps those jobs and their
+  images. `remove` on a terminal likewise keeps the checkpointed jobs if you answer no.
 - After a failed dump the helper moves its `dump.log` to `failed-logs/<job id>-<unix ms>.log` in
   the same directory (root only) and keeps the newest 20 of them. The job's last error names the
   file.

@@ -239,7 +239,8 @@ pub enum SubCommand {
     /// Remove jobs from the list.
     ///
     /// Running or paused jobs have to be killed first. The checkpoint image of a Checkpointed
-    /// job is deleted as well.
+    /// job is deleted as well; when asked, answering no keeps the Checkpointed jobs and removes
+    /// the others.
     #[command(alias("rm"))]
     Remove {
         /// The ids of the jobs to remove.
@@ -558,7 +559,9 @@ pub enum SubCommand {
 
     /// Kill all jobs, remove them and reset the groups.
     ///
-    /// Regular users only reset their own jobs; administrators reset everything.
+    /// Regular users only reset their own jobs; administrators reset everything. Asks for
+    /// confirmation first, and separately whether Checkpointed jobs and their checkpoint images
+    /// are removed too.
     Reset {
         /// Only reset these groups (may be given multiple times).
         #[arg(short, long)]
@@ -567,6 +570,10 @@ pub enum SubCommand {
         /// Don't ask for confirmation.
         #[arg(short, long)]
         force: bool,
+
+        /// (gpueue) Keep Checkpointed jobs and their checkpoint images.
+        #[arg(long)]
+        keep_checkpoints: bool,
     },
 
     /// Checkpoint all running jobs and stop the daemon (administrators only).
