@@ -296,7 +296,8 @@ settings.
   checkpointed either (CRIU would restore the socket as root's, and it could then share its port
   with a root service). Some servers set it by default; turn it off or use `--no-checkpoint`.
 - **Deleted files:** files the job deleted while it still has them open (temporary files,
-  multiprocessing semaphores) are saved in the image. A job that holds a deleted file that still
+  multiprocessing semaphores, PyTorch DataLoader batches in `/dev/shm`) are saved in the image,
+  however large, as long as they fit in the free space of the checkpoint directory. A job that holds a deleted file that still
   has another hard link, a file deleted on NFS while open (`.nfs<hex>`), or a deleted program
   with the setuid/setgid bit or file capabilities cannot be checkpointed; the checkpoint is
   refused and the job keeps running. Libraries that a package upgrade replaced while the job
