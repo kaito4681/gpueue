@@ -48,7 +48,7 @@ jobs:
       - run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt
           rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
@@ -64,7 +64,7 @@ jobs:
       - run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked
@@ -98,7 +98,7 @@ jobs:
       - run: |
           rustup toolchain install 1.89 --profile minimal
           rustup default 1.89
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --all-targets --locked
@@ -268,7 +268,7 @@ jobs:
       # first use, and the save below could not empty the directory.
       - if: matrix.nix-cache
         run: mkdir -p "$RUNNER_TEMP"/nix-cache/{nar,log,realisations}
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           # cache.nixos.org drops connections now and then (HTTP/2 framing
           # errors, a 416 on a resumed download): fall back to building,
@@ -294,7 +294,7 @@ jobs:
       # The Nix toolchain's build of the dependencies (its compiler comes
       # with flake.lock).
       - if: matrix.cargo-test
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: nix-${{ hashFiles('flake.lock') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
