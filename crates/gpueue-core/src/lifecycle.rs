@@ -595,13 +595,14 @@ pub enum Event {
     },
     Exited(ExitStatus),
     CheckpointSucceeded,
-    /// The dump was attempted and failed; CRIU rolled back, so the process
-    /// still runs.
+    /// The dump was attempted and failed, and its rollback did not fully
+    /// succeed: the process may still run, but is not to be trusted.
     CheckpointFailed {
         reason: String,
     },
     /// The helper declined the dump before touching the process (its
-    /// pre-checks failed); the process runs on as it was.
+    /// pre-checks failed), or the dump failed and was rolled back cleanly;
+    /// the process runs on.
     CheckpointRefused {
         reason: String,
     },
@@ -662,8 +663,9 @@ fn done(result: JobResult) -> Transition {
 /// - After a checkpoint failure the job is `Terminating{CheckpointFailed}`
 ///   and keeps its slots until its `Exited` (or `Lost`) arrives; it then
 ///   becomes `Done` with the checkpoint-failure result.
-/// - A refused checkpoint did not touch the process, so the job simply
-///   keeps running (the daemon records the reason and warns the owner).
+/// - A refused checkpoint did not touch the process, and a failed one the
+///   helper rolled back cleanly undid what it did, so the job simply keeps
+///   running (the daemon records the reason and warns the owner).
 /// - On an OS shutdown the helper dumps running jobs on its own, and
 ///   systemd stops whatever it could not save: a failed or refused dump of
 ///   a `Running`/`Paused` job also ends in `Terminating{CheckpointFailed}`
@@ -705,13 +707,13 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
                 reason: reason.clone(),
             },
         }),
-        // The process was not touched (a paused job was resumed for the
-        // dump, so it runs now).
+        // The process was not touched, or the failed dump was undone (a
+        // paused job was resumed for the dump, so it runs now).
         (Event::CheckpointRefused { .. }, JobState::Checkpointing) => {
             Transition::to(JobState::Running)
         }
-        // CRIU leaves the process running when a dump fails; stop it, giving
-        // it a chance to save its own checkpoint on SIGTERM.
+        // A failed dump whose rollback did not fully succeed: stop the
+        // process, giving it a chance to save its own checkpoint on SIGTERM.
         (Event::CheckpointFailed { reason }, JobState::Checkpointing) => {
             Transition::to(JobState::Terminating {
                 result: JobResult::CheckpointFailed {

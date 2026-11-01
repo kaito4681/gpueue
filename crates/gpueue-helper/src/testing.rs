@@ -323,6 +323,9 @@ pub struct FakeExecState {
     pub actions: Vec<Option<Action>>,
     /// Fail the first step whose action matches.
     pub fail_on: Option<fn(&Action) -> bool>,
+    /// Becomes `fail_on` once that has failed a step (a failed rollback
+    /// after a failed dump, say).
+    pub then_fail_on: Option<fn(&Action) -> bool>,
     /// Let the first step whose action matches hang until its timeout,
     /// then fail as killed (as a real stuck tool would).
     pub hang_on: Option<fn(&Action) -> bool>,
@@ -386,10 +389,15 @@ impl Executor for FakeExecutor {
                 output: StepOutput::default(),
             });
         }
-        if let (Some(action), Some(fail)) = (step.action(), st.fail_on)
+        // A rollback step's guard runs its step (see `Step::IfRunnable`).
+        let guarded = match step {
+            Step::IfRunnable { then, .. } => then.action(),
+            _ => step.action(),
+        };
+        if let (Some(action), Some(fail)) = (guarded, st.fail_on)
             && fail(&action)
         {
-            st.fail_on = None;
+            st.fail_on = st.then_fail_on.take();
             return Err(StepError::Failed {
                 code: Some(1),
                 output: StepOutput {

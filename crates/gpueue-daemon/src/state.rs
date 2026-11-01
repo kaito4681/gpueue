@@ -59,6 +59,12 @@ pub fn refusal_reason(helper_reason: &str) -> String {
     format!("checkpoint refused: {helper_reason}")
 }
 
+/// The reason recorded for a dump that failed and was rolled back, so that
+/// the job keeps running (`code: checkpoint_rolled_back`).
+pub fn rollback_reason(helper_reason: &str) -> String {
+    format!("checkpoint failed, the job keeps running: {helper_reason}")
+}
+
 /// The single SQLite connection, used from blocking threads.
 #[derive(Clone)]
 pub struct Db(Arc<Mutex<Store>>);
@@ -2102,8 +2108,8 @@ impl Core {
                             None,
                         )
                     }
-                    // Without a code the dump was attempted and rolled back
-                    // (the job was frozen): it is terminated.
+                    // Without a code the dump was attempted and its rollback
+                    // did not fully succeed: the job is terminated.
                     CheckpointOutcome::Failed { reason, code: None } => (
                         E::CheckpointFailed {
                             reason: reason.clone(),
@@ -2116,8 +2122,10 @@ impl Core {
                         None,
                         Some(reason),
                     ),
-                    // `checkpoint_refused`: the job was not touched. So is
-                    // any other code, which only says why the dump did not
+                    // `checkpoint_refused`: the job was not touched;
+                    // `checkpoint_rolled_back`: the failed dump was undone,
+                    // so the job runs on as after a refusal. So does any
+                    // other code, which only says why the dump did not
                     // happen (one this daemon does not know comes from a
                     // newer helper): killing a healthy job because of a
                     // code it cannot read would be worse than leaving
@@ -2126,15 +2134,19 @@ impl Core {
                         reason,
                         code: Some(code),
                     } => {
-                        if code != HelperErrorCode::CheckpointRefused {
-                            tracing::warn!(
-                                job = %job,
-                                ?code,
-                                "the helper failed the dump with an unexpected code; \
-                                 taking the job as untouched"
-                            );
-                        }
-                        let reason = refusal_reason(&reason);
+                        let reason = match code {
+                            HelperErrorCode::CheckpointRefused => refusal_reason(&reason),
+                            HelperErrorCode::CheckpointRolledBack => rollback_reason(&reason),
+                            _ => {
+                                tracing::warn!(
+                                    job = %job,
+                                    ?code,
+                                    "the helper failed the dump with an unexpected code; \
+                                     taking the job as untouched"
+                                );
+                                refusal_reason(&reason)
+                            }
+                        };
                         (
                             E::CheckpointRefused {
                                 reason: reason.clone(),

@@ -2403,9 +2403,12 @@ warned on their next command. Refusals:
 A paused job that is checkpointed is resumed for the dump. If the dump is refused, it is paused
 again.
 
-A dump that is attempted and **fails** stops the job (SIGTERM, then SIGKILL after `grace_secs`),
-because CRIU and cuda-checkpoint have already frozen it. The job is marked `Checkpoint failed`
-with a summary of the CRIU log and the path of the full log. Common reasons:
+A dump that is attempted and **fails** is rolled back: CRIU thaws the job and the helper resumes
+its CUDA state. When that succeeds, the job keeps running (paused again if it was paused) and its
+last error, starting with `checkpoint failed, the job keeps running:`, has a summary of the CRIU
+log and the path of the full log. If the rollback is incomplete, or CRIU was killed at the
+deadline, the job's state cannot be trusted: it is stopped (SIGTERM, then SIGKILL after
+`grace_secs`) and marked `Checkpoint failed` with the same summary. Common reasons:
 
 - `Can't handle non-regular mapping` or `handle_device_vma plugin failed` in the CRIU summary: a
   process that a CUDA process forked without `exec` still maps `/dev/nvidia*`. The fork guard

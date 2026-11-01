@@ -2133,9 +2133,11 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
 
 为暂停的作业创建检查点时，它会为转储而恢复运行。如果转储被拒绝，它会再次被暂停。
 
-已尝试但**失败**的转储会停止作业（SIGTERM，`grace_secs` 后 SIGKILL），因为 CRIU 和
-cuda-checkpoint 已经冻结了它。作业被标记为 `Checkpoint failed`，并附带 CRIU 日志摘要和完整日志
-的路径。常见原因：
+已尝试但**失败**的转储会被回滚：CRIU 解冻作业，helper 恢复其 CUDA 状态。如果回滚成功，作业会继续运行
+（之前处于暂停状态则再次暂停），其最后一条错误以 `checkpoint failed, the job keeps running:` 开头，
+附带 CRIU 日志摘要和完整日志的路径。如果回滚不完整，或 CRIU 在期限到达时被终止，作业的状态不可信：
+作业会被停止（SIGTERM，`grace_secs` 后 SIGKILL），并被标记为 `Checkpoint failed`，附带同样的摘要。
+常见原因：
 
 - CRIU 摘要中出现 `Can't handle non-regular mapping` 或 `handle_device_vma plugin failed`：CUDA
   进程未经 `exec` fork 出的子进程仍映射着 `/dev/nvidia*`。fork guard 通常可以防止这种情况。请
