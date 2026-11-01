@@ -795,14 +795,24 @@ fn reset_groups_and_force() {
         cmd(&["reset"]),
         SubCommand::Reset {
             groups: vec![],
-            force: false
+            force: false,
+            keep_checkpoints: false
         }
     );
     assert_eq!(
-        cmd(&["reset", "-g", "a", "--groups", "b", "-f"]),
+        cmd(&[
+            "reset",
+            "-g",
+            "a",
+            "--groups",
+            "b",
+            "-f",
+            "--keep-checkpoints"
+        ]),
         SubCommand::Reset {
             groups: vec!["a".into(), "b".into()],
-            force: true
+            force: true,
+            keep_checkpoints: true
         }
     );
 }

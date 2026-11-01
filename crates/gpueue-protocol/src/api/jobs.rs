@@ -543,6 +543,10 @@ pub struct ResetRequest {
     /// Only this group (`-g`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Leave Checkpointed (and restore-queued) jobs and their checkpoint
+    /// images alone (`--keep-checkpoints`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_checkpointed: bool,
 }
 
 /// Body of `POST /v1/jobs/switch`: swap the queue positions of two jobs.

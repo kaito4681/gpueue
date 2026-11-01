@@ -21,7 +21,8 @@ and NVIDIA cuda-checkpoint, without changes to the program.
 - A paused job can be checkpointed too. It is restored paused (still holding its GPU slots);
   resume it with `gpueue start <id>`.
 - `gpueue restart <id>` on a `Checkpointed` job starts it over from the beginning as a new job and
-  keeps the image. `gpueue remove <id>` discards the job **and deletes the image**.
+  keeps the image. `gpueue remove <id>` discards the job **and deletes the image** (on a terminal it asks first;
+  answering no keeps the job). `gpueue reset --keep-checkpoints` resets everything else.
 - `gpueue start` does not resume a `Checkpointed` job; use `restore`.
 
 ## What can make a checkpoint or restore fail

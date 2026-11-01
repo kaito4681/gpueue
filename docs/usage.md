@@ -44,6 +44,7 @@ Extra commands and options:
 | --- | --- |
 | `add --gpu <LIST>` | GPUs the job runs on, e.g. `0` or `0,1`. Without it the job is CPU-only (`CUDA_VISIBLE_DEVICES` is empty). |
 | `add --no-checkpoint` | never checkpoint this job; on shutdown it is terminated |
+| `reset --keep-checkpoints` | reset everything except `Checkpointed` (and restore-queued) jobs, which keep their checkpoint images |
 | `checkpoint [IDS] [-g GROUP] [-a]` | save running jobs and stop them |
 | `restore [IDS] [-g GROUP] [-a] [-i]` | resume `Checkpointed` jobs (`-i`: like `start`, right away for administrators, first among your own jobs for anybody else) |
 | `gpu [-j]`, `gpu parallel <N> [--gpu LIST]` | list GPUs, or set the per-GPU job limit (administrators) |
@@ -316,6 +317,9 @@ settings.
   checkpointed. gpueue refuses the dump and tells you why. The job keeps running.
 - Checkpoint images are never deleted automatically while their job exists. They are removed when
   the job is restored successfully, removed (`remove`, `clean`, `reset`), or when its dump fails.
+  Before removing them, `reset` (unless `-f`) and `remove` (on a terminal) ask `[y/N]` whether the
+  `Checkpointed` jobs go too; answering no (the default) keeps those jobs and their images and
+  removes the others. `reset` also asks `[y/N]` before it kills and removes anything.
   Above `checkpoint_size_limit_bytes`, gpueue warns but does not refuse.
 - Not available yet: `edit`, `env`, periodic checkpoints, checkpointing a job while keeping it
   running, freeing a GPU without a full checkpoint ("GPU suspend"), a web UI or TCP API, and slots

@@ -726,7 +726,8 @@ impl Core {
     }
 
     /// `POST /v1/jobs/reset`: kill and remove every job in scope. Running
-    /// jobs are removed once they have stopped.
+    /// jobs are removed once they have stopped. With `keep_checkpointed`,
+    /// jobs waiting to be restored keep their images and are left alone.
     pub async fn reset(
         self: &Arc<Self>,
         caller: Caller,
@@ -748,6 +749,7 @@ impl Core {
                     .into_iter()
                     .filter(|j| scope.includes(j))
                     .filter(|j| request.group.as_ref().is_none_or(|g| *g == j.spec.group))
+                    .filter(|j| !(request.keep_checkpointed && j.state.awaits_restore()))
                     .collect();
                 let mut removed = Vec::new();
                 let mut live = Vec::new();
