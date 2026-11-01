@@ -132,9 +132,12 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   作业继续运行。`gpueue checkpoint` 会失败并给出原因。如果拒绝发生在应当转储的时刻（例如在 `gpueue shutdown`
   期间），所有者会在下一次执行 `gpueue` 命令时收到警告。原因会作为作业的最后一条错误显示在
   `gpueue status` 和 `gpueue log` 中。
-- **失败：** 转储本身失败。CRIU 会让作业继续，但作业已经被冻结过，因此会被停止（先发送 SIGTERM，
-  让它有机会保存自己的检查点，`grace_secs` 之后再发送 SIGKILL），并显示为 `Checkpoint failed` 及其原因。
-  所有者会在下一次执行 `gpueue` 命令时收到警告。
+- **失败：** 转储本身失败（例如超过 CRIU 上限的已删除文件，或作业持有的文件锁）。CRIU 会让作业继续，
+  helper 会撤销对作业 CUDA 状态所做的更改；如果这些都成功，作业会继续运行，原因（以
+  `checkpoint failed, the job keeps running:` 开头）会作为作业的最后一条错误显示在 `gpueue status` 和
+  `gpueue log` 中。如果无法干净地恢复作业（其 CUDA 状态无法恢复，或 CRIU 在期限到达时于转储中途被终止），
+  作业会被停止（先发送 SIGTERM，让它有机会保存自己的检查点，`grace_secs` 之后再发送 SIGKILL），并显示为
+  `Checkpoint failed` 及其原因。无论哪种情况，所有者都会在下一次执行 `gpueue` 命令时收到警告。
 
 在操作系统关机或重启期间，systemd 会停止所有无法保存的作业，无论其转储是被拒绝还是失败。启动后，它会显示为
 `Checkpoint failed` 及其原因，并且所有者会收到警告。断电或内核崩溃时不会保存任何内容。
@@ -257,7 +260,8 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - **`SO_REUSEPORT`：** 如果作业有设置了 `SO_REUSEPORT` 的 TCP 或 UDP 套接字，同样无法为它创建检查点
   （CRIU 会把该套接字恢复为属于 root 的套接字，它随后可能与某个 root 服务共享端口）。有些服务器默认会设置它；
   请将其关闭，或使用 `--no-checkpoint`。
-- **已删除的文件：** 作业在仍打开时删除的文件（临时文件、multiprocessing 信号量）会保存到镜像中。如果作业持有
+- **已删除的文件：** 作业在仍打开时删除的文件（临时文件、multiprocessing 信号量、`/dev/shm` 中的 PyTorch DataLoader
+  批数据）只要能放进检查点目录的剩余空间，无论多大都会保存到镜像中。如果作业持有
   仍有其他硬链接的已删除文件、在打开时于 NFS 上被删除的文件（`.nfs<十六进制>`），或带有 setuid / setgid
   位或文件能力的已删除程序，就无法为它创建检查点；检查点会被拒绝，作业继续运行。作业运行期间被软件包升级
   替换的库没有问题。

@@ -49,6 +49,8 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt
           rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -63,6 +65,8 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked
 
   # The tests in the environment release.yml runs them in: root in the
@@ -95,6 +99,8 @@ jobs:
           rustup toolchain install 1.89 --profile minimal
           rustup default 1.89
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --all-targets --locked
 
   shellcheck:
@@ -178,7 +184,8 @@ jobs:
               case "$file" in
                 # Read by the package (keep in sync with the source fileset
                 # in packaging/nix/package.nix), or this workflow.
-                scripts/install.sh | scripts/dist/deb-check.sh | scripts/dist/get-minisign.sh | .github/workflows/ci.yml) ;;
+                scripts/install.sh | scripts/dist/deb-check.sh | scripts/dist/get-minisign.sh | \
+                  scripts/nix-ci-cache.sh | .github/workflows/ci.yml) ;;
                 .agents/* | skills/* | AGENTS.md | README.ja.md | README.zh-CN.md | .gitignore | deny.toml | docker/* | scripts/* | .github/*)
                   continue ;;
               esac
@@ -212,10 +219,12 @@ jobs:
             kvm: true
             build: .#checks.x86_64-linux.nixos .#checks.x86_64-linux.home-manager
             smoke: true
+            nix-cache: save
           - name: x86_64 helper-tests VM
             runner: ubuntu-24.04
             kvm: true
             build: .#checks.x86_64-linux.helper-tests
+            nix-cache: restore
           # Evaluates every output for every system; the builds of the
           # x86_64 checks are in the two jobs above.
           - name: x86_64 eval and tests
@@ -227,6 +236,7 @@ jobs:
             flake-check: true
             cargo-test: true
             smoke: true
+            nix-cache: save
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -241,6 +251,23 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      # What the jobs build that cache.nixos.org does not have and that does
+      # not depend on gpueue's source (CRIU, the vendored crates), as a
+      # binary cache of about 20 MB per architecture: restored everywhere,
+      # saved only by a push to main (pull requests cannot read each other's
+      # caches, and their own would only fill the 10 GB the repository has).
+      # It is trusted unsigned (`trusted=1`): only main writes it.
+      - id: nix-cache
+        if: matrix.nix-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/nix-cache
+          key: nix-store-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'packaging/nix/**') }}
+          restore-keys: nix-store-${{ runner.arch }}-
+      # Created by this user: the root daemon would otherwise create them on
+      # first use, and the save below could not empty the directory.
+      - if: matrix.nix-cache
+        run: mkdir -p "$RUNNER_TEMP"/nix-cache/{nar,log,realisations}
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           # cache.nixos.org drops connections now and then (HTTP/2 framing
@@ -253,6 +280,7 @@ jobs:
             download-attempts = 8
             http2 = false
             ${{ matrix.kvm && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
+            ${{ matrix.nix-cache && format('extra-substituters = file://{0}/nix-cache?trusted=1&priority=30', runner.temp) || '' }}
       - if: matrix.flake-check
         run: nix flake check -L
       - if: matrix.eval
@@ -263,6 +291,13 @@ jobs:
         run: |
           read -ra installables <<< "$INSTALLABLES"
           nix build -L --no-link "${installables[@]}"
+      # The Nix toolchain's build of the dependencies (its compiler comes
+      # with flake.lock).
+      - if: matrix.cargo-test
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: nix-${{ hashFiles('flake.lock') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Tests outside the build sandbox
         if: matrix.cargo-test
         run: nix develop -c cargo test --workspace --locked
@@ -274,6 +309,17 @@ jobs:
           test -s result/share/bash-completion/completions/gpueue.bash
           nix build -L .#criu -o result-criu
           ./result-criu/bin/criu --version
+      - if: >-
+          matrix.nix-cache == 'save' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+          && steps.nix-cache.outputs.cache-hit != 'true'
+        run: scripts/nix-ci-cache.sh "$RUNNER_TEMP/nix-cache" .#gpueue.cargoDeps .#criu
+      - if: >-
+          matrix.nix-cache == 'save' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+          && steps.nix-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/nix-cache
+          key: ${{ steps.nix-cache.outputs.cache-primary-key }}
 
   # `gpueue service install|uninstall|status` and the install method checks
   # under systemd in a privileged container.
@@ -479,7 +525,10 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - id: month
         run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Saved only by a push to main, like the other caches: one image per
+      # pull request would fill the repository's 10 GB.
+      - id: vm-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/vm-cache
           key: vm-images-${{ steps.month.outputs.month }}-${{ hashFiles('scripts/vm/distros.sh', 'scripts/vm/user-data.yaml') }}
@@ -488,3 +537,10 @@ jobs:
           GPUEUE_VM_CACHE: ${{ runner.temp }}/vm-cache
           # The releases API (the previous release for the upgrade scenario).
           GH_TOKEN: ${{ github.token }}
+      - if: >-
+          github.event_name == 'push' && github.ref == 'refs/heads/main'
+          && steps.vm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/vm-cache
+          key: ${{ steps.vm-cache.outputs.cache-primary-key }}

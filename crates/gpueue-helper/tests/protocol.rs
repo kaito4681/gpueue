@@ -1704,46 +1704,26 @@ async fn dumps_are_refused_without_a_usable_criu() {
 
 /// Deleted files go into the image instead of being linked back by root
 /// (`--link-remap`, which is never passed) through a path the owner
-/// controls; the ghost limit covers the largest, private ones included.
+/// controls. The ghost limit is the free space (at least CRIU's default,
+/// at most what `atol` parses), whatever deleted files the pre-checks saw:
+/// a job creates new ones until CRIU freezes it.
 #[test]
 fn deleted_files_are_dumped_as_ghosts() {
-    use gpueue_helper::host::DeletedFile;
     let mut ck = gpueue_helper::config::default_checkpoint_config();
     assert!(!ck.criu.link_remap);
-    let none = gpueue_helper::engine::dump_options(&ck, &DumpHazards::default());
-    assert_eq!(none, ck);
     ck.criu.link_remap = true;
-    assert!(
-        !gpueue_helper::engine::dump_options(&ck, &DumpHazards::default())
-            .criu
-            .link_remap
-    );
-    let file = |path: &str, size: u64, private: bool| DeletedFile {
-        path: path.into(),
-        size,
-        uid: 1000,
-        mode: 0o100600,
-        nlink: 0,
-        private,
-        file_caps: false,
+    let limit = |available: u64| {
+        let dump = gpueue_helper::engine::dump_options(&ck, available);
+        assert!(!dump.criu.link_remap);
+        let [flag, value] = &dump.criu.extra_dump_args[..] else {
+            panic!("{:?}", dump.criu.extra_dump_args)
+        };
+        assert_eq!(flag, "--ghost-limit");
+        value.to_str().unwrap().parse::<u64>().unwrap()
     };
-    let h = DumpHazards {
-        deleted_files: vec![
-            file("/home/a/x", 5 << 20, false),
-            file("/home/a/y", 10, false),
-            file("/tmp/big", 7 << 20, true),
-        ],
-        ..Default::default()
-    };
-    let ghost = gpueue_helper::engine::dump_options(&ck, &h);
-    assert!(!ghost.criu.link_remap);
-    assert_eq!(
-        ghost.criu.extra_dump_args,
-        [
-            "--ghost-limit".into(),
-            ((7u64 << 20) + 1).to_string().into()
-        ] as [std::ffi::OsString; 2]
-    );
+    assert_eq!(limit(50 << 30), 50 << 30);
+    assert_eq!(limit(10), 1 << 20);
+    assert_eq!(limit(u64::MAX), i64::MAX as u64);
 }
 
 /// Deleted files that CRIU could only link back as root, or would
@@ -1849,6 +1829,21 @@ async fn deleted_libraries_of_root_are_dumped() {
     let args = args.last().unwrap();
     assert!(!args.iter().any(|a| a == "--link-remap"), "{args:?}");
     assert!(args.iter().any(|a| a == "--ghost-limit"), "{args:?}");
+}
+
+/// A deleted file larger than any the pre-checks saw (a PyTorch DataLoader
+/// batch in `/dev/shm`, created after them) still fits under the ghost
+/// limit, which is the free space of the image base.
+#[tokio::test]
+async fn the_ghost_limit_does_not_depend_on_the_deleted_files_seen() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    env.host.set_available(64 << 30);
+    spawn_and_dump(&env, &mut c, 3).await;
+    let args = env.exec.lock().unwrap().dump_args.clone();
+    let args = args.last().unwrap();
+    let at = args.iter().position(|a| a == "--ghost-limit").unwrap();
+    assert_eq!(args[at + 1], (64u64 << 30).to_string(), "{args:?}");
 }
 
 /// The post-dump hook found something to refuse while CRIU had the job
@@ -2198,7 +2193,11 @@ async fn failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first()
     assert_eq!(r, ResponseResult::Accepted);
     let ev = c.event().await;
     let Event::CheckpointFinished {
-        outcome: CheckpointOutcome::Failed { reason, code: None },
+        outcome:
+            CheckpointOutcome::Failed {
+                reason,
+                code: Some(HelperErrorCode::CheckpointRolledBack),
+            },
         ..
     } = ev.event
     else {
@@ -2245,6 +2244,41 @@ async fn failed_dump_leaves_the_job_running_and_stopped_jobs_are_resumed_first()
         ResponseResult::Ok
     );
     assert!(kept[0].exists());
+}
+
+/// A failed dump whose rollback fails too (here CUDA cannot be resumed)
+/// is reported without a code: the daemon terminates the job.
+#[tokio::test]
+async fn a_failed_dump_with_a_failed_rollback_has_no_code() {
+    let env = Env::new().await;
+    let mut c = env.client().await;
+    assert!(matches!(
+        c.request(Request::Spawn(env.spawn_req(5))).await,
+        ResponseResult::Spawned { .. }
+    ));
+    env.host.set_cuda_pids(vec![10_001]);
+    {
+        let mut exec = env.exec.lock().unwrap();
+        exec.fail_on = Some(|a| matches!(a, Action::CriuDump { .. }));
+        exec.then_fail_on = Some(|a| matches!(a, Action::CudaRestore { .. }));
+    }
+    let r = c
+        .request(Request::Checkpoint {
+            job: JobId(5),
+            image_dir: env.base().join("5"),
+            options: Default::default(),
+        })
+        .await;
+    assert_eq!(r, ResponseResult::Accepted);
+    let ev = c.event().await;
+    let Event::CheckpointFinished {
+        outcome: CheckpointOutcome::Failed { reason, code: None },
+        ..
+    } = ev.event
+    else {
+        panic!("{ev:?}")
+    };
+    assert!(reason.contains("rollback incomplete"), "{reason}");
 }
 
 #[tokio::test]
