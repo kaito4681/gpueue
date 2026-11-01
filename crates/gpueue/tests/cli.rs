@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -117,6 +117,8 @@ enum Mode {
     /// jobs report the groups they paused or resumed, as for an
     /// administrator.
     Admin,
+    /// Like `Normal`, with a Checkpointed job 3.
+    Checkpointed,
 }
 
 /// The groups the fake daemon reports as paused/resumed for a bulk request.
@@ -188,13 +190,19 @@ async fn route(
                 }],
             },
         ),
-        ("GET", "/v1/jobs") => json(
-            StatusCode::OK,
-            ListJobsResponse {
-                jobs: jobs(),
-                orphans: Vec::new(),
-            },
-        ),
+        ("GET", "/v1/jobs") => {
+            let mut jobs = jobs();
+            if mode == Mode::Checkpointed {
+                jobs.push(job(3, JobState::Checkpointed));
+            }
+            json(
+                StatusCode::OK,
+                ListJobsResponse {
+                    jobs,
+                    orphans: Vec::new(),
+                },
+            )
+        }
         ("GET", "/v1/jobs/2") => {
             // A single job comes with its environment.
             let mut job = jobs().remove(1);
@@ -217,6 +225,10 @@ async fn route(
                 ],
                 groups: changed_groups(mode, &body),
             },
+        ),
+        ("POST", "/v1/jobs/reset") => json(
+            StatusCode::OK,
+            BulkJobResponse::new(vec![JobActionResult::ok(JobId(1))]),
         ),
         ("GET", "/v1/jobs/2/log?tail=16") => Response::builder()
             .header("content-type", CONTENT_TYPE_LOG)
@@ -331,6 +343,29 @@ fn gpueue(socket: &Path, args: &[&str]) -> Output {
         .env("GPUEUE_TEST_MARKER", "present")
         .output()
         .unwrap()
+}
+
+/// `gpueue` with `input` on its standard input.
+fn gpueue_with_input(socket: &Path, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gpueue"))
+        .arg("--socket")
+        .arg(socket)
+        .arg("--color")
+        .arg("never")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 fn stdout(output: &Output) -> String {
@@ -600,5 +635,80 @@ fn all_selection_reports_own_jobs_for_normal_users() {
         let (code, out) = run_bulk(Mode::Normal, args);
         assert_eq!(code, Some(1), "{args:?}");
         assert_eq!(out, *expected, "{args:?}");
+    }
+}
+
+/// The body of the `reset` request `daemon` got, if any.
+fn reset_body(daemon: &FakeDaemon) -> Option<String> {
+    daemon
+        .requests()
+        .into_iter()
+        .find(|r| r.uri == "/v1/jobs/reset")
+        .map(|r| r.body)
+}
+
+#[test]
+fn reset_asks_first_and_whether_checkpoints_go_too() {
+    // (input, args, reset body sent, prompts shown)
+    let cases: &[(&str, &[&str], Option<&str>, usize)] = &[
+        // Declining the reset (also by default) sends nothing.
+        ("n\n", &[], None, 1),
+        ("\n", &[], None, 1),
+        ("", &[], None, 1),
+        // Yes to both: everything goes.
+        ("y\ny\n", &[], Some("{}"), 2),
+        // No (the default) to the checkpoints: they are kept.
+        ("y\n\n", &[], Some(r#"{"keep_checkpointed":true}"#), 2),
+        // `--keep-checkpoints` asks only about the other jobs.
+        (
+            "y\n",
+            &["--keep-checkpoints"],
+            Some(r#"{"keep_checkpointed":true}"#),
+            1,
+        ),
+        // `--force` asks nothing.
+        ("", &["-f"], Some("{}"), 0),
+        (
+            "",
+            &["-f", "--keep-checkpoints"],
+            Some(r#"{"keep_checkpointed":true}"#),
+            0,
+        ),
+    ];
+    for (input, args, body, prompts) in cases {
+        let daemon = FakeDaemon::start(Mode::Checkpointed);
+        let mut argv = vec!["reset"];
+        argv.extend_from_slice(args);
+        let output = gpueue_with_input(&daemon.socket, &argv, input);
+        let err = stderr(&output);
+        assert_eq!(
+            reset_body(&daemon).as_deref(),
+            *body,
+            "{input:?} {args:?}: {err}"
+        );
+        assert_eq!(output.status.success(), body.is_some(), "{err}");
+        assert_eq!(err.matches("[y/N]").count(), *prompts, "{err}");
+        if *prompts > 0 {
+            let removed = if args.contains(&"--keep-checkpoints") {
+                "1, 2"
+            } else {
+                "1, 2, 3"
+            };
+            assert!(
+                err.contains(&format!(
+                    "You are trying to kill and remove jobs: {removed}\n"
+                )),
+                "{err}"
+            );
+        }
+        if *prompts == 2 {
+            assert!(
+                err.contains(
+                    "You are trying to also remove checkpointed jobs and delete their \
+                     checkpoint images: 3\n"
+                ),
+                "{err}"
+            );
+        }
     }
 }

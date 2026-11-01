@@ -114,14 +114,33 @@ pub struct Cli {
     )]
     pub socket: PathBuf,
 
+    /// Print JSON: alone, the job list as `status --json` does; before a command that has
+    /// `--json`, the same as giving it to that command.
+    #[arg(short, long)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub cmd: Option<SubCommand>,
 }
 
 impl Cli {
     /// The subcommand to run. Like pueue, no subcommand means `status` without arguments.
+    /// `--json` is passed on to it (see [`Cli::json_unsupported_by`]).
     pub fn subcommand(&self) -> SubCommand {
-        self.cmd.clone().unwrap_or_else(SubCommand::default_status)
+        let mut cmd = self.cmd.clone().unwrap_or_else(SubCommand::default_status);
+        if self.json
+            && let Some(json) = cmd.json_flag()
+        {
+            *json = true;
+        }
+        cmd
+    }
+
+    /// The name of the subcommand that the top-level `--json` was given to but that has no
+    /// JSON output.
+    pub fn json_unsupported_by(&self) -> Option<&'static str> {
+        let mut cmd = self.cmd.clone()?;
+        (self.json && cmd.json_flag().is_none()).then(|| cmd.name())
     }
 }
 
@@ -220,7 +239,8 @@ pub enum SubCommand {
     /// Remove jobs from the list.
     ///
     /// Running or paused jobs have to be killed first. The checkpoint image of a Checkpointed
-    /// job is deleted as well.
+    /// job is deleted as well; when asked, answering no keeps the Checkpointed jobs and removes
+    /// the others.
     #[command(alias("rm"))]
     Remove {
         /// The ids of the jobs to remove.
@@ -539,7 +559,9 @@ pub enum SubCommand {
 
     /// Kill all jobs, remove them and reset the groups.
     ///
-    /// Regular users only reset their own jobs; administrators reset everything.
+    /// Regular users only reset their own jobs; administrators reset everything. Asks for
+    /// confirmation first, and separately whether Checkpointed jobs and their checkpoint images
+    /// are removed too.
     Reset {
         /// Only reset these groups (may be given multiple times).
         #[arg(short, long)]
@@ -548,6 +570,10 @@ pub enum SubCommand {
         /// Don't ask for confirmation.
         #[arg(short, long)]
         force: bool,
+
+        /// (gpueue) Keep Checkpointed jobs and their checkpoint images.
+        #[arg(long)]
+        keep_checkpoints: bool,
     },
 
     /// Checkpoint all running jobs and stop the daemon (administrators only).
@@ -785,6 +811,19 @@ impl SubCommand {
             query: Vec::new(),
             json: false,
             group: None,
+        }
+    }
+
+    /// The `--json` flag of a subcommand that has one.
+    fn json_flag(&mut self) -> Option<&mut bool> {
+        match self {
+            SubCommand::Status { json, .. }
+            | SubCommand::Log { json, .. }
+            | SubCommand::Group { json, .. }
+            | SubCommand::Gpu { json, .. }
+            | SubCommand::Prio { json, .. }
+            | SubCommand::Share { json, .. } => Some(json),
+            _ => None,
         }
     }
 

@@ -1645,7 +1645,9 @@ GPU 编号遵循 PCI 总线顺序，但设备节点以驱动的次设备号命�
   一条警告；在元数据能够写入之前，恢复会失败，但镜像会被保留。
   helper 在系统关机时完成转储后，还会在那里写入 `shutdown-manifest.json`。
 - 每个作业最多有一个镜像。恢复成功、作业被删除（`remove`、`clean`、`reset`）或转储失败时，
-  镜像会被删除。恢复失败时镜像会被保留。
+  镜像会被删除。恢复失败时镜像会被保留。`reset` 在删除任何作业之前都会确认（非交互使用需要 `-f`），
+  在删除已创建检查点的作业之前还会再次确认：回答 no 或使用 `--keep-checkpoints` 会保留这些作业及其镜像。
+  在终端中使用 `remove` 时，回答 no 同样会保留已创建检查点的作业。
 - 转储失败后，helper 会把其 `dump.log` 移到同一目录下的 `failed-logs/<job id>-<unix ms>.log`
   （仅限 root），并保留最新的 20 个。作业的最后错误会给出该文件名。
 - 空间：每次转储前，helper 要求可用空间至少为（作业的 RSS + VRAM + 其私有 `/tmp` 和 `/dev/shm` 中
@@ -2105,6 +2107,10 @@ keeps running` 失败，原因成为作业的最后错误。如果拒绝在转�
 - `the job holds deleted files with the setuid or setgid bit or file capabilities (...)`：恢复会以 root 身份、
   带着该所有者和权限把它们重新创建出来，成为特权程序。请在创建检查点之前关闭它们，或重启该作业。（其他已删除
   的文件，例如作业运行期间被软件包升级替换掉的库，会保存在镜像中，没有问题。）
+- `the job holds file leases (...)`：恢复时，CRIU 会在把凭据还给作业之前以 root 身份重新获取作业的文件锁。
+  这对 `flock`、POSIX 和 OFD 锁无害，因此它们会被创建检查点（用 `uv run` 启动、对 uv 缓存持有锁的作业也
+  可以创建检查点），但 lease 可能是其所有者本无法获取的。请在创建检查点之前用 `fcntl(F_SETLEASE, F_UNLCK)`
+  释放 lease，或用 `--no-checkpoint` 运行该作业。
 - `... (found while CRIU had the job stopped for the dump); the job was resumed`：作业在转储前的检查之后
   打开了这样的文件；CRIU 的 `post-dump` 检查发现了它，CRIU 放弃了转储。
 - `the job depends on a filesystem that is gone, does not answer or root cannot access: <mount

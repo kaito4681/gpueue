@@ -21,7 +21,8 @@ and NVIDIA cuda-checkpoint, without changes to the program.
 - A paused job can be checkpointed too. It is restored paused (still holding its GPU slots);
   resume it with `gpueue start <id>`.
 - `gpueue restart <id>` on a `Checkpointed` job starts it over from the beginning as a new job and
-  keeps the image. `gpueue remove <id>` discards the job **and deletes the image**.
+  keeps the image. `gpueue remove <id>` discards the job **and deletes the image** (on a terminal it asks first;
+  answering no keeps the job). `gpueue reset --keep-checkpoints` resets everything else.
 - `gpueue start` does not resume a `Checkpointed` job; use `restore`.
 
 ## What can make a checkpoint or restore fail
@@ -39,6 +40,9 @@ that CRIU and the helper roll back cleanly also leaves the job running (its last
   abstract name.
 - **`SO_REUSEPORT`** on a TCP/UDP socket makes the checkpoint refused; turn it off or use
   `--no-checkpoint`.
+- **File locks** (`flock`, `fcntl`, OFD; e.g. `uv run`'s cache lock) are saved and taken again on
+  restore, which waits while another process holds a conflicting lock. A **file lease**
+  (`F_SETLEASE`) makes the checkpoint refused; release it first.
 - **Deleted files** the job still holds are saved in the image, except that a deleted file with
   another hard link, a file deleted on NFS (`.nfs<hex>`), or a deleted setuid/setgid program
   (or one with file capabilities) makes the checkpoint refused; restart such a job, or close the

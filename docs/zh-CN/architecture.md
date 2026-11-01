@@ -124,7 +124,7 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    CRIU 的 `post-dump` 动作脚本（`gpueue-helper dump-hook`）会在 CRIU 仍停住被转储的任务时，对作业的文件再做一遍相同的检查；
    如果发现应当拒绝的内容（作业在第一轮检查之后打开了它），或没有及时完成，脚本就会失败，CRIU 放弃转储并让作业继续运行，
    检查点会连同原因一起报告为被拒绝。在手动模式下，它随后对每个 CUDA 进程运行
-   `cuda-checkpoint --action lock` 和 `checkpoint`，接着以 `--tcp-close` 和
+   `cuda-checkpoint --action lock` 和 `checkpoint`，接着以 `--tcp-close`、`--file-locks` 和
    `/var/lib/gpueue/checkpoints/<id>/` 下的镜像目录对命名空间的 init 执行 `criu dump`。
    在插件模式下，它只运行 `criu dump`，使用 CRIU 的默认插件目录，由 CRIU 的 `cuda_plugin.so` 调用 cuda-checkpoint
    （在插件模式下，如果插件缺失，CUDA 作业会被拒绝）。在转储之前，它写入恢复除 CRIU 镜像之外所需的内容
@@ -191,7 +191,12 @@ CRIU 以 root 身份运行，并按转储时的路径重新打开、创建或绑
   就能占用这样的名称（抽象名称没有权限，作业共享主机的网络命名空间），gpueue 0.1.3 也是这样恢复这些监听套接字的）、
   有 inotify 或 fanotify 描述符的作业（CRIU 会以 root 身份通过跟随符号链接的路径重新添加它们的监视），并且在 post-dump
   钩子中，拒绝带有 Unix 套接字消息中传输中的描述符（`sk-queues.img` 中的 `SCM_RIGHTS`；CRIU 会以 root 身份重新打开
-  它们并交给作业，恢复钩子看不到这一过程，因此该钩子会使转储失败，作业继续运行）的转储。它拒绝带有设置了
+  它们并交给作业，恢复钩子看不到这一过程，因此该钩子会使转储失败，作业继续运行）的转储。转储和恢复都会传入
+  `--file-locks`：CRIU 会在恢复作业的凭据之前，以 root 身份在恢复出的描述符上重新获取作业的锁（已在 CRIU 4.2
+  中确认）。`flock`、POSIX 和 OFD 锁只取决于描述符的访问模式，因此这不会带来额外权限；如果其间有其他进程持有冲突的锁，
+  恢复会等待。文件租约取决于是否拥有该文件（或 `CAP_LEASE`），并且 CRIU 会通过路径打开文件来重新中断正在中断的租约，
+  因此 helper 会在转储之前和 post-dump 钩子中拒绝持有租约、委托或这三种之外的锁的作业（与 CRIU 一样从
+  `/proc/<pid>/fdinfo/<fd>` 读取）。它拒绝带有设置了
   `SO_REUSEPORT` 的网络套接字的作业（CRIU 在恢复作业的凭据之前
   以 root 身份创建套接字，因此恢复后的套接字将属于 root，并可能加入同一端口上某个 root 服务的 `SO_REUSEPORT`
   组；已在 CRIU 4.2 上确认；helper 通过 `pidfd_getfd` 检查这些套接字，无法检查时拒绝转储），从不使用 `--link-remap`（CRIU 会在转储期间以 root 身份按路径把没有自己名字的打开文件

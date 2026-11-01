@@ -184,6 +184,15 @@ impl JobState {
         }
     }
 
+    /// Whether the job waits to be restored from its checkpoint image
+    /// (removing it deletes the image).
+    pub fn awaits_restore(&self) -> bool {
+        matches!(
+            self,
+            JobState::Checkpointed | JobState::RestoreQueued { .. }
+        )
+    }
+
     /// Whether the job currently holds group and GPU slots.
     pub fn occupies_slot(&self) -> bool {
         matches!(

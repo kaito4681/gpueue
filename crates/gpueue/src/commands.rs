@@ -294,7 +294,11 @@ impl App {
                 }
                 Ok(ExitCode::SUCCESS)
             }
-            SubCommand::Reset { groups, force } => self.reset(groups, force).await,
+            SubCommand::Reset {
+                groups,
+                force,
+                keep_checkpoints,
+            } => self.reset(groups, force, keep_checkpoints).await,
             SubCommand::Shutdown { no_checkpoint } => {
                 self.client
                     .shutdown(&ShutdownRequest { no_checkpoint })
@@ -498,23 +502,29 @@ impl App {
     }
 
     async fn remove(&self, task_ids: &[usize]) -> Result<ExitCode> {
-        let ids = requests::job_ids(task_ids);
+        let mut ids = requests::job_ids(task_ids);
         if io::stdin().is_terminal() {
             let checkpointed: Vec<JobId> = self
                 .jobs()
                 .await?
                 .into_iter()
-                .filter(|job| ids.contains(&job.id) && job.state == JobState::Checkpointed)
+                .filter(|job| ids.contains(&job.id) && job.state.awaits_restore())
                 .map(|job| job.id)
                 .collect();
             if !checkpointed.is_empty()
                 && !confirm(
                     "remove checkpointed jobs and delete their checkpoint images",
                     &checkpointed,
+                    false,
                 )?
             {
-                eprintln!("Aborted!");
-                return Ok(ExitCode::FAILURE);
+                // The other jobs are removed all the same.
+                ids.retain(|id| !checkpointed.contains(id));
+                if ids.is_empty() {
+                    eprintln!("Aborted!");
+                    return Ok(ExitCode::FAILURE);
+                }
+                eprintln!("Keeping checkpointed jobs: {}", id_list(&checkpointed));
             }
         }
         self.bulk(
@@ -564,32 +574,60 @@ impl App {
         .await
     }
 
-    async fn reset(&self, groups: Vec<String>, force: bool) -> Result<ExitCode> {
+    async fn reset(
+        &self,
+        groups: Vec<String>,
+        force: bool,
+        keep_checkpoints: bool,
+    ) -> Result<ExitCode> {
+        let mut keep_checkpointed = keep_checkpoints;
         if !force {
-            let running: Vec<JobId> = self
+            let jobs: Vec<JobView> = self
                 .jobs()
                 .await?
                 .into_iter()
                 .filter(|job| {
-                    !job.is_redacted()
-                        && job.state.occupies_slot()
-                        && (groups.is_empty() || groups.contains(&job.group))
+                    !job.is_redacted() && (groups.is_empty() || groups.contains(&job.group))
                 })
+                .collect();
+            let checkpointed: Vec<JobId> = jobs
+                .iter()
+                .filter(|job| job.state.awaits_restore())
                 .map(|job| job.id)
                 .collect();
-            if !running.is_empty() && !confirm("remove running jobs", &running)? {
+            let removed: Vec<JobId> = jobs
+                .iter()
+                .filter(|job| !(keep_checkpointed && job.state.awaits_restore()))
+                .map(|job| job.id)
+                .collect();
+            if !removed.is_empty() && !confirm("kill and remove jobs", &removed, false)? {
                 eprintln!("Aborted!");
                 return Ok(ExitCode::FAILURE);
+            }
+            if !keep_checkpointed
+                && !checkpointed.is_empty()
+                && !confirm(
+                    "also remove checkpointed jobs and delete their checkpoint images",
+                    &checkpointed,
+                    false,
+                )?
+            {
+                keep_checkpointed = true;
+                eprintln!("Keeping checkpointed jobs: {}", id_list(&checkpointed));
             }
         }
 
         let requests: Vec<ResetRequest> = if groups.is_empty() {
-            vec![ResetRequest { group: None }]
+            vec![ResetRequest {
+                group: None,
+                keep_checkpointed,
+            }]
         } else {
             groups
                 .iter()
                 .map(|group| ResetRequest {
                     group: Some(group.clone()),
+                    keep_checkpointed,
                 })
                 .collect()
         };
@@ -1275,8 +1313,19 @@ struct LogJson {
     output: String,
 }
 
+/// `value` as JSON for stdout: indented on a terminal, on one line otherwise
+/// (for pipes, `jq` and scripts).
 fn to_json<T: Serialize>(value: &T) -> String {
-    serde_json::to_string(value).expect("output serializes")
+    json_text(value, io::stdout().is_terminal())
+}
+
+fn json_text<T: Serialize>(value: &T, pretty: bool) -> String {
+    if pretty {
+        serde_json::to_string_pretty(value)
+    } else {
+        serde_json::to_string(value)
+    }
+    .expect("output serializes")
 }
 
 fn to_u32(value: usize) -> Result<u32> {
@@ -1287,21 +1336,29 @@ fn format_local(at: &DateTime<Local>) -> String {
     at.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-/// Asks `You are trying to {action}: 1, 2` and reads a `[Y/n]` answer from
-/// stdin, like pueue. End of input counts as "no".
-fn confirm(action: &str, ids: &[JobId]) -> Result<bool> {
+/// `1, 2, 3`.
+fn id_list(ids: &[JobId]) -> String {
     let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
-    eprintln!("You are trying to {action}: {}", ids.join(", "));
+    ids.join(", ")
+}
+
+/// Asks `You are trying to {action}: 1, 2` and reads a yes/no answer from
+/// stdin, like pueue; an empty answer is `default`. End of input counts as
+/// "no".
+fn confirm(action: &str, ids: &[JobId], default: bool) -> Result<bool> {
+    eprintln!("You are trying to {action}: {}", id_list(ids));
+    let choices = if default { "[Y/n]" } else { "[y/N]" };
     let stdin = io::stdin();
     loop {
-        eprint!("Do you want to continue [Y/n]: ");
+        eprint!("Do you want to continue {choices}: ");
         io::stderr().flush()?;
         let mut input = String::new();
         if stdin.lock().read_line(&mut input)? == 0 {
             return Ok(false);
         }
         match input.trim() {
-            "" | "y" | "Y" | "yes" => return Ok(true),
+            "" => return Ok(default),
+            "y" | "Y" | "yes" => return Ok(true),
             "n" | "N" | "no" => return Ok(false),
             _ => {}
         }
@@ -1408,6 +1465,16 @@ mod tests {
 
     use super::*;
     use crate::render::tests::{ctx, job};
+
+    #[test]
+    fn json_is_indented_only_when_asked() {
+        let value = serde_json::json!({"jobs": [{"id": 1}]});
+        assert_eq!(json_text(&value, false), r#"{"jobs":[{"id":1}]}"#);
+        assert_eq!(
+            json_text(&value, true),
+            "{\n  \"jobs\": [\n    {\n      \"id\": 1\n    }\n  ]\n}"
+        );
+    }
 
     #[test]
     fn version_mismatch_hints_at_the_install() {

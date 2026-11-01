@@ -35,6 +35,14 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => err.exit(),
     };
+    if let Some(name) = cli.json_unsupported_by() {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!("`{name}` has no JSON output; --json only applies to status, log, group, gpu, prio and share"),
+            )
+            .exit();
+    }
     // Only an explicit --socket / GPUEUE_SOCKET overrides the daemon's config file.
     let socket_is_explicit = !matches!(
         matches.value_source("socket"),

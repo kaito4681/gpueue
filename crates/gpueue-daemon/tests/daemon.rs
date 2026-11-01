@@ -3903,6 +3903,51 @@ async fn reset_jobs_that_run_again_after_a_checkpoint_or_restore_are_removed() {
     h.stop().await;
 }
 
+/// `reset` with `keep_checkpointed` removes everything else but leaves
+/// Checkpointed jobs and their images alone; without it they go too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_can_keep_checkpointed_jobs() {
+    let mut h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let kept = h.checkpointed_job().await;
+    let stashed = alice
+        .add(&AddJobRequest {
+            stashed: true,
+            ..job_request("stashed", &[])
+        })
+        .await;
+    let reset: BulkJobResponse = alice
+        .post("/v1/jobs/reset", json!({"keep_checkpointed": true}))
+        .await
+        .json();
+    assert!(reset.all_ok(), "{reset:?}");
+    assert_eq!(
+        reset.results.iter().map(|r| r.id).collect::<Vec<_>>(),
+        [stashed]
+    );
+    assert_eq!(
+        alice.get(&format!("/v1/jobs/{stashed}")).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(alice.job(kept).await.state, JobState::Checkpointed);
+    assert!(h.helper.has_image(kept));
+
+    let reset: BulkJobResponse = alice.post("/v1/jobs/reset", json!({})).await.json();
+    assert!(reset.all_ok(), "{reset:?}");
+    assert_eq!(
+        alice.get(&format!("/v1/jobs/{kept}")).await.status,
+        StatusCode::NOT_FOUND
+    );
+    for _ in 0..250 {
+        if !h.helper.has_image(kept) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!h.helper.has_image(kept));
+    h.stop().await;
+}
+
 /// How many SIGTERMs the helper got for `id`.
 fn sigterms(h: &Harness, id: JobId) -> usize {
     h.helper

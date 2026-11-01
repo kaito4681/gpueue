@@ -44,6 +44,7 @@ Extra commands and options:
 | --- | --- |
 | `add --gpu <LIST>` | GPUs the job runs on, e.g. `0` or `0,1`. Without it the job is CPU-only (`CUDA_VISIBLE_DEVICES` is empty). |
 | `add --no-checkpoint` | never checkpoint this job; on shutdown it is terminated |
+| `reset --keep-checkpoints` | reset everything except `Checkpointed` (and restore-queued) jobs, which keep their checkpoint images |
 | `checkpoint [IDS] [-g GROUP] [-a]` | save running jobs and stop them |
 | `restore [IDS] [-g GROUP] [-a] [-i]` | resume `Checkpointed` jobs (`-i`: like `start`, right away for administrators, first among your own jobs for anybody else) |
 | `gpu [-j]`, `gpu parallel <N> [--gpu LIST]` | list GPUs, or set the per-GPU job limit (administrators) |
@@ -64,7 +65,9 @@ columns, and `Checkpointed` jobs show the image size.
 
 ## JSON output
 
-`gpueue status --json` prints `{"groups": [...], "jobs": [...]}`:
+`gpueue status --json` (or just `gpueue --json`) prints `{"groups": [...], "jobs": [...]}`. Every
+`--json` output is indented when stdout is a terminal and on one line otherwise (in a pipe, for
+`jq` or a script):
 
 ```json
 {
@@ -293,6 +296,12 @@ settings.
 - **inotify, fanotify and descriptors in flight:** a job with an inotify or fanotify descriptor
   (file watchers), or one that is passing descriptors over a Unix socket (`SCM_RIGHTS`) at the
   moment of the checkpoint, cannot be checkpointed (CRIU would recreate those as root).
+- **File locks and leases:** `flock`, POSIX (`fcntl`) and OFD locks are saved and taken again on
+  restore, so jobs started with `uv run` (which locks its cache while it runs) can be
+  checkpointed. A restore waits while another process holds a conflicting lock (up to its
+  deadline; it then fails and keeps the image, so it can be retried). A job holding a
+  file lease (`F_SETLEASE`) cannot be checkpointed (CRIU would take it again as root); release it
+  first.
 - **Listening ports:** a job whose TCP or UDP socket is bound to a port can be checkpointed
   (Jupyter, TensorBoard), but it is restored only while no other socket on the host has that
   port; otherwise the restore is refused and can be retried once the port is free.
@@ -321,6 +330,9 @@ settings.
   checkpointed. gpueue refuses the dump and tells you why. The job keeps running.
 - Checkpoint images are never deleted automatically while their job exists. They are removed when
   the job is restored successfully, removed (`remove`, `clean`, `reset`), or when its dump fails.
+  Before removing them, `reset` (unless `-f`) and `remove` (on a terminal) ask `[y/N]` whether the
+  `Checkpointed` jobs go too; answering no (the default) keeps those jobs and their images and
+  removes the others. `reset` also asks `[y/N]` before it kills and removes anything.
   Above `checkpoint_size_limit_bytes`, gpueue warns but does not refuse.
 - Not available yet: `edit`, `env`, periodic checkpoints, checkpointing a job while keeping it
   running, freeing a GPU without a full checkpoint ("GPU suspend"), a web UI or TCP API, and slots

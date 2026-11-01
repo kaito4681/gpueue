@@ -1,7 +1,9 @@
 # gpueue JSON output
 
 `--json` (`-j`) prints gpueue's own schema (not pueue's state dump) on `status`, `log`, `gpu`,
-`group`, `prio` and `share`. Timestamps are Unix epoch milliseconds; `owner` is a uid.
+`group`, `prio` and `share` (`gpueue --json` alone is `status --json`). Timestamps are Unix epoch
+milliseconds; `owner` is a uid. Output is indented on a terminal and one line otherwise, so
+`jq` and scripts get compact JSON.
 
 ## `gpueue status --json`
 

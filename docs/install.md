@@ -1844,6 +1844,9 @@ their unit. You need to turn it off:
   The helper also writes `shutdown-manifest.json` there after the dumps at system shutdown.
 - Each job has at most one image. It is deleted when the restore succeeds, when the job is removed
   (`remove`, `clean`, `reset`), or when the dump fails. A failed restore keeps the image.
+  `reset` asks before it removes any job (non-interactive use needs `-f`) and asks again before it
+  removes checkpointed jobs: answering no, or `--keep-checkpoints`, keeps those jobs and their
+  images. `remove` on a terminal likewise keeps the checkpointed jobs if you answer no.
 - After a failed dump the helper moves its `dump.log` to `failed-logs/<job id>-<unix ms>.log` in
   the same directory (root only) and keeps the newest 20 of them. The job's last error names the
   file.
@@ -2371,6 +2374,11 @@ warned on their next command. Refusals:
   restore would re-create them as root with that owner and mode, as privileged programs. Close
   them before the checkpoint, or restart the job. (Other deleted files, such as libraries that a
   package upgrade replaced while the job ran, are saved in the image and are fine.)
+- `the job holds file leases (...)`: CRIU takes a job's file locks again on restore, as root
+  before it gives the job its credentials back. That is harmless for `flock`, POSIX and OFD locks,
+  which are checkpointed (so jobs started with `uv run`, which holds a lock on uv's cache, can be
+  checkpointed), but a lease could be one its owner could not take. Release the lease with
+  `fcntl(F_SETLEASE, F_UNLCK)` before the checkpoint, or run the job with `--no-checkpoint`.
 - `... (found while CRIU had the job stopped for the dump); the job was resumed`: the job opened
   such a file after the checks before the dump; CRIU's `post-dump` check found it and CRIU
   abandoned the dump.

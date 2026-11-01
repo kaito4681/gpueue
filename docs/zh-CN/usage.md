@@ -44,6 +44,7 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | --- | --- |
 | `add --gpu <LIST>` | 作业运行所用的 GPU，例如 `0` 或 `0,1`。不指定时作业仅使用 CPU（`CUDA_VISIBLE_DEVICES` 为空）。 |
 | `add --no-checkpoint` | 从不为该作业创建检查点；关机时将其终止 |
+| `reset --keep-checkpoints` | 重置除 `Checkpointed`（以及等待恢复）作业之外的所有作业，这些作业保留其检查点镜像 |
 | `checkpoint [IDS] [-g GROUP] [-a]` | 保存运行中的作业并停止它们 |
 | `restore [IDS] [-g GROUP] [-a] [-i]` | 继续运行 `Checkpointed` 作业（`-i`：与 `start` 一样，管理员立即运行，其他用户排到自己作业的最前面） |
 | `gpu [-j]`、`gpu parallel <N> [--gpu LIST]` | 列出 GPU，或设置每块 GPU 的作业数上限（管理员） |
@@ -64,7 +65,8 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 <a id="json-output"></a>
 ## JSON 输出
 
-`gpueue status --json` 输出 `{"groups": [...], "jobs": [...]}`：
+`gpueue status --json`（或只用 `gpueue --json`）输出 `{"groups": [...], "jobs": [...]}`。
+所有 `--json` 输出在标准输出是终端时带缩进显示，否则（管道、`jq` 或脚本）输出为一行：
 
 ```json
 {
@@ -255,6 +257,9 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   root 是监听者），但 libcuda 在每个 CUDA 进程中监听的套接字（`@cuda-uvmfd-<PID 命名空间的 inode>-<PID>@`）除外。
 - **inotify、fanotify 和传输中的描述符：** 如果作业有 inotify 或 fanotify 描述符（文件监视器），或在创建检查点的
   那一刻正通过 Unix 套接字传递描述符（`SCM_RIGHTS`），就无法为它创建检查点（CRIU 会以 root 身份重新创建它们）。
+- **文件锁和租约：** `flock`、POSIX（`fcntl`）和 OFD 锁会被保存，并在恢复时重新获取，因此用 `uv run`
+  （运行期间一直锁定其缓存）启动的作业也可以创建检查点。其他进程持有冲突的锁时，恢复会等待（直到其期限；之后恢复失败并保留镜像，可以重试）。持有文件租约
+  （`F_SETLEASE`）的作业无法创建检查点（CRIU 会以 root 身份重新获取它）；请先释放它。
 - **监听端口：** 如果作业的 TCP 或 UDP 套接字绑定了某个端口，仍可为它创建检查点（Jupyter、TensorBoard），但只有在
   主机上没有其他套接字占用该端口时才会恢复；否则恢复会被拒绝，待端口空闲后可以重试。
 - **`SO_REUSEPORT`：** 如果作业有设置了 `SO_REUSEPORT` 的 TCP 或 UDP 套接字，同样无法为它创建检查点
@@ -278,7 +283,9 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - **覆盖 `/` 的挂载：** 如果作业的根目录被另一个挂载覆盖，就无法为它创建检查点。
   gpueue 会拒绝转储并告诉你原因。作业继续运行。
 - 只要作业还存在，检查点镜像就不会被自动删除。在作业成功恢复、被删除（`remove`、`clean`、`reset`）
-  或其转储失败时，镜像会被删除。超过 `checkpoint_size_limit_bytes` 时，gpueue 会发出警告，但不会拒绝。
+  或其转储失败时，镜像会被删除。删除之前，`reset`（未加 `-f` 时）和 `remove`（在终端中运行时）会以 `[y/N]`
+  询问是否也删除 `Checkpointed` 作业；回答否（默认）会保留这些作业及其镜像，只删除其他作业。`reset` 在终止并
+  删除任何作业之前也会以 `[y/N]` 确认。超过 `checkpoint_size_limit_bytes` 时，gpueue 会发出警告，但不会拒绝。
 - 暂不支持：`edit`、`env`、定期检查点、在保持作业运行的同时创建检查点、不做完整检查点而释放 GPU
   （"GPU suspend"）、Web UI 或 TCP API，以及按显存计数的槽位。
 

@@ -20,7 +20,8 @@ session, needs a GPU, or competes with other users for the machine.
 - Act only on jobs the user owns. Always pass explicit job ids to `kill`, `pause`, `remove`,
   `restart`, `checkpoint`, `restore` and `clean`-like actions. Without ids, `kill`, `pause` and
   `start` act on all of the user's jobs in the default group; `reset` kills and removes all of
-  the user's jobs. Never run `reset` unless the user explicitly asks for it.
+  the user's jobs (`--keep-checkpoints` keeps `Checkpointed` jobs and their images). Never run
+  `reset` unless the user explicitly asks for it.
 - Never use `sudo` with gpueue, and do not run administrator commands (`shutdown`, `parallel`,
   `group add/remove/priority`, `gpu parallel`, `share set`, `site`, `service`, `uninstall`,
   `update`, `daemon`). If the user is not an administrator they fail with "permission denied";
@@ -32,7 +33,9 @@ session, needs a GPU, or competes with other users for the machine.
 - Other users' commands, logs, labels and environments are hidden from you; do not try to read
   them some other way.
 - `remove` of a `Checkpointed` job deletes its checkpoint image, which may hold hours of
-  progress. Confirm with the user first.
+  progress. Confirm with the user first. On a terminal, `remove` and `reset` ask `[y/N]` before
+  deleting checkpointed jobs; without a terminal (as an agent) `remove` does not ask and `reset`
+  reads no answer and aborts unless `-f` is given.
 
 ## 1. Check that gpueue is available
 
@@ -111,7 +114,7 @@ gpueue wait 7 8 --status success -q   # exits non-zero if any of them did not su
 - Run long `wait`/`follow` calls in the background or with a timeout if the agent's tool has
   one; they are cheap (event stream, no polling).
 - For machine-readable output use `--json` on `status`, `log`, `gpu`, `group`, `prio` and
-  `share`. See [references/json.md](references/json.md) for the schema and `jq` recipes.
+  `share`; `gpueue --json` alone prints the job list like `gpueue status --json`. See [references/json.md](references/json.md) for the schema and `jq` recipes.
 
 ## 4. Control jobs
 
