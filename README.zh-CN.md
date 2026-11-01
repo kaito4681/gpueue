@@ -319,6 +319,26 @@ gpueue 处于 1.0 之前、正在积极开发的阶段；当前版本和发布�
 [测试范围](docs/zh-CN/usage.md#test-coverage)。请报告在你的硬件上哪些功能可用、哪些不可用。
 
 <details>
+<summary><b>从 v0.1.4 升级</b></summary>
+
+v0.1.5 改变了检查点失败时的处理方式，并增加了一些 CLI 功能。请确认以下行为变更：
+
+- CRIU 和 helper 干净回滚的转储失败不再停止作业：作业继续运行，其最后一条错误以
+  `checkpoint failed, the job keeps running:` 开头。只有回滚未完全成功、或 CRIU 在期限到达时被终止的转储，
+  仍会停止作业。
+- 作业在转储开始期间创建的已删除文件（例如 `/dev/shm` 下 PyTorch DataLoader 的共享内存）不再导致转储失败：
+  CRIU 的 ghost limit 现在是可用空间。
+- 持有文件锁（flock、POSIX 或 OFD 锁，例如用 `uv run` 启动的作业）的作业现在可以创建检查点；持有文件
+  lease 的作业会被拒绝。
+- 除非给出 `-f`，`gpueue reset` 总是要求确认，因此脚本必须传入 `-f`。删除已创建检查点的作业之前会另外询问，
+  `--keep-checkpoints` 会保留它们。`gpueue remove` 回答 "no" 时，会保留已创建检查点的作业并删除其余作业。
+- `gpueue --json` 输出作业列表；JSON 输出在终端上会缩进。
+- 当 CRIU 缺失或早于 4.2 时，`.deb` 和 `.rpm` 会在安装时发出警告，`gpueue doctor` 会给出适合该发行版的解决方法。
+- 升级后恢复 v0.1.4 创建的检查点由升级测试（`scripts/vm-reboot-test.sh`，CPU 作业）覆盖。
+
+</details>
+
+<details>
 <summary><b>从 v0.1.3 或更早版本升级</b></summary>
 
 v0.1.4 修复了安全审查中发现的问题（参见其

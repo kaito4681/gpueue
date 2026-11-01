@@ -316,6 +316,30 @@ reboot on bare metal and the GPU parts of a real reboot are not tested yet; see
 does not on your hardware.
 
 <details>
+<summary><b>Upgrading from v0.1.4</b></summary>
+
+v0.1.5 changes how checkpoint failures are handled and adds a few CLI features. Check these
+behaviour changes:
+
+- A failed dump that CRIU and the helper rolled back cleanly no longer stops the job: it keeps
+  running, and its last error starts with `checkpoint failed, the job keeps running:`. Only a dump
+  whose rollback was incomplete, or whose CRIU was killed at the deadline, still stops the job.
+- Deleted files that a job creates while a dump starts (such as PyTorch DataLoader shared memory
+  under `/dev/shm`) no longer fail the dump: CRIU's ghost limit is now the free space.
+- Jobs holding file locks (flock, POSIX or OFD locks, for example jobs started with `uv run`) can
+  now be checkpointed; jobs holding file leases are refused.
+- `gpueue reset` always asks for confirmation unless `-f` is given, so scripts must pass `-f`. It
+  asks separately before removing checkpointed jobs, and `--keep-checkpoints` keeps them. When
+  `gpueue remove` is answered "no", it keeps the checkpointed jobs and removes the others.
+- `gpueue --json` prints the job list; JSON output is indented on a terminal.
+- The `.deb` and `.rpm` warn at install time when CRIU is missing or older than 4.2, and
+  `gpueue doctor` names the fix for the distribution.
+- Restoring a checkpoint taken by v0.1.4 after the upgrade is covered by the upgrade test
+  (`scripts/vm-reboot-test.sh`, CPU jobs).
+
+</details>
+
+<details>
 <summary><b>Upgrading from v0.1.3 or earlier</b></summary>
 
 v0.1.4 fixed the findings of a security review (see its
