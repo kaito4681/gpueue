@@ -22,6 +22,61 @@ systemd_running() {
     [ -d /run/systemd/system ]
 }
 
+# Whether $1, what it resolves to and every directory above that are owned by
+# root and not group- or world-writable, as the helper requires of a program
+# it runs as root: nothing else is run here either.
+root_owned() {
+    p=$(readlink -f -- "$1") || return 1
+    while :; do
+        [ -n "$(find "$p" -maxdepth 0 -user 0 ! -perm /022 2>/dev/null)" ] || return 1
+        [ "$p" = / ] && return 0
+        p=$(dirname -- "$p")
+    done
+}
+
+# Warns when the CRIU the helper would use is missing or older than 4.2: jobs
+# run without it, but every checkpoint is refused. Never fails the install.
+check_criu() {
+    criu=$(sed -n 's/^[[:space:]]*criu_path[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+        /etc/gpueue/config.toml 2>/dev/null | tail -n 1)
+    [ -n "$criu" ] || criu=criu
+    case "$criu" in
+    */*) [ -x "$criu" ] || criu= ;;
+    *)
+        name=$criu
+        criu=
+        # systemd's PATH for services, which the helper searches.
+        for dir in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+            if [ -f "$dir/$name" ] && [ -x "$dir/$name" ]; then
+                criu=$dir/$name
+                break
+            fi
+        done
+        ;;
+    esac
+    if [ -z "$criu" ]; then
+        found="not found"
+    elif ! root_owned "$criu"; then
+        echo "gpueue: warning: $criu is not owned by root (or is writable by others), so the helper will not run it; see \`gpueue doctor\`" >&2
+        return 0
+    else
+        version=$(timeout 10 "$criu" --version 2>/dev/null |
+            sed -n 's/^Version:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' | head -n 1) || true
+        # Not parsable: an unusual build, which the helper assumes is new enough.
+        [ -n "$version" ] || return 0
+        major=${version%%.*}
+        minor=${version#"$major"}
+        minor=${minor#.}
+        minor=${minor%%.*}
+        if [ "$major" -gt 4 ] || { [ "$major" -eq 4 ] && [ "${minor:-0}" -ge 2 ]; }; then
+            return 0
+        fi
+        found="found $version at $criu"
+    fi
+    echo "gpueue: warning: CRIU 4.2 or newer is needed to checkpoint ($found)." >&2
+    echo "gpueue: jobs run, but checkpoints are refused until it is installed; see \`gpueue doctor\` and https://github.com/kaito4681/gpueue/blob/main/docs/install.md#criu" >&2
+}
+
 case "$1" in
 configure)
     if [ -z "$2" ] || [ -e "$REMOVED_MARKER" ]; then
@@ -83,5 +138,7 @@ else
             echo "gpueue: warning: restarting $UNITS failed; see \`gpueue doctor\`" >&2
     fi
 fi
+
+check_criu || true
 
 exit 0

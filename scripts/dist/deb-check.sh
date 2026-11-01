@@ -4,7 +4,8 @@
 # `apt-get install ./gpueue_*.deb` succeeds and sets up the user, directories
 # and services, that an edited conffile survives a reinstallation, that
 # installing next to `gpueue service install` is refused, that a rolled-back
-# removal (postinst abort-remove) enables the services again, and what
+# removal (postinst abort-remove) enables the services again, that postinst
+# warns about a CRIU older than 4.2 (and runs none root does not own), and what
 # `dpkg -r` and `dpkg -P` keep and delete.
 #
 # TODO(P4b): `apt-get update` / `apt upgrade` against a real (test) APT
@@ -83,6 +84,26 @@ must_exist /etc/systemd/system/multi-user.target.wants/gpueue.service \
 # apt reads the repository from gpueue.sources (not fetched: it does not exist yet).
 apt-get indextargets --no-release-info 2>/dev/null | grep -q 'github.com/kaito4681/gpueue/releases/download/apt' ||
     fail "apt does not see the gpueue repository"
+
+step "postinst warns about a CRIU older than 4.2, and does not run one root does not own"
+# /usr/local/sbin comes first in the helper's PATH, before a distribution CRIU.
+fake=/usr/local/sbin/criu
+mkdir -p /usr/local/sbin
+printf '#!/bin/sh\ntouch /tmp/criu-ran\necho "Version: 3.16"\n' >"$fake"
+chmod 755 "$fake"
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+grep -q 'CRIU 4.2 or newer is needed to checkpoint (found 3.16 at /usr/local/sbin/criu)' /tmp/criu.err ||
+    { cat /tmp/criu.err; fail "no warning about CRIU 3.16"; }
+printf '#!/bin/sh\necho "Version: 4.2.1"\n' >"$fake"
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+! grep -q CRIU /tmp/criu.err || { cat /tmp/criu.err; fail "warned about CRIU 4.2.1"; }
+printf '#!/bin/sh\ntouch /tmp/criu-ran\necho "Version: 3.16"\n' >"$fake"
+chown 1000 "$fake"
+rm -f /tmp/criu-ran
+/var/lib/dpkg/info/gpueue.postinst configure 0.0.0 >/dev/null 2>/tmp/criu.err
+grep -q 'is not owned by root' /tmp/criu.err || { cat /tmp/criu.err; fail "no warning about a criu root does not own"; }
+must_not_exist /tmp/criu-ran
+rm -f "$fake"
 
 step "a rolled-back removal enables the services again (prerm remove, postinst abort-remove)"
 wants=/etc/systemd/system/multi-user.target.wants

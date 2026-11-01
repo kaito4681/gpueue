@@ -56,7 +56,10 @@ Debian 13 (4.1) and RHEL/Rocky/Alma 9 (3.19) do not have it: build CRIU from sou
 <https://criu.org/Installation> (the upstream release tarball, `make` and `sudo make install`
 into `/usr/local/sbin`), or point `criu_path` in `/etc/gpueue/config.toml` at a root-owned build.
 The `.deb` and the `.rpm` only recommend `criu`, so on those releases apt or dnf installs the old
-package or none; a CRIU in `/usr/local/sbin` comes first in the helper's `PATH`. In the default **manual** mode
+package or none; a CRIU in `/usr/local/sbin` comes first in the helper's `PATH`. The package
+warns at the end of the installation when the CRIU the helper would use is missing or older than
+4.2, and `gpueue doctor` says what to do on the distribution it runs on: install its package where
+that is new enough, or build CRIU from source. In the default **manual** mode
 (`cuda_checkpoint_mode = "manual"`) the helper calls cuda-checkpoint itself and runs CRIU without
 plugins. The distribution package works for this, even though it ships without CRIU's CUDA plugin.
 

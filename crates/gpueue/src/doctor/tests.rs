@@ -137,6 +137,57 @@ fn printed_failures_carry_fix_hints() {
     assert!(out.ends_with("1 failed, 0 warning(s).\n"), "{out}");
 }
 
+/// The CRIU hint names the distribution's package where docs/install.md#criu says it is new
+/// enough, and a build from source elsewhere.
+#[test]
+fn criu_hint_depends_on_the_distribution() {
+    let (sys, _sockets) = healthy();
+    sys.respond("criu --version", CmdOutput::ok("Version: 3.16\n"));
+    let restart = "then `sudo systemctl restart gpueue-helper`";
+    for (os_release, package) in [
+        (
+            "ID=ubuntu\nID_LIKE=debian\nVERSION_ID=\"26.04\"\n",
+            "`sudo apt install criu` (in universe)",
+        ),
+        ("ID=fedora\nVERSION_ID=43\n", "`sudo dnf install criu`"),
+        ("ID=arch\n", "`sudo pacman -S criu`"),
+    ] {
+        sys.write("/etc/os-release", os_release);
+        assert_eq!(
+            hint(&run(&sys, None), "criu"),
+            format!("install the distribution's CRIU with {package}, {restart}"),
+            "{os_release}"
+        );
+    }
+    let build = "build CRIU 4.2 or newer from source (https://criu.org/Installation: the \
+                 release tarball, `make` and `sudo make install` into /usr/local/sbin) or set \
+                 `criu_path` in /etc/gpueue/config.toml to a root-owned build";
+    for os_release in [
+        "ID=ubuntu\nID_LIKE=debian\nVERSION_ID=\"24.04\"\n",
+        "ID=ubuntu\nID_LIKE=debian\nVERSION_ID=\"22.04\"\n",
+        "ID=debian\nVERSION_ID=\"13\"\n",
+        "ID=rocky\nID_LIKE=\"rhel centos fedora\"\nVERSION_ID=\"9.6\"\n",
+    ] {
+        sys.write("/etc/os-release", os_release);
+        assert_eq!(
+            hint(&run(&sys, None), "criu"),
+            format!(
+                "install CRIU 4.2 or newer: this distribution's package is older or missing, \
+                 so {build}; {restart}"
+            ),
+            "{os_release}"
+        );
+    }
+    sys.write("/etc/os-release", "");
+    assert_eq!(
+        hint(&run(&sys, None), "criu"),
+        format!(
+            "install CRIU 4.2 or newer: the distribution's package if it is new enough, else \
+             {build}; {restart}"
+        )
+    );
+}
+
 #[test]
 fn old_criu_fails() {
     let (sys, _sockets) = healthy();
@@ -1800,10 +1851,10 @@ fn hints_outside_nixos_are_unchanged() {
     for os_release in ["ID=ubuntu\nID_LIKE=debian\n", "ID=fedora\n", ""] {
         let (sys, _sockets) = broken_on(os_release);
         let report = run(&sys, None);
-        assert_eq!(
-            hint(&report, "criu"),
-            "install CRIU 4.2 or newer (https://criu.org/Installation), or set `criu_path` in \
-             /etc/gpueue/config.toml"
+        assert!(
+            hint(&report, "criu").starts_with("install "),
+            "{}",
+            hint(&report, "criu")
         );
         assert_eq!(
             hint(&report, "cuda-checkpoint"),

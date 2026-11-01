@@ -85,6 +85,7 @@ fn os(id: &str, id_like: &[&str]) -> OsRelease {
     OsRelease {
         id: id.to_owned(),
         id_like: id_like.iter().map(|s| (*s).to_owned()).collect(),
+        ..OsRelease::default()
     }
 }
 

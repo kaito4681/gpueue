@@ -56,7 +56,9 @@ Debian 12（3.17）、Debian 13（4.1）以及 RHEL/Rocky/Alma 9（3.19）则不
 <https://criu.org/Installation> 从源码构建 CRIU（使用上游发布的源码包，执行 `make` 和 `sudo make install`
 安装到 `/usr/local/sbin`），或者将 `/etc/gpueue/config.toml` 中的 `criu_path` 指向一个属于 root 的构建产物。
 `.deb` 和 `.rpm` 只是推荐（recommends）`criu`，因此在这些发行版上 apt 或 dnf 会安装旧版软件包或什么都不装；
-`/usr/local/sbin` 中的 CRIU 在 helper 的 `PATH` 中优先。在默认的 **manual** 模式
+`/usr/local/sbin` 中的 CRIU 在 helper 的 `PATH` 中优先。如果 helper 将使用的 CRIU 缺失或低于 4.2，
+软件包会在安装结束时给出警告；`gpueue doctor` 会针对当前发行版说明该怎么做：该发行版的软件包足够新时安装它，
+否则从源码构建 CRIU。在默认的 **manual** 模式
 （`cuda_checkpoint_mode = "manual"`）下，helper 自己调用 cuda-checkpoint，并以不加载插件的方式运行 CRIU。
 发行版软件包可以满足这种用法，即使它不带 CRIU 的 CUDA 插件。
 

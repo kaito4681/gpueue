@@ -43,11 +43,12 @@ const OS_RELEASE_FILES: &[&str] = &["/etc/os-release", "/usr/lib/os-release"];
 /// Symlinks followed while resolving a path, like the kernel's limit.
 const MAX_SYMLINKS: usize = 40;
 
-/// `ID` and `ID_LIKE` of os-release(5).
+/// `ID`, `ID_LIKE` and `VERSION_ID` of os-release(5).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OsRelease {
     pub id: String,
     pub id_like: Vec<String>,
+    pub version_id: String,
 }
 
 /// Distribution families, for naming the package manager in messages.
@@ -81,6 +82,7 @@ impl OsRelease {
                 "ID_LIKE" => {
                     release.id_like = value.split_whitespace().map(str::to_owned).collect();
                 }
+                "VERSION_ID" => release.version_id = value.to_owned(),
                 _ => {}
             }
         }
