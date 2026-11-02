@@ -19,6 +19,10 @@
 #   d  GPU job checkpointed while another GPU job runs and finishes, then
 #      restored
 #   e  GPU job with --no-checkpoint runs to Success
+#   f  preemption: a --yield GPU job is checkpointed by the scheduler when a
+#      job that does not yield needs its GPU slot, and is restored by itself
+#      once that job has finished (needs `preemption = true`, the default;
+#      CPU-only --yield jobs on the GPU fill its other free slots first)
 # After every dump: the job is Checkpointed with a size, its GPU slot is free,
 # nvidia-smi shows none of its processes and its progress file stands still.
 # After every restore: the counter continues from the dumped step (the
@@ -40,7 +44,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 src="$root/scripts/gpu-host-test"
 
 keep=0
-only="a,b,c,d,e"
+only="a,b,c,d,e,f"
 gpu=0
 group=default
 timeout="${GPUEUE_TEST_TIMEOUT:-300}"
@@ -63,7 +67,7 @@ while [ $# -gt 0 ]; do
 done
 case "$gpu" in '' | *[!0-9]*) echo "--gpu needs a number" >&2; exit 2 ;; esac
 for s in ${only//,/ }; do
-    case "$s" in a | b | c | d | e) ;; *) echo "unknown scenario: $s (a-e)" >&2; exit 2 ;; esac
+    case "$s" in a | b | c | d | e | f) ;; *) echo "unknown scenario: $s (a-f)" >&2; exit 2 ;; esac
 done
 
 run_id="ghtest-$(date +%Y%m%d%H%M%S)-$$"
@@ -160,7 +164,7 @@ add_job() {
     prog="$workdir/bin/$kind"
     mkdir -p "$dir"
     local gpuflag=()
-    [ "$kind" = check ] && gpuflag=(--gpu "$gpu")
+    case "$kind" in check*) gpuflag=(--gpu "$gpu") ;; esac
     new_id="$(gpueue add -p -g "$group" -l "$run_id-$name" -w "$dir" "${gpuflag[@]}" "$@" -- \
         "exec '$prog' '$dir'")" || { bad "gpueue add failed"; return 1; }
     jobs_created+=("$new_id")
@@ -341,6 +345,99 @@ scenario_e() {
     finish_job "$id" "$dir"
 }
 
+# PIDs on the GPU of the processes of scenario f's --yield GPU counter.
+yield_gpu_pids() {
+    nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null |
+        awk -F', ' -v p="$workdir/bin/check-yield" 'index($2, p) { print $1 }'
+}
+
+# Free slots (0: unlimited) of GPU $gpu and of group $group now.
+free_gpu_slots() {
+    gpueue gpu --json 2>/dev/null | jq -r --argjson g "$gpu" \
+        '.gpus[] | select(.index == $g) | if .parallel == 0 then 0 else ([.parallel - .used, 0] | max) end'
+}
+free_group_slots() {
+    local parallel used
+    parallel="$(gpueue group --json 2>/dev/null | jq -r --arg g "$group" '.groups[] | select(.name == $g) | .parallel')"
+    [ "${parallel:-0}" = 0 ] && { echo 0; return; }
+    used="$(gpueue status --json 2>/dev/null | jq -r --arg g "$group" \
+        '[.jobs[] | select(.group == $g and (.state.state | IN("running","paused","restoring","checkpointing")))] | length')"
+    echo $((parallel > used ? parallel - used : 0))
+}
+
+scenario_f() {
+    local dir="$workdir/f-yield" dir2="$workdir/f-urgent" id id2 fg fgr free fill=() i st pids
+    # The jobs must compete for one slot: fill all but one of the free slots
+    # (of the GPU or of the group, whichever has fewer) with CPU-only
+    # --yield jobs on the GPU. They start before the GPU counter, so the
+    # scheduler picks the counter, the most recently started, to preempt.
+    fg="$(free_gpu_slots)"
+    fgr="$(free_group_slots)"
+    if [ "${fg:-0}" = 0 ] && [ "${fgr:-0}" = 0 ]; then
+        bad "GPU $gpu and group $group both have unlimited slots, so no job ever waits for another; use --group with a limited group"
+        return 1
+    fi
+    if [ "${fg:-0}" = 0 ]; then free="$fgr"
+    elif [ "${fgr:-0}" = 0 ]; then free="$fg"
+    else free=$((fg < fgr ? fg : fgr)); fi
+    if [ "$free" -gt 8 ]; then
+        bad "$free free slots on GPU $gpu / in group $group; this scenario fills at most 7 (use a group with fewer slots)"
+        return 1
+    fi
+    info "$free free slot(s); filling $((free - 1)) with CPU-only --yield jobs"
+    for ((i = 1; i < free; i++)); do
+        add_job "fill$i" cpu "$workdir/f-fill$i" --gpu "$gpu" --yield || return 1
+        fill+=("$new_id")
+        start_counter "$new_id" "$workdir/f-fill$i" || return 1
+    done
+
+    add_job gpu-yield check-yield "$dir" --yield || return 1; id="$new_id"
+    start_counter "$id" "$dir" || return 1
+    wait_progress "$dir" $(($(progress_step_or_zero "$dir") + 2)) 30 || { bad "job $id stalled"; return 1; }
+    add_job gpu-urgent check "$dir2" || return 1; id2="$new_id"
+    info "job $id2 (does not yield) added for GPU $gpu"
+    if ! st="$(wait_state "$id" "$timeout" restore_queued)"; then
+        bad "job $id was not preempted (checkpointed and waiting to be restored): $st; is preemption off (\`preemption = false\`) or preempt_exempt_secs long?"
+        return 1
+    fi
+    if [ "$(job_json "$id" | jq -r '.preempted_at != null')" != true ]; then
+        bad "job $id is waiting to be restored but not marked as preempted"; return 1
+    fi
+    ok "job $id preempted (checkpointed, waiting to be restored)"
+    if gpu_slot_holds "$id"; then bad "GPU $gpu still lists job $id in a slot"; return 1; fi
+    pids="$(yield_gpu_pids | tr '\n' ' ')"
+    if [ -n "$pids" ]; then bad "nvidia-smi still shows the preempted job's processes: $pids"; return 1; fi
+    ok "GPU $gpu slot of job $id free, none of its processes in nvidia-smi"
+    dumped_step="$(progress_step_or_zero "$dir")"
+    start_counter "$id2" "$dir2" || return 1
+    sleep 2
+    [ "$(progress_step_or_zero "$dir")" = "$dumped_step" ] || { bad "job $id's progress advanced while preempted"; return 1; }
+    st="$(job_state "$id")"
+    [ "$st" = restore_queued ] || { bad "job $id is $st while job $id2 runs, not waiting to be restored"; return 1; }
+    ok "job $id still waits at step $dumped_step while job $id2 runs"
+    finish_job "$id2" "$dir2" || return 1
+
+    # Restored by the scheduler, nobody runs `gpueue restore`.
+    local t0=$SECONDS
+    if ! st="$(wait_state "$id" "$timeout" running)"; then
+        if [ "$st" = checkpointed:error ]; then
+            bad "restore of job $id FAILED (the job is Checkpointed again): $(last_error "$id" | cut -c1-160)"
+        else
+            bad "job $id was not restored by itself: $st"
+        fi
+        return 1
+    fi
+    if [ "$(job_json "$id" | jq -r '.preempted_at == null')" != true ]; then
+        bad "job $id runs again but is still marked as preempted"; return 1
+    fi
+    ok "job $id restored by itself in $((SECONDS - t0))s"
+    check_continues "$id" "$dir" || return 1
+    finish_job "$id" "$dir" || return 1
+    for ((i = 1; i < free; i++)); do
+        finish_job "${fill[$((i - 1))]}" "$workdir/f-fill$i" || return 1
+    done
+}
+
 describe() {
     case "$1" in
         a) echo "GPU job, 3 checkpoint/restore cycles" ;;
@@ -348,6 +445,7 @@ describe() {
         c) echo "CPU job, 2 checkpoint/restore cycles" ;;
         d) echo "GPU job checkpointed while another GPU job runs, then restored" ;;
         e) echo "GPU job without checkpoint (--no-checkpoint)" ;;
+        f) echo "--yield GPU job preempted by a job for its GPU, restored by itself" ;;
     esac
 }
 
@@ -476,6 +574,8 @@ workdir="$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/gpueue-host-test.XXXXXX")"
 mkdir -p "$workdir/bin"
 if "$cc" -O2 -Wall -o "$workdir/bin/check" "$src/check.c" -ldl 2>"$workdir/cc.log" &&
     "$cc" -O2 -Wall -o "$workdir/bin/cpu" "$src/cpu.c" 2>>"$workdir/cc.log"; then
+    # Scenario f's --yield counter, under its own name in nvidia-smi.
+    cp "$workdir/bin/check" "$workdir/bin/check-yield"
     ok "built the counters in $workdir/bin with $cc"
 else
     pf_fail "building the counters failed:"; sed 's/^/          /' "$workdir/cc.log"
