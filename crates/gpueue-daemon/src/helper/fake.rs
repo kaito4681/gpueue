@@ -75,6 +75,9 @@ struct State {
     ignore_leave_stopped: bool,
     /// The `leave_stopped` of every restore request.
     restores_stopped: Vec<(JobId, bool)>,
+    /// The job of every checkpoint request that reached the helper
+    /// (connected), whatever its outcome.
+    checkpoints_requested: Vec<JobId>,
     checkpoint_outcome: FakeOutcome,
     restore_outcome: FakeOutcome,
     restore_rejection: Option<String>,
@@ -414,6 +417,12 @@ impl FakeHelper {
         self.with(|s| s.restores_stopped.clone())
     }
 
+    /// The job of every checkpoint request received while connected, in
+    /// order, whatever its outcome.
+    pub fn checkpoint_requests(&self) -> Vec<JobId> {
+        self.with(|s| s.checkpoints_requested.clone())
+    }
+
     /// Holds spawn and restore requests until [`release_launches`].
     ///
     /// [`release_launches`]: FakeHelper::release_launches
@@ -733,6 +742,7 @@ impl FakeHelper {
     fn do_checkpoint(&self, job: JobId) -> HelperResult<()> {
         self.with(|s| {
             s.check_connected()?;
+            s.checkpoints_requested.push(job);
             if s.stopping {
                 return Err(HelperError::Rejected {
                     code: HelperErrorCode::ShuttingDown,

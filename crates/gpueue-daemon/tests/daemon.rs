@@ -4643,6 +4643,97 @@ async fn group_tiers_are_for_administrators() {
     assert_eq!(reply.error().code, ErrorCode::GroupNotFound);
 }
 
+/// Waits until `id` has been preempted: checkpointed and waiting, marked,
+/// to be restored.
+async fn wait_preempted(client: &Client, id: JobId) -> JobView {
+    client
+        .wait_for(id, "preempted", |j| {
+            matches!(j.state, JobState::RestoreQueued { .. }) && j.preempted_at.is_some()
+        })
+        .await
+}
+
+/// A `--yield` job on GPU 0 is checkpointed by the scheduler when another
+/// user's job needs GPU 0, waits (listed by `gpueue prio`) while that job
+/// runs, and is restored by itself once it has finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_yielding_job_is_preempted_and_restored_by_itself() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+
+    let mut request = job_request("long", &[0]);
+    request.spec.yield_mode = YieldMode::All;
+    let yielding = alice.add(&request).await;
+    alice.wait_state(yielding, &JobState::Running).await;
+    h.wait_spawned(yielding).await;
+
+    let urgent = bob.add(&job_request("urgent", &[0])).await;
+    let preempted = wait_preempted(&alice, yielding).await;
+    assert!(h.helper.has_image(yielding));
+    bob.wait_state(urgent, &JobState::Running).await;
+    assert_eq!(h.helper.checkpoint_requests(), [yielding]);
+    assert_eq!(
+        alice.job(yielding).await.preempted_at,
+        preempted.preempted_at
+    );
+    // Waiting for its slot like any restore-queued job.
+    assert_eq!(priority_order(&alice).await, [yielding.0]);
+
+    h.exit(urgent, 0).await;
+    bob.wait_state(urgent, &done(JobResult::Success)).await;
+    let restored = alice.wait_state(yielding, &JobState::Running).await;
+    assert_eq!(restored.preempted_at, None);
+    assert_eq!(h.helper.restore_requests(), [(yielding, false)]);
+    h.wait_launch_settled(yielding).await;
+    assert!(h.helper.is_running(yielding));
+    assert!(priority_order(&alice).await.is_empty());
+    // Checkpointed once.
+    assert_eq!(h.helper.checkpoint_requests(), [yielding]);
+
+    h.stop().await;
+}
+
+/// A job of a group of a higher tier preempts a job of a lower tier on
+/// the GPU it needs; the preempted job is restored once it has finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_higher_tier_groups_job_preempts_a_lower_tier_groups_job() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let admin = h.client(admin());
+    let reply = admin
+        .post("/v1/groups", json!({"name": "urgent", "parallel": 0}))
+        .await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    let reply = admin
+        .call(
+            Method::PUT,
+            "/v1/groups/urgent/tier",
+            Some(json!({ "tier": 1 })),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    let low = alice.add(&job_request("low", &[0])).await;
+    alice.wait_state(low, &JobState::Running).await;
+    h.wait_spawned(low).await;
+
+    let mut request = job_request("high", &[0]);
+    request.spec.group = "urgent".to_owned();
+    let high = bob.add(&request).await;
+    wait_preempted(&alice, low).await;
+    bob.wait_state(high, &JobState::Running).await;
+
+    h.exit(high, 0).await;
+    let restored = alice.wait_state(low, &JobState::Running).await;
+    assert_eq!(restored.preempted_at, None);
+    assert_eq!(h.helper.restore_requests(), [(low, false)]);
+    assert_eq!(h.helper.checkpoint_requests(), [low]);
+
+    h.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn priority_view_hides_commands_and_shows_factors() {
     let h = Harness::new(0).await;

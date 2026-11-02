@@ -53,12 +53,6 @@ use crate::logfile;
 use crate::usage::SizeWarnings;
 use crate::users::UserDb;
 
-// The scheduler does not preempt jobs yet; remove this once
-// `Core::schedule_once` calls `Core::preempt_jobs`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "not called by the scheduler yet")
-)]
 mod preempt;
 pub(crate) use preempt::{Preemption, RunNote};
 
@@ -2763,11 +2757,25 @@ impl Core {
         }
     }
 
+    /// One scheduling pass: delayed enqueues, dependency failures, forced
+    /// launches, then [`scheduler::plan_preemptive`]'s launches and
+    /// preemptions, all in one transaction; the spawn, restore and dump
+    /// requests are sent once it has committed.
+    ///
+    /// The jobs to preempt are marked and put in `Checkpointing` in the
+    /// transaction they were chosen in, so nothing changes between the
+    /// choice and the marking, and the next pass (woken by this one's
+    /// changes) sees them as being preempted, which the scheduler counts as
+    /// freed: it does not preempt again for the same waiting job while the
+    /// dumps run. The jobs launched in this pass are never chosen: the
+    /// planned ones are still waiting in the snapshot the scheduler gets,
+    /// and the forced ones are left out like those whose launch has not
+    /// been answered yet (see [`Core::not_preemptible`]).
     pub async fn schedule_once(self: &Arc<Self>) -> ApiResult<()> {
         let launch = !self.is_shutting_down() && self.helper_ready() && !self.launches_paused();
         let now = self.now_ms();
         let core = self.clone();
-        let launched = self
+        let (launched, preempted) = self
             .write(move |tx, ch| {
                 // Checked under the database lock (see `Core::stop_launches`).
                 // So is the launch pause: a helper's refusal pauses launches
@@ -2775,6 +2783,7 @@ impl Core {
                 // the pause before that must not relaunch the job right away.
                 let launch =
                     launch && !core.launches_stopped.is_cancelled() && !core.launches_paused();
+                let preempt = launch && core.can_preempt();
                 // Finished jobs only matter as dependencies. Commands and
                 // environments are not needed to decide (only to launch).
                 let mut jobs = tx.list_unfinished_jobs_brief()?;
@@ -2821,8 +2830,25 @@ impl Core {
                     fairshare: &fairshare,
                     resources: core.priority_resources(gpus.len()),
                 };
-                let plan =
-                    scheduler::plan_prioritized(now, &jobs, &groups, &gpus, &reserved, &input);
+                // Read under the database lock, so they match the jobs.
+                let mut refused = core.not_preemptible(&jobs, now);
+                refused.extend(launched.iter().map(|(id, _)| *id));
+                let running_since = core.running_since();
+                let preempt_input = scheduler::PreemptInput {
+                    enabled: preempt,
+                    exempt_ms: core.preemption.exempt_ms,
+                    refused: &refused,
+                    running_since: &running_since,
+                };
+                let plan = scheduler::plan_preemptive(
+                    now,
+                    &jobs,
+                    &groups,
+                    &gpus,
+                    &reserved,
+                    &input,
+                    &preempt_input,
+                );
                 let mut by_id: HashMap<JobId, Job> = jobs.into_iter().map(|j| (j.id, j)).collect();
                 for id in &plan.enqueue {
                     let Some(job) = by_id.get_mut(id) else {
@@ -2858,6 +2884,20 @@ impl Core {
                         launched.push((job.id, t.effects));
                     }
                 }
+                // Last, as the scheduler expects: the launches above do not
+                // count on the slots these free.
+                let mut preempted = Vec::new();
+                if preempt {
+                    for &id in &plan.preempt {
+                        // The whole job, for its dump request.
+                        let Some(mut job) = tx.get_job(id)? else {
+                            continue;
+                        };
+                        if let Some(effects) = core.preempt_in_tx(tx, &mut job, now, ch)? {
+                            preempted.push((job, effects));
+                        }
+                    }
+                }
                 // The whole jobs, for their spawn or restore requests.
                 let mut full = Vec::with_capacity(launched.len());
                 for (id, effects) in launched {
@@ -2871,9 +2911,10 @@ impl Core {
                     ));
                     full.push((job, effects));
                 }
-                Ok(full)
+                Ok((full, preempted))
             })
             .await?;
+        self.send_preemptions(preempted);
         // Each launch runs on its own task, so one slow helper answer does
         // not hold up the next scheduling round; at most
         // `MAX_CONCURRENT_LAUNCHES` are sent at a time. A launch still

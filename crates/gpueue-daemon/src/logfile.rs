@@ -29,10 +29,6 @@ pub enum Access {
     Read,
     Write,
     /// Writing at the end only (`O_APPEND`), as the job writes its output.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "preemption is not called by the scheduler yet")
-    )]
     Append,
 }
 
@@ -123,10 +119,6 @@ pub fn truncate(logs_dir: &Path, owner: Uid, id: JobId) -> io::Result<()> {
 /// on restore that the files the job had open have the size they had when
 /// it was dumped, so a note written in between would make the restore
 /// fail.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "preemption is not called by the scheduler yet")
-)]
 pub fn append_note(logs_dir: &Path, owner: Uid, id: JobId, note: &str) -> io::Result<()> {
     use std::io::Write;
     match open(logs_dir, owner, id, Access::Append) {

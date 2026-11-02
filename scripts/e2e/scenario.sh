@@ -10,6 +10,10 @@
 # Prints "PASS <scenario>" / "FAIL <scenario>: <reason>" per scenario and
 # exits non-zero if any failed.
 set -uo pipefail
+# `docker exec` passes on the container runtime's umask, which is 0000
+# under some rootless Docker setups: files and directories made here would
+# be world-writable (and the helper refuses such an /etc/gpueue).
+umask 022
 
 LOGS=/var/lib/gpueue/logs
 CKPT=/var/lib/gpueue/checkpoints
@@ -2118,6 +2122,52 @@ s29_mount_edge_cases() {
     umount -l "$base/b"
 }
 
+# s30: preemption. A --yield counter in a group that runs one job at a time
+# is checkpointed by the scheduler when a job that does not yield is added
+# to the group; that job runs and finishes, then the counter is restored by
+# itself (nobody runs `gpueue restore`) and counts on from where it was
+# dumped, not from 0.
+s30_yield_preemption() {
+    local y n hold before after
+    last_number() { grep -E '^[0-9]+$' "$LOGS/$1/$2.log" | tail -n1; }
+    preempted() { [ "$(q carol "job($1).get('preempted_at') is not None")" = true ]; }
+    pz carol group add yield30 -p 1 || fail "group add"
+    y=$(add alice -g yield30 --yield -- "$COUNTER")
+    wait_state "$y" running
+    wait_unit "$y"
+    sleep 1.5
+    hold=$(hold_file bob yield30)
+    n=$(add bob -g yield30 -- "$(hold_cmd "$hold" 'echo urgent done')")
+    # Checkpointed for job n, and waiting to be restored while n runs.
+    wait_state "$y" restore_queued 120
+    preempted "$y" || fail "job $y is not marked as preempted"
+    wait_state "$n" running
+    wait_unit "$n"
+    unit_inactive "$y" || fail "the unit of job $y still runs after its dump"
+    [ -e "$CKPT/$y" ] || fail "no image in $CKPT/$y"
+    grep -q '^\[gpueue\] checkpointing the job to make room for a higher-priority job' \
+        "$LOGS/1000/$y.log" || fail "the log of job $y does not say why it stopped"
+    before=$(last_number 1000 "$y")
+    sleep 1
+    [ "$(last_number 1000 "$y")" = "$before" ] || fail "the log grows while job $y is preempted"
+    expect_state "$y" restore_queued
+    release "$hold"
+    wait_state "$n" done/success 30
+    rm -f "$hold"
+    # Restored by the scheduler once n has given the slot back.
+    wait_state "$y" running 120
+    [ "$(q carol "job($y).get('preempted_at')")" = null ] || fail "job $y is still marked as preempted"
+    [ "$(started_at "$n")" -ge "$(q carol "job($y)['started_at']")" ] || fail "job $y was started again instead of restored"
+    expect_continues 1000 "$y"
+    sleep 1
+    after=$(last_number 1000 "$y")
+    echo "counter of job $y when preempted: $before, after its restore: $after"
+    [ "$after" -gt "$before" ] || fail "job $y did not continue after its restore"
+    check_counter_log 1000 "$y"
+    pz alice kill "$y" >/dev/null || fail "kill $y"
+    wait_state "$y" 'done/*'
+}
+
 case "${1:-main}" in
 main)
     run "1 add/status/log/follow/wait" s1_lifecycle
@@ -2139,6 +2189,7 @@ main)
     run "27 signals of a job" s27_job_signals
     run "28 deleted files at a checkpoint" s28_deleted_files
     run "29 hidden, oddly named and redirectable mounts" s29_mount_edge_cases
+    run "30 preemption of a --yield job" s30_yield_preemption
     if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
         run "9 GPU checkpoint and restore" s9_gpu
         run "11 GPU training with forked DataLoader workers" s11_gpu_fork_workers
