@@ -71,7 +71,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Group, Job, JobId, JobState, Timestamp, Uid};
+use crate::model::{Group, Job, JobId, JobState, Timestamp, Uid, YieldMode};
 
 /// CPUs a job is counted as using: gpueue does not allocate CPUs, so every
 /// job counts as one.
@@ -321,6 +321,26 @@ pub struct JobPriority {
     pub weighted: Weighted,
     pub site: i32,
     pub nice: i32,
+    /// The tier of the job's group (0 if the group is unknown). Jobs are
+    /// ordered by tier and yield before the priority (see
+    /// [`crate::scheduler::order_key`]). Omitted when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tier: i32,
+    /// The job's yield mode. JSON key `yield`, omitted when none.
+    #[serde(rename = "yield", default, skip_serializing_if = "YieldMode::is_none")]
+    pub yield_mode: YieldMode,
+}
+
+fn is_zero(value: &i32) -> bool {
+    *value == 0
+}
+
+/// The tier of `job`'s group (0 if the group is unknown).
+pub(crate) fn group_tier(job: &Job, groups: &[Group]) -> i32 {
+    groups
+        .iter()
+        .find(|g| g.name == job.spec.group)
+        .map_or(0, |g| g.tier)
 }
 
 /// What ordering pending jobs needs besides the jobs.
@@ -441,6 +461,8 @@ pub fn prioritize(
                 weighted: Weighted::default(),
                 site: job.site_factor,
                 nice: job.spec.nice,
+                tier: group_tier(job, ctx.groups),
+                yield_mode: job.spec.yield_mode,
             })
             .collect();
     }
@@ -540,6 +562,8 @@ pub fn prioritize(
                     weighted,
                     site: job.site_factor,
                     nice: job.spec.nice,
+                    tier: group_tier(job, ctx.groups),
+                    yield_mode: job.spec.yield_mode,
                 },
                 rank[&job.id],
             )

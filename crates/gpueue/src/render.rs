@@ -485,15 +485,27 @@ pub fn priorities(response: &PriorityResponse, ctx: &RenderCtx) -> String {
     if response.jobs.is_empty() {
         return format!("{headline}\nNo pending jobs.");
     }
+    // Tiers and yields only when some job has them, like the optional
+    // columns of `gpueue status`.
+    let tiers = response
+        .jobs
+        .iter()
+        .any(|job| job.tier != 0 || !job.yield_mode.is_none());
+    let headline = if tiers {
+        format!("{headline}\nJobs are ordered by tier and yield first, then by priority.")
+    } else {
+        headline
+    };
     let mut table = ctx.table();
     table.load_style(UTF8_HORIZONTAL_ONLY);
+    let mut header = vec!["Id", "Owner", "Group"];
+    if tiers {
+        header.extend(["Tier", "Yield"]);
+    }
     if basic {
-        table.set_header(vec!["Id", "Owner", "Group", "Prio"]);
+        header.push("Prio");
     } else {
-        table.set_header(vec![
-            "Id",
-            "Owner",
-            "Group",
+        header.extend([
             "Priority",
             "Site",
             "Age",
@@ -504,13 +516,21 @@ pub fn priorities(response: &PriorityResponse, ctx: &RenderCtx) -> String {
             "Nice",
         ]);
     }
+    table.set_header(header);
     for job in &response.jobs {
         let mut row = vec![
             Cell::new(job.id),
             Cell::new(ctx.users.name(job.owner)),
             Cell::new(escape_controls(&job.group)),
-            Cell::new(whole(job.priority)),
         ];
+        if tiers {
+            row.push(Cell::new(job.tier));
+            row.push(Cell::new(match job.yield_mode {
+                gpueue_core::model::YieldMode::None => "-",
+                mode => mode.name(),
+            }));
+        }
+        row.push(Cell::new(whole(job.priority)));
         if !basic {
             row.extend([
                 Cell::new(job.site),
