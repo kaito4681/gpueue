@@ -53,6 +53,15 @@ use crate::logfile;
 use crate::usage::SizeWarnings;
 use crate::users::UserDb;
 
+// The scheduler does not preempt jobs yet; remove this once
+// `Core::schedule_once` calls `Core::preempt_jobs`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "not called by the scheduler yet")
+)]
+mod preempt;
+pub(crate) use preempt::{Preemption, RunNote};
+
 /// The reason recorded for a dump the helper refused before touching the
 /// job (`code: checkpoint_refused`).
 pub fn refusal_reason(helper_reason: &str) -> String {
@@ -207,6 +216,10 @@ pub struct Changes {
     /// Launches of the scheduler, recorded in [`Core::unsent_launches`]
     /// once the transaction has committed.
     unsent: Vec<(JobId, UnsentLaunch)>,
+    /// Jobs that started or stopped running, or whose preemption did not
+    /// happen, in order; kept in memory once the transaction has committed
+    /// (see [`Core::running_since`] and [`Core::preempt_refused`]).
+    run_notes: Vec<(JobId, RunNote)>,
 }
 
 impl Changes {
@@ -247,6 +260,9 @@ impl Changes {
     /// has committed.
     pub(crate) fn set_fairshare(&mut self, factors: HashMap<Uid, f64>) {
         self.fairshare = Some(Arc::new(factors));
+    }
+    fn note_run(&mut self, id: JobId, note: RunNote) {
+        self.run_notes.push((id, note));
     }
     fn is_empty(&self) -> bool {
         self.added.is_empty()
@@ -480,6 +496,8 @@ pub struct Core {
     pub config: Config,
     /// `config.priority` as the priority calculation takes it.
     pub priority_params: gpueue_core::priority::Params,
+    /// `config.priority`'s preemption settings.
+    pub preemption: Preemption,
     /// CPUs of the machine (for the job size and TRES factors).
     pub cpus: u32,
     /// Fair-share factor per user (see [`crate::priority`]).
@@ -570,6 +588,12 @@ pub struct Core {
     pub(crate) size_warnings: Mutex<SizeWarnings>,
     /// Where state changes, billing and reminders take the time from.
     pub(crate) clock: Arc<dyn Clock>,
+    /// Jobs whose preemption checkpoint did not happen, and when (see
+    /// [`Core::preempt_refused`]).
+    preempt_refused: Mutex<HashMap<JobId, Timestamp>>,
+    /// When each running or paused job (or one being checkpointed) last
+    /// started running, by spawn or restore (see [`Core::running_since`]).
+    running_since: Mutex<HashMap<JobId, Timestamp>>,
     /// Failed attempts of [`Core::retry_storage`] so far.
     #[cfg(test)]
     storage_failures: AtomicU64,
@@ -591,6 +615,7 @@ impl Core {
         let (changes, _) = watch::channel(0);
         Arc::new(Self {
             priority_params: config.priority.params(),
+            preemption: Preemption::new(&config.priority),
             cpus: crate::priority::machine_cpus(),
             fairshare: Mutex::new(Arc::new(HashMap::new())),
             config,
@@ -624,6 +649,8 @@ impl Core {
             launches_paused_until: Mutex::new(None),
             size_warnings: Mutex::default(),
             clock,
+            preempt_refused: Mutex::new(HashMap::new()),
+            running_since: Mutex::new(HashMap::new()),
             #[cfg(test)]
             storage_failures: AtomicU64::new(0),
         })
@@ -1054,6 +1081,7 @@ impl Core {
                     for &id in &changes.removed {
                         core.launches.forget(id);
                         core.checkpoint_requests.forget(id);
+                        core.apply_run_note(id, RunNote::Stopped);
                     }
                     core.publish(store, &changes);
                 }
@@ -1091,6 +1119,9 @@ impl Core {
                 .lock()
                 .unwrap()
                 .extend(changes.unsent.drain(..));
+        }
+        for (id, note) in changes.run_notes.drain(..) {
+            self.apply_run_note(id, note);
         }
     }
 
@@ -1159,6 +1190,7 @@ impl Core {
         changes: &mut Changes,
     ) -> ApiResult<Option<Job>> {
         let was_paused = job.state == JobState::Paused;
+        let preempted_before = job.preempted_at;
         if transition.next.is_some() {
             // From `Checkpointed`: a late success of a restore that was
             // given up as interrupted.
@@ -1167,6 +1199,10 @@ impl Core {
             let old = job.state.clone();
             transition.apply(job, now);
             tx.update_job_state(job.id, &job.state, job.started_at, job.finished_at)?;
+            if job.preempted_at != preempted_before {
+                tx.set_job_preempted_at(job.id, job.preempted_at)?;
+            }
+            preempt::note_run_change(changes, &old, job, preempted_before, now);
             self.account_run(tx, &old, job, now)?;
             if old.occupies_slot() && !job.state.occupies_slot() {
                 changes.released.push(job.id);
@@ -1732,6 +1768,11 @@ impl Core {
                 JobState::Running
             };
             tx.update_job_state(id, &next, job.started_at, None)?;
+            // A preemption that did not happen: not tried again for a while.
+            if job.preempted_at.take().is_some() {
+                tx.set_job_preempted_at(id, None)?;
+                ch.note_run(id, RunNote::PreemptRefused(now));
+            }
             let old = std::mem::replace(&mut job.state, next.clone());
             core.account_run(tx, &old, &job, now)?;
             if record.is_some() {
@@ -2019,7 +2060,7 @@ impl Core {
                     return Ok(None);
                 }
                 let event = choose(&job);
-                let mut transition = match lifecycle::on_event(&job, &event) {
+                let mut transition = match lifecycle::on_event(&job, &event, now) {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::debug!("ignoring helper event: {e}");
@@ -3156,6 +3197,9 @@ impl Core {
 
 #[cfg(test)]
 mod helper_event_tests;
+
+#[cfg(test)]
+mod preempt_tests;
 
 #[cfg(test)]
 mod tests {

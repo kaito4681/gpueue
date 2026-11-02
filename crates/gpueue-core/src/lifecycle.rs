@@ -23,9 +23,37 @@
 //! | `clean`      | Done                                                  |
 //! | `checkpoint` | Running, Paused                                       |
 //! | `restore`    | Checkpointed                                          |
+//! | [`preempt`]  | Running, Paused; not `--no-checkpoint` (scheduler)    |
 //!
 //! Checkpointed jobs are only resumed by `restore`; `start` and `kill` reject
 //! them, and [`hint`] tells the user which command to use instead.
+//!
+//! # Preemption
+//!
+//! The scheduler checkpoints a running (or paused) job to make room for a
+//! higher-priority one with [`preempt`]: the same transition as
+//! [`checkpoint`], and the daemon sets [`Job::preempted_at`], which marks the
+//! job as preempted until it runs again. The mark is persisted, so a dump
+//! that is still running when the daemon restarts ends the same way. It
+//! changes how the events of the dump end (see [`on_event`]):
+//!
+//! | event                 | state         | checkpoint   | preemption                        |
+//! |-----------------------|---------------|--------------|-----------------------------------|
+//! | `CheckpointSucceeded` | Checkpointing | Checkpointed | RestoreQueued (resumes by itself) |
+//! | `CheckpointRefused`   | Checkpointing | Running      | Running, mark cleared             |
+//! | `CheckpointFailed`    | Checkpointing | Terminating  | Terminating, mark cleared         |
+//! | `RestoreSucceeded`    | Restoring     | Running      | Running, mark cleared             |
+//! | `RestoreFailed`       | Restoring     | Checkpointed | Checkpointed, mark cleared        |
+//!
+//! (`Paused` instead of `Running` for a job paused when its dump began, see
+//! [`keep_paused`].) [`Transition::apply`] keeps the mark only while the job
+//! stays on the preempted path, `Checkpointing` → `RestoreQueued` →
+//! `Restoring`, and clears it whenever the job goes anywhere else: back to
+//! running or paused (refused, restored, a lost checkpoint request), to
+//! `Checkpointed` (a failed restore, `stash`), `Terminating`, `Done`, or
+//! back in line (`restart --in-place`). A dump the helper makes on its own
+//! on an OS shutdown (`CheckpointSucceeded` while `Running` or `Paused`)
+//! leaves the job `Checkpointed`, as without preemption.
 
 use std::collections::{HashMap, HashSet};
 
@@ -95,7 +123,9 @@ impl Transition {
     ///
     /// - entering `Running` for the first time sets `started_at`;
     /// - entering `Done` sets `finished_at`;
-    /// - going back to `Queued` / `Stashed` (in-place restart) clears both.
+    /// - going back to `Queued` / `Stashed` (in-place restart) clears both;
+    /// - leaving the preempted path clears `preempted_at` (see
+    ///   [`on_preempted_path`] and the [module documentation](self)).
     pub fn apply(&self, job: &mut Job, now: Timestamp) {
         let Some(next) = &self.next else {
             return;
@@ -108,6 +138,9 @@ impl Transition {
                 job.finished_at = None;
             }
             _ => {}
+        }
+        if !on_preempted_path(next) {
+            job.preempted_at = None;
         }
         job.state = next.clone();
     }
@@ -195,6 +228,16 @@ fn invalid(job: &Job, action: &'static str) -> Error {
 
 fn reject(job: &Job, action: Action) -> Error {
     invalid(job, action.verb())
+}
+
+/// The states a preempted job (one with [`Job::preempted_at`]) goes
+/// through until it runs again: dumped, waiting for a slot, restored. The
+/// mark is cleared as soon as the job is in any other state.
+pub fn on_preempted_path(state: &JobState) -> bool {
+    matches!(
+        state,
+        JobState::Checkpointing | JobState::RestoreQueued { .. } | JobState::Restoring
+    )
 }
 
 /// Whether the job's state may still have a checkpoint image on disk.
@@ -471,6 +514,19 @@ pub fn checkpoint(job: &Job) -> Result<Transition, Error> {
     }
 }
 
+/// Preemption: the scheduler checkpoints a running or paused job to make
+/// room for a higher-priority one. The same transition and effects as
+/// [`checkpoint`]; the daemon sets [`Job::preempted_at`] along with it, so
+/// that a successful dump puts the job back in line to be restored
+/// (`RestoreQueued`) instead of leaving it `Checkpointed` (see
+/// [`on_event`]). A job with `--no-checkpoint` cannot be preempted.
+pub fn preempt(job: &Job) -> Result<Transition, Error> {
+    if job.spec.no_checkpoint {
+        return Err(invalid(job, "preempted (it has --no-checkpoint)"));
+    }
+    checkpoint(job).map_err(|_| invalid(job, "preempted"))
+}
+
 /// `restore`: put a checkpointed job back in line, or with `immediate`
 /// restore it right away regardless of free slots (only for an
 /// administrator; the daemon queues anybody else's, see [`start`]).
@@ -651,7 +707,7 @@ fn done(result: JobResult) -> Transition {
     Transition::to(JobState::Done { result })
 }
 
-/// Apply a runtime event to a job.
+/// Apply a runtime event to a job at `now`.
 ///
 /// An event that does not fit the current state yields
 /// [`Error::InvalidTransition`]; the daemon should log it and keep the state.
@@ -671,7 +727,11 @@ fn done(result: JobResult) -> Transition {
 ///   a `Running`/`Paused` job also ends in `Terminating{CheckpointFailed}`
 ///   (without effects), so the job ends as "checkpoint failed" when its
 ///   exit, or its absence after the reboot, is noticed.
-pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
+/// - A successful dump of a preempted job (`preempted_at` set, see
+///   [`preempt`]) puts it back in line to be restored, enqueued at `now`.
+///   Every other outcome is the same as without preemption; leaving the
+///   preempted path clears the mark (see [`Transition::apply`]).
+pub fn on_event(job: &Job, event: &Event, now: Timestamp) -> Result<Transition, Error> {
     let state = &job.state;
     let transition = match (event, state) {
         // A spawn is dispatched as Running; this only confirms it.
@@ -688,6 +748,10 @@ pub fn on_event(job: &Job, event: &Event) -> Result<Transition, Error> {
         }
         (Event::Exited(_) | Event::Lost, JobState::Terminating { result }) => done(result.clone()),
 
+        // Preempted by the scheduler: resumes by itself once there is room.
+        (Event::CheckpointSucceeded, JobState::Checkpointing) if job.preempted_at.is_some() => {
+            Transition::to(JobState::RestoreQueued { enqueued_at: now })
+        }
         (Event::CheckpointSucceeded, JobState::Checkpointing) => {
             Transition::to(JobState::Checkpointed)
         }
@@ -1320,7 +1384,7 @@ mod tests {
     fn spawn_events() {
         let running = job(1, JobState::Running);
         assert_eq!(
-            on_event(&running, &Event::Spawned),
+            on_event(&running, &Event::Spawned, NOW),
             Ok(Transition::unchanged())
         );
         let t = on_event(
@@ -1328,6 +1392,7 @@ mod tests {
             &Event::SpawnFailed {
                 reason: "no such dir".to_owned(),
             },
+            NOW,
         )
         .unwrap();
         assert_eq!(
@@ -1341,7 +1406,8 @@ mod tests {
         assert!(
             on_event(
                 &job(2, JobState::Queued { enqueued_at: 0 }),
-                &Event::Spawned
+                &Event::Spawned,
+                NOW
             )
             .is_err()
         );
@@ -1350,7 +1416,7 @@ mod tests {
     #[test]
     fn exit_events() {
         for state in [JobState::Running, JobState::Paused, JobState::Checkpointing] {
-            let t = on_event(&job(1, state), &Event::Exited(ExitStatus::Code(1))).unwrap();
+            let t = on_event(&job(1, state), &Event::Exited(ExitStatus::Code(1)), NOW).unwrap();
             assert_eq!(
                 t.next,
                 Some(JobState::Done {
@@ -1361,6 +1427,7 @@ mod tests {
         let t = on_event(
             &job(1, JobState::Running),
             &Event::Exited(ExitStatus::Signal(9)),
+            NOW,
         )
         .unwrap();
         assert_eq!(
@@ -1375,7 +1442,7 @@ mod tests {
             (JobState::Paused, vec![]),
             (JobState::Checkpointing, vec![Effect::DeleteCheckpointImage]),
         ] {
-            let t = on_event(&job(1, state), &Event::Exited(ExitStatus::Code(0))).unwrap();
+            let t = on_event(&job(1, state), &Event::Exited(ExitStatus::Code(0)), NOW).unwrap();
             assert_eq!(t.effects, effects);
         }
         // Exit after checkpoint failure finishes with the CheckpointFailed result.
@@ -1390,25 +1457,26 @@ mod tests {
         );
         for event in [Event::Exited(ExitStatus::Signal(15)), Event::Lost] {
             assert_eq!(
-                on_event(&terminating, &event).unwrap().next,
+                on_event(&terminating, &event, NOW).unwrap().next,
                 Some(JobState::Done {
                     result: failed.clone()
                 })
             );
         }
         let already_done = job(1, JobState::Done { result: failed });
-        assert!(on_event(&already_done, &Event::Exited(ExitStatus::Signal(15))).is_err());
+        assert!(on_event(&already_done, &Event::Exited(ExitStatus::Signal(15)), NOW).is_err());
         let success = job(
             1,
             JobState::Done {
                 result: JobResult::Success,
             },
         );
-        assert!(on_event(&success, &Event::Exited(ExitStatus::Code(0))).is_err());
+        assert!(on_event(&success, &Event::Exited(ExitStatus::Code(0)), NOW).is_err());
         assert!(
             on_event(
                 &job(1, JobState::Checkpointed),
-                &Event::Exited(ExitStatus::Code(0))
+                &Event::Exited(ExitStatus::Code(0)),
+                NOW
             )
             .is_err()
         );
@@ -1417,7 +1485,7 @@ mod tests {
     #[test]
     fn checkpoint_events() {
         let ckpt = job(1, JobState::Checkpointing);
-        let t = on_event(&ckpt, &Event::CheckpointSucceeded).unwrap();
+        let t = on_event(&ckpt, &Event::CheckpointSucceeded, NOW).unwrap();
         assert_eq!(t.next, Some(JobState::Checkpointed));
         assert!(t.effects.is_empty());
 
@@ -1426,6 +1494,7 @@ mod tests {
             &Event::CheckpointFailed {
                 reason: "criu: dump failed".to_owned(),
             },
+            NOW,
         )
         .unwrap();
         assert_eq!(
@@ -1441,7 +1510,14 @@ mod tests {
             t.effects,
             vec![Effect::Terminate, Effect::DeleteCheckpointImage]
         );
-        assert!(on_event(&job(1, JobState::Checkpointed), &Event::CheckpointSucceeded).is_err());
+        assert!(
+            on_event(
+                &job(1, JobState::Checkpointed),
+                &Event::CheckpointSucceeded,
+                NOW
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1449,11 +1525,11 @@ mod tests {
         let refused = Event::CheckpointRefused {
             reason: "not enough free space".to_owned(),
         };
-        let t = on_event(&job(1, JobState::Checkpointing), &refused).unwrap();
+        let t = on_event(&job(1, JobState::Checkpointing), &refused, NOW).unwrap();
         assert_eq!(t.next, Some(JobState::Running));
         assert!(t.effects.is_empty(), "no signal, no image to delete");
-        assert!(on_event(&job(1, JobState::Checkpointed), &refused).is_err());
-        assert!(on_event(&job(1, JobState::Queued { enqueued_at: 0 }), &refused).is_err());
+        assert!(on_event(&job(1, JobState::Checkpointed), &refused, NOW).is_err());
+        assert!(on_event(&job(1, JobState::Queued { enqueued_at: 0 }), &refused, NOW).is_err());
     }
 
     /// The outcome of a dump whose request was taken for lost (the job is
@@ -1466,7 +1542,7 @@ mod tests {
                 reason: "criu failed".to_owned(),
                 attempted: true,
             };
-            let t = on_event(&job(1, state.clone()), &failed).unwrap();
+            let t = on_event(&job(1, state.clone()), &failed, NOW).unwrap();
             assert_eq!(
                 t.next,
                 Some(JobState::Terminating {
@@ -1484,7 +1560,7 @@ mod tests {
                 reason: "no space".to_owned(),
                 attempted: false,
             };
-            let t = on_event(&job(1, state.clone()), &refused).unwrap();
+            let t = on_event(&job(1, state.clone()), &refused, NOW).unwrap();
             assert_eq!(t, Transition::unchanged());
             assert_eq!(keep_paused(&refused, t.clone()), t);
         }
@@ -1499,7 +1575,7 @@ mod tests {
                 result: JobResult::Killed,
             },
         ] {
-            assert!(on_event(&job(1, state), &failed).is_err());
+            assert!(on_event(&job(1, state), &failed, NOW).is_err());
         }
     }
 
@@ -1507,7 +1583,7 @@ mod tests {
     fn shutdown_dump_by_the_helper() {
         // The helper dumped a running job while the daemon was down.
         for state in [JobState::Running, JobState::Paused] {
-            let t = on_event(&job(1, state.clone()), &Event::CheckpointSucceeded).unwrap();
+            let t = on_event(&job(1, state.clone()), &Event::CheckpointSucceeded, NOW).unwrap();
             assert_eq!(t.next, Some(JobState::Checkpointed));
             assert!(t.effects.is_empty());
             // A failed or refused one: systemd stops the job, which ends as
@@ -1524,7 +1600,7 @@ mod tests {
                     reason: "x".to_owned(),
                 };
                 let mut j = job(1, state.clone());
-                let t = on_event(&j, &event).unwrap();
+                let t = on_event(&j, &event, NOW).unwrap();
                 assert_eq!(
                     t.next,
                     Some(JobState::Terminating {
@@ -1534,14 +1610,14 @@ mod tests {
                 assert!(t.effects.is_empty(), "systemd stops it");
                 t.apply(&mut j, NOW);
                 // A replayed duplicate is ignored.
-                assert!(on_event(&j, &event).is_err());
+                assert!(on_event(&j, &event, NOW).is_err());
                 for end in [
                     Event::Exited(ExitStatus::Signal(15)),
                     Event::Exited(ExitStatus::Code(1)),
                     Event::Lost,
                 ] {
                     assert_eq!(
-                        on_event(&j, &end).unwrap().next,
+                        on_event(&j, &end, NOW).unwrap().next,
                         Some(JobState::Done {
                             result: result.clone()
                         })
@@ -1555,12 +1631,12 @@ mod tests {
     fn restore_events() {
         let restoring = job(1, JobState::Restoring);
         let ok = Event::RestoreSucceeded { stopped: false };
-        let t = on_event(&restoring, &ok).unwrap();
+        let t = on_event(&restoring, &ok, NOW).unwrap();
         assert_eq!(t.next, Some(JobState::Running));
         assert_eq!(t.effects, vec![Effect::DeleteCheckpointImage]);
         // Processes left stopped (not asked for, as the job was not paused)
         // are continued.
-        let t = on_event(&restoring, &Event::RestoreSucceeded { stopped: true }).unwrap();
+        let t = on_event(&restoring, &Event::RestoreSucceeded { stopped: true }, NOW).unwrap();
         assert_eq!(t.next, Some(JobState::Running));
         assert_eq!(
             t.effects,
@@ -1572,6 +1648,7 @@ mod tests {
             &Event::RestoreFailed {
                 reason: "driver mismatch".to_owned(),
             },
+            NOW,
         )
         .unwrap();
         assert_eq!(t.next, Some(JobState::Checkpointed));
@@ -1582,7 +1659,7 @@ mod tests {
         assert!(!t.effects.contains(&Effect::DeleteCheckpointImage));
         // A success reported after the restore was given up as interrupted
         // brings the job back to running.
-        let t = on_event(&job(1, JobState::Checkpointed), &ok).unwrap();
+        let t = on_event(&job(1, JobState::Checkpointed), &ok, NOW).unwrap();
         assert_eq!(t.next, Some(JobState::Running));
         assert_eq!(t.effects, vec![Effect::DeleteCheckpointImage]);
 
@@ -1593,6 +1670,7 @@ mod tests {
             &Event::RestoreFailed {
                 reason: "criu restore failed".to_owned(),
             },
+            NOW,
         )
         .unwrap();
         assert_eq!(t.next, None);
@@ -1603,14 +1681,21 @@ mod tests {
         let failed = Event::RestoreFailed {
             reason: "x".to_owned(),
         };
-        assert!(on_event(&job(1, JobState::Running), &failed).is_err());
-        assert!(on_event(&job(1, JobState::RestoreQueued { enqueued_at: 0 }), &failed).is_err());
+        assert!(on_event(&job(1, JobState::Running), &failed, NOW).is_err());
+        assert!(
+            on_event(
+                &job(1, JobState::RestoreQueued { enqueued_at: 0 }),
+                &failed,
+                NOW
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn lost_events() {
         for state in [JobState::Running, JobState::Paused] {
-            let t = on_event(&job(1, state), &Event::Lost).unwrap();
+            let t = on_event(&job(1, state), &Event::Lost, NOW).unwrap();
             assert_eq!(
                 t.next,
                 Some(JobState::Done {
@@ -1618,12 +1703,19 @@ mod tests {
                 })
             );
         }
-        let t = on_event(&job(1, JobState::Checkpointing), &Event::Lost).unwrap();
+        let t = on_event(&job(1, JobState::Checkpointing), &Event::Lost, NOW).unwrap();
         assert_eq!(t.effects, vec![Effect::DeleteCheckpointImage]);
-        let t = on_event(&job(1, JobState::Restoring), &Event::Lost).unwrap();
+        let t = on_event(&job(1, JobState::Restoring), &Event::Lost, NOW).unwrap();
         assert_eq!(t.next, Some(JobState::Checkpointed));
-        assert!(on_event(&job(1, JobState::Checkpointed), &Event::Lost).is_err());
-        assert!(on_event(&job(1, JobState::Queued { enqueued_at: 0 }), &Event::Lost).is_err());
+        assert!(on_event(&job(1, JobState::Checkpointed), &Event::Lost, NOW).is_err());
+        assert!(
+            on_event(
+                &job(1, JobState::Queued { enqueued_at: 0 }),
+                &Event::Lost,
+                NOW
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1634,17 +1726,17 @@ mod tests {
         assert_eq!(j.started_at, Some(10));
 
         checkpoint(&j).unwrap().apply(&mut j, 20);
-        on_event(&j, &Event::CheckpointSucceeded)
+        on_event(&j, &Event::CheckpointSucceeded, NOW)
             .unwrap()
             .apply(&mut j, 30);
         restore(&j, true, 40).unwrap().apply(&mut j, 40);
-        on_event(&j, &Event::RestoreSucceeded { stopped: false })
+        on_event(&j, &Event::RestoreSucceeded { stopped: false }, NOW)
             .unwrap()
             .apply(&mut j, 50);
         assert_eq!(j.state, JobState::Running);
         assert_eq!(j.started_at, Some(10), "kept across checkpoint/restore");
 
-        on_event(&j, &Event::Exited(ExitStatus::Code(0)))
+        on_event(&j, &Event::Exited(ExitStatus::Code(0)), NOW)
             .unwrap()
             .apply(&mut j, 60);
         assert_eq!(j.finished_at, Some(60));
@@ -1664,12 +1756,12 @@ mod tests {
         let restoring = job(1, JobState::Restoring);
         // Left stopped by the helper: nothing to signal.
         let stopped = Event::RestoreSucceeded { stopped: true };
-        let t = keep_paused(&stopped, on_event(&restoring, &stopped).unwrap());
+        let t = keep_paused(&stopped, on_event(&restoring, &stopped, NOW).unwrap());
         assert_eq!(t.next, Some(JobState::Paused));
         assert_eq!(t.effects, vec![Effect::DeleteCheckpointImage]);
         // Resumed by a helper that predates stopped restores: stopped again.
         let running = Event::RestoreSucceeded { stopped: false };
-        let t = keep_paused(&running, on_event(&restoring, &running).unwrap());
+        let t = keep_paused(&running, on_event(&restoring, &running, NOW).unwrap());
         assert_eq!(t.next, Some(JobState::Paused));
         assert_eq!(
             t.effects,
@@ -1678,14 +1770,14 @@ mod tests {
         // Also a late success of a restore given up as interrupted.
         let checkpointed = job(1, JobState::Checkpointed);
         for event in [stopped, running] {
-            let t = keep_paused(&event, on_event(&checkpointed, &event).unwrap());
+            let t = keep_paused(&event, on_event(&checkpointed, &event, NOW).unwrap());
             assert_eq!(t.next, Some(JobState::Paused));
         }
 
         let refused = Event::CheckpointRefused { reason: "x".into() };
         let t = keep_paused(
             &refused,
-            on_event(&job(1, JobState::Checkpointing), &refused).unwrap(),
+            on_event(&job(1, JobState::Checkpointing), &refused, NOW).unwrap(),
         );
         assert_eq!(t.next, Some(JobState::Paused));
         assert_eq!(t.effects, vec![Effect::SignalStop]);
@@ -1694,17 +1786,155 @@ mod tests {
     #[test]
     fn keep_paused_leaves_other_transitions_alone() {
         let failed = Event::CheckpointFailed { reason: "x".into() };
-        let t = on_event(&job(1, JobState::Checkpointing), &failed).unwrap();
+        let t = on_event(&job(1, JobState::Checkpointing), &failed, NOW).unwrap();
         assert_eq!(keep_paused(&failed, t.clone()), t);
         let ok = Event::CheckpointSucceeded;
-        let t = on_event(&job(1, JobState::Checkpointing), &ok).unwrap();
+        let t = on_event(&job(1, JobState::Checkpointing), &ok, NOW).unwrap();
         assert_eq!(keep_paused(&ok, t.clone()), t);
         // A refused dump on an OS shutdown ends the job anyway.
         let refused = Event::CheckpointRefused { reason: "x".into() };
-        let t = on_event(&job(1, JobState::Paused), &refused).unwrap();
+        let t = on_event(&job(1, JobState::Paused), &refused, NOW).unwrap();
         assert_eq!(keep_paused(&refused, t.clone()), t);
         let failed = Event::RestoreFailed { reason: "x".into() };
-        let t = on_event(&job(1, JobState::Restoring), &failed).unwrap();
+        let t = on_event(&job(1, JobState::Restoring), &failed, NOW).unwrap();
         assert_eq!(keep_paused(&failed, t.clone()), t);
+    }
+
+    /// A job in `state` that the scheduler has preempted.
+    fn preempted(state: JobState) -> Job {
+        let mut j = job(1, state);
+        j.preempted_at = Some(500);
+        j
+    }
+
+    #[test]
+    fn preempt_running_or_paused_like_checkpoint() {
+        assert_accepts(
+            preempt,
+            |s| matches!(s, JobState::Running | JobState::Paused),
+            "preempted",
+        );
+        for state in [JobState::Running, JobState::Paused] {
+            assert_eq!(
+                preempt(&job(1, state.clone())),
+                checkpoint(&job(1, state.clone()))
+            );
+        }
+        let mut opted_out = job(1, JobState::Running);
+        opted_out.spec.no_checkpoint = true;
+        assert_eq!(
+            preempt(&opted_out),
+            Err(Error::InvalidTransition {
+                id: JobId(1),
+                action: "preempted (it has --no-checkpoint)",
+                state: "running",
+            })
+        );
+    }
+
+    #[test]
+    fn a_preempted_dump_puts_the_job_back_in_line_to_be_restored() {
+        let mut j = preempted(JobState::Checkpointing);
+        let t = on_event(&j, &Event::CheckpointSucceeded, NOW).unwrap();
+        assert_eq!(t.next, Some(JobState::RestoreQueued { enqueued_at: NOW }));
+        assert!(t.effects.is_empty());
+        // Nothing to undo for a job that was paused when the dump began.
+        assert_eq!(keep_paused(&Event::CheckpointSucceeded, t.clone()), t);
+        t.apply(&mut j, NOW);
+        assert_eq!(j.preempted_at, Some(500), "still on the preempted path");
+
+        // Dispatched, put back in line by a stopping helper, dispatched
+        // again: still preempted.
+        dispatch(&j).unwrap().apply(&mut j, NOW + 1);
+        assert_eq!(j.state, JobState::Restoring);
+        requeue_unlaunched(&j, NOW + 2)
+            .unwrap()
+            .apply(&mut j, NOW + 2);
+        assert_eq!(
+            j.state,
+            JobState::RestoreQueued {
+                enqueued_at: NOW + 2
+            }
+        );
+        restore(&j, true, NOW + 3).unwrap().apply(&mut j, NOW + 3);
+        assert_eq!(j.preempted_at, Some(500));
+
+        // Restored: the mark is gone, and so is the image.
+        let t = on_event(&j, &Event::RestoreSucceeded { stopped: false }, NOW + 4).unwrap();
+        assert_eq!(t.next, Some(JobState::Running));
+        assert_eq!(t.effects, vec![Effect::DeleteCheckpointImage]);
+        t.apply(&mut j, NOW + 4);
+        assert_eq!(j.preempted_at, None);
+    }
+
+    #[test]
+    fn a_preempted_paused_job_is_restored_paused() {
+        let mut j = preempted(JobState::Restoring);
+        let event = Event::RestoreSucceeded { stopped: true };
+        let t = keep_paused(&event, on_event(&j, &event, NOW).unwrap());
+        assert_eq!(t.next, Some(JobState::Paused));
+        t.apply(&mut j, NOW);
+        assert_eq!(j.preempted_at, None);
+    }
+
+    #[test]
+    fn other_outcomes_of_a_preemption_are_those_of_a_checkpoint_and_clear_the_mark() {
+        let failed = Event::CheckpointFailed { reason: "x".into() };
+        let refused = Event::CheckpointRefused { reason: "x".into() };
+        let restore_failed = Event::RestoreFailed { reason: "x".into() };
+        for (state, event) in [
+            (JobState::Checkpointing, refused.clone()),
+            (JobState::Checkpointing, failed.clone()),
+            (JobState::Checkpointing, Event::Exited(ExitStatus::Code(0))),
+            (JobState::Checkpointing, Event::Lost),
+            (JobState::Restoring, restore_failed.clone()),
+            (JobState::Restoring, Event::Lost),
+        ] {
+            let mut j = preempted(state.clone());
+            let t = on_event(&j, &event, NOW).unwrap();
+            assert_eq!(
+                t,
+                on_event(&job(1, state.clone()), &event, NOW).unwrap(),
+                "{state:?} {event:?}"
+            );
+            t.apply(&mut j, NOW);
+            assert_eq!(j.preempted_at, None, "{state:?} {event:?}");
+        }
+        // A refused dump of a job that was paused leaves it paused.
+        let t = keep_paused(
+            &refused,
+            on_event(&preempted(JobState::Checkpointing), &refused, NOW).unwrap(),
+        );
+        assert_eq!(t.next, Some(JobState::Paused));
+    }
+
+    /// A dump the helper made on its own on an OS shutdown leaves the job
+    /// checkpointed, as without preemption, even with a stale mark.
+    #[test]
+    fn a_shutdown_dump_of_a_marked_running_job_leaves_it_checkpointed() {
+        for state in [JobState::Running, JobState::Paused] {
+            let mut j = preempted(state);
+            let t = on_event(&j, &Event::CheckpointSucceeded, NOW).unwrap();
+            assert_eq!(t.next, Some(JobState::Checkpointed));
+            t.apply(&mut j, NOW);
+            assert_eq!(j.preempted_at, None);
+        }
+    }
+
+    #[test]
+    fn leaving_the_preempted_path_clears_the_mark() {
+        for state in all_states() {
+            let mut j = preempted(JobState::Checkpointing);
+            Transition::to(state.clone()).apply(&mut j, NOW);
+            assert_eq!(
+                j.preempted_at.is_some(),
+                on_preempted_path(&state),
+                "{state:?}"
+            );
+        }
+        // An unchanged state keeps it.
+        let mut j = preempted(JobState::RestoreQueued { enqueued_at: 1 });
+        Transition::unchanged().apply(&mut j, NOW);
+        assert_eq!(j.preempted_at, Some(500));
     }
 }
