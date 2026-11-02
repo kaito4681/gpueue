@@ -27,8 +27,10 @@ milliseconds; `owner` is a uid. Output is indented on a terminal and one line ot
 - `terminating` and `done` carry `result`: `success`, `failed` (with `exit_code`),
   `failed_to_spawn` (`reason`), `killed`, `dependency_failed`, `checkpoint_failed` (`reason`)
   or `lost`.
-- `checkpoint_size_bytes`, `details`, `details.last_error`, `nice` and a group's `priority` are
-  omitted when they do not apply (or are 0).
+- `checkpoint_size_bytes`, `details`, `details.last_error`, `nice`, `yield`, `preempted_at` and a
+  group's `priority` and `tier` are omitted when they do not apply (or are 0). `yield` is `"all"`
+  (`--yield`) or `"group"` (`--yield=group`); `preempted_at` is set on a `restore_queued` job
+  that was checkpointed by a preemption and waits to be restored automatically.
 - Other users' jobs: `label` is null, `details` is absent and `reason` is `"<redacted>"`.
 - `waiting` appears on a queued job that a non-administrator asked to launch right away but that
   waits for a resource: `{"reason": "gpu_slots", "gpus": [0]}`, `{"reason": "group_paused"}` or
@@ -43,7 +45,8 @@ milliseconds; `owner` is a uid. Output is indented on a terminal and one line ot
   "driver_version", "parallel", "used", "jobs": [{"id", "owner"}]}]}`; `"available": false`
   marks a GPU that disappeared.
 - `gpueue prio --json` → `{"priority_type", "weights": {...}, "jobs": [{"id", "owner", "group",
-  "priority", "factors": {...}, "weighted": {...}, "site", "nice"}]}`, jobs in scheduling order.
+  "priority", "factors": {...}, "weighted": {...}, "site", "nice", "tier", "yield"}]}`, jobs in
+  scheduling order (`tier`, `yield` omitted at 0 / not yielding).
 - `gpueue share --json` → `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
   "effective_usage", "fairshare", "active"}], ...}`.
 
@@ -58,6 +61,9 @@ gpueue status --json | jq --argjson me "$(id -u)" '[.jobs[] | select(.owner == $
 
 # GPUs with a free slot (parallel 0 means unlimited)
 gpueue gpu --json | jq '[.gpus[] | select(.available != false and (.parallel == 0 or .used < .parallel)) | .index]'
+
+# My jobs waiting to be restored after a preemption
+gpueue status --json | jq --argjson me "$(id -u)" '[.jobs[] | select(.owner == $me and .preempted_at != null) | .id]'
 
 # Full output of job 7 as plain text
 gpueue log --json --full 7 | jq -r '."7".output'

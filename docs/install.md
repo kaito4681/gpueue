@@ -1441,7 +1441,7 @@ Every `*_secs` key is at most one year (31536000).
 | `update_source` | `"github:kaito4681/gpueue"` | CLI | where `gpueue update` and `gpueue doctor` look for releases: `github:<owner>/<repo>` |
 | `update_check` | `true` | CLI | whether `gpueue doctor` asks `update_source` for a newer release |
 | `[[gpus]]` | empty | daemon | static GPU list: `index` (required), `uuid`, `name`, `memory_total_bytes` (see [GPU detection](#gpu-detection)) |
-| `[priority]` | multifactor priority with fair share | daemon | how queued jobs are ordered (see [Priority and fair share](#priority-and-fair-share)) |
+| `[priority]` | multifactor priority with fair share, preemption on | daemon | how queued jobs are ordered and when running jobs are preempted (see [Priority and fair share](#priority-and-fair-share)) |
 
 `gpueue-helper serve` also accepts command-line flags (`gpueue-helper serve --help`). They override
 the file. Prefer the file: `gpueue doctor` reports the file's values and warns when the unit's
@@ -1679,6 +1679,30 @@ first among your jobs rather than started, and the API reply carries `"queued": 
 apply), the job is queued like any other job without being moved (`"queued": "in_line"`).
 `start` of a paused job resumes it, as before.
 
+**Tiers and preemption.** Before the priority, jobs are ordered by their group's tier (Slurm's
+partition `PriorityTier`, set with `gpueue group tier <group> <n>`, 0 by default, may be negative)
+and by whether they yield (`gpueue add --yield[=group]`, `gpueue yield`): jobs of a higher tier
+first, `--yield` jobs after every job that does not yield, `--yield=group` jobs after the jobs of
+the same tier that do not yield. Unlike the group priority, which is one weighted factor among
+others, tiers are strict. With `preemption = true` (the default), a waiting job may also have
+running jobs checkpointed to make room, like Slurm's `PreemptType=preempt/partition_prio` with
+`PreemptMode=CHECKPOINT`; the checkpointed jobs wait in `Restore queued` and are restored
+automatically once there is room again (also after a reboot). A waiting job `J` may preempt a
+running or paused job `V` when `J` ranks higher, where the rank is first whether the job does not
+yield to everybody (`--yield` ranks lower) and then its group's tier, or when both are in the same
+group, `V` has `--yield=group` and `J` does not yield; jobs of the same rank never preempt each
+other. The scheduler preempts only jobs whose slots (the waiting job's group, or one of its GPUs)
+let `J` start right away, and only the fewest it needs, the lowest-ranked first. It never preempts
+`--no-checkpoint` jobs (they cannot yield either), jobs that started or were restored less than
+`preempt_exempt_secs` ago, or a job whose preemption checkpoint was refused in the last 10 minutes,
+and an administrator's immediate launch never preempts. A failed dump that cannot be rolled back
+ends the job as `Checkpoint failed`, as for `gpueue checkpoint`. Time spent checkpointed or waiting
+to be restored is not billed. A preempted job is restored on the same GPUs, and each preemption
+costs a dump and a restore (seconds to minutes and roughly RSS + VRAM of disk space for a large GPU
+job), so where jobs come and go often, set `preempt_exempt_secs` to a few minutes. With
+`preemption = false`, tiers and yield only order the waiting jobs. Users see the details in
+[Yielding and preemption](usage.md#yielding-and-preemption).
+
 **Commands.**
 
 | Command | Who | Slurm |
@@ -1690,17 +1714,20 @@ apply), the job is queued like any other job without being moved (`"queued": "in
 | `gpueue site <IDS>... <N>` | administrators | the site factor |
 | `gpueue share set <USER> <N>` | administrators | `sacctmgr modify user set fairshare=` |
 | `gpueue group priority <GROUP> <N>` | administrators | partition `PriorityJobFactor` |
+| `gpueue group tier <GROUP> <N>` | administrators | partition `PriorityTier` (with preemption: `PreemptType=preempt/partition_prio`) |
+| `gpueue add --yield[=group]`, `gpueue yield <IDS>... [all\|group\|off]` | owner (any mode), administrators | no direct equivalent; like a job in a preemptable partition of a lower tier |
 
 As in Slurm, users may only raise a nice value, so they cannot undo a value an administrator
 set. A restarted job, a copy or `restart --in-place`, keeps a nice value of 0 or more, but not a
 negative one, the site factor or its `top` position. `gpueue prio` lists exactly the jobs the
-scheduler considers, in its order. `gpueue status --json` shows a job's `nice` and a group's `priority` when they are not 0.
+scheduler considers, in its order, with `Tier` and `Yield` columns when a pending job has a tier
+or yields. `gpueue status --json` shows a job's `nice` and `yield` and a group's `priority` and
+`tier` when they are not 0 (or not yielding).
 
-No release has been published yet, so this only matters for development builds: the database of
-a build from before priorities is migrated to schema version 6 when the daemon starts. Existing
-jobs keep their `-o` priority, which from then on orders only their owner's jobs, and usage
-starts at zero. Older builds cannot open the migrated database (`gpueue update` refuses to
-install them).
+The database of v0.1.5 and earlier (schema version 6) is migrated to schema version 7 when the
+daemon starts: every group starts at tier 0 and no job yields, so the order stays the same until an
+administrator sets a tier or a user adds a job with `--yield`. Older builds cannot open the
+migrated database (`gpueue update` refuses to install them).
 
 **Settings.** The `[priority]` table of `/etc/gpueue/config.toml` (restart `gpueue.service` after a
 change). Keys below the `[priority]` line belong to the table, so keep other keys above it.
@@ -1720,6 +1747,8 @@ change). Keys below the `[priority]` line belong to the table, so keep other key
 | `priority_favor_small` | `false` | `PriorityFavorSmall` |
 | `tres_billing_weights` | `"CPU=1.0,GRES/gpu=10.0"` | `TRESBillingWeights` |
 | `enable_user_top` | `true` | `SchedulerParameters=enable_user_top` |
+| `preemption` | `true` (`false`: tiers and yield only order jobs) | `PreemptType=preempt/partition_prio`, `PreemptMode=CHECKPOINT` |
+| `preempt_exempt_secs` | `0` (at most one year) | `PreemptExemptTime` |
 
 For example, to favour jobs that use more GPUs and give the `urgent` group a boost:
 
@@ -1731,6 +1760,18 @@ priority_weight_partition = 5000
 
 ```sh
 sudo gpueue group priority urgent 10
+```
+
+To let a `background` group use idle GPUs but give way to every other group, and not to checkpoint
+a job again within 10 minutes of its start or restore:
+
+```toml
+[priority]
+preempt_exempt_secs = 600
+```
+
+```sh
+sudo gpueue group tier background -1
 ```
 
 ## GPU detection

@@ -6,12 +6,17 @@
 
 English | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
 
-A GPU job queue for one Linux machine shared by several users. Its CLI works like
-[pueue](https://github.com/Nukesor/pueue). gpueue adds two things on top: GPU slots, and
-transparent checkpoint/restore of running jobs (CPU, memory and GPU state) with
-[CRIU](https://criu.org) and NVIDIA [cuda-checkpoint](https://github.com/NVIDIA/cuda-checkpoint).
-A training run that is still going when the machine reboots is saved to disk and resumes where it
-stopped. It does not start over.
+A GPU job queue for one Linux machine shared by several users, with a CLI that works like
+[pueue](https://github.com/Nukesor/pueue). Priorities can stop running jobs without losing their
+work: when a job of higher priority needs the GPUs, gpueue checkpoints the lower-priority jobs that
+hold them, GPU state included, with [CRIU](https://criu.org) and NVIDIA
+[cuda-checkpoint](https://github.com/NVIDIA/cuda-checkpoint). Once the higher-priority work is
+done, they are restored automatically and continue where they stopped. They do not start over.
+
+Which jobs give way is explicit: a job added with `gpueue add --yield` gives way to every job that
+does not yield, and administrators rank groups in tiers (`gpueue group tier`), like Slurm's
+partition preemption. Jobs ask for specific GPUs (`--gpu 0,1`), and a Slurm-style fair share
+decides whose job starts next.
 
 > [!NOTE]
 > **Status: pre-release.** Everything below is implemented and tested in Docker (systemd as PID 1,
@@ -39,11 +44,14 @@ stopped. It does not start over.
 ## Why
 
 On a shared GPU workstation people usually run jobs with `nohup`, `tmux` or a per-user pueue, and
-they argue over GPUs in chat. A reboot for kernel or driver updates kills every training run.
+they argue over GPUs in chat. Whoever started a week-long run first holds the GPU, and someone with
+a deadline either waits or asks for it to be killed, losing its progress.
 gpueue gives everyone one queue: a system-wide daemon schedules all users' jobs and shows who is
-using which GPU. A job asks for specific GPUs (`--gpu 0,1`) and only starts when they are free.
-Running jobs are saved when the OS shuts down, on `gpueue shutdown`, or on demand with
-`gpueue checkpoint`, and resume later with `gpueue restore`, with no changes to your code.
+using which GPU. A job asks for specific GPUs (`--gpu 0,1`) and only starts when they are free. A
+long run added with `--yield` uses GPUs that would otherwise sit idle and is checkpointed to make
+room when other work arrives, then resumes by itself. Running jobs are also saved when the OS shuts
+down, on `gpueue shutdown`, or on demand with `gpueue checkpoint`, and resume later with
+`gpueue restore`, with no changes to your code.
 
 ## Features
 
@@ -52,6 +60,7 @@ Running jobs are saved when the OS shuts down, on `gpueue shutdown`, or on deman
 | pueue-compatible CLI | `add`, `status`, `log`, `follow`, `wait`, `pause`, `start`, `kill`, `remove`, `restart`, `clean`, `reset`, `stash`, `enqueue`, `switch`, `group`, `parallel`, `shutdown`, `completions`, plus groups, dependencies (`--after`), priorities, delays and labels |
 | GPU slots | per-GPU limits on how many jobs run at once (`gpueue gpu parallel`); each job gets `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER=PCI_BUS_ID`; GPUs are detected with NVML |
 | Fair sharing | Slurm-style multifactor priority (fair share with decaying usage, age, nice, `top`); `gpueue prio` and `gpueue share` show the numbers |
+| Preemption | `add --yield` jobs, and jobs of groups with a lower tier (`gpueue group tier`), are checkpointed to make room for the jobs they yield to and restored automatically afterwards (Slurm's `preempt/partition_prio` with `PreemptMode=CHECKPOINT`); `gpueue yield` changes a job's mode later |
 | Checkpoint/restore | transparent, for CPU and CUDA processes, including PyTorch jobs whose DataLoader workers are forked (see [fork guard](docs/usage.md#limitations)); automatic for all running jobs when the OS shuts down or reboots |
 | Multi-user | jobs run as their owner; other users can see that a job exists, but not its command, environment or log; administrators are root and the `gpueue-admin` group |
 | Privilege separation | the daemon (HTTP API, scheduler, SQLite) runs as the unprivileged system user `gpueue`; only a small root helper starts jobs and runs CRIU |
@@ -182,7 +191,7 @@ sudo usermod -aG gpueue-admin alice
 `gpueue --help` lists every command. Commands without a `(gpueue)` tag work like pueue's (the
 [differences](docs/usage.md#pueue-compatibility-and-differences) are mostly about one shared
 daemon and who may do what); the tagged ones are gpueue's additions. `gpueue <command> --help`
-shows each command's options, for example `--gpu` and `--no-checkpoint` of `add`.
+shows each command's options, for example `--gpu`, `--yield` and `--no-checkpoint` of `add`.
 
 ```console
 $ gpueue --help
@@ -221,6 +230,7 @@ Commands:
   prio         (gpueue) Show the priority of pending jobs and its factors (like Slurm's `sprio`)
   nice         (gpueue) Set the nice value of jobs (like Slurm's nice option): it is subtracted from
                their priority
+  yield        (gpueue) Make jobs yield to other jobs (checkpointed for them, resumed afterwards)
   top          (gpueue) Move jobs to the top of their owner's queue (Slurm's `scontrol top`)
   site         (gpueue) Set the site factor of jobs, which is added to their priority
                (administrators only)
@@ -271,6 +281,10 @@ bring it back later.
 # environment.
 gpueue add --gpu 0 -l resnet -- 'python train.py --epochs 100'
 
+# A long run that steps aside: when another job needs GPU 0 it is checkpointed, and it resumes
+# by itself once there is room again.
+gpueue add --yield --gpu 0 -l sweep -- 'python sweep.py'
+
 gpueue status          # all jobs of all users (others' commands are hidden)
 gpueue gpu             # GPUs, slots in use, and which jobs hold them
 gpueue log 0           # the last lines of job 0's output
@@ -282,10 +296,11 @@ gpueue restore -i 0    # ...or put it first among your queued jobs (administrato
 ```
 
 A restored job continues from the moment it was checkpointed, keeps its job id and appends to the
-same log. When the OS shuts down, the helper checkpoints the running jobs one at a time
-(`--no-checkpoint` jobs are simply terminated); after the boot they are `Checkpointed`, and each
-owner resumes them with `gpueue restore <id>` or `gpueue restore -a`: restores are not started
-automatically. Only administrators start a job right away with `start`, `add -i`, `restart -i` or
+same log. Preempted jobs are restored automatically (`gpueue stash <id>` holds one back,
+`gpueue restore <id>` lets it go again). When the OS shuts down, the helper checkpoints the
+running jobs one at a time (`--no-checkpoint` jobs are simply terminated); after the boot they are
+`Checkpointed`, and each owner resumes them with `gpueue restore <id>` or `gpueue restore -a`:
+these restores are not started automatically. Only administrators start a job right away with `start`, `add -i`, `restart -i` or
 `restore -i`; anybody else's job is queued first among their own jobs.
 
 [docs/usage.md](docs/usage.md) is the reference for the rest:
@@ -293,8 +308,9 @@ automatically. Only administrators start a job right away with `start`, `add -i`
 [JSON output](docs/usage.md#json-output),
 [paused jobs, reboots and failed checkpoints](docs/usage.md#checkpoint-and-restore),
 [who may do what](docs/usage.md#multi-user-model-and-authorization),
-[GPU slots and isolation](docs/usage.md#gpu-slots) and
-[job priority](docs/usage.md#job-priority).
+[GPU slots and isolation](docs/usage.md#gpu-slots),
+[job priority](docs/usage.md#job-priority) and
+[yielding and preemption](docs/usage.md#yielding-and-preemption).
 
 ## Limitations
 
@@ -379,8 +395,8 @@ npx skills add kaito4681/gpueue -g -a claude-code -y
 
 | Document | Contents |
 | --- | --- |
-| [docs/install.md](docs/install.md) | requirements, building, installing, configuration, priority and fair share, upgrading, uninstalling and troubleshooting |
-| [docs/usage.md](docs/usage.md) | pueue differences, JSON output, checkpoint/restore, multi-user model, GPU slots, job priority, limitations and test coverage |
+| [docs/install.md](docs/install.md) | requirements, building, installing, configuration, priority, tiers and fair share, upgrading, uninstalling and troubleshooting |
+| [docs/usage.md](docs/usage.md) | pueue differences, JSON output, checkpoint/restore, multi-user model, GPU slots, job priority and preemption, limitations and test coverage |
 | [docs/architecture.md](docs/architecture.md) | components, job flow, shutdown ordering, state storage and crate layout |
 
 ## Contributing
