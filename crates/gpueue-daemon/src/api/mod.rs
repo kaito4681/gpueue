@@ -21,9 +21,9 @@ use gpueue_protocol::api::{
     EnqueueOptions, ErrorCode, HelperStatus, JobAction, JobActionResult, JobView, KillOptions,
     ListGpusResponse, ListGroupsResponse, ListJobsQuery, ListJobsResponse, NiceRequest,
     PauseOptions, ResetRequest, RestartOptions, RestoreOptions, SetGpusParallelRequest,
-    SetGroupPriorityRequest, SetParallelRequest, SetSharesRequest, ShutdownRequest, SiteRequest,
-    StashOptions, SwitchRequest, TopRequest, VERSION_HEADER, VersionResponse, WARNINGS_HEADER,
-    Warning,
+    SetGroupPriorityRequest, SetGroupTierRequest, SetParallelRequest, SetSharesRequest,
+    ShutdownRequest, SiteRequest, StashOptions, SwitchRequest, TopRequest, VERSION_HEADER,
+    VersionResponse, WARNINGS_HEADER, Warning, YieldRequest,
 };
 
 use crate::error::{ApiResult, Failure};
@@ -67,10 +67,12 @@ pub fn router(core: Arc<Core>) -> Router {
         .route(routes::JOBS_NICE, post(nice))
         .route(routes::JOBS_TOP, post(top))
         .route(routes::JOBS_SITE, post(site))
+        .route(routes::JOBS_YIELD, post(yield_jobs))
         .route(routes::PRIORITY, get(priorities))
         .route(routes::SHARES, get(shares))
         .route(routes::SHARE_TEMPLATE, put(set_shares))
         .route(routes::GROUP_PRIORITY_TEMPLATE, put(set_group_priority))
+        .route(routes::GROUP_TIER_TEMPLATE, put(set_group_tier))
         .route(routes::JOB_TEMPLATE, get(get_job).delete(remove_job))
         .route(routes::JOB_LOG_TEMPLATE, get(log::job_log))
         .route(routes::JOB_ACTION_TEMPLATE, post(job_action))
@@ -350,6 +352,14 @@ async fn site(
     Ok(Json(core.site(caller, request).await?).into_response())
 }
 
+async fn yield_jobs(
+    State(core): State<AppState>,
+    Auth(caller): Auth,
+    JsonBody(request): JsonBody<YieldRequest>,
+) -> ApiResult<Response> {
+    Ok(Json(core.yield_jobs(caller, request).await?).into_response())
+}
+
 async fn priorities(State(core): State<AppState>, Auth(_): Auth) -> ApiResult<Response> {
     Ok(Json(core.priorities().await?).into_response())
 }
@@ -380,6 +390,16 @@ async fn set_group_priority(
     let group = core
         .set_group_priority(caller, name, request.priority)
         .await?;
+    Ok(Json(group).into_response())
+}
+
+async fn set_group_tier(
+    State(core): State<AppState>,
+    Auth(caller): Auth,
+    Path(name): Path<String>,
+    JsonBody(request): JsonBody<SetGroupTierRequest>,
+) -> ApiResult<Response> {
+    let group = core.set_group_tier(caller, name, request.tier).await?;
     Ok(Json(group).into_response())
 }
 

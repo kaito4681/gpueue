@@ -14,9 +14,9 @@
 //!   checkpoint states (see `crate::query`). `status --json` prints gpueue's own schema
 //!   (`{"groups": [...], "jobs": [...]}`, job views without their environment), not pueue's
 //!   state dump.
-//! - gpueue extensions: `add --gpu/--no-checkpoint/--nice`, `checkpoint`, `restore`, `gpu`,
-//!   `prio`, `nice`, `top`, `site`, `share`, `group priority`, `daemon`, `service`, `uninstall`,
-//!   `doctor` and `update`.
+//! - gpueue extensions: `add --gpu/--no-checkpoint/--nice/--yield`, `checkpoint`, `restore`,
+//!   `gpu`, `prio`, `nice`, `yield`, `top`, `site`, `share`, `group priority`, `group tier`,
+//!   `daemon`, `service`, `uninstall`, `doctor` and `update`.
 //! - Priority: with the default multifactor priority (see `gpueue prio`), `add -o/--priority`
 //!   and `switch` only order the caller's own jobs; another user's job is never overtaken
 //!   because of them. `priority_type = "basic"` restores pueue's global order.
@@ -24,7 +24,10 @@
 use std::{fmt, path::PathBuf, str::FromStr};
 
 use chrono::{DateTime, Local, TimeDelta};
-use clap::{ArgAction, Parser, Subcommand, ValueEnum, ValueHint};
+use clap::error::ErrorKind;
+use clap::{
+    Arg, ArgAction, ArgMatches, Args, FromArgMatches, Parser, Subcommand, ValueEnum, ValueHint,
+};
 
 /// Default path of the daemon's client socket.
 pub const DEFAULT_SOCKET: &str = "/run/gpueue/gpueue.sock";
@@ -81,6 +84,11 @@ Examples:
   - `command%=echo`
   - `label=nightly`
   - `columns=id,status,command status=running start > 2023-05-21 12:03:17 order_by command first 5`";
+
+const YIELD_EXAMPLES: &str = "Examples:
+  gpueue yield 3 4
+  gpueue yield 3 4 group
+  gpueue yield 3 off";
 
 /// Top-level command line arguments.
 #[derive(Parser, Debug, Clone, PartialEq)]
@@ -234,6 +242,26 @@ pub enum SubCommand {
         /// (gpueue) Never checkpoint this job; on shutdown it is terminated instead.
         #[arg(long)]
         no_checkpoint: bool,
+
+        /// (gpueue) Let other jobs preempt this one: it is checkpointed to make room for them
+        /// and resumes automatically once there is room again.
+        ///
+        /// `--yield` (or `--yield=all`) yields to every job that does not yield, in any group;
+        /// `--yield=group` only to the jobs of its own group that do not yield. Jobs of a group
+        /// with a higher tier (see `gpueue group tier`) preempt it either way. Change it later
+        /// with `gpueue yield`. A value needs `=`: in `gpueue add --yield python train.py`,
+        /// `python` is the command. Cannot be combined with --no-checkpoint.
+        #[arg(
+            long = "yield",
+            visible_alias = "preemptible",
+            value_name = "TO",
+            value_enum,
+            require_equals = true,
+            num_args = 0..=1,
+            default_missing_value = "all",
+            conflicts_with = "no_checkpoint"
+        )]
+        yield_to: Option<YieldTo>,
     },
 
     /// Remove jobs from the list.
@@ -694,6 +722,21 @@ pub enum SubCommand {
         nice: i32,
     },
 
+    /// (gpueue) Make jobs yield to other jobs (checkpointed for them, resumed afterwards).
+    ///
+    /// A yielding job is checkpointed to make room for the jobs it yields to and resumes
+    /// automatically once there is room again (Slurm's preemption). The mode follows the ids:
+    /// `all` (the default) yields to every job that does not yield, in any group; `group` only
+    /// to the jobs of the job's own group that do not yield; `off` stops yielding. Jobs of a
+    /// group with a higher tier (see `gpueue group tier`) preempt jobs of lower tiers whatever
+    /// their mode. Jobs that are never checkpointed cannot yield. Users may change their own
+    /// jobs, administrators any job.
+    #[command(
+        override_usage = "gpueue yield <IDS>... [all|group|off]",
+        after_help = YIELD_EXAMPLES
+    )]
+    Yield(YieldTargets),
+
     /// (gpueue) Move jobs to the top of their owner's queue (Slurm's `scontrol top`).
     ///
     /// The jobs go before the owner's other jobs, in the order given, but not before other
@@ -857,6 +900,7 @@ impl SubCommand {
             SubCommand::Gpu { .. } => "gpu",
             SubCommand::Prio { .. } => "prio",
             SubCommand::Nice { .. } => "nice",
+            SubCommand::Yield(_) => "yield",
             SubCommand::Top { .. } => "top",
             SubCommand::Site { .. } => "site",
             SubCommand::Share { .. } => "share",
@@ -922,6 +966,22 @@ pub enum GroupCommand {
 
         /// The new priority (0 or more).
         priority: u32,
+    },
+
+    /// (gpueue) Set a group's priority tier (administrators only; default 0).
+    ///
+    /// Jobs of a group with a higher tier start before jobs of lower tiers and preempt them:
+    /// a running job of a lower tier is checkpointed to make room and resumes automatically
+    /// later (Slurm's partition `PriorityTier`). May be negative, e.g. `-1` for a group that
+    /// yields to all others.
+    #[command(allow_negative_numbers = true)]
+    Tier {
+        /// Name of the group.
+        name: String,
+
+        /// The new tier; may be negative.
+        #[arg(allow_negative_numbers = true)]
+        tier: i32,
     },
 }
 
@@ -1009,6 +1069,98 @@ pub enum ServiceCommand {
     /// `gpueue update`).
     #[command(hide = true)]
     VersionInfo,
+}
+
+/// Whom `add --yield[=TO]` yields to.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YieldTo {
+    /// Every job that does not yield, in any group.
+    All,
+    /// The jobs of its own group that do not yield.
+    Group,
+}
+
+/// The mode `gpueue yield` sets.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum YieldSetting {
+    /// Yield to every job that does not yield, in any group.
+    #[default]
+    All,
+    /// Yield to the jobs of the job's own group that do not yield.
+    Group,
+    /// Do not yield.
+    Off,
+}
+
+/// The operands of `gpueue yield <IDS>... [all|group|off]`: job ids, then
+/// optionally the mode, like `gpueue nice <IDS>... <N>`. The last operand is
+/// the mode if it is not a number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YieldTargets {
+    pub task_ids: Vec<usize>,
+    pub mode: YieldSetting,
+}
+
+const YIELD_OPERANDS: &str = "operands";
+
+impl YieldTargets {
+    /// Splits the operands into ids and the mode.
+    fn from_operands(operands: &[String]) -> Result<Self, String> {
+        let (mode, ids) = match operands.split_last() {
+            Some((last, rest)) if last.parse::<usize>().is_err() => {
+                let mode = YieldSetting::from_str(last, true).map_err(|_| {
+                    format!("invalid value '{last}': expected a job id, or all, group or off last")
+                })?;
+                (mode, rest)
+            }
+            _ => (YieldSetting::default(), operands),
+        };
+        if ids.is_empty() {
+            return Err("no job ids given".to_owned());
+        }
+        let task_ids = ids
+            .iter()
+            .map(|id| {
+                id.parse::<usize>().map_err(|_| {
+                    format!("invalid job id '{id}' (the mode all, group or off goes after the ids)")
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { task_ids, mode })
+    }
+}
+
+impl FromArgMatches for YieldTargets {
+    fn from_arg_matches(matches: &ArgMatches) -> Result<Self, clap::Error> {
+        let operands: Vec<String> = matches
+            .get_many::<String>(YIELD_OPERANDS)
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default();
+        Self::from_operands(&operands)
+            .map_err(|message| clap::Error::raw(ErrorKind::ValueValidation, message))
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches(matches)?;
+        Ok(())
+    }
+}
+
+impl Args for YieldTargets {
+    fn augment_args(cmd: clap::Command) -> clap::Command {
+        cmd.arg(
+            Arg::new(YIELD_OPERANDS)
+                .value_name("IDS")
+                .required(true)
+                .num_args(1..)
+                .action(ArgAction::Append)
+                .help("The ids of the jobs, then the mode: all (default), group or off."),
+        )
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
 }
 
 /// When to colorize output.

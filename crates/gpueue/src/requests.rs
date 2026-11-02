@@ -8,6 +8,8 @@ use chrono::{DateTime, Local};
 use gpueue_core::model::{DEFAULT_GROUP, GpuIndex, JobId, JobSpec, YieldMode};
 use gpueue_protocol::api::{AddJobRequest, JobSelector};
 
+use crate::cli::{YieldSetting, YieldTo};
+
 /// Which jobs `-a`, `-g` and ids select, as pueue's `selection_from_params`:
 /// `--all` wins over `--group`, which wins over ids; nothing at all means the
 /// default group.
@@ -41,6 +43,24 @@ pub fn gpu_indices(gpus: &[u32]) -> Vec<GpuIndex> {
     gpus.iter().map(|&index| GpuIndex(index)).collect()
 }
 
+/// The yield mode of `add` without `--yield` (`None`) or with `--yield[=TO]`.
+pub fn yield_mode(to: Option<YieldTo>) -> YieldMode {
+    match to {
+        None => YieldMode::None,
+        Some(YieldTo::All) => YieldMode::All,
+        Some(YieldTo::Group) => YieldMode::Group,
+    }
+}
+
+/// The yield mode `gpueue yield ... <MODE>` sets.
+pub fn yield_setting(setting: YieldSetting) -> YieldMode {
+    match setting {
+        YieldSetting::All => YieldMode::All,
+        YieldSetting::Group => YieldMode::Group,
+        YieldSetting::Off => YieldMode::None,
+    }
+}
+
 pub fn timestamp(at: &DateTime<Local>) -> i64 {
     at.timestamp_millis()
 }
@@ -57,6 +77,7 @@ pub struct AddArgs<'a> {
     pub label: Option<&'a str>,
     pub gpu: &'a [u32],
     pub no_checkpoint: bool,
+    pub yield_to: Option<YieldTo>,
     pub stashed: bool,
     pub delay: Option<DateTime<Local>>,
     pub immediate: bool,
@@ -90,7 +111,7 @@ pub fn add_request(
             label: args.label.map(str::to_owned),
             no_checkpoint: args.no_checkpoint,
             nice: args.nice.unwrap_or(0),
-            yield_mode: YieldMode::None,
+            yield_mode: yield_mode(args.yield_to),
         },
         // As in pueue, a delayed job is stashed until its time comes.
         stashed: args.stashed || args.delay.is_some(),
@@ -209,6 +230,28 @@ mod tests {
         assert!(!request.stashed);
         assert_eq!(request.enqueue_at, None);
         assert!(request.immediate);
+        assert_eq!(request.spec.yield_mode, YieldMode::None);
+    }
+
+    #[test]
+    fn add_request_yield() {
+        let command = words(&["ls"]);
+        for (to, mode) in [
+            (None, YieldMode::None),
+            (Some(YieldTo::All), YieldMode::All),
+            (Some(YieldTo::Group), YieldMode::Group),
+        ] {
+            let args = AddArgs {
+                command: &command,
+                yield_to: to,
+                ..AddArgs::default()
+            };
+            let request = add_request(&args, PathBuf::from("/"), BTreeMap::new());
+            assert_eq!(request.spec.yield_mode, mode, "{to:?}");
+        }
+        assert_eq!(yield_setting(YieldSetting::All), YieldMode::All);
+        assert_eq!(yield_setting(YieldSetting::Group), YieldMode::Group);
+        assert_eq!(yield_setting(YieldSetting::Off), YieldMode::None);
     }
 
     #[test]

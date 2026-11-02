@@ -650,6 +650,7 @@ fn routes() {
         (Route::NiceJobs, Method::Post, "/v1/jobs/nice"),
         (Route::TopJobs, Method::Post, "/v1/jobs/top"),
         (Route::SiteJobs, Method::Post, "/v1/jobs/site"),
+        (Route::YieldJobs, Method::Post, "/v1/jobs/yield"),
         (Route::Priority, Method::Get, "/v1/priority"),
         (Route::ListShares, Method::Get, "/v1/shares"),
         (
@@ -661,6 +662,11 @@ fn routes() {
             Route::SetGroupPriority("a b".into()),
             Method::Put,
             "/v1/groups/a%20b/priority",
+        ),
+        (
+            Route::SetGroupTier("a b".into()),
+            Method::Put,
+            "/v1/groups/a%20b/tier",
         ),
     ];
     for (route, method, path) in cases {

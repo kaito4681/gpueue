@@ -229,6 +229,29 @@ async fn route(
                 groups: changed_groups(mode, &body),
             },
         ),
+        ("POST", "/v1/jobs/yield") => json(
+            StatusCode::OK,
+            BulkJobResponse::new(vec![
+                JobActionResult::ok(JobId(1)),
+                JobActionResult::error(
+                    JobId(2),
+                    ApiError::new(
+                        ErrorCode::BadRequest,
+                        "a job with --no-checkpoint cannot yield",
+                    ),
+                ),
+            ]),
+        ),
+        ("PUT", "/v1/groups/background/tier") => json(
+            StatusCode::OK,
+            Group {
+                name: "background".into(),
+                parallel: 1,
+                paused: false,
+                priority: 0,
+                tier: -1,
+            },
+        ),
         ("POST", "/v1/jobs/reset") => json(
             StatusCode::OK,
             BulkJobResponse::new(vec![JobActionResult::ok(JobId(1))]),
@@ -498,6 +521,89 @@ fn add_sends_cwd_and_environment() {
 
     let output = gpueue(&daemon.socket, &["add", "-p", "true"]);
     assert_eq!(stdout(&output), "5\n");
+}
+
+#[test]
+fn add_sends_yield_only_when_given() {
+    let daemon = FakeDaemon::start(Mode::Normal);
+    let added = |args: &[&str]| {
+        let output = gpueue(&daemon.socket, args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        let add = daemon
+            .requests()
+            .into_iter()
+            .rfind(|r| r.method == "POST" && r.uri == "/v1/jobs")
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&add.body).unwrap()
+    };
+    let body = added(&["add", "-w", "/", "--yield", "python", "train.py"]);
+    assert_eq!(body["yield"], "all");
+    assert_eq!(body["command"], "python train.py");
+    let body = added(&["add", "-w", "/", "--preemptible=group", "python"]);
+    assert_eq!(body["yield"], "group");
+    let body = added(&["add", "-w", "/", "python"]);
+    assert!(body.get("yield").is_none(), "{body}");
+
+    let output = gpueue(
+        &daemon.socket,
+        &["add", "--yield", "--no-checkpoint", "python"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("cannot be used with"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn yield_and_group_tier() {
+    let daemon = FakeDaemon::start(Mode::Normal);
+    let output = gpueue(&daemon.socket, &["yield", "1", "2", "group"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stdout(&output),
+        "Yielding to the jobs of their own group: 1\n"
+    );
+    assert_eq!(
+        stderr(&output),
+        "Job 2: a job with --no-checkpoint cannot yield\n"
+    );
+    let request = daemon.requests().pop().unwrap();
+    assert_eq!(
+        (request.method.as_str(), request.uri.as_str()),
+        ("POST", "/v1/jobs/yield")
+    );
+    assert_eq!(request.body, r#"{"ids":[1,2],"mode":"group"}"#);
+
+    gpueue(&daemon.socket, &["yield", "1", "off"]);
+    let request = daemon.requests().pop().unwrap();
+    assert_eq!(request.body, r#"{"ids":[1],"mode":"none"}"#);
+    gpueue(&daemon.socket, &["yield", "1"]);
+    let request = daemon.requests().pop().unwrap();
+    assert_eq!(request.body, r#"{"ids":[1],"mode":"all"}"#);
+
+    // A mode before the ids is a usage error, reported with the usage.
+    let count = daemon.requests().len();
+    let output = gpueue(&daemon.socket, &["yield", "off", "1"]);
+    assert_eq!(output.status.code(), Some(2));
+    let err = stderr(&output);
+    assert!(err.contains("invalid job id 'off'"), "{err}");
+    assert!(
+        err.contains("Usage: gpueue yield <IDS>... [all|group|off]"),
+        "{err}"
+    );
+    assert_eq!(daemon.requests().len(), count);
+
+    let output = gpueue(&daemon.socket, &["group", "tier", "background", "-1"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Tier of group \"background\" set to -1\n");
+    let request = daemon.requests().pop().unwrap();
+    assert_eq!(
+        (request.method.as_str(), request.uri.as_str()),
+        ("PUT", "/v1/groups/background/tier")
+    );
+    assert_eq!(request.body, r#"{"tier":-1}"#);
 }
 
 #[test]

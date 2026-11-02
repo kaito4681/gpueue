@@ -11,7 +11,7 @@ use comfy_table::{
     Cell, CellAlignment, ContentArrangement, ContentLineStyle, LineStyle, Row, Table, TableStyle,
 };
 use gpueue_core::authz::REDACTED;
-use gpueue_core::model::{DEFAULT_GROUP, Group, JobId, JobResult, JobState};
+use gpueue_core::model::{DEFAULT_GROUP, Group, JobId, JobResult, JobState, YieldMode};
 use gpueue_core::priority::PriorityType;
 use gpueue_protocol::api::{
     ActionOutcome, GpuView, JobActionResult, JobView, OrphanJob, PriorityResponse, QueuedLaunch,
@@ -77,18 +77,21 @@ pub fn escape_controls(text: &str) -> Cow<'_, str> {
 // ---------------------------------------------------------------------------
 
 /// The state as shown in the status table, with its color (pueue's names
-/// and colors, plus the gpueue checkpoint states).
+/// and colors, plus the gpueue checkpoint states). Notes follow in
+/// parentheses: the image size and a failed restore of a checkpointed job,
+/// `preempted` for a job checkpointed to make room for another one, and
+/// `yield` / `yield=group` for an unfinished job that yields.
 pub fn state_text(job: &JobView) -> (String, Color) {
-    match &job.state {
-        JobState::Queued { .. } => ("Queued".into(), Color::Yellow),
-        JobState::Stashed { .. } => ("Stashed".into(), Color::Yellow),
-        JobState::Running => ("Running".into(), Color::Green),
-        JobState::Paused => ("Paused".into(), Color::White),
-        JobState::Checkpointing => ("Checkpointing".into(), Color::Yellow),
+    let mut notes: Vec<String> = Vec::new();
+    let (name, color) = match &job.state {
+        JobState::Queued { .. } => ("Queued", Color::Yellow),
+        JobState::Stashed { .. } => ("Stashed", Color::Yellow),
+        JobState::Running => ("Running", Color::Green),
+        JobState::Paused => ("Paused", Color::White),
+        JobState::Checkpointing => ("Checkpointing", Color::Yellow),
         JobState::Checkpointed => {
             // The last error of a checkpointed job is a failed restore (only
             // in the owner's view; `gpueue log` shows the reason).
-            let mut notes = Vec::new();
             if let Some(size) = job.checkpoint_size_bytes {
                 notes.push(human_bytes(size));
             }
@@ -96,13 +99,8 @@ pub fn state_text(job: &JobView) -> (String, Color) {
             if restore_failed {
                 notes.push("restore failed".into());
             }
-            let text = if notes.is_empty() {
-                "Checkpointed".into()
-            } else {
-                format!("Checkpointed ({})", notes.join(", "))
-            };
             (
-                text,
+                "Checkpointed",
                 if restore_failed {
                     Color::Red
                 } else {
@@ -110,19 +108,37 @@ pub fn state_text(job: &JobView) -> (String, Color) {
                 },
             )
         }
-        JobState::RestoreQueued { .. } => ("Restore queued".into(), Color::Yellow),
-        JobState::Restoring => ("Restoring".into(), Color::Yellow),
-        JobState::Terminating { .. } => ("Terminating".into(), Color::Red),
-        JobState::Done { result } => match result {
-            JobResult::Success => ("Success".into(), Color::Green),
-            JobResult::Failed { exit_code } => (format!("Failed ({exit_code})"), Color::Red),
-            JobResult::FailedToSpawn { .. } => ("Failed to spawn".into(), Color::Red),
-            JobResult::Killed => ("Killed".into(), Color::Red),
-            JobResult::DependencyFailed => ("Dependency failed".into(), Color::Red),
-            JobResult::CheckpointFailed { .. } => ("Checkpoint failed".into(), Color::Red),
-            JobResult::Lost => ("Lost".into(), Color::Red),
-        },
+        JobState::RestoreQueued { .. } => {
+            if job.preempted_at.is_some() {
+                notes.push("preempted".into());
+            }
+            ("Restore queued", Color::Yellow)
+        }
+        JobState::Restoring => ("Restoring", Color::Yellow),
+        JobState::Terminating { .. } => ("Terminating", Color::Red),
+        JobState::Done { result } => {
+            return match result {
+                JobResult::Success => ("Success".into(), Color::Green),
+                JobResult::Failed { exit_code } => (format!("Failed ({exit_code})"), Color::Red),
+                JobResult::FailedToSpawn { .. } => ("Failed to spawn".into(), Color::Red),
+                JobResult::Killed => ("Killed".into(), Color::Red),
+                JobResult::DependencyFailed => ("Dependency failed".into(), Color::Red),
+                JobResult::CheckpointFailed { .. } => ("Checkpoint failed".into(), Color::Red),
+                JobResult::Lost => ("Lost".into(), Color::Red),
+            };
+        }
+    };
+    match job.yield_mode {
+        YieldMode::None => {}
+        YieldMode::All => notes.push("yield".into()),
+        YieldMode::Group => notes.push("yield=group".into()),
     }
+    let text = if notes.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{name} ({})", notes.join(", "))
+    };
+    (text, color)
 }
 
 /// The last error the daemon recorded for the job (owner's view only).
@@ -168,7 +184,8 @@ pub fn has_log(state: &JobState) -> bool {
 // Groups
 // ---------------------------------------------------------------------------
 
-/// `Group "name" (N parallel): running`, as pueue's group headline.
+/// `Group "name" (N parallel): running`, as pueue's group headline, with
+/// the group's tier when it is not 0 (`(N parallel, tier T)`).
 pub fn group_headline(name: &str, group: Option<&Group>, style: &Style) -> String {
     let title = style.bold(format!("Group \"{}\"", escape_controls(name)));
     let Some(group) = group else {
@@ -179,7 +196,12 @@ pub fn group_headline(name: &str, group: Option<&Group>, style: &Style) -> Strin
     } else {
         style.paint("running", Some(Color::Green), false)
     };
-    format!("{title} ({} parallel): {status}", group.parallel)
+    let tier = if group.tier == 0 {
+        String::new()
+    } else {
+        format!(", tier {}", group.tier)
+    };
+    format!("{title} ({} parallel{tier}): {status}", group.parallel)
 }
 
 /// The output of `gpueue group` (one headline per group).

@@ -22,10 +22,12 @@ pub const JOBS_SWITCH: &str = "/v1/jobs/switch";
 pub const JOBS_NICE: &str = "/v1/jobs/nice";
 pub const JOBS_TOP: &str = "/v1/jobs/top";
 pub const JOBS_SITE: &str = "/v1/jobs/site";
+pub const JOBS_YIELD: &str = "/v1/jobs/yield";
 pub const GROUPS: &str = "/v1/groups";
 pub const GROUP_TEMPLATE: &str = "/v1/groups/{name}";
 pub const GROUP_PARALLEL_TEMPLATE: &str = "/v1/groups/{name}/parallel";
 pub const GROUP_PRIORITY_TEMPLATE: &str = "/v1/groups/{name}/priority";
+pub const GROUP_TIER_TEMPLATE: &str = "/v1/groups/{name}/tier";
 pub const PRIORITY: &str = "/v1/priority";
 pub const SHARES: &str = "/v1/shares";
 pub const SHARE_TEMPLATE: &str = "/v1/shares/{uid}";
@@ -91,6 +93,8 @@ pub enum Route {
     TopJobs,
     /// `POST /v1/jobs/site` — [`super::SiteRequest`] → [`super::BulkJobResponse`].
     SiteJobs,
+    /// `POST /v1/jobs/yield` — [`super::YieldRequest`] → [`super::BulkJobResponse`].
+    YieldJobs,
     /// `GET /v1/priority` → [`super::PriorityResponse`].
     Priority,
     /// `GET /v1/shares` → [`super::SharesResponse`].
@@ -99,6 +103,8 @@ pub enum Route {
     SetShares(Uid),
     /// `PUT /v1/groups/{name}/priority` — [`super::SetGroupPriorityRequest`] → group.
     SetGroupPriority(String),
+    /// `PUT /v1/groups/{name}/tier` — [`super::SetGroupTierRequest`] → group.
+    SetGroupTier(String),
     /// `GET /v1/groups` → [`super::ListGroupsResponse`].
     ListGroups,
     /// `POST /v1/groups` — [`super::CreateGroupRequest`] → `201` group.
@@ -201,7 +207,8 @@ impl Route {
             | Route::SetGpuParallel(_)
             | Route::SetGpusParallel
             | Route::SetShares(_)
-            | Route::SetGroupPriority(_) => Method::Put,
+            | Route::SetGroupPriority(_)
+            | Route::SetGroupTier(_) => Method::Put,
             Route::AddJob
             | Route::JobAction(..)
             | Route::BulkJobAction
@@ -211,6 +218,7 @@ impl Route {
             | Route::NiceJobs
             | Route::TopJobs
             | Route::SiteJobs
+            | Route::YieldJobs
             | Route::CreateGroup
             | Route::Shutdown => Method::Post,
         }
@@ -232,12 +240,14 @@ impl Route {
             Route::NiceJobs => JOBS_NICE.to_owned(),
             Route::TopJobs => JOBS_TOP.to_owned(),
             Route::SiteJobs => JOBS_SITE.to_owned(),
+            Route::YieldJobs => JOBS_YIELD.to_owned(),
             Route::Priority => PRIORITY.to_owned(),
             Route::ListShares => SHARES.to_owned(),
             Route::SetShares(uid) => format!("{SHARES}/{uid}"),
             Route::SetGroupPriority(name) => {
                 format!("{GROUPS}/{}/priority", percent_encode(name))
             }
+            Route::SetGroupTier(name) => format!("{GROUPS}/{}/tier", percent_encode(name)),
             Route::JobLog(id) => format!("{JOBS}/{id}/log"),
             Route::ListGroups | Route::CreateGroup => GROUPS.to_owned(),
             Route::DeleteGroup(name) => format!("{GROUPS}/{}", percent_encode(name)),
