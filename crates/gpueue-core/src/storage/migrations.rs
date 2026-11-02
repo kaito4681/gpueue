@@ -192,9 +192,24 @@ CREATE TABLE user_usage (
 ) STRICT;
 "#;
 
+/// Version 7: priority tiers and preemption.
+///
+/// - `groups.tier`: the group's priority tier (Slurm's partition
+///   `PriorityTier`); may be negative.
+/// - `jobs.yield_mode`: [`YieldMode::as_i64`](crate::model::YieldMode::as_i64)
+///   (0 = none, 1 = group, 2 = all).
+/// - `jobs.preempted_at`: when the scheduler checkpointed the job to make
+///   room for a higher-tier job (`NULL` unless it is being or has been
+///   preempted and not yet restored).
+const V7: &str = r#"
+ALTER TABLE groups ADD COLUMN tier INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN yield_mode INTEGER NOT NULL DEFAULT 0 CHECK (yield_mode IN (0, 1, 2));
+ALTER TABLE jobs ADD COLUMN preempted_at INTEGER;
+"#;
+
 /// All migrations, in order. The schema version after migrating is
 /// `MIGRATIONS.len()`.
-pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
+pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
 
 /// The schema version this build of gpueue writes.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

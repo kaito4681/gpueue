@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use gpueue_core::authz;
 use gpueue_core::model::{
-    Caller, GpuIndex, Job, JobId, JobResult, JobSpec, JobState, Timestamp, Uid,
+    Caller, GpuIndex, Job, JobId, JobResult, JobSpec, JobState, Timestamp, Uid, YieldMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +56,10 @@ pub struct JobView {
     /// when 0.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub nice: i32,
+    /// Whether and to whom the job yields (`gpueue add --yield[=group]`,
+    /// `gpueue yield`); JSON key `yield`, omitted when it does not yield.
+    #[serde(rename = "yield", default, skip_serializing_if = "YieldMode::is_none")]
+    pub yield_mode: YieldMode,
     pub label: Option<String>,
     pub no_checkpoint: bool,
     pub state: JobState,
@@ -65,6 +69,11 @@ pub struct JobView {
     /// Size of the stored checkpoint image, if any. Filled in by the daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_size_bytes: Option<u64>,
+    /// When the scheduler checkpointed the job to make room for a
+    /// higher-tier job, while it waits to be restored (see
+    /// [`Job::preempted_at`]); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempted_at: Option<Timestamp>,
     /// Owner/admin-only fields; `None` in the redacted view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<JobDetails>,
@@ -127,6 +136,7 @@ impl JobView {
             dependencies: job.spec.dependencies.clone(),
             priority: job.spec.priority,
             nice: job.spec.nice,
+            yield_mode: job.spec.yield_mode,
             label: None,
             no_checkpoint: job.spec.no_checkpoint,
             state: authz::redact_state(&job.state),
@@ -134,6 +144,7 @@ impl JobView {
             started_at: job.started_at,
             finished_at: job.finished_at,
             checkpoint_size_bytes: None,
+            preempted_at: job.preempted_at,
             details: None,
         }
     }

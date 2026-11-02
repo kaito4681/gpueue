@@ -454,7 +454,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::model::{DEFAULT_GROUP, JobSpec, Uid};
+    use crate::model::{DEFAULT_GROUP, JobSpec, Uid, YieldMode};
 
     const NOW: Timestamp = 1_000_000;
 
@@ -496,6 +496,7 @@ mod tests {
                 label: None,
                 no_checkpoint: false,
                 nice: 0,
+                yield_mode: YieldMode::None,
             },
             state,
             created_at: 0,
@@ -503,6 +504,7 @@ mod tests {
             finished_at: None,
             site_factor: 0,
             top_seq: None,
+            preempted_at: None,
         })
     }
 
@@ -531,6 +533,7 @@ mod tests {
             parallel,
             paused: false,
             priority: 0,
+            tier: 0,
         }
     }
 

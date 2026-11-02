@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use chrono::DateTime;
-use gpueue_core::model::{GpuIndex, Group, JobId, JobResult, JobState, Uid};
+use gpueue_core::model::{GpuIndex, Group, JobId, JobResult, JobState, Uid, YieldMode};
 use gpueue_protocol::api::{
     ActionOutcome, ApiError, ErrorCode, GpuJob, GpuView, JobActionResult, JobDetails, JobView,
 };
@@ -37,6 +37,7 @@ pub(crate) fn job(id: u64, state: JobState) -> JobView {
         dependencies: vec![],
         priority: 0,
         nice: 0,
+        yield_mode: YieldMode::None,
         label: None,
         no_checkpoint: false,
         state,
@@ -44,6 +45,7 @@ pub(crate) fn job(id: u64, state: JobState) -> JobView {
         started_at: None,
         finished_at: None,
         checkpoint_size_bytes: None,
+        preempted_at: None,
         details: Some(JobDetails {
             command: "sleep 60".into(),
             cwd: PathBuf::from("/tmp"),
@@ -63,6 +65,7 @@ fn group(name: &str, parallel: u32, paused: bool) -> Group {
         parallel,
         paused,
         priority: 0,
+        tier: 0,
     }
 }
 

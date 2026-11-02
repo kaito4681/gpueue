@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpueue_core::model::{GpuIndex, JobId, JobResult, JobSpec, JobState, Uid};
+use gpueue_core::model::{GpuIndex, JobId, JobResult, JobSpec, JobState, Uid, YieldMode};
 use gpueue_daemon::api::TEST_UID_HEADER;
 use gpueue_daemon::helper::FakeOutcome;
 use gpueue_daemon::{
@@ -197,6 +197,7 @@ fn job_request(command: &str, gpus: &[u32]) -> AddJobRequest {
             label: Some("experiment".to_owned()),
             no_checkpoint: false,
             nice: 0,
+            yield_mode: YieldMode::None,
         },
         stashed: false,
         enqueue_at: None,

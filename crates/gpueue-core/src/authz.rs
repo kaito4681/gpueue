@@ -263,7 +263,7 @@ fn redact_result(result: &JobResult) -> JobResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DEFAULT_GROUP, JobSpec};
+    use crate::model::{DEFAULT_GROUP, JobSpec, YieldMode};
 
     const OWNER: Uid = Uid(1000);
     const OTHER: Uid = Uid(1001);
@@ -297,6 +297,7 @@ mod tests {
                 label: Some("resnet-sweep".to_owned()),
                 no_checkpoint: true,
                 nice: 0,
+                yield_mode: YieldMode::None,
             },
             state,
             created_at: 10,
@@ -304,6 +305,7 @@ mod tests {
             finished_at: None,
             site_factor: 0,
             top_seq: None,
+            preempted_at: None,
         }
     }
 

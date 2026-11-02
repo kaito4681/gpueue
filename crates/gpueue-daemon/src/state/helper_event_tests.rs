@@ -3,7 +3,7 @@
 
 use std::future::Future;
 
-use gpueue_core::model::JobSpec;
+use gpueue_core::model::{JobSpec, YieldMode};
 use gpueue_protocol::helper::Event;
 
 use super::*;
@@ -48,6 +48,7 @@ fn spec() -> JobSpec {
         label: None,
         no_checkpoint: false,
         nice: 0,
+        yield_mode: YieldMode::None,
     }
 }
 

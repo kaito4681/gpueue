@@ -3159,7 +3159,7 @@ mod helper_event_tests;
 
 #[cfg(test)]
 mod tests {
-    use gpueue_core::model::JobSpec;
+    use gpueue_core::model::{JobSpec, YieldMode};
 
     use super::*;
     use crate::helper::FakeHelper;
@@ -3203,6 +3203,7 @@ mod tests {
             label: None,
             no_checkpoint: false,
             nice: 0,
+            yield_mode: YieldMode::None,
         }
     }
 

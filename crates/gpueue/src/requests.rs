@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
-use gpueue_core::model::{DEFAULT_GROUP, GpuIndex, JobId, JobSpec};
+use gpueue_core::model::{DEFAULT_GROUP, GpuIndex, JobId, JobSpec, YieldMode};
 use gpueue_protocol::api::{AddJobRequest, JobSelector};
 
 /// Which jobs `-a`, `-g` and ids select, as pueue's `selection_from_params`:
@@ -90,6 +90,7 @@ pub fn add_request(
             label: args.label.map(str::to_owned),
             no_checkpoint: args.no_checkpoint,
             nice: args.nice.unwrap_or(0),
+            yield_mode: YieldMode::None,
         },
         // As in pueue, a delayed job is stashed until its time comes.
         stashed: args.stashed || args.delay.is_some(),

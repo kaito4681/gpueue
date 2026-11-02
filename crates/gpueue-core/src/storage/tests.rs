@@ -22,6 +22,7 @@ fn spec(command: &str) -> JobSpec {
         label: None,
         no_checkpoint: false,
         nice: 0,
+        yield_mode: YieldMode::None,
     }
 }
 
@@ -42,6 +43,7 @@ fn full_spec() -> JobSpec {
         label: Some("exp-42".to_owned()),
         no_checkpoint: true,
         nice: 0,
+        yield_mode: YieldMode::None,
     }
 }
 
@@ -756,6 +758,7 @@ fn default_group_exists_after_migration() {
             parallel: 1,
             paused: false,
             priority: 0,
+            tier: 0,
         }]
     );
 }
@@ -771,6 +774,7 @@ fn group_create_configure_and_list() {
             parallel: 2,
             paused: false,
             priority: 0,
+            tier: 0,
         }
     );
     assert!(matches!(
@@ -788,6 +792,7 @@ fn group_create_configure_and_list() {
             parallel: 8,
             paused: true,
             priority: 0,
+            tier: 0,
         }
     );
     store.set_group_paused("gpu", false).unwrap();
@@ -1752,5 +1757,137 @@ fn run_since_usage_additions_grants_and_active_owners() {
     assert_eq!(
         store.list_active_owners().unwrap(),
         std::collections::BTreeSet::from([Uid(1)])
+    );
+}
+
+// ----- tiers and preemption -----
+
+#[test]
+fn version_six_database_gains_tiers_and_yield() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    {
+        let conn = Connection::open(&path).unwrap();
+        for sql in &migrations::MIGRATIONS[..6] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO groups (name, parallel, paused, priority) VALUES ('gpu', 2, 1, 5);
+               INSERT INTO jobs (id, owner_uid, command, cwd, group_name, priority, state,
+                                 state_data, created_at, nice)
+               VALUES (0, 1000, 'x', x'2f', 'gpu', 7, 'queued',
+                       '{"state":"queued","enqueued_at":5}', 1, 3);
+               UPDATE meta SET value = 1 WHERE key = 'next_job_id';"#,
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let job = store.get_job(JobId(0)).unwrap().unwrap();
+    assert_eq!((job.spec.priority, job.spec.nice), (7, 3));
+    assert_eq!(job.spec.yield_mode, YieldMode::None);
+    assert_eq!(job.preempted_at, None);
+    let group = store.get_group("gpu").unwrap().unwrap();
+    assert_eq!(
+        (group.parallel, group.paused, group.priority, group.tier),
+        (2, true, 5, 0)
+    );
+    assert_eq!(store.get_group(DEFAULT_GROUP).unwrap().unwrap().tier, 0);
+}
+
+#[test]
+fn yield_mode_and_preempted_at_are_stored() {
+    let store = Store::open_in_memory().unwrap();
+    let mut s = spec("a");
+    s.yield_mode = YieldMode::All;
+    let a = store.insert_job(Uid(1), &s, &queued(0), 0).unwrap();
+    assert_eq!(a.spec.yield_mode, YieldMode::All);
+    assert_eq!(a.preempted_at, None);
+    let b = store.insert_job(Uid(1), &spec("b"), &queued(0), 0).unwrap();
+    assert_eq!(store.get_job(a.id).unwrap().unwrap(), a);
+    assert_eq!(
+        store.get_job(b.id).unwrap().unwrap().spec.yield_mode,
+        YieldMode::None
+    );
+
+    store.set_job_yield_mode(b.id, YieldMode::Group).unwrap();
+    store.set_job_preempted_at(a.id, Some(42)).unwrap();
+    let get = |id| store.get_job(id).unwrap().unwrap();
+    assert_eq!(get(b.id).spec.yield_mode, YieldMode::Group);
+    assert_eq!(get(a.id).preempted_at, Some(42));
+    assert_eq!(get(b.id).preempted_at, None);
+
+    // The brief listing the scheduler reads carries them too.
+    let brief = store.list_unfinished_jobs_brief().unwrap();
+    let modes: Vec<_> = brief
+        .iter()
+        .map(|j| (j.id, j.spec.yield_mode, j.preempted_at))
+        .collect();
+    assert_eq!(
+        modes,
+        [
+            (a.id, YieldMode::All, Some(42)),
+            (b.id, YieldMode::Group, None)
+        ]
+    );
+    let listed = store.list_jobs(&JobFilter::all()).unwrap();
+    assert_eq!(listed[0].preempted_at, Some(42));
+    assert_eq!(listed[1].spec.yield_mode, YieldMode::Group);
+
+    store.set_job_yield_mode(a.id, YieldMode::None).unwrap();
+    store.set_job_preempted_at(a.id, None).unwrap();
+    assert_eq!(get(a.id).spec.yield_mode, YieldMode::None);
+    assert_eq!(get(a.id).preempted_at, None);
+
+    assert_domain(
+        store
+            .set_job_yield_mode(JobId(99), YieldMode::All)
+            .unwrap_err(),
+        Error::JobNotFound(JobId(99)),
+    );
+    assert_domain(
+        store.set_job_preempted_at(JobId(99), Some(1)).unwrap_err(),
+        Error::JobNotFound(JobId(99)),
+    );
+
+    // They move with the job on `switch`.
+    store.set_job_preempted_at(b.id, Some(7)).unwrap();
+    store.swap_job_ids(a.id, b.id).unwrap();
+    assert_eq!(
+        (get(a.id).spec.yield_mode, get(a.id).preempted_at),
+        (YieldMode::Group, Some(7))
+    );
+    assert_eq!(
+        (get(b.id).spec.yield_mode, get(b.id).preempted_at),
+        (YieldMode::None, None)
+    );
+
+    // The schema refuses an unknown mode.
+    assert!(
+        store
+            .conn
+            .execute("UPDATE jobs SET yield_mode = 3 WHERE id = ?1", [a.id.0])
+            .is_err()
+    );
+}
+
+#[test]
+fn group_tier_is_stored() {
+    let store = Store::open_in_memory().unwrap();
+    let g = store.create_group("gpu", 1).unwrap();
+    assert_eq!(g.tier, 0);
+    store.set_group_tier("gpu", 2).unwrap();
+    store.set_group_tier(DEFAULT_GROUP, -1).unwrap();
+    assert_eq!(store.get_group("gpu").unwrap().unwrap().tier, 2);
+    let groups = store.list_groups().unwrap();
+    assert_eq!(groups.iter().map(|g| g.tier).collect::<Vec<_>>(), [-1, 2]);
+    // Setting the priority leaves the tier alone, and the other way round.
+    store.set_group_priority("gpu", 10).unwrap();
+    let gpu = store.get_group("gpu").unwrap().unwrap();
+    assert_eq!((gpu.priority, gpu.tier), (10, 2));
+    assert_domain(
+        store.set_group_tier("nope", 1).unwrap_err(),
+        Error::GroupNotFound("nope".into()),
     );
 }

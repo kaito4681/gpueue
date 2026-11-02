@@ -47,7 +47,9 @@ use serde::{Deserialize, Serialize};
 pub use crate::error::StorageError;
 use std::collections::BTreeMap;
 
-use crate::model::{Gpu, GpuIndex, Group, Job, JobId, JobSpec, JobState, Timestamp, Uid};
+use crate::model::{
+    Gpu, GpuIndex, Group, Job, JobId, JobSpec, JobState, Timestamp, Uid, YieldMode,
+};
 pub use migrations::SCHEMA_VERSION;
 
 pub type Result<T, E = StorageError> = std::result::Result<T, E>;
@@ -434,6 +436,19 @@ pub trait StoreOps: sealed::Sealed {
         jobs::set_site_factor(self.conn(), id, site)
     }
 
+    /// Sets a job's yield mode (`gpueue yield`). Fails with
+    /// [`Error::JobNotFound`](crate::Error::JobNotFound) if it does not exist.
+    fn set_job_yield_mode(&self, id: JobId, mode: YieldMode) -> Result<()> {
+        jobs::set_yield_mode(self.conn(), id, mode)
+    }
+
+    /// Marks a job as preempted at `at` (`None` clears the mark; see
+    /// [`Job::preempted_at`]). Fails with
+    /// [`Error::JobNotFound`](crate::Error::JobNotFound) if it does not exist.
+    fn set_job_preempted_at(&self, id: JobId, at: Option<Timestamp>) -> Result<()> {
+        jobs::set_preempted_at(self.conn(), id, at)
+    }
+
     /// Moves jobs to the top of their owners' queues (`gpueue top`): each
     /// gets a `top_seq` above every earlier one, the first id the highest.
     /// Fails (changing nothing) if a job does not exist.
@@ -493,6 +508,13 @@ pub trait StoreOps: sealed::Sealed {
 
     fn set_group_priority(&self, name: &str, priority: u32) -> Result<()> {
         groups::set_priority(self.conn(), name, priority)
+    }
+
+    /// Sets a group's priority tier. Fails with
+    /// [`Error::GroupNotFound`](crate::Error::GroupNotFound) if it does not
+    /// exist.
+    fn set_group_tier(&self, name: &str, tier: i32) -> Result<()> {
+        groups::set_tier(self.conn(), name, tier)
     }
 
     /// Removes an empty group. The default group cannot be removed.

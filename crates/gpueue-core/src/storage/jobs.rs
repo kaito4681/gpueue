@@ -3,11 +3,12 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use rusqlite::types::Type;
 use rusqlite::{Connection, Row, params};
 
 use super::{JobFilter, Result};
 use crate::error::{Error, StorageError};
-use crate::model::{GpuIndex, Job, JobId, JobSpec, JobState, Timestamp, Uid};
+use crate::model::{GpuIndex, Job, JobId, JobSpec, JobState, Timestamp, Uid, YieldMode};
 
 pub(super) fn path_to_blob(path: &Path) -> &[u8] {
     path.as_os_str().as_bytes()
@@ -57,8 +58,8 @@ pub(super) fn insert(
     conn.prepare_cached(
         "INSERT INTO jobs (id, owner_uid, command, cwd, group_name, priority, label,
                            no_checkpoint, state, state_data, created_at, started_at, finished_at,
-                           nice)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12)",
+                           nice, yield_mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?13)",
     )?
     .execute(params![
         id.0,
@@ -73,6 +74,7 @@ pub(super) fn insert(
         state_data,
         created_at,
         spec.nice,
+        spec.yield_mode.as_i64(),
     ])?;
 
     let mut env =
@@ -102,18 +104,20 @@ pub(super) fn insert(
         finished_at: None,
         site_factor: 0,
         top_seq: None,
+        preempted_at: None,
     })
 }
 
 const JOB_COLUMNS: &str = "id, owner_uid, command, cwd, group_name, priority, label, \
                            no_checkpoint, state, state_data, created_at, started_at, finished_at, \
-                           nice, site_factor, top_seq";
+                           nice, site_factor, top_seq, yield_mode, preempted_at";
 
 /// [`JOB_COLUMNS`] without the command (read as an empty string), for
 /// [`Detail::Brief`].
 const JOB_COLUMNS_BRIEF: &str = "id, owner_uid, '', cwd, group_name, priority, label, \
                                  no_checkpoint, state, state_data, created_at, started_at, \
-                                 finished_at, nice, site_factor, top_seq";
+                                 finished_at, nice, site_factor, top_seq, yield_mode, \
+                                 preempted_at";
 
 /// How much of each job [`load_where`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +137,14 @@ struct JobRow {
 }
 
 fn job_row(row: &Row<'_>) -> rusqlite::Result<JobRow> {
+    let yield_mode: i64 = row.get(16)?;
+    let yield_mode = YieldMode::from_i64(yield_mode).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            16,
+            Type::Integer,
+            format!("unknown yield mode {yield_mode}").into(),
+        )
+    })?;
     Ok(JobRow {
         job: Job {
             id: JobId(row.get(0)?),
@@ -148,6 +160,7 @@ fn job_row(row: &Row<'_>) -> rusqlite::Result<JobRow> {
                 label: row.get(6)?,
                 no_checkpoint: row.get(7)?,
                 nice: row.get(13)?,
+                yield_mode,
             },
             // Placeholder; decoded from `state_data` in `decode_state`.
             state: JobState::Running,
@@ -156,6 +169,7 @@ fn job_row(row: &Row<'_>) -> rusqlite::Result<JobRow> {
             finished_at: row.get(12)?,
             site_factor: row.get(14)?,
             top_seq: row.get::<_, Option<i64>>(15)?.map(|seq| seq.max(0) as u64),
+            preempted_at: row.get(17)?,
         },
         state_name: row.get(8)?,
         state_data: row.get(9)?,
@@ -349,6 +363,20 @@ pub(super) fn set_site_factor(conn: &Connection, id: JobId, site: i32) -> Result
     let changed = conn
         .prepare_cached("UPDATE jobs SET site_factor = ?2 WHERE id = ?1")?
         .execute(params![id.0, site])?;
+    one_job(changed, id)
+}
+
+pub(super) fn set_yield_mode(conn: &Connection, id: JobId, mode: YieldMode) -> Result<()> {
+    let changed = conn
+        .prepare_cached("UPDATE jobs SET yield_mode = ?2 WHERE id = ?1")?
+        .execute(params![id.0, mode.as_i64()])?;
+    one_job(changed, id)
+}
+
+pub(super) fn set_preempted_at(conn: &Connection, id: JobId, at: Option<Timestamp>) -> Result<()> {
+    let changed = conn
+        .prepare_cached("UPDATE jobs SET preempted_at = ?2 WHERE id = ?1")?
+        .execute(params![id.0, at])?;
     one_job(changed, id)
 }
 

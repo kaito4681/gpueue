@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::*;
-use crate::model::{DEFAULT_GROUP, GpuIndex, JobResult, JobSpec};
+use crate::model::{DEFAULT_GROUP, GpuIndex, JobResult, JobSpec, YieldMode};
 
 const HOUR: i64 = 60 * 60 * 1000;
 const DAY: i64 = 24 * HOUR;
@@ -23,6 +23,7 @@ fn job(id: u64, owner: u32) -> Job {
             label: None,
             no_checkpoint: false,
             nice: 0,
+            yield_mode: YieldMode::None,
         },
         state: JobState::Queued { enqueued_at: NOW },
         created_at: 0,
@@ -30,6 +31,7 @@ fn job(id: u64, owner: u32) -> Job {
         finished_at: None,
         site_factor: 0,
         top_seq: None,
+        preempted_at: None,
     }
 }
 
@@ -49,6 +51,7 @@ fn group(name: &str, priority: u32) -> Group {
         parallel: 1,
         paused: false,
         priority,
+        tier: 0,
     }
 }
 

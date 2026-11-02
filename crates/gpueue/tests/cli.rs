@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use gpueue_core::model::{Group, JobId, JobResult, JobState, Uid};
+use gpueue_core::model::{Group, JobId, JobResult, JobState, Uid, YieldMode};
 use gpueue_protocol::api::*;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Frame, Incoming};
@@ -79,6 +79,7 @@ fn job(id: u64, state: JobState) -> JobView {
         dependencies: vec![],
         priority: 0,
         nice: 0,
+        yield_mode: YieldMode::None,
         label: None,
         no_checkpoint: false,
         state,
@@ -86,6 +87,7 @@ fn job(id: u64, state: JobState) -> JobView {
         started_at: Some(1_000),
         finished_at: None,
         checkpoint_size_bytes: None,
+        preempted_at: None,
         details: Some(JobDetails {
             command: "python train.py".into(),
             cwd: PathBuf::from("/work"),
@@ -187,6 +189,7 @@ async fn route(
                     parallel: 1,
                     paused: false,
                     priority: 0,
+                    tier: 0,
                 }],
             },
         ),

@@ -81,10 +81,68 @@ pub struct JobSpec {
     /// Can be changed after submission (`gpueue nice`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub nice: i32,
+    /// Whether and to whom the job yields its slots (`gpueue add
+    /// --yield[=group]`): a yielding job is checkpointed to make room and
+    /// restored automatically later. Fixed at submission but can be changed
+    /// with `gpueue yield`. Cannot be combined with `no_checkpoint` (checked
+    /// where requests are validated, not here). JSON key `yield`, omitted
+    /// when [`YieldMode::None`].
+    #[serde(rename = "yield", default, skip_serializing_if = "YieldMode::is_none")]
+    pub yield_mode: YieldMode,
 }
 
 fn is_zero(value: &i32) -> bool {
     *value == 0
+}
+
+/// How a job yields to others (`gpueue add --yield[=group]`), on top of the
+/// group tiers: jobs of a higher-tier group preempt jobs of lower tiers
+/// whatever their mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum YieldMode {
+    /// Does not yield (only higher tiers preempt it).
+    #[default]
+    None,
+    /// Yields only to the non-yielding jobs of its own group
+    /// (`--yield=group`).
+    Group,
+    /// Yields to every job that does not yield, in any group (`--yield`).
+    All,
+}
+
+impl YieldMode {
+    pub fn is_none(&self) -> bool {
+        *self == YieldMode::None
+    }
+
+    /// A short, stable name used in messages and JSON.
+    pub fn name(self) -> &'static str {
+        match self {
+            YieldMode::None => "none",
+            YieldMode::Group => "group",
+            YieldMode::All => "all",
+        }
+    }
+
+    /// The value stored in `jobs.yield_mode`.
+    pub fn as_i64(self) -> i64 {
+        match self {
+            YieldMode::None => 0,
+            YieldMode::Group => 1,
+            YieldMode::All => 2,
+        }
+    }
+
+    /// The inverse of [`YieldMode::as_i64`].
+    pub fn from_i64(value: i64) -> Option<Self> {
+        Some(match value {
+            0 => YieldMode::None,
+            1 => YieldMode::Group,
+            2 => YieldMode::All,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +163,13 @@ pub struct Job {
     /// first among their owner's jobs, higher values first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_seq: Option<u64>,
+    /// Set when the scheduler checkpoints the job to make room for a job of
+    /// a higher tier (a preemption). While set, a successful checkpoint puts
+    /// the job back in line (`RestoreQueued`) instead of `Checkpointed`.
+    /// Cleared when the job is restored or stashed, or when the preemption
+    /// is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempted_at: Option<Timestamp>,
 }
 
 /// Lifecycle state of a job.
@@ -240,6 +305,13 @@ pub struct Group {
     /// group's jobs. Set by administrators (`gpueue group priority`).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub priority: u32,
+    /// The group's priority tier (Slurm's partition `PriorityTier`), set by
+    /// administrators (`gpueue group tier`); may be negative. Jobs of a
+    /// higher tier start first and may preempt (checkpoint) jobs of lower
+    /// tiers. Unlike `priority`, which only nudges the order, tiers are
+    /// strict.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tier: i32,
 }
 
 fn is_zero_u32(value: &u32) -> bool {
@@ -382,6 +454,85 @@ mod tests {
                 "{json} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn yield_mode_names_and_storage_values() {
+        for (mode, name, value) in [
+            (YieldMode::None, "none", 0),
+            (YieldMode::Group, "group", 1),
+            (YieldMode::All, "all", 2),
+        ] {
+            assert_eq!(mode.name(), name);
+            assert_eq!(mode.as_i64(), value);
+            assert_eq!(YieldMode::from_i64(value), Some(mode));
+            assert_eq!(serde_json::to_string(&mode).unwrap(), format!("\"{name}\""));
+            assert_eq!(mode.is_none(), mode == YieldMode::None);
+        }
+        assert_eq!(YieldMode::default(), YieldMode::None);
+        assert_eq!(YieldMode::from_i64(3), None);
+        assert_eq!(YieldMode::from_i64(-1), None);
+    }
+
+    #[test]
+    fn new_fields_are_omitted_at_their_defaults() {
+        let mut spec = JobSpec {
+            command: "x".into(),
+            cwd: "/".into(),
+            envs: BTreeMap::new(),
+            group: DEFAULT_GROUP.into(),
+            gpus: Vec::new(),
+            dependencies: Vec::new(),
+            priority: 0,
+            label: None,
+            no_checkpoint: false,
+            nice: 0,
+            yield_mode: YieldMode::None,
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(!json.contains("yield"), "{json}");
+        assert_eq!(serde_json::from_str::<JobSpec>(&json).unwrap(), spec);
+        spec.yield_mode = YieldMode::Group;
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.ends_with(r#","yield":"group"}"#), "{json}");
+        assert_eq!(serde_json::from_str::<JobSpec>(&json).unwrap(), spec);
+
+        let mut job = Job {
+            id: JobId(1),
+            owner: Uid(1000),
+            spec,
+            state: JobState::Running,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            site_factor: 0,
+            top_seq: None,
+            preempted_at: None,
+        };
+        let json = serde_json::to_string(&job).unwrap();
+        assert!(!json.contains("preempted_at"), "{json}");
+        job.preempted_at = Some(42);
+        let json = serde_json::to_string(&job).unwrap();
+        assert!(json.ends_with(r#","preempted_at":42}"#), "{json}");
+        assert_eq!(serde_json::from_str::<Job>(&json).unwrap(), job);
+
+        let mut group = Group {
+            name: "gpu".into(),
+            parallel: 1,
+            paused: false,
+            priority: 0,
+            tier: 0,
+        };
+        let json = serde_json::to_string(&group).unwrap();
+        assert_eq!(json, r#"{"name":"gpu","parallel":1,"paused":false}"#);
+        assert_eq!(serde_json::from_str::<Group>(&json).unwrap(), group);
+        group.tier = -1;
+        let json = serde_json::to_string(&group).unwrap();
+        assert_eq!(
+            json,
+            r#"{"name":"gpu","parallel":1,"paused":false,"tier":-1}"#
+        );
+        assert_eq!(serde_json::from_str::<Group>(&json).unwrap(), group);
     }
 
     #[test]
