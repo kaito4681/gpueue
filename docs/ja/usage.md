@@ -13,6 +13,7 @@
 - [マルチユーザーモデルと認可](#multi-user-model-and-authorization)
 - [GPU スロット](#gpu-slots)
 - [ジョブの優先度](#job-priority)
+  - [譲ることとプリエンプション](#yielding-and-preemption)
 - [制限事項](#limitations)
 - [テストの範囲](#test-coverage)
 
@@ -30,6 +31,7 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 | `send` | タスクの stdin に入力を送る | 非対応：ジョブの stdin は `/dev/null` です。コマンドを非対話的にしてください。 |
 | `shutdown` | 全タスクを kill してデーモンを停止 | 管理者のみ。実行中の全ジョブをチェックポイントしてからデーモンを停止します。チェックポイントが拒否されたジョブは動き続けます。`--no-checkpoint` を付けると代わりに kill します。 |
 | `restart` | 終了したタスク | `Checkpointed` のジョブにも使えます。新しいジョブとして最初からやり直し、イメージは残ります。 |
+| `stash` | キュー中のタスク | リストア待ちのジョブ（[プリエンプト](#yielding-and-preemption)されたものを含む）にも使えます。イメージを残したまま `Checkpointed` に戻り、`gpueue restore` で再びキューされます。`-g`/`-a` にも含まれます。これらのジョブには `--delay` は使えません。 |
 | `start <id>`、`add -i`、`restart -i`（と `restore -i`） | すべての上限を無視してすぐにタスクを開始 | すべての上限を無視してすぐに開始するのは管理者だけです。それ以外のユーザーのジョブは自分のジョブの先頭にキューされ（`gpueue top` と同じ）、ほかのキュー中のジョブと同じく順番を待ちます（[ジョブの優先度](#job-priority)を参照） |
 | `reset`、`-a/--all`、`-g/--group` | 全タスク | 自分のジョブ。管理者は全員のジョブに作用します。 |
 | `pause/start/kill -a`、`-g` | グループも一時停止/再開 | グループを一時停止/再開するのは管理者だけです。それ以外のユーザーの場合、グループはそのままです。 |
@@ -45,6 +47,7 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 | --- | --- |
 | `add --gpu <LIST>` | ジョブを実行する GPU。例：`0` や `0,1`。指定しなければ CPU のみのジョブになります（`CUDA_VISIBLE_DEVICES` は空）。 |
 | `add --no-checkpoint` | このジョブは決してチェックポイントしません。シャットダウン時には終了されます |
+| `add --yield[=group]`（別名 `--preemptible`）、`yield <IDS>... [all\|group\|off]` | ほかのジョブがこのジョブをプリエンプトできるようにします。場所を空けるためにチェックポイントされ、自動的に再開します（[譲ることとプリエンプション](#yielding-and-preemption)を参照） |
 | `reset --keep-checkpoints` | `Checkpointed`（とリストア待ち）のジョブを除いてリセットします。それらのチェックポイントのイメージは残ります |
 | `checkpoint [IDS] [-g GROUP] [-a]` | 実行中のジョブを保存して停止します |
 | `restore [IDS] [-g GROUP] [-a] [-i]` | `Checkpointed` のジョブを再開します（`-i`：`start` と同じく、管理者ならすぐ、それ以外は自分のジョブの先頭に） |
@@ -54,6 +57,7 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 | `prio [IDS] [-j]` | 待機中のジョブをスケジュール順に、優先度の要素とともに表示します（Slurm の `sprio` に相当） |
 | `share [-j]`、`share set <USER> <N>` | ユーザーごとのフェアシェアの状態を表示します（Slurm の `sshare` に相当）。ユーザーのシェアを設定します（管理者） |
 | `site <IDS>... <N>`、`group priority <GROUP> <N>` | ジョブのサイトファクター、グループの優先度を設定します（管理者） |
+| `group tier <GROUP> <N>` | グループの優先度ティアを設定します（管理者。負の値も可）。ティアの高いジョブが先に開始し、ティアの低いジョブをプリエンプトします |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | systemd サービスを管理します。install は最後のチェックが失敗すると 0 以外で終了します（[install.md](install.md) を参照） |
 | `uninstall [--purge] [--yes]` | サービスと、`service install` がコピーしたバイナリを削除します（root が必要） |
 | `update [--check] [--version V] [-y]` | 最新（または指定した）リリースに gpueue を更新します。root が必要で、root でなければ確認だけを行います（[install.md](install.md#upgrading) を参照） |
@@ -62,7 +66,9 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 
 追加のジョブの状態：`Checkpointing`、`Checkpointed`、`Restore queued`、`Restoring`、`Terminating`
 （チェックポイントの失敗後に停止中）。`status` の表には `Owner` と `GPU` の列があり、`Checkpointed` の
-ジョブにはイメージのサイズが表示されます。
+ジョブにはイメージのサイズが表示されます。括弧内の注記は、プリエンプトされたジョブ
+（`Restore queued (preempted)`）と譲るジョブ（`Running (yield)`、`Queued (yield=group)`）を示します。
+グループの見出しには、0 でないときにティアが表示されます（`Group "background" (1 parallel, tier -1)`）。
 
 <a id="json-output"></a>
 ## JSON 出力
@@ -92,8 +98,10 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
   `terminating` と `done` は `result` を持ち、これは `success`、`failed`（`exit_code`）、
   `failed_to_spawn`（`reason`）、`killed`、`dependency_failed`、`checkpoint_failed`（`reason`）、
   `lost` のいずれかです。
-- `checkpoint_size_bytes`、`details`、`details.last_error`、ジョブの `nice`、グループの `priority` は
-  該当しない場合（または 0 の場合）は省略されます。他のユーザーのジョブでは、`label` は null、`details` はなく、`reason` は `"<redacted>"` です。
+- `checkpoint_size_bytes`、`details`、`details.last_error`、ジョブの `nice`、`yield`、`preempted_at`、
+  グループの `priority`、`tier` は該当しない場合（または 0 の場合）は省略されます。`yield` は譲るジョブで
+  `"all"` か `"group"` です。`preempted_at` は、プリエンプションでチェックポイントされたジョブがリストアを
+  待っている間だけ付きます。他のユーザーのジョブでは、`label` は null、`details` はなく、`reason` は `"<redacted>"` です。
 - `waiting` は、管理者以外がすぐに実行しようとしたものの GPU スロットか一時停止中のグループを待っている
   キュー中のジョブにだけ付きます：`{"reason": "gpu_slots", "gpus": [0]}`、`{"reason": "group_paused"}`、
   `{"reason": "unavailable"}` のいずれかです。
@@ -104,7 +112,8 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
 - `gpueue prio --json` は `{"priority_type", "weights": {"age", "fairshare", "job_size",
   "partition", "tres"}, "jobs": [{"id", "owner", "group", "priority", "factors": {"age",
   "fairshare", "job_size", "partition", "tres_cpu", "tres_gpu"}, "weighted": {"age", "fairshare",
-  "job_size", "partition", "tres"}, "site", "nice"}]}` を出力し、ジョブはスケジュール順に並びます。
+  "job_size", "partition", "tres"}, "site", "nice", "tier", "yield"}]}` を出力し、ジョブはスケジュール順に
+  並びます（`tier` と `yield` は 0 または譲らない場合は省略されます）。
   `gpueue share --json` は `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
   "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
   "usage_reset_period", "billing_weights", "usage_calc_at"}` を出力します。
@@ -133,9 +142,10 @@ pueue での習慣やスクリプトの多くはそのまま使えます。gpueu
    停止されます。このとき実行中のジョブを 1 つずつチェックポイントします。`--no-checkpoint` のジョブは
    単に終了されます。
 2. 起動後、それらのジョブは `Checkpointed` として表示されます。キューで待っていたジョブはそのまま待機し、
-   通常どおり開始します。
-3. 各所有者（または管理者）が `gpueue restore <id>` か `gpueue restore -a` でジョブを再開します。リストアが
-   自動で始まることはありません。
+   通常どおり開始します。`Restore queued` で待っていた[プリエンプト](#yielding-and-preemption)された
+   ジョブも、通常どおり自動でリストアされます。
+3. 各所有者（または管理者）が `gpueue restore <id>` か `gpueue restore -a` で `Checkpointed` のジョブを
+   再開します。これらのリストアが自動で始まることはありません。
 
 チェックポイントがうまくいかない場合は 2 通りあります。
 
@@ -190,8 +200,10 @@ OS のシャットダウンや再起動の間は、保存できなかったジ�
 - **全員：** ジョブが存在すること、その所有者、グループ、GPU、状態、優先度、依存関係、時刻の閲覧
   （`status`、`gpu`）、待機中のジョブの優先度の要素（`prio`）、全員のフェアシェアの使用量（`share`）。
   これで誰がどの GPU を使っているかが分かります。
-- **所有者：** `nice` を上げること（0 未満にはできません）と、`top`（`enable_user_top = false` でない場合）。
-- **管理者のみ：** `share set`、`group priority`、`site`、負の値の `nice`、他のユーザーのジョブの `top`、
+- **所有者：** `nice` を上げること（0 未満にはできません）、`top`（`enable_user_top = false` でない場合）、
+  任意のモード（`off` を含む）での `yield`。
+- **管理者のみ：** `share set`、`group priority`、`group tier`、`site`、負の値の `nice`、他のユーザーの
+  ジョブの `top` と `yield`、
   `group add/remove`、`parallel`、`gpu parallel`、グループ全体の一時停止や再開
   （1 つのグループには `pause/start/kill -g`、全グループには `pause/start/kill -a`）、`shutdown`、他の
   ユーザーのジョブの `reset`、[孤立ジョブ](architecture.md#orphans)（デーモンが把握していないのにヘルパーが
@@ -248,7 +260,85 @@ OS のシャットダウンや再起動の間は、保存できなかったジ�
 もとで他のユーザーのジョブと順番を競います。コマンドは、開始ではなくキューされたことを表示します。
 `enable_user_top = false`（または `priority_type = "basic"`）のときは、単にキューされます。一時停止中の
 ジョブの `start` はこれまでどおり再開です。管理者の即時実行はすべての上限を無視してすぐに開始します。`gpueue prio` はジョブがその位置にある理由を、`gpueue share` は全員の使用量を表示します。
-計算式と設定は [優先度とフェアシェア](install.md#priority-and-fair-share) を参照してください。
+計算式と設定は [優先度とフェアシェア](install.md#priority-and-fair-share) を参照してください。これらすべての
+前に、ジョブはグループのティアと、譲るかどうかで並べられます。次の節で説明します。
+
+<a id="yielding-and-preemption"></a>
+### 譲ることとプリエンプション
+
+ジョブの yield モードとグループのティアが、どの待機中のジョブのためにどの実行中のジョブを止めてよいかを
+決めます。スケジューラーは `gpueue checkpoint` と同じように、GPU の状態も含めてジョブをチェックポイントして
+止めます。場所が空くとそのジョブを自動でリストアし、ジョブは止まったところから続きを実行します（Slurm の
+`PreemptMode=CHECKPOINT` によるプリエンプション）。
+
+```sh
+# A long run that uses GPU 0 while nobody else needs it, and steps aside when someone does.
+gpueue add --yield --gpu 0 python train.py
+# Step aside only for the jobs of its own group that do not yield.
+gpueue add --yield=group -g team --gpu 1 python train.py
+# Change it later: all (the default), group or off.
+gpueue yield 3 4 off
+
+# Administrators: the jobs of "background" give way to every other group.
+sudo gpueue group tier background -1
+```
+
+`--yield` の値には `=` が必要です（`gpueue add --yield python train.py` では `python` がコマンドです）。
+`--preemptible` は別名です。実行中（または一時停止中）のジョブは、次の待機中ジョブにプリエンプトされます。
+
+| 実行中のジョブ | プリエンプトする待機中のジョブ |
+| --- | --- |
+| 譲らない | `--yield` を使わず、ティアがより高いグループにあるジョブ |
+| `--yield=group` | 上と同じジョブと、自分のグループの譲らないジョブ |
+| `--yield` | `--yield` を使わないジョブ（どのグループ、どのティアでも）と、ティアがより高い `--yield` のジョブ |
+
+言い換えると、ジョブのランクはまず全員に譲るかどうか（`--yield` のほうが低い）、次にグループのティアで決まり、
+ランクの高いジョブが低いジョブをプリエンプトします。さらに `--yield=group` は自分のグループに譲ります。
+ランクが同じジョブどうしはプリエンプトし合わないので、ティアが同じ別々のグループのジョブ 2 つは、通常どおり
+互いを待つだけです。待機中のジョブも同じように並びます。ティアの高いものが先、`--yield` のジョブは譲らない
+すべてのジョブの後、`--yield=group` のジョブは同じティアの譲らないジョブの後で、それぞれの中では前述の優先度で
+決まります。
+
+- ジョブがプリエンプトされるのは、それによって待機中のジョブがすぐに開始できる場合（待機中のジョブの
+  グループかその GPU のスロットが空き、ほかに妨げるものがない）だけで、必要な数だけ、ランクと優先度の低い
+  ものから選ばれます。
+- `--no-checkpoint` のジョブは決してプリエンプトされず、譲ることもできません（`gpueue yield` は
+  `a job with --no-checkpoint cannot yield` で拒否し、`add` はその組み合わせを拒否します）。ティアの低い
+  グループにあるそのようなジョブは、そのまま動き続けます。
+- 一時停止中のジョブもプリエンプトされます。`gpueue checkpoint` のあとと同じく、一時停止したままリストア
+  されます。
+- プリエンプションのチェックポイントが拒否された場合、ジョブは動き続け、所有者に警告が出て、10 分間は再び
+  試されません。ダンプが失敗してロールバックもできなかった場合は、`gpueue checkpoint` と同じくジョブは
+  `Checkpoint failed` で終わります（[チェックポイントとリストア](#checkpoint-and-restore)を参照）。
+- 管理者の即時実行（`start <id>`、`add -i` など）は何もプリエンプトしません。
+- チェックポイントされている時間やリストアを待っている時間は、フェアシェアの使用量に数えられません。
+- 管理者はプリエンプションを無効にしたり（`preemption = false`：ティアと yield は待機中のジョブを並べるだけに
+  なります）、開始やリストアから間もないジョブを保護したり（`preempt_exempt_secs`）できます。
+  [優先度とフェアシェア](install.md#priority-and-fair-share)を参照してください。
+
+**表示されるもの。** `gpueue status` は譲るジョブに印を付けます（`Running (yield)`、
+`Queued (yield=group)`）。プリエンプトされたジョブは `Checkpointing` から `Restore queued (preempted)` に
+なり、そのあと自動で `Restoring`、`Running` に戻ります。`gpueue wait` はその間も待ち続けます。グループの
+見出しには 0 以外のティアが表示され（`Group "background" (1 parallel, tier -1): running`）、`gpueue prio` は
+待機中のジョブにティアか yield があると `Tier` と `Yield` の列を加えます。JSON では、ジョブに `yield` と、
+プリエンプションのあとリストアを待つ間は `preempted_at` が付き、グループに `tier` が付きます。ジョブのログには
+ダンプの直前に次の 1 行が書かれます。
+
+```text
+[gpueue] checkpointing the job to make room for a higher-priority job (preemption); it resumes automatically once there is room again
+```
+
+**プリエンプトされたジョブを引き止める。** `gpueue stash <id>` は `Restore queued` のジョブ（プリエンプト
+されたものかどうかによらず）をイメージを残したまま `Checkpointed` に戻すので、`gpueue restore <id>` で再び
+キューするまでリストアされません。`gpueue stash -g <group>` と `stash -a` はそのようなジョブも含みます。
+`stash --delay` はそれらを拒否します。
+
+**制限。** プリエンプトされたジョブは、動いていたのと同じ GPU（同じインデックス）でリストアされるので、
+まさにその GPU が空くのを待ちます。`gpueue checkpoint` の制限はすべて当てはまります（TCP 接続が閉じられる、
+ダンプできなくなるソケットがある、など。[制限事項](#limitations)を参照）。チェックポイントとリストアには時間と
+ディスク容量がかかり（おおよそ RSS + VRAM。テストでは VRAM 7 GB のジョブで 10〜20 秒）、待機中のジョブは
+ダンプが終わってから開始します。ジョブの出入りが多い場合は、管理者に `preempt_exempt_secs` を数分にするよう
+頼んでください。
 
 <a id="limitations"></a>
 ## 制限事項
@@ -266,7 +356,7 @@ OS のシャットダウンや再起動の間は、保存できなかったジ�
   そうでなければリストアは拒否され、イメージは残ります。`/scratch` のような tmpfs 上のファイルは再起動後に
   残りません。[ファイルシステムとマウント](install.md#filesystems-and-mounts) を参照してください。
 - **クラッシュ耐性なし：** チェックポイントが取られるのは、正常なシャットダウン、`gpueue shutdown`、
-  `gpueue checkpoint` のときだけです。電源断、カーネルパニック、ハードリセットでは何も保存されません。定期的な
+  `gpueue checkpoint`、[プリエンプション](#yielding-and-preemption)のときだけです。電源断、カーネルパニック、ハードリセットでは何も保存されません。定期的な
   チェックポイントはまだありません。学習自体のチェックポイントも引き続き保存してください。
 - **fork ガード：** CUDA プロセスが `exec` せずに fork した子プロセス（たとえば `fork` 開始方式の PyTorch
   DataLoader ワーカー）は、CRIU が保存できない NVIDIA デバイスのマッピングを引き継ぎます。ヘルパーは

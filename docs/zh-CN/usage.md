@@ -13,6 +13,7 @@
 - [多用户模型与授权](#multi-user-model-and-authorization)
 - [GPU 槽位](#gpu-slots)
 - [作业优先级](#job-priority)
+  - [让路与抢占](#yielding-and-preemption)
 - [限制](#limitations)
 - [测试范围](#test-coverage)
 
@@ -29,6 +30,7 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | `send` | 向任务的 stdin 发送输入 | 不支持：作业的 stdin 是 `/dev/null`。请让命令以非交互方式运行。 |
 | `shutdown` | 终止所有任务并停止守护进程 | 仅限管理员。为所有运行中的作业创建检查点，然后停止守护进程。检查点被拒绝的作业会继续运行。`--no-checkpoint` 则改为终止它们。 |
 | `restart` | 已结束的任务 | 也适用于 `Checkpointed` 作业：它们作为新作业从头开始，镜像会被保留 |
+| `stash` | 排队中的任务 | 也适用于等待恢复的作业（包括[被抢占](#yielding-and-preemption)的作业）：它们回到 `Checkpointed`，保留镜像，`gpueue restore` 会让它们重新排队。`-g`/`-a` 也包括它们；对它们不能使用 `--delay`。 |
 | `start <id>`、`add -i`、`restart -i`（以及 `restore -i`） | 忽略所有限制，立即启动任务 | 只有管理员的会忽略所有限制立即启动；其他用户的作业会被排到其自己作业的最前面（与 `gpueue top` 相同），并像其他排队作业一样等待轮到它（参见 [作业优先级](#job-priority)） |
 | `reset`、`-a/--all`、`-g/--group` | 所有任务 | 你自己的作业。管理员作用于所有人的作业。 |
 | `pause/start/kill -a`、`-g` | 同时暂停/继续这些组 | 只有管理员会暂停/继续组；对其他用户而言，组保持原样 |
@@ -44,6 +46,7 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | --- | --- |
 | `add --gpu <LIST>` | 作业运行所用的 GPU，例如 `0` 或 `0,1`。不指定时作业仅使用 CPU（`CUDA_VISIBLE_DEVICES` 为空）。 |
 | `add --no-checkpoint` | 从不为该作业创建检查点；关机时将其终止 |
+| `add --yield[=group]`（别名 `--preemptible`）、`yield <IDS>... [all\|group\|off]` | 允许其他作业抢占该作业：为给它们腾出位置而为其创建检查点，之后自动继续（参见[让路与抢占](#yielding-and-preemption)） |
 | `reset --keep-checkpoints` | 重置除 `Checkpointed`（以及等待恢复）作业之外的所有作业，这些作业保留其检查点镜像 |
 | `checkpoint [IDS] [-g GROUP] [-a]` | 保存运行中的作业并停止它们 |
 | `restore [IDS] [-g GROUP] [-a] [-i]` | 继续运行 `Checkpointed` 作业（`-i`：与 `start` 一样，管理员立即运行，其他用户排到自己作业的最前面） |
@@ -53,6 +56,7 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 | `prio [IDS] [-j]` | 按调度顺序列出等待中的作业及其优先级因子（类似 Slurm 的 `sprio`） |
 | `share [-j]`、`share set <USER> <N>` | 每个用户的 fair-share 状态（类似 Slurm 的 `sshare`）；设置用户的份额（管理员） |
 | `site <IDS>... <N>`、`group priority <GROUP> <N>` | 作业的 site 因子、组的优先级（管理员） |
+| `group tier <GROUP> <N>` | 组的优先级层级（管理员；可以为负）：层级高的作业先启动，并抢占层级低的作业 |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | 管理 systemd 服务；如果最终检查失败，install 以非零状态退出（参见 [install.md](install.md)） |
 | `uninstall [--purge] [--yes]` | 删除服务以及 `service install` 复制的二进制文件（需要 root） |
 | `update [--check] [--version V] [-y]` | 将 gpueue 更新到最新（或指定的）发布版本；需要 root，非 root 时只检查（参见 [install.md](install.md#upgrading)） |
@@ -61,6 +65,8 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 
 额外的作业状态：`Checkpointing`、`Checkpointed`、`Restore queued`、`Restoring` 以及
 `Terminating`（检查点失败后正在停止）。`status` 表格包含 `Owner` 和 `GPU` 列，`Checkpointed` 作业会显示镜像大小。
+括号中的注释标出被抢占的作业（`Restore queued (preempted)`）和让路的作业（`Running (yield)`、
+`Queued (yield=group)`），组的标题行在层级不为 0 时显示层级（`Group "background" (1 parallel, tier -1)`）。
 
 <a id="json-output"></a>
 ## JSON 输出
@@ -89,8 +95,9 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   `terminating` 和 `done` 带有 `result`，其值为以下之一：`success`、`failed`（`exit_code`）、
   `failed_to_spawn`（`reason`）、`killed`、`dependency_failed`、`checkpoint_failed`（`reason`）和
   `lost`。
-- `checkpoint_size_bytes`、`details`、`details.last_error`、作业的 `nice` 以及组的
-  `priority` 在不适用（或为 0）时省略。
+- `checkpoint_size_bytes`、`details`、`details.last_error`、作业的 `nice`、`yield` 和 `preempted_at`，
+  以及组的 `priority` 和 `tier` 在不适用（或为 0）时省略。让路的作业的 `yield` 为 `"all"` 或 `"group"`；
+  `preempted_at` 只在因抢占而创建检查点的作业等待恢复期间存在。
   对于其他用户的作业，`label` 为 null，`details` 不存在，`reason` 为 `"<redacted>"`。
 - `waiting` 只出现在由非管理员立即启动、但正在等待 GPU 槽位或其暂停的组的排队作业上：
   `{"reason": "gpu_slots", "gpus": [0]}`、`{"reason": "group_paused"}` 或 `{"reason": "unavailable"}`。
@@ -101,7 +108,8 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 - `gpueue prio --json` 输出 `{"priority_type", "weights": {"age", "fairshare", "job_size",
   "partition", "tres"}, "jobs": [{"id", "owner", "group", "priority", "factors": {"age",
   "fairshare", "job_size", "partition", "tres_cpu", "tres_gpu"}, "weighted": {"age", "fairshare",
-  "job_size", "partition", "tres"}, "site", "nice"}]}`，作业按调度顺序排列。
+  "job_size", "partition", "tres"}, "site", "nice", "tier", "yield"}]}`，作业按调度顺序排列（`tier` 和
+  `yield` 在为 0 或不让路时省略）。
   `gpueue share --json` 输出 `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
   "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
   "usage_reset_period", "billing_weights", "usage_calc_at"}`。
@@ -125,8 +133,10 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 
 1. 操作系统关机时，`gpueue-helper.service` 会在文件系统和 NVIDIA 服务之前停止。它逐个为运行中的作业创建检查点。
    `--no-checkpoint` 作业则直接被终止。
-2. 启动后，这些作业显示为 `Checkpointed`。原本在排队的作业继续排队，并照常启动。
-3. 每个所有者（或管理员）用 `gpueue restore <id>` 或 `gpueue restore -a` 恢复自己的作业。恢复不会自动开始。
+2. 启动后，这些作业显示为 `Checkpointed`。原本在排队的作业继续排队，并照常启动；在 `Restore queued` 中等待的
+   [被抢占](#yielding-and-preemption)作业也照常自动恢复。
+3. 每个所有者（或管理员）用 `gpueue restore <id>` 或 `gpueue restore -a` 恢复自己的 `Checkpointed` 作业。
+   这些恢复不会自动开始。
 
 检查点可能以两种方式出错：
 
@@ -171,8 +181,10 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   重复给出的依赖只记录一次。
 - **所有人：** 查看作业的存在、其所有者、组、GPU、状态、优先级、依赖和时间（`status`、`gpu`），
   等待中作业的优先级因子（`prio`）以及所有人的 fair-share 用量（`share`）。由此可以看到谁在使用哪块 GPU。
-- **所有者：** 调高 `nice`（不能低于 0），以及 `top`（除非设置了 `enable_user_top = false`）。
-- **仅限管理员：** `share set`、`group priority`、`site`、负值的 `nice`、对其他用户作业执行 `top`、
+- **所有者：** 调高 `nice`（不能低于 0）、`top`（除非设置了 `enable_user_top = false`），以及以任意模式
+  （包括 `off`）执行 `yield`。
+- **仅限管理员：** `share set`、`group priority`、`group tier`、`site`、负值的 `nice`、对其他用户作业执行
+  `top` 和 `yield`、
   `group add/remove`、`parallel`、`gpu parallel`、暂停或继续整个组
   （`pause/start/kill -g` 针对一个组，`pause/start/kill -a` 针对所有组）、
   `shutdown`、对其他用户作业执行 `reset`，以及对[孤立作业](architecture.md#orphans)（helper 正在运行、
@@ -223,7 +235,72 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
 `priority_type = "basic"`）时，作业只是被排队。对暂停作业执行 `start` 仍然是恢复它。管理员的即时启动会
 忽略所有限制立即启动。`gpueue prio` 显示作业
 为何处于当前位置，`gpueue share` 显示所有人的用量。公式和设置参见
-[优先级与公平共享](install.md#priority-and-fair-share)。
+[优先级与公平共享](install.md#priority-and-fair-share)。在这一切之前，作业先按其组的层级以及是否让路排序，
+见下一节。
+
+<a id="yielding-and-preemption"></a>
+### 让路与抢占
+
+作业的 yield 模式和其组的层级决定可以为哪些等待中的作业停下哪些运行中的作业。调度器像 `gpueue checkpoint`
+一样为作业创建检查点（包括 GPU 状态）来停下它；有位置后自动恢复该作业，作业从中断处继续运行（Slurm 的
+`PreemptMode=CHECKPOINT` 抢占）。
+
+```sh
+# A long run that uses GPU 0 while nobody else needs it, and steps aside when someone does.
+gpueue add --yield --gpu 0 python train.py
+# Step aside only for the jobs of its own group that do not yield.
+gpueue add --yield=group -g team --gpu 1 python train.py
+# Change it later: all (the default), group or off.
+gpueue yield 3 4 off
+
+# Administrators: the jobs of "background" give way to every other group.
+sudo gpueue group tier background -1
+```
+
+`--yield` 的值需要用 `=`（在 `gpueue add --yield python train.py` 中，`python` 是命令）；`--preemptible`
+是其别名。运行中（或暂停）的作业会被以下等待中的作业抢占：
+
+| 运行中的作业 | 可抢占它的等待中作业 |
+| --- | --- |
+| 不让路 | 不使用 `--yield` 且所在组层级更高的作业 |
+| `--yield=group` | 同上，以及其自己组中不让路的作业 |
+| `--yield` | 不使用 `--yield` 的作业（任何组、任何层级），以及层级更高的 `--yield` 作业 |
+
+换言之，作业的等级先看是否对所有人让路（`--yield` 更低），再看其组的层级，等级高的抢占等级低的；此外
+`--yield=group` 还会让给自己的组。等级相同的作业互不抢占，因此层级相同的不同组中的两个作业只会照常互相等待。
+等待中的作业也按同样的方式排序：层级高的在前，`--yield` 作业排在所有不让路的作业之后，`--yield=group` 作业
+排在同一层级中不让路的作业之后，每一类内部再由上述优先级决定。
+
+- 只有当抢占能让等待中的作业立即启动时（腾出等待作业的组或其某块 GPU 的槽位，且没有其他阻碍），才会抢占
+  作业，并且只抢占所需的最少数量，从等级和优先级最低的开始。
+- `--no-checkpoint` 作业从不被抢占，也不能让路（`gpueue yield` 以 `a job with --no-checkpoint cannot yield`
+  拒绝，`add` 拒绝这种组合）。处于低层级组中的这类作业会继续运行。
+- 暂停的作业也可以被抢占；它会像 `gpueue checkpoint` 之后一样以暂停状态恢复。
+- 如果抢占的检查点被拒绝，作业继续运行，所有者会收到警告，并且 10 分钟内不会再尝试。转储失败且无法回滚时，
+  作业会像 `gpueue checkpoint` 一样以 `Checkpoint failed` 结束（参见[检查点与恢复](#checkpoint-and-restore)）。
+- 管理员的即时启动（`start <id>`、`add -i` 等）从不抢占任何作业。
+- 作业处于检查点状态或等待恢复的时间不计入公平共享的用量。
+- 管理员可以关闭抢占（`preemption = false`：层级和 yield 只用于给等待中的作业排序），或保护刚启动或刚恢复的
+  作业（`preempt_exempt_secs`）；参见[优先级与公平共享](install.md#priority-and-fair-share)。
+
+**你会看到什么。** `gpueue status` 会标出让路的作业（`Running (yield)`、`Queued (yield=group)`）。被抢占的
+作业经过 `Checkpointing` 变为 `Restore queued (preempted)`，之后自动回到 `Restoring` 和 `Running`；
+`gpueue wait` 在此期间会一直等待。组的标题行显示不为 0 的层级（`Group "background" (1 parallel, tier -1): running`），
+当某个等待中的作业有层级或 yield 时，`gpueue prio` 会增加 `Tier` 和 `Yield` 列。在 JSON 中，作业带有
+`yield`，被抢占后等待恢复期间还带有 `preempted_at`；组带有 `tier`。作业的日志会在转储之前写入这样一行：
+
+```text
+[gpueue] checkpointing the job to make room for a higher-priority job (preemption); it resumes automatically once there is room again
+```
+
+**暂缓被抢占的作业。** `gpueue stash <id>` 把处于 `Restore queued` 的作业（无论是否被抢占）变回
+`Checkpointed` 并保留镜像，因此在 `gpueue restore <id>` 让它重新排队之前不会恢复。`gpueue stash -g <group>`
+和 `stash -a` 也包括这类作业；`stash --delay` 会拒绝它们。
+
+**限制。** 被抢占的作业会在它原来运行的同一批 GPU（相同的编号）上恢复，因此要等正是这些 GPU 空闲。
+`gpueue checkpoint` 的所有限制都适用（TCP 连接会被关闭、某些套接字使转储无法进行等；参见[限制](#limitations)）。
+检查点和恢复需要时间和磁盘空间（大约 RSS + VRAM；测试中一个使用 7 GB VRAM 的作业约需 10 到 20 秒），等待中的
+作业要等转储完成后才会启动；如果作业进出频繁，请让管理员把 `preempt_exempt_secs` 设为几分钟。
 
 <a id="limitations"></a>
 ## 限制
@@ -237,7 +314,7 @@ gpueue 只复制了 CLI。它不使用 pueue 的协议，也不读取 pueue 的�
   要恢复作业，这些文件系统都必须重新挂载到相同的路径；否则恢复会被拒绝，镜像会被保留。
   `/scratch` 这类 tmpfs 上的文件在重启后不会保留。参见
   [文件系统与挂载](install.md#filesystems-and-mounts)。
-- **没有崩溃保护：** 只有在有序关机、`gpueue shutdown` 和 `gpueue checkpoint` 时才会创建检查点。
+- **没有崩溃保护：** 只有在有序关机、`gpueue shutdown`、`gpueue checkpoint` 和[抢占](#yielding-and-preemption)时才会创建检查点。
   断电、内核 panic 或硬重置时不会保存任何内容。暂不支持定期检查点。请继续保存你自己的训练检查点。
 - **Fork guard：** CUDA 进程不经 `exec` 而 fork 出的子进程（例如使用 `fork` 启动方式的 PyTorch
   DataLoader worker）会继承 CRIU 无法保存的 NVIDIA 设备映射。helper 会向每个作业预加载一个小型库

@@ -42,7 +42,8 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    （超出会以 `bad_request` 被拒绝；每个依赖按 8 字节计算，一个作业最多可依赖 1000 个作业）。落后太多的 `/v1/events` 订阅者会收到一个 `resync` 事件来代替它错过的事件；
    `gpueue wait` 随后会重新读取作业列表。
 2. **调度。** 当排队作业的组有空闲槽位，且其申请的每块 GPU 都有空闲槽位时，该作业启动。
-   候选作业按优先级顺序考虑（参见[优先级与公平共享](#priority-and-fair-share)）。每一轮调度读取未结束的作业时不读取
+   候选作业先按组的层级和 yield 模式、再按优先级顺序考虑，可以抢占运行中作业的等待作业能让它们创建检查点以腾出
+   位置（参见[优先级与公平共享](#priority-and-fair-share)）。每一轮调度读取未结束的作业时不读取
    它们的命令和环境变量，只完整读取要启动的作业。守护进程随后请求 helper 创建它（同时最多 8 个 spawn 或 restore
    请求；作业在其请求排队等待之前就被记录为运行中）。
    管理员的立即启动（`start <id>`、`add -i`、`restart -i`、`restore -i`）的作业会在内存中被标记为"强制"，
@@ -350,7 +351,8 @@ helper，所以可以执行它）复制到 rename 之前的临时文件上，每
   被拒绝的作业）会在远程文件系统卸载和网络关闭之前停止。下次启动时，
   守护进程从 helper 重放的事件中获取结果，并将这些作业标记为
   `Checkpointed`。转储失败或被拒绝的作业已被 systemd 停止。它们被标记为
-  `Checkpoint failed` 并附带原因，其所有者会收到警告。
+  `Checkpoint failed` 并附带原因，其所有者会收到警告。在 `RestoreQueued` 中等待的被抢占作业继续等待，
+  由调度器照常恢复。
 - **`gpueue shutdown`**（管理员）不依赖单元顺序。守护进程逐个为运行中的作业创建检查点
   （或在 `--no-checkpoint` 时终止它们），等待它们稳定下来，然后退出。helper 继续运行。转储失败的作业会被终止，除非该转储已被干净地回滚。
   转储被 helper 拒绝的作业会继续运行，因为终止它会丢失工作成果。守护进程会记录一条警告，所有者也会收到警告。
@@ -371,7 +373,23 @@ helper，所以可以执行它）复制到 rename 之前的临时文件上，每
   通常的槽位、暂停和依赖规则，因此放不下的高优先级作业永远不会阻塞排在它后面的作业。`plan`/`plan_with`
   保持 pueue 的顺序（也用于 `priority_type = "basic"`，此时 `priority::basic_order` 让用户的 `-o` 只重排该用户自己的作业）。`scheduler::pending_priorities`（`gpueue prio`
   背后的实现）使用相同的候选选择，因此它列出的正是调度计划所考虑的作业。
-- 存储中保存 `jobs.nice`、`jobs.site_factor`、`jobs.top_seq`、`jobs.run_since`、`groups.priority`、
+- 层级与抢占（Slurm 的 `preempt/partition_prio` 加 `PreemptMode=CHECKPOINT`）同样是纯逻辑。
+  `scheduler::order_key` 在优先级之前对候选作业排序：不让路的作业为 `(1, tier, 1)`，`--yield=group` 为
+  `(1, tier, 0)`，`--yield` 为 `(0, tier, 0)`，其中 `tier` 是其组的层级。`scheduler::may_preempt` 判断等待中的
+  作业能否抢占运行中的作业：`(0 if --yield else 1, tier)` 严格更高，或者两者同组、运行中的作业为
+  `--yield=group` 且等待中的作业不让路；能抢占另一个作业的作业，其键一定更高。`scheduler::plan_preemptive` 在
+  `preemption = true` 时于启动阶段之后再增加一轮：对每个未能启动、但除空闲槽位外都满足条件的候选作业，按从低到高
+  的顺序加入候选受害者（运行中或暂停、在其组中或使用其某块 GPU、不是 `no_checkpoint`、最近没有被拒绝、自上次启动
+  或恢复以来已运行至少 `preempt_exempt_secs`），直到候选作业能放下，然后去掉所有不需要的受害者，并通过
+  `Plan::preempt` 返回。正在为抢占创建检查点的作业算作已腾出，因此在其转储期间不会重复抢占。守护进程像
+  `gpueue checkpoint` 一样为受害者创建检查点，并在同一事务中设置 `jobs.preempted_at`；设置期间，成功的转储会把
+  作业放入 `RestoreQueued` 而不是 `Checkpointed`，作业像其他恢复一样等待槽位（能抢占另一个作业的作业总是排在它
+  前面，因此腾出的槽位先给等待中的作业）。作业被恢复、被 stash 回 `Checkpointed` 或抢占被拒绝时，该标记会被清除；
+  它是持久化的，因此守护进程重启时仍在进行的转储也会以同样的方式结束。作业的日志在请求转储之前写入一行说明，而不是
+  在转储之后（CRIU 在恢复时会检查打开的文件大小是否与转储时相同）。最近 10 分钟内抢占检查点被拒绝的作业，以及
+  每个运行中作业最近一次开始运行的时间，只保存在内存中：重启后这些作业会再被尝试一次，也没有作业受保护。
+- 存储中保存 `jobs.nice`、`jobs.site_factor`、`jobs.top_seq`、`jobs.run_since`、`jobs.yield_mode`、
+  `jobs.preempted_at`、`groups.priority`、`groups.tier`（schema 版本 7）、
   `user_shares` 和 `user_usage` 表，并在 `meta` 中保存上次计算和重置用量的时间（schema 版本 6），以及上次重置所针对的
   重置周期开始的本地日期。只有当前周期开始于更晚的日期时才会重置，因此 UTC 偏移的变化（夏令时）不会让同一个边界重置两次。
 - 只有运行时间会被计费。每次状态变化都经过守护进程中的同一个地方（`Core::apply_in_tx`），它在作业开始运行时
@@ -380,9 +398,10 @@ helper，所以可以执行它）复制到 rename 之前的临时文件上，每
   作业计费到当前时刻（推进它们的 `run_since`），执行到期的重置，并重新计算 fair-share 因子，守护进程会缓存这些
   因子。调度过程使用该缓存，不读取用量表。一次计费最多覆盖两个周期，因此守护进程停机的时间不会被计费。
 - API 增加了 `GET /v1/priority`（等待中的作业及其因子，不含命令，所有人可用）、
-  `GET /v1/shares`、`PUT /v1/shares/{uid}` 和 `PUT /v1/groups/{name}/priority`（管理员），
-  以及 `POST /v1/jobs/nice`、`/v1/jobs/top` 和 `/v1/jobs/site`，它们像批量端点一样按作业报告结果。
-  负的 nice 值、site 因子、份额和组优先级在 `gpueue-core::authz` 中检查。
+  `GET /v1/shares`、`PUT /v1/shares/{uid}`、`PUT /v1/groups/{name}/priority` 和
+  `PUT /v1/groups/{name}/tier`（管理员），以及 `POST /v1/jobs/nice`、`/v1/jobs/top`、`/v1/jobs/site` 和
+  `/v1/jobs/yield`，它们像批量端点一样按作业报告结果。负的 nice 值、site 因子、份额、组优先级和层级，以及
+  `no_checkpoint` 作业不能让路的规则，在 `gpueue-core::authz` 中检查。
 
 <a id="state"></a>
 ## 状态

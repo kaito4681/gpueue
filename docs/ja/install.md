@@ -1447,7 +1447,7 @@ sudo systemctl restart gpueue-helper.service gpueue.service
 | `update_source` | `"github:kaito4681/gpueue"` | CLI | `gpueue update` と `gpueue doctor` がリリースを探す場所：`github:<owner>/<repo>` |
 | `update_check` | `true` | CLI | `gpueue doctor` が `update_source` に新しいリリースを問い合わせるかどうか |
 | `[[gpus]]` | 空 | デーモン | 静的な GPU のリスト：`index`（必須）、`uuid`、`name`、`memory_total_bytes`（[GPU の検出](#gpu-detection) を参照） |
-| `[priority]` | フェアシェアを含むマルチファクター優先度 | デーモン | キューにあるジョブの順序の決め方（[優先度とフェアシェア](#priority-and-fair-share) を参照） |
+| `[priority]` | フェアシェアを含むマルチファクター優先度、プリエンプションは有効 | デーモン | キューにあるジョブの順序の決め方と、実行中のジョブをプリエンプトする条件（[優先度とフェアシェア](#priority-and-fair-share) を参照） |
 
 `gpueue-helper serve` はコマンドラインのフラグも受け付けます（`gpueue-helper serve --help`）。フラグはファイルより
 優先されます。ファイルを使うことを推奨します。`gpueue doctor` はファイルの値を報告し、ユニットの `ExecStart=`
@@ -1677,6 +1677,28 @@ API の応答には `"queued": "first"` が入ります。`enable_user_top = fal
 `priority_type = "basic"`（所有者の順序が適用されない）のときは、ジョブは移動されずに他のジョブと同じように
 キューされます（`"queued": "in_line"`）。一時停止中のジョブの `start` はこれまでどおり再開です。
 
+**ティアとプリエンプション。** 優先度より前に、ジョブはグループのティア（Slurm のパーティションの
+`PriorityTier`。`gpueue group tier <group> <n>` で設定し、デフォルトは 0、負の値も可）と、譲るかどうか
+（`gpueue add --yield[=group]`、`gpueue yield`）で並べられます。ティアの高いジョブが先、`--yield` のジョブは
+譲らないすべてのジョブの後、`--yield=group` のジョブは同じティアの譲らないジョブの後です。重み付けされた要素の
+1 つにすぎないグループの優先度と違い、ティアは厳格です。`preemption = true`（デフォルト）では、待機中のジョブは
+場所を空けるために実行中のジョブをチェックポイントさせることもできます。Slurm の
+`PreemptType=preempt/partition_prio` と `PreemptMode=CHECKPOINT` に相当します。チェックポイントされたジョブは
+`Restore queued` で待ち、場所が空くと自動でリストアされます（再起動後も同じ）。待機中のジョブ `J` が実行中
+または一時停止中のジョブ `V` をプリエンプトできるのは、`J` のランクが高いとき（ランクはまず全員に譲らないか
+どうか。`--yield` のほうが低い。次にグループのティア）、または両者が同じグループにあり、`V` が
+`--yield=group` で `J` が譲らないときです。ランクが同じジョブどうしはプリエンプトし合いません。スケジューラーは、
+そのスロット（待機中のジョブのグループか、その GPU の 1 つ）を空ければ `J` がすぐに開始できるジョブだけを、
+必要な最少数だけ、ランクの低いものからプリエンプトします。`--no-checkpoint` のジョブ（譲ることもできません）、
+開始またはリストアから `preempt_exempt_secs` が経っていないジョブ、プリエンプションのチェックポイントが直近
+10 分以内に拒否されたジョブは決してプリエンプトせず、管理者の即時実行はプリエンプトしません。ダンプが失敗して
+ロールバックもできなかった場合、`gpueue checkpoint` と同じくジョブは `Checkpoint failed` で終わります。
+チェックポイントされている時間とリストアを待つ時間は課金されません。プリエンプトされたジョブは同じ GPU で
+リストアされ、プリエンプションのたびにダンプとリストアのコスト（大きな GPU ジョブなら数秒から数分と、おおよそ
+RSS + VRAM のディスク容量）がかかるので、ジョブの出入りが多い場合は `preempt_exempt_secs` を数分にしてください。
+`preemption = false` では、ティアと yield は待機中のジョブを並べるだけです。ユーザーから見た詳細は
+[譲ることとプリエンプション](usage.md#yielding-and-preemption) にあります。
+
 **コマンド。**
 
 | コマンド | 実行できるユーザー | Slurm |
@@ -1688,16 +1710,20 @@ API の応答には `"queued": "first"` が入ります。`enable_user_top = fal
 | `gpueue site <IDS>... <N>` | 管理者 | サイトファクター |
 | `gpueue share set <USER> <N>` | 管理者 | `sacctmgr modify user set fairshare=` |
 | `gpueue group priority <GROUP> <N>` | 管理者 | パーティションの `PriorityJobFactor` |
+| `gpueue group tier <GROUP> <N>` | 管理者 | パーティションの `PriorityTier`（プリエンプションでは `PreemptType=preempt/partition_prio`） |
+| `gpueue add --yield[=group]`、`gpueue yield <IDS>... [all\|group\|off]` | 所有者（任意のモード）、管理者 | 直接の対応はありません。ティアの低い、プリエンプト可能なパーティションのジョブに近いものです |
 
 Slurm と同じく、ユーザーは nice 値を上げることしかできないため、管理者が設定した値を元に戻すことはできません。
 restart したジョブ（コピーでも `restart --in-place` でも）は、0 以上の nice 値は引き継ぎますが、負の値、
 サイトファクター、`top` の位置は引き継ぎません。`gpueue prio` はスケジューラーが考慮するジョブをちょうどその
-順序で一覧表示します。`gpueue status --json` は、ジョブの `nice` とグループの `priority` が 0 でないときに表示します。
+順序で一覧表示し、待機中のジョブにティアか yield があれば `Tier` と `Yield` の列を加えます。
+`gpueue status --json` は、ジョブの `nice` と `yield`、グループの `priority` と `tier` を、0 でない（または
+譲る）ときに表示します。
 
-リリースはまだ公開されていないため、これは開発ビルドにだけ関係します。優先度より前のビルドのデータベースは、
-デーモンの起動時にスキーマバージョン 6 に移行します。既存のジョブは `-o` の優先度を保ち、以後それはその
-所有者のジョブの順序だけを決めます。使用量は 0 から始まります。古いビルドは移行したデータベースを開けません
-（`gpueue update` はそれらのインストールを拒否します）。
+v0.1.5 以前のデータベース（スキーマバージョン 6）は、デーモンの起動時にスキーマバージョン 7 に移行します。
+すべてのグループはティア 0 から始まり、譲るジョブもないので、管理者がティアを設定するかユーザーが `--yield` 付きの
+ジョブを追加するまで順序は変わりません。古いビルドは移行したデータベースを開けません（`gpueue update` は
+それらのインストールを拒否します）。
 
 **設定。** `/etc/gpueue/config.toml` の `[priority]` テーブルです（変更したら `gpueue.service` を再起動して
 ください）。`[priority]` の行より下のキーはこのテーブルに属するので、他のキーはその上に置いてください。
@@ -1717,6 +1743,8 @@ restart したジョブ（コピーでも `restart --in-place` でも）は、0 
 | `priority_favor_small` | `false` | `PriorityFavorSmall` |
 | `tres_billing_weights` | `"CPU=1.0,GRES/gpu=10.0"` | `TRESBillingWeights` |
 | `enable_user_top` | `true` | `SchedulerParameters=enable_user_top` |
+| `preemption` | `true`（`false`：ティアと yield はジョブを並べるだけ） | `PreemptType=preempt/partition_prio`、`PreemptMode=CHECKPOINT` |
+| `preempt_exempt_secs` | `0`（最大 1 年） | `PreemptExemptTime` |
 
 たとえば、GPU を多く使うジョブを優先し、`urgent` グループの優先度を上げるには次のようにします。
 
@@ -1728,6 +1756,18 @@ priority_weight_partition = 5000
 
 ```sh
 sudo gpueue group priority urgent 10
+```
+
+`background` グループには空いている GPU を使わせつつほかのすべてのグループに譲らせ、ジョブの開始やリストアから
+10 分以内には再びチェックポイントしないようにするには：
+
+```toml
+[priority]
+preempt_exempt_secs = 600
+```
+
+```sh
+sudo gpueue group tier background -1
 ```
 
 <a id="gpu-detection"></a>

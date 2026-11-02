@@ -7,11 +7,15 @@
 
 [English](README.md) | [日本語](README.ja.md) | 简体中文
 
-面向多用户共享的单台 Linux 机器的 GPU 作业队列。其 CLI 的用法与
-[pueue](https://github.com/Nukesor/pueue) 相同。gpueue 在此基础上增加了两项功能：GPU 槽位，以及借助
-[CRIU](https://criu.org) 和 NVIDIA [cuda-checkpoint](https://github.com/NVIDIA/cuda-checkpoint)
-对运行中的作业（CPU、内存和 GPU 状态）进行透明的检查点保存与恢复。机器重启时仍在运行的训练会被保存到磁盘，
-并从中断处继续运行，而不必从头开始。
+面向多用户共享的单台 Linux 机器的 GPU 作业队列，其 CLI 的用法与
+[pueue](https://github.com/Nukesor/pueue) 相同。优先级可以停下运行中的作业而不丢失其进度：当高优先级的作业
+需要 GPU 时，gpueue 借助 [CRIU](https://criu.org) 和 NVIDIA
+[cuda-checkpoint](https://github.com/NVIDIA/cuda-checkpoint) 为占用这些 GPU 的低优先级作业创建检查点（包括
+GPU 状态）。高优先级的工作完成后，它们会自动恢复，并从中断处继续运行，而不必从头开始。
+
+哪些作业让路是明确指定的：用 `gpueue add --yield` 添加的作业会让给所有不让路的作业，管理员则把组划分为不同的
+层级（`gpueue group tier`），类似 Slurm 的分区抢占。作业申请指定的 GPU（`--gpu 0,1`），下一个启动谁的作业由
+Slurm 风格的公平共享决定。
 
 > [!NOTE]
 > **状态：预发布。** 下文所述的全部功能均已实现，并已在 Docker 中测试（systemd 作为 PID 1、
@@ -40,10 +44,11 @@
 ## 为什么需要 gpueue
 
 在共享的 GPU 工作站上，人们通常用 `nohup`、`tmux` 或每个用户各自的 pueue 来运行作业，并在聊天群里争抢 GPU。
-为了更新内核或驱动而重启，会终止所有正在进行的训练。gpueue 让所有人共用一个队列：一个系统级守护进程调度所有用户的
-作业，并显示谁在使用哪块 GPU。作业申请指定的 GPU（`--gpu 0,1`），并且只在这些 GPU 空闲时才启动。在操作系统关机时、
-执行 `gpueue shutdown` 时，或通过 `gpueue checkpoint` 按需保存运行中的作业，之后用 `gpueue restore` 继续运行，
-无需修改你的代码。
+谁先启动了长达一周的训练，谁就占着 GPU；赶截止日期的人只能等待，或者请对方终止作业并丢掉其进度。
+gpueue 让所有人共用一个队列：一个系统级守护进程调度所有用户的作业，并显示谁在使用哪块 GPU。作业申请指定的 GPU
+（`--gpu 0,1`），并且只在这些 GPU 空闲时才启动。用 `--yield` 添加的长时间训练会使用本来闲置的 GPU，有其他工作到来时
+被创建检查点以腾出位置，之后自动继续。在操作系统关机时、执行 `gpueue shutdown` 时，或通过 `gpueue checkpoint`
+按需，运行中的作业也会被保存，之后用 `gpueue restore` 继续运行，无需修改你的代码。
 
 <a id="features"></a>
 ## 功能
@@ -53,6 +58,7 @@
 | 兼容 pueue 的 CLI | `add`、`status`、`log`、`follow`、`wait`、`pause`、`start`、`kill`、`remove`、`restart`、`clean`、`reset`、`stash`、`enqueue`、`switch`、`group`、`parallel`、`shutdown`、`completions`，以及组、依赖（`--after`）、优先级、延迟和标签 |
 | GPU 槽位 | 按 GPU 限制同时运行的作业数（`gpueue gpu parallel`）。每个作业会获得 `CUDA_VISIBLE_DEVICES` 和 `CUDA_DEVICE_ORDER=PCI_BUS_ID`。GPU 通过 NVML 检测 |
 | 公平共享 | Slurm 风格的多因子优先级（带衰减用量的 fair share、等待时间、nice、`top`）；`gpueue prio` 和 `gpueue share` 显示具体数值 |
+| 抢占 | `add --yield` 的作业以及层级较低的组（`gpueue group tier`）中的作业，会为它们所让路的作业创建检查点以腾出位置，之后自动恢复（Slurm 的 `preempt/partition_prio` 加 `PreemptMode=CHECKPOINT`）；之后可用 `gpueue yield` 更改作业的模式 |
 | 检查点/恢复 | 对 CPU 和 CUDA 进程进行透明的检查点保存与恢复，包括 DataLoader worker 通过 fork 创建的 PyTorch 作业（参见 [fork guard](docs/zh-CN/usage.md#limitations)）；操作系统关机或重启时，自动为所有运行中的作业创建检查点 |
 | 多用户 | 作业以其所有者的身份运行。其他用户可以看到作业的存在，但看不到其命令、环境变量或日志。管理员是 root 和 `gpueue-admin` 组的成员 |
 | 权限分离 | 守护进程（HTTP API、调度器、SQLite）以非特权系统用户 `gpueue` 运行。只有一个小型的 root helper 负责启动作业和运行 CRIU |
@@ -191,7 +197,7 @@ sudo usermod -aG gpueue-admin alice
 
 `gpueue --help` 列出所有命令。没有 `(gpueue)` 标记的命令与 pueue 的用法相同（[差异](docs/zh-CN/usage.md#pueue-compatibility-and-differences)
 主要在于共用一个守护进程以及谁可以做什么）；带标记的是 gpueue 新增的命令。`gpueue <command> --help` 显示每个命令的
-选项，例如 `add` 的 `--gpu` 和 `--no-checkpoint`。
+选项，例如 `add` 的 `--gpu`、`--yield` 和 `--no-checkpoint`。
 
 ```console
 $ gpueue --help
@@ -230,6 +236,7 @@ Commands:
   prio         (gpueue) Show the priority of pending jobs and its factors (like Slurm's `sprio`)
   nice         (gpueue) Set the nice value of jobs (like Slurm's nice option): it is subtracted from
                their priority
+  yield        (gpueue) Make jobs yield to other jobs (checkpointed for them, resumed afterwards)
   top          (gpueue) Move jobs to the top of their owner's queue (Slurm's `scontrol top`)
   site         (gpueue) Set the site factor of jobs, which is added to their priority
                (administrators only)
@@ -279,6 +286,10 @@ Options:
 # environment.
 gpueue add --gpu 0 -l resnet -- 'python train.py --epochs 100'
 
+# A long run that steps aside: when another job needs GPU 0 it is checkpointed, and it resumes
+# by itself once there is room again.
+gpueue add --yield --gpu 0 -l sweep -- 'python sweep.py'
+
 gpueue status          # all jobs of all users (others' commands are hidden)
 gpueue gpu             # GPUs, slots in use, and which jobs hold them
 gpueue log 0           # the last lines of job 0's output
@@ -289,9 +300,10 @@ gpueue restore 0       # queue it again; it resumes once its group and GPUs have
 gpueue restore -i 0    # ...or put it first among your queued jobs (administrators: resume right away; see "Job priority")
 ```
 
-恢复后的作业从创建检查点的那一刻继续运行，保留原来的作业 id，其输出会追加到同一个日志中。操作系统关机时，helper
+恢复后的作业从创建检查点的那一刻继续运行，保留原来的作业 id，其输出会追加到同一个日志中。被抢占的作业会自动恢复
+（`gpueue stash <id>` 可以暂缓它，`gpueue restore <id>` 让它重新排队）。操作系统关机时，helper
 逐个为运行中的作业创建检查点（`--no-checkpoint` 作业则直接被终止）；启动后它们显示为 `Checkpointed`，每个所有者用
-`gpueue restore <id>` 或 `gpueue restore -a` 恢复它们：恢复不会自动开始。只有管理员能用 `start`、`add -i`、
+`gpueue restore <id>` 或 `gpueue restore -a` 恢复它们：这些恢复不会自动开始。只有管理员能用 `start`、`add -i`、
 `restart -i` 或 `restore -i` 立即启动作业；其他用户的作业会被排到其自己作业的最前面。
 
 其余内容参见参考文档 [docs/zh-CN/usage.md](docs/zh-CN/usage.md)：
@@ -299,8 +311,9 @@ gpueue restore -i 0    # ...or put it first among your queued jobs (administrato
 [JSON 输出](docs/zh-CN/usage.md#json-output)、
 [暂停的作业、重启和失败的检查点](docs/zh-CN/usage.md#checkpoint-and-restore)、
 [谁可以做什么](docs/zh-CN/usage.md#multi-user-model-and-authorization)、
-[GPU 槽位与隔离](docs/zh-CN/usage.md#gpu-slots)以及
-[作业优先级](docs/zh-CN/usage.md#job-priority)。
+[GPU 槽位与隔离](docs/zh-CN/usage.md#gpu-slots)、
+[作业优先级](docs/zh-CN/usage.md#job-priority)以及
+[让路与抢占](docs/zh-CN/usage.md#yielding-and-preemption)。
 
 <a id="limitations"></a>
 ## 限制
@@ -374,8 +387,8 @@ npx skills add kaito4681/gpueue -g -a claude-code -y
 
 | 文档 | 内容 |
 | --- | --- |
-| [docs/zh-CN/install.md](docs/zh-CN/install.md) | 要求、构建、安装、配置、优先级与公平共享、升级、卸载和故障排查 |
-| [docs/zh-CN/usage.md](docs/zh-CN/usage.md) | 与 pueue 的差异、JSON 输出、检查点/恢复、多用户模型、GPU 槽位、作业优先级、限制和测试范围 |
+| [docs/zh-CN/install.md](docs/zh-CN/install.md) | 要求、构建、安装、配置、优先级、层级与公平共享、升级、卸载和故障排查 |
+| [docs/zh-CN/usage.md](docs/zh-CN/usage.md) | 与 pueue 的差异、JSON 输出、检查点/恢复、多用户模型、GPU 槽位、作业优先级与抢占、限制和测试范围 |
 | [docs/zh-CN/architecture.md](docs/zh-CN/architecture.md) | 组件、作业流程、关机顺序、状态存储和 crate 布局 |
 
 <a id="contributing"></a>

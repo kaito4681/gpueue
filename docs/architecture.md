@@ -46,8 +46,9 @@ gpueue add ──HTTP /v1 over /run/gpueue/gpueue.sock──▶ gpueue daemon �
    (refused with `bad_request`; each dependency counts 8 bytes, and a job may depend on at most 1000 jobs). A `/v1/events` subscriber that falls too far behind gets a
    `resync` event instead of the events it missed; `gpueue wait` then reads the job list again.
 2. **Scheduling.** A queued job starts when its group has a free slot and every requested GPU has
-   a free slot. Candidates are considered in priority order (see
-   [Priority and fair share](#priority-and-fair-share)). A scheduling pass reads the jobs that
+   a free slot. Candidates are considered by group tier and yield mode first, then in priority
+   order, and a waiting job that may preempt running jobs can have them checkpointed to make room
+   (see [Priority and fair share](#priority-and-fair-share)). A scheduling pass reads the jobs that
    have not finished without their commands and environments, and only the jobs it launches in
    full. The daemon then asks the helper to spawn
    it (at most 8 spawn or restore requests at a time; the job is recorded as running before its
@@ -507,7 +508,8 @@ run unconfined (`unconfined_service_t`), which may map it.
   goes down. On the
   next boot the daemon gets the results from the helper's replayed events and marks the jobs
   `Checkpointed`. Jobs whose dump failed or was refused were stopped by systemd. They are marked
-  `Checkpoint failed` with the reason, and their owners are warned.
+  `Checkpoint failed` with the reason, and their owners are warned. Preempted jobs that were
+  waiting in `RestoreQueued` keep waiting and are restored by the scheduler as usual.
 - **`gpueue shutdown`** (administrators) does not rely on unit ordering. The daemon checkpoints
   running jobs one at a time (or terminates them with `--no-checkpoint`), waits for them to settle,
   and exits. The helper keeps running. A job whose dump fails is terminated unless the dump was rolled
@@ -536,7 +538,31 @@ scheduler:
   high-priority job that does not fit never blocks jobs behind it. `plan`/`plan_with` keep pueue's
   order (also used for `priority_type = "basic"`, where `priority::basic_order` lets a user's `-o` reorder only that user's own jobs). `scheduler::pending_priorities` (behind
   `gpueue prio`) uses the same candidate selection, so it lists what the plan considers.
-- The storage keeps `jobs.nice`, `jobs.site_factor`, `jobs.top_seq`, `jobs.run_since`, `groups.priority`, the
+- Tiers and preemption (Slurm's `preempt/partition_prio` with `PreemptMode=CHECKPOINT`) are pure
+  too. `scheduler::order_key` sorts candidates before their priority: `(1, tier, 1)` for a job that
+  does not yield, `(1, tier, 0)` for `--yield=group` and `(0, tier, 0)` for `--yield`, where `tier`
+  is the group's. `scheduler::may_preempt` says whether a waiting job may preempt a running one: a
+  strictly higher `(0 if --yield else 1, tier)`, or the same group with the running job on
+  `--yield=group` and the waiting one not yielding; a job that may preempt another always has a
+  higher key. `scheduler::plan_preemptive`, with `preemption = true`, adds a pass after the launch
+  pass: for each candidate that did not launch but would fit apart from free slots, it adds
+  candidate victims (running or paused, in its group or on one of its GPUs, not `no_checkpoint`, not
+  refused recently, running for at least `preempt_exempt_secs` since their last start or restore)
+  lowest first until the candidate fits, then drops every victim it does not need, and returns them
+  in `Plan::preempt`. Jobs already being checkpointed for a preemption count as freed, so a
+  preemption is not repeated while its dump runs. The daemon checkpoints the victims like
+  `gpueue checkpoint` and sets `jobs.preempted_at` in the same transaction; while it is set, a
+  successful dump puts the job in `RestoreQueued` instead of `Checkpointed`, where it waits for a
+  slot like any other restore (a job that may preempt another is always ordered before it, so the
+  freed slots go to the waiting job first). The mark is cleared when the job is restored, stashed
+  back to `Checkpointed`, or when the preemption is refused; it is persisted, so a dump that is
+  still running when the daemon restarts ends the same way. The job's log gets a note before the
+  dump is requested, not after it (CRIU checks on restore that open files still have the size they
+  had at the dump). Which jobs' preemption checkpoints were refused in the last 10 minutes, and when
+  each running job last started running, are kept in memory only: after a restart such jobs are
+  tried once more and none is exempt.
+- The storage keeps `jobs.nice`, `jobs.site_factor`, `jobs.top_seq`, `jobs.run_since`,
+  `jobs.yield_mode`, `jobs.preempted_at`, `groups.priority`, `groups.tier` (schema version 7), the
   `user_shares` and `user_usage` tables and, in `meta`, when usage was last calculated and reset
   (schema version 6), and the local day on which the reset period of the last reset began. A
   reset is due when the current period began on a later day, so a change of the UTC offset
@@ -550,10 +576,11 @@ scheduler:
   the cache and do not read the usage tables. One charge covers at most two periods, so daemon
   downtime is not billed.
 - The API adds `GET /v1/priority` (pending jobs with their factors, no commands, for everyone),
-  `GET /v1/shares`, `PUT /v1/shares/{uid}` and `PUT /v1/groups/{name}/priority` (administrators),
-  and `POST /v1/jobs/nice`, `/v1/jobs/top` and `/v1/jobs/site`, which report per job like the
-  bulk endpoint. Negative nice values, site factors, shares and group priorities are checked in
-  `gpueue-core::authz`.
+  `GET /v1/shares`, `PUT /v1/shares/{uid}`, `PUT /v1/groups/{name}/priority` and
+  `PUT /v1/groups/{name}/tier` (administrators), and `POST /v1/jobs/nice`, `/v1/jobs/top`,
+  `/v1/jobs/site` and `/v1/jobs/yield`, which report per job like the bulk endpoint. Negative nice
+  values, site factors, shares, group priorities and tiers, and the rule that a `no_checkpoint`
+  job cannot yield, are checked in `gpueue-core::authz`.
 
 ## State
 

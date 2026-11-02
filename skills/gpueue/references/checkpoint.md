@@ -9,6 +9,14 @@ and NVIDIA cuda-checkpoint, without changes to the program.
   jobs now. Their GPU slots are freed. State: `Checkpointing` → `Checkpointed`.
 - On an orderly OS shutdown or reboot, and on an administrator's `gpueue shutdown`, running jobs
   are checkpointed automatically, one at a time. `--no-checkpoint` jobs are terminated instead.
+- **Preemption:** a job added with `--yield[=group]` (or changed with `gpueue yield`), or a job of
+  a group with a lower tier, is checkpointed by the scheduler to make room for a waiting job it
+  yields to (its log gets a line `[gpueue] checkpointing the job to make room for a
+  higher-priority job (preemption); ...` just before). It then waits as `Restore queued (preempted)` and is restored automatically once its
+  GPUs and group have a free slot again, also after a reboot. `--no-checkpoint` jobs are never
+  preempted. A refused preemption checkpoint leaves the job running (with the usual warning; not retried for
+  10 minutes); a
+  failed dump that cannot be rolled back ends it as `Checkpoint failed`, as below.
 - Never on a power loss, kernel panic or hard reset, and there are no periodic checkpoints. Keep
   saving your own training checkpoints.
 
@@ -24,6 +32,9 @@ and NVIDIA cuda-checkpoint, without changes to the program.
   keeps the image. `gpueue remove <id>` discards the job **and deletes the image** (on a terminal it asks first;
   answering no keeps the job). `gpueue reset --keep-checkpoints` resets everything else.
 - `gpueue start` does not resume a `Checkpointed` job; use `restore`.
+- `gpueue stash <IDS>` holds `Restore queued` jobs (including preempted ones) back as
+  `Checkpointed`, keeping the image; `gpueue restore` queues them again. `stash -g`/`-a` include
+  them; `stash --delay` refuses them.
 
 ## What can make a checkpoint or restore fail
 

@@ -1308,7 +1308,7 @@ helper 以 root 身份运行，除非该文件及其所有父目录（`/etc/gpue
 | `update_source` | `"github:kaito4681/gpueue"` | CLI | `gpueue update` 和 `gpueue doctor` 查找发布版本的位置：`github:<owner>/<repo>` |
 | `update_check` | `true` | CLI | `gpueue doctor` 是否向 `update_source` 查询更新的发布版本 |
 | `[[gpus]]` | 空 | 守护进程 | 静态 GPU 列表：`index`（必需）、`uuid`、`name`、`memory_total_bytes`（见 [GPU 检测](#gpu-detection)） |
-| `[priority]` | 带 fair share 的多因子优先级 | 守护进程 | 排队作业的排序方式（见[优先级与公平共享](#priority-and-fair-share)） |
+| `[priority]` | 带 fair share 的多因子优先级，启用抢占 | 守护进程 | 排队作业的排序方式，以及何时抢占运行中的作业（见[优先级与公平共享](#priority-and-fair-share)） |
 
 `gpueue-helper serve` 也接受命令行参数（`gpueue-helper serve --help`），它们会覆盖配置文件。请优先
 使用配置文件：`gpueue doctor` 报告的是文件中的值，并会在单元的 `ExecStart=` 传递参数时发出警告。
@@ -1498,6 +1498,23 @@ site 因子、`top` 和 fair share 都被忽略），不过用户的 `-o` 仍然
 `enable_user_top = false` 时，或在 `priority_type = "basic"`（不适用所有者的顺序）时，作业不会被移动，
 而是像其他作业一样排队（`"queued": "in_line"`）。对已暂停的作业执行 `start` 仍然是恢复它。
 
+**层级与抢占。** 在优先级之前，作业先按其组的层级（Slurm partition 的 `PriorityTier`，用
+`gpueue group tier <group> <n>` 设置，默认为 0，可以为负）以及是否让路（`gpueue add --yield[=group]`、
+`gpueue yield`）排序：层级高的作业在前，`--yield` 作业排在所有不让路的作业之后，`--yield=group` 作业排在同一
+层级中不让路的作业之后。组的优先级只是加权因子之一，而层级是严格的。在 `preemption = true`（默认）时，等待中的
+作业还可以让运行中的作业创建检查点以腾出位置，相当于 Slurm 的 `PreemptType=preempt/partition_prio` 加
+`PreemptMode=CHECKPOINT`；被创建检查点的作业在 `Restore queued` 中等待，有位置后自动恢复（重启后也一样）。
+等待中的作业 `J` 可以抢占运行中或暂停的作业 `V`，当 `J` 的等级更高时（等级先看是否不对所有人让路，`--yield`
+更低，再看组的层级），或者两者在同一个组、`V` 为 `--yield=group` 且 `J` 不让路时；等级相同的作业互不抢占。
+调度器只抢占那些腾出其槽位（等待作业的组或其某块 GPU）就能让 `J` 立即启动的作业，并且只抢占所需的最少数量，
+从等级最低的开始。它从不抢占 `--no-checkpoint` 作业（它们也不能让路）、启动或恢复后未满 `preempt_exempt_secs`
+的作业，以及抢占检查点在最近 10 分钟内被拒绝的作业，管理员的即时启动也从不抢占。转储失败且无法回滚时，作业会像
+`gpueue checkpoint` 一样以 `Checkpoint failed` 结束。处于检查点状态或等待恢复的时间不计费。被抢占的作业在
+同一批 GPU 上恢复，每次抢占都要付出一次转储和一次恢复的代价（对大型 GPU 作业而言需要几秒到几分钟，以及大约
+RSS + VRAM 的磁盘空间），因此在作业进出频繁的地方，请把 `preempt_exempt_secs` 设为几分钟。在
+`preemption = false` 时，层级和 yield 只用于给等待中的作业排序。用户看到的细节见
+[让路与抢占](usage.md#yielding-and-preemption)。
+
 **命令。**
 
 | 命令 | 谁可以使用 | Slurm |
@@ -1509,14 +1526,18 @@ site 因子、`top` 和 fair share 都被忽略），不过用户的 `-o` 仍然
 | `gpueue site <IDS>... <N>` | 管理员 | site 因子 |
 | `gpueue share set <USER> <N>` | 管理员 | `sacctmgr modify user set fairshare=` |
 | `gpueue group priority <GROUP> <N>` | 管理员 | partition 的 `PriorityJobFactor` |
+| `gpueue group tier <GROUP> <N>` | 管理员 | partition 的 `PriorityTier`（抢占时为 `PreemptType=preempt/partition_prio`） |
+| `gpueue add --yield[=group]`、`gpueue yield <IDS>... [all\|group\|off]` | 所有者（任意模式）、管理员 | 没有直接对应；类似于层级较低、可被抢占的 partition 中的作业 |
 
 与 Slurm 一样，用户只能调高 nice 值，因此无法撤销管理员设置的值。被 restart 的作业（无论是副本还是
 `restart --in-place`）会保留 0 或以上的 nice 值，但不会保留负的 nice 值、site 因子或其 `top` 位置。
-`gpueue prio` 按调度器的顺序列出的正是调度器所考虑的作业。`gpueue status --json` 会在作业的 `nice` 和组的 `priority` 不为 0 时显示它们。
+`gpueue prio` 按调度器的顺序列出的正是调度器所考虑的作业，当某个等待中的作业有层级或 yield 时还会增加 `Tier` 和
+`Yield` 列。`gpueue status --json` 会在作业的 `nice` 和 `yield` 以及组的 `priority` 和 `tier` 不为 0（或让路）
+时显示它们。
 
-目前尚未发布任何版本，因此这只与开发构建有关：引入优先级之前的构建的数据库会在守护进程启动时迁移到
-schema 版本 6。已有作业保留其 `-o` 优先级，从此它只对其所有者的作业排序，用量从零开始。旧的构建无法打开
-迁移后的数据库（`gpueue update` 会拒绝安装它们）。
+v0.1.5 及更早版本的数据库（schema 版本 6）会在守护进程启动时迁移到 schema 版本 7：所有组从层级 0 开始，也没有
+作业让路，因此在管理员设置层级或用户添加带 `--yield` 的作业之前，顺序保持不变。旧的构建无法打开迁移后的数据库
+（`gpueue update` 会拒绝安装它们）。
 
 **设置。** 位于 `/etc/gpueue/config.toml` 的 `[priority]` 表中（更改后请重启 `gpueue.service`）。
 `[priority]` 行之后的键都属于该表，因此请把其他键放在它的上方。
@@ -1536,6 +1557,8 @@ schema 版本 6。已有作业保留其 `-o` 优先级，从此它只对其所�
 | `priority_favor_small` | `false` | `PriorityFavorSmall` |
 | `tres_billing_weights` | `"CPU=1.0,GRES/gpu=10.0"` | `TRESBillingWeights` |
 | `enable_user_top` | `true` | `SchedulerParameters=enable_user_top` |
+| `preemption` | `true`（`false`：层级和 yield 只用于排序） | `PreemptType=preempt/partition_prio`、`PreemptMode=CHECKPOINT` |
+| `preempt_exempt_secs` | `0`（最多一年） | `PreemptExemptTime` |
 
 例如，要让使用更多 GPU 的作业优先，并提升 `urgent` 组的优先级：
 
@@ -1547,6 +1570,17 @@ priority_weight_partition = 5000
 
 ```sh
 sudo gpueue group priority urgent 10
+```
+
+要让 `background` 组使用空闲的 GPU，但让给其他所有组，并且在作业启动或恢复后 10 分钟内不再为其创建检查点：
+
+```toml
+[priority]
+preempt_exempt_secs = 600
+```
+
+```sh
+sudo gpueue group tier background -1
 ```
 
 <a id="gpu-detection"></a>
