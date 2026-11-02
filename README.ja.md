@@ -8,10 +8,16 @@
 [English](README.md) | 日本語 | [简体中文](README.zh-CN.md)
 
 複数のユーザーで共有する 1 台の Linux マシン向けの GPU ジョブキューです。CLI は
-[pueue](https://github.com/Nukesor/pueue) と同じように使えます。gpueue はその上に 2 つの機能を加えます。GPU
-スロットと、[CRIU](https://criu.org) と NVIDIA [cuda-checkpoint](https://github.com/NVIDIA/cuda-checkpoint)
-による実行中ジョブの透過的なチェックポイント/リストア（CPU、メモリ、GPU の状態）です。マシンの再起動時にまだ
-動いている学習はディスクに保存され、止まったところから再開します。最初からやり直すことはありません。
+[pueue](https://github.com/Nukesor/pueue) と同じように使えます。優先度によって、実行中のジョブをその成果を
+失わずに止められます。優先度の高いジョブが GPU を必要とすると、gpueue はその GPU を使っている優先度の低い
+ジョブを、GPU の状態も含めて [CRIU](https://criu.org) と NVIDIA
+[cuda-checkpoint](https://github.com/NVIDIA/cuda-checkpoint) でチェックポイントします。優先度の高い処理が
+終わると、それらは自動でリストアされ、止まったところから続きを実行します。最初からやり直すことはありません。
+
+どのジョブが譲るかは明示的に決めます。`gpueue add --yield` で追加したジョブは譲らないすべてのジョブに譲り、
+管理者はグループをティアで順位付けします（`gpueue group tier`。Slurm のパーティションによるプリエンプションと
+同様）。ジョブは特定の GPU を要求し（`--gpu 0,1`）、どのジョブを次に開始するかは Slurm 式のフェアシェアで
+決まります。
 
 > [!NOTE]
 > **状態：プレリリース。** 以下の機能はすべて実装済みで、Docker 内（PID 1 の systemd、本物の CRIU、本物の
@@ -41,11 +47,14 @@
 ## なぜ gpueue か
 
 共有の GPU ワークステーションでは、ジョブを `nohup` や `tmux`、ユーザーごとの pueue で動かし、GPU の取り合いを
-チャットで調整するのが普通です。カーネルやドライバーの更新のための再起動は、すべての学習を止めてしまいます。
+チャットで調整するのが普通です。1 週間かかる学習を先に始めた人が GPU を占有し、締め切りを抱えた人は待つか、
+進捗を失うのを承知でそれを kill してもらうしかありません。
 gpueue は全員に 1 つのキューを提供します。システム全体のデーモンが全ユーザーのジョブをスケジュールし、誰がどの
 GPU を使っているかを表示します。ジョブは特定の GPU を要求し（`--gpu 0,1`）、それらが空いたときにだけ開始します。
-実行中のジョブは、OS のシャットダウン時、`gpueue shutdown` の実行時、または `gpueue checkpoint` で必要なときに
-保存され、あとで `gpueue restore` で再開できます。コードを変更する必要はありません。
+`--yield` を付けて追加した長い学習は、空いている GPU を使い、ほかの仕事が来るとチェックポイントされて場所を
+空け、あとで自動的に再開します。実行中のジョブは、OS のシャットダウン時、`gpueue shutdown` の実行時、または
+`gpueue checkpoint` で必要なときにも保存され、あとで `gpueue restore` で再開できます。コードを変更する必要は
+ありません。
 
 <a id="features"></a>
 ## 機能
@@ -55,6 +64,7 @@ GPU を使っているかを表示します。ジョブは特定の GPU を要�
 | pueue 互換の CLI | `add`、`status`、`log`、`follow`、`wait`、`pause`、`start`、`kill`、`remove`、`restart`、`clean`、`reset`、`stash`、`enqueue`、`switch`、`group`、`parallel`、`shutdown`、`completions`。加えて、グループ、依存関係（`--after`）、優先度、遅延実行、ラベル |
 | GPU スロット | GPU ごとに同時に実行できるジョブ数の上限（`gpueue gpu parallel`）。各ジョブには `CUDA_VISIBLE_DEVICES` と `CUDA_DEVICE_ORDER=PCI_BUS_ID` が設定されます。GPU は NVML で検出します |
 | 公平な共有 | Slurm 式のマルチファクター優先度（減衰する使用量によるフェアシェア、待ち時間、nice、`top`）。`gpueue prio` と `gpueue share` で数値を確認できます |
+| プリエンプション | `add --yield` のジョブと、ティアの低いグループ（`gpueue group tier`）のジョブは、譲る相手のジョブのためにチェックポイントされて場所を空け、あとで自動的にリストアされます（Slurm の `preempt/partition_prio` と `PreemptMode=CHECKPOINT`）。ジョブのモードはあとから `gpueue yield` で変えられます |
 | チェックポイント/リストア | CPU と CUDA プロセスの透過的なチェックポイント/リストア。DataLoader のワーカーを fork する PyTorch のジョブも含みます（[fork ガード](docs/ja/usage.md#limitations) を参照）。OS のシャットダウンや再起動のときは、実行中の全ジョブを自動でチェックポイントします |
 | マルチユーザー | ジョブはその所有者として実行されます。他のユーザーはジョブが存在することは分かりますが、そのコマンド、環境変数、ログは見えません。管理者は root と `gpueue-admin` グループです |
 | 権限分離 | デーモン（HTTP API、スケジューラー、SQLite）は特権のないシステムユーザー `gpueue` として動きます。ジョブの起動と CRIU の実行は、小さな root ヘルパーだけが行います |
@@ -203,7 +213,7 @@ sudo usermod -aG gpueue-admin alice
 `gpueue --help` がすべてのコマンドを一覧表示します。`(gpueue)` の付いていないコマンドは pueue と同じように
 動作し（[違い](docs/ja/usage.md#pueue-compatibility-and-differences)は主に、共有の 1 つのデーモンと、誰が何を
 できるかに関するものです）、付いているものは gpueue で追加したものです。各コマンドのオプション（たとえば `add`
-の `--gpu` と `--no-checkpoint`）は `gpueue <command> --help` で表示されます。
+の `--gpu`、`--yield`、`--no-checkpoint`）は `gpueue <command> --help` で表示されます。
 
 ```console
 $ gpueue --help
@@ -242,6 +252,7 @@ Commands:
   prio         (gpueue) Show the priority of pending jobs and its factors (like Slurm's `sprio`)
   nice         (gpueue) Set the nice value of jobs (like Slurm's nice option): it is subtracted from
                their priority
+  yield        (gpueue) Make jobs yield to other jobs (checkpointed for them, resumed afterwards)
   top          (gpueue) Move jobs to the top of their owner's queue (Slurm's `scontrol top`)
   site         (gpueue) Set the site factor of jobs, which is added to their priority
                (administrators only)
@@ -291,6 +302,10 @@ Options:
 # environment.
 gpueue add --gpu 0 -l resnet -- 'python train.py --epochs 100'
 
+# A long run that steps aside: when another job needs GPU 0 it is checkpointed, and it resumes
+# by itself once there is room again.
+gpueue add --yield --gpu 0 -l sweep -- 'python sweep.py'
+
 gpueue status          # all jobs of all users (others' commands are hidden)
 gpueue gpu             # GPUs, slots in use, and which jobs hold them
 gpueue log 0           # the last lines of job 0's output
@@ -302,9 +317,11 @@ gpueue restore -i 0    # ...or put it first among your queued jobs (administrato
 ```
 
 リストアされたジョブは、チェックポイントされた瞬間から処理を続けます。ジョブ ID は変わらず、出力は同じログに
-追記されます。OS がシャットダウンするとき、ヘルパーは実行中のジョブを 1 つずつチェックポイントします
-（`--no-checkpoint` のジョブは単に終了されます）。起動後それらは `Checkpointed` になり、各所有者が
-`gpueue restore <id>` か `gpueue restore -a` で再開します。リストアが自動で始まることはありません。
+追記されます。プリエンプトされたジョブは自動でリストアされます（`gpueue stash <id>` で引き止め、
+`gpueue restore <id>` で再び進められます）。OS がシャットダウンするとき、ヘルパーは実行中のジョブを 1 つずつ
+チェックポイントします（`--no-checkpoint` のジョブは単に終了されます）。起動後それらは `Checkpointed` になり、
+各所有者が `gpueue restore <id>` か `gpueue restore -a` で再開します。これらのリストアが自動で始まることは
+ありません。
 `start`、`add -i`、`restart -i`、`restore -i` でジョブをすぐに開始できるのは管理者だけで、それ以外のユーザーの
 ジョブは自分のジョブの先頭にキューされます。
 
@@ -314,7 +331,8 @@ gpueue restore -i 0    # ...or put it first among your queued jobs (administrato
 [一時停止中のジョブ、再起動、失敗したチェックポイント](docs/ja/usage.md#checkpoint-and-restore)、
 [誰が何をできるか](docs/ja/usage.md#multi-user-model-and-authorization)、
 [GPU スロットと分離](docs/ja/usage.md#gpu-slots)、
-[ジョブの優先度](docs/ja/usage.md#job-priority)。
+[ジョブの優先度](docs/ja/usage.md#job-priority)、
+[譲ることとプリエンプション](docs/ja/usage.md#yielding-and-preemption)。
 
 <a id="limitations"></a>
 ## 制限事項
@@ -400,8 +418,8 @@ npx skills add kaito4681/gpueue -g -a claude-code -y
 
 | ドキュメント | 内容 |
 | --- | --- |
-| [docs/ja/install.md](docs/ja/install.md) | 要件、ビルド、インストール、設定、優先度とフェアシェア、アップグレード、アンインストール、トラブルシューティング |
-| [docs/ja/usage.md](docs/ja/usage.md) | pueue との違い、JSON 出力、チェックポイント/リストア、マルチユーザーモデル、GPU スロット、ジョブの優先度、制限事項、テストの範囲 |
+| [docs/ja/install.md](docs/ja/install.md) | 要件、ビルド、インストール、設定、優先度、ティアとフェアシェア、アップグレード、アンインストール、トラブルシューティング |
+| [docs/ja/usage.md](docs/ja/usage.md) | pueue との違い、JSON 出力、チェックポイント/リストア、マルチユーザーモデル、GPU スロット、ジョブの優先度とプリエンプション、制限事項、テストの範囲 |
 | [docs/ja/architecture.md](docs/ja/architecture.md) | コンポーネント、ジョブの流れ、シャットダウンの順序、状態の保存、クレートの構成 |
 
 <a id="contributing"></a>

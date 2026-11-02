@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use chrono::DateTime;
-use gpueue_core::model::{GpuIndex, Group, JobId, JobResult, JobState, Uid};
+use gpueue_core::model::{GpuIndex, Group, JobId, JobResult, JobState, Uid, YieldMode};
 use gpueue_protocol::api::{
     ActionOutcome, ApiError, ErrorCode, GpuJob, GpuView, JobActionResult, JobDetails, JobView,
 };
@@ -37,6 +37,7 @@ pub(crate) fn job(id: u64, state: JobState) -> JobView {
         dependencies: vec![],
         priority: 0,
         nice: 0,
+        yield_mode: YieldMode::None,
         label: None,
         no_checkpoint: false,
         state,
@@ -44,6 +45,7 @@ pub(crate) fn job(id: u64, state: JobState) -> JobView {
         started_at: None,
         finished_at: None,
         checkpoint_size_bytes: None,
+        preempted_at: None,
         details: Some(JobDetails {
             command: "sleep 60".into(),
             cwd: PathBuf::from("/tmp"),
@@ -63,6 +65,7 @@ fn group(name: &str, parallel: u32, paused: bool) -> Group {
         parallel,
         paused,
         priority: 0,
+        tier: 0,
     }
 }
 
@@ -291,6 +294,92 @@ fn group_list() {
 
 fn groups_text() -> String {
     super::groups(&groups(), &Style::PLAIN)
+}
+
+#[test]
+fn group_tiers_are_shown_when_set() {
+    let mut background = group("background", 1, false);
+    background.tier = -1;
+    let mut urgent = group("urgent", 0, true);
+    urgent.tier = 2;
+    assert_eq!(
+        super::groups(
+            &[group("default", 2, false), background, urgent],
+            &Style::PLAIN
+        ),
+        lines(&[
+            r#"Group "default" (2 parallel): running"#,
+            r#"Group "background" (1 parallel, tier -1): running"#,
+            r#"Group "urgent" (0 parallel, tier 2): paused"#,
+        ])
+    );
+}
+
+#[test]
+fn yielding_and_preempted_jobs_in_status() {
+    let mut yielding = job(5, JobState::Running);
+    yielding.yield_mode = YieldMode::All;
+    yielding.started_at = Some(NOW - HOUR);
+    let mut preempted = job(6, JobState::RestoreQueued { enqueued_at: NOW });
+    preempted.yield_mode = YieldMode::Group;
+    preempted.preempted_at = Some(NOW);
+    preempted.started_at = Some(NOW - 2 * HOUR);
+    let mut queued_restore = job(7, JobState::RestoreQueued { enqueued_at: NOW });
+    queued_restore.started_at = Some(NOW - 2 * HOUR);
+    let mut finished = job(
+        8,
+        JobState::Done {
+            result: JobResult::Success,
+        },
+    );
+    finished.yield_mode = YieldMode::All;
+    let mut checkpointed = job(9, JobState::Checkpointed);
+    checkpointed.yield_mode = YieldMode::All;
+    checkpointed.checkpoint_size_bytes = Some(4096);
+
+    let texts: Vec<String> = [&yielding, &preempted, &queued_restore, &finished]
+        .into_iter()
+        .chain([&checkpointed])
+        .map(|j| state_text(j).0)
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "Running (yield)",
+            "Restore queued (preempted, yield=group)",
+            "Restore queued",
+            "Success",
+            "Checkpointed (4.0 KiB, yield)",
+        ]
+    );
+    assert_eq!(state_text(&preempted).1, Color::Yellow);
+
+    let mut default = group("default", 1, false);
+    default.tier = 1;
+    let output = status(
+        StatusInput {
+            groups: &[default],
+            jobs: vec![yielding, preempted, queued_restore],
+            no_jobs_at_all: false,
+            group: Some("default"),
+            columns: &[Column::Id, Column::Status],
+        },
+        &ctx(),
+    )
+    .unwrap();
+    let expected = lines(&[
+        r#"Group "default" (1 parallel, tier 1): running"#,
+        "──────────────────────────────────────────────",
+        " Id   Status                                  ",
+        "══════════════════════════════════════════════",
+        " 5    Running (yield)                         ",
+        "──────────────────────────────────────────────",
+        " 6    Restore queued (preempted, yield=group) ",
+        "──────────────────────────────────────────────",
+        " 7    Restore queued                          ",
+        "──────────────────────────────────────────────",
+    ]);
+    assert_eq!(output, expected, "\n{output}");
 }
 
 #[test]
@@ -610,6 +699,8 @@ fn priority_table() {
             },
             site: 0,
             nice: 1,
+            tier: 0,
+            yield_mode: YieldMode::None,
         }],
     };
     let out = priorities(&response, &ctx());
@@ -642,6 +733,46 @@ fn priority_table() {
         ..response.clone()
     };
     assert!(priorities(&empty, &ctx()).ends_with("No pending jobs."));
+    assert!(!out.contains("Tier"), "{out}");
+    assert!(!out.contains("Yield"), "{out}");
+    // Unused tiers and yields leave the JSON as it was.
+    let json = serde_json::to_string(&response.jobs[0]).unwrap();
+    assert!(json.ends_with(r#""site":0,"nice":1}"#), "{json}");
+
+    // Tiers and yields add two columns and a note on the order.
+    let mut tiered = response.clone();
+    tiered.jobs[0].tier = -1;
+    tiered.jobs.push(JobPriority {
+        id: JobId(5),
+        yield_mode: YieldMode::Group,
+        tier: 0,
+        ..tiered.jobs[0].clone()
+    });
+    let out = priorities(&tiered, &ctx());
+    assert!(out.contains("ordered by tier and yield first"), "{out}");
+    let cells = |id: &str| -> Vec<String> {
+        let row = out
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some(id))
+            .unwrap();
+        row.split_whitespace().map(str::to_owned).collect()
+    };
+    assert_eq!(cells("4")[..6], ["4", "bob", "default", "-1", "-", "10500"]);
+    assert_eq!(
+        cells("5")[..6],
+        ["5", "bob", "default", "0", "group", "10500"]
+    );
+    let header = out.lines().find(|l| l.contains("Priority")).unwrap();
+    let header: Vec<&str> = header.split_whitespace().collect();
+    assert_eq!(
+        header[..6],
+        ["Id", "Owner", "Group", "Tier", "Yield", "Priority"]
+    );
+    let json = serde_json::to_string(&tiered.jobs[1]).unwrap();
+    assert!(json.ends_with(r#""nice":1,"yield":"group"}"#), "{json}");
+    let json = serde_json::to_string(&tiered.jobs[0]).unwrap();
+    assert!(json.ends_with(r#""nice":1,"tier":-1}"#), "{json}");
+
     let basic = PriorityResponse {
         priority_type: PriorityType::Basic,
         ..response
@@ -649,6 +780,14 @@ fn priority_table() {
     let out = priorities(&basic, &ctx());
     assert!(out.contains("\"basic\""), "{out}");
     assert!(!out.contains("Fairshare"), "{out}");
+    let basic = PriorityResponse {
+        priority_type: PriorityType::Basic,
+        ..tiered
+    };
+    let out = priorities(&basic, &ctx());
+    let header = out.lines().find(|l| l.contains("Prio")).unwrap();
+    let header: Vec<&str> = header.split_whitespace().collect();
+    assert_eq!(header, ["Id", "Owner", "Group", "Tier", "Yield", "Prio"]);
 }
 
 #[test]

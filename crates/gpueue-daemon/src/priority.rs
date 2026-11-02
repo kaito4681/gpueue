@@ -34,7 +34,7 @@ use gpueue_core::scheduler::{self, PriorityInput};
 use gpueue_core::storage::{JobFilter, StorageError, StoreOps};
 use gpueue_protocol::api::{
     BulkJobResponse, JobActionResult, NiceRequest, PriorityResponse, PriorityWeights,
-    SharesResponse, SiteRequest, TopRequest,
+    SharesResponse, SiteRequest, TopRequest, YieldRequest,
 };
 
 use crate::error::{ApiResult, Failure};
@@ -348,6 +348,23 @@ impl Core {
         .await
     }
 
+    /// `PUT /v1/groups/{name}/tier`.
+    pub async fn set_group_tier(
+        self: &Arc<Self>,
+        caller: Caller,
+        name: String,
+        tier: i32,
+    ) -> ApiResult<Group> {
+        authz::require_admin_for(&caller, AdminOperation::SetGroupTier)?;
+        self.write(move |tx, ch| {
+            tx.set_group_tier(&name, tier)?;
+            ch.group(&name);
+            tx.get_group(&name)?
+                .ok_or_else(|| gpueue_core::Error::GroupNotFound(name).into())
+        })
+        .await
+    }
+
     /// Applies `check` to each job of `ids` in one transaction, then
     /// `apply` to the jobs that passed; reports per job.
     async fn per_job(
@@ -402,6 +419,30 @@ impl Core {
             move |tx, ids| {
                 for id in ids {
                     tx.set_job_nice(*id, nice)?;
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// `POST /v1/jobs/yield`.
+    pub async fn yield_jobs(
+        self: &Arc<Self>,
+        caller: Caller,
+        request: YieldRequest,
+    ) -> ApiResult<BulkJobResponse> {
+        let YieldRequest { ids, mode } = request;
+        self.per_job(
+            ids,
+            move |job| {
+                authz::require_yield(&caller, job)?;
+                require_unfinished(job, "given a yield mode")?;
+                authz::check_yield(job.spec.no_checkpoint, mode).map_err(Failure::bad_request)
+            },
+            move |tx, ids| {
+                for id in ids {
+                    tx.set_job_yield_mode(*id, mode)?;
                 }
                 Ok(())
             },

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use gpueue_core::model::{GpuIndex, Group, JobId};
+use gpueue_core::model::{GpuIndex, Group, JobId, YieldMode};
 use gpueue_protocol::api::*;
 use gpueue_protocol::client::{Client, ClientError};
 use http_body_util::{BodyExt, Full};
@@ -86,6 +86,7 @@ fn group(name: &str, parallel: u32) -> Group {
         parallel,
         paused: false,
         priority: 0,
+        tier: 0,
     }
 }
 
@@ -474,6 +475,7 @@ async fn add_job_posts_flattened_spec() {
             label: None,
             no_checkpoint: false,
             nice: 0,
+            yield_mode: YieldMode::None,
         },
         stashed: false,
         enqueue_at: None,
@@ -509,6 +511,7 @@ async fn unencodable_request_is_an_error_not_a_panic() {
             label: None,
             no_checkpoint: false,
             nice: 0,
+            yield_mode: YieldMode::None,
         },
         stashed: false,
         enqueue_at: None,

@@ -3,7 +3,7 @@
 
 use std::future::Future;
 
-use gpueue_core::model::JobSpec;
+use gpueue_core::model::{JobSpec, YieldMode};
 use gpueue_protocol::helper::Event;
 
 use super::*;
@@ -48,6 +48,7 @@ fn spec() -> JobSpec {
         label: None,
         no_checkpoint: false,
         nice: 0,
+        yield_mode: YieldMode::None,
     }
 }
 
@@ -311,6 +312,13 @@ async fn a_rolled_back_dump_leaves_the_job_running() {
             job: id,
             outcome: CheckpointOutcome::rolled_back("criu dump failed; the job was resumed"),
         });
+        // The state alone does not tell that the event was applied: the
+        // reconciliation may already have put the job back (the helper
+        // lists it as running, not dumping).
+        eventually("the outcome is applied", || async {
+            helper.unacked().is_empty()
+        })
+        .await;
         if paused {
             wait_state(&core, id, JobState::Paused).await;
             assert_eq!(helper.signals(), [(id, signal::SIGSTOP)]);

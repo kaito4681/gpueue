@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpueue_core::model::{GpuIndex, JobId, JobResult, JobSpec, JobState, Uid};
+use gpueue_core::model::{GpuIndex, JobId, JobResult, JobSpec, JobState, Uid, YieldMode};
 use gpueue_daemon::api::TEST_UID_HEADER;
 use gpueue_daemon::helper::FakeOutcome;
 use gpueue_daemon::{
@@ -17,8 +17,8 @@ use gpueue_daemon::{
 use gpueue_protocol::BINARY_VERSION;
 use gpueue_protocol::api::{
     AddJobRequest, AddJobResponse, ApiError, BulkJobResponse, CleanResponse, ErrorCode,
-    Event as ApiEvent, GpuDetection, GpuSource, JobView, ListGpusResponse, ListJobsResponse,
-    SseDecoder, VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
+    Event as ApiEvent, GpuDetection, GpuSource, JobActionResult, JobView, ListGpusResponse,
+    ListJobsResponse, SseDecoder, VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
 };
 use gpueue_protocol::helper::{RunningPhase, signal};
 use http_body_util::{BodyExt, Full};
@@ -197,6 +197,7 @@ fn job_request(command: &str, gpus: &[u32]) -> AddJobRequest {
             label: Some("experiment".to_owned()),
             no_checkpoint: false,
             nice: 0,
+            yield_mode: YieldMode::None,
         },
         stashed: false,
         enqueue_at: None,
@@ -1491,6 +1492,198 @@ async fn pause_is_refused_while_the_job_is_checkpointed() {
     assert!(h.helper.signals().is_empty());
     h.helper.dump(id);
     alice.wait_state(id, &JobState::Checkpointed).await;
+    h.stop().await;
+}
+
+/// `stash` holds restore-queued jobs back as checkpointed: by id, `-g` and
+/// `-a` (owners their own jobs, administrators everyone's). The image is
+/// kept and the preemption mark cleared; a delay is refused for them (a
+/// bulk stash reports them and stashes its queued jobs), and `restore`
+/// queues them again. Jobs being checkpointed or restored are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stash_holds_restore_queued_jobs_back_as_checkpointed() {
+    use gpueue_core::storage::StoreOps;
+    use gpueue_protocol::api::ActionOutcome;
+
+    async fn checkpointed(client: &Client, command: &str) -> JobId {
+        let id = client.add(&job_request(command, &[])).await;
+        client.wait_state(id, &JobState::Running).await;
+        let reply = client.action(id, "checkpoint", json!(null)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        client.wait_state(id, &JobState::Checkpointed).await;
+        id
+    }
+    async fn stash_bulk(
+        client: &Client,
+        target: Value,
+        enqueue_at: Option<i64>,
+    ) -> BulkJobResponse {
+        let mut body = json!({"target": target, "action": "stash"});
+        if let Some(at) = enqueue_at {
+            body["enqueue_at"] = json!(at);
+        }
+        let reply = client.post("/v1/jobs/bulk", body).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        reply.json()
+    }
+    fn restore_queued(job: &JobView) -> bool {
+        matches!(job.state, JobState::RestoreQueued { .. })
+    }
+
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(1).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let admin = h.client(admin());
+
+    let a = checkpointed(&alice, "a").await;
+    let b = checkpointed(&bob, "b").await;
+    let c = checkpointed(&alice, "c").await;
+    // The only slot is taken: queued and restore-queued jobs wait.
+    let blocker = alice.add(&job_request("blocker", &[])).await;
+    alice.wait_state(blocker, &JobState::Running).await;
+    let queued = alice.add(&job_request("queued", &[])).await;
+    for (client, id) in [(&alice, a), (&bob, b), (&alice, c)] {
+        let reply = client.action(id, "restore", json!({})).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert!(restore_queued(&client.job(id).await));
+    }
+    // a and b were preempted (the scheduler marks them so).
+    for id in [a, b] {
+        h.store().set_job_preempted_at(id, Some(42)).unwrap();
+    }
+    assert_eq!(alice.job(a).await.preempted_at, Some(42));
+    let in_an_hour = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 3_600_000;
+
+    // By id: a checkpointed job has no scheduled restore, so no delay.
+    let reply = alice
+        .action(a, "stash", json!({"enqueue_at": in_an_hour}))
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    let error = reply.error();
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        error.message.contains("cannot be stashed with a delay")
+            && error.message.contains("without --delay"),
+        "{}",
+        error.message
+    );
+    let job = alice.job(a).await;
+    assert!(restore_queued(&job));
+    assert_eq!(job.preempted_at, Some(42));
+
+    // Without one it is held back, keeping its image, and no longer
+    // counts as preempted.
+    assert_eq!(
+        alice.action(a, "stash", json!({})).await.status,
+        StatusCode::OK
+    );
+    let job = alice.job(a).await;
+    assert_eq!(job.state, JobState::Checkpointed);
+    assert_eq!(job.preempted_at, None);
+    assert_eq!(h.store().get_job(a).unwrap().unwrap().preempted_at, None);
+    assert!(h.helper.has_image(a));
+    assert_eq!(job.checkpoint_size_bytes, Some(4096));
+    // Once held back, `stash` and `enqueue` point to `restore`.
+    for action in ["stash", "enqueue"] {
+        let reply = alice.action(a, action, json!({})).await;
+        assert_eq!(reply.status, StatusCode::CONFLICT, "{action}");
+        let message = reply.error().message;
+        assert!(message.contains("gpueue restore"), "{action}: {message}");
+    }
+
+    // Somebody else's job is refused.
+    assert_eq!(
+        alice.action(b, "stash", json!({})).await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    // `-a` with a delay: alice's queued job is stashed until then, her
+    // restore-queued one is reported with the reason; bob's job and the
+    // jobs the action does not apply to are left alone.
+    let reply = stash_bulk(&alice, json!({"kind": "all"}), Some(in_an_hour)).await;
+    assert_eq!(reply.results.len(), 2, "{reply:?}");
+    let result = |id: JobId| {
+        reply
+            .results
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("no result for job {id}: {reply:?}"))
+    };
+    assert!(result(queued).is_ok(), "{reply:?}");
+    match &result(c).outcome {
+        ActionOutcome::Error { error } => {
+            assert_eq!(error.code, ErrorCode::BadRequest);
+            assert!(error.message.contains("with a delay"), "{}", error.message);
+        }
+        other => panic!("job {c} was stashed with a delay: {other:?}"),
+    }
+    assert_eq!(
+        alice.job(queued).await.state,
+        JobState::Stashed {
+            enqueue_at: Some(in_an_hour)
+        }
+    );
+    assert!(restore_queued(&alice.job(c).await));
+
+    // `-g` without a delay: alice's restore-queued job is held back.
+    let reply = stash_bulk(&alice, json!({"kind": "group", "group": "default"}), None).await;
+    assert_eq!(reply.results, vec![JobActionResult::ok(c)]);
+    assert_eq!(alice.job(c).await.state, JobState::Checkpointed);
+    assert!(restore_queued(&bob.job(b).await));
+
+    // An administrator's `-a` takes everyone's.
+    let reply = stash_bulk(&admin, json!({"kind": "all"}), None).await;
+    assert_eq!(reply.results, vec![JobActionResult::ok(b)]);
+    let job = bob.job(b).await;
+    assert_eq!(job.state, JobState::Checkpointed);
+    assert_eq!(job.preempted_at, None);
+    assert!(h.helper.has_image(b));
+
+    // `restore` queues a held-back job again. Once the scheduler has
+    // picked it (the restore is in flight), it is no longer stashable.
+    h.helper.hold_launches();
+    assert_eq!(
+        alice.action(a, "restore", json!({})).await.status,
+        StatusCode::OK
+    );
+    assert!(restore_queued(&alice.job(a).await));
+    h.exit(blocker, 0).await;
+    h.helper.wait_held(1).await;
+    assert_eq!(alice.job(a).await.state, JobState::Restoring);
+    let reply = alice.action(a, "stash", json!({})).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert!(reply.error().message.contains("restoring"));
+    assert!(
+        stash_bulk(&alice, json!({"kind": "all"}), None)
+            .await
+            .results
+            .is_empty()
+    );
+    h.helper.release_launches();
+    alice.wait_state(a, &JobState::Running).await;
+    h.wait_spawned(a).await;
+
+    // Nor while it is being checkpointed.
+    h.helper.set_checkpoint_outcome(FakeOutcome::Hold);
+    assert_eq!(
+        alice.action(a, "checkpoint", json!(null)).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(a, &JobState::Checkpointing).await;
+    let reply = alice.action(a, "stash", json!({})).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    let message = reply.error().message;
+    assert!(
+        message.contains("once the checkpoint has finished"),
+        "{message}"
+    );
+    h.helper.dump(a);
+    alice.wait_state(a, &JobState::Checkpointed).await;
     h.stop().await;
 }
 
@@ -4282,6 +4475,263 @@ async fn nice_site_shares_and_group_priority_authorization() {
         )
         .await;
     assert_eq!(reply.error().code, ErrorCode::GroupNotFound);
+}
+
+/// The error message of each failed job of a bulk reply.
+fn bulk_messages(reply: &Reply) -> Vec<(u64, Option<String>)> {
+    reply
+        .json::<BulkJobResponse>()
+        .results
+        .into_iter()
+        .map(|r| {
+            let message = match r.outcome {
+                gpueue_protocol::api::ActionOutcome::Ok { .. } => None,
+                gpueue_protocol::api::ActionOutcome::Error { error } => Some(error.message),
+            };
+            (r.id.0, message)
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn yield_at_submission_and_later() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let admin = h.client(admin());
+    let stashed = |command: &str| AddJobRequest {
+        stashed: true,
+        ..job_request(command, &[])
+    };
+
+    // The daemon refuses a yielding job that is never checkpointed, also
+    // when a client sends one.
+    let mut request = stashed("x");
+    request.spec.no_checkpoint = true;
+    for mode in ["all", "group"] {
+        let mut body = serde_json::to_value(&request).unwrap();
+        body["yield"] = json!(mode);
+        let reply = alice.post("/v1/jobs", body).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{mode}");
+        assert_eq!(
+            reply.error().message,
+            "a job with --no-checkpoint cannot yield"
+        );
+    }
+    let no_checkpoint = alice.add(&request).await;
+
+    let mut request = stashed("x");
+    request.spec.yield_mode = YieldMode::Group;
+    let id = alice.add(&request).await;
+    assert_eq!(alice.job(id).await.yield_mode, YieldMode::Group);
+    let view = alice.get(&format!("/v1/jobs/{}", id.0)).await;
+    assert_eq!(view.json::<Value>()["yield"], json!("group"));
+    // Not shown while the job does not yield.
+    let view = alice.get(&format!("/v1/jobs/{}", no_checkpoint.0)).await;
+    assert!(view.json::<Value>().get("yield").is_none());
+
+    // The owner may change it, also back to not yielding.
+    for (mode, expected) in [
+        ("all", YieldMode::All),
+        ("none", YieldMode::None),
+        ("group", YieldMode::Group),
+    ] {
+        let reply = alice
+            .post("/v1/jobs/yield", json!({ "ids": [id.0], "mode": mode }))
+            .await;
+        assert_eq!(bulk_results(&reply), [(id.0, None)], "{mode}");
+        assert_eq!(alice.job(id).await.yield_mode, expected);
+    }
+    // Other users may not.
+    let reply = bob
+        .post("/v1/jobs/yield", json!({ "ids": [id.0], "mode": "none" }))
+        .await;
+    assert_eq!(
+        bulk_results(&reply),
+        [(id.0, Some(ErrorCode::PermissionDenied))]
+    );
+    assert_eq!(alice.job(id).await.yield_mode, YieldMode::Group);
+    // Administrators may change any job.
+    let reply = admin
+        .post("/v1/jobs/yield", json!({ "ids": [id.0], "mode": "all" }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(id.0, None)]);
+    assert_eq!(alice.job(id).await.yield_mode, YieldMode::All);
+
+    // A job that is never checkpointed cannot be made to yield, by anybody;
+    // the other jobs of the request are changed all the same.
+    for client in [&alice, &admin] {
+        let reply = client
+            .post(
+                "/v1/jobs/yield",
+                json!({ "ids": [no_checkpoint.0, id.0], "mode": "group" }),
+            )
+            .await;
+        assert_eq!(
+            bulk_results(&reply),
+            [(no_checkpoint.0, Some(ErrorCode::BadRequest)), (id.0, None)]
+        );
+        assert_eq!(
+            bulk_messages(&reply)[0].1.as_deref(),
+            Some("a job with --no-checkpoint cannot yield")
+        );
+    }
+    assert_eq!(alice.job(no_checkpoint).await.yield_mode, YieldMode::None);
+    let reply = alice
+        .post(
+            "/v1/jobs/yield",
+            json!({ "ids": [no_checkpoint.0], "mode": "none" }),
+        )
+        .await;
+    assert_eq!(bulk_results(&reply), [(no_checkpoint.0, None)]);
+
+    // Unknown and finished jobs are reported per job; no ids at all is an
+    // error.
+    let reply = alice
+        .post("/v1/jobs/yield", json!({ "ids": [999], "mode": "all" }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(999, Some(ErrorCode::JobNotFound))]);
+    let reply = alice
+        .post("/v1/jobs/yield", json!({ "ids": [], "mode": "all" }))
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::BadRequest);
+    let finished = alice.add(&job_request("x", &[])).await;
+    alice.wait_state(finished, &JobState::Running).await;
+    h.exit(finished, 0).await;
+    alice.wait_state(finished, &done(JobResult::Success)).await;
+    let reply = alice
+        .post(
+            "/v1/jobs/yield",
+            json!({ "ids": [finished.0], "mode": "all" }),
+        )
+        .await;
+    assert_eq!(
+        bulk_results(&reply),
+        [(finished.0, Some(ErrorCode::InvalidState))]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_tiers_are_for_administrators() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let admin = h.client(admin());
+    let set_tier = |client: &Client, group: &str, tier: i32| {
+        let path = format!("/v1/groups/{group}/tier");
+        let client = client.clone();
+        async move {
+            client
+                .call(Method::PUT, &path, Some(json!({ "tier": tier })))
+                .await
+        }
+    };
+
+    let reply = set_tier(&alice, "default", 1).await;
+    assert_eq!(reply.error().code, ErrorCode::PermissionDenied);
+    let reply = set_tier(&admin, "default", -1).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let group: gpueue_core::model::Group = reply.json();
+    assert_eq!(group.tier, -1);
+    let groups = alice.get("/v1/groups").await.json::<Value>();
+    assert_eq!(groups["groups"][0]["tier"], json!(-1));
+    let reply = set_tier(&admin, "default", 0).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    // A tier of 0 is not shown.
+    let groups = alice.get("/v1/groups").await.json::<Value>();
+    assert!(groups["groups"][0].get("tier").is_none(), "{groups}");
+    let reply = set_tier(&admin, "nope", 1).await;
+    assert_eq!(reply.error().code, ErrorCode::GroupNotFound);
+}
+
+/// Waits until `id` has been preempted: checkpointed and waiting, marked,
+/// to be restored.
+async fn wait_preempted(client: &Client, id: JobId) -> JobView {
+    client
+        .wait_for(id, "preempted", |j| {
+            matches!(j.state, JobState::RestoreQueued { .. }) && j.preempted_at.is_some()
+        })
+        .await
+}
+
+/// A `--yield` job on GPU 0 is checkpointed by the scheduler when another
+/// user's job needs GPU 0, waits (listed by `gpueue prio`) while that job
+/// runs, and is restored by itself once it has finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_yielding_job_is_preempted_and_restored_by_itself() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+
+    let mut request = job_request("long", &[0]);
+    request.spec.yield_mode = YieldMode::All;
+    let yielding = alice.add(&request).await;
+    alice.wait_state(yielding, &JobState::Running).await;
+    h.wait_spawned(yielding).await;
+
+    let urgent = bob.add(&job_request("urgent", &[0])).await;
+    let preempted = wait_preempted(&alice, yielding).await;
+    assert!(h.helper.has_image(yielding));
+    bob.wait_state(urgent, &JobState::Running).await;
+    assert_eq!(h.helper.checkpoint_requests(), [yielding]);
+    assert_eq!(
+        alice.job(yielding).await.preempted_at,
+        preempted.preempted_at
+    );
+    // Waiting for its slot like any restore-queued job.
+    assert_eq!(priority_order(&alice).await, [yielding.0]);
+
+    h.exit(urgent, 0).await;
+    bob.wait_state(urgent, &done(JobResult::Success)).await;
+    let restored = alice.wait_state(yielding, &JobState::Running).await;
+    assert_eq!(restored.preempted_at, None);
+    assert_eq!(h.helper.restore_requests(), [(yielding, false)]);
+    h.wait_launch_settled(yielding).await;
+    assert!(h.helper.is_running(yielding));
+    assert!(priority_order(&alice).await.is_empty());
+    // Checkpointed once.
+    assert_eq!(h.helper.checkpoint_requests(), [yielding]);
+
+    h.stop().await;
+}
+
+/// A job of a group of a higher tier preempts a job of a lower tier on
+/// the GPU it needs; the preempted job is restored once it has finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_higher_tier_groups_job_preempts_a_lower_tier_groups_job() {
+    let mut h = Harness::new(1).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let admin = h.client(admin());
+    let reply = admin
+        .post("/v1/groups", json!({"name": "urgent", "parallel": 0}))
+        .await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    let reply = admin
+        .call(
+            Method::PUT,
+            "/v1/groups/urgent/tier",
+            Some(json!({ "tier": 1 })),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    let low = alice.add(&job_request("low", &[0])).await;
+    alice.wait_state(low, &JobState::Running).await;
+    h.wait_spawned(low).await;
+
+    let mut request = job_request("high", &[0]);
+    request.spec.group = "urgent".to_owned();
+    let high = bob.add(&request).await;
+    wait_preempted(&alice, low).await;
+    bob.wait_state(high, &JobState::Running).await;
+
+    h.exit(high, 0).await;
+    let restored = alice.wait_state(low, &JobState::Running).await;
+    assert_eq!(restored.preempted_at, None);
+    assert_eq!(h.helper.restore_requests(), [(low, false)]);
+    assert_eq!(h.helper.checkpoint_requests(), [low]);
+
+    h.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

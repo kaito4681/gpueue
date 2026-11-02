@@ -29,6 +29,10 @@
 #
 # Usage: mounts.sh setup
 set -euo pipefail
+# `docker exec` passes on the container runtime's umask, which is 0000
+# under some rootless Docker setups: files and directories made here would
+# be world-writable (and the helper refuses such an /etc/gpueue).
+umask 022
 
 DISK=/var/lib/gpueue-e2e-disk
 

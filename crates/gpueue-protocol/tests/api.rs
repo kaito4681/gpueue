@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
-use gpueue_core::model::{Caller, GpuIndex, Group, Job, JobId, JobResult, JobSpec, JobState, Uid};
+use gpueue_core::model::{
+    Caller, GpuIndex, Group, Job, JobId, JobResult, JobSpec, JobState, Uid, YieldMode,
+};
 use gpueue_protocol::api::routes::{self, JobActionKind};
 use gpueue_protocol::api::*;
 use serde::Serialize;
@@ -37,6 +39,7 @@ fn sample_job() -> Job {
             label: Some("run1".into()),
             no_checkpoint: false,
             nice: 0,
+            yield_mode: YieldMode::None,
         },
         state: JobState::Running,
         created_at: 1_000,
@@ -44,6 +47,7 @@ fn sample_job() -> Job {
         finished_at: None,
         site_factor: 0,
         top_seq: None,
+        preempted_at: None,
     }
 }
 
@@ -143,6 +147,26 @@ fn list_view_leaves_out_envs() {
 }
 
 #[test]
+fn yield_and_preemption_in_views() {
+    let mut job = sample_job();
+    job.spec.yield_mode = YieldMode::All;
+    job.preempted_at = Some(3_000);
+    let stranger = Caller {
+        uid: Uid(1001),
+        is_admin: false,
+    };
+    // Shown to everybody, like the rest of the scheduling state.
+    let view = JobView::for_caller(&job, &stranger);
+    assert_golden(
+        &view,
+        r#"{"id":7,"owner":1000,"group":"default","gpus":[0,1],"dependencies":[],"priority":0,"yield":"all","label":null,"no_checkpoint":false,"state":{"state":"running"},"created_at":1000,"started_at":2000,"finished_at":null,"preempted_at":3000}"#,
+    );
+    let full = JobView::full(&job);
+    assert_eq!(full.yield_mode, YieldMode::All);
+    assert_eq!(full.preempted_at, Some(3_000));
+}
+
+#[test]
 fn result_reasons_are_the_owners_last_error_only() {
     let stranger = Caller {
         uid: Uid(1001),
@@ -207,6 +231,7 @@ fn add_job_request_golden() {
             label: None,
             no_checkpoint: true,
             nice: 0,
+            yield_mode: YieldMode::None,
         },
         stashed: false,
         enqueue_at: None,
@@ -418,6 +443,7 @@ fn event_golden_and_sse() {
             parallel: 2,
             paused: false,
             priority: 0,
+            tier: 0,
         },
     };
     assert_golden(
@@ -624,6 +650,7 @@ fn routes() {
         (Route::NiceJobs, Method::Post, "/v1/jobs/nice"),
         (Route::TopJobs, Method::Post, "/v1/jobs/top"),
         (Route::SiteJobs, Method::Post, "/v1/jobs/site"),
+        (Route::YieldJobs, Method::Post, "/v1/jobs/yield"),
         (Route::Priority, Method::Get, "/v1/priority"),
         (Route::ListShares, Method::Get, "/v1/shares"),
         (
@@ -635,6 +662,11 @@ fn routes() {
             Route::SetGroupPriority("a b".into()),
             Method::Put,
             "/v1/groups/a%20b/priority",
+        ),
+        (
+            Route::SetGroupTier("a b".into()),
+            Method::Put,
+            "/v1/groups/a%20b/tier",
         ),
     ];
     for (route, method, path) in cases {

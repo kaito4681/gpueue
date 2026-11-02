@@ -13,6 +13,7 @@ operating gpueue.
 - [Multi-user model and authorization](#multi-user-model-and-authorization)
 - [GPU slots](#gpu-slots)
 - [Job priority](#job-priority)
+  - [Yielding and preemption](#yielding-and-preemption)
 - [Limitations](#limitations)
 - [Test coverage](#test-coverage)
 
@@ -29,6 +30,7 @@ and does not read pueue's files. These are the differences:
 | `send` | sends input to a task's stdin | not supported: jobs' stdin is `/dev/null`. Make the command non-interactive. |
 | `shutdown` | kills all tasks and stops the daemon | administrators only. Checkpoints all running jobs, then stops the daemon. A job whose checkpoint is refused keeps running. `--no-checkpoint` kills them instead. |
 | `restart` | finished tasks | also works on `Checkpointed` jobs: they start over as a new job, and the image is kept |
+| `stash` | queued tasks | also restore-queued jobs (including [preempted](#yielding-and-preemption) ones): they go back to `Checkpointed`, keeping their image, and `gpueue restore` queues them again. `-g`/`-a` include them; `--delay` is refused for them. |
 | `start <id>`, `add -i`, `restart -i` (and `restore -i`) | start the task right away, ignoring every limit | only administrators' start right away, ignoring every limit; anybody else's job is queued first among their own jobs (like `gpueue top`) and waits for its turn like any queued job (see [Job priority](#job-priority)) |
 | `reset`, `-a/--all`, `-g/--group` | all tasks | your own jobs. Administrators act on everyone's. |
 | `pause/start/kill -a`, `-g` | also pause/resume the groups | only administrators pause/resume groups; for others, groups are left as they are |
@@ -44,6 +46,7 @@ Extra commands and options:
 | --- | --- |
 | `add --gpu <LIST>` | GPUs the job runs on, e.g. `0` or `0,1`. Without it the job is CPU-only (`CUDA_VISIBLE_DEVICES` is empty). |
 | `add --no-checkpoint` | never checkpoint this job; on shutdown it is terminated |
+| `add --yield[=group]` (alias `--preemptible`), `yield <IDS>... [all\|group\|off]` | let other jobs preempt this one: it is checkpointed to make room for them and resumes automatically (see [Yielding and preemption](#yielding-and-preemption)) |
 | `reset --keep-checkpoints` | reset everything except `Checkpointed` (and restore-queued) jobs, which keep their checkpoint images |
 | `checkpoint [IDS] [-g GROUP] [-a]` | save running jobs and stop them |
 | `restore [IDS] [-g GROUP] [-a] [-i]` | resume `Checkpointed` jobs (`-i`: like `start`, right away for administrators, first among your own jobs for anybody else) |
@@ -53,6 +56,7 @@ Extra commands and options:
 | `prio [IDS] [-j]` | pending jobs in scheduling order with their priority factors (like Slurm's `sprio`) |
 | `share [-j]`, `share set <USER> <N>` | fair-share state per user (like Slurm's `sshare`); set a user's shares (administrators) |
 | `site <IDS>... <N>`, `group priority <GROUP> <N>` | a job's site factor, a group's priority (administrators) |
+| `group tier <GROUP> <N>` | a group's priority tier (administrators; may be negative): jobs of higher tiers start first and preempt jobs of lower tiers |
 | `service install [--bin-dir DIR] [--no-start] [--force] / uninstall / status` | manage the systemd services; install exits non-zero if the final check fails (see [install.md](install.md)) |
 | `uninstall [--purge] [--yes]` | remove the services and the binaries `service install` copied (root) |
 | `update [--check] [--version V] [-y]` | update gpueue from the latest (or the given) release; needs root, without root it only checks (see [install.md](install.md#upgrading)) |
@@ -61,7 +65,9 @@ Extra commands and options:
 
 Additional job states: `Checkpointing`, `Checkpointed`, `Restore queued`, `Restoring`, and
 `Terminating` (stopping after a failed checkpoint). The `status` table has `Owner` and `GPU`
-columns, and `Checkpointed` jobs show the image size.
+columns, and `Checkpointed` jobs show the image size. Notes in parentheses mark a preempted job
+(`Restore queued (preempted)`) and a job that yields (`Running (yield)`, `Queued (yield=group)`),
+and a group's headline shows its tier when it is not 0 (`Group "background" (1 parallel, tier -1)`).
 
 ## JSON output
 
@@ -90,8 +96,10 @@ columns, and `Checkpointed` jobs show the image size.
   `terminating` and `done` carry `result`, which is one of `success`, `failed` (`exit_code`),
   `failed_to_spawn` (`reason`), `killed`, `dependency_failed`, `checkpoint_failed` (`reason`) and
   `lost`.
-- `checkpoint_size_bytes`, `details`, `details.last_error`, a job's `nice` and a group's
-  `priority` are omitted when they do not apply (or are 0).
+- `checkpoint_size_bytes`, `details`, `details.last_error`, a job's `nice`, `yield` and
+  `preempted_at`, and a group's `priority` and `tier` are omitted when they do not apply (or are
+  0). `yield` is `"all"` or `"group"` for a job that yields; `preempted_at` is set while a job
+  checkpointed by a preemption waits to be restored.
   For other users' jobs, `label` is null, `details` is absent and `reason` is `"<redacted>"`.
 - `waiting` is present on a queued job that was launched right away by a non-administrator but
   waits for a GPU slot or its paused group: `{"reason": "gpu_slots", "gpus": [0]}`,
@@ -104,7 +112,8 @@ columns, and `Checkpointed` jobs show the image size.
 - `gpueue prio --json` prints `{"priority_type", "weights": {"age", "fairshare", "job_size",
   "partition", "tres"}, "jobs": [{"id", "owner", "group", "priority", "factors": {"age",
   "fairshare", "job_size", "partition", "tres_cpu", "tres_gpu"}, "weighted": {"age", "fairshare",
-  "job_size", "partition", "tres"}, "site", "nice"}]}`, the jobs in scheduling order.
+  "job_size", "partition", "tres"}, "site", "nice", "tier", "yield"}]}`, the jobs in scheduling
+  order (`tier` and `yield` omitted when 0 or not yielding).
   `gpueue share --json` prints `{"users": [{"uid", "shares", "norm_shares", "raw_usage",
   "effective_usage", "fairshare", "active"}], "decay_half_life_secs", "calc_period_secs",
   "usage_reset_period", "billing_weights", "usage_calc_at"}`.
@@ -131,9 +140,10 @@ progress.
    services. It checkpoints the running jobs one at a time. `--no-checkpoint` jobs are simply
    terminated.
 2. After boot, those jobs are listed as `Checkpointed`. Jobs that were queued stay queued and start
-   as usual.
-3. Each owner (or an administrator) resumes their jobs with `gpueue restore <id>` or
-   `gpueue restore -a`. Restores are not started automatically.
+   as usual, and [preempted](#yielding-and-preemption) jobs that were waiting in `Restore queued`
+   are restored automatically as usual.
+3. Each owner (or an administrator) resumes their `Checkpointed` jobs with `gpueue restore <id>`
+   or `gpueue restore -a`. These restores are not started automatically.
 
 A checkpoint can go wrong in two ways:
 
@@ -189,17 +199,18 @@ owner is warned. Nothing is saved on a power loss or a kernel crash.
 - **Everyone:** seeing that a job exists, its owner, group, GPUs, state, priority, dependencies and
   times (`status`, `gpu`), the priority factors of pending jobs (`prio`) and everyone's fair-share
   usage (`share`). This shows who is using which GPU.
-- **Owner:** raising `nice` (never below 0), and `top` (unless `enable_user_top = false`).
-- **Administrators only:** `share set`, `group priority`, `site`, negative `nice`, `top` of other
-  users' jobs, `group add/remove`, `parallel`, `gpu parallel`, pausing or resuming
-  whole groups (`pause/start/kill -g` for one group, `pause/start/kill -a` for all groups),
-  `shutdown`, `reset` of other users' jobs, and `kill <id>` of an
-  [orphan](architecture.md#orphans) (a process the helper runs that the daemon does not
-  account for; `status` lists them to administrators). As in pueue, `pause` and `kill` pause the selected
-  groups, `start` resumes them, and `pause --wait` pauses only the groups and lets running jobs
-  finish. Unlike pueue, `kill -g/-a` pauses the groups even when nothing is queued in them.
-  When a regular user runs `pause/start/kill -g` or `-a`, only their own jobs are affected and no
-  group's paused state changes (`pause --wait` then does nothing). The output says which happened
+- **Owner:** raising `nice` (never below 0), `top` (unless `enable_user_top = false`), and
+  `yield` in any mode, including `off`.
+- **Administrators only:** `share set`, `group priority`, `group tier`, `site`, negative `nice`,
+  `top` and `yield` of other users' jobs, `group add/remove`, `parallel`, `gpu parallel`, pausing or
+  resuming whole groups (`pause/start/kill -g` for one group, `pause/start/kill -a` for all groups),
+  `shutdown`, `reset` of other users' jobs, and `kill <id>` of an [orphan](architecture.md#orphans)
+  (a process the helper runs that the daemon does not account for; `status` lists them to
+  administrators). As in pueue, `pause` and `kill` pause the selected groups, `start` resumes them,
+  and `pause --wait` pauses only the groups and lets running jobs finish. Unlike pueue, `kill -g/-a`
+  pauses the groups even when nothing is queued in them. When a regular user runs
+  `pause/start/kill -g` or `-a`, only their own jobs are affected and no group's paused state
+  changes (`pause --wait` then does nothing). The output says which happened
   (`All groups are being paused.` versus `Your jobs are being paused: 3, 4`).
 - **Only administrators launch jobs immediately** (`start <id>`, `add -i`, `restart -i`,
   `restore -i`), ignoring every limit; everybody else's job is queued first among their own jobs
@@ -250,7 +261,86 @@ job resumes it as before. Administrators' immediate launches start right away, i
 limit. `gpueue prio` shows why a job is
 where it is, `gpueue share` shows everyone's usage. See
 [Priority and fair share](install.md#priority-and-fair-share) for the formula and the
-settings.
+settings. Before any of this, jobs are ordered by their group's tier and whether they yield,
+described next.
+
+### Yielding and preemption
+
+A job's yield mode and its group's tier decide which running jobs may be stopped for which
+waiting ones. The scheduler stops a job by checkpointing it, as `gpueue checkpoint` does, GPU
+state included; once there is room again it restores the job automatically and the job continues
+where it stopped (Slurm's preemption with `PreemptMode=CHECKPOINT`).
+
+```sh
+# A long run that uses GPU 0 while nobody else needs it, and steps aside when someone does.
+gpueue add --yield --gpu 0 python train.py
+# Step aside only for the jobs of its own group that do not yield.
+gpueue add --yield=group -g team --gpu 1 python train.py
+# Change it later: all (the default), group or off.
+gpueue yield 3 4 off
+
+# Administrators: the jobs of "background" give way to every other group.
+sudo gpueue group tier background -1
+```
+
+The value of `--yield` needs `=` (in `gpueue add --yield python train.py`, `python` is the
+command); `--preemptible` is an alias. A running (or paused) job is preempted by waiting jobs as
+follows:
+
+| Running job | Preempted by waiting jobs that |
+| --- | --- |
+| does not yield | do not use `--yield` and are in a group of a higher tier |
+| `--yield=group` | the same, and the jobs of its own group that do not yield |
+| `--yield` | do not use `--yield` (in any group and tier), and `--yield` jobs of a higher tier |
+
+In other words, a job's rank is whether it yields to everybody (`--yield` ranks lower), then its
+group's tier, and a higher rank preempts a lower one; on top of that, `--yield=group` gives way to
+its own group. Jobs of the same rank never preempt each other, so two jobs of different groups
+with the same tier just wait for each other as usual. Waiting jobs are ordered the same way:
+higher tiers first, `--yield` jobs after every job that does not yield, `--yield=group` jobs after
+the jobs of the same tier that do not yield, and the priority above decides within each of these.
+
+- A job is preempted only if that lets the waiting job start right away (it frees a slot of the
+  waiting job's group or of one of its GPUs, and nothing else holds the job back), and only as
+  many as it needs, the lowest-ranked and lowest-priority first.
+- `--no-checkpoint` jobs are never preempted and cannot yield (`gpueue yield` refuses with
+  `a job with --no-checkpoint cannot yield`; `add` refuses the combination). Such a job in a
+  group of a low tier just keeps running.
+- A paused job can be preempted; it is restored paused, as after `gpueue checkpoint`.
+- If the preemption checkpoint is refused, the job keeps running, its owner is warned and it is not
+  tried again for 10 minutes. A dump that fails and cannot be rolled back ends the job as
+  `Checkpoint failed`, as for `gpueue checkpoint` (see
+  [Checkpoint and restore](#checkpoint-and-restore)).
+- Administrators' immediate launches (`start <id>`, `add -i`, ...) never preempt anything.
+- Time a job spends checkpointed or waiting to be restored is not billed for fair share.
+- Administrators can turn preemption off (`preemption = false`: tiers and yield then only order
+  the waiting jobs) or protect jobs that started or were restored recently
+  (`preempt_exempt_secs`); see [Priority and fair share](install.md#priority-and-fair-share).
+
+**What you see.** `gpueue status` marks jobs that yield (`Running (yield)`,
+`Queued (yield=group)`). A preempted job goes through `Checkpointing` to
+`Restore queued (preempted)`, then `Restoring` and `Running` again on its own; `gpueue wait`
+keeps waiting through this. Group headlines show tiers other than 0
+(`Group "background" (1 parallel, tier -1): running`), and `gpueue prio` adds `Tier` and `Yield`
+columns when a pending job has either. In JSON a job carries `yield` and, while it waits to be
+restored after a preemption, `preempted_at`; a group carries `tier`. The job's log gets one line
+just before the dump:
+
+```text
+[gpueue] checkpointing the job to make room for a higher-priority job (preemption); it resumes automatically once there is room again
+```
+
+**Holding a preempted job back.** `gpueue stash <id>` turns a job in `Restore queued` (preempted
+or not) back into `Checkpointed`, keeping its image, so it is not restored until
+`gpueue restore <id>` queues it again. `gpueue stash -g <group>` and `stash -a` include such jobs;
+`stash --delay` refuses them.
+
+**Limitations.** A preempted job is restored on the same GPUs (the same indices) it ran on, so it
+waits for exactly those to be free again. Everything that limits `gpueue checkpoint` applies
+(closed TCP connections, sockets that make a dump impossible, ...; see [Limitations](#limitations)).
+A checkpoint and a restore take time and disk space (roughly RSS + VRAM; about 10 to 20 s for a
+job with 7 GB of VRAM in tests), and the waiting job starts only after the dump has finished;
+if jobs come and go often, ask the administrator for a `preempt_exempt_secs` of a few minutes.
 
 ## Limitations
 
@@ -267,9 +357,10 @@ settings.
   those filesystems must be mounted again at the same path; otherwise the restore is refused and
   the image is kept. Files on a tmpfs such as `/scratch` do not survive a reboot. See
   [Filesystems and mounts](install.md#filesystems-and-mounts).
-- **No crash safety:** checkpoints are taken only on an orderly shutdown, `gpueue shutdown` and
-  `gpueue checkpoint`. Nothing is saved on a power loss, a kernel panic or a hard reset. Periodic
-  checkpoints are not available yet. Keep saving your own training checkpoints.
+- **No crash safety:** checkpoints are taken only on an orderly shutdown, `gpueue shutdown`,
+  `gpueue checkpoint` and a [preemption](#yielding-and-preemption). Nothing is saved on a power
+  loss, a kernel panic or a hard reset. Periodic checkpoints are not available yet. Keep saving your
+  own training checkpoints.
 - **Fork guard:** children that a CUDA process forks without `exec` (for example PyTorch
   DataLoader workers with the `fork` start method) inherit NVIDIA device mappings that CRIU cannot
   save. The helper preloads a small library (`LD_PRELOAD`) into every job that removes them in the

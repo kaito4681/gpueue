@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpueue_core::model::{JobId, JobResult, JobSpec, JobState};
+use gpueue_core::model::{JobId, JobResult, JobSpec, JobState, YieldMode};
 use gpueue_daemon::api::TEST_UID_HEADER;
 use gpueue_daemon::{
     Config, Daemon, DaemonOptions, FakeHelper, StaticGpuDetector, StaticUserDb, SystemClock,
@@ -82,6 +82,7 @@ impl Client {
                 label: None,
                 no_checkpoint: false,
                 nice: 0,
+                yield_mode: YieldMode::None,
             },
             stashed: false,
             enqueue_at: None,

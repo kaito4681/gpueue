@@ -77,6 +77,8 @@
 //! priority_favor_small = false
 //! tres_billing_weights = "CPU=1.0,GRES/gpu=10.0"
 //! enable_user_top = true
+//! preemption = true
+//! preempt_exempt_secs = 0
 //!
 //! # The [[gpus]] list is empty by default. See [`GpuConfig`] for the fields.
 //! [[gpus]]
@@ -295,6 +297,15 @@ pub struct PriorityConfig {
     /// `restart -i`, `restore -i`) queue the job first among their jobs
     /// with it, and just queue it without it.
     pub enable_user_top: bool,
+    /// Slurm's `PreemptType`/`PreemptMode=CHECKPOINT`: the scheduler may
+    /// checkpoint running jobs that yield (`--yield`, or a group of a lower
+    /// tier) to make room for a waiting job they yield to, and restores
+    /// them by itself once there is room again. `false`: yielding and
+    /// tiers only order the waiting jobs; nothing is stopped.
+    pub preemption: bool,
+    /// Slurm's `PreemptExemptTime`: a job is not preempted until it has
+    /// run this long since it last started or was restored. 0: right away.
+    pub preempt_exempt_secs: u64,
 }
 
 pub use gpueue_core::priority::{PriorityType, ResetPeriod, TresWeights};
@@ -315,6 +326,8 @@ impl Default for PriorityConfig {
             priority_favor_small: false,
             tres_billing_weights: "CPU=1.0,GRES/gpu=10.0".to_owned(),
             enable_user_top: true,
+            preemption: true,
+            preempt_exempt_secs: 0,
         }
     }
 }
@@ -335,6 +348,7 @@ impl PriorityConfig {
                 self.priority_decay_half_life_secs,
             ),
             ("priority_calc_period_secs", self.priority_calc_period_secs),
+            ("preempt_exempt_secs", self.preempt_exempt_secs),
         ] {
             if value > MAX_SECS {
                 return Err(format!(
@@ -747,6 +761,8 @@ mod tests {
             }
         );
         assert!(p.enable_user_top);
+        assert!(p.preemption);
+        assert_eq!(p.preempt_exempt_secs, 0);
         assert_eq!(p.params(), gpueue_core::priority::Params::default());
     }
 
@@ -770,6 +786,8 @@ mod tests {
             priority_favor_small = true
             tres_billing_weights = "CPU=2"
             enable_user_top = false
+            preemption = false
+            preempt_exempt_secs = 600
             future_key = 1
             "#,
         )
@@ -778,6 +796,8 @@ mod tests {
         let p = &config.priority;
         assert_eq!(p.priority_usage_reset_period, ResetPeriod::Weekly);
         assert!(!p.enable_user_top);
+        assert!(!p.preemption);
+        assert_eq!(p.preempt_exempt_secs, 600);
         let params = p.params();
         assert_eq!(params.kind, PriorityType::Basic);
         assert_eq!(
@@ -806,6 +826,7 @@ mod tests {
                 "priority_decay_half_life_secs",
             ),
             ("priority_max_age_secs = 31536001", "priority_max_age_secs"),
+            ("preempt_exempt_secs = 31536001", "preempt_exempt_secs"),
         ] {
             let message = invalid(&format!("[priority]\n{text}"));
             assert!(message.contains(needle), "{text}: {message}");
@@ -814,6 +835,8 @@ mod tests {
             "priority_type = \"fifo\"",
             "priority_usage_reset_period = \"hourly\"",
             "priority_weight_age = -1",
+            "preemption = \"yes\"",
+            "preempt_exempt_secs = -1",
         ] {
             assert!(
                 matches!(

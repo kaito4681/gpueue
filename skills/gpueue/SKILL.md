@@ -1,6 +1,6 @@
 ---
 name: gpueue
-description: Run, monitor and manage long-running or GPU jobs on a shared Linux machine through the gpueue job queue (a pueue-compatible CLI with GPU slots, fair-share priority and CRIU checkpoint/restore). Use when the machine has `gpueue` installed and the user wants to queue a training run or other long command, pick or wait for a free GPU, follow a job's log, wait for jobs to finish, or pause, kill, restart, checkpoint or restore their jobs.
+description: Run, monitor and manage long-running or GPU jobs on a shared Linux machine through the gpueue job queue (a pueue-compatible CLI with GPU slots, fair-share priority, preemption and CRIU checkpoint/restore). Use when the machine has `gpueue` installed and the user wants to queue a training run or other long command, pick or wait for a free GPU, let a job yield its GPUs to others, follow a job's log, wait for jobs to finish, or pause, kill, restart, checkpoint or restore their jobs.
 license: MIT
 compatibility: Requires a Linux machine where an administrator installed gpueue (the `gpueue` CLI and its system daemon at /run/gpueue/gpueue.sock). Regular users install nothing.
 ---
@@ -9,7 +9,9 @@ compatibility: Requires a Linux machine where an administrator installed gpueue 
 
 gpueue is a job queue for one Linux machine shared by several users. A system-wide daemon
 schedules everybody's jobs, assigns GPUs, runs each job as its owner in its own systemd unit,
-and can checkpoint running jobs to disk (CPU, memory and GPU state) and restore them later.
+and can checkpoint running jobs to disk (CPU, memory and GPU state) and restore them later. Jobs
+that yield (`--yield`) or belong to a group of a lower tier are checkpointed automatically to make
+room for the jobs they yield to, and resume by themselves afterwards (preemption).
 The CLI mirrors pueue 4.0 (`pueue` → `gpueue`), with "job" instead of "task".
 
 Use gpueue instead of `nohup`, `tmux`, `&` or `screen` for anything that should outlive the agent
@@ -23,7 +25,7 @@ session, needs a GPU, or competes with other users for the machine.
   the user's jobs (`--keep-checkpoints` keeps `Checkpointed` jobs and their images). Never run
   `reset` unless the user explicitly asks for it.
 - Never use `sudo` with gpueue, and do not run administrator commands (`shutdown`, `parallel`,
-  `group add/remove/priority`, `gpu parallel`, `share set`, `site`, `service`, `uninstall`,
+  `group add/remove/priority/tier`, `gpu parallel`, `share set`, `site`, `service`, `uninstall`,
   `update`, `daemon`). If the user is not an administrator they fail with "permission denied";
   if they are, they affect everybody. Ask the user instead.
 - Do not busy-poll `gpueue status` in a loop. Block with `gpueue wait <id>` or stream with
@@ -79,7 +81,8 @@ Key flags (all verified against `gpueue add --help`):
 | `--nice N` | lower the job's priority (non-negative for regular users) |
 | `-s, --stashed` / `-d, --delay WHEN` | don't queue now / queue later (`3h`, `3600`, `wednesday 10:30pm`, ...) |
 | `-i, --immediate` (`--follow`) | see below |
-| `--no-checkpoint` | never checkpoint this job; on shutdown/reboot it is terminated |
+| `--no-checkpoint` | never checkpoint this job; on shutdown/reboot it is terminated. Such a job is never preempted and cannot yield. |
+| `--yield[=group]` (`--preemptible`) | let other jobs preempt this one (see below). `--yield` yields to every job that does not yield; `--yield=group` only to those of its own group. The value needs `=`: in `gpueue add --yield python x.py`, `python` is the command. Not with `--no-checkpoint`. |
 | `-e, --escape` | escape shell characters (disables `&&`, redirections, ...) |
 
 ### Scheduling, priority and `-i`
@@ -94,6 +97,25 @@ Key flags (all verified against `gpueue add --help`):
   launched right away". This is expected, not an error.
 - `gpueue prio [IDS]` shows why a pending job is where it is; `gpueue share` shows fair-share
   usage; `gpueue top <IDS>` and `gpueue nice <IDS> <N>` reorder or deprioritise your own jobs.
+
+### Yielding and preemption
+
+- Before the priority, jobs are ordered by their group's tier (set by administrators with
+  `gpueue group tier`; shown as `tier N` in the group headline of `status`) and by whether they
+  yield. A waiting job may have a running (or paused) job checkpointed to make room when it ranks
+  higher: rank = (does not use `--yield`, group tier), compared in that order. A `--yield=group`
+  job also gives way to the non-yielding jobs of its own group. Same rank never preempts.
+- A preempted job shows `Checkpointing`, then `Restore queued (preempted)`, and is restored
+  automatically on the same GPUs once they are free, continuing where it stopped (same id, same
+  log). `gpueue wait` keeps waiting through this. A paused job is restored paused.
+- Use `--yield` for long work that should not block others (sweeps, background training):
+  `gpueue add -p --yield --gpu 0 -- 'python sweep.py'`. It only helps for jobs that can be
+  checkpointed (see [references/checkpoint.md](references/checkpoint.md)); a refused preemption
+  checkpoint leaves the job running.
+- `gpueue yield <IDS>... [all|group|off]` changes the mode of your own unfinished jobs later
+  (`all` is the default): `gpueue yield 7 off`.
+- `gpueue stash <id>` on a `Restore queued` job holds it back as `Checkpointed` (image kept);
+  `gpueue restore <id>` lets it be restored again.
 
 ## 3. Watch, wait and read output
 
@@ -111,6 +133,8 @@ gpueue wait 7 8 --status success -q   # exits non-zero if any of them did not su
   the exit status matters, or check the result afterwards with `gpueue status --json`.
 - `wait` keeps waiting for queued, stashed, paused and `Checkpointed` jobs. A job checkpointed
   by a reboot only continues after `gpueue restore`, so `wait` on it will not return by itself.
+  A preempted job (`Restore queued (preempted)`) is restored automatically, so `wait` does return
+  once it has finished.
 - Run long `wait`/`follow` calls in the background or with a timeout if the agent's tool has
   one; they are cheap (event stream, no polling).
 - For machine-readable output use `--json` on `status`, `log`, `gpu`, `group`, `prio` and
@@ -128,6 +152,7 @@ gpueue restart -i 7     # ...reusing the same id and overwriting its log
 gpueue remove 7         # delete a finished/queued job from the list (kill running ones first)
 gpueue clean -s         # remove your jobs that finished successfully
 gpueue stash 7 / gpueue enqueue 7    # hold a queued job back / queue it again
+gpueue yield 7 / gpueue yield 7 off  # let job 7 be preempted / stop that
 gpueue switch 7 8       # swap two of your queued jobs
 ```
 
@@ -143,7 +168,8 @@ gpueue restore 7        # queue it again; resumes from the saved state when slot
 
 The job keeps its id and log. On an orderly OS shutdown/reboot gpueue checkpoints running jobs
 automatically; after boot they are `Checkpointed` and the owner must `gpueue restore` them
-(`gpueue restore -a` for all of the user's). Restores are never automatic.
+(`gpueue restore -a` for all of the user's): those restores are not automatic. Only preempted
+jobs (`Restore queued (preempted)`) are restored automatically, also after a reboot.
 
 Before relying on checkpoints, read [references/checkpoint.md](references/checkpoint.md): open
 TCP connections are closed, `/tmp` is private to the job, the venv/binaries/working directory
@@ -159,6 +185,8 @@ a power loss. Training code should still save its own checkpoints.
 | `job N does not exist` | wrong id, or the job was removed/cleaned. |
 | `job N cannot be <action> while it is <state>` | e.g. `remove` of a running job (kill first), `pause` during a checkpoint, `start` of a Checkpointed job (use `restore`). |
 | `GPU N does not exist` | use an index listed by `gpueue gpu`. |
+| `a job with --no-checkpoint cannot yield` / `the argument '--yield[=<TO>]' cannot be used with '--no-checkpoint'` | a job that is never checkpointed cannot be preempted; drop one of the two. |
+| `job N cannot be stashed with a delay while it is restore_queued` | stash a restore-queued job without `--delay`; resume it with `gpueue restore`. |
 | `group "x" does not exist` | use `gpueue group`; only admins create groups. |
 | `... queued first among your jobs instead of being launched right away` | normal for non-admin `-i`/`start`; the job waits for its turn. |
 | job `Failed to spawn`: `gpueue refuses to run jobs as <user>: <reason>` | the account is not allowed to run jobs (system user, denied group such as `docker`/`sudo` as primary group); tell the user. |

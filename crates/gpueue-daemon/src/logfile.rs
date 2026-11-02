@@ -10,7 +10,8 @@
 //!
 //! [`open`] therefore opens the user directory and then the log relative to
 //! it, neither following symlinks nor blocking, and accepts only a regular
-//! file owned by the job's owner. Truncation goes through that same handle.
+//! file owned by the job's owner. Truncation goes through that same handle,
+//! and so do the notes the daemon appends ([`append_note`]).
 
 use std::fs::File;
 use std::io;
@@ -27,6 +28,8 @@ use nix::sys::stat::Mode;
 pub enum Access {
     Read,
     Write,
+    /// Writing at the end only (`O_APPEND`), as the job writes its output.
+    Append,
 }
 
 /// The file name of job `id`'s log inside its owner's log directory.
@@ -62,6 +65,7 @@ pub fn open(logs_dir: &Path, owner: Uid, id: JobId, access: Access) -> io::Resul
         Access::Read => OFlag::O_RDONLY,
         // No O_TRUNC: nothing may change before the checks below.
         Access::Write => OFlag::O_WRONLY,
+        Access::Append => OFlag::O_WRONLY | OFlag::O_APPEND,
     };
     // O_NONBLOCK: opening a FIFO must not hang (it is rejected below).
     let fd = openat(
@@ -89,8 +93,11 @@ pub fn open(logs_dir: &Path, owner: Uid, id: JobId, access: Access) -> io::Resul
         return Err(refuse(&path, "it has setuid, setgid or sticky bits"));
     }
     // Regular files ignore O_NONBLOCK; clear it all the same.
-    nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_SETFL(OFlag::empty()))
-        .map_err(io::Error::from)?;
+    let keep = match access {
+        Access::Append => OFlag::O_APPEND,
+        Access::Read | Access::Write => OFlag::empty(),
+    };
+    nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_SETFL(keep)).map_err(io::Error::from)?;
     Ok(file)
 }
 
@@ -98,6 +105,24 @@ pub fn open(logs_dir: &Path, owner: Uid, id: JobId, access: Access) -> io::Resul
 pub fn truncate(logs_dir: &Path, owner: Uid, id: JobId) -> io::Result<()> {
     match open(logs_dir, owner, id, Access::Write) {
         Ok(file) => file.set_len(0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Appends `note` and a newline to job `id`'s log, as one write at its
+/// end (the job's own output is appended too, so neither overwrites the
+/// other). A missing log is left missing: the daemon cannot create it with
+/// the owner's ownership.
+///
+/// Only while the job's process runs (or before it is dumped): CRIU checks
+/// on restore that the files the job had open have the size they had when
+/// it was dumped, so a note written in between would make the restore
+/// fail.
+pub fn append_note(logs_dir: &Path, owner: Uid, id: JobId, note: &str) -> io::Result<()> {
+    use std::io::Write;
+    match open(logs_dir, owner, id, Access::Append) {
+        Ok(mut file) => file.write_all(format!("{note}\n").as_bytes()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
@@ -146,6 +171,27 @@ mod tests {
     }
 
     #[test]
+    fn appends_notes_at_the_end_and_creates_no_log() {
+        let (_tmp, logs, log) = setup();
+        append_note(&logs, me(), JobId(1), "[gpueue] note").unwrap();
+        assert!(!log.exists());
+        std::fs::write(&log, "out\n").unwrap();
+        // Opened for appending: also after something else wrote further.
+        let mut file = open(&logs, me(), JobId(1), Access::Append).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .and_then(|mut f| io::Write::write_all(&mut f, b"more\n"))
+            .unwrap();
+        io::Write::write_all(&mut file, b"tail\n").unwrap();
+        append_note(&logs, me(), JobId(1), "[gpueue] note").unwrap();
+        assert_eq!(
+            read(&logs, me()).unwrap(),
+            "out\nmore\ntail\n[gpueue] note\n"
+        );
+    }
+
+    #[test]
     fn refuses_symlinks_and_leaves_their_target_alone() {
         let (tmp, logs, log) = setup();
         let secret = tmp.path().join("state.sqlite");
@@ -154,6 +200,8 @@ mod tests {
         let err = read(&logs, me()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
         let err = truncate(&logs, me(), JobId(1)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        let err = append_note(&logs, me(), JobId(1), "x").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "secret");
         // A dangling symlink is no "missing log" either.

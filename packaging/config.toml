@@ -277,3 +277,14 @@
 # the user's jobs, with false it is just queued (only administrators start
 # jobs right away).
 # enable_user_top = true
+
+# Checkpoint running jobs that yield (`gpueue add --yield`, or a job group of
+# a lower tier) to make room for a waiting job they yield to, and restore them
+# automatically once there is room again (Slurm's PreemptType with
+# PreemptMode=CHECKPOINT). With false, yielding and tiers only order the
+# waiting jobs and nothing is stopped.
+# preemption = true
+
+# Do not preempt a job until it has run this long since it last started or
+# was restored (PreemptExemptTime). 0: preempt right away.
+# preempt_exempt_secs = 0
