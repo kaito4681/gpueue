@@ -613,6 +613,8 @@ fn priority_table() {
             },
             site: 0,
             nice: 1,
+            tier: 0,
+            yield_mode: YieldMode::None,
         }],
     };
     let out = priorities(&response, &ctx());
@@ -645,6 +647,46 @@ fn priority_table() {
         ..response.clone()
     };
     assert!(priorities(&empty, &ctx()).ends_with("No pending jobs."));
+    assert!(!out.contains("Tier"), "{out}");
+    assert!(!out.contains("Yield"), "{out}");
+    // Unused tiers and yields leave the JSON as it was.
+    let json = serde_json::to_string(&response.jobs[0]).unwrap();
+    assert!(json.ends_with(r#""site":0,"nice":1}"#), "{json}");
+
+    // Tiers and yields add two columns and a note on the order.
+    let mut tiered = response.clone();
+    tiered.jobs[0].tier = -1;
+    tiered.jobs.push(JobPriority {
+        id: JobId(5),
+        yield_mode: YieldMode::Group,
+        tier: 0,
+        ..tiered.jobs[0].clone()
+    });
+    let out = priorities(&tiered, &ctx());
+    assert!(out.contains("ordered by tier and yield first"), "{out}");
+    let cells = |id: &str| -> Vec<String> {
+        let row = out
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some(id))
+            .unwrap();
+        row.split_whitespace().map(str::to_owned).collect()
+    };
+    assert_eq!(cells("4")[..6], ["4", "bob", "default", "-1", "-", "10500"]);
+    assert_eq!(
+        cells("5")[..6],
+        ["5", "bob", "default", "0", "group", "10500"]
+    );
+    let header = out.lines().find(|l| l.contains("Priority")).unwrap();
+    let header: Vec<&str> = header.split_whitespace().collect();
+    assert_eq!(
+        header[..6],
+        ["Id", "Owner", "Group", "Tier", "Yield", "Priority"]
+    );
+    let json = serde_json::to_string(&tiered.jobs[1]).unwrap();
+    assert!(json.ends_with(r#""nice":1,"yield":"group"}"#), "{json}");
+    let json = serde_json::to_string(&tiered.jobs[0]).unwrap();
+    assert!(json.ends_with(r#""nice":1,"tier":-1}"#), "{json}");
+
     let basic = PriorityResponse {
         priority_type: PriorityType::Basic,
         ..response
@@ -652,6 +694,14 @@ fn priority_table() {
     let out = priorities(&basic, &ctx());
     assert!(out.contains("\"basic\""), "{out}");
     assert!(!out.contains("Fairshare"), "{out}");
+    let basic = PriorityResponse {
+        priority_type: PriorityType::Basic,
+        ..tiered
+    };
+    let out = priorities(&basic, &ctx());
+    let header = out.lines().find(|l| l.contains("Prio")).unwrap();
+    let header: Vec<&str> = header.split_whitespace().collect();
+    assert_eq!(header, ["Id", "Owner", "Group", "Tier", "Yield", "Prio"]);
 }
 
 #[test]
