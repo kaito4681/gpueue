@@ -332,6 +332,25 @@ reboot on bare metal and the GPU parts of a real reboot are not tested yet; see
 does not on your hardware.
 
 <details>
+<summary><b>Upgrading from v0.1.5</b></summary>
+
+v0.1.6 adds priorities that preempt running jobs by checkpointing them and restore them
+automatically afterwards (`gpueue add --yield`, `gpueue group tier`, see
+[Yielding and preemption](docs/usage.md#yielding-and-preemption)). Check these points:
+
+- Nothing changes until someone uses `--yield` or gives a group a tier: without them the scheduling
+  order is the same as before. Preemption is on by default (`[priority] preemption = true`); set it
+  to `false` to let tiers and `--yield` only order the queue.
+- `gpueue stash` (also `-g` and `-a`) now holds restore-queued jobs back as checkpointed, keeping
+  their checkpoints, instead of skipping them; `gpueue restore` puts them back in line.
+- The daemon's database is migrated to schema 7 on the first start. v0.1.5 cannot open it
+  afterwards, so to downgrade, keep a copy of `/var/lib/gpueue/daemon` from before the upgrade.
+- Restoring a checkpoint taken by v0.1.5 after the upgrade is covered by the upgrade test
+  (`scripts/vm-reboot-test.sh`, CPU jobs).
+
+</details>
+
+<details>
 <summary><b>Upgrading from v0.1.4</b></summary>
 
 v0.1.5 changes how checkpoint failures are handled and adds a few CLI features. Check these
