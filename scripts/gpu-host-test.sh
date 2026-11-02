@@ -572,7 +572,13 @@ busy="$(gpueue status --json 2>/dev/null | jq -r --arg g "$group" \
 
 workdir="$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/gpueue-host-test.XXXXXX")" || { pf_fail "cannot create a work directory"; exit 1; }
 mkdir -p "$workdir/bin"
-if "$cc" -O2 -Wall -o "$workdir/bin/check" "$src/check.c" -ldl 2>"$workdir/cc.log" &&
+# NixOS keeps the driver's libraries in /run/opengl-driver/lib, which is in
+# neither the loader's search path nor ldconfig's cache; let the GPU counter's
+# dlopen find libcuda there.
+driver_lib=/run/opengl-driver/lib
+rpath=()
+[ -e "$driver_lib/libcuda.so.1" ] && rpath=("-Wl,-rpath,$driver_lib")
+if "$cc" -O2 -Wall -o "$workdir/bin/check" "$src/check.c" -ldl "${rpath[@]}" 2>"$workdir/cc.log" &&
     "$cc" -O2 -Wall -o "$workdir/bin/cpu" "$src/cpu.c" 2>>"$workdir/cc.log"; then
     # Scenario f's --yield counter, under its own name in nvidia-smi.
     cp "$workdir/bin/check" "$workdir/bin/check-yield"
@@ -581,7 +587,8 @@ else
     pf_fail "building the counters failed:"; sed 's/^/          /' "$workdir/cc.log"
 fi
 # The GPU counter loads libcuda itself; check that the driver library exists.
-if ! { ldconfig -p || /sbin/ldconfig -p; } 2>/dev/null | grep -q 'libcuda\.so\.1'; then
+if [ "${#rpath[@]}" = 0 ] &&
+    ! { ldconfig -p || /sbin/ldconfig -p; } 2>/dev/null | grep -q 'libcuda\.so\.1'; then
     pf_fail "libcuda.so.1 (the NVIDIA driver's CUDA library) not found"
 fi
 
