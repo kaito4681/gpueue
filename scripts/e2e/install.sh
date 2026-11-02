@@ -6,6 +6,10 @@
 # persisted /var/lib/gpueue.
 #   alice (1000), bob (1001): regular users; carol (1002): gpueue-admin.
 set -euo pipefail
+# `docker exec` passes on the container runtime's umask, which is 0000
+# under some rootless Docker setups: files and directories made here would
+# be world-writable (and the helper refuses such an /etc/gpueue).
+umask 022
 
 mkdir -p /etc/gpueue
 if [ "${GPUEUE_E2E_GPU:-}" = 1 ]; then
