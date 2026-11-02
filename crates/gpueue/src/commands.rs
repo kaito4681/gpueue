@@ -7,12 +7,13 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use chrono::{DateTime, Local};
-use gpueue_core::model::{DEFAULT_GROUP, Group, JobId, JobResult, JobState};
+use gpueue_core::model::{DEFAULT_GROUP, Group, JobId, JobResult, JobState, YieldMode};
 use gpueue_protocol::api::{
     BulkJobRequest, BulkJobResponse, CleanRequest, CreateGroupRequest, EnqueueOptions, ErrorCode,
     Event, JobAction, JobSelector, JobView, KillOptions, ListJobsQuery, ListJobsResponse, LogQuery,
     NiceRequest, PauseOptions, ResetRequest, RestartOptions, RestoreOptions,
     SetGpusParallelRequest, ShutdownRequest, SiteRequest, StashOptions, SwitchRequest, TopRequest,
+    YieldRequest,
 };
 use gpueue_protocol::client::{Client, ClientError};
 use serde::Serialize;
@@ -116,6 +117,7 @@ impl App {
                 print_task_id,
                 gpu,
                 no_checkpoint,
+                yield_to,
             } => {
                 let cwd = match working_directory {
                     Some(dir) => dir.canonicalize().map_err(|err| {
@@ -134,6 +136,7 @@ impl App {
                     label: label.as_deref(),
                     gpu: &gpu,
                     no_checkpoint,
+                    yield_to,
                     stashed,
                     delay,
                     immediate,
@@ -362,6 +365,22 @@ impl App {
                     })
                     .await?;
                 self.report(&response, &format!("Nice value set to {nice} for jobs"))
+            }
+            SubCommand::Yield(targets) => {
+                let mode = requests::yield_setting(targets.mode);
+                let response = self
+                    .client
+                    .yield_jobs(&YieldRequest {
+                        ids: requests::job_ids(&targets.task_ids),
+                        mode,
+                    })
+                    .await?;
+                let message = match mode {
+                    YieldMode::None => "No longer yielding",
+                    YieldMode::Group => "Yielding to the jobs of their own group",
+                    YieldMode::All => "Yielding to every job that does not yield",
+                };
+                self.report(&response, message)
             }
             SubCommand::Top { task_ids } => {
                 let response = self
@@ -678,6 +697,10 @@ impl App {
             Some(GroupCommand::Priority { name, priority }) => {
                 self.client.set_group_priority(&name, priority).await?;
                 outln!("Priority of group \"{name}\" set to {priority}")?;
+            }
+            Some(GroupCommand::Tier { name, tier }) => {
+                self.client.set_group_tier(&name, tier).await?;
+                outln!("Tier of group \"{name}\" set to {tier}")?;
             }
         }
         Ok(ExitCode::SUCCESS)

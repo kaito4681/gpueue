@@ -1147,7 +1147,7 @@ fn doctor() {
 #[test]
 fn subcommand_names_match_clap() {
     let command = Cli::command();
-    let samples: [&[&str]; 35] = [
+    let samples: [&[&str]; 36] = [
         &["add", "x"],
         &["remove", "1"],
         &["switch", "1", "2"],
@@ -1175,6 +1175,7 @@ fn subcommand_names_match_clap() {
         &["gpu"],
         &["prio"],
         &["nice", "1", "2"],
+        &["yield", "1"],
         &["top", "1"],
         &["site", "1", "2"],
         &["share"],
@@ -1566,4 +1567,149 @@ fn prio_and_share() {
     for name in ["prio", "nice", "top", "site", "share"] {
         assert!(Cli::command().find_subcommand(name).is_some(), "{name}");
     }
+}
+
+// --- Yielding and tiers (gpueue extensions) -------------------------------------------------
+
+fn add_yield(args: &[&str]) -> (Option<YieldTo>, Vec<String>) {
+    let SubCommand::Add {
+        yield_to, command, ..
+    } = cmd(args)
+    else {
+        panic!("expected add for {args:?}");
+    };
+    (yield_to, command)
+}
+
+#[test]
+fn add_yield_and_its_alias() {
+    let train = ["python", "train.py"].map(String::from).to_vec();
+    for flag in ["--yield", "--preemptible"] {
+        assert_eq!(
+            add_yield(&["add", flag, "python", "train.py"]),
+            (Some(YieldTo::All), train.clone()),
+            "{flag}"
+        );
+        assert_eq!(
+            add_yield(&["add", &format!("{flag}=all"), "python", "train.py"]),
+            (Some(YieldTo::All), train.clone()),
+            "{flag}"
+        );
+        assert_eq!(
+            add_yield(&["add", &format!("{flag}=group"), "python", "train.py"]),
+            (Some(YieldTo::Group), train.clone()),
+            "{flag}"
+        );
+        // Without `=` a following word is never taken as the value.
+        assert_eq!(
+            add_yield(&["add", flag, "group"]),
+            (Some(YieldTo::All), vec!["group".to_owned()]),
+            "{flag}"
+        );
+        assert_eq!(
+            add_yield(&["add", "--gpu", "0", flag, "--", "python"]),
+            (Some(YieldTo::All), vec!["python".to_owned()]),
+            "{flag}"
+        );
+        assert_eq!(
+            parse_err(&["add", &format!("{flag}=off"), "x"]),
+            ErrorKind::InvalidValue
+        );
+        assert_eq!(
+            parse_err(&["add", flag, "--no-checkpoint", "x"]),
+            ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            parse_err(&["add", "--no-checkpoint", &format!("{flag}=group"), "x"]),
+            ErrorKind::ArgumentConflict
+        );
+    }
+    assert_eq!(add_yield(&["add", "x"]), (None, vec!["x".to_owned()]));
+    // Both spellings are one argument.
+    assert_eq!(
+        parse_err(&["add", "--yield", "--preemptible=group", "x"]),
+        ErrorKind::ArgumentConflict
+    );
+}
+
+#[test]
+fn yield_ids_then_mode() {
+    let parsed = |args: &[&str]| match cmd(args) {
+        SubCommand::Yield(targets) => (targets.task_ids, targets.mode),
+        other => panic!("expected yield for {args:?}, got {other:?}"),
+    };
+    assert_eq!(parsed(&["yield", "3"]), (vec![3], YieldSetting::All));
+    assert_eq!(
+        parsed(&["yield", "3", "4"]),
+        (vec![3, 4], YieldSetting::All)
+    );
+    assert_eq!(
+        parsed(&["yield", "3", "4", "all"]),
+        (vec![3, 4], YieldSetting::All)
+    );
+    assert_eq!(
+        parsed(&["yield", "3", "4", "group"]),
+        (vec![3, 4], YieldSetting::Group)
+    );
+    assert_eq!(
+        parsed(&["yield", "3", "4", "off"]),
+        (vec![3, 4], YieldSetting::Off)
+    );
+    assert_eq!(parsed(&["yield", "3", "OFF"]), (vec![3], YieldSetting::Off));
+    assert_eq!(parse_err(&["yield"]), ErrorKind::MissingRequiredArgument);
+    for bad in [
+        &["yield", "off"][..],
+        &["yield", "3", "never"],
+        &["yield", "group", "3"],
+        &["yield", "3", "off", "4"],
+        &["yield", "3", "all", "group"],
+    ] {
+        assert_eq!(parse_err(bad), ErrorKind::ValueValidation, "{bad:?}");
+    }
+    let usage = Cli::command()
+        .find_subcommand_mut("yield")
+        .unwrap()
+        .render_usage()
+        .to_string();
+    assert!(
+        usage.contains("gpueue yield <IDS>... [all|group|off]"),
+        "{usage}"
+    );
+}
+
+#[test]
+fn yield_operand_errors_name_the_problem() {
+    let message = |args: &[&str]| try_parse(args).unwrap_err().to_string();
+    assert!(message(&["yield", "off"]).contains("no job ids given"));
+    assert!(message(&["yield", "3", "never"]).contains("all, group or off"));
+    assert!(message(&["yield", "group", "3"]).contains("invalid job id 'group'"));
+}
+
+#[test]
+fn group_tier() {
+    for (args, tier) in [
+        (&["group", "tier", "g", "-1"][..], -1),
+        (&["group", "tier", "g", "2"], 2),
+        (&["group", "tier", "g", "0"], 0),
+    ] {
+        assert_eq!(
+            cmd(args),
+            SubCommand::Group {
+                json: false,
+                cmd: Some(GroupCommand::Tier {
+                    name: "g".into(),
+                    tier
+                })
+            },
+            "{args:?}"
+        );
+    }
+    assert_eq!(
+        parse_err(&["group", "tier", "g"]),
+        ErrorKind::MissingRequiredArgument
+    );
+    assert_eq!(
+        parse_err(&["group", "tier", "g", "high"]),
+        ErrorKind::ValueValidation
+    );
 }

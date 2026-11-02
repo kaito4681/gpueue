@@ -29,8 +29,8 @@ pub use jobs::{
     QueuedLaunch, ResetRequest, RestartOptions, RestoreOptions, StashOptions, SwitchRequest,
 };
 pub use priority::{
-    NiceRequest, PriorityResponse, PriorityWeights, SetGroupPriorityRequest, SetSharesRequest,
-    SharesResponse, SiteRequest, TopRequest,
+    NiceRequest, PriorityResponse, PriorityWeights, SetGroupPriorityRequest, SetGroupTierRequest,
+    SetSharesRequest, SharesResponse, SiteRequest, TopRequest, YieldRequest,
 };
 pub use resources::{
     CheckpointStorage, CreateGroupRequest, DetectedGpuSummary, GpuDetection, GpuDetectionStatus,

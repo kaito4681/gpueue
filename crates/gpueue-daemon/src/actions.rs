@@ -279,6 +279,9 @@ impl Core {
             )));
         }
         authz::require_nice_value(&caller, 0, spec.nice)?;
+        // Not left to the client: a job that is never checkpointed cannot
+        // be made to yield.
+        authz::check_yield(spec.no_checkpoint, spec.yield_mode).map_err(Failure::bad_request)?;
         let helper_ready = self.helper_ready();
         let now = self.now_ms();
         let core = self.clone();

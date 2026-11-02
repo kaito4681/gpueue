@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::model::{Caller, GpuIndex, Job, JobId, JobResult, JobState, Timestamp, Uid};
+use crate::model::{Caller, GpuIndex, Job, JobId, JobResult, JobState, Timestamp, Uid, YieldMode};
 
 /// Whether `caller` may change `job`.
 pub fn can_mutate(caller: &Caller, job: &Job) -> bool {
@@ -66,6 +66,9 @@ pub enum AdminOperation {
     SetShares,
     /// `group priority`: a group's partition priority.
     SetGroupPriority,
+    /// `group tier`: a group's priority tier, which decides whose jobs
+    /// preempt whose.
+    SetGroupTier,
     /// `site`: a job's site factor.
     SetSiteFactor,
 }
@@ -96,6 +99,29 @@ pub fn require_nice_value(caller: &Caller, current: i32, nice: i32) -> Result<()
 pub fn require_nice(caller: &Caller, job: &Job, nice: i32) -> Result<(), Error> {
     require_mutate(caller, job)?;
     require_nice_value(caller, job.spec.nice, nice)
+}
+
+/// Why a job that is never checkpointed cannot yield: yielding means being
+/// checkpointed to make room, which such a job cannot be.
+pub const NO_CHECKPOINT_YIELD: &str = "a job with --no-checkpoint cannot yield";
+
+/// Whether a job with `no_checkpoint` may yield in `mode` (at `add` and in
+/// `gpueue yield`): only [`YieldMode::None`] is possible for a job that is
+/// never checkpointed. Fails with [`NO_CHECKPOINT_YIELD`].
+pub fn check_yield(no_checkpoint: bool, mode: YieldMode) -> Result<(), &'static str> {
+    if no_checkpoint && !mode.is_none() {
+        Err(NO_CHECKPOINT_YIELD)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether `caller` may change `job`'s yield mode (`gpueue yield`). Yielding
+/// only lowers the job's own standing, so its owner may set any mode on it,
+/// including turning it off again; administrators may change any job.
+/// Whether the mode suits the job is [`check_yield`]'s business.
+pub fn require_yield(caller: &Caller, job: &Job) -> Result<(), Error> {
+    require_mutate(caller, job)
 }
 
 /// Whether `caller` may move `job` to the top of its owner's queue (`gpueue
@@ -263,7 +289,7 @@ fn redact_result(result: &JobResult) -> JobResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DEFAULT_GROUP, JobSpec, YieldMode};
+    use crate::model::{DEFAULT_GROUP, JobSpec};
 
     const OWNER: Uid = Uid(1000);
     const OTHER: Uid = Uid(1001);
@@ -504,6 +530,36 @@ mod tests {
         );
         // Administrators may set anything.
         assert!(require_nice(&admin(), &j, -1000).is_ok());
+    }
+
+    #[test]
+    fn yield_rules() {
+        let mut j = job(JobState::Running);
+        j.spec.no_checkpoint = false;
+        assert_eq!(require_yield(&user(OWNER), &j), Ok(()));
+        assert_eq!(require_yield(&admin(), &j), Ok(()));
+        assert_eq!(
+            require_yield(&user(OTHER), &j),
+            Err(Error::PermissionDenied)
+        );
+        for mode in [YieldMode::None, YieldMode::Group, YieldMode::All] {
+            assert_eq!(check_yield(false, mode), Ok(()));
+        }
+        // A job that is never checkpointed cannot be made to yield, but
+        // turning yielding off is always possible.
+        assert_eq!(check_yield(true, YieldMode::None), Ok(()));
+        for mode in [YieldMode::Group, YieldMode::All] {
+            assert_eq!(
+                check_yield(true, mode),
+                Err("a job with --no-checkpoint cannot yield")
+            );
+        }
+        // Group tiers are for administrators.
+        assert!(require_admin_for(&admin(), AdminOperation::SetGroupTier).is_ok());
+        assert_eq!(
+            require_admin_for(&user(OWNER), AdminOperation::SetGroupTier),
+            Err(Error::PermissionDenied)
+        );
     }
 
     #[test]

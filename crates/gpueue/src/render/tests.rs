@@ -297,6 +297,92 @@ fn groups_text() -> String {
 }
 
 #[test]
+fn group_tiers_are_shown_when_set() {
+    let mut background = group("background", 1, false);
+    background.tier = -1;
+    let mut urgent = group("urgent", 0, true);
+    urgent.tier = 2;
+    assert_eq!(
+        super::groups(
+            &[group("default", 2, false), background, urgent],
+            &Style::PLAIN
+        ),
+        lines(&[
+            r#"Group "default" (2 parallel): running"#,
+            r#"Group "background" (1 parallel, tier -1): running"#,
+            r#"Group "urgent" (0 parallel, tier 2): paused"#,
+        ])
+    );
+}
+
+#[test]
+fn yielding_and_preempted_jobs_in_status() {
+    let mut yielding = job(5, JobState::Running);
+    yielding.yield_mode = YieldMode::All;
+    yielding.started_at = Some(NOW - HOUR);
+    let mut preempted = job(6, JobState::RestoreQueued { enqueued_at: NOW });
+    preempted.yield_mode = YieldMode::Group;
+    preempted.preempted_at = Some(NOW);
+    preempted.started_at = Some(NOW - 2 * HOUR);
+    let mut queued_restore = job(7, JobState::RestoreQueued { enqueued_at: NOW });
+    queued_restore.started_at = Some(NOW - 2 * HOUR);
+    let mut finished = job(
+        8,
+        JobState::Done {
+            result: JobResult::Success,
+        },
+    );
+    finished.yield_mode = YieldMode::All;
+    let mut checkpointed = job(9, JobState::Checkpointed);
+    checkpointed.yield_mode = YieldMode::All;
+    checkpointed.checkpoint_size_bytes = Some(4096);
+
+    let texts: Vec<String> = [&yielding, &preempted, &queued_restore, &finished]
+        .into_iter()
+        .chain([&checkpointed])
+        .map(|j| state_text(j).0)
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "Running (yield)",
+            "Restore queued (preempted, yield=group)",
+            "Restore queued",
+            "Success",
+            "Checkpointed (4.0 KiB, yield)",
+        ]
+    );
+    assert_eq!(state_text(&preempted).1, Color::Yellow);
+
+    let mut default = group("default", 1, false);
+    default.tier = 1;
+    let output = status(
+        StatusInput {
+            groups: &[default],
+            jobs: vec![yielding, preempted, queued_restore],
+            no_jobs_at_all: false,
+            group: Some("default"),
+            columns: &[Column::Id, Column::Status],
+        },
+        &ctx(),
+    )
+    .unwrap();
+    let expected = lines(&[
+        r#"Group "default" (1 parallel, tier 1): running"#,
+        "──────────────────────────────────────────────",
+        " Id   Status                                  ",
+        "══════════════════════════════════════════════",
+        " 5    Running (yield)                         ",
+        "──────────────────────────────────────────────",
+        " 6    Restore queued (preempted, yield=group) ",
+        "──────────────────────────────────────────────",
+        " 7    Restore queued                          ",
+        "──────────────────────────────────────────────",
+    ]);
+    assert_eq!(output, expected, "\n{output}");
+}
+
+#[test]
 fn gpu_table() {
     let gpus = vec![
         GpuView {

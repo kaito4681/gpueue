@@ -33,7 +33,20 @@ fn main() -> ExitCode {
     let matches = Cli::command().get_matches();
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
-        Err(err) => err.exit(),
+        // Errors found while converting (the operands of `gpueue yield`)
+        // get the usage of their subcommand, as clap's own errors do.
+        Err(err) => {
+            let mut command = Cli::command();
+            command.build();
+            let err = match matches
+                .subcommand_name()
+                .and_then(|name| command.find_subcommand_mut(name))
+            {
+                Some(sub) => err.format(sub),
+                None => err.format(&mut command),
+            };
+            err.exit()
+        }
     };
     if let Some(name) = cli.json_unsupported_by() {
         Cli::command()

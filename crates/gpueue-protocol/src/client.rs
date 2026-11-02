@@ -30,8 +30,9 @@ use crate::api::{
     ErrorCode, Event, GpuView, JobAction, JobActionResult, JobView, ListGpusResponse,
     ListGroupsResponse, ListJobsQuery, ListJobsResponse, LogQuery, Method, NiceRequest,
     PriorityResponse, ResetRequest, SetGpusParallelRequest, SetGroupPriorityRequest,
-    SetParallelRequest, SetSharesRequest, SharesResponse, ShutdownRequest, SiteRequest, SseDecoder,
-    SwitchRequest, TopRequest, VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
+    SetGroupTierRequest, SetParallelRequest, SetSharesRequest, SharesResponse, ShutdownRequest,
+    SiteRequest, SseDecoder, SwitchRequest, TopRequest, VERSION_HEADER, VersionResponse,
+    WARNINGS_HEADER, Warning, YieldRequest,
 };
 
 /// The largest JSON response (or error body) the client reads into memory;
@@ -229,6 +230,11 @@ impl Client {
         self.json(&Route::NiceJobs, "", Some(request)).await
     }
 
+    /// `POST /v1/jobs/yield`.
+    pub async fn yield_jobs(&self, request: &YieldRequest) -> Result<BulkJobResponse> {
+        self.json(&Route::YieldJobs, "", Some(request)).await
+    }
+
     /// `POST /v1/jobs/top`.
     pub async fn top(&self, request: &TopRequest) -> Result<BulkJobResponse> {
         self.json(&Route::TopJobs, "", Some(request)).await
@@ -263,6 +269,13 @@ impl Client {
     pub async fn set_group_priority(&self, name: &str, priority: u32) -> Result<Group> {
         let route = Route::SetGroupPriority(name.to_owned());
         self.json(&route, "", Some(&SetGroupPriorityRequest { priority }))
+            .await
+    }
+
+    /// `PUT /v1/groups/{name}/tier`.
+    pub async fn set_group_tier(&self, name: &str, tier: i32) -> Result<Group> {
+        let route = Route::SetGroupTier(name.to_owned());
+        self.json(&route, "", Some(&SetGroupTierRequest { tier }))
             .await
     }
 

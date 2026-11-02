@@ -1,7 +1,7 @@
 //! Priority and fair-share request and response bodies (`gpueue prio`,
-//! `share`, `nice`, `top`, `site`, `group priority`).
+//! `share`, `nice`, `top`, `site`, `yield`, `group priority`, `group tier`).
 
-use gpueue_core::model::{JobId, Timestamp};
+use gpueue_core::model::{JobId, Timestamp, YieldMode};
 use gpueue_core::priority::{JobPriority, PriorityType, ResetPeriod, UserShare};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +58,23 @@ pub struct SetSharesRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetGroupPriorityRequest {
     pub priority: u32,
+}
+
+/// Body of `PUT /v1/groups/{name}/tier` (administrators only); answered
+/// with the group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetGroupTierRequest {
+    pub tier: i32,
+}
+
+/// Body of `POST /v1/jobs/yield` (`gpueue yield`): set whether and to whom
+/// jobs yield ([`YieldMode::None`] is `off`). The owner and administrators
+/// may change it on unfinished jobs; a `no_checkpoint` job may only be set
+/// to [`YieldMode::None`]. Answered with a [`super::BulkJobResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YieldRequest {
+    pub ids: Vec<JobId>,
+    pub mode: YieldMode,
 }
 
 /// Body of `POST /v1/jobs/nice` (`gpueue nice`): set the nice value of

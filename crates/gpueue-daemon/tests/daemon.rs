@@ -4477,6 +4477,172 @@ async fn nice_site_shares_and_group_priority_authorization() {
     assert_eq!(reply.error().code, ErrorCode::GroupNotFound);
 }
 
+/// The error message of each failed job of a bulk reply.
+fn bulk_messages(reply: &Reply) -> Vec<(u64, Option<String>)> {
+    reply
+        .json::<BulkJobResponse>()
+        .results
+        .into_iter()
+        .map(|r| {
+            let message = match r.outcome {
+                gpueue_protocol::api::ActionOutcome::Ok { .. } => None,
+                gpueue_protocol::api::ActionOutcome::Error { error } => Some(error.message),
+            };
+            (r.id.0, message)
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn yield_at_submission_and_later() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let admin = h.client(admin());
+    let stashed = |command: &str| AddJobRequest {
+        stashed: true,
+        ..job_request(command, &[])
+    };
+
+    // The daemon refuses a yielding job that is never checkpointed, also
+    // when a client sends one.
+    let mut request = stashed("x");
+    request.spec.no_checkpoint = true;
+    for mode in ["all", "group"] {
+        let mut body = serde_json::to_value(&request).unwrap();
+        body["yield"] = json!(mode);
+        let reply = alice.post("/v1/jobs", body).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{mode}");
+        assert_eq!(
+            reply.error().message,
+            "a job with --no-checkpoint cannot yield"
+        );
+    }
+    let no_checkpoint = alice.add(&request).await;
+
+    let mut request = stashed("x");
+    request.spec.yield_mode = YieldMode::Group;
+    let id = alice.add(&request).await;
+    assert_eq!(alice.job(id).await.yield_mode, YieldMode::Group);
+    let view = alice.get(&format!("/v1/jobs/{}", id.0)).await;
+    assert_eq!(view.json::<Value>()["yield"], json!("group"));
+    // Not shown while the job does not yield.
+    let view = alice.get(&format!("/v1/jobs/{}", no_checkpoint.0)).await;
+    assert!(view.json::<Value>().get("yield").is_none());
+
+    // The owner may change it, also back to not yielding.
+    for (mode, expected) in [
+        ("all", YieldMode::All),
+        ("none", YieldMode::None),
+        ("group", YieldMode::Group),
+    ] {
+        let reply = alice
+            .post("/v1/jobs/yield", json!({ "ids": [id.0], "mode": mode }))
+            .await;
+        assert_eq!(bulk_results(&reply), [(id.0, None)], "{mode}");
+        assert_eq!(alice.job(id).await.yield_mode, expected);
+    }
+    // Other users may not.
+    let reply = bob
+        .post("/v1/jobs/yield", json!({ "ids": [id.0], "mode": "none" }))
+        .await;
+    assert_eq!(
+        bulk_results(&reply),
+        [(id.0, Some(ErrorCode::PermissionDenied))]
+    );
+    assert_eq!(alice.job(id).await.yield_mode, YieldMode::Group);
+    // Administrators may change any job.
+    let reply = admin
+        .post("/v1/jobs/yield", json!({ "ids": [id.0], "mode": "all" }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(id.0, None)]);
+    assert_eq!(alice.job(id).await.yield_mode, YieldMode::All);
+
+    // A job that is never checkpointed cannot be made to yield, by anybody;
+    // the other jobs of the request are changed all the same.
+    for client in [&alice, &admin] {
+        let reply = client
+            .post(
+                "/v1/jobs/yield",
+                json!({ "ids": [no_checkpoint.0, id.0], "mode": "group" }),
+            )
+            .await;
+        assert_eq!(
+            bulk_results(&reply),
+            [(no_checkpoint.0, Some(ErrorCode::BadRequest)), (id.0, None)]
+        );
+        assert_eq!(
+            bulk_messages(&reply)[0].1.as_deref(),
+            Some("a job with --no-checkpoint cannot yield")
+        );
+    }
+    assert_eq!(alice.job(no_checkpoint).await.yield_mode, YieldMode::None);
+    let reply = alice
+        .post(
+            "/v1/jobs/yield",
+            json!({ "ids": [no_checkpoint.0], "mode": "none" }),
+        )
+        .await;
+    assert_eq!(bulk_results(&reply), [(no_checkpoint.0, None)]);
+
+    // Unknown and finished jobs are reported per job; no ids at all is an
+    // error.
+    let reply = alice
+        .post("/v1/jobs/yield", json!({ "ids": [999], "mode": "all" }))
+        .await;
+    assert_eq!(bulk_results(&reply), [(999, Some(ErrorCode::JobNotFound))]);
+    let reply = alice
+        .post("/v1/jobs/yield", json!({ "ids": [], "mode": "all" }))
+        .await;
+    assert_eq!(reply.error().code, ErrorCode::BadRequest);
+    let finished = alice.add(&job_request("x", &[])).await;
+    alice.wait_state(finished, &JobState::Running).await;
+    h.exit(finished, 0).await;
+    alice.wait_state(finished, &done(JobResult::Success)).await;
+    let reply = alice
+        .post(
+            "/v1/jobs/yield",
+            json!({ "ids": [finished.0], "mode": "all" }),
+        )
+        .await;
+    assert_eq!(
+        bulk_results(&reply),
+        [(finished.0, Some(ErrorCode::InvalidState))]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_tiers_are_for_administrators() {
+    let h = Harness::new(0).await;
+    let alice = h.client(ALICE);
+    let admin = h.client(admin());
+    let set_tier = |client: &Client, group: &str, tier: i32| {
+        let path = format!("/v1/groups/{group}/tier");
+        let client = client.clone();
+        async move {
+            client
+                .call(Method::PUT, &path, Some(json!({ "tier": tier })))
+                .await
+        }
+    };
+
+    let reply = set_tier(&alice, "default", 1).await;
+    assert_eq!(reply.error().code, ErrorCode::PermissionDenied);
+    let reply = set_tier(&admin, "default", -1).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let group: gpueue_core::model::Group = reply.json();
+    assert_eq!(group.tier, -1);
+    let groups = alice.get("/v1/groups").await.json::<Value>();
+    assert_eq!(groups["groups"][0]["tier"], json!(-1));
+    let reply = set_tier(&admin, "default", 0).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    // A tier of 0 is not shown.
+    let groups = alice.get("/v1/groups").await.json::<Value>();
+    assert!(groups["groups"][0].get("tier").is_none(), "{groups}");
+    let reply = set_tier(&admin, "nope", 1).await;
+    assert_eq!(reply.error().code, ErrorCode::GroupNotFound);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn priority_view_hides_commands_and_shows_factors() {
     let h = Harness::new(0).await;
