@@ -17,8 +17,8 @@ use gpueue_daemon::{
 use gpueue_protocol::BINARY_VERSION;
 use gpueue_protocol::api::{
     AddJobRequest, AddJobResponse, ApiError, BulkJobResponse, CleanResponse, ErrorCode,
-    Event as ApiEvent, GpuDetection, GpuSource, JobView, ListGpusResponse, ListJobsResponse,
-    SseDecoder, VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
+    Event as ApiEvent, GpuDetection, GpuSource, JobActionResult, JobView, ListGpusResponse,
+    ListJobsResponse, SseDecoder, VERSION_HEADER, VersionResponse, WARNINGS_HEADER, Warning,
 };
 use gpueue_protocol::helper::{RunningPhase, signal};
 use http_body_util::{BodyExt, Full};
@@ -1492,6 +1492,198 @@ async fn pause_is_refused_while_the_job_is_checkpointed() {
     assert!(h.helper.signals().is_empty());
     h.helper.dump(id);
     alice.wait_state(id, &JobState::Checkpointed).await;
+    h.stop().await;
+}
+
+/// `stash` holds restore-queued jobs back as checkpointed: by id, `-g` and
+/// `-a` (owners their own jobs, administrators everyone's). The image is
+/// kept and the preemption mark cleared; a delay is refused for them (a
+/// bulk stash reports them and stashes its queued jobs), and `restore`
+/// queues them again. Jobs being checkpointed or restored are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stash_holds_restore_queued_jobs_back_as_checkpointed() {
+    use gpueue_core::storage::StoreOps;
+    use gpueue_protocol::api::ActionOutcome;
+
+    async fn checkpointed(client: &Client, command: &str) -> JobId {
+        let id = client.add(&job_request(command, &[])).await;
+        client.wait_state(id, &JobState::Running).await;
+        let reply = client.action(id, "checkpoint", json!(null)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        client.wait_state(id, &JobState::Checkpointed).await;
+        id
+    }
+    async fn stash_bulk(
+        client: &Client,
+        target: Value,
+        enqueue_at: Option<i64>,
+    ) -> BulkJobResponse {
+        let mut body = json!({"target": target, "action": "stash"});
+        if let Some(at) = enqueue_at {
+            body["enqueue_at"] = json!(at);
+        }
+        let reply = client.post("/v1/jobs/bulk", body).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        reply.json()
+    }
+    fn restore_queued(job: &JobView) -> bool {
+        matches!(job.state, JobState::RestoreQueued { .. })
+    }
+
+    let mut h = Harness::new(0).await;
+    h.set_default_parallel(1).await;
+    let alice = h.client(ALICE);
+    let bob = h.client(BOB);
+    let admin = h.client(admin());
+
+    let a = checkpointed(&alice, "a").await;
+    let b = checkpointed(&bob, "b").await;
+    let c = checkpointed(&alice, "c").await;
+    // The only slot is taken: queued and restore-queued jobs wait.
+    let blocker = alice.add(&job_request("blocker", &[])).await;
+    alice.wait_state(blocker, &JobState::Running).await;
+    let queued = alice.add(&job_request("queued", &[])).await;
+    for (client, id) in [(&alice, a), (&bob, b), (&alice, c)] {
+        let reply = client.action(id, "restore", json!({})).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert!(restore_queued(&client.job(id).await));
+    }
+    // a and b were preempted (the scheduler marks them so).
+    for id in [a, b] {
+        h.store().set_job_preempted_at(id, Some(42)).unwrap();
+    }
+    assert_eq!(alice.job(a).await.preempted_at, Some(42));
+    let in_an_hour = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 3_600_000;
+
+    // By id: a checkpointed job has no scheduled restore, so no delay.
+    let reply = alice
+        .action(a, "stash", json!({"enqueue_at": in_an_hour}))
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    let error = reply.error();
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        error.message.contains("cannot be stashed with a delay")
+            && error.message.contains("without --delay"),
+        "{}",
+        error.message
+    );
+    let job = alice.job(a).await;
+    assert!(restore_queued(&job));
+    assert_eq!(job.preempted_at, Some(42));
+
+    // Without one it is held back, keeping its image, and no longer
+    // counts as preempted.
+    assert_eq!(
+        alice.action(a, "stash", json!({})).await.status,
+        StatusCode::OK
+    );
+    let job = alice.job(a).await;
+    assert_eq!(job.state, JobState::Checkpointed);
+    assert_eq!(job.preempted_at, None);
+    assert_eq!(h.store().get_job(a).unwrap().unwrap().preempted_at, None);
+    assert!(h.helper.has_image(a));
+    assert_eq!(job.checkpoint_size_bytes, Some(4096));
+    // Once held back, `stash` and `enqueue` point to `restore`.
+    for action in ["stash", "enqueue"] {
+        let reply = alice.action(a, action, json!({})).await;
+        assert_eq!(reply.status, StatusCode::CONFLICT, "{action}");
+        let message = reply.error().message;
+        assert!(message.contains("gpueue restore"), "{action}: {message}");
+    }
+
+    // Somebody else's job is refused.
+    assert_eq!(
+        alice.action(b, "stash", json!({})).await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    // `-a` with a delay: alice's queued job is stashed until then, her
+    // restore-queued one is reported with the reason; bob's job and the
+    // jobs the action does not apply to are left alone.
+    let reply = stash_bulk(&alice, json!({"kind": "all"}), Some(in_an_hour)).await;
+    assert_eq!(reply.results.len(), 2, "{reply:?}");
+    let result = |id: JobId| {
+        reply
+            .results
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("no result for job {id}: {reply:?}"))
+    };
+    assert!(result(queued).is_ok(), "{reply:?}");
+    match &result(c).outcome {
+        ActionOutcome::Error { error } => {
+            assert_eq!(error.code, ErrorCode::BadRequest);
+            assert!(error.message.contains("with a delay"), "{}", error.message);
+        }
+        other => panic!("job {c} was stashed with a delay: {other:?}"),
+    }
+    assert_eq!(
+        alice.job(queued).await.state,
+        JobState::Stashed {
+            enqueue_at: Some(in_an_hour)
+        }
+    );
+    assert!(restore_queued(&alice.job(c).await));
+
+    // `-g` without a delay: alice's restore-queued job is held back.
+    let reply = stash_bulk(&alice, json!({"kind": "group", "group": "default"}), None).await;
+    assert_eq!(reply.results, vec![JobActionResult::ok(c)]);
+    assert_eq!(alice.job(c).await.state, JobState::Checkpointed);
+    assert!(restore_queued(&bob.job(b).await));
+
+    // An administrator's `-a` takes everyone's.
+    let reply = stash_bulk(&admin, json!({"kind": "all"}), None).await;
+    assert_eq!(reply.results, vec![JobActionResult::ok(b)]);
+    let job = bob.job(b).await;
+    assert_eq!(job.state, JobState::Checkpointed);
+    assert_eq!(job.preempted_at, None);
+    assert!(h.helper.has_image(b));
+
+    // `restore` queues a held-back job again. Once the scheduler has
+    // picked it (the restore is in flight), it is no longer stashable.
+    h.helper.hold_launches();
+    assert_eq!(
+        alice.action(a, "restore", json!({})).await.status,
+        StatusCode::OK
+    );
+    assert!(restore_queued(&alice.job(a).await));
+    h.exit(blocker, 0).await;
+    h.helper.wait_held(1).await;
+    assert_eq!(alice.job(a).await.state, JobState::Restoring);
+    let reply = alice.action(a, "stash", json!({})).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert!(reply.error().message.contains("restoring"));
+    assert!(
+        stash_bulk(&alice, json!({"kind": "all"}), None)
+            .await
+            .results
+            .is_empty()
+    );
+    h.helper.release_launches();
+    alice.wait_state(a, &JobState::Running).await;
+    h.wait_spawned(a).await;
+
+    // Nor while it is being checkpointed.
+    h.helper.set_checkpoint_outcome(FakeOutcome::Hold);
+    assert_eq!(
+        alice.action(a, "checkpoint", json!(null)).await.status,
+        StatusCode::OK
+    );
+    alice.wait_state(a, &JobState::Checkpointing).await;
+    let reply = alice.action(a, "stash", json!({})).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    let message = reply.error().message;
+    assert!(
+        message.contains("once the checkpoint has finished"),
+        "{message}"
+    );
+    h.helper.dump(a);
+    alice.wait_state(a, &JobState::Checkpointed).await;
     h.stop().await;
 }
 

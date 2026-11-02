@@ -264,21 +264,26 @@ pub enum SubCommand {
     /// Stash jobs so they won't be started automatically.
     ///
     /// Use `gpueue enqueue` to put them back into the queue, or `gpueue start <id>` to start them.
+    ///
+    /// (gpueue) Jobs waiting to be restored are held back as checkpointed instead, keeping their
+    /// checkpoint; `gpueue restore` puts them back in line.
     #[command(after_help = DELAY_FORMAT_HELP)]
     Stash {
         /// Stash these jobs.
         #[arg(value_name = "IDS")]
         task_ids: Vec<usize>,
 
-        /// Stash all queued jobs of a group.
+        /// Stash all queued jobs of a group, and hold back its restore-queued jobs.
         #[arg(short, long, conflicts_with = "all")]
         group: Option<String>,
 
-        /// Stash all queued jobs in all groups.
+        /// Stash all queued jobs in all groups, and hold back all restore-queued jobs.
         #[arg(short, long)]
         all: bool,
 
         /// Re-enqueue the stashed jobs once 'delay' has elapsed. See DELAY FORMAT below.
+        ///
+        /// Not for restore-queued jobs: a checkpointed job has no scheduled restore.
         #[arg(short, long, value_parser = parse_delay_until)]
         delay: Option<DateTime<Local>>,
     },

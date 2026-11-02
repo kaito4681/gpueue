@@ -17,15 +17,18 @@
 //! | `kill`       | Running, Paused                                       |
 //! | `remove`     | Queued, Stashed, Done, Checkpointed, RestoreQueued    |
 //! | `restart`    | Done, Checkpointed (new job; in place: Done only)     |
-//! | `stash`      | Queued                                                |
+//! | `stash`      | Queued, RestoreQueued (to Checkpointed, no delay)     |
 //! | `enqueue`    | Stashed                                               |
 //! | `switch`     | Queued, Stashed                                       |
 //! | `clean`      | Done                                                  |
 //! | `checkpoint` | Running, Paused                                       |
 //! | `restore`    | Checkpointed                                          |
 //!
-//! Checkpointed jobs are only resumed by `restore`; `start` and `kill` reject
-//! them, and [`hint`] tells the user which command to use instead.
+//! Checkpointed jobs are only resumed by `restore`; `start`, `kill` and
+//! `enqueue` reject them, and [`hint`] tells the user which command to use
+//! instead. `stash` and `restore` mirror pueue's `stash` and `enqueue` for
+//! checkpointed jobs: `stash` holds a restore-queued job back as
+//! Checkpointed (keeping its image), `restore` puts it back in line.
 
 use std::collections::{HashMap, HashSet};
 
@@ -177,6 +180,24 @@ pub fn hint(action: Action, state: &JobState) -> Option<&'static str> {
         (Action::Pause, JobState::Restoring) => {
             Some("the job is being restored; pause it once it runs again")
         }
+        (Action::Enqueue, JobState::Checkpointed) => {
+            Some("checkpointed jobs are put back in line with `gpueue restore`")
+        }
+        (Action::Stash, JobState::Checkpointed) => {
+            Some("the job is already checkpointed and held back; resume it with `gpueue restore`")
+        }
+        // Only refused with a delay (see [`stash`]).
+        (Action::Stash, JobState::RestoreQueued { .. }) => Some(
+            "a checkpointed job has no scheduled restore; stash it without --delay and \
+             resume it with `gpueue restore`",
+        ),
+        (Action::Stash, JobState::Checkpointing) => {
+            Some("the job is being checkpointed; stash it once the checkpoint has finished")
+        }
+        (Action::Stash, JobState::Restoring) => Some(
+            "the job is already being restored; checkpoint it with `gpueue checkpoint` once it \
+             runs again",
+        ),
         (Action::Restart, JobState::Checkpointed) => Some(
             "a checkpointed job cannot be restarted in place; restart without --in-place \
              creates a new job and keeps the checkpoint",
@@ -396,13 +417,27 @@ pub fn restart(
     }
 }
 
-/// `stash`: hold back a queued job, optionally until `enqueue_at`.
+/// `stash`: hold back a queued job, optionally until `enqueue_at`, or a
+/// restore-queued job: it goes back to Checkpointed, keeping its image, and
+/// is resumed with [`restore`]. A checkpointed job has no scheduled restore,
+/// so a restore-queued job cannot be stashed with a delay. The daemon clears
+/// the job's `preempted_at`: the job is an ordinary checkpointed one now.
+///
+/// A job being checkpointed is refused (the checkpoint has to finish
+/// first), as is one being restored: the scheduler has already picked it.
 pub fn stash(job: &Job, enqueue_at: Option<Timestamp>) -> Result<Transition, Error> {
     match job.state {
         JobState::Queued { .. } => Ok(Transition::to(JobState::Stashed { enqueue_at })),
+        JobState::RestoreQueued { .. } if enqueue_at.is_none() => {
+            Ok(Transition::to(JobState::Checkpointed))
+        }
+        JobState::RestoreQueued { .. } => Err(invalid(job, STASHED_WITH_DELAY)),
         _ => Err(reject(job, Action::Stash)),
     }
 }
+
+/// The action named when [`stash`] refuses a delay for a restore-queued job.
+pub const STASHED_WITH_DELAY: &str = "stashed with a delay";
 
 /// `enqueue`: queue a stashed job now, or schedule it for `enqueue_at`.
 pub fn enqueue(
@@ -1119,11 +1154,8 @@ mod tests {
 
     #[test]
     fn stash_and_enqueue() {
-        assert_accepts(
-            |j| stash(j, None),
-            |s| matches!(s, JobState::Queued { .. }),
-            "stashed",
-        );
+        // Which states `stash` accepts: see
+        // `stash_holds_restore_queued_jobs_back_as_checkpointed`.
         assert_eq!(
             stash(&job(1, JobState::Queued { enqueued_at: 1 }), Some(50))
                 .unwrap()
@@ -1148,6 +1180,84 @@ mod tests {
             Some(JobState::Stashed {
                 enqueue_at: Some(2_000)
             })
+        );
+    }
+
+    #[test]
+    fn stash_holds_restore_queued_jobs_back_as_checkpointed() {
+        assert_accepts(
+            |j| stash(j, None),
+            |s| matches!(s, JobState::Queued { .. } | JobState::RestoreQueued { .. }),
+            "stashed",
+        );
+        let waiting = job(1, JobState::RestoreQueued { enqueued_at: 1 });
+        let t = stash(&waiting, None).unwrap();
+        assert_eq!(t.next, Some(JobState::Checkpointed));
+        // The image is kept.
+        assert!(t.effects.is_empty());
+
+        // A checkpointed job has no scheduled restore: no delay.
+        assert_eq!(
+            stash(&waiting, Some(50)).unwrap_err(),
+            Error::InvalidTransition {
+                id: JobId(1),
+                action: STASHED_WITH_DELAY,
+                state: "restore_queued",
+            }
+        );
+        // That rejection is the only one for a restore-queued job, so its
+        // hint is about the delay.
+        assert!(
+            hint(Action::Stash, &waiting.state)
+                .unwrap()
+                .contains("without --delay")
+        );
+        // A delay is refused only there.
+        for state in all_states() {
+            let result = stash(&job(7, state.clone()), Some(50));
+            match state {
+                JobState::Queued { .. } => assert!(result.is_ok()),
+                JobState::RestoreQueued { .. } => assert!(matches!(
+                    result,
+                    Err(Error::InvalidTransition {
+                        action: STASHED_WITH_DELAY,
+                        ..
+                    })
+                )),
+                _ => assert!(matches!(
+                    result,
+                    Err(Error::InvalidTransition {
+                        action: "stashed",
+                        ..
+                    })
+                )),
+            }
+        }
+
+        // Hints for the states next to it.
+        assert!(
+            hint(Action::Stash, &JobState::Checkpointed)
+                .unwrap()
+                .contains("already")
+        );
+        assert!(
+            hint(Action::Stash, &JobState::Checkpointing)
+                .unwrap()
+                .contains("once the checkpoint has finished")
+        );
+        assert!(hint(Action::Stash, &JobState::Restoring).is_some());
+        assert!(
+            hint(Action::Enqueue, &JobState::Checkpointed)
+                .unwrap()
+                .contains("gpueue restore")
+        );
+
+        // `restore` puts it back in line.
+        let mut held = waiting.clone();
+        t.apply(&mut held, NOW);
+        assert_eq!(
+            restore(&held, false, NOW).unwrap().next,
+            Some(JobState::RestoreQueued { enqueued_at: NOW })
         );
     }
 

@@ -55,6 +55,25 @@ fn transition_for(
     }
 }
 
+/// The failure for an action the job's state refuses, with its hint. A
+/// delayed `stash` of a restore-queued job is a bad request rather than a
+/// state conflict: the job could be stashed, only not with a delay, so a
+/// group or all selection reports it instead of skipping it.
+fn transition_failure(err: gpueue_core::Error, action: &JobAction, state: &JobState) -> Failure {
+    let delay_refused = matches!(
+        err,
+        gpueue_core::Error::InvalidTransition {
+            action: lifecycle::STASHED_WITH_DELAY,
+            ..
+        }
+    );
+    let mut failure = Failure::invalid_transition(err, lifecycle_action(action), state);
+    if delay_refused {
+        failure.0.code = ErrorCode::BadRequest;
+    }
+    failure
+}
+
 /// What a successful [`Core::job_action`] reports.
 #[derive(Debug, Clone, Default)]
 pub struct ActionDone {
@@ -481,9 +500,8 @@ impl Core {
         self.write(move |tx, ch| {
                 let mut job = tx.get_job(id)?.ok_or_else(|| job_not_found(id))?;
                 authz::require_mutate(&caller, &job)?;
-                let mut transition = transition_for(&action, &job, now).map_err(|e| {
-                    Failure::invalid_transition(e, lifecycle_action(&action), &job.state)
-                })?;
+                let mut transition = transition_for(&action, &job, now)
+                    .map_err(|e| transition_failure(e, &action, &job.state))?;
                 if transition.effects.iter().any(targets_live_process)
                     && core.launch_in_flight(id)
                 {
@@ -538,6 +556,15 @@ impl Core {
                 }
                 let snapshot = job.clone();
                 let copy = core.apply_in_tx(tx, &mut job, &transition, now, ch)?;
+                if matches!(action, JobAction::Stash(_))
+                    && job.state == JobState::Checkpointed
+                    && job.preempted_at.is_some()
+                {
+                    // A preempted job held back by `stash` is an ordinary
+                    // checkpointed job now, resumed by `restore`.
+                    tx.set_job_preempted_at(id, None)?;
+                    job.preempted_at = None;
+                }
                 let mut queued = None;
                 if launch && admin {
                     // Also when launching now: should the helper not start
