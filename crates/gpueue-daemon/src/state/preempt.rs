@@ -1,10 +1,13 @@
 //! Preemption: checkpointing running jobs to make room for higher-priority
 //! ones, and restoring them by themselves once there is room again.
 //!
-//! The scheduler picks the jobs; [`Core::preempt_jobs`] carries it out. A
-//! preempted job is checkpointed like one of `gpueue checkpoint` (see
-//! [`lifecycle::preempt`]), marked with [`Job::preempted_at`] in the same
-//! transaction. Its dump's outcome is applied by the usual event handling:
+//! The scheduler picks the jobs
+//! ([`gpueue_core::scheduler::plan_preemptive`]); `Core::schedule_once`
+//! preempts them with [`Core::preempt_in_tx`] in the transaction it
+//! planned in, and sends their dumps once it has committed
+//! ([`Core::send_preemptions`]). A preempted job is checkpointed like one
+//! of `gpueue checkpoint` (see [`lifecycle::preempt`]), marked with
+//! [`Job::preempted_at`] in the same transaction. Its dump's outcome is applied by the usual event handling:
 //! a successful dump puts it back in line to be restored (`RestoreQueued`),
 //! where the scheduler restores it like any other job waiting for a slot,
 //! and every other outcome is that of a checkpoint (see the lifecycle
@@ -164,13 +167,33 @@ impl Core {
     /// Whether jobs can be preempted now: preemption is enabled, and jobs
     /// could be launched (the helper is ready, the daemon is not stopping
     /// or shutting down, and launches are not paused). A preempted job must
-    /// be restored later, and its dump needs the helper.
-    fn can_preempt(&self) -> bool {
+    /// be restored later, and its dump needs the helper. Consistent with
+    /// the database when called inside [`Core::write`] (see
+    /// `Core::stop_launches`).
+    pub(super) fn can_preempt(&self) -> bool {
         self.preemption.enabled
             && !self.is_shutting_down()
             && self.helper_ready()
             && !self.launches_stopped.is_cancelled()
             && !self.launches_paused()
+    }
+
+    /// The jobs of `jobs` the scheduler must not choose to preempt at
+    /// `now`: those of [`Core::preempt_refused`], and the running or paused
+    /// ones [`Core::preempt_in_tx`] would leave alone (their spawn or
+    /// restore has not been answered yet, or `reset` is removing them), so
+    /// that the scheduler does not count on slots that are not freed.
+    /// Consistent with the database when called inside [`Core::write`].
+    pub(super) fn not_preemptible(&self, jobs: &[Job], now: Timestamp) -> HashSet<JobId> {
+        let mut out = self.preempt_refused(now);
+        let removing = self.pending_removal.lock().unwrap();
+        out.extend(
+            jobs.iter()
+                .filter(|j| matches!(j.state, JobState::Running | JobState::Paused))
+                .filter(|j| self.launch_in_flight(j.id) || removing.contains_key(&j.id))
+                .map(|j| j.id),
+        );
+        out
     }
 
     /// Preempts `job` (re-read in this transaction) at `now`: marks it
@@ -219,11 +242,36 @@ impl Core {
         }
     }
 
+    /// Sends the dump requests of the jobs `preempted` in a committed
+    /// transaction (with the effects [`Core::preempt_in_tx`] returned),
+    /// each on its own task, so a slow helper answer does not hold up the
+    /// caller.
+    pub(super) fn send_preemptions(self: &Arc<Self>, preempted: Vec<(Job, Vec<Effect>)>) {
+        for (job, effects) in preempted {
+            tracing::info!(job = %job.id, "preempting the job to make room for a higher-priority job");
+            let core = self.clone();
+            tokio::spawn(async move {
+                // A request not sent when the daemon stops leaves the job
+                // checkpointing; the next daemon's reconciliation puts it
+                // back to running (see `Core::abandon_lost_checkpoint`).
+                tokio::select! {
+                    biased;
+                    _ = core.cancel.cancelled() => {}
+                    _ = core.run_preemption(&job, &effects) => {}
+                }
+            });
+        }
+    }
+
     /// Preempts the jobs `ids` (see [`Core::preempt_in_tx`]) in one
-    /// transaction, and sends their dump requests on their own tasks, so
-    /// a slow helper answer does not hold up the caller. Returns the jobs
-    /// that are being preempted; none if jobs cannot be preempted now (see
+    /// transaction, and sends their dump requests (see
+    /// [`Core::send_preemptions`]). Returns the jobs that are being
+    /// preempted; none if jobs cannot be preempted now (see
     /// [`Core::can_preempt`]). Skips jobs that cannot be preempted.
+    ///
+    /// The scheduler does not use this: it preempts the jobs it chooses in
+    /// the transaction it chose them in (see `Core::schedule_once`).
+    #[cfg(test)]
     pub(crate) async fn preempt_jobs(self: &Arc<Self>, ids: Vec<JobId>) -> ApiResult<Vec<JobId>> {
         if ids.is_empty() || !self.can_preempt() {
             return Ok(Vec::new());
@@ -250,20 +298,7 @@ impl Core {
             })
             .await?;
         let ids = preempted.iter().map(|(job, _)| job.id).collect();
-        for (job, effects) in preempted {
-            tracing::info!(job = %job.id, "preempting the job to make room for a higher-priority job");
-            let core = self.clone();
-            tokio::spawn(async move {
-                // A request not sent when the daemon stops leaves the job
-                // checkpointing; the next daemon's reconciliation puts it
-                // back to running (see `Core::abandon_lost_checkpoint`).
-                tokio::select! {
-                    biased;
-                    _ = core.cancel.cancelled() => {}
-                    _ = core.run_preemption(&job, &effects) => {}
-                }
-            });
-        }
+        self.send_preemptions(preempted);
         Ok(ids)
     }
 }
