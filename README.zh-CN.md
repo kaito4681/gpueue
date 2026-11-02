@@ -332,6 +332,22 @@ gpueue 处于 1.0 之前、正在积极开发的阶段；当前版本和发布�
 [测试范围](docs/zh-CN/usage.md#test-coverage)。请报告在你的硬件上哪些功能可用、哪些不可用。
 
 <details>
+<summary><b>从 v0.1.5 升级</b></summary>
+
+v0.1.6 新增了按优先级抢占：通过检查点停止正在运行的作业，之后自动恢复（`gpueue add --yield`、
+`gpueue group tier`，参见 [让路与抢占](docs/zh-CN/usage.md#yielding-and-preemption)）。请确认以下几点：
+
+- 在有人使用 `--yield` 或为组设置 tier 之前，什么都不会改变：不使用它们时，调度顺序与之前相同。抢占默认开启
+  （`[priority] preemption = true`）；设为 `false` 时，tier 和 `--yield` 只影响队列顺序。
+- `gpueue stash`（以及 `-g` 和 `-a`）现在会把等待恢复的作业保留为已创建检查点的状态（保留其检查点），
+  而不是跳过它们；`gpueue restore` 会让它们重新排队。
+- daemon 的数据库会在首次启动时迁移到 schema 7。迁移后 v0.1.5 无法打开它，因此如需降级，请在升级前保留一份
+  `/var/lib/gpueue/daemon` 的副本。
+- 升级后恢复 v0.1.5 创建的检查点由升级测试（`scripts/vm-reboot-test.sh`，CPU 作业）覆盖。
+
+</details>
+
+<details>
 <summary><b>从 v0.1.4 升级</b></summary>
 
 v0.1.5 改变了检查点失败时的处理方式，并增加了一些 CLI 功能。请确认以下行为变更：
