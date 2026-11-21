@@ -268,7 +268,7 @@ jobs:
       # first use, and the save below could not empty the directory.
       - if: matrix.nix-cache
         run: mkdir -p "$RUNNER_TEMP"/nix-cache/{nar,log,realisations}
-      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
         with:
           # cache.nixos.org drops connections now and then (HTTP/2 framing
           # errors, a 416 on a resumed download): fall back to building,
